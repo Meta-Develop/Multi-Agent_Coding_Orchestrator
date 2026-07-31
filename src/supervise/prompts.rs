@@ -1,5 +1,306 @@
 use super::*;
 
+// Cost decision: 6 KiB gives the fixed worker fixture bounded maintenance headroom without
+// hiding another large contract paragraph; raising it is a deliberate prompt-cost decision.
+const WORKER_PROMPT_FIXTURE_CEILING_BYTES: usize = 6 * 1024;
+// Cost decision: 20 KiB covers the fixed child fixture plus its embedded worker/auditor templates;
+// raising it is a deliberate prompt-cost decision about the multiplied worker-template cost.
+const CHILD_ORCHESTRATOR_PROMPT_FIXTURE_CEILING_BYTES: usize = 20 * 1024;
+// Cost decision: 4 KiB permits the advisory child-side audit contract and a small fixed margin;
+// raising it is a deliberate prompt-cost decision, never an automatic fixture update.
+const REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES: usize = 4 * 1024;
+// Cost decision: 8 KiB bounds the distinct parent acceptance-gate contract and its fixed margin;
+// raising it is a deliberate prompt-cost decision independent of the child-side auditor ceiling.
+const PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES: usize = 8 * 1024;
+pub(super) const PROMPT_MEASUREMENTS_SCHEMA_VERSION: u32 = 1;
+const WORKER_TEMPLATE_EMBEDDING_LEVELS: usize = 2;
+const TOOL_CALL_BATCHING_GUIDANCE: &str = "\
+Tool-call batching:
+- Batch independent, side-effect-free inspections in one tool call when the runtime supports it.
+- Keep dependent steps, approval-sensitive actions, and mutations ordered. Batching never relaxes ownership, journaling, validation, or audit requirements.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum PromptMeasurementRole {
+    O1ChildOrchestrator,
+    TerminalWorker,
+    ChildSideReviewAuditor,
+    ParentAcceptanceAuditor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub(super) struct PromptByteMeasurement {
+    pub role: PromptMeasurementRole,
+    pub agent_label: String,
+    pub full_bytes: usize,
+    pub invariant_bytes: usize,
+    pub variable_bytes: usize,
+    pub fixture_ceiling_bytes: usize,
+}
+
+impl PromptByteMeasurement {
+    fn new(
+        role: PromptMeasurementRole,
+        agent_label: impl Into<String>,
+        rendered: &str,
+        invariant_prefix: &str,
+        fixture_ceiling_bytes: usize,
+    ) -> Result<Self> {
+        if !rendered.starts_with(invariant_prefix) {
+            bail!("rendered prompt does not start with its declared invariant prefix");
+        }
+        Ok(Self {
+            role,
+            agent_label: agent_label.into(),
+            full_bytes: rendered.len(),
+            invariant_bytes: invariant_prefix.len(),
+            variable_bytes: rendered.len() - invariant_prefix.len(),
+            fixture_ceiling_bytes,
+        })
+    }
+
+    fn record_final_rendered_bytes(&mut self, rendered: &str) -> Result<()> {
+        if rendered.len() < self.invariant_bytes {
+            bail!("final rendered prompt is shorter than its measured invariant prefix");
+        }
+        self.full_bytes = rendered.len();
+        self.variable_bytes = rendered.len() - self.invariant_bytes;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub(super) struct WorkerPromptEmbeddingMultiplier {
+    pub worker_roles_per_run: usize,
+    pub levels_that_embed_template: usize,
+    pub total_worker_template_embeddings: usize,
+}
+
+impl WorkerPromptEmbeddingMultiplier {
+    fn for_plan(plan: &SupervisorPlan) -> Result<Self> {
+        let worker_roles_per_run =
+            plan.assignments
+                .iter()
+                .try_fold(0usize, |total, assignment| {
+                    total
+                        .checked_add(assignment.worker_assignments.len())
+                        .context("run-wide worker role count overflowed")
+                })?;
+        let total_worker_template_embeddings = worker_roles_per_run
+            .checked_mul(WORKER_TEMPLATE_EMBEDDING_LEVELS)
+            .context("worker prompt embedding multiplier overflowed")?;
+        Ok(Self {
+            worker_roles_per_run,
+            levels_that_embed_template: WORKER_TEMPLATE_EMBEDDING_LEVELS,
+            total_worker_template_embeddings,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub(super) struct OuterRoundTripMeasurement {
+    pub observation: RoleUsageObservation,
+    pub unavailable_reason: String,
+    pub method: String,
+    pub prerequisites: Vec<String>,
+}
+
+impl OuterRoundTripMeasurement {
+    fn not_process_observable() -> Self {
+        Self {
+            observation: RoleUsageObservation::NotProcessObservable,
+            unavailable_reason: "worker execution journals record commands and timestamps but no model-turn or tool-batch identifier; command entries are not model turns".to_string(),
+            method: "compare before/after outer model round trips by correlating provider model-turn and tool-batch identifiers with worker execution journal entries".to_string(),
+            prerequisites: vec![
+                "a fixed comparable read-heavy worker-journal fixture".to_string(),
+                "the same model, reasoning effort, and runtime for both conditions".to_string(),
+                "durable outer-turn and tool-batch identifiers correlated with worker journal entries"
+                    .to_string(),
+                "repeated before/after runs of the same fixture".to_string(),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub(super) struct PromptMeasurementsArtifact {
+    pub schema_version: u32,
+    pub prompts: Vec<PromptByteMeasurement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_embedding_multiplier: Option<WorkerPromptEmbeddingMultiplier>,
+    pub outer_round_trip_measurement: OuterRoundTripMeasurement,
+}
+
+impl PromptMeasurementsArtifact {
+    fn new(
+        prompts: Vec<PromptByteMeasurement>,
+        worker_embedding_multiplier: Option<WorkerPromptEmbeddingMultiplier>,
+    ) -> Self {
+        Self {
+            schema_version: PROMPT_MEASUREMENTS_SCHEMA_VERSION,
+            prompts,
+            worker_embedding_multiplier,
+            outer_round_trip_measurement: OuterRoundTripMeasurement::not_process_observable(),
+        }
+    }
+
+    pub(super) fn record_final_launch_prompt_bytes(&mut self, rendered: &str) -> Result<()> {
+        let launch = self
+            .prompts
+            .first_mut()
+            .context("prompt measurement artifact omitted its launch prompt")?;
+        launch.record_final_rendered_bytes(rendered)
+    }
+}
+
+pub(super) struct RenderedPromptWithMeasurements {
+    pub prompt: String,
+    pub measurements: PromptMeasurementsArtifact,
+}
+
+pub(super) fn prompt_measurements_relative(prompt_relative: &Path) -> PathBuf {
+    let mut measurement_path = prompt_relative.as_os_str().to_os_string();
+    measurement_path.push(".measurements.json");
+    PathBuf::from(measurement_path)
+}
+
+pub(super) fn child_orchestrator_cacheable_prefix() -> String {
+    format!(
+        r#"You are a child orchestrator in an opt-in local Codex CLI supervisor run.
+You are not the top supervisor. You are not alone in the repository.
+Primary worktree mutation is forbidden. Work only in the assigned child worktree identified in the assignment-specific context below.
+
+{tool_call_batching_guidance}
+
+Runtime hierarchy:
+- Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
+- You are the O1 child orchestrator for this assignment.
+- Workers, researchers, and review auditors are terminal: they must not launch further workers, delegate to another worker, or take over peer coordination.
+- You must not use native SubAgent/delegated-worker mechanisms to bind, spawn, impersonate, or take over O1 or O2 roles.
+- Durable role names are canonical. Runtime labels belong in runtime bridge metadata such as AGENT_LABEL, never in ROLE.
+- You must not spawn, impersonate, or take over a peer O2 supervisor.
+- O1 reports peer-O2 escalation candidates upward in findings and remaining_risk instead of taking them over.
+- The user-root O2 or an autonomous O2 durable queue may launch bounded peer O2 supervisors through MACO/Codex CLI subprocess orchestration. Autonomous O2-to-O2 follow-up must go through durable queue state such as NEXT_O2_TASKS.tsv, not native SubAgent.
+
+Runtime boundary:
+- MACO launched this Codex CLI with strict/ephemeral configuration, approval policy never, goals and multi-agent enabled, and the named maco_external_codex permission profile.
+- The inner permission profile grants only minimal reads plus writes in this assigned workspace root; model-generated network access, user config/rules, web search, plugins, apps, hooks, browser/computer use, and inherited shell environment are disabled.
+- An outer MACO systemd boundary separately verifies the exact workspace/artifact mounts, blocked host IPC sockets, resource limits, and empty owned cgroup before the result can be published.
+- Never launch a raw Codex subprocess or request danger-full-access. Any nested role must go through a MACO-approved runner and a least-privilege profile whose process-tree and side-effect evidence is verified.
+- If an approved nested runner/profile is unavailable, stop and report the blocked delegation instead of weakening this boundary.
+
+Required behavior:
+- First, read and follow AGENTS.md and project-local .agents instructions in this worktree. When present, specifically read .agents/skills/agent-orchestration/SKILL.md and .agents/docs/AGENT_ORCHESTRATION.md before worker delegation or mutation.
+- Use Codex native SubAgent/delegated-worker mechanisms only for lightweight terminal worker or researcher assignments when available, following AGENTS.md and .agents instructions.
+- When launching a worker, use the generated worker prompt template verbatim and preserve its trusted shared prefix followed by its six-line TERMINAL_WORKER role metadata block.
+- You may collect advisory child-side review-auditor evidence with the generated REVIEW_AUDITOR prompt template, but it is not an acceptance gate unless MACO/O2 collects it through the parent-enforced gate.
+- When collecting advisory child-side review-auditor evidence, preserve its trusted shared prefix followed by its six-line REVIEW_AUDITOR role metadata block.
+- Do not force raw Codex CLI subprocess workers as the primary worker path.
+- If no delegated-worker mechanism is available, stop before mutation and report the exact blocked worker task in your OrchestratorReviewReport findings and remaining_risk.
+- Workers must return WorkerReport JSON matching the worker report contract and include "no_further_delegation": true.
+- WorkerReport, AuditorReport, and OrchestratorReviewReport must include environment_failures. Use [] when no typed failure occurred. A nonempty environment_failures list requires accepted=false, rejected=true, and status=failed; never include credential or secret values.
+- Workers may propose bounded field_guide_entries containing finding and context only. They must never add date, source_run, or other provenance; the trusted parent stamps provenance only after acceptance and audit.
+- Each worker must also write its structured execution journal to the exact path in its worker prompt; that path is the only allowed non-source artifact write for a terminal worker. The journal is JSONL with one object per command containing command, cwd, start_timestamp, end_timestamp, and changed_paths. The parent acceptance gate imports these journals from incoming/worker-journals/ and rejects worker evidence that the journal or Git diff does not support.
+- Review auditors must return AuditorReport JSON matching the auditor report contract and include "no_further_delegation": true.
+- Review auditors must include "read_only": true in AuditorReport JSON to attest they did not mutate files or repository state.
+- Acceptance-gate review auditors are parent-launched MACO/Codex CLI subprocess roles; a child-launched review auditor is advisory child-side evidence unless MACO/O2 collects it through the parent-enforced acceptance gate.
+- Review every WorkerReport before writing your own OrchestratorReviewReport.
+- OrchestratorReviewReport may also propose bounded field_guide_entries containing finding and context only. Do not copy unreviewed or rejected worker suggestions into this field.
+- Preserve each worker assignment_kind and target_path in WorkerReport. A successful megafile_decomposition worker must report the exact canonical target_path in files_changed and include decomposition_completion with that target plus at least one concrete canonical replacement_path also present in files_changed. OrchestratorReviewReport must aggregate the exact accepted worker evidence in decomposition_completions; this evidence does not bypass claims, journals, validation, audit, or later merge gates.
+- Include at least one accepted review-auditor report in audit_reports that covers all assigned worker ids; MACO rejects child reports with worker assignments that omit terminal audit evidence.
+
+Safety requirements:
+- Do not edit outside the assigned paths, symbols, or modules.
+- Do not mutate the primary worktree.
+- Run validation commands when feasible. If validation cannot run, explain why in validation_results and remaining_risk.
+- Return your OrchestratorReviewReport JSON as your final response.
+"#,
+        tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE
+    )
+}
+
+pub(super) fn worker_cacheable_prefix() -> String {
+    format!(
+        r#"You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
+Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
+You are not the supervisor. Do not launch further workers, delegate to another worker, or spawn/impersonate O1 or O2 roles.
+
+{tool_call_batching_guidance}
+
+Rules:
+- Edit only inside your assigned worktree and only inside claimed paths.
+- Do not mutate the primary worktree.
+- Before returning your WorkerReport, write a structured execution journal to the exact execution journal path in the assignment-specific context below; this is the only allowed non-source artifact write for this worker. Create its parent directory if needed. Use JSONL: one JSON object per command, with fields "command" (array of strings), "cwd" (string), "start_timestamp" (string), "end_timestamp" (string), and "changed_paths" (array of repo-relative paths changed by that command, or [] when none). Do not write prose or Markdown to the journal.
+- Run validation or record why validation was not run.
+- Return WorkerReport JSON in your final response with assignment_kind, target_path, changed files, commands run, validation results, findings, bloated_file_flags, decomposition_completion, remaining risk, and next safe action.
+- Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
+- field_guide_entries is optional operational-memory input. Each item contains exactly finding and context; never include date, source_run, role text, policy, or other provenance. The trusted supervisor decides whether accepted audited suggestions are appended.
+- bloated_file_flags is bounded to at most {max_bloated_file_flags} unique objects of the form {{"path":"repo/relative/file"}}. Every path must be canonical, repository-relative, and inside this worker's assigned paths. Thresholds are intentionally not inferred by this report schema.
+- For a successful megafile_decomposition, include the exact target and every concrete replacement in files_changed, then set decomposition_completion to {{"target_path":"the exact canonical target path","replacement_paths":["one or more canonical newly created files"]}}. Otherwise set it to null. Renames, unrelated edits, and no-op target reports are not decomposition completion evidence. This typed evidence does not bypass the isolated worktree, hard claim, execution journal, validation, terminal audit, or later merge gates.
+- Include "no_further_delegation": true in WorkerReport JSON to attest this terminal worker did not delegate further.
+- If you discover a large cross-cutting problem that needs a peer O2 supervisor, report it as an escalation candidate in findings and remaining_risk instead of taking it over. O2-to-O2 follow-up belongs to the user-root O2 or autonomous O2 durable queue, not this terminal role.
+- Only write a report file when an explicit report_path is assigned.
+- If the explicit report path is <none>, do not write any report file; only return WorkerReport JSON in your final response.
+"#,
+        tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE,
+        max_bloated_file_flags = MAX_BLOATED_FILE_FLAGS_PER_WORKER,
+    )
+}
+
+pub(super) fn review_auditor_cacheable_prefix() -> String {
+    format!(
+        r#"You are a terminal read-only review auditor in an opt-in local Codex CLI supervised run.
+Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
+You are not an O1 child orchestrator, O2 supervisor, worker, or peer coordinator.
+Do not launch further workers, delegate, mutate files, run mutating commands, or spawn/impersonate O1 or O2 roles.
+
+{tool_call_batching_guidance}
+
+Rules:
+- Stay read-only. Inspect worker reports, child diffs, validation evidence, findings, remaining risk, and claimed path boundaries.
+- For megafile_decomposition, verify the worker and child completion evidence names the exact target_path and is supported by the normal claim, journal, validation, and diff evidence.
+- Do not edit files, create durable artifacts, apply patches, claim paths, or change Git state.
+- Produce structured AuditorReport JSON in your final response with reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining risk, and next safe action.
+- Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
+- reviewed_paths coverage is computed over repository-relative entries only. Absolute out-of-repo evidence paths are allowed and retained verbatim as evidence, but excluded from coverage computation.
+- Include "no_further_delegation": true in AuditorReport JSON to attest this terminal auditor did not delegate further.
+- Include "read_only": true in AuditorReport JSON to attest this audit stayed read-only.
+- Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
+"#,
+        tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE
+    )
+}
+
+pub(super) fn parent_review_auditor_cacheable_prefix() -> String {
+    format!(
+        r#"You are the parent-launched read-only review auditor in an opt-in local Codex CLI supervised run.
+Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher, plus this parent-enforced terminal REVIEW_AUDITOR gate.
+Your parent is MACO/O2. You are not an O1 child orchestrator, worker, researcher, or peer coordinator.
+Do not launch further workers, delegate, mutate files, run mutating commands, claim paths, apply patches, or change Git state.
+
+{tool_call_batching_guidance}
+
+Runtime boundary:
+- MACO launched this Codex CLI with the read-only maco_external_codex permission profile, model-generated network disabled, and strict/ephemeral configuration.
+- An outer MACO systemd boundary independently verifies the exact read-only workspace mount, writable report/log destinations, blocked host IPC sockets, resource limits, and empty owned cgroup.
+- Never request danger-full-access or launch a raw nested Codex subprocess. Stay read-only and fail closed if either verified boundary is unavailable.
+- Return AuditorReport JSON as your final response. Codex CLI --output-last-message records that final response at the auditor report path.
+
+Review requirements:
+- Review the child report, worker_reports, child worktree diff/changed paths, validation_results, findings, remaining_risk, assigned worker IDs, and assigned paths.
+- Verify every assigned worker id has adequate WorkerReport coverage and terminal no-delegation evidence. When there are no assigned workers, verify reviewed_worker_ids covers the child orchestrator id for the changed child diff.
+- Verify reviewed_paths covers the assigned paths and any changed paths relevant to this child scope.
+- For megafile_decomposition, verify the worker and child completion evidence names the exact target_path and is supported by the normal claim, journal, validation, and diff evidence.
+- reviewed_paths coverage is computed over repository-relative entries only. Absolute out-of-repo evidence paths are allowed and retained verbatim as evidence, but excluded from coverage computation.
+- Set role="auditor", no_further_delegation=true, read_only=true.
+- Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
+- Include reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining_risk, and next_safe_action.
+- Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
+"#,
+        tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE
+    )
+}
+
 pub(super) fn fresh_field_guide_frame_nonce(
     entries: &[DecodedFieldGuidePromptEntry],
     nonce_source: &mut dyn FnMut() -> Result<String>,
@@ -100,6 +401,23 @@ pub(super) fn child_orchestrator_prompt_with_incoming_root_and_field_guide(
     assignment_metadata: &AssignmentMetadata,
     field_guide: &SupervisorFieldGuidePrompt,
 ) -> Result<String> {
+    Ok(
+        render_child_orchestrator_prompt_with_incoming_root_and_field_guide(
+            context,
+            incoming_root,
+            assignment_metadata,
+            field_guide,
+        )?
+        .prompt,
+    )
+}
+
+pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guide(
+    context: ChildOrchestratorPromptContext<'_>,
+    incoming_root: &Path,
+    assignment_metadata: &AssignmentMetadata,
+    field_guide: &SupervisorFieldGuidePrompt,
+) -> Result<RenderedPromptWithMeasurements> {
     let ChildOrchestratorPromptContext {
         plan,
         assignment,
@@ -117,12 +435,12 @@ pub(super) fn child_orchestrator_prompt_with_incoming_root_and_field_guide(
         assignment_metadata,
     )?)
     .context("failed to serialize orchestrator assignment")?;
-    let worker_prompts = assignment
+    let worker_prompt_renders = assignment
         .worker_assignments
         .iter()
-        .map(|worker| {
+        .map(|worker| -> Result<(String, PromptByteMeasurement)> {
             let metadata = worker_assignment_metadata(assignment_metadata, assignment, worker);
-            worker_prompt_with_field_guide(
+            let rendered = worker_prompt_with_field_guide(
                 WorkerPromptRenderContext {
                     plan,
                     orchestrator: assignment,
@@ -133,9 +451,22 @@ pub(super) fn child_orchestrator_prompt_with_incoming_root_and_field_guide(
                     schema_path: worker_schema_path,
                 },
                 field_guide,
-            )
+            )?;
+            let invariant_prefix = worker_cacheable_prefix();
+            let measurement = PromptByteMeasurement::new(
+                PromptMeasurementRole::TerminalWorker,
+                &worker.id,
+                &rendered,
+                &invariant_prefix,
+                WORKER_PROMPT_FIXTURE_CEILING_BYTES,
+            )?;
+            Ok((rendered, measurement))
         })
-        .collect::<Result<Vec<_>>>()?
+        .collect::<Result<Vec<_>>>()?;
+    let worker_prompts = worker_prompt_renders
+        .iter()
+        .map(|(rendered, _)| rendered.as_str())
+        .collect::<Vec<_>>()
         .join("\n\n--- worker prompt contract ---\n\n");
     let auditor_prompt = review_auditor_prompt_with_metadata_and_field_guide(
         plan,
@@ -144,6 +475,15 @@ pub(super) fn child_orchestrator_prompt_with_incoming_root_and_field_guide(
         run_dir,
         auditor_schema_path,
         field_guide,
+    )?;
+    let auditor_prefix = review_auditor_cacheable_prefix();
+    let auditor_id = format!("{}-review-auditor", assignment.id);
+    let auditor_measurement = PromptByteMeasurement::new(
+        PromptMeasurementRole::ChildSideReviewAuditor,
+        auditor_id,
+        &auditor_prompt,
+        &auditor_prefix,
+        REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES,
     )?;
     let task = assignment_task(plan, assignment);
     let role_prefix = supervise_role_prefix(
@@ -155,14 +495,12 @@ pub(super) fn child_orchestrator_prompt_with_incoming_root_and_field_guide(
         role_model_selection(plan, AgentRole::ChildOrchestrator);
     let (worker_model, worker_reasoning_effort) = role_model_selection(plan, AgentRole::Worker);
     let consultation_section = consultation_prompt_section(consultant);
-    Ok(format!(
-        r#"{role_prefix}{field_guide_section}
-You are a child orchestrator in an opt-in local Codex CLI supervisor run.
-You are not the top supervisor. You are not alone in the repository.
-Primary worktree mutation is forbidden. Work only in this assigned child worktree:
-{worktree_path}
+    let cacheable_prefix = child_orchestrator_cacheable_prefix();
+    let prompt = format!(
+        r#"{cacheable_prefix}{role_prefix}{field_guide_section}
 
-Ownership:
+Assignment-specific context:
+- Assigned child worktree: {worktree_path}
 - Child orchestrator id: {child_id}
 - Megafile decomposition worker targets: {decomposition_targets}
 - Assigned paths: {assigned_paths}
@@ -177,50 +515,9 @@ Declared role selections:
 - Nested worker model: {worker_model}
 - Nested worker reasoning effort: {worker_reasoning_effort}
 - Worker values are declarative context for the generated worker prompts. MACO does not launch a separate worker process, so worker usage remains unavailable until runtime-side role-tagged usage reporting exists.
-
-Runtime hierarchy:
-- Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
-- You are the O1 child orchestrator for this assignment.
-- Workers, researchers, and review auditors are terminal: they must not launch further workers, delegate to another worker, or take over peer coordination.
-- You must not use native SubAgent/delegated-worker mechanisms to bind, spawn, impersonate, or take over O1 or O2 roles.
-- Durable role names are canonical. Runtime labels belong in runtime bridge metadata such as AGENT_LABEL, never in ROLE.
-- You must not spawn, impersonate, or take over a peer O2 supervisor.
-- O1 reports peer-O2 escalation candidates upward in findings and remaining_risk instead of taking them over.
-- The user-root O2 or an autonomous O2 durable queue may launch bounded peer O2 supervisors through MACO/Codex CLI subprocess orchestration. Autonomous O2-to-O2 follow-up must go through durable queue state such as NEXT_O2_TASKS.tsv, not native SubAgent.
-
-Runtime boundary:
-- MACO launched this Codex CLI with strict/ephemeral configuration, approval policy never, goals and multi-agent enabled, and the named maco_external_codex permission profile.
-- The inner permission profile grants only minimal reads plus writes in this assigned workspace root; model-generated network access, user config/rules, web search, plugins, apps, hooks, browser/computer use, and inherited shell environment are disabled.
-- An outer MACO systemd boundary separately verifies the exact workspace/artifact mounts, blocked host IPC sockets, resource limits, and empty owned cgroup before the result can be published.
-- Never launch a raw Codex subprocess or request danger-full-access. Any nested role must go through a MACO-approved runner and a least-privilege profile whose process-tree and side-effect evidence is verified.
-- If an approved nested runner/profile is unavailable, stop and report the blocked delegation instead of weakening this boundary.
-
-Required behavior:
-- First, read and follow AGENTS.md and project-local .agents instructions in this worktree. When present, specifically read .agents/skills/agent-orchestration/SKILL.md and .agents/docs/AGENT_ORCHESTRATION.md before worker delegation or mutation.
-- Use Codex native SubAgent/delegated-worker mechanisms only for lightweight terminal worker or researcher assignments when available, following AGENTS.md and .agents instructions.
-- When launching a worker, use the generated worker prompt template verbatim and preserve its six-line TERMINAL_WORKER role-prefix block with no preamble.
-- You may collect advisory child-side review-auditor evidence with the generated REVIEW_AUDITOR prompt template, but it is not an acceptance gate unless MACO/O2 collects it through the parent-enforced gate.
-- When collecting advisory child-side review-auditor evidence, preserve its six-line REVIEW_AUDITOR role-prefix block with no preamble.
-- Do not force raw Codex CLI subprocess workers as the primary worker path.
-- If no delegated-worker mechanism is available, stop before mutation and report the exact blocked worker task in your OrchestratorReviewReport findings and remaining_risk.
-- Workers must return WorkerReport JSON matching the worker report contract and include "no_further_delegation": true.
-- WorkerReport, AuditorReport, and OrchestratorReviewReport must include environment_failures. Use [] when no typed failure occurred. A nonempty environment_failures list requires accepted=false, rejected=true, and status=failed; never include credential or secret values.
-- Workers may propose bounded field_guide_entries containing finding and context only. They must never add date, source_run, or other provenance; the trusted parent stamps provenance only after acceptance and audit.
-- Each worker must also write its structured execution journal to the exact path in its worker prompt; that path is the only allowed non-source artifact write for a terminal worker. The journal is JSONL with one object per command containing command, cwd, start_timestamp, end_timestamp, and changed_paths. The parent acceptance gate imports these journals from incoming/worker-journals/ and rejects worker evidence that the journal or Git diff does not support.
-- Review auditors must return AuditorReport JSON matching the auditor report contract and include "no_further_delegation": true.
-- Review auditors must include "read_only": true in AuditorReport JSON to attest they did not mutate files or repository state.
-- Acceptance-gate review auditors are parent-launched MACO/Codex CLI subprocess roles; a child-launched review auditor is advisory child-side evidence unless MACO/O2 collects it through the parent-enforced acceptance gate.
-- Review every WorkerReport before writing your own OrchestratorReviewReport.
-- OrchestratorReviewReport may also propose bounded field_guide_entries containing finding and context only. Do not copy unreviewed or rejected worker suggestions into this field.
-- Preserve each worker assignment_kind and target_path in WorkerReport. A successful megafile_decomposition worker must report the exact canonical target_path in files_changed and include decomposition_completion with that target plus at least one concrete canonical replacement_path also present in files_changed. OrchestratorReviewReport must aggregate the exact accepted worker evidence in decomposition_completions; this evidence does not bypass claims, journals, validation, audit, or later merge gates.
-- Include at least one accepted review-auditor report in audit_reports that covers all assigned worker ids; MACO rejects child reports with worker assignments that omit terminal audit evidence.
 {consultation_section}
 
-Safety requirements:
-- Do not edit outside the assigned paths, symbols, or modules.
-- Do not mutate the primary worktree.
-- Run validation commands when feasible. If validation cannot run, explain why in validation_results and remaining_risk.
-- Return your OrchestratorReviewReport JSON as your final response.
+Collection targets:
 - Do not write the orchestrator report file yourself with tools; Codex CLI --output-last-message records your final response at this MACO collection target:
 {report_path}
 - The orchestrator review report schema path is:
@@ -242,6 +539,7 @@ Worker prompt templates:
 Review auditor prompt template:
 {auditor_prompt}
 "#,
+        cacheable_prefix = cacheable_prefix,
         role_prefix = role_prefix,
         field_guide_section = field_guide.section,
         worktree_path = worktree.path.display(),
@@ -272,7 +570,28 @@ Review auditor prompt template:
         worker_prompts = worker_prompts,
         auditor_prompt = auditor_prompt,
         consultation_section = consultation_section,
-    ))
+    );
+    let mut prompt_measurements = Vec::with_capacity(worker_prompt_renders.len() + 2);
+    prompt_measurements.push(PromptByteMeasurement::new(
+        PromptMeasurementRole::O1ChildOrchestrator,
+        &assignment.id,
+        &prompt,
+        &cacheable_prefix,
+        CHILD_ORCHESTRATOR_PROMPT_FIXTURE_CEILING_BYTES,
+    )?);
+    prompt_measurements.extend(
+        worker_prompt_renders
+            .into_iter()
+            .map(|(_, measurement)| measurement),
+    );
+    prompt_measurements.push(auditor_measurement);
+    Ok(RenderedPromptWithMeasurements {
+        prompt,
+        measurements: PromptMeasurementsArtifact::new(
+            prompt_measurements,
+            Some(WorkerPromptEmbeddingMultiplier::for_plan(plan)?),
+        ),
+    })
 }
 
 fn consultation_prompt_section(consultant: &SupervisorConsultantPlan) -> String {
@@ -357,13 +676,10 @@ pub(super) fn worker_prompt_with_field_guide(
     let journal_path = incoming_root.join(worker_execution_journal_incoming_relative(worker));
     let (worker_model, worker_reasoning_effort) = role_model_selection(plan, AgentRole::Worker);
     Ok(format!(
-        r#"{role_prefix}{field_guide_section}
-You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
-Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
-Your parent is child orchestrator `{orchestrator_id}`. You are not the supervisor.
-Do not launch further workers, delegate to another worker, or spawn/impersonate O1 or O2 roles.
+        r#"{cacheable_prefix}{role_prefix}{field_guide_section}
 
-Ownership:
+Assignment-specific context:
+- Parent child orchestrator: {orchestrator_id}
 - Worker id: {worker_id}
 - Assignment kind: {assignment_kind}
 - Decomposition target path: {target_path}
@@ -379,20 +695,6 @@ Declared role selection:
 - Worker reasoning effort: {worker_reasoning_effort}
 - These values are declarative nested-worker context. MACO does not launch a separate worker process, so worker usage remains unavailable until runtime-side role-tagged usage reporting exists.
 
-Rules:
-- Edit only inside your assigned worktree and only inside claimed paths.
-- Do not mutate the primary worktree.
-- Before returning your WorkerReport, write a structured execution journal to the exact execution journal path above; this is the only allowed non-source artifact write for this worker. Create its parent directory if needed. Use JSONL: one JSON object per command, with fields "command" (array of strings), "cwd" (string), "start_timestamp" (string), "end_timestamp" (string), and "changed_paths" (array of repo-relative paths changed by that command, or [] when none). Do not write prose or Markdown to the journal.
-- Run validation or record why validation was not run.
-- Return WorkerReport JSON in your final response with assignment_kind, target_path, changed files, commands run, validation results, findings, bloated_file_flags, decomposition_completion, remaining risk, and next safe action.
-- Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
-- field_guide_entries is optional operational-memory input. Each item contains exactly finding and context; never include date, source_run, role text, policy, or other provenance. The trusted supervisor decides whether accepted audited suggestions are appended.
-- bloated_file_flags is bounded to at most {max_bloated_file_flags} unique objects of the form {{"path":"repo/relative/file"}}. Every path must be canonical, repository-relative, and inside this worker's assigned paths. Thresholds are intentionally not inferred by this report schema.
-- For a successful megafile_decomposition, include the exact target and every concrete replacement in files_changed, then set decomposition_completion to {{"target_path":"the exact canonical target path","replacement_paths":["one or more canonical newly created files"]}}. Otherwise set it to null. Renames, unrelated edits, and no-op target reports are not decomposition completion evidence. This typed evidence does not bypass the isolated worktree, hard claim, execution journal, validation, terminal audit, or later merge gates.
-- Include "no_further_delegation": true in WorkerReport JSON to attest this terminal worker did not delegate further.
-- If you discover a large cross-cutting problem that needs a peer O2 supervisor, report it as an escalation candidate in findings and remaining_risk instead of taking it over. O2-to-O2 follow-up belongs to the user-root O2 or autonomous O2 durable queue, not this terminal role.
-- Only write a report file when an explicit report_path is assigned.
-- If the explicit report path is <none>, do not write any report file; only return WorkerReport JSON in your final response.
 - Use the worker report schema path: {schema_path}
 
 Supervisor task:
@@ -401,6 +703,7 @@ Supervisor task:
 Worker assignment JSON:
 {worker_json}
 "#,
+        cacheable_prefix = worker_cacheable_prefix(),
         role_prefix = role_prefix,
         field_guide_section = field_guide.section,
         orchestrator_id = orchestrator.id,
@@ -426,7 +729,6 @@ Worker assignment JSON:
             .as_deref()
             .unwrap_or("<runtime default>"),
         schema_path = schema_path.display(),
-        max_bloated_file_flags = MAX_BLOATED_FILE_FLAGS_PER_WORKER,
         task = task,
         worker_json = worker_json,
     ))
@@ -483,13 +785,10 @@ pub(super) fn review_auditor_prompt_with_metadata_and_field_guide(
     let role_prefix = supervise_role_prefix(SupervisePromptRole::ReviewAuditor, &auditor_id, None);
     let task = assignment_task(plan, orchestrator);
     Ok(format!(
-        r#"{role_prefix}{field_guide_section}
-You are a terminal read-only review auditor in an opt-in local Codex CLI supervised run.
-Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
-Your parent is child orchestrator `{orchestrator_id}`. You are not an O1 child orchestrator, O2 supervisor, worker, or peer coordinator.
-Do not launch further workers, delegate, mutate files, run mutating commands, or spawn/impersonate O1 or O2 roles.
+        r#"{cacheable_prefix}{role_prefix}{field_guide_section}
 
-Ownership:
+Assignment-specific context:
+- Parent child orchestrator: {orchestrator_id}
 - Review auditor id: {auditor_id}
 - Assigned worker ids to audit: {worker_ids}
 - Megafile decomposition worker targets: {decomposition_targets}
@@ -498,21 +797,12 @@ Ownership:
 - Semantic modules: {semantic_modules}
 - Run artifact root: {run_dir}
 
-Rules:
-- Stay read-only. Inspect worker reports, child diffs, validation evidence, findings, remaining risk, and claimed path boundaries.
-- For megafile_decomposition, verify the worker and child completion evidence names the exact target_path and is supported by the normal claim, journal, validation, and diff evidence.
-- Do not edit files, create durable artifacts, apply patches, claim paths, or change Git state.
-- Produce structured AuditorReport JSON in your final response with reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining risk, and next safe action.
-- Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
-- reviewed_paths coverage is computed over repository-relative entries only. Absolute out-of-repo evidence paths are allowed and retained verbatim as evidence, but excluded from coverage computation.
-- Include "no_further_delegation": true in AuditorReport JSON to attest this terminal auditor did not delegate further.
-- Include "read_only": true in AuditorReport JSON to attest this audit stayed read-only.
-- Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
 - Use the auditor report schema path: {schema_path}
 
 Supervisor task:
 {task}
 "#,
+        cacheable_prefix = review_auditor_cacheable_prefix(),
         role_prefix = role_prefix,
         field_guide_section = field_guide.section,
         orchestrator_id = orchestrator.id,
@@ -532,10 +822,18 @@ Supervisor task:
     ))
 }
 
+#[cfg(test)]
 pub(super) fn parent_review_auditor_prompt_with_field_guide(
     context: ParentReviewAuditorPromptContext<'_>,
     field_guide: &SupervisorFieldGuidePrompt,
 ) -> Result<String> {
+    Ok(render_parent_review_auditor_prompt_with_field_guide(context, field_guide)?.prompt)
+}
+
+pub(super) fn render_parent_review_auditor_prompt_with_field_guide(
+    context: ParentReviewAuditorPromptContext<'_>,
+    field_guide: &SupervisorFieldGuidePrompt,
+) -> Result<RenderedPromptWithMeasurements> {
     let ParentReviewAuditorPromptContext {
         plan,
         assignment,
@@ -570,18 +868,9 @@ pub(super) fn parent_review_auditor_prompt_with_field_guide(
     }))
     .context("failed to serialize redacted field-guide suggestion metadata")?;
     let task = assignment_task(plan, assignment);
-    Ok(format!(
-        r#"{role_prefix}{field_guide_section}
-You are the parent-launched read-only review auditor in an opt-in local Codex CLI supervised run.
-Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher, plus this parent-enforced terminal REVIEW_AUDITOR gate.
-Your parent is MACO/O2. You are not an O1 child orchestrator, worker, researcher, or peer coordinator.
-Do not launch further workers, delegate, mutate files, run mutating commands, claim paths, apply patches, or change Git state.
-
-Runtime boundary:
-- MACO launched this Codex CLI with the read-only maco_external_codex permission profile, model-generated network disabled, and strict/ephemeral configuration.
-- An outer MACO systemd boundary independently verifies the exact read-only workspace mount, writable report/log destinations, blocked host IPC sockets, resource limits, and empty owned cgroup.
-- Never request danger-full-access or launch a raw nested Codex subprocess. Stay read-only and fail closed if either verified boundary is unavailable.
-- Return AuditorReport JSON as your final response. Codex CLI --output-last-message records that final response at the auditor report path.
+    let cacheable_prefix = parent_review_auditor_cacheable_prefix();
+    let prompt = format!(
+        r#"{cacheable_prefix}{role_prefix}{field_guide_section}
 
 Evidence to review:
 - Supervisor task: {task}
@@ -597,20 +886,10 @@ Evidence to review:
 - Child-reported and supervisor-inspected changed paths: {changed_paths}
 - Field-guide suggestion metadata (raw agent-authored text deliberately omitted): {field_guide_suggestion_metadata}
 
-Review requirements:
-- Review the child report, worker_reports, child worktree diff/changed paths, validation_results, findings, remaining_risk, assigned worker IDs, and assigned paths.
-- Verify every assigned worker id has adequate WorkerReport coverage and terminal no-delegation evidence. When there are no assigned workers, verify reviewed_worker_ids covers the child orchestrator id for the changed child diff.
-- Verify reviewed_paths covers the assigned paths and any changed paths relevant to this child scope.
-- For megafile_decomposition, verify the worker and child completion evidence names the exact target_path and is supported by the normal claim, journal, validation, and diff evidence.
-- reviewed_paths coverage is computed over repository-relative entries only. Absolute out-of-repo evidence paths are allowed and retained verbatim as evidence, but excluded from coverage computation.
-- Set role="auditor", no_further_delegation=true, read_only=true.
-- Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
-- Include reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining_risk, and next_safe_action.
-- Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
-
 Child report JSON:
 {child_report_json}
 "#,
+        cacheable_prefix = cacheable_prefix,
         role_prefix = role_prefix,
         field_guide_section = field_guide.section,
         task = task,
@@ -629,7 +908,18 @@ Child report JSON:
         changed_paths = display_paths(&child_report.files_changed),
         field_guide_suggestion_metadata = field_guide_suggestion_metadata,
         child_report_json = child_report_json,
-    ))
+    );
+    let measurement = PromptByteMeasurement::new(
+        PromptMeasurementRole::ParentAcceptanceAuditor,
+        auditor_id,
+        &prompt,
+        &cacheable_prefix,
+        PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES,
+    )?;
+    Ok(RenderedPromptWithMeasurements {
+        prompt,
+        measurements: PromptMeasurementsArtifact::new(vec![measurement], None),
+    })
 }
 
 fn assignment_task<'a>(
@@ -719,4 +1009,428 @@ pub(super) fn apply_canonical_environment_requirements(
     requirements: &[EnvironmentRequirement],
 ) -> ExternalAgentCommand {
     command.with_environment_requirements(requirements.iter().cloned())
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    fn fixed_prompt_fixture() -> Result<(String, String, String, String)> {
+        fixed_prompt_fixture_with_ids("child-a", "worker-a", "src/supervise/prompts.rs")
+    }
+
+    fn fixed_prompt_fixture_with_ids(
+        child_id: &str,
+        worker_id: &str,
+        assigned_path: &str,
+    ) -> Result<(String, String, String, String)> {
+        let worker = WorkerAssignment {
+            id: worker_id.to_string(),
+            role: AgentRole::Worker,
+            assigned_paths: vec![PathBuf::from(assigned_path)],
+            semantic_symbols: vec!["worker_prompt_with_field_guide".to_string()],
+            semantic_modules: vec!["supervise::prompts".to_string()],
+            task: Some("implement the assigned prompt change".to_string()),
+            environment_requirements: Vec::new(),
+            report_path: None,
+        };
+        let assignment = OrchestratorAssignment {
+            id: child_id.to_string(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from(assigned_path)],
+            semantic_symbols: vec!["worker_prompt_with_field_guide".to_string()],
+            semantic_modules: vec!["supervise::prompts".to_string()],
+            task: Some("complete the bounded prompt-chain assignment".to_string()),
+            worker_assignments: vec![worker],
+            environment_requirements: Vec::new(),
+            notes: None,
+        };
+        let plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "fixed rendered-prompt regression fixture".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 60,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            assignments: vec![assignment.clone()],
+        };
+        let run_dir = Path::new("/tmp/maco-prompt-regression");
+        let incoming_root = run_dir.join("incoming");
+        let worker_schema_path = run_dir.join("schemas/worker-report.schema.json");
+        let auditor_schema_path = run_dir.join("schemas/auditor-report.schema.json");
+        let field_guide = SupervisorFieldGuidePrompt::empty()?;
+        let assignment_metadata = AssignmentMetadata::new();
+        let worker_metadata = WorkerAssignmentMetadata::default();
+        let worker_prompt = worker_prompt_with_field_guide(
+            WorkerPromptRenderContext {
+                plan: &plan,
+                orchestrator: &assignment,
+                worker: &assignment.worker_assignments[0],
+                metadata: &worker_metadata,
+                run_dir,
+                incoming_root: &incoming_root,
+                schema_path: &worker_schema_path,
+            },
+            &field_guide,
+        )?;
+        let auditor_prompt = review_auditor_prompt_with_metadata_and_field_guide(
+            &plan,
+            &assignment,
+            &assignment_metadata,
+            run_dir,
+            &auditor_schema_path,
+            &field_guide,
+        )?;
+        let worktree = WorktreeRecord {
+            name: assignment.id.clone(),
+            path: PathBuf::from("/tmp/maco-prompt-regression/worktree"),
+            branch: "maco/prompt-regression-child".to_string(),
+        };
+        let claim = PathClaim {
+            token: ClaimToken::from_u64(1),
+            agent_id: assignment.id.clone(),
+            paths: assignment.assigned_paths.clone(),
+        };
+        let consultant = SupervisorConsultantPlan::default();
+        let child_report_path = incoming_root.join(format!("{child_id}.json"));
+        let child_prompt = child_orchestrator_prompt_with_incoming_root_and_field_guide(
+            ChildOrchestratorPromptContext {
+                plan: &plan,
+                assignment: &assignment,
+                run_dir,
+                worktree: &worktree,
+                report_path: &child_report_path,
+                schema_path: &run_dir.join("schemas/orchestrator-review-report.schema.json"),
+                worker_schema_path: &worker_schema_path,
+                auditor_schema_path: &auditor_schema_path,
+                consultant: &consultant,
+                claim_context: ChildPromptClaimContext {
+                    claim: &claim,
+                    semantic_intent_token: None,
+                },
+            },
+            &incoming_root,
+            &assignment_metadata,
+            &field_guide,
+        )?;
+        let child_report = OrchestratorReviewReport {
+            id: assignment.id.clone(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: assignment.assigned_paths.clone(),
+            semantic_symbols: assignment.semantic_symbols.clone(),
+            semantic_modules: assignment.semantic_modules.clone(),
+            claim_token: None,
+            semantic_intent_token: None,
+            commands_run: Vec::new(),
+            environment_failures: Vec::new(),
+            files_changed: Vec::new(),
+            validation_results: Vec::new(),
+            findings: Vec::new(),
+            field_guide_entries: Vec::new(),
+            worker_reports: Vec::new(),
+            audit_reports: Vec::new(),
+            decomposition_completions: Vec::new(),
+            gate_denials: Vec::new(),
+            gate_correction_outcomes: Vec::new(),
+            accepted: true,
+            rejected: false,
+            status: ReviewStatus::Succeeded,
+            remaining_risk: "none".to_string(),
+            next_safe_action: "review".to_string(),
+        };
+        let parent_auditor_prompt = parent_review_auditor_prompt_with_field_guide(
+            ParentReviewAuditorPromptContext {
+                plan: &plan,
+                assignment: &assignment,
+                assignment_metadata: &assignment_metadata,
+                run_dir,
+                worktree_path: &worktree.path,
+                child_report_path: &child_report_path,
+                auditor_report_path: &incoming_root.join(format!("{child_id}-review-auditor.json")),
+                schema_path: &auditor_schema_path,
+                child_report: &child_report,
+            },
+            &field_guide,
+        )?;
+        Ok((
+            worker_prompt,
+            child_prompt,
+            auditor_prompt,
+            parent_auditor_prompt,
+        ))
+    }
+
+    fn enforce_fixture_ceiling(role: &str, rendered: &str, ceiling: usize) -> Result<()> {
+        if rendered.len() > ceiling {
+            bail!(
+                "rendered {role} prompt grew to {} bytes, above its declared {ceiling}-byte fixture ceiling",
+                rendered.len()
+            );
+        }
+        Ok(())
+    }
+
+    fn common_prefix_bytes(left: &str, right: &str) -> usize {
+        left.bytes()
+            .zip(right.bytes())
+            .take_while(|(left_byte, right_byte)| left_byte == right_byte)
+            .count()
+    }
+
+    #[test]
+    fn worker_embedding_multiplier_uses_all_worker_roles_in_the_run() {
+        let assignment = |id: &str, worker_count: usize| OrchestratorAssignment {
+            id: id.to_string(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: (0..worker_count)
+                .map(|index| WorkerAssignment {
+                    id: format!("{id}-worker-{index}"),
+                    role: AgentRole::Worker,
+                    assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: Vec::new(),
+                    task: None,
+                    environment_requirements: Vec::new(),
+                    report_path: None,
+                })
+                .collect(),
+            environment_requirements: Vec::new(),
+            notes: None,
+        };
+        let plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "run-wide multiplier fixture".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 2,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 60,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            assignments: vec![assignment("child-a", 1), assignment("child-b", 2)],
+        };
+
+        let multiplier =
+            WorkerPromptEmbeddingMultiplier::for_plan(&plan).expect("run-wide multiplier");
+        assert_eq!(multiplier.worker_roles_per_run, 3);
+        assert_eq!(multiplier.levels_that_embed_template, 2);
+        assert_eq!(multiplier.total_worker_template_embeddings, 6);
+    }
+
+    #[test]
+    fn rendered_role_prompts_stay_within_declared_fixture_ceilings() {
+        let (worker, child, auditor, parent_auditor) =
+            fixed_prompt_fixture().expect("render the fixed prompt fixture");
+        let measurements = [
+            (
+                "terminal worker",
+                worker.as_str(),
+                WORKER_PROMPT_FIXTURE_CEILING_BYTES,
+            ),
+            (
+                "child orchestrator",
+                child.as_str(),
+                CHILD_ORCHESTRATOR_PROMPT_FIXTURE_CEILING_BYTES,
+            ),
+            (
+                "review auditor",
+                auditor.as_str(),
+                REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES,
+            ),
+            (
+                "parent acceptance auditor",
+                parent_auditor.as_str(),
+                PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES,
+            ),
+        ];
+
+        for (role, rendered, ceiling) in measurements {
+            eprintln!(
+                "{role}: {} rendered bytes (ceiling {ceiling})",
+                rendered.len()
+            );
+            enforce_fixture_ceiling(role, rendered, ceiling)
+                .unwrap_or_else(|error| panic!("{error:#}"));
+        }
+    }
+
+    #[test]
+    fn rendered_role_prompt_ceiling_guard_rejects_growth() {
+        let oversized = "x".repeat(WORKER_PROMPT_FIXTURE_CEILING_BYTES.saturating_add(1));
+        let error = enforce_fixture_ceiling(
+            "terminal worker",
+            &oversized,
+            WORKER_PROMPT_FIXTURE_CEILING_BYTES,
+        )
+        .expect_err("one byte beyond the declared ceiling must fail");
+
+        assert!(error.to_string().contains("above its declared"));
+        assert!(error
+            .to_string()
+            .contains(&WORKER_PROMPT_FIXTURE_CEILING_BYTES.to_string()));
+    }
+
+    #[test]
+    fn rendered_role_prompts_carry_bounded_tool_call_batching_contract() {
+        let (worker, child, auditor, parent_auditor) =
+            fixed_prompt_fixture().expect("render the fixed prompt fixture");
+
+        for rendered in [&worker, &child, &auditor, &parent_auditor] {
+            assert!(rendered.contains(
+                "Batch independent, side-effect-free inspections in one tool call when the runtime supports it."
+            ));
+            assert!(rendered.contains(
+                "Keep dependent steps, approval-sensitive actions, and mutations ordered."
+            ));
+            assert!(rendered.contains(
+                "Batching never relaxes ownership, journaling, validation, or audit requirements."
+            ));
+        }
+    }
+
+    #[test]
+    fn rendered_role_prompts_share_invariant_bytes_before_role_specific_divergence() {
+        let (worker_a, child_a, auditor_a, parent_auditor_a) =
+            fixed_prompt_fixture_with_ids("child-a", "worker-a", "src/supervise/prompts-a.rs")
+                .expect("render prompt fixture a");
+        let (worker_b, child_b, auditor_b, parent_auditor_b) =
+            fixed_prompt_fixture_with_ids("child-b", "worker-b", "src/supervise/prompts-b.rs")
+                .expect("render prompt fixture b");
+        let worker_prefix = worker_cacheable_prefix();
+        let child_prefix = child_orchestrator_cacheable_prefix();
+        let auditor_prefix = review_auditor_cacheable_prefix();
+        let parent_auditor_prefix = parent_review_auditor_cacheable_prefix();
+        let comparisons = [
+            (
+                "terminal worker",
+                worker_a.as_str(),
+                worker_b.as_str(),
+                worker_prefix.as_str(),
+            ),
+            (
+                "child orchestrator",
+                child_a.as_str(),
+                child_b.as_str(),
+                child_prefix.as_str(),
+            ),
+            (
+                "review auditor",
+                auditor_a.as_str(),
+                auditor_b.as_str(),
+                auditor_prefix.as_str(),
+            ),
+            (
+                "parent acceptance auditor",
+                parent_auditor_a.as_str(),
+                parent_auditor_b.as_str(),
+                parent_auditor_prefix.as_str(),
+            ),
+        ];
+
+        for (role, rendered_a, rendered_b, invariant_prefix) in comparisons {
+            assert!(rendered_a.starts_with(invariant_prefix));
+            assert!(rendered_b.starts_with(invariant_prefix));
+            assert_eq!(
+                &rendered_a.as_bytes()[..invariant_prefix.len()],
+                &rendered_b.as_bytes()[..invariant_prefix.len()]
+            );
+            let divergence = common_prefix_bytes(rendered_a, rendered_b);
+            assert!(
+                divergence >= invariant_prefix.len(),
+                "{role} diverged before its invariant prefix ended"
+            );
+            assert!(
+                divergence < rendered_a.len() && divergence < rendered_b.len(),
+                "{role} fixtures never diverged"
+            );
+            assert_ne!(
+                rendered_a.as_bytes()[divergence],
+                rendered_b.as_bytes()[divergence]
+            );
+            eprintln!(
+                "{role}: {} invariant bytes, first fixture divergence at byte {divergence}",
+                invariant_prefix.len()
+            );
+        }
+
+        let worker_role_offset = worker_a
+            .find("ROLE: TERMINAL_WORKER\n")
+            .expect("worker role metadata block");
+        assert_eq!(worker_role_offset, worker_prefix.len());
+        let worker_field_guide_offset = worker_a
+            .find(FIELD_GUIDE_SECTION_NOTICE)
+            .expect("worker field-guide notice");
+        assert_eq!(
+            worker_field_guide_offset,
+            worker_role_offset
+                + supervise_role_prefix(SupervisePromptRole::TerminalWorker, "worker-a", None)
+                    .len()
+        );
+        assert!(worker_a
+            .find("Assignment-specific context:")
+            .is_some_and(|offset| offset > worker_field_guide_offset));
+
+        let child_role_prefix =
+            supervise_role_prefix(SupervisePromptRole::O1ChildOrchestrator, "child-a", None);
+        let child_role_offset = child_a
+            .find("ROLE: O1_CHILD_ORCHESTRATOR\n")
+            .expect("child role metadata block");
+        assert_eq!(child_role_offset, child_prefix.len());
+        let child_field_guide_offset = child_a
+            .find(FIELD_GUIDE_SECTION_NOTICE)
+            .expect("child field-guide notice");
+        assert_eq!(
+            child_field_guide_offset,
+            child_role_offset + child_role_prefix.len()
+        );
+        assert!(child_a.starts_with(&format!(
+            "{child_prefix}{child_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n"
+        )));
+
+        let child_auditor_id = "child-a-review-auditor";
+        let child_auditor_role_prefix =
+            supervise_role_prefix(SupervisePromptRole::ReviewAuditor, child_auditor_id, None);
+        let child_auditor_role_offset = auditor_a
+            .find("ROLE: REVIEW_AUDITOR\n")
+            .expect("child-side auditor role metadata block");
+        assert_eq!(child_auditor_role_offset, auditor_prefix.len());
+        let child_auditor_field_guide_offset = auditor_a
+            .find(FIELD_GUIDE_SECTION_NOTICE)
+            .expect("child-side auditor field-guide notice");
+        assert_eq!(
+            child_auditor_field_guide_offset,
+            child_auditor_role_offset + child_auditor_role_prefix.len()
+        );
+        assert!(auditor_a.starts_with(&format!(
+            "{auditor_prefix}{child_auditor_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n"
+        )));
+
+        let parent_auditor_role_prefix =
+            supervise_role_prefix(SupervisePromptRole::ReviewAuditor, child_auditor_id, None);
+        let parent_auditor_role_offset = parent_auditor_a
+            .find("ROLE: REVIEW_AUDITOR\n")
+            .expect("parent auditor role metadata block");
+        assert_eq!(parent_auditor_role_offset, parent_auditor_prefix.len());
+        let parent_auditor_field_guide_offset = parent_auditor_a
+            .find(FIELD_GUIDE_SECTION_NOTICE)
+            .expect("parent auditor field-guide notice");
+        assert_eq!(
+            parent_auditor_field_guide_offset,
+            parent_auditor_role_offset + parent_auditor_role_prefix.len()
+        );
+        assert!(parent_auditor_a.starts_with(&format!(
+            "{parent_auditor_prefix}{parent_auditor_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n"
+        )));
+    }
 }

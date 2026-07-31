@@ -151,8 +151,7 @@ fn supervise_field_guide_cap_reduces_oversized_input_and_rejects_noncanonical_re
 }
 
 #[test]
-fn o1_worker_and_auditor_production_prompts_inject_the_same_readable_nonce_frame_after_their_role_prefix(
-) {
+fn o1_worker_and_auditor_production_prompts_place_the_nonce_frame_after_role_metadata() {
     let guide_finding = "shared prompt observation";
     let guide_context = "shared prompt context";
     let rendered = format!(
@@ -202,7 +201,8 @@ fn o1_worker_and_auditor_production_prompts_inject_the_same_readable_nonce_frame
         None,
     );
     assert!(child_prompt.starts_with(&format!(
-        "{child_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n"
+        "{}{child_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n",
+        child_orchestrator_cacheable_prefix()
     )));
     assert_eq!(child_prompt.matches(FIELD_GUIDE_SECTION_NOTICE).count(), 3);
     assert_eq!(child_prompt.matches(guide_finding).count(), 3);
@@ -225,7 +225,8 @@ fn o1_worker_and_auditor_production_prompts_inject_the_same_readable_nonce_frame
     let worker_role_prefix =
         supervise_role_prefix(SupervisePromptRole::TerminalWorker, &worker.id, None);
     assert!(worker_prompt.starts_with(&format!(
-        "{worker_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n"
+        "{}{worker_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n",
+        worker_cacheable_prefix()
     )));
     assert_eq!(worker_prompt.matches(guide_finding).count(), 1);
     assert_eq!(worker_prompt.matches(guide_context).count(), 1);
@@ -244,7 +245,8 @@ fn o1_worker_and_auditor_production_prompts_inject_the_same_readable_nonce_frame
     let auditor_role_prefix =
         supervise_role_prefix(SupervisePromptRole::ReviewAuditor, &auditor_id, None);
     assert!(child_auditor_prompt.starts_with(&format!(
-        "{auditor_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n"
+        "{}{auditor_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n",
+        review_auditor_cacheable_prefix()
     )));
     assert_eq!(child_auditor_prompt.matches(guide_finding).count(), 1);
     assert_eq!(child_auditor_prompt.matches(guide_context).count(), 1);
@@ -267,7 +269,8 @@ fn o1_worker_and_auditor_production_prompts_inject_the_same_readable_nonce_frame
     )
     .expect("render parent auditor prompt");
     assert!(parent_auditor_prompt.starts_with(&format!(
-        "{auditor_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n"
+        "{}{auditor_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n",
+        parent_review_auditor_cacheable_prefix()
     )));
     assert_eq!(parent_auditor_prompt.matches(guide_finding).count(), 1);
     assert_eq!(parent_auditor_prompt.matches(guide_context).count(), 1);
