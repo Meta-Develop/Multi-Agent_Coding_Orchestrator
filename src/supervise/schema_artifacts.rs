@@ -48,10 +48,50 @@ pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
                 "items": gate_correction_outcome_schema_value()
             },
             "run_budget": run_budget_report_schema_value(),
+            "review_lens_usage": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["lens_id", "backend_id", "model", "observation"],
+                    "properties": {
+                        "lens_id": {"type": "string"},
+                        "backend_id": {"type": "string"},
+                        "model": {"type": "string"},
+                        "usage": usage_schema_value(),
+                        "cost_usd": {"type": "number", "minimum": 0},
+                        "observation": {
+                            "type": "string",
+                            "enum": [
+                                "process_observed",
+                                "supervisor_aggregate",
+                                "not_process_observable",
+                                "synthetic_fake"
+                            ]
+                        },
+                        "unavailable_reason": {"type": "string"}
+                    }
+                }
+            },
+            "review_lens_total_usage": usage_schema_value(),
+            "review_lens_total_cost_usd": {"type": "number", "minimum": 0},
             "environment_failures": {
                 "type": "array",
                 "items": environment_failure_schema_value()
             }
+        }
+    })
+}
+
+fn usage_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["input_tokens", "output_tokens", "total_tokens"],
+        "properties": {
+            "input_tokens": {"type": "integer", "minimum": 0},
+            "output_tokens": {"type": "integer", "minimum": 0},
+            "total_tokens": {"type": "integer", "minimum": 0}
         }
     })
 }

@@ -187,6 +187,9 @@ pub struct ExternalAgentCommand {
     /// Optional model for the primary Codex process. Absence deliberately leaves model selection
     /// to the same runtime defaults used before this field existed.
     pub model: Option<String>,
+    /// Optional Codex model-provider id. When present it is passed as strict runtime configuration
+    /// and never silently replaced with the runtime default.
+    pub model_provider: Option<String>,
     /// Optional reasoning effort for the primary Codex process.
     pub reasoning_effort: Option<String>,
     /// Optional lifecycle identity for the long-running provider process. `registry_repo` is the
@@ -572,6 +575,7 @@ impl ExternalAgentCommand {
             workspace_access: WorkspaceAccess::ReadWrite,
             hidden_roots: Vec::new(),
             model: None,
+            model_provider: None,
             reasoning_effort: None,
             agent_lifecycle: None,
             worktree_control_exceptions: Vec::new(),
@@ -600,6 +604,7 @@ impl ExternalAgentCommand {
             workspace_access: WorkspaceAccess::ReadOnly,
             hidden_roots: Vec::new(),
             model: None,
+            model_provider: None,
             reasoning_effort: None,
             agent_lifecycle: None,
             worktree_control_exceptions: Vec::new(),
@@ -628,6 +633,7 @@ impl ExternalAgentCommand {
             workspace_access: WorkspaceAccess::ReadOnly,
             hidden_roots: Vec::new(),
             model: None,
+            model_provider: None,
             reasoning_effort: None,
             agent_lifecycle: None,
             worktree_control_exceptions: Vec::new(),
@@ -653,6 +659,11 @@ impl ExternalAgentCommand {
     ) -> Self {
         self.model = model;
         self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    pub fn with_model_provider(mut self, model_provider: Option<String>) -> Self {
+        self.model_provider = model_provider;
         self
     }
 
@@ -5767,6 +5778,13 @@ fn codex_hardened_argv(
         argv.push(OsString::from("-m"));
         argv.push(OsString::from(model));
     }
+    if let Some(model_provider) = &spec.model_provider {
+        argv.push(OsString::from("-c"));
+        argv.push(OsString::from(format!(
+            "model_provider={}",
+            toml_basic_string(model_provider)
+        )));
+    }
     if let Some(reasoning_effort) = &spec.reasoning_effort {
         argv.push(OsString::from("-c"));
         argv.push(OsString::from(format!(
@@ -5829,6 +5847,13 @@ fn codex_app_server_argv(
         argv.push(OsString::from(format!(
             "model={}",
             toml_basic_string(model)
+        )));
+    }
+    if let Some(model_provider) = &spec.model_provider {
+        argv.push(OsString::from("-c"));
+        argv.push(OsString::from(format!(
+            "model_provider={}",
+            toml_basic_string(model_provider)
         )));
     }
     if let Some(reasoning_effort) = &spec.reasoning_effort {

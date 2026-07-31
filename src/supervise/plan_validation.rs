@@ -173,6 +173,24 @@ pub(super) fn validate_supervisor_plan(
     if plan.assignments.is_empty() {
         bail!("supervisor plan must include at least one orchestrator assignment");
     }
+    validate_review_lens_set(&plan.review_lenses)
+        .context("supervisor review_lenses are invalid")?;
+    if plan
+        .review_lenses
+        .iter()
+        .any(|lens| matches!(lens.backend, ReviewLensBackendConfig::Precomputed { .. }))
+    {
+        bail!("supervisor review_lenses must be executable model-backed lenses");
+    }
+    if let ReviewAggregationPolicy::ValidatedQuorum { minimum_accepts } =
+        plan.review_aggregation_policy
+    {
+        if minimum_accepts == 0 || minimum_accepts > plan.review_lenses.len() {
+            bail!(
+                "supervisor review_lenses validated quorum must be between 1 and the configured lens count"
+            );
+        }
+    }
     for (role, selection) in &mut plan.role_models {
         selection.model = normalize_optional_model_field(
             selection.model.take(),

@@ -830,6 +830,7 @@ pub(super) fn parent_review_auditor_prompt_with_field_guide(
     Ok(render_parent_review_auditor_prompt_with_field_guide(context, field_guide)?.prompt)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn render_parent_review_auditor_prompt_with_field_guide(
     context: ParentReviewAuditorPromptContext<'_>,
     field_guide: &SupervisorFieldGuidePrompt,
@@ -909,6 +910,69 @@ Child report JSON:
         field_guide_suggestion_metadata = field_guide_suggestion_metadata,
         child_report_json = child_report_json,
     );
+    let measurement = PromptByteMeasurement::new(
+        PromptMeasurementRole::ParentAcceptanceAuditor,
+        auditor_id,
+        &prompt,
+        &cacheable_prefix,
+        PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES,
+    )?;
+    Ok(RenderedPromptWithMeasurements {
+        prompt,
+        measurements: PromptMeasurementsArtifact::new(vec![measurement], None),
+    })
+}
+
+pub(super) fn render_review_lens_auditor_prompt(
+    context: ReviewLensAuditorPromptContext<'_>,
+    lens_index: usize,
+) -> Result<RenderedPromptWithMeasurements> {
+    let ReviewLensAuditorPromptContext {
+        assignment,
+        lens,
+        request,
+        required_coverage,
+    } = context;
+    let auditor_id = review_lens_auditor_id(assignment, lens_index);
+    let cacheable_prefix = parent_review_auditor_cacheable_prefix();
+    let role_prefix = supervise_role_prefix(SupervisePromptRole::ReviewAuditor, &auditor_id, None);
+    let request_json = serde_json::to_string(request)
+        .context("failed to serialize the parent-built review lens request")?;
+    let coverage_json = serde_json::to_string(required_coverage)
+        .context("failed to serialize supervisor-derived review coverage")?;
+    let prompt = format!(
+        r#"{cacheable_prefix}{role_prefix}
+
+Review-lens execution contract:
+- Lens id: {lens_id}
+- Backend id: {backend_id}
+- Model: {model}
+- Reasoning effort: {reasoning_effort}
+- Treat REVIEW_LENS_REQUEST_JSON as the complete review-information boundary.
+- Do not attempt to discover omitted child information, repository state, worktree state, artifacts, or ambient files.
+- Report reviewed_worker_ids and reviewed_paths for every entry in REQUIRED_COVERAGE_JSON.
+- Return only an AuditorReport JSON matching the runtime-supplied output schema.
+
+REQUIRED_COVERAGE_JSON:
+{coverage_json}
+
+REVIEW_LENS_REQUEST_JSON:
+{request_json}
+"#,
+        lens_id = lens.id,
+        backend_id = lens.backend.backend_id(),
+        model = lens.backend.model(),
+        reasoning_effort = lens
+            .backend
+            .reasoning_effort()
+            .unwrap_or("<runtime-default>"),
+    );
+    if prompt.len() > MAX_SUPERVISOR_PROMPT_BYTES {
+        bail!(
+            "review lens prompt exceeds its {} byte launch limit",
+            MAX_SUPERVISOR_PROMPT_BYTES
+        );
+    }
     let measurement = PromptByteMeasurement::new(
         PromptMeasurementRole::ParentAcceptanceAuditor,
         auditor_id,
@@ -1004,6 +1068,52 @@ pub(super) fn apply_role_model_selection(
     Ok(command.with_model_selection(selection.model, selection.reasoning_effort))
 }
 
+pub(super) fn apply_review_lens_model_selection(
+    command: ExternalAgentCommand,
+    lens: &ReviewLensConfig,
+    runtime: SupervisorRuntime,
+    catalog: &RuntimeModelCatalog,
+) -> Result<ExternalAgentCommand> {
+    let ReviewLensBackendConfig::Model {
+        backend_id,
+        model,
+        reasoning_effort,
+        ..
+    } = &lens.backend
+    else {
+        bail!("precomputed review lenses cannot be dispatched as model processes");
+    };
+    validate_review_lens_runtime_selection(lens, runtime, catalog)?;
+    if runtime == SupervisorRuntime::Fake {
+        return Ok(command
+            .with_model_provider(None)
+            .with_model_selection(None, None));
+    }
+    Ok(command
+        .with_model_provider(Some(backend_id.clone()))
+        .with_model_selection(Some(model.clone()), reasoning_effort.clone()))
+}
+
+pub(super) fn validate_review_lens_runtime_selection(
+    lens: &ReviewLensConfig,
+    runtime: SupervisorRuntime,
+    catalog: &RuntimeModelCatalog,
+) -> Result<()> {
+    let ReviewLensBackendConfig::Model { model, .. } = &lens.backend else {
+        bail!("precomputed review lenses cannot be dispatched as model processes");
+    };
+    if runtime != SupervisorRuntime::Fake
+        && catalog.availability(Some(model), runtime)? != RoleModelAvailability::Available
+    {
+        bail!(
+            "configured model '{}' for review lens '{}' is unavailable; lens dispatch fails closed",
+            model,
+            lens.id
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn apply_canonical_environment_requirements(
     command: ExternalAgentCommand,
     requirements: &[EnvironmentRequirement],
@@ -1057,6 +1167,8 @@ mod regression_tests {
             semantic_coordination: SemanticCoordinationMode::Off,
             role_models: BTreeMap::new(),
             model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: vec![assignment.clone()],
         };
         let run_dir = Path::new("/tmp/maco-prompt-regression");
@@ -1134,6 +1246,7 @@ mod regression_tests {
             field_guide_entries: Vec::new(),
             worker_reports: Vec::new(),
             audit_reports: Vec::new(),
+            review_lens_aggregate: None,
             decomposition_completions: Vec::new(),
             gate_denials: Vec::new(),
             gate_correction_outcomes: Vec::new(),
@@ -1218,6 +1331,8 @@ mod regression_tests {
             semantic_coordination: SemanticCoordinationMode::Off,
             role_models: BTreeMap::new(),
             model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: vec![assignment("child-a", 1), assignment("child-b", 2)],
         };
 
@@ -1432,5 +1547,156 @@ mod regression_tests {
         assert!(parent_auditor_a.starts_with(&format!(
             "{parent_auditor_prefix}{parent_auditor_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n"
         )));
+    }
+
+    #[test]
+    fn review_lens_dispatch_preserves_distinct_runtime_selection_and_scope() -> Result<()> {
+        let assignment = OrchestratorAssignment {
+            id: "child-decorrelated".to_string(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("src/review.rs")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: Some("review the bounded change".to_string()),
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            notes: None,
+        };
+        let diff_lens = ReviewLensConfig {
+            id: "diff-security".to_string(),
+            backend: ReviewLensBackendConfig::Model {
+                backend_id: "provider-alpha".to_string(),
+                model: "model-alpha".to_string(),
+                reasoning_effort: Some("high".to_string()),
+                reviewer: ReviewerConfig::default(),
+            },
+            information_scope: ReviewInformationScope::DiffOnly,
+        };
+        let report_lens = ReviewLensConfig {
+            id: "report-consistency".to_string(),
+            backend: ReviewLensBackendConfig::Model {
+                backend_id: "provider-beta".to_string(),
+                model: "model-beta".to_string(),
+                reasoning_effort: Some("xhigh".to_string()),
+                reviewer: ReviewerConfig::default(),
+            },
+            information_scope: ReviewInformationScope::OutputReportOnly,
+        };
+        let sources = ReviewLensRequestSources {
+            child_transcript: "TRANSCRIPT_MUST_NOT_CROSS_NARROW_LENSES",
+            diff: "DIFF_VISIBLE_ONLY_TO_DIFF_LENS",
+            output_report: "REPORT_VISIBLE_ONLY_TO_REPORT_LENS",
+        };
+        let diff_request = build_review_lens_request(&diff_lens, sources)?;
+        let report_request = build_review_lens_request(&report_lens, sources)?;
+        let coverage = ReviewCoverageRequirement {
+            worker_ids: vec!["worker-a".to_string()],
+            paths: vec![PathBuf::from("src/review.rs")],
+        };
+        let diff_prompt = render_review_lens_auditor_prompt(
+            ReviewLensAuditorPromptContext {
+                assignment: &assignment,
+                lens: &diff_lens,
+                request: &diff_request,
+                required_coverage: &coverage,
+            },
+            0,
+        )?
+        .prompt;
+        let report_prompt = render_review_lens_auditor_prompt(
+            ReviewLensAuditorPromptContext {
+                assignment: &assignment,
+                lens: &report_lens,
+                request: &report_request,
+                required_coverage: &coverage,
+            },
+            1,
+        )?
+        .prompt;
+        assert!(diff_prompt.contains("DIFF_VISIBLE_ONLY_TO_DIFF_LENS"));
+        assert!(!diff_prompt.contains("REPORT_VISIBLE_ONLY_TO_REPORT_LENS"));
+        assert!(!diff_prompt.contains("TRANSCRIPT_MUST_NOT_CROSS_NARROW_LENSES"));
+        assert!(report_prompt.contains("REPORT_VISIBLE_ONLY_TO_REPORT_LENS"));
+        assert!(!report_prompt.contains("DIFF_VISIBLE_ONLY_TO_DIFF_LENS"));
+        assert!(!report_prompt.contains("TRANSCRIPT_MUST_NOT_CROSS_NARROW_LENSES"));
+
+        let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([
+            "model-alpha",
+            "model-beta",
+        ])?);
+        let primary = tempfile::tempdir()?;
+        let child_worktree = tempfile::tempdir()?;
+        let make_command = |lens: &ReviewLensConfig, prompt_name: &str| -> Result<_> {
+            let workspace = create_review_lens_scope_workspace()?;
+            let command = ExternalAgentCommand::codex(
+                "codex",
+                workspace.path(),
+                Path::new(prompt_name),
+                Path::new("/tmp/review-lens-test.jsonl"),
+                Path::new("/tmp/review-lens-test.json"),
+                Duration::from_secs(30),
+            );
+            let command = apply_review_lens_model_selection(
+                command,
+                lens,
+                SupervisorRuntime::Codex,
+                &catalog,
+            )?;
+            let command = configure_read_only_auditor_command(command)?
+                .with_hidden_root(primary.path())
+                .with_hidden_root(child_worktree.path());
+            Ok((workspace, command))
+        };
+        let (diff_workspace, diff_command) = make_command(&diff_lens, "diff-prompt.md")?;
+        let (report_workspace, report_command) = make_command(&report_lens, "report-prompt.md")?;
+        assert_ne!(diff_workspace.path(), report_workspace.path());
+        assert_eq!(diff_command.cwd, diff_workspace.path());
+        assert_eq!(report_command.cwd, report_workspace.path());
+        assert_eq!(
+            diff_command.hidden_roots,
+            vec![
+                primary.path().to_path_buf(),
+                child_worktree.path().to_path_buf()
+            ]
+        );
+        assert_eq!(
+            diff_command.model_provider.as_deref(),
+            Some("provider-alpha")
+        );
+        assert_eq!(diff_command.model.as_deref(), Some("model-alpha"));
+        assert_eq!(diff_command.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            report_command.model_provider.as_deref(),
+            Some("provider-beta")
+        );
+        assert_eq!(report_command.model.as_deref(), Some("model-beta"));
+        assert_eq!(report_command.reasoning_effort.as_deref(), Some("xhigh"));
+        let diff_argv = crate::external_agent::command_argv(&diff_command)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let report_argv = crate::external_agent::command_argv(&report_command)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(diff_argv
+            .windows(2)
+            .any(|pair| pair == ["-m", "model-alpha"]));
+        assert!(diff_argv
+            .iter()
+            .any(|argument| argument == "model_provider=\"provider-alpha\""));
+        assert!(diff_argv
+            .iter()
+            .any(|argument| argument == "model_reasoning_effort=\"high\""));
+        assert!(report_argv
+            .windows(2)
+            .any(|pair| pair == ["-m", "model-beta"]));
+        assert!(report_argv
+            .iter()
+            .any(|argument| argument == "model_provider=\"provider-beta\""));
+        assert!(report_argv
+            .iter()
+            .any(|argument| argument == "model_reasoning_effort=\"xhigh\""));
+        Ok(())
     }
 }

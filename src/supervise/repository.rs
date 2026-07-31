@@ -219,6 +219,62 @@ pub(super) fn collect_paths_changed_since_base(
     Ok(paths.into_iter().collect())
 }
 
+pub(super) fn collect_diff_since_base(
+    worktree_path: &Path,
+    base_oid: &Oid,
+    max_bytes: usize,
+) -> Result<String> {
+    let repo = Repository::open(worktree_path)
+        .with_context(|| format!("failed to open child worktree {}", worktree_path.display()))?;
+    let base_commit = repo
+        .find_commit(*base_oid)
+        .with_context(|| format!("failed to find child base commit {base_oid}"))?;
+    let base_tree = base_commit
+        .tree()
+        .with_context(|| format!("failed to read tree for child base commit {base_oid}"))?;
+    let mut options = DiffOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true)
+        .include_typechange(true);
+    let mut diff = repo
+        .diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut options))
+        .context("failed to diff child worktree against child base commit")?;
+    let mut find_options = DiffFindOptions::new();
+    find_options.renames(true);
+    diff.find_similar(Some(&mut find_options))
+        .context("failed to detect renamed child worktree paths")?;
+    let mut bytes = Vec::new();
+    let mut exceeded = false;
+    let print_result = diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+        let origin = line.origin();
+        let origin_len = usize::from(matches!(origin, ' ' | '+' | '-'));
+        let Some(next_len) = bytes
+            .len()
+            .checked_add(origin_len)
+            .and_then(|length| length.checked_add(line.content().len()))
+        else {
+            exceeded = true;
+            return false;
+        };
+        if next_len > max_bytes {
+            exceeded = true;
+            return false;
+        }
+        if origin_len == 1 {
+            bytes.push(origin as u8);
+        }
+        bytes.extend_from_slice(line.content());
+        true
+    });
+    if exceeded {
+        bail!("child diff exceeds its {max_bytes} byte review-lens input limit");
+    }
+    print_result.context("failed to render child worktree diff")?;
+    String::from_utf8(bytes).context("child worktree diff is not valid UTF-8")
+}
+
 fn collect_delta_paths(delta: git2::DiffDelta<'_>, paths: &mut BTreeSet<PathBuf>) {
     match delta.status() {
         Delta::Deleted => insert_delta_path(delta.old_file().path(), paths),

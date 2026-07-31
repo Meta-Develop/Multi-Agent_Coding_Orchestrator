@@ -676,6 +676,9 @@ struct SupervisorFinalReportConstruction<'context> {
     success: bool,
     run_budget_report: Option<RunBudgetReport>,
     role_usage: BTreeMap<AgentRole, RoleUsageReport>,
+    review_lens_usage: Vec<ReviewLensUsageReport>,
+    review_lens_total_usage: Option<Usage>,
+    review_lens_total_cost_usd: Option<f64>,
     total_usage: Option<Usage>,
     total_cost_usd: Option<f64>,
     usage_complete: bool,
@@ -713,6 +716,9 @@ fn build_supervisor_final_report(
         success,
         run_budget_report,
         role_usage,
+        review_lens_usage,
+        review_lens_total_usage,
+        review_lens_total_cost_usd,
         total_usage,
         total_cost_usd,
         usage_complete,
@@ -786,6 +792,9 @@ fn build_supervisor_final_report(
         ),
         run_budget: run_budget_report,
         role_usage,
+        review_lens_usage,
+        review_lens_total_usage,
+        review_lens_total_cost_usd,
         total_usage,
         total_cost_usd,
         usage_complete,
@@ -1488,11 +1497,17 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     let usage_complete = !collected.usage_incomplete;
     let RoleUsageAggregation {
         reports: mut role_usage,
+        lens_reports: review_lens_usage,
         total_usage,
         total_cost_usd: observed_total_cost_usd,
+        lens_total_usage: review_lens_total_usage,
+        lens_total_cost_usd: observed_review_lens_total_cost_usd,
     } = role_usage_report(&plan, std::mem::take(&mut collected.usage_samples))?;
     let total_cost_usd =
         finalize_supervisor_cost(usage_complete, &mut role_usage, observed_total_cost_usd);
+    let review_lens_total_cost_usd = usage_complete
+        .then_some(observed_review_lens_total_cost_usd)
+        .flatten();
     let bloated_file_flags = accepted_bloated_file_flags(&collected.orchestrator_reports);
     let decomposition_candidates =
         accepted_decomposition_candidates(&collected.orchestrator_reports);
@@ -1517,6 +1532,9 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         success,
         run_budget_report,
         role_usage,
+        review_lens_usage,
+        review_lens_total_usage,
+        review_lens_total_cost_usd,
         total_usage,
         total_cost_usd,
         usage_complete,
@@ -1578,6 +1596,8 @@ mod decomposition_tests {
             semantic_coordination: SemanticCoordinationMode::Off,
             role_models: BTreeMap::new(),
             model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments,
         }
     }
@@ -1791,6 +1811,9 @@ mod decomposition_tests {
             success: true,
             run_budget_report: None,
             role_usage: BTreeMap::new(),
+            review_lens_usage: Vec::new(),
+            review_lens_total_usage: None,
+            review_lens_total_cost_usd: None,
             total_usage: None,
             total_cost_usd: None,
             usage_complete: true,

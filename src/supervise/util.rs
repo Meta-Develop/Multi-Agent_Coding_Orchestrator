@@ -126,6 +126,13 @@ pub(super) fn parent_auditor_id(assignment: &OrchestratorAssignment) -> String {
     format!("{}-review-auditor", assignment.id)
 }
 
+pub(super) fn review_lens_auditor_id(
+    assignment: &OrchestratorAssignment,
+    lens_index: usize,
+) -> String {
+    format!("{}-review-auditor-lens-{lens_index}", assignment.id)
+}
+
 pub(super) fn path_is_covered_by_claim(path: &Path, claim: &Path) -> bool {
     path == claim || path.starts_with(claim)
 }

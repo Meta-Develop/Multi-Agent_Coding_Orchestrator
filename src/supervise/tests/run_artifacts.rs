@@ -1009,6 +1009,8 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
+        review_lenses: default_supervisor_review_lenses(),
+        review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
             id: assignment_id.to_string(),
             role: AgentRole::ChildOrchestrator,
@@ -1079,6 +1081,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
             next_safe_action: "review".to_string(),
         }],
         audit_reports: Vec::new(),
+        review_lens_aggregate: None,
         decomposition_completions: Vec::new(),
         gate_denials: Vec::new(),
         gate_correction_outcomes: Vec::new(),

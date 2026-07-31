@@ -32,7 +32,8 @@ use std::os::unix::{
 const REVIEW_OUTPUT_LIMIT: usize = 8 * 1024;
 const REVIEW_CAPTURE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const REVIEW_JSON_LIMIT_BYTES: usize = 256 * 1024;
-const REVIEW_INPUT_LIMIT_BYTES: usize = 256 * 1024;
+pub const REVIEW_LENS_REQUEST_LIMIT_BYTES: usize = 256 * 1024;
+const REVIEW_INPUT_LIMIT_BYTES: usize = REVIEW_LENS_REQUEST_LIMIT_BYTES;
 const REVIEW_CONFIG_LIMIT_BYTES: usize = 64 * 1024;
 const REVIEW_COMMAND_LIMIT_BYTES: usize = 16 * 1024;
 const REVIEW_ARG_LIMIT: usize = 128;
@@ -6590,6 +6591,59 @@ mod tests {
             aggregate.lens_verdicts[2].effective_verdict,
             ReviewLensVerdictStatus::Reject
         );
+        Ok(())
+    }
+
+    #[test]
+    fn review_lens_validated_quorum_does_not_waive_all_worker_coverage() -> Result<()> {
+        let lenses = vec![
+            model_review_lens(
+                "lens-a",
+                "backend-a",
+                "model-a",
+                ReviewInformationScope::DiffOnly,
+            ),
+            model_review_lens(
+                "lens-b",
+                "backend-b",
+                "model-b",
+                ReviewInformationScope::OutputReportOnly,
+            ),
+            model_review_lens(
+                "lens-c",
+                "backend-c",
+                "model-c",
+                ReviewInformationScope::DiffOnly,
+            ),
+        ];
+        let aggregate = aggregate_review_lenses(
+            &lenses,
+            ReviewAggregationPolicy::ValidatedQuorum { minimum_accepts: 2 },
+            ReviewCoverageRequirement {
+                worker_ids: vec!["worker-a".to_string(), "worker-b".to_string()],
+                paths: vec![
+                    PathBuf::from("src/review.rs"),
+                    PathBuf::from("src/supervise.rs"),
+                ],
+            },
+            vec![
+                bound_lens_verdict(&lenses[0], ReviewLensVerdictStatus::Accept, "binding-a"),
+                bound_lens_verdict(&lenses[1], ReviewLensVerdictStatus::Accept, "binding-b"),
+                bound_lens_verdict(&lenses[2], ReviewLensVerdictStatus::Reject, "binding-c"),
+            ],
+        )?;
+
+        assert_eq!(
+            aggregate.decision,
+            ReviewAggregationDecision::ProceduralFailure
+        );
+        assert_eq!(aggregate.validated_accepts, 0);
+        assert_eq!(aggregate.procedural_failures, 2);
+        for verdict in &aggregate.lens_verdicts[..2] {
+            let errors = verdict.validation_errors.join("\n");
+            assert!(errors.contains("worker-b"));
+            assert!(errors.contains("src/supervise.rs"));
+        }
         Ok(())
     }
 

@@ -360,6 +360,8 @@ fn injected_multi_plan(
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
+        review_lenses: default_supervisor_review_lenses(),
+        review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments,
     }
 }
@@ -400,6 +402,8 @@ fn injected_plan(assignment: OrchestratorAssignment, max_child_retries: u8) -> S
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
+        review_lenses: default_supervisor_review_lenses(),
+        review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![assignment],
     }
 }
@@ -489,6 +493,9 @@ fn artifact_test_final_report(run_id: &RunId) -> SupervisorFinalReport {
         role_economics_profile: None,
         run_budget: None,
         role_usage: BTreeMap::new(),
+        review_lens_usage: Vec::new(),
+        review_lens_total_usage: None,
+        review_lens_total_cost_usd: None,
         total_usage: None,
         total_cost_usd: None,
         usage_complete: false,
@@ -572,6 +579,7 @@ fn injected_child_report(assignment: &OrchestratorAssignment) -> OrchestratorRev
         field_guide_entries: Vec::new(),
         worker_reports,
         audit_reports: Vec::new(),
+        review_lens_aggregate: None,
         decomposition_completions: Vec::new(),
         gate_denials: Vec::new(),
         gate_correction_outcomes: Vec::new(),
@@ -588,7 +596,7 @@ fn injected_auditor_report(
     child: &OrchestratorReviewReport,
 ) -> AuditorReport {
     AuditorReport {
-        id: parent_auditor_id(assignment),
+        id: review_lens_auditor_id(assignment, 0),
         role: AgentRole::Auditor,
         reviewed_worker_ids: required_auditor_prompt_subject_ids(assignment, child),
         reviewed_paths: required_auditor_review_paths(assignment, child),
