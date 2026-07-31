@@ -1639,9 +1639,11 @@ mod regression_tests {
                 SupervisorRuntime::Codex,
                 &catalog,
             )?;
-            let command = configure_read_only_auditor_command(command)?
-                .with_hidden_root(primary.path())
-                .with_hidden_root(child_worktree.path());
+            let command = configure_review_lens_execution_boundary(
+                command,
+                primary.path(),
+                child_worktree.path(),
+            )?;
             Ok((workspace, command))
         };
         let (diff_workspace, diff_command) = make_command(&diff_lens, "diff-prompt.md")?;

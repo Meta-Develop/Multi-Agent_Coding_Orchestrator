@@ -1414,12 +1414,22 @@ pub(super) fn create_review_lens_scope_workspace() -> Result<tempfile::TempDir> 
         .context("failed to create isolated review-lens workspace")?;
     Repository::init(workspace.path())
         .context("failed to initialize isolated review-lens workspace")?;
-    for protected_root in [".maco", ".maco-cache", ".codex"] {
+    for protected_root in [".maco", ".maco-cache", ".codex", ".agents"] {
         fs::create_dir(workspace.path().join(protected_root)).with_context(|| {
             format!("failed to create isolated review-lens protected root '{protected_root}'")
         })?;
     }
     Ok(workspace)
+}
+
+pub(super) fn configure_review_lens_execution_boundary(
+    command: ExternalAgentCommand,
+    primary_root: &Path,
+    child_root: &Path,
+) -> Result<ExternalAgentCommand> {
+    Ok(configure_read_only_auditor_command(command)?
+        .with_hidden_root(primary_root)
+        .with_hidden_root(child_root))
 }
 
 fn prepare_parent_auditor<'a>(
@@ -1536,15 +1546,14 @@ fn prepare_parent_auditor<'a>(
         runtime_model_catalog,
     )?;
     auditor_command.output_schema = Some(auditor_schema_path);
-    auditor_command = configure_read_only_auditor_command(auditor_command)?
-        .with_hidden_root(repo)
-        .with_hidden_root(&worktree.path)
-        .with_agent_lifecycle(
-            repo,
-            AgentRole::Auditor.as_str(),
-            options.run_id.as_str(),
-            &auditor_id,
-        );
+    auditor_command =
+        configure_review_lens_execution_boundary(auditor_command, repo, &worktree.path)?
+            .with_agent_lifecycle(
+                repo,
+                AgentRole::Auditor.as_str(),
+                options.run_id.as_str(),
+                &auditor_id,
+            );
     auditor_command = apply_canonical_environment_requirements(
         auditor_command,
         &preflight.environment_requirements,
@@ -2598,6 +2607,127 @@ mod decomposition_tests {
         _review: Option<ExternalPreActionReviewRuntime<'_>>,
     ) -> ExternalAgentRun {
         panic!("fake-runtime phase fixture must not invoke the external runner")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_lens_execution_boundary_hides_primary_and_child_roots_from_hostile_process(
+    ) -> Result<()> {
+        const CHILD_ENV: &str = "MACO_TEST_REVIEW_LENS_BOUNDARY_CHILD";
+        const PRIMARY_SECRET_ENV: &str = "MACO_TEST_REVIEW_LENS_PRIMARY_SECRET";
+        const CHILD_SECRET_ENV: &str = "MACO_TEST_REVIEW_LENS_CHILD_SECRET";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            for environment_name in [PRIMARY_SECRET_ENV, CHILD_SECRET_ENV] {
+                let secret = PathBuf::from(
+                    std::env::var_os(environment_name)
+                        .with_context(|| format!("missing hostile probe {environment_name}"))?,
+                );
+                assert!(
+                    fs::read_to_string(&secret).is_err(),
+                    "review lens process read hidden root {}",
+                    secret.display()
+                );
+            }
+            return Ok(());
+        }
+
+        let test_binary = std::env::current_exe()?;
+        let test_output_root = test_binary
+            .parent()
+            .and_then(Path::parent)
+            .context("test binary omitted its target output root")?;
+        let temp = tempfile::tempdir_in(test_output_root)?;
+        let primary_root = temp.path().join("primary");
+        let child_root = temp.path().join("child");
+        for root in [&primary_root, &child_root] {
+            fs::create_dir(root)?;
+        }
+        let primary_secret = primary_root.join("primary-secret.txt");
+        let child_secret = child_root.join("child-secret.txt");
+        fs::write(&primary_secret, "PRIMARY_SECRET_MUST_BE_HIDDEN\n")?;
+        fs::write(&child_secret, "CHILD_SECRET_MUST_BE_HIDDEN\n")?;
+
+        let scope_workspace = create_review_lens_scope_workspace()?;
+        let prompt = scope_workspace.path().join("prompt.md");
+        fs::write(&prompt, "Attempt hostile access to omitted lens inputs.\n")?;
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            scope_workspace.path(),
+            &prompt,
+            scope_workspace.path().join("events.jsonl"),
+            scope_workspace.path().join("report.json"),
+            Duration::from_secs(10),
+        );
+        let command =
+            configure_review_lens_execution_boundary(command, &primary_root, &child_root)?;
+
+        let mut profile = crate::process_runner::ExternalCodexProfile::read_only(&command.cwd);
+        for hidden_root in &command.hidden_roots {
+            profile = profile.with_hidden_root(hidden_root);
+        }
+        let environment = BTreeMap::from([
+            (CHILD_ENV.to_string(), "1".to_string()),
+            (
+                PRIMARY_SECRET_ENV.to_string(),
+                primary_secret.display().to_string(),
+            ),
+            (
+                CHILD_SECRET_ENV.to_string(),
+                child_secret.display().to_string(),
+            ),
+        ]);
+        let output = match run_process(
+            ProcessSpec::direct(
+                "review lens hostile hidden-root probe",
+                std::env::current_exe()?,
+                [
+                    OsStr::new("--exact"),
+                    OsStr::new(
+                        "supervise::assignment_execution::decomposition_tests::review_lens_execution_boundary_hides_primary_and_child_roots_from_hostile_process",
+                    ),
+                ],
+                &command.cwd,
+                4 * 1024,
+            )
+            .with_environment(EnvironmentMode::InheritAndSet(environment))
+            .with_stdin(StdinMode::Null)
+            .with_timeout(Some(Duration::from_secs(30)))
+            .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile)),
+        ) {
+            Ok(output) => output,
+            Err(error)
+                if matches!(
+                    error,
+                    crate::process_runner::ProcessRunError::ProcessOwnership { .. }
+                ) && [
+                    "inaccessible path remained",
+                    "inaccessible path placeholder",
+                    "could not inspect inaccessible-path",
+                ]
+                .iter()
+                .any(|diagnostic| error.to_string().contains(diagnostic)) =>
+            {
+                eprintln!("strict sandbox unavailable; hostile lens boundary probe did not launch");
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        assert!(
+            output.status.is_some_and(|status| status.success()),
+            "hostile boundary process failed: {output:#?}"
+        );
+        assert!(output.safety_evidence_verified());
+        assert_eq!(
+            fs::read_to_string(primary_secret)?,
+            "PRIMARY_SECRET_MUST_BE_HIDDEN\n"
+        );
+        assert_eq!(
+            fs::read_to_string(child_secret)?,
+            "CHILD_SECRET_MUST_BE_HIDDEN\n"
+        );
+        Ok(())
     }
 
     #[test]
