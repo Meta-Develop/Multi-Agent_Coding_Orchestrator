@@ -1,15 +1,168 @@
 use super::*;
 
-#[cfg(test)]
+// Cost decision: 6 KiB gives the fixed worker fixture bounded maintenance headroom without
+// hiding another large contract paragraph; raising it is a deliberate prompt-cost decision.
 const WORKER_PROMPT_FIXTURE_CEILING_BYTES: usize = 6 * 1024;
-#[cfg(test)]
+// Cost decision: 20 KiB covers the fixed child fixture plus its embedded worker/auditor templates;
+// raising it is a deliberate prompt-cost decision about the multiplied worker-template cost.
 const CHILD_ORCHESTRATOR_PROMPT_FIXTURE_CEILING_BYTES: usize = 20 * 1024;
-#[cfg(test)]
+// Cost decision: 4 KiB permits the advisory child-side audit contract and a small fixed margin;
+// raising it is a deliberate prompt-cost decision, never an automatic fixture update.
 const REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES: usize = 4 * 1024;
+// Cost decision: 8 KiB bounds the distinct parent acceptance-gate contract and its fixed margin;
+// raising it is a deliberate prompt-cost decision independent of the child-side auditor ceiling.
+const PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES: usize = 8 * 1024;
+pub(super) const PROMPT_MEASUREMENTS_SCHEMA_VERSION: u32 = 1;
+const WORKER_TEMPLATE_EMBEDDING_LEVELS: usize = 2;
 const TOOL_CALL_BATCHING_GUIDANCE: &str = "\
 Tool-call batching:
 - Batch independent, side-effect-free inspections in one tool call when the runtime supports it.
 - Keep dependent steps, approval-sensitive actions, and mutations ordered. Batching never relaxes ownership, journaling, validation, or audit requirements.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum PromptMeasurementRole {
+    O1ChildOrchestrator,
+    TerminalWorker,
+    ChildSideReviewAuditor,
+    ParentAcceptanceAuditor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub(super) struct PromptByteMeasurement {
+    pub role: PromptMeasurementRole,
+    pub agent_label: String,
+    pub full_bytes: usize,
+    pub invariant_bytes: usize,
+    pub variable_bytes: usize,
+    pub fixture_ceiling_bytes: usize,
+}
+
+impl PromptByteMeasurement {
+    fn new(
+        role: PromptMeasurementRole,
+        agent_label: impl Into<String>,
+        rendered: &str,
+        invariant_prefix: &str,
+        fixture_ceiling_bytes: usize,
+    ) -> Result<Self> {
+        if !rendered.starts_with(invariant_prefix) {
+            bail!("rendered prompt does not start with its declared invariant prefix");
+        }
+        Ok(Self {
+            role,
+            agent_label: agent_label.into(),
+            full_bytes: rendered.len(),
+            invariant_bytes: invariant_prefix.len(),
+            variable_bytes: rendered.len() - invariant_prefix.len(),
+            fixture_ceiling_bytes,
+        })
+    }
+
+    fn record_final_rendered_bytes(&mut self, rendered: &str) -> Result<()> {
+        if rendered.len() < self.invariant_bytes {
+            bail!("final rendered prompt is shorter than its measured invariant prefix");
+        }
+        self.full_bytes = rendered.len();
+        self.variable_bytes = rendered.len() - self.invariant_bytes;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub(super) struct WorkerPromptEmbeddingMultiplier {
+    pub worker_roles_per_run: usize,
+    pub levels_that_embed_template: usize,
+    pub total_worker_template_embeddings: usize,
+}
+
+impl WorkerPromptEmbeddingMultiplier {
+    fn for_plan(plan: &SupervisorPlan) -> Result<Self> {
+        let worker_roles_per_run =
+            plan.assignments
+                .iter()
+                .try_fold(0usize, |total, assignment| {
+                    total
+                        .checked_add(assignment.worker_assignments.len())
+                        .context("run-wide worker role count overflowed")
+                })?;
+        let total_worker_template_embeddings = worker_roles_per_run
+            .checked_mul(WORKER_TEMPLATE_EMBEDDING_LEVELS)
+            .context("worker prompt embedding multiplier overflowed")?;
+        Ok(Self {
+            worker_roles_per_run,
+            levels_that_embed_template: WORKER_TEMPLATE_EMBEDDING_LEVELS,
+            total_worker_template_embeddings,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub(super) struct OuterRoundTripMeasurement {
+    pub observation: RoleUsageObservation,
+    pub unavailable_reason: String,
+    pub method: String,
+    pub prerequisites: Vec<String>,
+}
+
+impl OuterRoundTripMeasurement {
+    fn not_process_observable() -> Self {
+        Self {
+            observation: RoleUsageObservation::NotProcessObservable,
+            unavailable_reason: "worker execution journals record commands and timestamps but no model-turn or tool-batch identifier; command entries are not model turns".to_string(),
+            method: "compare before/after outer model round trips by correlating provider model-turn and tool-batch identifiers with worker execution journal entries".to_string(),
+            prerequisites: vec![
+                "a fixed comparable read-heavy worker-journal fixture".to_string(),
+                "the same model, reasoning effort, and runtime for both conditions".to_string(),
+                "durable outer-turn and tool-batch identifiers correlated with worker journal entries"
+                    .to_string(),
+                "repeated before/after runs of the same fixture".to_string(),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub(super) struct PromptMeasurementsArtifact {
+    pub schema_version: u32,
+    pub prompts: Vec<PromptByteMeasurement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_embedding_multiplier: Option<WorkerPromptEmbeddingMultiplier>,
+    pub outer_round_trip_measurement: OuterRoundTripMeasurement,
+}
+
+impl PromptMeasurementsArtifact {
+    fn new(
+        prompts: Vec<PromptByteMeasurement>,
+        worker_embedding_multiplier: Option<WorkerPromptEmbeddingMultiplier>,
+    ) -> Self {
+        Self {
+            schema_version: PROMPT_MEASUREMENTS_SCHEMA_VERSION,
+            prompts,
+            worker_embedding_multiplier,
+            outer_round_trip_measurement: OuterRoundTripMeasurement::not_process_observable(),
+        }
+    }
+
+    pub(super) fn record_final_launch_prompt_bytes(&mut self, rendered: &str) -> Result<()> {
+        let launch = self
+            .prompts
+            .first_mut()
+            .context("prompt measurement artifact omitted its launch prompt")?;
+        launch.record_final_rendered_bytes(rendered)
+    }
+}
+
+pub(super) struct RenderedPromptWithMeasurements {
+    pub prompt: String,
+    pub measurements: PromptMeasurementsArtifact,
+}
+
+pub(super) fn prompt_measurements_relative(prompt_relative: &Path) -> PathBuf {
+    let mut measurement_path = prompt_relative.as_os_str().to_os_string();
+    measurement_path.push(".measurements.json");
+    PathBuf::from(measurement_path)
+}
 
 pub(super) fn child_orchestrator_cacheable_prefix() -> String {
     format!(
@@ -118,6 +271,36 @@ Rules:
     )
 }
 
+pub(super) fn parent_review_auditor_cacheable_prefix() -> String {
+    format!(
+        r#"You are the parent-launched read-only review auditor in an opt-in local Codex CLI supervised run.
+Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher, plus this parent-enforced terminal REVIEW_AUDITOR gate.
+Your parent is MACO/O2. You are not an O1 child orchestrator, worker, researcher, or peer coordinator.
+Do not launch further workers, delegate, mutate files, run mutating commands, claim paths, apply patches, or change Git state.
+
+{tool_call_batching_guidance}
+
+Runtime boundary:
+- MACO launched this Codex CLI with the read-only maco_external_codex permission profile, model-generated network disabled, and strict/ephemeral configuration.
+- An outer MACO systemd boundary independently verifies the exact read-only workspace mount, writable report/log destinations, blocked host IPC sockets, resource limits, and empty owned cgroup.
+- Never request danger-full-access or launch a raw nested Codex subprocess. Stay read-only and fail closed if either verified boundary is unavailable.
+- Return AuditorReport JSON as your final response. Codex CLI --output-last-message records that final response at the auditor report path.
+
+Review requirements:
+- Review the child report, worker_reports, child worktree diff/changed paths, validation_results, findings, remaining_risk, assigned worker IDs, and assigned paths.
+- Verify every assigned worker id has adequate WorkerReport coverage and terminal no-delegation evidence. When there are no assigned workers, verify reviewed_worker_ids covers the child orchestrator id for the changed child diff.
+- Verify reviewed_paths covers the assigned paths and any changed paths relevant to this child scope.
+- For megafile_decomposition, verify the worker and child completion evidence names the exact target_path and is supported by the normal claim, journal, validation, and diff evidence.
+- reviewed_paths coverage is computed over repository-relative entries only. Absolute out-of-repo evidence paths are allowed and retained verbatim as evidence, but excluded from coverage computation.
+- Set role="auditor", no_further_delegation=true, read_only=true.
+- Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
+- Include reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining_risk, and next_safe_action.
+- Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
+"#,
+        tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE
+    )
+}
+
 pub(super) fn fresh_field_guide_frame_nonce(
     entries: &[DecodedFieldGuidePromptEntry],
     nonce_source: &mut dyn FnMut() -> Result<String>,
@@ -218,6 +401,23 @@ pub(super) fn child_orchestrator_prompt_with_incoming_root_and_field_guide(
     assignment_metadata: &AssignmentMetadata,
     field_guide: &SupervisorFieldGuidePrompt,
 ) -> Result<String> {
+    Ok(
+        render_child_orchestrator_prompt_with_incoming_root_and_field_guide(
+            context,
+            incoming_root,
+            assignment_metadata,
+            field_guide,
+        )?
+        .prompt,
+    )
+}
+
+pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guide(
+    context: ChildOrchestratorPromptContext<'_>,
+    incoming_root: &Path,
+    assignment_metadata: &AssignmentMetadata,
+    field_guide: &SupervisorFieldGuidePrompt,
+) -> Result<RenderedPromptWithMeasurements> {
     let ChildOrchestratorPromptContext {
         plan,
         assignment,
@@ -235,12 +435,12 @@ pub(super) fn child_orchestrator_prompt_with_incoming_root_and_field_guide(
         assignment_metadata,
     )?)
     .context("failed to serialize orchestrator assignment")?;
-    let worker_prompts = assignment
+    let worker_prompt_renders = assignment
         .worker_assignments
         .iter()
-        .map(|worker| {
+        .map(|worker| -> Result<(String, PromptByteMeasurement)> {
             let metadata = worker_assignment_metadata(assignment_metadata, assignment, worker);
-            worker_prompt_with_field_guide(
+            let rendered = worker_prompt_with_field_guide(
                 WorkerPromptRenderContext {
                     plan,
                     orchestrator: assignment,
@@ -251,9 +451,22 @@ pub(super) fn child_orchestrator_prompt_with_incoming_root_and_field_guide(
                     schema_path: worker_schema_path,
                 },
                 field_guide,
-            )
+            )?;
+            let invariant_prefix = worker_cacheable_prefix();
+            let measurement = PromptByteMeasurement::new(
+                PromptMeasurementRole::TerminalWorker,
+                &worker.id,
+                &rendered,
+                &invariant_prefix,
+                WORKER_PROMPT_FIXTURE_CEILING_BYTES,
+            )?;
+            Ok((rendered, measurement))
         })
-        .collect::<Result<Vec<_>>>()?
+        .collect::<Result<Vec<_>>>()?;
+    let worker_prompts = worker_prompt_renders
+        .iter()
+        .map(|(rendered, _)| rendered.as_str())
+        .collect::<Vec<_>>()
         .join("\n\n--- worker prompt contract ---\n\n");
     let auditor_prompt = review_auditor_prompt_with_metadata_and_field_guide(
         plan,
@@ -262,6 +475,15 @@ pub(super) fn child_orchestrator_prompt_with_incoming_root_and_field_guide(
         run_dir,
         auditor_schema_path,
         field_guide,
+    )?;
+    let auditor_prefix = review_auditor_cacheable_prefix();
+    let auditor_id = format!("{}-review-auditor", assignment.id);
+    let auditor_measurement = PromptByteMeasurement::new(
+        PromptMeasurementRole::ChildSideReviewAuditor,
+        auditor_id,
+        &auditor_prompt,
+        &auditor_prefix,
+        REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES,
     )?;
     let task = assignment_task(plan, assignment);
     let role_prefix = supervise_role_prefix(
@@ -273,7 +495,8 @@ pub(super) fn child_orchestrator_prompt_with_incoming_root_and_field_guide(
         role_model_selection(plan, AgentRole::ChildOrchestrator);
     let (worker_model, worker_reasoning_effort) = role_model_selection(plan, AgentRole::Worker);
     let consultation_section = consultation_prompt_section(consultant);
-    Ok(format!(
+    let cacheable_prefix = child_orchestrator_cacheable_prefix();
+    let prompt = format!(
         r#"{cacheable_prefix}{role_prefix}{field_guide_section}
 
 Assignment-specific context:
@@ -316,7 +539,7 @@ Worker prompt templates:
 Review auditor prompt template:
 {auditor_prompt}
 "#,
-        cacheable_prefix = child_orchestrator_cacheable_prefix(),
+        cacheable_prefix = cacheable_prefix,
         role_prefix = role_prefix,
         field_guide_section = field_guide.section,
         worktree_path = worktree.path.display(),
@@ -347,7 +570,28 @@ Review auditor prompt template:
         worker_prompts = worker_prompts,
         auditor_prompt = auditor_prompt,
         consultation_section = consultation_section,
-    ))
+    );
+    let mut prompt_measurements = Vec::with_capacity(worker_prompt_renders.len() + 2);
+    prompt_measurements.push(PromptByteMeasurement::new(
+        PromptMeasurementRole::O1ChildOrchestrator,
+        &assignment.id,
+        &prompt,
+        &cacheable_prefix,
+        CHILD_ORCHESTRATOR_PROMPT_FIXTURE_CEILING_BYTES,
+    )?);
+    prompt_measurements.extend(
+        worker_prompt_renders
+            .into_iter()
+            .map(|(_, measurement)| measurement),
+    );
+    prompt_measurements.push(auditor_measurement);
+    Ok(RenderedPromptWithMeasurements {
+        prompt,
+        measurements: PromptMeasurementsArtifact::new(
+            prompt_measurements,
+            Some(WorkerPromptEmbeddingMultiplier::for_plan(plan)?),
+        ),
+    })
 }
 
 fn consultation_prompt_section(consultant: &SupervisorConsultantPlan) -> String {
@@ -578,10 +822,18 @@ Supervisor task:
     ))
 }
 
+#[cfg(test)]
 pub(super) fn parent_review_auditor_prompt_with_field_guide(
     context: ParentReviewAuditorPromptContext<'_>,
     field_guide: &SupervisorFieldGuidePrompt,
 ) -> Result<String> {
+    Ok(render_parent_review_auditor_prompt_with_field_guide(context, field_guide)?.prompt)
+}
+
+pub(super) fn render_parent_review_auditor_prompt_with_field_guide(
+    context: ParentReviewAuditorPromptContext<'_>,
+    field_guide: &SupervisorFieldGuidePrompt,
+) -> Result<RenderedPromptWithMeasurements> {
     let ParentReviewAuditorPromptContext {
         plan,
         assignment,
@@ -616,18 +868,9 @@ pub(super) fn parent_review_auditor_prompt_with_field_guide(
     }))
     .context("failed to serialize redacted field-guide suggestion metadata")?;
     let task = assignment_task(plan, assignment);
-    Ok(format!(
-        r#"{role_prefix}{field_guide_section}
-You are the parent-launched read-only review auditor in an opt-in local Codex CLI supervised run.
-Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher, plus this parent-enforced terminal REVIEW_AUDITOR gate.
-Your parent is MACO/O2. You are not an O1 child orchestrator, worker, researcher, or peer coordinator.
-Do not launch further workers, delegate, mutate files, run mutating commands, claim paths, apply patches, or change Git state.
-
-Runtime boundary:
-- MACO launched this Codex CLI with the read-only maco_external_codex permission profile, model-generated network disabled, and strict/ephemeral configuration.
-- An outer MACO systemd boundary independently verifies the exact read-only workspace mount, writable report/log destinations, blocked host IPC sockets, resource limits, and empty owned cgroup.
-- Never request danger-full-access or launch a raw nested Codex subprocess. Stay read-only and fail closed if either verified boundary is unavailable.
-- Return AuditorReport JSON as your final response. Codex CLI --output-last-message records that final response at the auditor report path.
+    let cacheable_prefix = parent_review_auditor_cacheable_prefix();
+    let prompt = format!(
+        r#"{cacheable_prefix}{role_prefix}{field_guide_section}
 
 Evidence to review:
 - Supervisor task: {task}
@@ -643,20 +886,10 @@ Evidence to review:
 - Child-reported and supervisor-inspected changed paths: {changed_paths}
 - Field-guide suggestion metadata (raw agent-authored text deliberately omitted): {field_guide_suggestion_metadata}
 
-Review requirements:
-- Review the child report, worker_reports, child worktree diff/changed paths, validation_results, findings, remaining_risk, assigned worker IDs, and assigned paths.
-- Verify every assigned worker id has adequate WorkerReport coverage and terminal no-delegation evidence. When there are no assigned workers, verify reviewed_worker_ids covers the child orchestrator id for the changed child diff.
-- Verify reviewed_paths covers the assigned paths and any changed paths relevant to this child scope.
-- For megafile_decomposition, verify the worker and child completion evidence names the exact target_path and is supported by the normal claim, journal, validation, and diff evidence.
-- reviewed_paths coverage is computed over repository-relative entries only. Absolute out-of-repo evidence paths are allowed and retained verbatim as evidence, but excluded from coverage computation.
-- Set role="auditor", no_further_delegation=true, read_only=true.
-- Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
-- Include reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining_risk, and next_safe_action.
-- Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
-
 Child report JSON:
 {child_report_json}
 "#,
+        cacheable_prefix = cacheable_prefix,
         role_prefix = role_prefix,
         field_guide_section = field_guide.section,
         task = task,
@@ -675,7 +908,18 @@ Child report JSON:
         changed_paths = display_paths(&child_report.files_changed),
         field_guide_suggestion_metadata = field_guide_suggestion_metadata,
         child_report_json = child_report_json,
-    ))
+    );
+    let measurement = PromptByteMeasurement::new(
+        PromptMeasurementRole::ParentAcceptanceAuditor,
+        auditor_id,
+        &prompt,
+        &cacheable_prefix,
+        PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES,
+    )?;
+    Ok(RenderedPromptWithMeasurements {
+        prompt,
+        measurements: PromptMeasurementsArtifact::new(vec![measurement], None),
+    })
 }
 
 fn assignment_task<'a>(
@@ -771,7 +1015,7 @@ pub(super) fn apply_canonical_environment_requirements(
 mod regression_tests {
     use super::*;
 
-    fn fixed_prompt_fixture() -> Result<(String, String, String)> {
+    fn fixed_prompt_fixture() -> Result<(String, String, String, String)> {
         fixed_prompt_fixture_with_ids("child-a", "worker-a", "src/supervise/prompts.rs")
     }
 
@@ -779,7 +1023,7 @@ mod regression_tests {
         child_id: &str,
         worker_id: &str,
         assigned_path: &str,
-    ) -> Result<(String, String, String)> {
+    ) -> Result<(String, String, String, String)> {
         let worker = WorkerAssignment {
             id: worker_id.to_string(),
             role: AgentRole::Worker,
@@ -874,7 +1118,51 @@ mod regression_tests {
             &assignment_metadata,
             &field_guide,
         )?;
-        Ok((worker_prompt, child_prompt, auditor_prompt))
+        let child_report = OrchestratorReviewReport {
+            id: assignment.id.clone(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: assignment.assigned_paths.clone(),
+            semantic_symbols: assignment.semantic_symbols.clone(),
+            semantic_modules: assignment.semantic_modules.clone(),
+            claim_token: None,
+            semantic_intent_token: None,
+            commands_run: Vec::new(),
+            environment_failures: Vec::new(),
+            files_changed: Vec::new(),
+            validation_results: Vec::new(),
+            findings: Vec::new(),
+            field_guide_entries: Vec::new(),
+            worker_reports: Vec::new(),
+            audit_reports: Vec::new(),
+            decomposition_completions: Vec::new(),
+            gate_denials: Vec::new(),
+            gate_correction_outcomes: Vec::new(),
+            accepted: true,
+            rejected: false,
+            status: ReviewStatus::Succeeded,
+            remaining_risk: "none".to_string(),
+            next_safe_action: "review".to_string(),
+        };
+        let parent_auditor_prompt = parent_review_auditor_prompt_with_field_guide(
+            ParentReviewAuditorPromptContext {
+                plan: &plan,
+                assignment: &assignment,
+                assignment_metadata: &assignment_metadata,
+                run_dir,
+                worktree_path: &worktree.path,
+                child_report_path: &child_report_path,
+                auditor_report_path: &incoming_root.join(format!("{child_id}-review-auditor.json")),
+                schema_path: &auditor_schema_path,
+                child_report: &child_report,
+            },
+            &field_guide,
+        )?;
+        Ok((
+            worker_prompt,
+            child_prompt,
+            auditor_prompt,
+            parent_auditor_prompt,
+        ))
     }
 
     fn enforce_fixture_ceiling(role: &str, rendered: &str, ceiling: usize) -> Result<()> {
@@ -895,8 +1183,54 @@ mod regression_tests {
     }
 
     #[test]
+    fn worker_embedding_multiplier_uses_all_worker_roles_in_the_run() {
+        let assignment = |id: &str, worker_count: usize| OrchestratorAssignment {
+            id: id.to_string(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: (0..worker_count)
+                .map(|index| WorkerAssignment {
+                    id: format!("{id}-worker-{index}"),
+                    role: AgentRole::Worker,
+                    assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: Vec::new(),
+                    task: None,
+                    environment_requirements: Vec::new(),
+                    report_path: None,
+                })
+                .collect(),
+            environment_requirements: Vec::new(),
+            notes: None,
+        };
+        let plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "run-wide multiplier fixture".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 2,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 60,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            assignments: vec![assignment("child-a", 1), assignment("child-b", 2)],
+        };
+
+        let multiplier =
+            WorkerPromptEmbeddingMultiplier::for_plan(&plan).expect("run-wide multiplier");
+        assert_eq!(multiplier.worker_roles_per_run, 3);
+        assert_eq!(multiplier.levels_that_embed_template, 2);
+        assert_eq!(multiplier.total_worker_template_embeddings, 6);
+    }
+
+    #[test]
     fn rendered_role_prompts_stay_within_declared_fixture_ceilings() {
-        let (worker, child, auditor) =
+        let (worker, child, auditor, parent_auditor) =
             fixed_prompt_fixture().expect("render the fixed prompt fixture");
         let measurements = [
             (
@@ -913,6 +1247,11 @@ mod regression_tests {
                 "review auditor",
                 auditor.as_str(),
                 REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES,
+            ),
+            (
+                "parent acceptance auditor",
+                parent_auditor.as_str(),
+                PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES,
             ),
         ];
 
@@ -944,10 +1283,10 @@ mod regression_tests {
 
     #[test]
     fn rendered_role_prompts_carry_bounded_tool_call_batching_contract() {
-        let (worker, child, auditor) =
+        let (worker, child, auditor, parent_auditor) =
             fixed_prompt_fixture().expect("render the fixed prompt fixture");
 
-        for rendered in [&worker, &child, &auditor] {
+        for rendered in [&worker, &child, &auditor, &parent_auditor] {
             assert!(rendered.contains(
                 "Batch independent, side-effect-free inspections in one tool call when the runtime supports it."
             ));
@@ -962,15 +1301,16 @@ mod regression_tests {
 
     #[test]
     fn rendered_role_prompts_share_invariant_bytes_before_role_specific_divergence() {
-        let (worker_a, child_a, auditor_a) =
+        let (worker_a, child_a, auditor_a, parent_auditor_a) =
             fixed_prompt_fixture_with_ids("child-a", "worker-a", "src/supervise/prompts-a.rs")
                 .expect("render prompt fixture a");
-        let (worker_b, child_b, auditor_b) =
+        let (worker_b, child_b, auditor_b, parent_auditor_b) =
             fixed_prompt_fixture_with_ids("child-b", "worker-b", "src/supervise/prompts-b.rs")
                 .expect("render prompt fixture b");
         let worker_prefix = worker_cacheable_prefix();
         let child_prefix = child_orchestrator_cacheable_prefix();
         let auditor_prefix = review_auditor_cacheable_prefix();
+        let parent_auditor_prefix = parent_review_auditor_cacheable_prefix();
         let comparisons = [
             (
                 "terminal worker",
@@ -989,6 +1329,12 @@ mod regression_tests {
                 auditor_a.as_str(),
                 auditor_b.as_str(),
                 auditor_prefix.as_str(),
+            ),
+            (
+                "parent acceptance auditor",
+                parent_auditor_a.as_str(),
+                parent_auditor_b.as_str(),
+                parent_auditor_prefix.as_str(),
             ),
         ];
 
@@ -1034,5 +1380,57 @@ mod regression_tests {
         assert!(worker_a
             .find("Assignment-specific context:")
             .is_some_and(|offset| offset > worker_field_guide_offset));
+
+        let child_role_prefix =
+            supervise_role_prefix(SupervisePromptRole::O1ChildOrchestrator, "child-a", None);
+        let child_role_offset = child_a
+            .find("ROLE: O1_CHILD_ORCHESTRATOR\n")
+            .expect("child role metadata block");
+        assert_eq!(child_role_offset, child_prefix.len());
+        let child_field_guide_offset = child_a
+            .find(FIELD_GUIDE_SECTION_NOTICE)
+            .expect("child field-guide notice");
+        assert_eq!(
+            child_field_guide_offset,
+            child_role_offset + child_role_prefix.len()
+        );
+        assert!(child_a.starts_with(&format!(
+            "{child_prefix}{child_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n"
+        )));
+
+        let child_auditor_id = "child-a-review-auditor";
+        let child_auditor_role_prefix =
+            supervise_role_prefix(SupervisePromptRole::ReviewAuditor, child_auditor_id, None);
+        let child_auditor_role_offset = auditor_a
+            .find("ROLE: REVIEW_AUDITOR\n")
+            .expect("child-side auditor role metadata block");
+        assert_eq!(child_auditor_role_offset, auditor_prefix.len());
+        let child_auditor_field_guide_offset = auditor_a
+            .find(FIELD_GUIDE_SECTION_NOTICE)
+            .expect("child-side auditor field-guide notice");
+        assert_eq!(
+            child_auditor_field_guide_offset,
+            child_auditor_role_offset + child_auditor_role_prefix.len()
+        );
+        assert!(auditor_a.starts_with(&format!(
+            "{auditor_prefix}{child_auditor_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n"
+        )));
+
+        let parent_auditor_role_prefix =
+            supervise_role_prefix(SupervisePromptRole::ReviewAuditor, child_auditor_id, None);
+        let parent_auditor_role_offset = parent_auditor_a
+            .find("ROLE: REVIEW_AUDITOR\n")
+            .expect("parent auditor role metadata block");
+        assert_eq!(parent_auditor_role_offset, parent_auditor_prefix.len());
+        let parent_auditor_field_guide_offset = parent_auditor_a
+            .find(FIELD_GUIDE_SECTION_NOTICE)
+            .expect("parent auditor field-guide notice");
+        assert_eq!(
+            parent_auditor_field_guide_offset,
+            parent_auditor_role_offset + parent_auditor_role_prefix.len()
+        );
+        assert!(parent_auditor_a.starts_with(&format!(
+            "{parent_auditor_prefix}{parent_auditor_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n"
+        )));
     }
 }

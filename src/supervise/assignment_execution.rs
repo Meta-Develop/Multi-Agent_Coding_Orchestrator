@@ -493,7 +493,10 @@ fn prepare_child_attempt<'a>(
         max_attempts > 1,
     );
     let corrective_retry_used = retry_feedback.is_some();
-    let prompt = child_orchestrator_prompt_with_incoming_root_and_field_guide(
+    let RenderedPromptWithMeasurements {
+        prompt,
+        mut measurements,
+    } = render_child_orchestrator_prompt_with_incoming_root_and_field_guide(
         ChildOrchestratorPromptContext {
             plan,
             assignment,
@@ -547,9 +550,18 @@ fn prepare_child_attempt<'a>(
         Some(ChildAttemptCorrection::Gate(denial)) => prompt_with_gate_correction(&prompt, denial)?,
         None => prompt,
     };
+    measurements.record_final_launch_prompt_bytes(&attempt_prompt)?;
     let prompt_relative = dirs.relative(&attempt_artifacts.prompt_path)?;
+    let measurements_relative = prompt_measurements_relative(&prompt_relative);
     with_supervisor_artifacts(artifacts, |writer, _| {
-        write_private_prompt(writer, &prompt_relative, &attempt_prompt)
+        write_private_prompt(writer, &prompt_relative, &attempt_prompt)?;
+        write_artifact_json(
+            writer,
+            &measurements_relative,
+            &measurements,
+            MAX_SUPERVISOR_PROMPT_BYTES,
+            ArtifactFileDisposition::PrivateEvidence,
+        )
     })
     .with_context(|| {
         format!(
@@ -1385,7 +1397,10 @@ fn prepare_parent_auditor<'a>(
         command_record_relative: PathBuf::from("logs").join(format!("{auditor_stem}.summary.json")),
     };
     let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
-    let auditor_prompt = parent_review_auditor_prompt_with_field_guide(
+    let RenderedPromptWithMeasurements {
+        prompt: auditor_prompt,
+        mut measurements,
+    } = render_parent_review_auditor_prompt_with_field_guide(
         ParentReviewAuditorPromptContext {
             plan,
             assignment,
@@ -1399,6 +1414,7 @@ fn prepare_parent_auditor<'a>(
         },
         field_guide,
     )?;
+    measurements.record_final_launch_prompt_bytes(&auditor_prompt)?;
     record_field_guide_prompt_injection_strict(
         artifacts,
         &auditor_id,
@@ -1409,8 +1425,16 @@ fn prepare_parent_auditor<'a>(
         *auditor_attempt,
     )?;
     let auditor_prompt_relative = dirs.relative(&auditor_prompt_path)?;
+    let measurements_relative = prompt_measurements_relative(&auditor_prompt_relative);
     with_supervisor_artifacts(artifacts, |writer, _| {
-        write_private_prompt(writer, &auditor_prompt_relative, &auditor_prompt)
+        write_private_prompt(writer, &auditor_prompt_relative, &auditor_prompt)?;
+        write_artifact_json(
+            writer,
+            &measurements_relative,
+            &measurements,
+            MAX_SUPERVISOR_PROMPT_BYTES,
+            ArtifactFileDisposition::PrivateEvidence,
+        )
     })
     .with_context(|| {
         format!(

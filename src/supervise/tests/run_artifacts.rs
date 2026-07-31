@@ -367,6 +367,23 @@ fn fake_supervise_run_finalizes_manifested_report_tree_events() {
     )
     .expect("run fake supervise journal fixture");
     assert!(report.success, "unexpected failed report: {report:#?}");
+    let accepted_child = report
+        .orchestrator_reports
+        .first()
+        .expect("accepted child report");
+    assert!(accepted_child.accepted);
+    assert_eq!(accepted_child.worker_reports.len(), 1);
+    assert!(accepted_child.worker_reports[0].accepted);
+    assert_eq!(accepted_child.audit_reports.len(), 1);
+    assert!(accepted_child.audit_reports[0].accepted);
+    assert!(accepted_child.audit_reports[0]
+        .reviewed_worker_ids
+        .iter()
+        .any(|worker_id| worker_id == "worker-a"));
+    assert!(accepted_child.audit_reports[0]
+        .reviewed_paths
+        .iter()
+        .any(|path| path == Path::new("README.md")));
 
     let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
         .expect("open finalized fake supervise run");
@@ -427,23 +444,143 @@ fn fake_supervise_run_finalizes_manifested_report_tree_events() {
             .expect("read child prompt"),
     )
     .expect("UTF-8 child prompt");
-    assert!(child_prompt.starts_with(&child_orchestrator_cacheable_prefix()));
-    assert!(child_prompt.contains(
-            "ROLE: O1_CHILD_ORCHESTRATOR\nAGENT_KIND: child_orchestrator\nAGENT_LABEL: child-a\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 1\nNO_FURTHER_DELEGATION: false\n"
-        ));
+    assert!(child_prompt.starts_with(&format!(
+        "{}ROLE: O1_CHILD_ORCHESTRATOR\nAGENT_KIND: child_orchestrator\nAGENT_LABEL: child-a\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 1\nNO_FURTHER_DELEGATION: false\n{FIELD_GUIDE_SECTION_NOTICE}\n",
+        child_orchestrator_cacheable_prefix()
+    )));
     assert_eq!(child_prompt.matches(seed_finding).count(), 3);
     assert_eq!(child_prompt.matches(seed_context).count(), 3);
+    let child_measurements: PromptMeasurementsArtifact = serde_json::from_slice(
+        &reader
+            .read("assignments/child-a.prompt.md.measurements.json")
+            .expect("read child prompt measurements"),
+    )
+    .expect("parse typed child prompt measurements");
+    assert_eq!(
+        child_measurements.schema_version,
+        PROMPT_MEASUREMENTS_SCHEMA_VERSION
+    );
+    assert_eq!(child_measurements.prompts.len(), 3);
+    assert_eq!(
+        child_measurements.prompts[0].role,
+        PromptMeasurementRole::O1ChildOrchestrator
+    );
+    assert_eq!(child_measurements.prompts[0].agent_label, "child-a");
+    assert_eq!(
+        child_measurements.prompts[0].invariant_bytes,
+        child_orchestrator_cacheable_prefix().len()
+    );
+    assert_eq!(child_measurements.prompts[0].full_bytes, child_prompt.len());
+    assert_eq!(
+        child_measurements.prompts[1].role,
+        PromptMeasurementRole::TerminalWorker
+    );
+    assert_eq!(child_measurements.prompts[1].agent_label, "worker-a");
+    assert_eq!(
+        child_measurements.prompts[1].invariant_bytes,
+        worker_cacheable_prefix().len()
+    );
+    assert_eq!(
+        child_measurements.prompts[2].role,
+        PromptMeasurementRole::ChildSideReviewAuditor
+    );
+    assert_eq!(
+        child_measurements.prompts[2].agent_label,
+        "child-a-review-auditor"
+    );
+    assert_eq!(
+        child_measurements.prompts[2].invariant_bytes,
+        review_auditor_cacheable_prefix().len()
+    );
+    for measurement in &child_measurements.prompts {
+        assert_eq!(
+            measurement.full_bytes,
+            measurement.invariant_bytes + measurement.variable_bytes
+        );
+    }
+    let multiplier = child_measurements
+        .worker_embedding_multiplier
+        .as_ref()
+        .expect("child prompt exposes worker embedding multiplier");
+    assert_eq!(multiplier.worker_roles_per_run, 1);
+    assert_eq!(multiplier.levels_that_embed_template, 2);
+    assert_eq!(multiplier.total_worker_template_embeddings, 2);
+    assert_eq!(
+        child_measurements.outer_round_trip_measurement.observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+    assert!(child_measurements
+        .outer_round_trip_measurement
+        .unavailable_reason
+        .contains("command entries are not model turns"));
+    assert_eq!(
+        child_measurements.outer_round_trip_measurement.method,
+        "compare before/after outer model round trips by correlating provider model-turn and tool-batch identifiers with worker execution journal entries"
+    );
+    assert_eq!(
+        child_measurements
+            .outer_round_trip_measurement
+            .prerequisites,
+        vec![
+            "a fixed comparable read-heavy worker-journal fixture",
+            "the same model, reasoning effort, and runtime for both conditions",
+            "durable outer-turn and tool-batch identifiers correlated with worker journal entries",
+            "repeated before/after runs of the same fixture",
+        ]
+    );
     let parent_prompt = String::from_utf8(
         reader
             .read("assignments/child-a-review-auditor.prompt.md")
             .expect("read parent auditor prompt"),
     )
     .expect("UTF-8 parent auditor prompt");
-    assert!(parent_prompt.starts_with(
-            "ROLE: REVIEW_AUDITOR\nAGENT_KIND: auditor\nAGENT_LABEL: child-a-review-auditor\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 2\nNO_FURTHER_DELEGATION: true\n"
-        ));
+    assert!(parent_prompt.starts_with(&format!(
+        "{}ROLE: REVIEW_AUDITOR\nAGENT_KIND: auditor\nAGENT_LABEL: child-a-review-auditor\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 2\nNO_FURTHER_DELEGATION: true\n{FIELD_GUIDE_SECTION_NOTICE}\n",
+        parent_review_auditor_cacheable_prefix()
+    )));
     assert_eq!(parent_prompt.matches(seed_finding).count(), 1);
     assert_eq!(parent_prompt.matches(seed_context).count(), 1);
+    let parent_measurements: PromptMeasurementsArtifact = serde_json::from_slice(
+        &reader
+            .read("assignments/child-a-review-auditor.prompt.md.measurements.json")
+            .expect("read parent auditor prompt measurements"),
+    )
+    .expect("parse typed parent auditor prompt measurements");
+    assert_eq!(parent_measurements.prompts.len(), 1);
+    assert_eq!(
+        parent_measurements.prompts[0].role,
+        PromptMeasurementRole::ParentAcceptanceAuditor
+    );
+    assert_eq!(
+        parent_measurements.prompts[0].agent_label,
+        "child-a-review-auditor"
+    );
+    assert_eq!(
+        parent_measurements.prompts[0].invariant_bytes,
+        parent_review_auditor_cacheable_prefix().len()
+    );
+    assert_eq!(
+        parent_measurements.prompts[0].full_bytes,
+        parent_prompt.len()
+    );
+    assert_eq!(
+        parent_measurements.prompts[0].full_bytes,
+        parent_measurements.prompts[0].invariant_bytes
+            + parent_measurements.prompts[0].variable_bytes
+    );
+    assert!(parent_measurements.worker_embedding_multiplier.is_none());
+    assert_ne!(
+        review_auditor_cacheable_prefix(),
+        parent_review_auditor_cacheable_prefix(),
+        "advisory child-side and parent acceptance auditors require distinct authority prefixes"
+    );
+    assert!(review_auditor_cacheable_prefix()
+        .contains("You are not an O1 child orchestrator, O2 supervisor"));
+    assert!(parent_review_auditor_cacheable_prefix().contains("Your parent is MACO/O2"));
+    assert!(parent_review_auditor_cacheable_prefix()
+        .contains("read-only maco_external_codex permission profile"));
+    assert!(parent_review_auditor_cacheable_prefix()
+        .contains("An outer MACO systemd boundary independently verifies"));
     assert!(events.iter().any(|event| {
         event.node == "worker-a"
             && event.parent.as_deref() == Some(assignment.id.as_str())
@@ -631,8 +768,10 @@ fn accepted_audited_suggestions_append_with_trusted_provenance_and_redacted_jour
     )
     .expect("render actual worker role prompt");
     let role_prefix = supervise_role_prefix(SupervisePromptRole::TerminalWorker, &worker.id, None);
-    assert!(worker_prompt.starts_with(&worker_cacheable_prefix()));
-    assert!(worker_prompt.contains(&format!("{role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n")));
+    assert!(worker_prompt.starts_with(&format!(
+        "{}{role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n",
+        worker_cacheable_prefix()
+    )));
     let (opening_token, closing_token) = single_field_guide_frame_tokens(&worker_prompt);
     let final_nonce = opening_token
         .strip_prefix(FIELD_GUIDE_FRAME_BEGIN_PREFIX)
@@ -1264,7 +1403,9 @@ fn injected_runner_retries_structural_report_once_then_runs_parent_auditor() {
     let run_root = repo_path.join(".maco/o2/runs/injected-retry");
     for relative in [
         "assignments/child-a.attempt-1.prompt.md",
+        "assignments/child-a.attempt-1.prompt.md.measurements.json",
         "assignments/child-a.attempt-2.prompt.md",
+        "assignments/child-a.attempt-2.prompt.md.measurements.json",
         "evidence/incoming/child-a.attempt-1.json",
         "evidence/incoming/child-a.attempt-2.json",
         "logs/workers/child-a/worker-a.jsonl",
@@ -1281,6 +1422,16 @@ fn injected_runner_retries_structural_report_once_then_runs_parent_auditor() {
             .expect("read corrective prompt");
     assert!(corrective_prompt.contains("STRUCTURAL REPORT RETRY:"));
     assert!(!corrective_prompt.contains("does not match assignment"));
+    let corrective_measurements: PromptMeasurementsArtifact = serde_json::from_slice(
+        &fs::read(run_root.join("assignments/child-a.attempt-2.prompt.md.measurements.json"))
+            .expect("read corrective prompt measurements"),
+    )
+    .expect("parse corrective prompt measurements");
+    assert_eq!(
+        corrective_measurements.prompts[0].full_bytes,
+        corrective_prompt.len(),
+        "measurement must cover the final prompt after retry text is appended"
+    );
     let history = finding_messages(&report.orchestrator_reports[0]);
     assert!(history.contains("child attempt 1 history"));
     assert!(history.contains("child attempt 2 history"));
