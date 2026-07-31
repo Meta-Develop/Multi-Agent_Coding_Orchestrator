@@ -773,15 +773,51 @@ recorded partially quarantined operation. Quarantine does not resume such an
 operation: restore it to a consistent source layout, then start a fresh
 quarantine attempt.
 
-This boundary is local-first and deliberately narrow. It currently supports
-directory retention only on Linux. It does not transparently intercept an
-arbitrary shell command, the existing artifact/worktree cleanup commands, or an
-agent launched directly without registering and honoring a machine-global
-claim. Those directly launched agents remain a follow-up enforcement gap.
-Coordinate comparison currently assumes case-sensitive filesystem spelling;
-case-insensitive or casefolded alias behavior is not established as supported,
-so such roots should not be declared. The mount policy is intentionally
-conservative and does not claim to detect every conceivable physical alias.
+### Cooperative enforcement and known bypasses
+
+Machine-global enforcement is cooperative. A destructive path is protected only when
+the caller opens the same reviewed configuration and state root, declares the target
+under the correct root ID, and performs the mutation through the gate. This is not
+syscall interposition and is not a host-wide guarantee: a hand-run shell command, a
+directly launched agent, or an arbitrary child process can still modify or delete data
+without consulting MACO.
+
+`merge arbitrate` requires `--machine-global-config` and
+`--machine-global-runtime-root-id`. Its external-agent output staging cleanup is routed
+through the machine-global gate. An intersecting active claim produces the existing
+typed `GateDenial`, leaves the staging directory in place, and makes the run
+non-publishable. An allowed cleanup is quarantined; the public run record carries only
+the retention operation ID, while the purge token remains in a mode-0600 private
+receipt beside the JSON log. This is a launch-time obligation for that orchestrator
+path, not protection against commands launched outside it.
+
+The current cleanup/retention audit is:
+
+| Path | Gate status | Reason and attribution boundary |
+| --- | --- | --- |
+| External-agent output staging used by `merge arbitrate` | Routed | The exact existing staging directory is resolved beneath the explicitly declared root ID and revalidated. Refusals use `GateDenial`; allowed operations use the existing retention record. |
+| External-agent output staging used without a machine-global binding | Known bypass, attributed | Completed cleanup records `actor=maco-external-agent`, `operation=delete_private_output_staging`, the reason, and `process_attribution=not_process_observable` in the serialized run; early `Drop` cleanup emits the same actor/operation marker before deletion. This identifies the cooperative bypass without claiming process-level observation. |
+| External-agent staging setup rollback | Known empty-directory bypass, attributed | If exclusive output reservation fails, setup emits `actor=maco-external-agent`, `operation=delete_empty_output_staging_setup_rollback`, and `process_attribution=not_process_observable` before removing only the newly created, still-empty staging directory. No external data was accepted into that directory. |
+| Bounded worktree-status crash scavenging under `/tmp/maco-worktree-status-<uid>` | Known bypass | It removes only identity-bound, bounded files from MACO's per-user status root, but no reviewed root configuration is available at that call site. The call site and per-user root identify the subsystem; the deleting process is not durably observed. |
+| Merge private-runtime orphan scavenging and close cleanup under `/run/user/<uid>` or `/tmp/maco-runtime-<uid>` | Known bypass | Runtime teardown and orphan recovery must also work before a repository/configuration is available. Owner records carry PID, process start time, boot ID, and runtime kind while present, but successful deletion removes those records; this is not durable deletion attribution. |
+| Orchestrator cleanup of user-selected `--patch-dir` and `--checkpoint-dir` reservations | Known bypass | Exclusive leaf reservation prevents overwrite, but cleanup is still direct because these optional roots are not declared machine-global roots. The enclosing run, agent, and reservation identify the logical actor while present; process-level deletion attribution is not durable. |
+| Reviewer program/view cleanup in the private runtime root | Known bypass | These are current-run private runtime files and cleanup must work without a reviewed machine-global configuration. The run/reviewer context identifies the logical actor while records remain; successful `Drop` cleanup is not durably attributed. |
+| Process-runner and pinned-exec systemd unit/runtime/descriptor cleanup | Known bypass | systemd can remove `RuntimeDirectory` content outside the Rust cleanup path, so the machine-global API cannot wrap every deletion without changing the runtime ceiling. Unit, runtime, and actor metadata provide operational context, not universal process-observable attribution. |
+| Publication secret-buffer zeroing in the private runtime root | Known intentional overwrite | The overwrite is identity-checked secret erasure, not retention. Publication/run context identifies the logical actor, but the erasure is not process-observable after the fact. |
+| Repository Git-common maintenance: authenticated snapshots, state migration/journals and effect ledgers, repository lock records, and managed-worktree metadata | Known bypass | A separate Git directory can place this authenticated repository state physically outside a worktree. Cleanup and overwrite are bounded to identity-checked leaves under repository-bound locks, but these paths must also work before a machine-global config is supplied. Signed intents, journals, repository identity, and run/operation IDs provide logical attribution where retained; successful temp/intent cleanup is not durable process attribution. |
+| Process-runner tee destinations | Conditional capability surface | Current production callers use repository/run-local destinations. Any future caller that supplies an external destination must route it through the gate or add it here as a reasoned, attributable bypass. |
+
+Repository-local retention is outside this machine-global audit: artifact pruning under
+`.maco`, live-claim cleanup under `.agents`, supervise reporting artifacts, and deletion
+of a managed worktree's own files operate inside a repository worktree. Git-common
+metadata for those operations is covered separately above because it may use a separate
+Git directory.
+
+The retention API currently supports directory retention only on Linux. Coordinate
+comparison assumes case-sensitive filesystem spelling; case-insensitive or casefolded
+alias behavior is not established as supported, so such roots should not be declared.
+The mount policy is intentionally conservative and does not claim to detect every
+conceivable physical alias.
 
 Default linked worktrees are created outside the repository at
 `../.maco/worktrees/<repo-name>/<agent-id>`. Completed task branches can be

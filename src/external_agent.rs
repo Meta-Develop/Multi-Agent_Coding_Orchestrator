@@ -2,6 +2,10 @@ use crate::agent_lifecycle::{AgentLaunchMetadata, MACO_RUN_ID_ENV, MACO_TASK_ID_
 use crate::artifacts::state_auth::sha256_hex;
 use crate::gate_denial::{ExternalSideEffectState, GateDenial};
 use crate::llm::provider::Usage;
+use crate::machine_global::{
+    DestructiveTargetInput, GateOutcome, MachineGlobalStore, RetentionOperation,
+    RetentionOperationId,
+};
 use crate::pre_action_review::{
     ActionDescriptor, ApprovalReviewRequest, BlastRadius, CommandClass, CommandInvocation,
     DecisionSource, PathAccess, PathAccessMode, PermissionRequest, PreActionReviewer,
@@ -194,6 +198,17 @@ pub struct ExternalAgentCommand {
     /// released. Every executable variant maps to a MACO-owned fixed version probe; assignments
     /// cannot provide commands or arguments.
     pub environment_requirements: Vec<EnvironmentRequirement>,
+    /// Explicit binding for recoverable cleanup of the private machine-global output staging
+    /// directory. Absence keeps the legacy path as an attributed cooperative bypass.
+    pub machine_global_retention: Option<ExternalMachineGlobalRetentionBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalMachineGlobalRetentionBinding {
+    pub config: PathBuf,
+    pub root_id: String,
+    pub owner: String,
+    pub correction_correlation_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -565,6 +580,7 @@ impl ExternalAgentCommand {
             agent_lifecycle: None,
             worktree_control_exceptions: Vec::new(),
             environment_requirements: Vec::new(),
+            machine_global_retention: None,
         }
     }
 
@@ -592,6 +608,7 @@ impl ExternalAgentCommand {
             agent_lifecycle: None,
             worktree_control_exceptions: Vec::new(),
             environment_requirements: Vec::new(),
+            machine_global_retention: None,
         }
     }
 
@@ -619,6 +636,7 @@ impl ExternalAgentCommand {
             agent_lifecycle: None,
             worktree_control_exceptions: Vec::new(),
             environment_requirements: Vec::new(),
+            machine_global_retention: None,
         }
     }
 
@@ -675,6 +693,14 @@ impl ExternalAgentCommand {
         self.environment_requirements.extend(requirements);
         self
     }
+
+    pub fn with_machine_global_retention(
+        mut self,
+        binding: ExternalMachineGlobalRetentionBinding,
+    ) -> Self {
+        self.machine_global_retention = Some(binding);
+        self
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -697,6 +723,15 @@ pub struct ExternalAgentRun {
     /// Descriptor-captured final output. This is deliberately excluded from the public report
     /// surface so callers cannot confuse a tainted pathname with the held capability.
     pub(crate) output_last_message: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachineGlobalBypassAttribution {
+    pub actor: String,
+    pub operation: String,
+    pub process_attribution: String,
+    pub reason: String,
 }
 
 impl std::fmt::Debug for ExternalAgentRun {
@@ -786,6 +821,16 @@ impl ExternalAgentRun {
 
     pub fn gate_denials(&self) -> &[GateDenial] {
         &self.stdout.run_metadata.gate_denials
+    }
+
+    pub fn machine_global_bypasses(&self) -> &[MachineGlobalBypassAttribution] {
+        &self.stdout.run_metadata.machine_global_bypasses
+    }
+
+    pub fn machine_global_retention_operation_id(&self) -> Option<RetentionOperationId> {
+        self.stdout
+            .run_metadata
+            .machine_global_retention_operation_id
     }
 
     pub fn pre_action_review_metrics(&self) -> Option<&ReviewMetricSnapshot> {
@@ -889,6 +934,10 @@ struct ExternalAgentRunWireRef<'a> {
     sandbox_denials: &'a Vec<SandboxDenialEvidence>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     gate_denials: &'a Vec<GateDenial>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    machine_global_bypasses: &'a Vec<MachineGlobalBypassAttribution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine_global_retention_operation_id: &'a Option<RetentionOperationId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pre_action_review_metrics: &'a Option<ReviewMetricSnapshot>,
     stdout: &'a CapturedOutput,
@@ -923,6 +972,10 @@ struct ExternalAgentRunWireOwned {
     #[serde(default)]
     gate_denials: Vec<GateDenial>,
     #[serde(default)]
+    machine_global_bypasses: Vec<MachineGlobalBypassAttribution>,
+    #[serde(default)]
+    machine_global_retention_operation_id: Option<RetentionOperationId>,
+    #[serde(default)]
     pre_action_review_metrics: Option<ReviewMetricSnapshot>,
     stdout: CapturedOutput,
     stderr: CapturedOutput,
@@ -954,6 +1007,11 @@ impl Serialize for ExternalAgentRun {
                 .environment_preflight_process_started,
             sandbox_denials: &self.stdout.run_metadata.sandbox_denials,
             gate_denials: &self.stdout.run_metadata.gate_denials,
+            machine_global_bypasses: &self.stdout.run_metadata.machine_global_bypasses,
+            machine_global_retention_operation_id: &self
+                .stdout
+                .run_metadata
+                .machine_global_retention_operation_id,
             pre_action_review_metrics: &self.stdout.run_metadata.pre_action_review_metrics,
             stdout: &self.stdout,
             stderr: &self.stderr,
@@ -976,6 +1034,9 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
             wire.environment_preflight_process_started;
         stdout.run_metadata.sandbox_denials = wire.sandbox_denials;
         stdout.run_metadata.gate_denials = wire.gate_denials;
+        stdout.run_metadata.machine_global_bypasses = wire.machine_global_bypasses;
+        stdout.run_metadata.machine_global_retention_operation_id =
+            wire.machine_global_retention_operation_id;
         stdout.run_metadata.pre_action_review_metrics = wire.pre_action_review_metrics;
         Ok(Self {
             command: wire.command,
@@ -1004,6 +1065,8 @@ struct ExternalAgentRunMetadata {
     environment_preflight_process_started: bool,
     sandbox_denials: Vec<SandboxDenialEvidence>,
     gate_denials: Vec<GateDenial>,
+    machine_global_bypasses: Vec<MachineGlobalBypassAttribution>,
+    machine_global_retention_operation_id: Option<RetentionOperationId>,
     pre_action_review_metrics: Option<ReviewMetricSnapshot>,
     external_side_effect_state: Option<ExternalSideEffectState>,
 }
@@ -1204,18 +1267,19 @@ fn run_external_agent_runtime(
             );
         }
     };
-    let mut output_staging = match ExternalOutputStaging::create(&spec.cwd) {
-        Ok(staging) => staging,
-        Err(error) => {
-            return failed_external_run(
-                spec,
-                started,
-                command_display(&resolved_program, &[]),
-                false,
-                format!("failed to prepare private external-agent output staging: {error}"),
-            );
-        }
-    };
+    let mut output_staging =
+        match ExternalOutputStaging::create(&spec.cwd, spec.machine_global_retention.clone()) {
+            Ok(staging) => staging,
+            Err(error) => {
+                return failed_external_run(
+                    spec,
+                    started,
+                    command_display(&resolved_program, &[]),
+                    false,
+                    format!("failed to prepare private external-agent output staging: {error}"),
+                );
+            }
+        };
     let mut target_spec = spec.clone();
     target_spec.output_last_message = match output_staging.path() {
         Ok(path) => path.to_path_buf(),
@@ -1921,14 +1985,49 @@ fn run_external_agent_runtime(
             }
         }
     }
-    if let Err(error) = output_staging.cleanup() {
-        report.error = append_external_error(
-            report.error.take(),
-            Some(format!(
-                "failed to remove private external-agent output staging: {error:#}"
-            )),
-        );
-        report.publishable = false;
+    match output_staging.cleanup() {
+        Ok(ExternalOutputCleanup::Quarantined(operation)) => {
+            if let Err(error) = persist_machine_global_retention_receipt(&spec.json_log, &operation)
+            {
+                report.error = append_external_error(
+                    report.error.take(),
+                    Some(format!(
+                        "machine-global output staging was quarantined as operation {} but its private purge receipt could not be persisted: {error:#}",
+                        operation.id.get()
+                    )),
+                );
+                report.publishable = false;
+            } else {
+                report
+                    .stdout
+                    .run_metadata
+                    .machine_global_retention_operation_id = Some(operation.id);
+            }
+        }
+        Ok(ExternalOutputCleanup::Denied(denial)) => {
+            retained_gate_denials.push(denial);
+            report.error = append_external_error(
+                report.error.take(),
+                Some("machine-global gate denied private output-staging cleanup".to_string()),
+            );
+            report.publishable = false;
+        }
+        Ok(ExternalOutputCleanup::Bypassed(attribution)) => {
+            report
+                .stdout
+                .run_metadata
+                .machine_global_bypasses
+                .push(attribution);
+        }
+        Err(error) => {
+            report.error = append_external_error(
+                report.error.take(),
+                Some(format!(
+                    "failed to clean private external-agent output staging: {error:#}"
+                )),
+            );
+            report.publishable = false;
+        }
     }
     report.stdout.run_metadata.gate_denials = retained_gate_denials;
     report.stdout.run_metadata.pre_action_review_metrics = retained_review_metrics;
@@ -2491,28 +2590,71 @@ fn reserve_external_output(path: &Path) -> Result<ReservedOutputFile> {
     root.reserve(name)
 }
 
+fn persist_machine_global_retention_receipt(
+    json_log_path: &Path,
+    operation: &RetentionOperation,
+) -> Result<()> {
+    let parent = required_parent(json_log_path)?;
+    let root = SecureOutputRoot::open_or_create(parent)?;
+    let name = OsString::from(format!(
+        "machine-global-retention-{}.private.json",
+        operation.id.get()
+    ));
+    let mut receipt = root.reserve(&name)?;
+    let mut bytes = serde_json::to_vec_pretty(operation)
+        .context("failed to serialize private machine-global retention receipt")?;
+    bytes.push(b'\n');
+    receipt
+        .write_bytes_atomic(&bytes, OUTPUT_TEE_LIMIT_BYTES)
+        .context("failed to persist private machine-global retention receipt")
+}
+
 struct ExternalOutputStaging {
     root_path: PathBuf,
     reservation: Option<ReservedOutputFile>,
+    machine_global_retention: Option<ExternalMachineGlobalRetentionBinding>,
+    cleanup_completed: bool,
+}
+
+enum ExternalOutputCleanup {
+    Quarantined(RetentionOperation),
+    Denied(GateDenial),
+    Bypassed(MachineGlobalBypassAttribution),
 }
 
 impl ExternalOutputStaging {
-    fn create(writable_workspace: &Path) -> Result<Self> {
+    fn create(
+        writable_workspace: &Path,
+        machine_global_retention: Option<ExternalMachineGlobalRetentionBinding>,
+    ) -> Result<Self> {
         #[cfg(target_os = "linux")]
         {
             let runtime_root = crate::process_runner::trusted_linux_runtime_root()
                 .context("owner-private runtime root is unavailable for output staging")?;
-            Self::create_under(&runtime_root, writable_workspace)
+            Self::create_under_with_retention(
+                &runtime_root,
+                writable_workspace,
+                machine_global_retention,
+            )
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = writable_workspace;
+            let _ = (writable_workspace, machine_global_retention);
             bail!("private external-agent output staging requires the strict Linux runtime")
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", test))]
     fn create_under(runtime_root: &Path, writable_workspace: &Path) -> Result<Self> {
+        Self::create_under_with_retention(runtime_root, writable_workspace, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_under_with_retention(
+        runtime_root: &Path,
+        writable_workspace: &Path,
+        machine_global_retention: Option<ExternalMachineGlobalRetentionBinding>,
+    ) -> Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
 
         let mut root_path = None;
@@ -2551,8 +2693,17 @@ impl ExternalOutputStaging {
             Ok(reservation) => Ok(Self {
                 root_path,
                 reservation: Some(reservation),
+                machine_global_retention,
+                cleanup_completed: false,
             }),
             Err(error) => {
+                tracing::warn!(
+                    actor = "maco-external-agent",
+                    operation = "delete_empty_output_staging_setup_rollback",
+                    process_attribution = "not_process_observable",
+                    reason = "output reservation creation failed before staging accepted data",
+                    "machine-global cleanup bypass"
+                );
                 let _ = fs::remove_dir(&root_path);
                 Err(error)
             }
@@ -2582,8 +2733,42 @@ impl ExternalOutputStaging {
             .context("private output staging reservation was already cleaned")
     }
 
-    fn cleanup(&mut self) -> Result<()> {
-        self.cleanup_inner()
+    fn cleanup(&mut self) -> Result<ExternalOutputCleanup> {
+        let Some(binding) = self.machine_global_retention.as_ref() else {
+            let attribution = MachineGlobalBypassAttribution {
+                actor: "maco-external-agent".to_string(),
+                operation: "delete_private_output_staging".to_string(),
+                process_attribution: "not_process_observable".to_string(),
+                reason: "no explicit machine-global config/root binding was supplied".to_string(),
+            };
+            tracing::warn!(
+                actor = %attribution.actor,
+                operation = %attribution.operation,
+                process_attribution = %attribution.process_attribution,
+                reason = %attribution.reason,
+                "machine-global cleanup bypass"
+            );
+            self.cleanup_inner()?;
+            self.cleanup_completed = true;
+            return Ok(ExternalOutputCleanup::Bypassed(attribution));
+        };
+
+        let store = MachineGlobalStore::open_config(&binding.config)?;
+        let coordinate =
+            store.coordinate_for_existing_directory(&binding.root_id, &self.root_path)?;
+        let outcome = store.quarantine(
+            &binding.owner,
+            &binding.correction_correlation_id,
+            vec![DestructiveTargetInput::Declared(coordinate)],
+        )?;
+        match outcome {
+            GateOutcome::Allowed(operation) => {
+                self.reservation.take();
+                self.cleanup_completed = true;
+                Ok(ExternalOutputCleanup::Quarantined(operation))
+            }
+            GateOutcome::Denied(denial) => Ok(ExternalOutputCleanup::Denied(denial)),
+        }
     }
 
     fn cleanup_inner(&mut self) -> Result<()> {
@@ -2603,7 +2788,30 @@ impl ExternalOutputStaging {
 
 impl Drop for ExternalOutputStaging {
     fn drop(&mut self) {
-        let _ = self.cleanup_inner();
+        if self.cleanup_completed {
+            return;
+        }
+        if self.machine_global_retention.is_some() {
+            if self.reservation.is_some() {
+                tracing::warn!(
+                    actor = "maco-external-agent",
+                    operation = "preserve_private_output_staging",
+                    process_attribution = "not_process_observable",
+                    denied_or_incomplete = true,
+                    "preserved machine-global-bound output staging because cleanup did not complete"
+                );
+            }
+            return;
+        }
+        tracing::warn!(
+            actor = "maco-external-agent",
+            operation = "delete_private_output_staging",
+            process_attribution = "not_process_observable",
+            "machine-global cleanup bypass in unbound output-staging Drop"
+        );
+        if self.cleanup_inner().is_ok() {
+            self.cleanup_completed = true;
+        }
     }
 }
 
@@ -6947,6 +7155,234 @@ else:
             staging.root_path().to_path_buf()
         };
         assert!(!dropped_root.exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn machine_global_claim_refuses_real_output_staging_cleanup_and_drop_preserves() -> Result<()> {
+        use crate::gate_denial::{DestructiveTargetDenial, GateDenialReason};
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("workspace");
+        let runtime_root = temp.path().join("private-runtime");
+        let state_root = temp.path().join("machine-global-state");
+        for path in [&workspace, &runtime_root, &state_root] {
+            fs::create_dir(path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+        let config = temp.path().join("machine-global.json");
+        fs::write(
+            &config,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "state_root": state_root,
+                "roots": [{
+                    "id": "runtime",
+                    "path": runtime_root,
+                    "protected_paths": [],
+                    "quarantine_grace_seconds": 60
+                }]
+            }))?,
+        )?;
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
+
+        let binding = ExternalMachineGlobalRetentionBinding {
+            config: config.clone(),
+            root_id: "runtime".to_string(),
+            owner: "cleanup-agent".to_string(),
+            correction_correlation_id: "cleanup-correlation".to_string(),
+        };
+        let mut staging = ExternalOutputStaging::create_under_with_retention(
+            &runtime_root,
+            &workspace,
+            Some(binding),
+        )?;
+        staging
+            .reservation_mut()?
+            .write_bytes_atomic(b"irrecoverable", OUTPUT_TEE_LIMIT_BYTES)?;
+        let staging_root = staging.root_path().to_path_buf();
+        let staging_path = staging.path()?.to_path_buf();
+
+        let repair_store = MachineGlobalStore::open_config(&config)?;
+        let coordinate =
+            repair_store.coordinate_for_existing_directory("runtime", &staging_root)?;
+        let claim = repair_store.claim(
+            "repair-agent",
+            "repair-correlation",
+            vec![coordinate.clone()],
+        )?;
+        assert!(matches!(claim, GateOutcome::Allowed(_)));
+
+        let denial = match staging.cleanup()? {
+            ExternalOutputCleanup::Denied(denial) => denial,
+            ExternalOutputCleanup::Quarantined(_) => {
+                panic!("active repair claim must prevent staging quarantine")
+            }
+            ExternalOutputCleanup::Bypassed(_) => {
+                panic!("bound staging cleanup must not bypass the gate")
+            }
+        };
+        assert!(matches!(
+            denial.reason,
+            GateDenialReason::DestructiveTarget {
+                denial
+            } if matches!(
+                denial.as_ref(),
+                DestructiveTargetDenial::ActiveClaimIntersection {
+                    target,
+                    active_claim
+                } if target == &coordinate && active_claim == &coordinate
+            )
+        ));
+        assert_eq!(fs::read(&staging_path)?, b"irrecoverable");
+        assert!(staging_root.exists());
+        assert!(repair_store.status()?.retention_operations.is_empty());
+
+        drop(staging);
+        assert!(staging_root.exists(), "Drop must not bypass a gate denial");
+        assert_eq!(fs::read(staging_path)?, b"irrecoverable");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unbound_output_staging_cleanup_is_attributed_in_run_wire() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("workspace");
+        let runtime_root = temp.path().join("private-runtime");
+        for path in [&workspace, &runtime_root] {
+            fs::create_dir(path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+        let mut staging = ExternalOutputStaging::create_under(&runtime_root, &workspace)?;
+        let attribution = match staging.cleanup()? {
+            ExternalOutputCleanup::Bypassed(attribution) => attribution,
+            ExternalOutputCleanup::Quarantined(_) | ExternalOutputCleanup::Denied(_) => {
+                panic!("unbound cleanup must report its cooperative bypass")
+            }
+        };
+        assert_eq!(
+            attribution,
+            MachineGlobalBypassAttribution {
+                actor: "maco-external-agent".to_string(),
+                operation: "delete_private_output_staging".to_string(),
+                process_attribution: "not_process_observable".to_string(),
+                reason: "no explicit machine-global config/root binding was supplied".to_string(),
+            }
+        );
+
+        create_mandatory_control_roots(&workspace)?;
+        let agent = workspace.join("fake-agent.sh");
+        fs::write(
+            &agent,
+            r#"#!/bin/sh
+while IFS= read -r _line; do
+    :
+done
+printf '{"type":"done"}\n'
+"#,
+        )?;
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+        let prompt = workspace.join("prompt");
+        fs::write(&prompt, b"exercise unbound staging cleanup\n")?;
+        let output = workspace.join("output");
+        fs::create_dir(&output)?;
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o700))?;
+        let command = ExternalAgentCommand::codex(
+            agent,
+            &workspace,
+            prompt,
+            output.join("run.jsonl"),
+            output.join("last-message"),
+            Duration::from_secs(3),
+        );
+        let report = run_external_agent_nonpublishable_simulation(&command);
+        assert_eq!(report.exit_code, Some(0), "{report:?}");
+        assert_eq!(report.error, None, "{report:?}");
+        assert_eq!(
+            report.machine_global_bypasses(),
+            std::slice::from_ref(&attribution)
+        );
+
+        let restored: ExternalAgentRun = serde_json::from_slice(&serde_json::to_vec(&report)?)?;
+        assert_eq!(restored.machine_global_bypasses(), &[attribution]);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn allowed_output_staging_quarantine_persists_private_purge_receipt() -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("workspace");
+        let runtime_root = temp.path().join("private-runtime");
+        let state_root = temp.path().join("machine-global-state");
+        let artifact_root = temp.path().join("private-artifacts");
+        for path in [&workspace, &runtime_root, &state_root, &artifact_root] {
+            fs::create_dir(path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+        let config = temp.path().join("machine-global.json");
+        fs::write(
+            &config,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "state_root": state_root,
+                "roots": [{
+                    "id": "runtime",
+                    "path": runtime_root,
+                    "protected_paths": [],
+                    "quarantine_grace_seconds": 60
+                }]
+            }))?,
+        )?;
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
+        let binding = ExternalMachineGlobalRetentionBinding {
+            config: config.clone(),
+            root_id: "runtime".to_string(),
+            owner: "cleanup-agent".to_string(),
+            correction_correlation_id: "cleanup-correlation".to_string(),
+        };
+        let mut staging = ExternalOutputStaging::create_under_with_retention(
+            &runtime_root,
+            &workspace,
+            Some(binding),
+        )?;
+        let staging_root = staging.root_path().to_path_buf();
+        staging
+            .reservation_mut()?
+            .write_bytes_atomic(b"private", OUTPUT_TEE_LIMIT_BYTES)?;
+
+        let operation = match staging.cleanup()? {
+            ExternalOutputCleanup::Quarantined(operation) => operation,
+            ExternalOutputCleanup::Denied(_) | ExternalOutputCleanup::Bypassed(_) => {
+                panic!("unclaimed bound staging must be recoverably quarantined")
+            }
+        };
+        assert!(!staging_root.exists());
+        let json_log = artifact_root.join("run.jsonl");
+        persist_machine_global_retention_receipt(&json_log, &operation)?;
+        let receipt_path = artifact_root.join(format!(
+            "machine-global-retention-{}.private.json",
+            operation.id.get()
+        ));
+        let metadata = fs::metadata(&receipt_path)?;
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        let restored: RetentionOperation = serde_json::from_slice(&fs::read(receipt_path)?)?;
+        assert_eq!(restored, operation);
+        assert_eq!(
+            MachineGlobalStore::open_config(config)?
+                .status()?
+                .retention_operations
+                .len(),
+            1
+        );
         Ok(())
     }
 

@@ -411,6 +411,42 @@ impl MachineGlobalStore {
         })
     }
 
+    /// Resolves one already-existing directory beneath a reviewed root into the
+    /// privacy-safe coordinate used by claims and destructive preflight.
+    ///
+    /// Callers must still supply the exact config and reviewed root id. This
+    /// helper does not discover configs or reinterpret arbitrary absolute paths.
+    pub fn coordinate_for_existing_directory(
+        &self,
+        root_id: impl AsRef<str>,
+        path: impl AsRef<Path>,
+    ) -> Result<DeclaredPathCoordinate> {
+        let root_id = root_id.as_ref();
+        let root = self
+            .roots
+            .get(root_id)
+            .with_context(|| format!("undeclared machine-global root {root_id}"))?;
+        root.safe.verify_linux_mount_id(root.mount_id)?;
+
+        let path = path.as_ref();
+        if !path.is_absolute() {
+            bail!("machine-global directory path must be absolute");
+        }
+        let canonical =
+            fs::canonicalize(path).context("failed to canonicalize machine-global directory")?;
+        if canonical != path {
+            bail!("machine-global directory path is not exact and canonical");
+        }
+        let relative = path.strip_prefix(root.safe.path()).with_context(|| {
+            format!("machine-global directory is outside reviewed root {root_id}")
+        })?;
+        let coordinate = DeclaredPathCoordinate::new(root_id, relative)
+            .context("machine-global directory is the root itself or has an invalid coordinate")?;
+        self.validate_coordinate(&coordinate, true)?;
+        root.safe.verify_linux_mount_id(root.mount_id)?;
+        Ok(coordinate)
+    }
+
     /// Acquires all declared targets atomically against the shared cross-repository state.
     pub fn claim(
         &self,

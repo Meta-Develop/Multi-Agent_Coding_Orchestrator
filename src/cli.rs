@@ -2858,6 +2858,8 @@ impl MergeCommand {
                     codex_bin: args.codex_bin,
                     timeout: Duration::from_secs(args.timeout_seconds),
                     worktree_root: args.worktree_root,
+                    machine_global_config: args.machine_global_config,
+                    machine_global_runtime_root_id: args.machine_global_runtime_root_id,
                 })?;
                 print_merge_arbitration_report(&report, args.json)
             }
@@ -3022,6 +3024,12 @@ struct MergeArbitrateArgs {
     /// Optional managed-worktree root for the fresh neutral arbitration worktree.
     #[arg(long)]
     worktree_root: Option<PathBuf>,
+    /// Exact reviewed config used to gate cleanup of private runtime output staging.
+    #[arg(long)]
+    machine_global_config: PathBuf,
+    /// Reviewed root id whose canonical root must contain the actual private runtime root.
+    #[arg(long)]
+    machine_global_runtime_root_id: String,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -4558,6 +4566,10 @@ mod tests {
             "src/lib.rs",
             "--validation-command",
             "cargo test",
+            "--machine-global-config",
+            "/tmp/maco-machine-global.json",
+            "--machine-global-runtime-root-id",
+            "runtime",
             "--approve",
         ])
         .expect("agent-primary arbitration should parse");
@@ -4573,6 +4585,10 @@ mod tests {
         assert!(agent_primary.second_claim.is_empty());
         assert_eq!(agent_primary.arbiter_id, "neutral-review");
         assert_eq!(agent_primary.validation_command, vec!["cargo test"]);
+        assert_eq!(
+            agent_primary.machine_global_runtime_root_id,
+            "runtime".to_string()
+        );
         assert!(agent_primary.approve);
 
         let agent_agent = Cli::try_parse_from([
@@ -4591,6 +4607,10 @@ mod tests {
             "src/lib.rs",
             "--validation-command",
             "cargo check",
+            "--machine-global-config",
+            "/tmp/maco-machine-global.json",
+            "--machine-global-runtime-root-id",
+            "runtime",
         ])
         .expect("agent-agent arbitration should parse");
         let Command::Merge(MergeCommand {
@@ -4603,6 +4623,56 @@ mod tests {
         assert_eq!(agent_agent.second_side, "agent-b");
         assert_eq!(agent_agent.second_claim, vec![PathBuf::from("src/lib.rs")]);
         assert!(!agent_agent.approve);
+
+        let missing_config = Cli::try_parse_from([
+            "maco",
+            "merge",
+            "arbitrate",
+            "agent-a",
+            "primary",
+            "--arbiter-id",
+            "neutral-review",
+            "--run-id",
+            "collision-missing-config",
+            "--first-claim",
+            "src",
+            "--validation-command",
+            "cargo check",
+            "--machine-global-runtime-root-id",
+            "runtime",
+        ])
+        .expect_err("merge arbitration must declare a machine-global config");
+        assert!(
+            missing_config
+                .to_string()
+                .contains("--machine-global-config"),
+            "missing-config refusal must identify the launch obligation"
+        );
+
+        let missing_root_id = Cli::try_parse_from([
+            "maco",
+            "merge",
+            "arbitrate",
+            "agent-a",
+            "primary",
+            "--arbiter-id",
+            "neutral-review",
+            "--run-id",
+            "collision-missing-root",
+            "--first-claim",
+            "src",
+            "--validation-command",
+            "cargo check",
+            "--machine-global-config",
+            "/tmp/maco-machine-global.json",
+        ])
+        .expect_err("merge arbitration must declare a machine-global runtime root id");
+        assert!(
+            missing_root_id
+                .to_string()
+                .contains("--machine-global-runtime-root-id"),
+            "missing-root refusal must identify the launch obligation"
+        );
 
         assert!(Cli::try_parse_from(["maco", "merge", "arbitrate"]).is_err());
         assert!(Cli::try_parse_from([
