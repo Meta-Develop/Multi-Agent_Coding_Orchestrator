@@ -1058,6 +1058,59 @@ fixtures do not claim that command exists.
 Gate-policy/classifier corpus experiments remain separate and depend on the
 Issue #28 production broker path.
 
+### Provisional named hybrid default
+
+When a supervisor plan supplies no `role_models` override, MACO selects the
+named `provisional-phase-a-hybrid-effort-v1` profile. The profile assigns
+`gpt-5.6-sol` to every role, with `xhigh` reasoning effort for the supervisor,
+child orchestrator, and auditor, `medium` for workers, and `high` for the
+`gate_classifier`. A per-role `role_models` entry replaces that role's
+selection.
+
+On the production Codex path, the no-override child-orchestrator and auditor
+commands are constructed with the profile's explicit model and role-specific
+reasoning effort. Worker selection remains declarative data in the child
+orchestrator prompt because nested workers are not launched as separately
+process-observable commands; it is not per-worker model or usage evidence. The
+supervisor entry completes the reported role profile rather than claiming that
+the running supervisor launches itself. The `gate_classifier` entry currently
+has only the deterministic-fake evaluation boundary described above; Issue
+#28's writable production gate remains deferred.
+
+Before a verified Codex run schedules any assignment, MACO invokes the trusted
+system Codex CLI's non-bundled `codex debug models` command exactly once. The
+preflight requires a validated `auth.json`, runs in the contained parent-Codex
+network profile with a private `HOME` and `CODEX_HOME`, bounds and validates the
+JSON catalog, and rechecks both the auth source and executable identity after
+the command. Explicit custom executables never receive auth or provider network
+access. Missing auth, a failed/nonzero command, unsafe containment, truncated or
+malformed output, an empty catalog, duplicate slugs, or invalid slug syntax
+fails closed before any child or auditor dispatch.
+
+Exact slug membership in that immutable per-run catalog determines availability
+for child and auditor command construction. A present slug remains explicit in
+argv. An absent slug is `unavailable`, so the configured fallback is applied
+before budget reservation and spawn-event dispatch:
+
+| Configured fallback | Known-unavailable behavior |
+| --- | --- |
+| `runtime_default` | Clear the explicit model while preserving the configured reasoning effort, allowing the runtime to choose its default model. |
+| `fail_closed` | Refuse the selection rather than dispatch with another model. |
+| `local_deterministic_fake` | Use the deterministic local fallback only with the Fake runtime; reject it for Codex. |
+
+The Fake runtime performs no catalog command and treats configured provider
+models as unavailable, so its declared local fallback remains local. The Codex
+CLI can return an in-memory or cached catalog when an online refresh fails;
+therefore membership is runtime-advertised availability at preflight time, not
+proof of a fresh entitlement check or a guarantee that a later provider launch
+will succeed. MACO does not retry by cycling model names.
+
+This default is operationally selected, but it is not an evidence-backed
+production recommendation. Its source remains provisional deterministic-fake
+Phase A evidence over a hand-authored plan, so the profile is reported as
+`production_eligible=false`. Genuine Issue #26 evidence is required before the
+profile can be qualified for production or revised on empirical grounds.
+
 ### Platform boundary
 
 Linux is the fully supported security-sensitive runtime path. macOS and Windows
@@ -1342,11 +1395,21 @@ turns a blocked merge into an apply.
 denial to correction consumers. It carries a typed reason family, derived
 retryability, canonical verified owner/path context, a typed `GateCheckSource`,
 a responsible route, and a typed non-executable next-safe operation. The public
-source discriminator distinguishes claim acquisition, auditor and future
-approval review, validation, primary drift, Git apply check, merge scope,
-validation binding and state, sandbox policy, containment, primary integrity,
-and external side effects without parsing prose. Reason/source mismatches are
-rejected by both constructors and validated deserialization.
+source discriminator distinguishes claim acquisition, budget admission, auditor
+and future approval review, validation, primary drift, Git apply check, merge
+scope, validation binding and state, sandbox policy, containment, primary
+integrity, and external side effects without parsing prose. Reason/source
+mismatches are rejected by both constructors and validated deserialization.
+
+The public budget-admission reason carries a `BudgetAdmissionDenial` drawn from
+a finite, value-free set: `new_dispatch_stopped`, `missing_cost_estimate`,
+`hard_token_ceiling`, or `hard_cost_ceiling`. Numeric limits, reservations, and
+consumption remain in the structured run-budget report instead of becoming part
+of the denial's stable identity. Every budget-admission denial is `not_retryable`,
+routes to the child or controller, and derives
+`NextSafeOperation::ReviewRunBudgetAndStartNewRun`
+(`review_run_budget_and_start_new_run` on the serialized surface). A new run
+may start only after the budget or scope is corrected.
 
 Sandbox denials carry the existing `SandboxDenialEvidence` type without a second
 schema. Its evidence-level retryability is reporting data, not execution
@@ -1368,6 +1431,7 @@ Routing is explicit and fixed:
 | Denial family | Responsible route |
 | --- | --- |
 | Pre-launch claim-acquisition conflict | Planner or parent |
+| Budget admission | Child or controller |
 | Auditor or validation repair | Child or controller |
 | Merge remediation, including `unclaimed_edits` | Integration controller |
 

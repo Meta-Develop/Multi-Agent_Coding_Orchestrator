@@ -176,7 +176,8 @@ fn codex_runtime_custom_bin_fails_closed_and_cannot_mutate_primary() -> Result<(
     use std::os::unix::fs::PermissionsExt;
 
     let temp = TempDir::new().context("tempdir")?;
-    let repo_path = create_committed_repo(temp.path())?;
+    let private_bin = copy_cargo_built_cli(temp.path())?;
+    let repo_path = create_committed_repo_with_bin(temp.path(), &private_bin)?;
     let marker = repo_path.join("must-not-be-created");
     let custom = temp.path().join("custom-codex");
     fs::write(
@@ -192,7 +193,7 @@ fn codex_runtime_custom_bin_fails_closed_and_cannot_mutate_primary() -> Result<(
     let plan_path = temp.path().join("codex-fail-closed.json");
     write_simple_plan(&plan_path, "codex-child")?;
 
-    let output = Command::new(BIN)
+    let output = Command::new(&private_bin)
         .args([
             "supervise",
             "run",
@@ -1215,6 +1216,27 @@ fn write_simple_plan(path: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn copy_cargo_built_cli(root: &Path) -> Result<std::path::PathBuf> {
+    let mut source = fs::File::open(BIN).context("open Cargo-built maco executable")?;
+    let source_metadata = source
+        .metadata()
+        .context("inspect Cargo-built maco executable")?;
+    let private_bin = root.join("maco-private-bin");
+    let mut destination = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&private_bin)
+        .context("create private maco test executable")?;
+    std::io::copy(&mut source, &mut destination).context("copy private maco test executable")?;
+    destination
+        .sync_all()
+        .context("sync private maco test executable")?;
+    fs::set_permissions(&private_bin, source_metadata.permissions())
+        .context("preserve private maco test executable permissions")?;
+    Ok(private_bin)
+}
+
 fn run_success_json(args: &[&str]) -> Result<Value> {
     let output = Command::new(BIN).args(args).output().context("run maco")?;
     if !output.status.success() {
@@ -1236,8 +1258,12 @@ fn run_failure_stderr(args: &[&str]) -> Result<String> {
 }
 
 fn create_committed_repo(root: &Path) -> Result<std::path::PathBuf> {
+    create_committed_repo_with_bin(root, Path::new(BIN))
+}
+
+fn create_committed_repo_with_bin(root: &Path, bin: &Path) -> Result<std::path::PathBuf> {
     let repo_path = root.join("repo");
-    let output = Command::new(BIN)
+    let output = Command::new(bin)
         .args(["init", "--repo", path_str(&repo_path)?, "--json"])
         .output()?;
     if !output.status.success() {

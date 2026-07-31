@@ -175,6 +175,7 @@ pub enum ApprovalReviewDenial {
 pub enum GateCheckSource {
     ClaimAcquisition,
     DestructiveTargetPreflight,
+    BudgetAdmission,
     Auditor,
     Validation,
     PrimaryDrift,
@@ -217,6 +218,9 @@ pub enum DestructiveTargetDenial {
 #[serde(tag = "family", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GateDenialReason {
     ClaimConflict,
+    BudgetAdmission {
+        denial: BudgetAdmissionDenial,
+    },
     AuditorRepair,
     ValidationRepair {
         blocker: ApplyBlocker,
@@ -257,6 +261,20 @@ pub enum GateDenialRoute {
     IntegrationController,
 }
 
+/// Typed budget-admission causes that may cross into correction and report consumers.
+///
+/// Numeric accounting remains in the structured run-budget report. Keeping this vocabulary
+/// finite and value-free gives each denial class a stable identity without encoding floating
+/// point diagnostics into the correction contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetAdmissionDenial {
+    NewDispatchStopped,
+    MissingCostEstimate,
+    HardTokenCeiling,
+    HardCostCeiling,
+}
+
 /// A typed, non-executable description of the next safe operation.
 ///
 /// Variants are policy vocabulary, not shell commands or reviewer-supplied text.
@@ -264,6 +282,7 @@ pub enum GateDenialRoute {
 #[serde(rename_all = "snake_case")]
 pub enum NextSafeOperation {
     NarrowOrReplanClaimOwnership,
+    ReviewRunBudgetAndStartNewRun,
     RepairAuditorFindings,
     RepairValidation,
     RestoreCleanPrimary,
@@ -894,6 +913,7 @@ fn validate_context_source(reason: &GateDenialReason, source: GateCheckSource) -
         GateDenialReason::DestructiveTarget { .. } => {
             source == GateCheckSource::DestructiveTargetPreflight
         }
+        GateDenialReason::BudgetAdmission { .. } => source == GateCheckSource::BudgetAdmission,
         GateDenialReason::AuditorRepair => {
             matches!(
                 source,
@@ -950,7 +970,8 @@ fn validate_context_source(reason: &GateDenialReason, source: GateCheckSource) -
 
 fn retryability_for(reason: &GateDenialReason) -> GateRetryability {
     match reason {
-        GateDenialReason::ContainmentFailure
+        GateDenialReason::BudgetAdmission { .. }
+        | GateDenialReason::ContainmentFailure
         | GateDenialReason::PrimaryIntegrityFailure
         | GateDenialReason::ExternalSideEffect { .. }
         | GateDenialReason::Sandbox { .. }
@@ -973,7 +994,8 @@ fn is_non_retryable_safety_class(reason: &GateDenialReason) -> bool {
 fn route_for(reason: &GateDenialReason) -> GateDenialRoute {
     match reason {
         GateDenialReason::ClaimConflict => GateDenialRoute::PlannerParent,
-        GateDenialReason::AuditorRepair
+        GateDenialReason::BudgetAdmission { .. }
+        | GateDenialReason::AuditorRepair
         | GateDenialReason::ValidationRepair { .. }
         | GateDenialReason::ContainmentFailure
         | GateDenialReason::Sandbox { .. }
@@ -988,6 +1010,9 @@ fn route_for(reason: &GateDenialReason) -> GateDenialRoute {
 fn next_safe_operation_for(reason: &GateDenialReason) -> NextSafeOperation {
     match reason {
         GateDenialReason::ClaimConflict => NextSafeOperation::NarrowOrReplanClaimOwnership,
+        GateDenialReason::BudgetAdmission { .. } => {
+            NextSafeOperation::ReviewRunBudgetAndStartNewRun
+        }
         GateDenialReason::AuditorRepair => NextSafeOperation::RepairAuditorFindings,
         GateDenialReason::ValidationRepair { .. } => NextSafeOperation::RepairValidation,
         GateDenialReason::MergeRemediation { blocker } => match blocker {
@@ -1073,6 +1098,18 @@ fn prompt_declared_coordinates(reason: &GateDenialReason) -> BTreeSet<&DeclaredP
 fn reason_label(reason: &GateDenialReason) -> &'static str {
     match reason {
         GateDenialReason::ClaimConflict => "pre-launch claim conflict",
+        GateDenialReason::BudgetAdmission { denial } => match denial {
+            BudgetAdmissionDenial::NewDispatchStopped => "run budget stopped new dispatch",
+            BudgetAdmissionDenial::MissingCostEstimate => {
+                "run budget lacks a trustworthy cost estimate"
+            }
+            BudgetAdmissionDenial::HardTokenCeiling => {
+                "run budget hard token ceiling denied dispatch"
+            }
+            BudgetAdmissionDenial::HardCostCeiling => {
+                "run budget hard cost ceiling denied dispatch"
+            }
+        },
         GateDenialReason::AuditorRepair => "auditor repair",
         GateDenialReason::ValidationRepair { blocker } => match blocker {
             ApplyBlocker::ValidationMissing => "validation evidence missing",
@@ -1165,6 +1202,7 @@ fn check_source_label(value: GateCheckSource) -> &'static str {
     match value {
         GateCheckSource::ClaimAcquisition => "claim acquisition",
         GateCheckSource::DestructiveTargetPreflight => "destructive target preflight",
+        GateCheckSource::BudgetAdmission => "budget admission",
         GateCheckSource::Auditor => "auditor",
         GateCheckSource::Validation => "validation",
         GateCheckSource::PrimaryDrift => "primary drift",
@@ -1184,6 +1222,9 @@ fn next_safe_operation_instruction(value: NextSafeOperation) -> &'static str {
     match value {
         NextSafeOperation::NarrowOrReplanClaimOwnership => {
             "return the conflict to the planner or parent to narrow the scope or replan claim ownership."
+        }
+        NextSafeOperation::ReviewRunBudgetAndStartNewRun => {
+            "return the denial to the child controller, review the run-budget evidence, and start a new run only after the budget or scope is corrected."
         }
         NextSafeOperation::RepairAuditorFindings => {
             "return verified auditor repair to the child or controller."
@@ -1438,6 +1479,36 @@ mod tests {
 
         let validation = validation_denial("validation-fix", &[]);
         assert_eq!(validation.route, GateDenialRoute::ChildController);
+    }
+
+    #[test]
+    fn budget_admission_denial_is_non_retryable_typed_child_contract() {
+        let denial = GateDenial::new(
+            "budget-fix",
+            GateDenialReason::BudgetAdmission {
+                denial: BudgetAdmissionDenial::HardTokenCeiling,
+            },
+            VerifiedGateContext::new("child-a", GateCheckSource::BudgetAdmission, ["src/lib.rs"])
+                .expect("budget context"),
+        )
+        .expect("budget denial");
+
+        assert_eq!(denial.context.source, GateCheckSource::BudgetAdmission);
+        assert_eq!(denial.route, GateDenialRoute::ChildController);
+        assert_eq!(denial.retryability, GateRetryability::NotRetryable);
+        assert_eq!(
+            denial.next_safe_operation,
+            NextSafeOperation::ReviewRunBudgetAndStartNewRun
+        );
+        let json = denial.to_json().expect("serialize budget denial");
+        assert_eq!(
+            GateDenial::from_json(&json).expect("deserialize budget denial"),
+            denial
+        );
+
+        let mut wrong_source = serde_json::to_value(&denial).expect("budget denial value");
+        wrong_source["context"]["source"] = serde_json::json!("validation");
+        assert!(serde_json::from_value::<GateDenial>(wrong_source).is_err());
     }
 
     #[test]
@@ -1753,6 +1824,7 @@ mod tests {
         let all_sources = [
             GateCheckSource::ClaimAcquisition,
             GateCheckSource::DestructiveTargetPreflight,
+            GateCheckSource::BudgetAdmission,
             GateCheckSource::Auditor,
             GateCheckSource::Validation,
             GateCheckSource::PrimaryDrift,
@@ -1771,6 +1843,7 @@ mod tests {
             serde_json::json!([
                 "claim_acquisition",
                 "destructive_target_preflight",
+                "budget_admission",
                 "auditor",
                 "validation",
                 "primary_drift",

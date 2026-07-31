@@ -39,6 +39,7 @@ pub mod semantic_coord;
 pub(crate) mod state_journal;
 pub(crate) mod state_migration;
 pub mod supervise;
+mod supervise_budget;
 pub mod swarm_health;
 pub mod sync;
 pub mod sync_store;
