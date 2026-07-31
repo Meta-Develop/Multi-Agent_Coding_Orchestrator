@@ -99,6 +99,22 @@ const MANAGED_LOGICAL_ID: &str = "managed-worktrees";
 static BOUNDED_STATUS_PROCESS_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
     std::sync::OnceLock::new();
 
+/// Configures the one Git repository extension whose on-disk semantics MACO
+/// explicitly supports in addition to libgit2's built-in extension set.
+///
+/// # Safety
+///
+/// This must run exactly once during process bootstrap, before any libgit2
+/// operation can run concurrently. `git2::opts::set_extensions` mutates
+/// libgit2 process-global state and provides no internal synchronization.
+#[doc(hidden)]
+pub unsafe fn configure_libgit2_repository_extensions() -> Result<(), git2::Error> {
+    // SAFETY: The caller upholds the pre-thread, pre-libgit2 bootstrap
+    // requirement documented above. The exact suffix keeps extension checking
+    // enabled and opts in only to relative worktree metadata.
+    unsafe { git2::opts::set_extensions(&["relativeworktrees"]) }
+}
+
 pub(crate) enum ManagedSnapshotSpec {}
 
 impl JournalSpec for ManagedSnapshotSpec {
