@@ -856,10 +856,14 @@ pub struct AggregatedReviewLensVerdict {
     pub validation_errors: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewLensAggregateAuthority {
+    ParentComputed,
+    DeserializedNonAuthoritative,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewLensAggregate {
-    #[serde(deserialize_with = "deserialize_review_schema_version")]
     pub version: u32,
     pub policy: ReviewAggregationPolicy,
     pub decision: ReviewAggregationDecision,
@@ -869,6 +873,22 @@ pub struct ReviewLensAggregate {
     pub procedural_failures: usize,
     pub required_coverage: ReviewCoverageRequirement,
     pub lens_verdicts: Vec<AggregatedReviewLensVerdict>,
+    authority: ReviewLensAggregateAuthority,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewLensAggregateWire {
+    #[serde(deserialize_with = "deserialize_review_schema_version")]
+    version: u32,
+    policy: ReviewAggregationPolicy,
+    decision: ReviewAggregationDecision,
+    required_accepts: usize,
+    validated_accepts: usize,
+    rejected_lenses: usize,
+    procedural_failures: usize,
+    required_coverage: ReviewCoverageRequirement,
+    lens_verdicts: Vec<AggregatedReviewLensVerdict>,
 }
 
 #[derive(Serialize)]
@@ -885,6 +905,10 @@ struct ReviewLensAggregateWireRef<'a> {
 }
 
 impl ReviewLensAggregate {
+    pub fn authority(&self) -> ReviewLensAggregateAuthority {
+        self.authority
+    }
+
     fn wire(&self) -> ReviewLensAggregateWireRef<'_> {
         ReviewLensAggregateWireRef {
             version: self.version,
@@ -897,6 +921,27 @@ impl ReviewLensAggregate {
             required_coverage: &self.required_coverage,
             lens_verdicts: &self.lens_verdicts,
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReviewLensAggregate {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ReviewLensAggregateWire::deserialize(deserializer)?;
+        Ok(Self {
+            version: wire.version,
+            policy: wire.policy,
+            decision: wire.decision,
+            required_accepts: wire.required_accepts,
+            validated_accepts: wire.validated_accepts,
+            rejected_lenses: wire.rejected_lenses,
+            procedural_failures: wire.procedural_failures,
+            required_coverage: wire.required_coverage,
+            lens_verdicts: wire.lens_verdicts,
+            authority: ReviewLensAggregateAuthority::DeserializedNonAuthoritative,
+        })
     }
 }
 
@@ -1045,6 +1090,7 @@ pub fn aggregate_review_lenses(
         procedural_failures,
         required_coverage,
         lens_verdicts,
+        authority: ReviewLensAggregateAuthority::ParentComputed,
     };
     validate_public_review_lens_aggregate_size(&aggregate)?;
     Ok(aggregate)
@@ -5547,6 +5593,54 @@ mod tests {
                 .to_string()
                 .contains("version is unsupported")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn review_lens_deserialized_aggregate_is_explicitly_non_authoritative() -> Result<()> {
+        let lens = model_review_lens(
+            "aggregate-authority-lens",
+            "aggregate-authority-backend",
+            "aggregate-authority-model",
+            ReviewInformationScope::DiffOnly,
+        );
+        let aggregate = aggregate_review_lenses(
+            std::slice::from_ref(&lens),
+            ReviewAggregationPolicy::AllMustAccept,
+            ReviewCoverageRequirement::default(),
+            vec![bound_lens_verdict(
+                &lens,
+                ReviewLensVerdictStatus::Accept,
+                "aggregate-authority-binding",
+            )],
+        )?;
+        assert_eq!(
+            aggregate.authority(),
+            ReviewLensAggregateAuthority::ParentComputed
+        );
+
+        let mut wire = serde_json::to_value(&aggregate)?;
+        assert!(wire.get("authority").is_none());
+        wire["decision"] = serde_json::json!("reject");
+        wire["required_accepts"] = serde_json::json!(99);
+        wire["validated_accepts"] = serde_json::json!(98);
+        wire["rejected_lenses"] = serde_json::json!(97);
+        wire["procedural_failures"] = serde_json::json!(96);
+        wire["required_coverage"] = serde_json::json!({
+            "worker_ids": ["unverified-worker"],
+            "paths": ["unverified/path.rs"]
+        });
+
+        let deserialized: ReviewLensAggregate = serde_json::from_value(wire.clone())?;
+        assert_eq!(
+            deserialized.authority(),
+            ReviewLensAggregateAuthority::DeserializedNonAuthoritative
+        );
+        assert_eq!(deserialized.required_accepts, 99);
+        assert_eq!(deserialized.validated_accepts, 98);
+
+        wire["authority"] = serde_json::json!("parent_computed");
+        assert!(serde_json::from_value::<ReviewLensAggregate>(wire).is_err());
         Ok(())
     }
 
