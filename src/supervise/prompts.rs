@@ -19,6 +19,16 @@ Tool-call batching:
 - Batch independent, side-effect-free inspections in one tool call when the runtime supports it.
 - Keep dependent steps, approval-sensitive actions, and mutations ordered. Batching never relaxes ownership, journaling, validation, or audit requirements.";
 
+fn enforce_rendered_prompt_ceiling(role: &str, rendered: &str, ceiling: usize) -> Result<()> {
+    if rendered.len() > ceiling {
+        bail!(
+            "rendered {role} prompt grew to {} bytes, above its declared {ceiling}-byte fixture ceiling",
+            rendered.len()
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum PromptMeasurementRole {
@@ -967,12 +977,11 @@ REVIEW_LENS_REQUEST_JSON:
             .reasoning_effort()
             .unwrap_or("<runtime-default>"),
     );
-    if prompt.len() > MAX_SUPERVISOR_PROMPT_BYTES {
-        bail!(
-            "review lens prompt exceeds its {} byte launch limit",
-            MAX_SUPERVISOR_PROMPT_BYTES
-        );
-    }
+    enforce_rendered_prompt_ceiling(
+        "parent acceptance auditor review lens",
+        &prompt,
+        PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES,
+    )?;
     let measurement = PromptByteMeasurement::new(
         PromptMeasurementRole::ParentAcceptanceAuditor,
         auditor_id,
@@ -1278,16 +1287,6 @@ mod regression_tests {
         ))
     }
 
-    fn enforce_fixture_ceiling(role: &str, rendered: &str, ceiling: usize) -> Result<()> {
-        if rendered.len() > ceiling {
-            bail!(
-                "rendered {role} prompt grew to {} bytes, above its declared {ceiling}-byte fixture ceiling",
-                rendered.len()
-            );
-        }
-        Ok(())
-    }
-
     fn common_prefix_bytes(left: &str, right: &str) -> usize {
         left.bytes()
             .zip(right.bytes())
@@ -1375,7 +1374,7 @@ mod regression_tests {
                 "{role}: {} rendered bytes (ceiling {ceiling})",
                 rendered.len()
             );
-            enforce_fixture_ceiling(role, rendered, ceiling)
+            enforce_rendered_prompt_ceiling(role, rendered, ceiling)
                 .unwrap_or_else(|error| panic!("{error:#}"));
         }
     }
@@ -1383,7 +1382,7 @@ mod regression_tests {
     #[test]
     fn rendered_role_prompt_ceiling_guard_rejects_growth() {
         let oversized = "x".repeat(WORKER_PROMPT_FIXTURE_CEILING_BYTES.saturating_add(1));
-        let error = enforce_fixture_ceiling(
+        let error = enforce_rendered_prompt_ceiling(
             "terminal worker",
             &oversized,
             WORKER_PROMPT_FIXTURE_CEILING_BYTES,
@@ -1695,6 +1694,62 @@ mod regression_tests {
         assert!(report_argv
             .iter()
             .any(|argument| argument == "model_reasoning_effort=\"xhigh\""));
+        Ok(())
+    }
+
+    #[test]
+    fn review_lens_prompt_rejects_parent_auditor_ceiling_overrun() -> Result<()> {
+        let assignment = OrchestratorAssignment {
+            id: "child-bounded-lens".to_string(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("src/review.rs")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            notes: None,
+        };
+        let lens = ReviewLensConfig {
+            id: "bounded-output".to_string(),
+            backend: ReviewLensBackendConfig::Model {
+                backend_id: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                reasoning_effort: Some("high".to_string()),
+            },
+            information_scope: ReviewInformationScope::OutputReportOnly,
+        };
+        let oversized_report = "x".repeat(PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES);
+        let request = build_review_lens_request(
+            &lens,
+            ReviewLensRequestSources {
+                child_transcript: "",
+                diff: "",
+                output_report: &oversized_report,
+            },
+        )?;
+        let error = match render_review_lens_auditor_prompt(
+            ReviewLensAuditorPromptContext {
+                assignment: &assignment,
+                lens: &lens,
+                request: &request,
+                required_coverage: &ReviewCoverageRequirement::default(),
+            },
+            0,
+        ) {
+            Ok(_) => panic!("an oversized real lens prompt must fail before launch"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("parent acceptance auditor review lens"),
+            "unexpected rejection: {error}"
+        );
+        assert!(error
+            .to_string()
+            .contains(&PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES.to_string()));
         Ok(())
     }
 }
