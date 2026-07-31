@@ -45,7 +45,7 @@ fn validated_scheduler_assignment_schedule(
         .context("supervisor scheduler rejected the validated assignment schedule")
 }
 
-fn release_assignment_resources_after_completion(
+pub(super) fn release_assignment_resources_after_completion(
     plan: &SupervisorPlan,
     schedule: &[AssignmentScheduleEntry],
     max_concurrent_children: usize,

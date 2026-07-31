@@ -96,7 +96,7 @@ pub(super) fn ensure_reusable_child_worktree(record: &WorktreeRecord, primary_he
     Ok(())
 }
 
-fn repository_is_dirty(repo: &Repository, context: &'static str) -> Result<bool> {
+pub(super) fn repository_is_dirty(repo: &Repository, context: &'static str) -> Result<bool> {
     Ok(!repository_dirty_paths(repo, context)?.is_empty())
 }
 

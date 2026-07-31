@@ -154,7 +154,7 @@ pub(super) fn release_concurrent_assignment(
     }
 }
 
-fn assignment_outcome_succeeded(outcome: &AssignmentExecutionOutcome) -> bool {
+pub(super) fn assignment_outcome_succeeded(outcome: &AssignmentExecutionOutcome) -> bool {
     !outcome.assignment_failed
         && !outcome.external_containment_failed
         && outcome.fatal_error.is_none()
@@ -197,7 +197,7 @@ pub(super) fn assignment_admission_state(
     }
 }
 
-fn suppressed_descendant_outcome(
+pub(super) fn suppressed_descendant_outcome(
     assignment: &OrchestratorAssignment,
     parent_assignment_id: &str,
 ) -> AssignmentExecutionOutcome {

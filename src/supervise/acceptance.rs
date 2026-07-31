@@ -564,7 +564,7 @@ fn auditor_review_path_coverage(
     }
 }
 
-fn validate_worker_report_delegation_attestations(
+pub(super) fn validate_worker_report_delegation_attestations(
     assignment: &OrchestratorAssignment,
     report_path: &Path,
     report: &mut OrchestratorReviewReport,
@@ -720,7 +720,7 @@ fn verify_child_report_paths(
             .to_string();
 }
 
-fn validate_assignment_report_plumbing(
+pub(super) fn validate_assignment_report_plumbing(
     assignment: &OrchestratorAssignment,
     assignment_metadata: &AssignmentMetadata,
     report_path: &Path,
@@ -1114,7 +1114,7 @@ pub(super) fn display_decomposition_targets(
     }
 }
 
-fn validate_worker_report_evidence(
+pub(super) fn validate_worker_report_evidence(
     assignment: &OrchestratorAssignment,
     assignment_metadata: &AssignmentMetadata,
     report_path: &Path,
@@ -1307,7 +1307,7 @@ fn validate_worker_report_evidence(
         "inspect worker reports and rerun the child scope with corrected evidence".to_string();
 }
 
-fn validate_worker_execution_journal_evidence(
+pub(super) fn validate_worker_execution_journal_evidence(
     assignment: &OrchestratorAssignment,
     report_path: &Path,
     journals: &WorkerExecutionJournalEvidenceSet,

@@ -27,7 +27,7 @@ pub(super) fn write_supervisor_final_schema(writer: &mut ArtifactRunWriter, rela
     write_schema(writer, relative, supervisor_final_report_schema_value())
 }
 
-fn supervisor_final_report_schema_value() -> serde_json::Value {
+pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "SupervisorFinalReport",
@@ -158,7 +158,7 @@ fn run_budget_report_schema_value() -> serde_json::Value {
     })
 }
 
-fn orchestrator_report_schema_value() -> serde_json::Value {
+pub(super) fn orchestrator_report_schema_value() -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "OrchestratorReviewReport",
@@ -307,7 +307,7 @@ pub(super) fn write_auditor_schema(writer: &mut ArtifactRunWriter, relative: &Pa
     write_schema(writer, relative, auditor_report_schema_value())
 }
 
-fn auditor_report_schema_value() -> serde_json::Value {
+pub(super) fn auditor_report_schema_value() -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "AuditorReport",
@@ -351,7 +351,7 @@ fn auditor_report_schema_value() -> serde_json::Value {
     })
 }
 
-fn worker_report_schema_value() -> serde_json::Value {
+pub(super) fn worker_report_schema_value() -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "WorkerReport",
@@ -458,7 +458,7 @@ fn bloated_file_flag_schema_value() -> serde_json::Value {
     })
 }
 
-fn decomposition_completion_schema_value() -> serde_json::Value {
+pub(super) fn decomposition_completion_schema_value() -> serde_json::Value {
     json!({
         "type": ["object", "null"],
         "additionalProperties": false,
@@ -494,7 +494,7 @@ fn decomposition_completion_object_schema_value() -> serde_json::Value {
     })
 }
 
-fn command_run_record_schema_value() -> serde_json::Value {
+pub(super) fn command_run_record_schema_value() -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -845,7 +845,7 @@ pub(super) fn write_final_report(
     .context("failed to write normalized supervisor final report")
 }
 
-fn read_supervisor_final_report(reader: &ArtifactRunReader) -> Result<SupervisorFinalReport> {
+pub(super) fn read_supervisor_final_report(reader: &ArtifactRunReader) -> Result<SupervisorFinalReport> {
     let relative = RunArtifactFamily::Supervise.final_report_relative_path();
     let contents = reader.read(&relative).with_context(|| {
         format!(

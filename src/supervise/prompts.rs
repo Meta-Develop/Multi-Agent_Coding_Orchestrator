@@ -17,7 +17,7 @@ pub(super) fn fresh_field_guide_frame_nonce(
     }
 }
 
-fn field_guide_frame_tokens(nonce: &str) -> (String, String) {
+pub(super) fn field_guide_frame_tokens(nonce: &str) -> (String, String) {
     (
         format!("{FIELD_GUIDE_FRAME_BEGIN_PREFIX}{nonce}"),
         format!("{FIELD_GUIDE_FRAME_END_PREFIX}{nonce}"),
@@ -313,7 +313,7 @@ pub fn worker_prompt(
     )
 }
 
-fn worker_prompt_with_incoming_root(
+pub(super) fn worker_prompt_with_incoming_root(
     plan: &SupervisorPlan,
     orchestrator: &OrchestratorAssignment,
     worker: &WorkerAssignment,
@@ -337,7 +337,7 @@ fn worker_prompt_with_incoming_root(
     )
 }
 
-fn worker_prompt_with_field_guide(
+pub(super) fn worker_prompt_with_field_guide(
     context: WorkerPromptRenderContext<'_>,
     field_guide: &SupervisorFieldGuidePrompt,
 ) -> Result<String> {
@@ -465,7 +465,7 @@ fn review_auditor_prompt_with_metadata(
     )
 }
 
-fn review_auditor_prompt_with_metadata_and_field_guide(
+pub(super) fn review_auditor_prompt_with_metadata_and_field_guide(
     plan: &SupervisorPlan,
     orchestrator: &OrchestratorAssignment,
     assignment_metadata: &AssignmentMetadata,
@@ -659,7 +659,7 @@ fn role_model_selection(
     (selection.model, selection.reasoning_effort)
 }
 
-fn provisional_default_role_model_selection(role: AgentRole) -> RoleModelSelection {
+pub(super) fn provisional_default_role_model_selection(role: AgentRole) -> RoleModelSelection {
     let reasoning_effort = match role {
         AgentRole::Worker => "medium",
         AgentRole::GateClassifier => "high",
@@ -691,7 +691,7 @@ pub(super) fn provisional_default_role_models() -> BTreeMap<AgentRole, RoleModel
     .collect()
 }
 
-fn effective_role_model_selection(plan: &SupervisorPlan, role: AgentRole) -> RoleModelSelection {
+pub(super) fn effective_role_model_selection(plan: &SupervisorPlan, role: AgentRole) -> RoleModelSelection {
     plan.role_models
         .get(&role)
         .cloned()

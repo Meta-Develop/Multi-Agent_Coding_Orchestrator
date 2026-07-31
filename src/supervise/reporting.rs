@@ -307,7 +307,7 @@ fn external_process_quiescent_for_scratch(
     }
 }
 
-fn parse_report_json<T>(contents: &str) -> Result<ParsedReport<T>>
+pub(super) fn parse_report_json<T>(contents: &str) -> Result<ParsedReport<T>>
 where
     T: DeserializeOwned,
 {
@@ -788,7 +788,7 @@ pub(super) fn accepted_decomposition_candidates(
         .collect()
 }
 
-fn accepted_field_guide_drafts(
+pub(super) fn accepted_field_guide_drafts(
     plan: &SupervisorPlan,
     reports: &[OrchestratorReviewReport],
 ) -> Result<Vec<AcceptedFieldGuideDraft>> {
@@ -1152,7 +1152,7 @@ pub(super) fn deterministic_fake_auditor_run(
     Ok(deterministic_fake_run(command, output))
 }
 
-fn deterministic_fake_run(command: &ExternalAgentCommand, output: Vec<u8>) -> ExternalAgentRun {
+pub(super) fn deterministic_fake_run(command: &ExternalAgentCommand, output: Vec<u8>) -> ExternalAgentRun {
     ExternalAgentRun {
         command: vec!["maco-internal-deterministic-fake".to_string()],
         cwd: command.cwd.clone(),
@@ -1381,7 +1381,7 @@ pub(super) fn command_record_from_external(
     }
 }
 
-fn sandbox_denials_for_report(denials: &[SandboxDenialEvidence]) -> Vec<SandboxDenialEvidence> {
+pub(super) fn sandbox_denials_for_report(denials: &[SandboxDenialEvidence]) -> Vec<SandboxDenialEvidence> {
     denials
         .iter()
         .cloned()

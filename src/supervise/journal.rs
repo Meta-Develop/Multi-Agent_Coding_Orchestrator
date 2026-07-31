@@ -217,7 +217,7 @@ pub(super) fn record_pre_action_event_strict(
     Ok(())
 }
 
-fn field_guide_injection_payload(
+pub(super) fn field_guide_injection_payload(
     prompt_role: SupervisePromptRole,
     prompt: &SupervisorFieldGuidePrompt,
     attempt: usize,

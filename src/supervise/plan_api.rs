@@ -44,7 +44,7 @@ pub fn supervisor_plan_document_from_task_file(
     )
 }
 
-fn supervisor_plan_and_consultant_from_task_file(
+pub(super) fn supervisor_plan_and_consultant_from_task_file(
     repo: impl AsRef<Path>,
     task_file: impl AsRef<Path>,
 ) -> Result<LoadedSupervisorPlan> {
@@ -202,7 +202,7 @@ pub fn load_supervisor_plan_file(path: impl AsRef<Path>) -> Result<SupervisorPla
     Ok(load_supervisor_plan_file_with_consultant(path)?.plan)
 }
 
-fn load_supervisor_plan_file_with_consultant(
+pub(super) fn load_supervisor_plan_file_with_consultant(
     path: impl AsRef<Path>,
 ) -> Result<LoadedSupervisorPlan> {
     let path = path.as_ref();
@@ -221,7 +221,7 @@ fn read_supervisor_input(path: &Path, label: &str) -> Result<String> {
         .with_context(|| format!("{label} is not valid UTF-8: {}", path.display()))
 }
 
-fn parse_supervisor_plan_with_consultant(contents: &str) -> Result<LoadedSupervisorPlan> {
+pub(super) fn parse_supervisor_plan_with_consultant(contents: &str) -> Result<LoadedSupervisorPlan> {
     let value: Value = serde_json::from_str(contents).context("supervisor plan is not JSON")?;
     let consultant = consultant_from_plan_value(&value)?;
     let mut plan: SupervisorPlan =
