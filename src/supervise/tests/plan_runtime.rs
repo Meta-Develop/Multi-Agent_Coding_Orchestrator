@@ -124,6 +124,64 @@ fn old_and_new_supervisor_model_economics_schema_round_trip() {
 }
 
 #[test]
+fn supervisor_plan_loads_executable_stacked_review_lens_configuration() {
+    let mut value =
+        serde_json::from_slice::<Value>(&bounded_loader_plan_json()).expect("parse base plan");
+    let object = value.as_object_mut().expect("plan object");
+    object.insert(
+        "review_lenses".to_string(),
+        json!([
+            {
+                "id": "diff-security",
+                "backend": {
+                    "kind": "model",
+                    "backend_id": "provider-alpha",
+                    "model": "model-alpha",
+                    "reasoning_effort": "high"
+                },
+                "information_scope": "diff_only"
+            },
+            {
+                "id": "report-consistency",
+                "backend": {
+                    "kind": "model",
+                    "backend_id": "provider-beta",
+                    "model": "model-beta",
+                    "reasoning_effort": "xhigh"
+                },
+                "information_scope": "output_report_only"
+            }
+        ]),
+    );
+    object.insert(
+        "review_aggregation_policy".to_string(),
+        json!({"kind": "validated_quorum", "minimum_accepts": 2}),
+    );
+    let loaded = parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&value).expect("serialize stacked plan"),
+    )
+    .expect("load stacked review lens plan");
+    assert_eq!(loaded.plan.review_lenses.len(), 2);
+    assert_eq!(
+        loaded.plan.review_lenses[0].backend.backend_id(),
+        "provider-alpha"
+    );
+    assert_eq!(loaded.plan.review_lenses[0].backend.model(), "model-alpha");
+    assert_eq!(
+        loaded.plan.review_lenses[0].backend.reasoning_effort(),
+        Some("high")
+    );
+    assert_eq!(
+        loaded.plan.review_lenses[1].information_scope,
+        ReviewInformationScope::OutputReportOnly
+    );
+    assert_eq!(
+        loaded.plan.review_aggregation_policy,
+        ReviewAggregationPolicy::ValidatedQuorum { minimum_accepts: 2 }
+    );
+}
+
+#[test]
 fn recursive_supervisor_plan_flattens_and_preserves_schedule_on_round_trip() {
     let source = json!({
         "version": 1,
@@ -1430,6 +1488,16 @@ fn known_unavailable_child_runtime_default_reaches_production_app_server_argv_be
             unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
         },
     );
+    let ReviewLensBackendConfig::Model {
+        model,
+        reasoning_effort,
+        ..
+    } = &mut plan.review_lenses[0].backend
+    else {
+        panic!("default supervisor lens must be model-backed");
+    };
+    *model = "available-auditor-model".to_string();
+    *reasoning_effort = Some("xhigh".to_string());
     let options = injected_options(
         &repo_path,
         temp.path(),
@@ -1502,7 +1570,7 @@ fn known_unavailable_child_runtime_default_reaches_production_app_server_argv_be
 }
 
 #[test]
-fn known_unavailable_auditor_runtime_default_reaches_production_exec_argv_before_dispatch() {
+fn configured_lens_selection_supersedes_role_wide_auditor_fallback_at_dispatch() {
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
@@ -1522,6 +1590,16 @@ fn known_unavailable_auditor_runtime_default_reaches_production_exec_argv_before
             unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
         },
     );
+    let ReviewLensBackendConfig::Model {
+        model,
+        reasoning_effort,
+        ..
+    } = &mut plan.review_lenses[0].backend
+    else {
+        panic!("default supervisor lens must be model-backed");
+    };
+    *model = "available-child-model".to_string();
+    *reasoning_effort = Some("xhigh".to_string());
     let options = injected_options(
         &repo_path,
         temp.path(),
@@ -1539,15 +1617,15 @@ fn known_unavailable_auditor_runtime_default_reaches_production_exec_argv_before
         if name.contains("review-auditor") {
             auditor_seen = true;
             assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
-            assert!(command.model.is_none());
+            assert_eq!(command.model.as_deref(), Some("available-child-model"));
+            assert_eq!(command.model_provider.as_deref(), Some("openai"));
             let argv = crate::external_agent::command_argv(command)
                 .into_iter()
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
-            assert!(
-                !argv.iter().any(|argument| argument == "-m"),
-                "known-unavailable auditor model remained pinned in exec argv: {argv:?}"
-            );
+            assert!(argv
+                .windows(2)
+                .any(|arguments| arguments == ["-m", "available-child-model"]));
             assert!(argv
                 .windows(2)
                 .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"xhigh\""] }));
@@ -1751,9 +1829,14 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
             },
         ),
     ]);
+    let ReviewLensBackendConfig::Model { model, .. } = &mut plan.review_lenses[0].backend else {
+        panic!("default supervisor lens must be model-backed");
+    };
+    *model = "auditor-model".to_string();
     let samples = vec![
         RoleUsageSample {
             role: AgentRole::ChildOrchestrator,
+            lens_id: None,
             model: Some("planner-model".to_string()),
             usage: Usage {
                 input_tokens: 1_000,
@@ -1763,6 +1846,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
         },
         RoleUsageSample {
             role: AgentRole::ChildOrchestrator,
+            lens_id: None,
             model: Some("planner-model".to_string()),
             usage: Usage {
                 input_tokens: 500,
@@ -1772,6 +1856,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
         },
         RoleUsageSample {
             role: AgentRole::Auditor,
+            lens_id: Some("parent-acceptance".to_string()),
             model: Some("auditor-model".to_string()),
             usage: Usage {
                 input_tokens: 500,
@@ -1781,6 +1866,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
         },
         RoleUsageSample {
             role: AgentRole::Auditor,
+            lens_id: Some("parent-acceptance".to_string()),
             model: Some("auditor-model".to_string()),
             usage: Usage {
                 input_tokens: 250,
@@ -1791,8 +1877,11 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
     ];
     let RoleUsageAggregation {
         reports: by_role,
+        lens_reports,
         total_usage: total,
         total_cost_usd: cost,
+        lens_total_usage,
+        lens_total_cost_usd,
     } = role_usage_report(&plan, samples.clone()).expect("aggregate process usage");
     assert_eq!(
         by_role[&AgentRole::ChildOrchestrator].usage,
@@ -1842,16 +1931,40 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
         RoleUsageObservation::SupervisorAggregate
     );
     assert_eq!(by_role[&AgentRole::Supervisor].usage, total);
+    assert_eq!(lens_reports.len(), 1);
+    assert_eq!(lens_reports[0].lens_id, "parent-acceptance");
+    assert_eq!(
+        lens_reports[0].observation,
+        RoleUsageObservation::ProcessObserved
+    );
+    assert_eq!(
+        lens_reports[0].usage,
+        Some(Usage {
+            input_tokens: 750,
+            output_tokens: 150,
+            total_tokens: 900,
+        })
+    );
+    assert_eq!(lens_total_usage, lens_reports[0].usage);
+    assert_eq!(lens_total_cost_usd, lens_reports[0].cost_usd);
 
     plan.model_pricing.clear();
     let RoleUsageAggregation {
         reports: unpriced,
+        lens_reports: unpriced_lenses,
         total_usage: unpriced_total,
         total_cost_usd: unpriced_cost,
+        lens_total_usage: unpriced_lens_total,
+        lens_total_cost_usd: unpriced_lens_cost,
     } = role_usage_report(&plan, samples).expect("aggregate unpriced process usage");
     assert_eq!(unpriced_total, total);
     assert!(unpriced.values().all(|report| report.cost_usd.is_none()));
     assert!(unpriced_cost.is_none());
+    assert_eq!(unpriced_lens_total, lens_total_usage);
+    assert!(unpriced_lens_cost.is_none());
+    assert!(unpriced_lenses
+        .iter()
+        .all(|report| report.cost_usd.is_none()));
 
     let mut incomplete = by_role;
     assert!(finalize_supervisor_cost(false, &mut incomplete, cost).is_none());
@@ -1871,8 +1984,11 @@ fn empty_process_usage_has_no_synthetic_supervisor_or_worker_totals() {
     .plan;
     let RoleUsageAggregation {
         reports: by_role,
+        lens_reports,
         total_usage: total,
         total_cost_usd: cost,
+        lens_total_usage,
+        lens_total_cost_usd,
     } = role_usage_report(&plan, Vec::new()).expect("empty process aggregation");
     assert!(total.is_none());
     assert!(cost.is_none());
@@ -1883,6 +1999,278 @@ fn empty_process_usage_has_no_synthetic_supervisor_or_worker_totals() {
         by_role[&AgentRole::Worker].observation,
         RoleUsageObservation::NotProcessObservable
     );
+    assert!(lens_total_usage.is_none());
+    assert!(lens_total_cost_usd.is_none());
+    assert_eq!(lens_reports.len(), 1);
+    assert_eq!(
+        lens_reports[0].observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+    assert!(lens_reports[0]
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("not heuristically allocated")));
+}
+
+#[test]
+fn supervisor_derives_review_coverage_from_assignment_and_run_report() {
+    let assignment = injected_assignment(true);
+    let mut child = injected_child_report(&assignment);
+    child.files_changed = vec![PathBuf::from("docs/runtime-evidence.md")];
+    let required = supervisor_review_coverage_requirement(&assignment, &child);
+    assert_eq!(required.worker_ids, vec!["worker-a"]);
+    assert_eq!(
+        required.paths,
+        vec![
+            PathBuf::from("README.md"),
+            PathBuf::from("docs/runtime-evidence.md")
+        ]
+    );
+}
+
+#[test]
+fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let mut plan = injected_plan(assignment.clone(), 0);
+    plan.review_lenses = vec![
+        ReviewLensConfig {
+            id: "diff-security".to_string(),
+            backend: ReviewLensBackendConfig::Model {
+                backend_id: "provider-alpha".to_string(),
+                model: "model-alpha".to_string(),
+                reasoning_effort: Some("high".to_string()),
+            },
+            information_scope: ReviewInformationScope::DiffOnly,
+        },
+        ReviewLensConfig {
+            id: "report-consistency".to_string(),
+            backend: ReviewLensBackendConfig::Model {
+                backend_id: "provider-beta".to_string(),
+                model: "model-beta".to_string(),
+                reasoning_effort: Some("xhigh".to_string()),
+            },
+            information_scope: ReviewInformationScope::OutputReportOnly,
+        },
+    ];
+    plan.review_aggregation_policy = ReviewAggregationPolicy::AllMustAccept;
+    plan.model_pricing = BTreeMap::from([
+        (
+            "model-alpha".to_string(),
+            ModelPricing {
+                input_usd_per_million_tokens: 1.0,
+                output_usd_per_million_tokens: 2.0,
+            },
+        ),
+        (
+            "model-beta".to_string(),
+            ModelPricing {
+                input_usd_per_million_tokens: 3.0,
+                output_usd_per_million_tokens: 4.0,
+            },
+        ),
+    ]);
+    let options = injected_options(&repo_path, temp.path(), "stacked-review-lenses-execute");
+    let run_id = options.run_id.clone();
+    let catalog = injected_codex_runtime_catalog(&["model-alpha", "model-beta"]);
+    let mut lens_commands = Vec::new();
+    let mut lens_prompts = Vec::new();
+    let mut runner = |command: &ExternalAgentCommand| {
+        let name = command
+            .output_last_message
+            .file_name()
+            .and_then(OsStr::to_str)
+            .expect("UTF-8 output name");
+        if name.contains("review-auditor") {
+            let mut audit =
+                injected_auditor_report(&assignment, &injected_child_report(&assignment));
+            audit.id = name
+                .strip_suffix(".json")
+                .expect("auditor JSON suffix")
+                .to_string();
+            write_injected_json(&command.output_last_message, &audit);
+            lens_commands.push(command.clone());
+            lens_prompts.push(fs::read_to_string(&command.prompt).expect("read lens prompt"));
+            if name.contains("lens-0") {
+                write_injected_usage(command, 100, 20);
+            } else {
+                write_injected_usage(command, 200, 40);
+            }
+        } else {
+            write_injected_assignment_report(command, &assignment);
+            write_injected_usage(command, 50, 10);
+        }
+        injected_verified_run(command)
+    };
+    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        Ok(catalog),
+        &mut runner,
+    )
+    .expect("run stacked review lenses");
+
+    assert!(
+        report.success,
+        "unexpected stacked-lens failure: {report:#?}"
+    );
+    assert_eq!(lens_commands.len(), 2);
+    assert_ne!(lens_commands[0].cwd, lens_commands[1].cwd);
+    assert_eq!(
+        lens_commands[0].model_provider.as_deref(),
+        Some("provider-alpha")
+    );
+    assert_eq!(lens_commands[0].model.as_deref(), Some("model-alpha"));
+    assert_eq!(lens_commands[0].reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(
+        lens_commands[1].model_provider.as_deref(),
+        Some("provider-beta")
+    );
+    assert_eq!(lens_commands[1].model.as_deref(), Some("model-beta"));
+    assert_eq!(lens_commands[1].reasoning_effort.as_deref(), Some("xhigh"));
+    assert!(lens_prompts[0].contains("\"scope\":\"diff_only\""));
+    assert!(!lens_prompts[0].contains("\"scope\":\"output_report_only\""));
+    assert!(lens_prompts[1].contains("\"scope\":\"output_report_only\""));
+    assert!(!lens_prompts[1].contains("\"scope\":\"diff_only\""));
+    let child = &report.orchestrator_reports[0];
+    let aggregate = child
+        .review_lens_aggregate
+        .as_ref()
+        .expect("parent-computed lens aggregate");
+    assert_eq!(
+        aggregate.authority(),
+        ReviewLensAggregateAuthority::ParentComputed
+    );
+    assert_eq!(aggregate.decision, ReviewAggregationDecision::Accept);
+    assert_eq!(aggregate.lens_verdicts.len(), 2);
+    assert_eq!(child.audit_reports.len(), 2);
+    assert!(report.usage_complete);
+    assert_eq!(report.review_lens_usage.len(), 2);
+    assert!(report.review_lens_usage.iter().all(|usage| {
+        usage.observation == RoleUsageObservation::ProcessObserved && usage.usage.is_some()
+    }));
+    assert_eq!(
+        report.review_lens_total_usage,
+        Some(Usage {
+            input_tokens: 300,
+            output_tokens: 60,
+            total_tokens: 360,
+        })
+    );
+    assert!(report
+        .review_lens_total_cost_usd
+        .is_some_and(|cost| (cost - 0.0009).abs() < 1e-12));
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+        .expect("open stacked-lens artifacts");
+    let events = read_finalized_orchestration_events(&reader);
+    let aggregate_event = events
+        .iter()
+        .find(|event| {
+            event.kind == OrchestrationEventKind::Gate
+                && event.payload.get("review_lens_aggregate").is_some()
+        })
+        .expect("strict aggregate gate event");
+    assert_eq!(
+        aggregate_event.payload["review_lens_aggregate"]["lens_verdicts"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    for audit in &child.audit_reports {
+        assert!(events.iter().any(|event| {
+            event.node == audit.id
+                && event.kind == OrchestrationEventKind::Accept
+                && event.payload["status"] == "succeeded"
+        }));
+    }
+    let reloaded: SupervisorFinalReport = serde_json::from_value(
+        serde_json::to_value(&report).expect("serialize stacked final report"),
+    )
+    .expect("deserialize stacked final report");
+    assert_eq!(
+        reloaded.orchestrator_reports[0]
+            .review_lens_aggregate
+            .as_ref()
+            .map(ReviewLensAggregate::authority),
+        Some(ReviewLensAggregateAuthority::DeserializedNonAuthoritative)
+    );
+}
+
+#[test]
+fn unavailable_lens_runtime_selection_is_reported_and_journaled_procedurally() {
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let mut plan = injected_plan(assignment.clone(), 0);
+    plan.role_models.insert(
+        AgentRole::ChildOrchestrator,
+        RoleModelSelection {
+            model: Some("child-model".to_string()),
+            reasoning_effort: Some("high".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+        },
+    );
+    let ReviewLensBackendConfig::Model { model, .. } = &mut plan.review_lenses[0].backend else {
+        panic!("default supervisor lens must be model-backed");
+    };
+    *model = "missing-lens-model".to_string();
+    let options = injected_options(
+        &repo_path,
+        temp.path(),
+        "unavailable-lens-selection-procedural",
+    );
+    let run_id = options.run_id.clone();
+    let catalog = injected_codex_runtime_catalog(&["child-model"]);
+    let mut invocations = Vec::new();
+    let mut runner = |command: &ExternalAgentCommand| {
+        let name = command
+            .output_last_message
+            .file_name()
+            .and_then(OsStr::to_str)
+            .expect("UTF-8 output name");
+        invocations.push(name.to_string());
+        assert!(!name.contains("review-auditor"));
+        write_injected_assignment_report(command, &assignment);
+        write_injected_usage(command, 50, 10);
+        injected_verified_run(command)
+    };
+    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        Ok(catalog),
+        &mut runner,
+    )
+    .expect("finalize unavailable-lens procedural report");
+    assert_eq!(invocations.len(), 1);
+    assert!(!report.success);
+    let aggregate = report.orchestrator_reports[0]
+        .review_lens_aggregate
+        .as_ref()
+        .expect("procedural aggregate");
+    assert_eq!(
+        aggregate.decision,
+        ReviewAggregationDecision::ProceduralFailure
+    );
+    assert_eq!(aggregate.procedural_failures, 1);
+    assert_eq!(
+        aggregate.lens_verdicts[0].effective_verdict,
+        ReviewLensVerdictStatus::ProceduralFailure
+    );
+    assert_eq!(
+        report.review_lens_usage[0].observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+        .expect("open procedural lens artifacts");
+    assert!(read_finalized_orchestration_events(&reader)
+        .iter()
+        .any(|event| {
+            event.kind == OrchestrationEventKind::Gate
+                && event.payload["review_lens_aggregate"]["decision"] == "procedural_failure"
+        }));
 }
 
 #[cfg(unix)]

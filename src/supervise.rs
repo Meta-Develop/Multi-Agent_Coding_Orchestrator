@@ -41,6 +41,14 @@ use crate::{
         ProcessTreeEvidence, SideEffectConfinementEvidence, SideEffectConfinementProfile,
         StdinMode, StrictOfflineWorkspaceProfile, WorkspaceAccess,
     },
+    review::{
+        aggregate_review_lenses_against_requests, build_review_lens_request,
+        validate_review_lens_set, ReviewAggregationDecision, ReviewAggregationPolicy,
+        ReviewCoverageRequirement, ReviewInformationScope, ReviewLensAggregate,
+        ReviewLensAggregateAuthority, ReviewLensBackendConfig, ReviewLensConfig,
+        ReviewLensCoverage, ReviewLensEvidenceKind, ReviewLensRequest, ReviewLensRequestSources,
+        ReviewLensVerdict, ReviewLensVerdictStatus, REVIEW_LENS_REQUEST_LIMIT_BYTES,
+    },
     safe_state::BoundedRegularReader,
     secure_output::SecureOutputRoot,
     semantic_coord::{SemanticIntent, SemanticIntentRequest, SemanticIntentStore},
@@ -62,8 +70,8 @@ use crate::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use git2::{
-    Delta, DiffFindOptions, DiffOptions, ErrorCode, ObjectType, Oid, Repository, Status,
-    StatusOptions,
+    Delta, DiffFindOptions, DiffFormat, DiffOptions, ErrorCode, ObjectType, Oid, Repository,
+    Status, StatusOptions,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize, Serializer};
 use serde_json::{json, Value};
@@ -271,8 +279,24 @@ pub struct SupervisorPlan {
     pub role_models: BTreeMap<AgentRole, RoleModelSelection>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_pricing: BTreeMap<String, ModelPricing>,
+    #[serde(default = "default_supervisor_review_lenses")]
+    pub review_lenses: Vec<ReviewLensConfig>,
+    #[serde(default)]
+    pub review_aggregation_policy: ReviewAggregationPolicy,
     #[serde(default)]
     pub assignments: Vec<OrchestratorAssignment>,
+}
+
+pub(crate) fn default_supervisor_review_lenses() -> Vec<ReviewLensConfig> {
+    vec![ReviewLensConfig {
+        id: "parent-acceptance".to_string(),
+        backend: ReviewLensBackendConfig::Model {
+            backend_id: "openai".to_string(),
+            model: DEFAULT_PROFILE_MODEL.to_string(),
+            reasoning_effort: Some("xhigh".to_string()),
+        },
+        information_scope: ReviewInformationScope::FullChildTranscript,
+    }]
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
@@ -780,6 +804,8 @@ pub struct OrchestratorReviewReport {
     pub worker_reports: Vec<WorkerReport>,
     #[serde(default)]
     pub audit_reports: Vec<AuditorReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_lens_aggregate: Option<ReviewLensAggregate>,
     #[serde(default)]
     pub decomposition_completions: Vec<DecompositionCompletion>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -829,6 +855,12 @@ pub struct SupervisorFinalReport {
     pub run_budget: Option<RunBudgetReport>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub role_usage: BTreeMap<AgentRole, RoleUsageReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_lens_usage: Vec<ReviewLensUsageReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_lens_total_usage: Option<Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_lens_total_cost_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_usage: Option<Usage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -905,6 +937,20 @@ pub struct RoleUsageReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
     #[serde(default)]
+    pub observation: RoleUsageObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct ReviewLensUsageReport {
+    pub lens_id: String,
+    pub backend_id: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
     pub observation: RoleUsageObservation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
@@ -1190,6 +1236,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         field_guide_entries: Vec::new(),
         worker_reports: vec![worker],
         audit_reports: vec![audit],
+        review_lens_aggregate: None,
         decomposition_completions: vec![completion.clone()],
         gate_denials: Vec::new(),
         gate_correction_outcomes: Vec::new(),
@@ -1222,6 +1269,9 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         role_economics_profile: None,
         run_budget: None,
         role_usage: BTreeMap::new(),
+        review_lens_usage: Vec::new(),
+        review_lens_total_usage: None,
+        review_lens_total_cost_usd: None,
         total_usage: None,
         total_cost_usd: None,
         usage_complete: true,
@@ -1414,6 +1464,7 @@ struct WorkerPromptRenderContext<'a> {
     schema_path: &'a Path,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 struct ParentReviewAuditorPromptContext<'a> {
     plan: &'a SupervisorPlan,
     assignment: &'a OrchestratorAssignment,
@@ -1424,6 +1475,13 @@ struct ParentReviewAuditorPromptContext<'a> {
     auditor_report_path: &'a Path,
     schema_path: &'a Path,
     child_report: &'a OrchestratorReviewReport,
+}
+
+struct ReviewLensAuditorPromptContext<'a> {
+    assignment: &'a OrchestratorAssignment,
+    lens: &'a ReviewLensConfig,
+    request: &'a ReviewLensRequest,
+    required_coverage: &'a ReviewCoverageRequirement,
 }
 
 impl SupervisorPlan {
@@ -1576,6 +1634,7 @@ struct WorkerExecutionJournalEntry {
 struct ChildAttemptHistory {
     attempt: usize,
     report_path: PathBuf,
+    raw_stdout_path: PathBuf,
     structural_problems: Vec<String>,
     corrective_retry_used: bool,
 }
@@ -2153,6 +2212,11 @@ fn test_runtime_model_catalog(
             ]
             .into_iter()
             .filter_map(|role| effective_role_model_selection(plan, role).model)
+            .chain(
+                plan.review_lenses
+                    .iter()
+                    .map(|lens| lens.backend.model().to_string()),
+            )
             .collect::<BTreeSet<_>>(),
         )
         .map(RuntimeModelCatalog::Codex),
@@ -2566,14 +2630,18 @@ impl ReportStatus for AuditorReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RoleUsageSample {
     role: AgentRole,
+    lens_id: Option<String>,
     model: Option<String>,
     usage: Usage,
 }
 
 struct RoleUsageAggregation {
     reports: BTreeMap<AgentRole, RoleUsageReport>,
+    lens_reports: Vec<ReviewLensUsageReport>,
     total_usage: Option<Usage>,
     total_cost_usd: Option<f64>,
+    lens_total_usage: Option<Usage>,
+    lens_total_cost_usd: Option<f64>,
 }
 
 #[derive(Debug)]

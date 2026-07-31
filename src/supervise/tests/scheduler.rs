@@ -1644,7 +1644,7 @@ fn supervise_holds_exclusive_worktree_lease_through_child_and_parent_auditor() {
         assert_eq!(lifecycle.run_id, "injected-write-lease");
         if output_name.contains("review-auditor") {
             assert_eq!(lifecycle.role, "auditor");
-            assert_eq!(lifecycle.task_id, parent_auditor_id(&assignment));
+            assert_eq!(lifecycle.task_id, review_lens_auditor_id(&assignment, 0));
             let child = injected_child_report(&assignment);
             write_injected_json(
                 &command.output_last_message,

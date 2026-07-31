@@ -839,6 +839,7 @@ fn dispatch_and_collect_child_attempt<'a>(
     match usage_settlement.reliable_usage() {
         Some(usage) => outcome.usage_samples.push(RoleUsageSample {
             role: assignment.role,
+            lens_id: None,
             model: command.model.clone(),
             usage,
         }),
@@ -1147,6 +1148,7 @@ fn decide_child_attempt(
         attempt_history.push(ChildAttemptHistory {
             attempt,
             report_path: attempt_artifacts.raw_report_relative.clone(),
+            raw_stdout_path: attempt_artifacts.raw_stdout_relative.clone(),
             structural_problems: report_shape_problems,
             corrective_retry_used,
         });
@@ -1160,6 +1162,7 @@ fn decide_child_attempt(
         attempt_history.push(ChildAttemptHistory {
             attempt,
             report_path: attempt_artifacts.raw_report_relative.clone(),
+            raw_stdout_path: attempt_artifacts.raw_stdout_relative.clone(),
             structural_problems: report_shape_problems,
             corrective_retry_used,
         });
@@ -1173,6 +1176,7 @@ fn decide_child_attempt(
         attempt_history.push(ChildAttemptHistory {
             attempt,
             report_path: attempt_artifacts.raw_report_relative.clone(),
+            raw_stdout_path: attempt_artifacts.raw_stdout_relative.clone(),
             structural_problems: report_shape_problems,
             corrective_retry_used,
         });
@@ -1186,6 +1190,7 @@ fn decide_child_attempt(
         attempt_history.push(ChildAttemptHistory {
             attempt,
             report_path: attempt_artifacts.raw_report_relative.clone(),
+            raw_stdout_path: attempt_artifacts.raw_stdout_relative.clone(),
             structural_problems: Vec::new(),
             corrective_retry_used,
         });
@@ -1199,6 +1204,7 @@ fn decide_child_attempt(
         attempt_history.push(ChildAttemptHistory {
             attempt,
             report_path: attempt_artifacts.raw_report_relative.clone(),
+            raw_stdout_path: attempt_artifacts.raw_stdout_relative.clone(),
             structural_problems: report_shape_problems,
             corrective_retry_used,
         });
@@ -1247,6 +1253,7 @@ fn decide_child_attempt(
         attempt_history.push(ChildAttemptHistory {
             attempt,
             report_path: attempt_artifacts.raw_report_relative.clone(),
+            raw_stdout_path: attempt_artifacts.raw_stdout_relative.clone(),
             structural_problems: report_shape_problems,
             corrective_retry_used,
         });
@@ -1265,6 +1272,7 @@ fn decide_child_attempt(
     attempt_history.push(ChildAttemptHistory {
         attempt,
         report_path: attempt_artifacts.raw_report_relative.clone(),
+        raw_stdout_path: attempt_artifacts.raw_stdout_relative.clone(),
         structural_problems: report_shape_problems.clone(),
         corrective_retry_used,
     });
@@ -1374,10 +1382,12 @@ fn decide_child_attempt(
 enum ParentAuditorPreparation<'a> {
     Ready(PreparedParentAuditor<'a>),
     AssignmentComplete,
-    GateComplete,
+    GateComplete { verdict: ReviewLensVerdict },
 }
 
 struct PreparedParentAuditor<'a> {
+    lens: ReviewLensConfig,
+    expected_request: ReviewLensRequest,
     auditor_id: String,
     auditor_artifacts: ChildAttemptArtifacts,
     auditor_command: ExternalAgentCommand,
@@ -1387,6 +1397,39 @@ struct PreparedParentAuditor<'a> {
     auditor_incoming_root: SecureOutputRoot,
     auditor_capture_root: SecureOutputRoot,
     auditor_budget_reservation: DispatchBudgetReservation<'a>,
+    scope_workspace: tempfile::TempDir,
+}
+
+struct ParentAuditorLensExecution<'a> {
+    lens: &'a ReviewLensConfig,
+    lens_index: usize,
+    expected_request: &'a ReviewLensRequest,
+    required_coverage: &'a ReviewCoverageRequirement,
+}
+
+pub(super) fn create_review_lens_scope_workspace() -> Result<tempfile::TempDir> {
+    let workspace = tempfile::Builder::new()
+        .prefix("maco-review-lens-")
+        .tempdir()
+        .context("failed to create isolated review-lens workspace")?;
+    Repository::init(workspace.path())
+        .context("failed to initialize isolated review-lens workspace")?;
+    for protected_root in [".maco", ".maco-cache", ".codex", ".agents"] {
+        fs::create_dir(workspace.path().join(protected_root)).with_context(|| {
+            format!("failed to create isolated review-lens protected root '{protected_root}'")
+        })?;
+    }
+    Ok(workspace)
+}
+
+pub(super) fn configure_review_lens_execution_boundary(
+    command: ExternalAgentCommand,
+    primary_root: &Path,
+    child_root: &Path,
+) -> Result<ExternalAgentCommand> {
+    Ok(configure_read_only_auditor_command(command)?
+        .with_hidden_root(primary_root)
+        .with_hidden_root(child_root))
 }
 
 fn prepare_parent_auditor<'a>(
@@ -1394,22 +1437,26 @@ fn prepare_parent_auditor<'a>(
     outcome: &mut AssignmentExecutionOutcome,
     preflight: &AssignmentExecutionPreflight<'_>,
     journal_parent_id: &str,
-    final_report_path: &Path,
     child_report: &mut OrchestratorReviewReport,
     auditor_attempt: &mut usize,
+    execution: ParentAuditorLensExecution<'_>,
 ) -> Result<ParentAuditorPreparation<'a>> {
+    let ParentAuditorLensExecution {
+        lens,
+        lens_index,
+        expected_request,
+        required_coverage,
+    } = execution;
     let AssignmentExecutionContext {
         index,
         concurrent_mode,
         plan,
         budget_config,
-        assignment_metadata,
         options,
         repo,
         run_dir,
         dirs,
         execution_runtime,
-        field_guide,
         artifacts,
         budget_ledger,
         runtime_model_catalog,
@@ -1427,7 +1474,7 @@ fn prepare_parent_auditor<'a>(
         );
         return Ok(ParentAuditorPreparation::AssignmentComplete);
     }
-    let auditor_id = parent_auditor_id(assignment);
+    let auditor_id = review_lens_auditor_id(assignment, lens_index);
     let auditor_stem = if plan.max_gate_corrections > 0 {
         format!("{auditor_id}.attempt-{auditor_attempt}")
     } else {
@@ -1454,30 +1501,16 @@ fn prepare_parent_auditor<'a>(
     let RenderedPromptWithMeasurements {
         prompt: auditor_prompt,
         mut measurements,
-    } = render_parent_review_auditor_prompt_with_field_guide(
-        ParentReviewAuditorPromptContext {
-            plan,
+    } = render_review_lens_auditor_prompt(
+        ReviewLensAuditorPromptContext {
             assignment,
-            assignment_metadata,
-            run_dir,
-            worktree_path: &worktree.path,
-            child_report_path: final_report_path,
-            auditor_report_path: &auditor_report_path,
-            schema_path: &auditor_schema_path,
-            child_report,
+            lens,
+            request: expected_request,
+            required_coverage,
         },
-        field_guide,
+        lens_index,
     )?;
     measurements.record_final_launch_prompt_bytes(&auditor_prompt)?;
-    record_field_guide_prompt_injection_strict(
-        artifacts,
-        &auditor_id,
-        Some(&assignment.id),
-        OrchestrationRole::Auditor,
-        SupervisePromptRole::ReviewAuditor,
-        field_guide,
-        *auditor_attempt,
-    )?;
     let auditor_prompt_relative = dirs.relative(&auditor_prompt_path)?;
     let measurements_relative = prompt_measurements_relative(&auditor_prompt_relative);
     with_supervisor_artifacts(artifacts, |writer, _| {
@@ -1497,30 +1530,30 @@ fn prepare_parent_auditor<'a>(
         )
     })?;
 
+    let scope_workspace = create_review_lens_scope_workspace()?;
     let mut auditor_command = ExternalAgentCommand::codex(
         &options.codex_bin,
-        &worktree.path,
+        scope_workspace.path(),
         &auditor_prompt_path,
         &auditor_log_path,
         &auditor_report_path,
         Duration::from_secs(plan.child_timeout_seconds),
     );
-    auditor_command = apply_role_model_selection(
+    auditor_command = apply_review_lens_model_selection(
         auditor_command,
-        plan,
-        AgentRole::Auditor,
+        lens,
         options.runtime,
         runtime_model_catalog,
     )?;
     auditor_command.output_schema = Some(auditor_schema_path);
-    auditor_command = configure_read_only_auditor_command(auditor_command)?
-        .with_hidden_root(repo)
-        .with_agent_lifecycle(
-            repo,
-            AgentRole::Auditor.as_str(),
-            options.run_id.as_str(),
-            &auditor_id,
-        );
+    auditor_command =
+        configure_review_lens_execution_boundary(auditor_command, repo, &worktree.path)?
+            .with_agent_lifecycle(
+                repo,
+                AgentRole::Auditor.as_str(),
+                options.run_id.as_str(),
+                &auditor_id,
+            );
     auditor_command = apply_canonical_environment_requirements(
         auditor_command,
         &preflight.environment_requirements,
@@ -1634,10 +1667,19 @@ fn prepare_parent_auditor<'a>(
             tracker.escalate_active(artifacts, &assignment.id, journal_parent_id)?;
             child_report.gate_denials = tracker.denials.clone();
             child_report.gate_correction_outcomes = tracker.outcomes.clone();
-            return Ok(ParentAuditorPreparation::GateComplete);
+            let verdict = ReviewLensVerdict::for_lens(
+                lens,
+                expected_request.request_binding.clone(),
+                ReviewLensVerdictStatus::ProceduralFailure,
+                ReviewLensCoverage::default(),
+                Vec::new(),
+            )?;
+            return Ok(ParentAuditorPreparation::GateComplete { verdict });
         }
     };
     Ok(ParentAuditorPreparation::Ready(PreparedParentAuditor {
+        lens: lens.clone(),
+        expected_request: expected_request.clone(),
         auditor_id,
         auditor_artifacts,
         auditor_command,
@@ -1647,6 +1689,7 @@ fn prepare_parent_auditor<'a>(
         auditor_incoming_root,
         auditor_capture_root,
         auditor_budget_reservation,
+        scope_workspace,
     }))
 }
 
@@ -1655,6 +1698,7 @@ struct ParentAuditorCollection {
     primary_integrity_failed: bool,
     sandbox_denied: bool,
     environment_blocked: bool,
+    verdict: ReviewLensVerdict,
 }
 
 fn dispatch_and_collect_parent_auditor(
@@ -1677,6 +1721,8 @@ fn dispatch_and_collect_parent_auditor(
     } = context;
     let assignment = &preflight.assignment;
     let PreparedParentAuditor {
+        lens,
+        expected_request,
         auditor_id,
         auditor_artifacts,
         auditor_command,
@@ -1686,6 +1732,7 @@ fn dispatch_and_collect_parent_auditor(
         auditor_incoming_root,
         auditor_capture_root,
         mut auditor_budget_reservation,
+        scope_workspace: _scope_workspace,
     } = prepared;
     record_shared_orchestration_event(
         artifacts,
@@ -1693,7 +1740,15 @@ fn dispatch_and_collect_parent_auditor(
         Some(&assignment.id),
         OrchestrationRole::Auditor,
         OrchestrationEventKind::Spawn,
-        json!({"attempt": auditor_attempt}),
+        json!({
+            "attempt": auditor_attempt,
+            "review_lens_id": lens.id,
+            "backend_id": lens.backend.backend_id(),
+            "model": lens.backend.model(),
+            "reasoning_effort": lens.backend.reasoning_effort(),
+            "information_scope": lens.information_scope,
+            "request_binding": expected_request.request_binding,
+        }),
     )?;
     record_shared_orchestration_event(
         artifacts,
@@ -1751,7 +1806,7 @@ fn dispatch_and_collect_parent_auditor(
                 })?;
                 return Err(error);
             }
-            deterministic_fake_auditor_run(&auditor_command, assignment, child_report)
+            deterministic_fake_auditor_run(&auditor_command, &auditor_id, assignment, child_report)
         }
     };
     let auditor_run = match auditor_run_result {
@@ -1776,6 +1831,7 @@ fn dispatch_and_collect_parent_auditor(
     match usage_settlement.reliable_usage() {
         Some(usage) => outcome.usage_samples.push(RoleUsageSample {
             role: AgentRole::Auditor,
+            lens_id: Some(lens.id.clone()),
             model: auditor_command.model.clone(),
             usage,
         }),
@@ -1878,7 +1934,7 @@ fn dispatch_and_collect_parent_auditor(
     let primary_auditor_changes =
         primary_integrity_changes(&primary_before_auditor, &primary_after_auditor);
     let mut auditor_report = collect_parent_auditor_report(
-        assignment,
+        &auditor_id,
         &auditor_artifacts.raw_report_relative,
         &auditor_run,
         &auditor_command,
@@ -1908,6 +1964,16 @@ fn dispatch_and_collect_parent_auditor(
         .context("failed to construct auditor primary-integrity gate denial")?;
         tracker.escalate(denial, artifacts, &assignment.id, journal_parent_id)?;
     }
+    let verdict = review_lens_verdict_from_auditor(
+        &lens,
+        &expected_request,
+        &auditor_id,
+        &auditor_report,
+        !auditor_containment_verified
+            || auditor_primary_integrity_failed
+            || auditor_sandbox_denied
+            || auditor_environment_blocked,
+    )?;
     child_report.audit_reports.push(auditor_report);
     enforce_orchestrator_environment_failure_outcome(child_report);
     Ok(ParentAuditorCollection {
@@ -1915,6 +1981,7 @@ fn dispatch_and_collect_parent_auditor(
         primary_integrity_failed: auditor_primary_integrity_failed,
         sandbox_denied: auditor_sandbox_denied,
         environment_blocked: auditor_environment_blocked,
+        verdict,
     })
 }
 
@@ -1965,20 +2032,28 @@ fn decide_parent_auditor_gate(
     if child_containment_verified
         && child_report.environment_failures.is_empty()
         && !auditor_environment_blocked
+        && child_report.review_lens_aggregate.is_none()
     {
         validate_auditor_reports(assignment, final_report_path, &mut child_report);
     }
     let parent_auditor_failed = child_report
-        .audit_reports
-        .iter()
-        .any(|report| report.id == parent_auditor_id(assignment) && report_failed(report));
+        .review_lens_aggregate
+        .as_ref()
+        .map(|aggregate| aggregate.decision != ReviewAggregationDecision::Accept)
+        .unwrap_or_else(|| {
+            child_report
+                .audit_reports
+                .iter()
+                .any(|report| report.id == parent_auditor_id(assignment) && report_failed(report))
+        });
     if parent_auditor_repair_eligible(
         parent_auditor_failed,
         assignment_containment_verified,
         auditor_primary_integrity_failed,
         auditor_sandbox_denied,
         auditor_environment_blocked,
-    ) {
+    ) && child_report.gate_denials.is_empty()
+    {
         let correction_correlation_id = outcome
             .gate_tracker
             .as_ref()
@@ -2138,7 +2213,11 @@ fn publish_assignment_report(
     })?;
     let failure_flags = final_report_failure_flags(
         child_report.status == ReviewStatus::Succeeded,
-        child_report.audit_reports.iter().any(report_failed),
+        child_report
+            .review_lens_aggregate
+            .as_ref()
+            .map(|aggregate| aggregate.decision != ReviewAggregationDecision::Accept)
+            .unwrap_or_else(|| child_report.audit_reports.iter().any(report_failed)),
         child_report.worker_reports.iter().any(report_failed),
     );
     if failure_flags.assignment_failed {
@@ -2181,9 +2260,12 @@ fn execute_supervisor_assignment_inner(
 ) -> Result<()> {
     let AssignmentExecutionContext {
         plan,
+        options,
         repo,
+        run_dir,
         dirs,
         artifacts,
+        runtime_model_catalog,
         ..
     } = context;
     let preflight = match prepare_assignment_execution(context, outcome)? {
@@ -2315,36 +2397,151 @@ fn execute_supervisor_assignment_inner(
             && !child_gate_terminal
             && parent_auditor_required(assignment, &child_report)
         {
-            let prepared_auditor = match prepare_parent_auditor(
-                context,
-                outcome,
-                &preflight,
-                journal_parent_id,
-                &final_report_path,
-                &mut child_report,
-                &mut auditor_attempt,
-            )? {
-                ParentAuditorPreparation::Ready(prepared) => prepared,
-                ParentAuditorPreparation::AssignmentComplete => return Ok(()),
-                ParentAuditorPreparation::GateComplete => {
-                    break 'gate_controller (child_report, None, assignment_containment_verified);
-                }
-            };
-            let auditor_collection = dispatch_and_collect_parent_auditor(
-                context,
-                outcome,
-                &preflight,
-                journal_parent_id,
-                auditor_attempt,
-                &mut child_report,
-                prepared_auditor,
-            )?;
-            if !auditor_collection.containment_verified {
-                assignment_containment_verified = false;
+            let transcript_path = attempt_history
+                .last()
+                .map(|history| run_dir.join(&history.raw_stdout_path))
+                .context("successful child attempt has no retained transcript evidence")?;
+            let transcript_probe_limit = REVIEW_LENS_REQUEST_LIMIT_BYTES
+                .checked_add(1)
+                .context("review-lens transcript probe limit overflowed")?;
+            let child_transcript_bytes =
+                read_bounded_regular_file_nofollow(&transcript_path, transcript_probe_limit)
+                    .with_context(|| {
+                        format!(
+                            "failed to read bounded child transcript {}",
+                            transcript_path.display()
+                        )
+                    })?;
+            if child_transcript_bytes.len() > REVIEW_LENS_REQUEST_LIMIT_BYTES {
+                bail!(
+                    "child transcript exceeds its {} byte review-lens input limit",
+                    REVIEW_LENS_REQUEST_LIMIT_BYTES
+                );
             }
-            auditor_primary_integrity_failed = auditor_collection.primary_integrity_failed;
-            auditor_sandbox_denied = auditor_collection.sandbox_denied;
-            auditor_environment_blocked = auditor_collection.environment_blocked;
+            let child_transcript = String::from_utf8(child_transcript_bytes)
+                .context("child transcript evidence is not valid UTF-8")?;
+            let diff = collect_diff_since_base(
+                &preflight.worktree.path,
+                &preflight.child_base_head,
+                REVIEW_LENS_REQUEST_LIMIT_BYTES,
+            )?;
+            let output_report = serde_json::to_string(&child_report)
+                .context("failed to serialize child output report for review lenses")?;
+            let sources = ReviewLensRequestSources {
+                child_transcript: &child_transcript,
+                diff: &diff,
+                output_report: &output_report,
+            };
+            let required_coverage =
+                supervisor_review_coverage_requirement(assignment, &child_report);
+            let mut expected_requests = Vec::with_capacity(plan.review_lenses.len());
+            let mut verdicts = Vec::with_capacity(plan.review_lenses.len());
+            for (lens_index, lens) in plan.review_lenses.iter().enumerate() {
+                let expected_request = build_review_lens_request(lens, sources)?;
+                if let Err(error) = validate_review_lens_runtime_selection(
+                    lens,
+                    options.runtime,
+                    runtime_model_catalog,
+                ) {
+                    child_report.findings.push(Finding {
+                        severity: FindingSeverity::Error,
+                        message: format!(
+                            "review lens '{}' could not be dispatched with its configured runtime selection: {error:#}",
+                            lens.id
+                        ),
+                        paths: assignment.assigned_paths.clone(),
+                    });
+                    verdicts.push(ReviewLensVerdict::for_lens(
+                        lens,
+                        expected_request.request_binding.clone(),
+                        ReviewLensVerdictStatus::ProceduralFailure,
+                        ReviewLensCoverage::default(),
+                        Vec::new(),
+                    )?);
+                    expected_requests.push(expected_request);
+                    continue;
+                }
+                let prepared_auditor = match prepare_parent_auditor(
+                    context,
+                    outcome,
+                    &preflight,
+                    journal_parent_id,
+                    &mut child_report,
+                    &mut auditor_attempt,
+                    ParentAuditorLensExecution {
+                        lens,
+                        lens_index,
+                        expected_request: &expected_request,
+                        required_coverage: &required_coverage,
+                    },
+                )? {
+                    ParentAuditorPreparation::Ready(prepared) => prepared,
+                    ParentAuditorPreparation::AssignmentComplete => return Ok(()),
+                    ParentAuditorPreparation::GateComplete { verdict } => {
+                        expected_requests.push(expected_request);
+                        verdicts.push(verdict);
+                        for remaining_lens in plan.review_lenses.iter().skip(lens_index + 1) {
+                            let remaining_request =
+                                build_review_lens_request(remaining_lens, sources)?;
+                            verdicts.push(ReviewLensVerdict::for_lens(
+                                remaining_lens,
+                                remaining_request.request_binding.clone(),
+                                ReviewLensVerdictStatus::ProceduralFailure,
+                                ReviewLensCoverage::default(),
+                                Vec::new(),
+                            )?);
+                            expected_requests.push(remaining_request);
+                        }
+                        break;
+                    }
+                };
+                let auditor_collection = dispatch_and_collect_parent_auditor(
+                    context,
+                    outcome,
+                    &preflight,
+                    journal_parent_id,
+                    auditor_attempt,
+                    &mut child_report,
+                    prepared_auditor,
+                )?;
+                assignment_containment_verified &= auditor_collection.containment_verified;
+                auditor_primary_integrity_failed |= auditor_collection.primary_integrity_failed;
+                auditor_sandbox_denied |= auditor_collection.sandbox_denied;
+                auditor_environment_blocked |= auditor_collection.environment_blocked;
+                expected_requests.push(expected_request);
+                verdicts.push(auditor_collection.verdict);
+            }
+            let aggregate = aggregate_review_lenses_against_requests(
+                &plan.review_lenses,
+                &expected_requests,
+                plan.review_aggregation_policy,
+                required_coverage,
+                verdicts,
+            )?;
+            with_supervisor_artifacts(artifacts, |writer, journal| {
+                record_gate_correction_event_strict(
+                    journal,
+                    writer,
+                    &assignment.id,
+                    Some(journal_parent_id),
+                    OrchestrationRole::Auditor,
+                    json!({"review_lens_aggregate": &aggregate}),
+                )
+            })?;
+            if aggregate.decision != ReviewAggregationDecision::Accept {
+                child_report.status = ReviewStatus::Failed;
+                child_report.accepted = false;
+                child_report.rejected = true;
+                child_report.findings.push(Finding {
+                    severity: FindingSeverity::Error,
+                    message: format!(
+                        "stacked review-lens gate did not accept: {:?}",
+                        aggregate.decision
+                    ),
+                    paths: assignment.assigned_paths.clone(),
+                });
+            }
+            child_report.review_lens_aggregate = Some(aggregate);
         }
         match decide_parent_auditor_gate(
             context,
@@ -2412,6 +2609,127 @@ mod decomposition_tests {
         panic!("fake-runtime phase fixture must not invoke the external runner")
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_lens_execution_boundary_hides_primary_and_child_roots_from_hostile_process(
+    ) -> Result<()> {
+        const CHILD_ENV: &str = "MACO_TEST_REVIEW_LENS_BOUNDARY_CHILD";
+        const PRIMARY_SECRET_ENV: &str = "MACO_TEST_REVIEW_LENS_PRIMARY_SECRET";
+        const CHILD_SECRET_ENV: &str = "MACO_TEST_REVIEW_LENS_CHILD_SECRET";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            for environment_name in [PRIMARY_SECRET_ENV, CHILD_SECRET_ENV] {
+                let secret = PathBuf::from(
+                    std::env::var_os(environment_name)
+                        .with_context(|| format!("missing hostile probe {environment_name}"))?,
+                );
+                assert!(
+                    fs::read_to_string(&secret).is_err(),
+                    "review lens process read hidden root {}",
+                    secret.display()
+                );
+            }
+            return Ok(());
+        }
+
+        let test_binary = std::env::current_exe()?;
+        let test_output_root = test_binary
+            .parent()
+            .and_then(Path::parent)
+            .context("test binary omitted its target output root")?;
+        let temp = tempfile::tempdir_in(test_output_root)?;
+        let primary_root = temp.path().join("primary");
+        let child_root = temp.path().join("child");
+        for root in [&primary_root, &child_root] {
+            fs::create_dir(root)?;
+        }
+        let primary_secret = primary_root.join("primary-secret.txt");
+        let child_secret = child_root.join("child-secret.txt");
+        fs::write(&primary_secret, "PRIMARY_SECRET_MUST_BE_HIDDEN\n")?;
+        fs::write(&child_secret, "CHILD_SECRET_MUST_BE_HIDDEN\n")?;
+
+        let scope_workspace = create_review_lens_scope_workspace()?;
+        let prompt = scope_workspace.path().join("prompt.md");
+        fs::write(&prompt, "Attempt hostile access to omitted lens inputs.\n")?;
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            scope_workspace.path(),
+            &prompt,
+            scope_workspace.path().join("events.jsonl"),
+            scope_workspace.path().join("report.json"),
+            Duration::from_secs(10),
+        );
+        let command =
+            configure_review_lens_execution_boundary(command, &primary_root, &child_root)?;
+
+        let mut profile = crate::process_runner::ExternalCodexProfile::read_only(&command.cwd);
+        for hidden_root in &command.hidden_roots {
+            profile = profile.with_hidden_root(hidden_root);
+        }
+        let environment = BTreeMap::from([
+            (CHILD_ENV.to_string(), "1".to_string()),
+            (
+                PRIMARY_SECRET_ENV.to_string(),
+                primary_secret.display().to_string(),
+            ),
+            (
+                CHILD_SECRET_ENV.to_string(),
+                child_secret.display().to_string(),
+            ),
+        ]);
+        let output = match run_process(
+            ProcessSpec::direct(
+                "review lens hostile hidden-root probe",
+                std::env::current_exe()?,
+                [
+                    OsStr::new("--exact"),
+                    OsStr::new(
+                        "supervise::assignment_execution::decomposition_tests::review_lens_execution_boundary_hides_primary_and_child_roots_from_hostile_process",
+                    ),
+                ],
+                &command.cwd,
+                4 * 1024,
+            )
+            .with_environment(EnvironmentMode::InheritAndSet(environment))
+            .with_stdin(StdinMode::Null)
+            .with_timeout(Some(Duration::from_secs(30)))
+            .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile)),
+        ) {
+            Ok(output) => output,
+            Err(error)
+                if matches!(
+                    error,
+                    crate::process_runner::ProcessRunError::ProcessOwnership { .. }
+                ) && [
+                    "inaccessible path remained",
+                    "inaccessible path placeholder",
+                    "could not inspect inaccessible-path",
+                ]
+                .iter()
+                .any(|diagnostic| error.to_string().contains(diagnostic)) =>
+            {
+                eprintln!("strict sandbox unavailable; hostile lens boundary probe did not launch");
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        assert!(
+            output.status.is_some_and(|status| status.success()),
+            "hostile boundary process failed: {output:#?}"
+        );
+        assert!(output.safety_evidence_verified());
+        assert_eq!(
+            fs::read_to_string(primary_secret)?,
+            "PRIMARY_SECRET_MUST_BE_HIDDEN\n"
+        );
+        assert_eq!(
+            fs::read_to_string(child_secret)?,
+            "CHILD_SECRET_MUST_BE_HIDDEN\n"
+        );
+        Ok(())
+    }
+
     #[test]
     fn extracted_assignment_units_are_directly_exercised_in_phase_order() {
         let temp = tempfile::tempdir().expect("temporary phase fixture");
@@ -2443,6 +2761,8 @@ mod decomposition_tests {
             semantic_coordination: SemanticCoordinationMode::Off,
             role_models: BTreeMap::new(),
             model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: vec![assignment.clone()],
         };
         let budget_config = SupervisorBudgetConfig::default();
@@ -2603,14 +2923,38 @@ mod decomposition_tests {
         })
         .expect("write interim child report");
         let mut auditor_attempt = 0;
+        let lens = plan.review_lenses[0].clone();
+        let output_report = serde_json::to_string(&child_report).expect("serialize child report");
+        let expected_request = build_review_lens_request(
+            &lens,
+            ReviewLensRequestSources {
+                child_transcript: "direct phase transcript",
+                diff: "direct phase diff",
+                output_report: &output_report,
+            },
+        )
+        .expect("build direct phase review request");
+        let required_coverage = ReviewCoverageRequirement {
+            worker_ids: assignment
+                .worker_assignments
+                .iter()
+                .map(|worker| worker.id.clone())
+                .collect(),
+            paths: assignment.assigned_paths.clone(),
+        };
         let prepared_auditor = match prepare_parent_auditor(
             &context,
             &mut outcome,
             &preflight,
             options.run_id.as_str(),
-            &final_report_path,
             &mut child_report,
             &mut auditor_attempt,
+            ParentAuditorLensExecution {
+                lens: &lens,
+                lens_index: 0,
+                expected_request: &expected_request,
+                required_coverage: &required_coverage,
+            },
         )
         .expect("direct auditor preparation invocation")
         {
@@ -2618,7 +2962,7 @@ mod decomposition_tests {
             ParentAuditorPreparation::AssignmentComplete => {
                 panic!("auditor preparation unexpectedly completed assignment")
             }
-            ParentAuditorPreparation::GateComplete => {
+            ParentAuditorPreparation::GateComplete { .. } => {
                 panic!("auditor preparation unexpectedly terminalized gate")
             }
         };

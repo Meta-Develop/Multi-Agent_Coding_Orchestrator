@@ -1174,6 +1174,8 @@ fn supervisor_plan_for_attempt(
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
+        review_lenses: crate::supervise::default_supervisor_review_lenses(),
+        review_aggregation_policy: crate::review::ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
             id: agent_id.to_string(),
             role: AgentRole::ChildOrchestrator,

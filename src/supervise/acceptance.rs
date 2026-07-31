@@ -102,6 +102,18 @@ pub(super) fn collect_child_report(
             paths: vec![report_path.to_path_buf()],
         });
     }
+    if report.review_lens_aggregate.take().is_some() {
+        report.status = ReviewStatus::Failed;
+        report.accepted = false;
+        report.rejected = true;
+        report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message:
+                "child report attempted to self-assert a supervisor-owned review-lens aggregate"
+                    .to_string(),
+            paths: vec![report_path.to_path_buf()],
+        });
+    }
     validate_worker_report_delegation_attestations(assignment, report_path, &mut report);
     verify_child_report_paths(assignment, worktree_path, child_base_head, &mut report);
     validate_worker_report_evidence(assignment, assignment_metadata, report_path, &mut report);
@@ -117,15 +129,14 @@ pub(super) fn collect_child_report(
 }
 
 pub(super) fn collect_parent_auditor_report(
-    assignment: &OrchestratorAssignment,
+    expected_id: &str,
     report_path: &Path,
     external_run: &ExternalAgentRun,
     external_command: &ExternalAgentCommand,
 ) -> AuditorReport {
-    let expected_id = parent_auditor_id(assignment);
     if external_run.environment_blocked() {
         let mut report = missing_parent_auditor_report(
-            &expected_id,
+            expected_id,
             report_path,
             external_run,
             anyhow!("parent-observed environment preflight blocked the auditor before launch"),
@@ -172,13 +183,68 @@ pub(super) fn collect_parent_auditor_report(
             }
             report
         }
-        Err(error) => missing_parent_auditor_report(&expected_id, report_path, external_run, error),
+        Err(error) => missing_parent_auditor_report(expected_id, report_path, external_run, error),
     };
     report
         .commands_run
         .push(command_record_from_external(external_run, external_command));
     enforce_auditor_environment_failure_outcome(&mut report);
     report
+}
+
+pub(super) fn review_lens_verdict_from_auditor(
+    lens: &ReviewLensConfig,
+    expected_request: &ReviewLensRequest,
+    expected_auditor_id: &str,
+    report: &AuditorReport,
+    process_procedural_failure: bool,
+) -> Result<ReviewLensVerdict> {
+    let normalized_paths = normalize_paths(report.reviewed_paths.clone()).ok();
+    let normalized_workers = report
+        .reviewed_worker_ids
+        .iter()
+        .map(|worker_id| normalize_agent_id(worker_id))
+        .collect::<Result<BTreeSet<_>>>()
+        .ok();
+    let structurally_valid = normalized_paths.is_some()
+        && normalized_workers.is_some()
+        && report.id == expected_auditor_id
+        && report.role == AgentRole::Auditor
+        && report.no_further_delegation == Some(true)
+        && report.read_only
+        && !report.commands_run.is_empty()
+        && !report.validation_results.is_empty()
+        && !report.remaining_risk.trim().is_empty()
+        && !report.next_safe_action.trim().is_empty();
+    let verdict = if process_procedural_failure || !structurally_valid {
+        ReviewLensVerdictStatus::ProceduralFailure
+    } else if report.accepted && !report.rejected && report.status == ReviewStatus::Succeeded {
+        ReviewLensVerdictStatus::Accept
+    } else if report.rejected || report.status == ReviewStatus::Rejected {
+        ReviewLensVerdictStatus::Reject
+    } else {
+        ReviewLensVerdictStatus::ProceduralFailure
+    };
+    let coverage = ReviewLensCoverage {
+        worker_ids: normalized_workers.unwrap_or_default().into_iter().collect(),
+        paths: normalized_paths.unwrap_or_default(),
+    };
+    let evidence = if verdict == ReviewLensVerdictStatus::ProceduralFailure {
+        Vec::new()
+    } else {
+        vec![(
+            ReviewLensEvidenceKind::ModelReview,
+            serde_json::to_string(report)
+                .context("failed to recompute parent-owned review-lens evidence")?,
+        )]
+    };
+    ReviewLensVerdict::for_lens(
+        lens,
+        expected_request.request_binding.clone(),
+        verdict,
+        coverage,
+        evidence,
+    )
 }
 
 pub(super) fn validate_auditor_reports(
@@ -248,7 +314,7 @@ pub(super) fn validate_auditor_reports(
             valid = false;
             messages.push("auditor report was not accepted as succeeded".to_string());
         }
-        if audit_report.id == required_parent_auditor_id {
+        if is_parent_auditor_id(assignment, &audit_report.id) {
             let coverage = auditor_review_path_coverage(audit_report, &required_reviewed_paths);
             if !coverage.excluded_paths.is_empty() {
                 audit_report.findings.push(Finding {
@@ -270,7 +336,7 @@ pub(super) fn validate_auditor_reports(
         }
 
         if valid {
-            if audit_report.id == required_parent_auditor_id {
+            if is_parent_auditor_id(assignment, &audit_report.id) {
                 parent_auditor_accepted = true;
             }
             covered_review_subject_ids.extend(
@@ -532,6 +598,16 @@ pub(super) fn required_auditor_review_paths(
             .cloned()
             .collect(),
     )
+}
+
+pub(super) fn supervisor_review_coverage_requirement(
+    assignment: &OrchestratorAssignment,
+    report: &OrchestratorReviewReport,
+) -> ReviewCoverageRequirement {
+    ReviewCoverageRequirement {
+        worker_ids: required_auditor_prompt_subject_ids(assignment, report),
+        paths: required_auditor_review_paths(assignment, report),
+    }
 }
 
 fn auditor_review_path_coverage(

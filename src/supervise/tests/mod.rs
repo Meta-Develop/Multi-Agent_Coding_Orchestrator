@@ -360,6 +360,8 @@ fn injected_multi_plan(
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
+        review_lenses: default_supervisor_review_lenses(),
+        review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments,
     }
 }
@@ -400,6 +402,8 @@ fn injected_plan(assignment: OrchestratorAssignment, max_child_retries: u8) -> S
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
+        review_lenses: default_supervisor_review_lenses(),
+        review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![assignment],
     }
 }
@@ -435,6 +439,14 @@ fn inject_priced_process_roles(plan: &mut SupervisorPlan, model: &str, rate: f64
     plan.role_models
         .insert(AgentRole::ChildOrchestrator, selection.clone());
     plan.role_models.insert(AgentRole::Auditor, selection);
+    for lens in &mut plan.review_lenses {
+        if let ReviewLensBackendConfig::Model {
+            model: lens_model, ..
+        } = &mut lens.backend
+        {
+            *lens_model = model.to_string();
+        }
+    }
     plan.model_pricing.insert(
         model.to_string(),
         ModelPricing {
@@ -489,6 +501,9 @@ fn artifact_test_final_report(run_id: &RunId) -> SupervisorFinalReport {
         role_economics_profile: None,
         run_budget: None,
         role_usage: BTreeMap::new(),
+        review_lens_usage: Vec::new(),
+        review_lens_total_usage: None,
+        review_lens_total_cost_usd: None,
         total_usage: None,
         total_cost_usd: None,
         usage_complete: false,
@@ -572,6 +587,7 @@ fn injected_child_report(assignment: &OrchestratorAssignment) -> OrchestratorRev
         field_guide_entries: Vec::new(),
         worker_reports,
         audit_reports: Vec::new(),
+        review_lens_aggregate: None,
         decomposition_completions: Vec::new(),
         gate_denials: Vec::new(),
         gate_correction_outcomes: Vec::new(),
@@ -588,7 +604,7 @@ fn injected_auditor_report(
     child: &OrchestratorReviewReport,
 ) -> AuditorReport {
     AuditorReport {
-        id: parent_auditor_id(assignment),
+        id: review_lens_auditor_id(assignment, 0),
         role: AgentRole::Auditor,
         reviewed_worker_ids: required_auditor_prompt_subject_ids(assignment, child),
         reviewed_paths: required_auditor_review_paths(assignment, child),
@@ -609,6 +625,56 @@ fn injected_auditor_report(
         remaining_risk: "none".to_string(),
         next_safe_action: "review".to_string(),
     }
+}
+
+fn attach_parent_computed_review_lens_aggregate(
+    plan: &SupervisorPlan,
+    assignment: &OrchestratorAssignment,
+    child: &mut OrchestratorReviewReport,
+) {
+    let output_report = serde_json::to_string(child).expect("serialize aggregate fixture report");
+    let sources = ReviewLensRequestSources {
+        child_transcript: "bounded test transcript",
+        diff: "bounded test diff",
+        output_report: &output_report,
+    };
+    let coverage = supervisor_review_coverage_requirement(assignment, child);
+    let requests = plan
+        .review_lenses
+        .iter()
+        .map(|lens| build_review_lens_request(lens, sources).expect("build fixture lens request"))
+        .collect::<Vec<_>>();
+    let verdicts = plan
+        .review_lenses
+        .iter()
+        .zip(&requests)
+        .map(|(lens, request)| {
+            ReviewLensVerdict::for_lens(
+                lens,
+                request.request_binding.clone(),
+                ReviewLensVerdictStatus::Accept,
+                ReviewLensCoverage {
+                    worker_ids: coverage.worker_ids.clone(),
+                    paths: coverage.paths.clone(),
+                },
+                vec![(
+                    ReviewLensEvidenceKind::ModelReview,
+                    format!("parent test evidence for {}", lens.id),
+                )],
+            )
+            .expect("construct fixture lens verdict")
+        })
+        .collect::<Vec<_>>();
+    child.review_lens_aggregate = Some(
+        aggregate_review_lenses_against_requests(
+            &plan.review_lenses,
+            &requests,
+            plan.review_aggregation_policy,
+            coverage,
+            verdicts,
+        )
+        .expect("aggregate fixture review lenses"),
+    );
 }
 
 fn injected_worker_journal_evidence(

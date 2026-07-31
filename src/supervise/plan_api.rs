@@ -180,6 +180,8 @@ fn supervisor_plan_and_consultant_from_goal_spec(
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
+        review_lenses: default_supervisor_review_lenses(),
+        review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments,
     };
     let metadata = SupervisorPlanMetadata {
@@ -811,6 +813,9 @@ pub fn collect_supervisor_run(
         role_economics_profile: None,
         run_budget: None,
         role_usage: BTreeMap::new(),
+        review_lens_usage: Vec::new(),
+        review_lens_total_usage: None,
+        review_lens_total_cost_usd: None,
         total_usage: None,
         total_cost_usd: None,
         usage_complete: false,
@@ -1020,22 +1025,22 @@ pub fn verified_megafile_decomposition_evidence(
     }
 
     let expected_auditor_id = format!("{}-review-auditor", child.id);
+    let expected_lens_auditor_prefix = format!("{}-review-auditor-lens-", child.id);
     let audit = child
         .audit_reports
         .iter()
-        .find(|audit| audit.id == expected_auditor_id)
+        .find(|audit| {
+            (audit.id == expected_auditor_id || audit.id.starts_with(&expected_lens_auditor_prefix))
+                && audit.role == AgentRole::Auditor
+                && !report_failed(*audit)
+                && audit.no_further_delegation == Some(true)
+                && audit.read_only
+                && !audit.commands_run.is_empty()
+                && !audit.validation_results.is_empty()
+                && !audit.validation_results.iter().any(validation_failed)
+                && audit.reviewed_worker_ids.iter().any(|id| id == &worker.id)
+        })
         .context("accepted parent review-auditor evidence is missing")?;
-    if audit.role != AgentRole::Auditor
-        || report_failed(audit)
-        || audit.no_further_delegation != Some(true)
-        || !audit.read_only
-        || audit.commands_run.is_empty()
-        || audit.validation_results.is_empty()
-        || audit.validation_results.iter().any(validation_failed)
-        || !audit.reviewed_worker_ids.iter().any(|id| id == &worker.id)
-    {
-        bail!("parent review-auditor evidence does not accept the successful decomposition worker");
-    }
     let reviewed_paths = audit
         .reviewed_paths
         .iter()

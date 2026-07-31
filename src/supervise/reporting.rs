@@ -23,6 +23,10 @@ pub(super) fn write_child_report(
 ) -> Result<()> {
     let mut normalized_report = report.clone();
     enforce_orchestrator_environment_failure_outcome(&mut normalized_report);
+    // This artifact also serves as the child process output contract. Keep supervisor-owned lens
+    // authority out of that child-writable file; the aggregate is published in the supervisor
+    // final report and strict event journal instead.
+    normalized_report.review_lens_aggregate = None;
     write_artifact_json(
         writer,
         relative,
@@ -677,6 +681,7 @@ pub(super) fn environment_blocked_child_report(
         field_guide_entries: Vec::new(),
         worker_reports,
         audit_reports: Vec::new(),
+        review_lens_aggregate: None,
         decomposition_completions: Vec::new(),
         gate_denials: Vec::new(),
         gate_correction_outcomes: Vec::new(),
@@ -719,6 +724,7 @@ pub(super) fn missing_child_report(
         field_guide_entries: Vec::new(),
         worker_reports: Vec::new(),
         audit_reports: Vec::new(),
+        review_lens_aggregate: None,
         decomposition_completions: Vec::new(),
         gate_denials: Vec::new(),
         gate_correction_outcomes: Vec::new(),
@@ -807,14 +813,20 @@ pub(super) fn accepted_field_guide_drafts(
         if report_failed(report) {
             continue;
         }
-        let parent_auditor_id = parent_auditor_id(assignment);
-        let parent_audited = report.audit_reports.iter().any(|auditor| {
-            auditor.id == parent_auditor_id
-                && !report_failed(auditor)
-                && auditor.role == AgentRole::Auditor
-                && auditor.read_only
-                && auditor.no_further_delegation == Some(true)
-        });
+        let parent_audited = report
+            .review_lens_aggregate
+            .as_ref()
+            .is_some_and(|aggregate| {
+                aggregate.authority() == ReviewLensAggregateAuthority::ParentComputed
+                    && aggregate.decision == ReviewAggregationDecision::Accept
+            })
+            && report.audit_reports.iter().any(|auditor| {
+                is_parent_auditor_id(assignment, &auditor.id)
+                    && !report_failed(auditor)
+                    && auditor.role == AgentRole::Auditor
+                    && auditor.read_only
+                    && auditor.no_further_delegation == Some(true)
+            });
         if report_has_field_guide_suggestions(report) && !parent_audited {
             bail!(
                 "accepted child '{}' has field-guide suggestions without an accepted parent audit",
@@ -1082,6 +1094,7 @@ pub(super) fn deterministic_fake_child_run(
         field_guide_entries: Vec::new(),
         worker_reports,
         audit_reports: Vec::new(),
+        review_lens_aggregate: None,
         decomposition_completions,
         gate_denials: Vec::new(),
         gate_correction_outcomes: Vec::new(),
@@ -1125,6 +1138,7 @@ fn write_deterministic_fake_worker_journals(
 
 pub(super) fn deterministic_fake_auditor_run(
     command: &ExternalAgentCommand,
+    expected_id: &str,
     assignment: &OrchestratorAssignment,
     child_report: &OrchestratorReviewReport,
 ) -> Result<ExternalAgentRun> {
@@ -1132,7 +1146,7 @@ pub(super) fn deterministic_fake_auditor_run(
         bail!("deterministic fake auditor command retained a provider model slug");
     }
     let report = AuditorReport {
-        id: parent_auditor_id(assignment),
+        id: expected_id.to_string(),
         role: AgentRole::Auditor,
         reviewed_worker_ids: required_auditor_prompt_subject_ids(assignment, child_report),
         reviewed_paths: required_auditor_review_paths(assignment, child_report),
@@ -1236,6 +1250,22 @@ pub(super) fn role_usage_report(
     samples: Vec<RoleUsageSample>,
 ) -> Result<RoleUsageAggregation> {
     let mut aggregates = BTreeMap::<AgentRole, (Usage, BTreeSet<String>, Option<f64>)>::new();
+    let mut lens_aggregates = plan
+        .review_lenses
+        .iter()
+        .map(|lens| {
+            (
+                lens.id.clone(),
+                (
+                    lens.backend.backend_id().to_string(),
+                    lens.backend.model().to_string(),
+                    Usage::default(),
+                    Some(0.0),
+                    false,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut total_usage = Usage::default();
     let mut total_cost_usd = Some(0.0);
     for sample in samples {
@@ -1255,6 +1285,34 @@ pub(super) fn role_usage_report(
             .and_then(|model| plan.model_pricing.get(model))
             .map(|pricing| pricing.cost_usd(sample.usage))
             .filter(|cost| cost.is_finite());
+        if let Some(lens_id) = sample.lens_id.as_deref() {
+            if sample.role != AgentRole::Auditor {
+                bail!(
+                    "review lens '{}' usage was attributed to non-auditor role {}",
+                    lens_id,
+                    sample.role.as_str()
+                );
+            }
+            let lens_aggregate = lens_aggregates.get_mut(lens_id).with_context(|| {
+                format!("usage referenced unknown configured review lens '{lens_id}'")
+            })?;
+            if sample.model.as_deref() != Some(lens_aggregate.1.as_str()) {
+                bail!(
+                    "review lens '{}' usage model does not match configured model '{}'",
+                    lens_id,
+                    lens_aggregate.1
+                );
+            }
+            lens_aggregate.2 = lens_aggregate.2.saturating_add(sample.usage);
+            lens_aggregate.3 = match (lens_aggregate.3, sample_cost_usd) {
+                (Some(total), Some(cost)) => {
+                    let total = total + cost;
+                    total.is_finite().then_some(total)
+                }
+                _ => None,
+            };
+            lens_aggregate.4 = true;
+        }
         total_cost_usd = match (total_cost_usd, sample_cost_usd) {
             (Some(total), Some(cost)) => {
                 let total = total + cost;
@@ -1321,6 +1379,52 @@ pub(super) fn role_usage_report(
                     .to_string(),
             ),
         });
+    let all_lenses_observed = !lens_aggregates.is_empty()
+        && lens_aggregates
+            .values()
+            .all(|(_, _, _, _, observed)| *observed);
+    let lens_total_usage = all_lenses_observed.then(|| {
+        lens_aggregates
+            .values()
+            .fold(Usage::default(), |total, (_, _, usage, _, _)| {
+                total.saturating_add(*usage)
+            })
+    });
+    let lens_total_cost_usd = all_lenses_observed
+        .then(|| {
+            lens_aggregates
+                .values()
+                .try_fold(0.0, |total, (_, _, _, cost, _)| {
+                    cost.and_then(|cost| {
+                        let total = total + cost;
+                        total.is_finite().then_some(total)
+                    })
+                })
+        })
+        .flatten();
+    let lens_reports = lens_aggregates
+        .into_iter()
+        .map(
+            |(lens_id, (backend_id, model, usage, cost_usd, observed))| {
+                ReviewLensUsageReport {
+                    lens_id,
+                    backend_id,
+                    model,
+                    usage: observed.then_some(usage),
+                    cost_usd: observed.then_some(cost_usd).flatten(),
+                    observation: if observed {
+                        RoleUsageObservation::ProcessObserved
+                    } else {
+                        RoleUsageObservation::NotProcessObservable
+                    },
+                    unavailable_reason: (!observed).then(|| {
+                        "no reliable process-observable usage sample was attributed to this configured review lens; usage and cost are not heuristically allocated"
+                            .to_string()
+                    }),
+                }
+            },
+        )
+        .collect();
     if !has_observed_samples {
         total_cost_usd = None;
     }
@@ -1345,8 +1449,11 @@ pub(super) fn role_usage_report(
     );
     Ok(RoleUsageAggregation {
         reports,
+        lens_reports,
         total_usage,
         total_cost_usd,
+        lens_total_usage,
+        lens_total_cost_usd,
     })
 }
 
