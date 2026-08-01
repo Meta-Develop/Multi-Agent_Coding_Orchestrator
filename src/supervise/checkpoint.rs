@@ -644,6 +644,7 @@ fn analyze_checkpoint_records(
     let mut worktrees = BTreeMap::new();
     let mut claims = BTreeMap::new();
     let mut scheduler_closed = false;
+    let mut scheduler_budget = None;
     let mut dispatches = BTreeSet::new();
     let mut final_report = None;
     let mut final_report_committed = false;
@@ -723,6 +724,7 @@ fn analyze_checkpoint_records(
                 if payload.pending_assignments != pending {
                     bail!("checkpoint scheduler closure has inconsistent pending assignments");
                 }
+                scheduler_budget = Some(payload.budget);
                 scheduler_closed = true;
             }
             PHASE_FINAL_REPORT_PLANNED => {
@@ -736,6 +738,7 @@ fn analyze_checkpoint_records(
                     .context("authenticated planned supervisor final report is malformed")?;
                 if report.run_id != *run_id
                     || report.run_budget != payload.budget
+                    || report.run_budget.as_ref() != scheduler_budget.as_ref()
                     || report.publishable != payload.publish_requested
                 {
                     bail!("authenticated planned supervisor report binding is inconsistent");

@@ -2392,12 +2392,18 @@ mod decomposition_tests {
         let mut journal = initialize_orchestration_event_journal(&repo, &run_id);
         assert!(journal.is_some());
         let plan = test_plan(Vec::new());
-        let report = build_supervisor_final_report(test_report_construction(&plan, run_id.clone()));
+        let mut report =
+            build_supervisor_final_report(test_report_construction(&plan, run_id.clone()));
         let consultant = SupervisorConsultantPlan::default();
         let assignment_metadata = AssignmentMetadata::new();
         let plan_metadata = SupervisorPlanMetadata::default();
         let budget_ledger =
             RunBudgetLedger::new(RunBudgetLimits::default()).expect("checkpoint budget ledger");
+        report.run_budget = Some(
+            budget_ledger
+                .report()
+                .expect("checkpoint final report budget"),
+        );
         let mut checkpoint = SupervisorCheckpointWriter::create(
             &repo,
             &run_id,
