@@ -1963,7 +1963,14 @@ fn run_process_cancellable_with_interaction(
             };
         }
 
-        if status.is_none() && cancellation.is_cancelled() {
+        let loop_decision = process_loop_decision(
+            status.is_some(),
+            cancellation.is_cancelled(),
+            operation_deadline,
+            Instant::now(),
+        );
+
+        if loop_decision == ProcessLoopDecision::Cancel {
             let cleanup =
                 process_tree.cleanup(&mut child, false, &spec.label, "cancellation termination");
             process_tree_evidence = cleanup.process_tree;
@@ -2021,7 +2028,7 @@ fn run_process_cancellable_with_interaction(
             break;
         }
 
-        if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if loop_decision == ProcessLoopDecision::Timeout {
             timed_out = true;
             let cleanup = process_tree.cleanup(
                 &mut child,
@@ -2079,7 +2086,7 @@ fn run_process_cancellable_with_interaction(
             break;
         }
 
-        if status.is_some() {
+        if loop_decision == ProcessLoopDecision::Complete {
             let cleanup = process_tree.cleanup(
                 &mut child,
                 true,
@@ -2122,6 +2129,33 @@ fn run_process_cancellable_with_interaction(
         process_error,
         stdin_error,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessLoopDecision {
+    Cancel,
+    Timeout,
+    Complete,
+    Continue,
+}
+
+fn process_loop_decision(
+    status_observed: bool,
+    cancelled: bool,
+    operation_deadline: Option<Instant>,
+    observed_at: Instant,
+) -> ProcessLoopDecision {
+    if !status_observed && cancelled {
+        ProcessLoopDecision::Cancel
+    } else if operation_deadline.is_some_and(|deadline| observed_at >= deadline) {
+        // The deadline governs when completion is observed, not when the child happened to exit.
+        // Keep this check ahead of `Complete` so a late first observation remains a timeout.
+        ProcessLoopDecision::Timeout
+    } else if status_observed {
+        ProcessLoopDecision::Complete
+    } else {
+        ProcessLoopDecision::Continue
+    }
 }
 
 impl ProcessRunError {
@@ -7669,7 +7703,7 @@ impl SystemdUnit {
                         ),
                     ));
                 }
-                Some(false) => thread::sleep(IO_CANCEL_POLL_INTERVAL),
+                Some(false) => wait_for_lifecycle_progress(IO_CANCEL_POLL_INTERVAL),
                 Some(true) if Instant::now() >= deadline => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
@@ -7679,7 +7713,7 @@ impl SystemdUnit {
                         ),
                     ));
                 }
-                Some(true) => thread::sleep(IO_CANCEL_POLL_INTERVAL),
+                Some(true) => wait_for_lifecycle_progress(IO_CANCEL_POLL_INTERVAL),
             }
         }
     }
@@ -8393,7 +8427,19 @@ fn terminate_unix_process_group(
     child_already_exited: bool,
     label: &str,
 ) -> Option<String> {
-    terminate_unix_process_group_with_wait(child, child_already_exited, label, thread::sleep)
+    terminate_unix_process_group_with_wait(
+        child,
+        child_already_exited,
+        label,
+        wait_for_lifecycle_progress,
+    )
+}
+
+#[cfg(unix)]
+fn wait_for_lifecycle_progress(duration: Duration) {
+    #[cfg(test)]
+    record_test_finalization_wait(duration);
+    thread::sleep(duration);
 }
 
 #[cfg(unix)]
@@ -9067,6 +9113,78 @@ struct OwnedIoThread {
     cancel: Arc<AtomicBool>,
 }
 
+/// Test-only accounting for waits requested by lifecycle finalization. The observer is installed
+/// per thread, so concurrently executing tests cannot contribute to one another's logical budget.
+/// Its gate lets a test exclude setup and start-gate contention from a post-release assertion.
+#[cfg(test)]
+#[derive(Clone)]
+struct TestFinalizationWaitObserver {
+    enabled: Arc<AtomicBool>,
+    requested_nanos: Arc<AtomicU64>,
+}
+
+#[cfg(test)]
+impl TestFinalizationWaitObserver {
+    fn new() -> Self {
+        Self {
+            enabled: Arc::new(AtomicBool::new(false)),
+            requested_nanos: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn install(&self) -> TestFinalizationWaitGuard {
+        let previous = TEST_FINALIZATION_WAIT_OBSERVER
+            .with(|observer| observer.borrow_mut().replace(self.clone()));
+        TestFinalizationWaitGuard { previous }
+    }
+
+    fn start(&self) {
+        self.enabled.store(true, Ordering::Release);
+    }
+
+    fn requested(&self) -> Duration {
+        Duration::from_nanos(self.requested_nanos.load(Ordering::Acquire))
+    }
+}
+
+#[cfg(test)]
+struct TestFinalizationWaitGuard {
+    previous: Option<TestFinalizationWaitObserver>,
+}
+
+#[cfg(test)]
+impl Drop for TestFinalizationWaitGuard {
+    fn drop(&mut self) {
+        TEST_FINALIZATION_WAIT_OBSERVER.with(|observer| {
+            *observer.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FINALIZATION_WAIT_OBSERVER: std::cell::RefCell<Option<TestFinalizationWaitObserver>>
+        = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record_test_finalization_wait(duration: Duration) {
+    let requested_nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+    TEST_FINALIZATION_WAIT_OBSERVER.with(|observer| {
+        let observer = observer.borrow();
+        let Some(observer) = observer.as_ref() else {
+            return;
+        };
+        if observer.enabled.load(Ordering::Acquire) {
+            let _ = observer.requested_nanos.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |current| Some(current.saturating_add(requested_nanos)),
+            );
+        }
+    });
+}
+
 trait IoThreadClock {
     type Deadline;
 
@@ -9117,6 +9235,7 @@ impl IoThreadClock for TestIoFinalizationClock {
     }
 
     fn wait(&self, duration: Duration) {
+        record_test_finalization_wait(duration);
         thread::sleep(duration);
         self.elapsed
             .set(self.elapsed.get().saturating_add(duration));
@@ -11535,20 +11654,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn completion_first_observed_after_deadline_is_a_timeout() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let spec = ProcessSpec::shell(
-            "deadline-racing command",
-            Shell::UnixSh,
-            "sleep 0.06",
-            temp.path(),
-            128,
-        )
-        .with_containment(ContainmentPolicy::TrustedBestEffort)
-        .with_timeout(Some(Duration::from_millis(50)));
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(Duration::from_millis(50))
+            .expect("representable deadline");
+        let before_deadline = started
+            .checked_add(Duration::from_millis(40))
+            .expect("representable early observation");
+        let after_deadline = started
+            .checked_add(Duration::from_millis(60))
+            .expect("representable late observation");
 
-        let output = run_process(spec).expect("run deadline-racing command");
-
-        assert!(output.timed_out);
+        assert_eq!(
+            process_loop_decision(true, false, Some(deadline), before_deadline),
+            ProcessLoopDecision::Complete
+        );
+        assert_eq!(
+            process_loop_decision(true, false, Some(deadline), after_deadline),
+            ProcessLoopDecision::Timeout
+        );
     }
 
     #[cfg(unix)]
@@ -11570,6 +11694,10 @@ mod tests {
         .with_containment(ContainmentPolicy::TrustedBestEffort)
         .with_timeout(Some(Duration::from_secs(2)));
 
+        let finalization_waits = TestFinalizationWaitObserver::new();
+        let _wait_observer = finalization_waits.install();
+        finalization_waits.start();
+
         let output = run_process(spec).expect("run descendant-spawning command");
 
         assert!(!output.timed_out);
@@ -11587,6 +11715,11 @@ mod tests {
             .contains("descendant-error"));
         let pid = std::fs::read_to_string(descendant_pid).expect("descendant pid");
         assert_process_not_executable(&pid, "output-pipe descendant");
+        assert!(
+            finalization_waits.requested() < Duration::from_secs(3),
+            "descendant pipe finalization exceeded its three-second logical wait contract: {:?}",
+            finalization_waits.requested()
+        );
     }
 
     #[cfg(unix)]
@@ -12936,8 +13069,13 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
         // Allow shared systemd-slot and setup contention to settle before the target publishes
         // readiness; the post-ready cleanup remains independently bounded below.
         .with_timeout(Some(Duration::from_secs(10)));
+        let finalization_waits = TestFinalizationWaitObserver::new();
         let output = thread::scope(|scope| {
-            let worker = scope.spawn(move || run_process(spec));
+            let worker_waits = finalization_waits.clone();
+            let worker = scope.spawn(move || {
+                let _wait_observer = worker_waits.install();
+                run_process(spec)
+            });
             let ready_deadline = Instant::now() + Duration::from_secs(10);
             while !target_ready_path.exists() && !worker.is_finished() {
                 assert!(
@@ -12954,6 +13092,7 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
             // Shared systemd-slot and setup contention is not kill latency. Release the main
             // shell only after its escaped stdin/pipe holder is ready, then keep the safety bound
             // focused on finalization proving the complete contained tree empty.
+            finalization_waits.start();
             fs::write(&release_target_path, b"release").expect("release escaped pipe holder");
             worker
                 .join()
@@ -12977,6 +13116,11 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH),
             "escaped descendant survived return"
+        );
+        assert!(
+            finalization_waits.requested() < Duration::from_secs(2),
+            "post-release containment and I/O finalization exceeded its two-second logical wait contract: {:?}",
+            finalization_waits.requested()
         );
     }
 
