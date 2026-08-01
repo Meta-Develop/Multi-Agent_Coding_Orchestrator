@@ -275,6 +275,7 @@ Rules:
 - reviewed_paths coverage is computed over repository-relative entries only. Absolute out-of-repo evidence paths are allowed and retained verbatim as evidence, but excluded from coverage computation.
 - Include "no_further_delegation": true in AuditorReport JSON to attest this terminal auditor did not delegate further.
 - Include "read_only": true in AuditorReport JSON to attest this audit stayed read-only.
+- Set rejection_kind=null for acceptance. For every rejection, set rejection_kind="implementation_defect" when the implementation must change, or rejection_kind="evidence_quality" only when validation/report evidence alone must be corrected.
 - Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
 "#,
         tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE
@@ -303,6 +304,7 @@ Review requirements:
 - For megafile_decomposition, verify the worker and child completion evidence names the exact target_path and is supported by the normal claim, journal, validation, and diff evidence.
 - reviewed_paths coverage is computed over repository-relative entries only. Absolute out-of-repo evidence paths are allowed and retained verbatim as evidence, but excluded from coverage computation.
 - Set role="auditor", no_further_delegation=true, read_only=true.
+- Set rejection_kind=null for acceptance. For every rejection, set rejection_kind="implementation_defect" when the preserved implementation must change, or rejection_kind="evidence_quality" only when the implementation is sound and validation/report evidence alone must be corrected.
 - Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
 - Include reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining_risk, and next_safe_action.
 - Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
@@ -420,6 +422,77 @@ pub(super) fn child_orchestrator_prompt_with_incoming_root_and_field_guide(
         )?
         .prompt,
     )
+}
+
+pub(super) fn render_evidence_only_reaudit_prompt(
+    assignment: &OrchestratorAssignment,
+    worktree: &WorktreeRecord,
+    report_path: &Path,
+    schema_path: &Path,
+    source: &EvidenceOnlyReauditSource,
+    diff: &str,
+) -> Result<RenderedPromptWithMeasurements> {
+    let cacheable_prefix = r#"You are the evidence-only report stage for an assignment-scoped MACO re-audit.
+The implementation candidate is immutable for this operation. Do not edit repository content, apply patches, commit, reset, clean, delegate, launch workers, or change Git state.
+Run only validation and inspection needed to correct the report evidence. Every tool action remains subject to the supervisor pre-action review boundary.
+Return one OrchestratorReviewReport JSON value through the configured output-last-message path.
+"#;
+    let role_prefix = supervise_role_prefix(
+        SupervisePromptRole::O1ChildOrchestrator,
+        &assignment.id,
+        None,
+    );
+    let source_report = serde_json::to_string_pretty(&source.report)
+        .context("failed to serialize authenticated source report for evidence-only re-audit")?;
+    let binding = serde_json::to_string_pretty(&source.operation.preserved_candidate_binding)
+        .context("failed to serialize preserved candidate binding")?;
+    let prompt = format!(
+        r#"{cacheable_prefix}{role_prefix}
+Evidence-only operation:
+- Source run id: {source_run_id}
+- Re-audit attempt: {attempt}
+- Assignment id: {assignment_id}
+- Preserved managed worktree: {worktree_path}
+- Assigned paths: {assigned_paths}
+- Output report path: {report_path}
+- Orchestrator report schema: {schema_path}
+- Required candidate binding: {binding}
+
+Report contract:
+- Preserve assigned_paths, semantic_symbols, semantic_modules, files_changed, field_guide_entries, worker_reports, and decomposition_completions exactly from the authenticated source report.
+- Set audit_reports=[], review_lens_aggregate=null, gate_denials=[], and gate_correction_outcomes=[]; these are supervisor-owned.
+- Update only commands_run, validation_results, findings, environment_failures, accepted/rejected/status, remaining_risk, next_safe_action, and current claim/semantic tokens as supported by evidence you actually observe.
+- Do not claim timings, counts, versions, disk state, lock history, or side effects unless the evidence in this operation establishes them.
+- Acceptance requires sufficient accurate validation evidence for the exact preserved diff below. If validation remains insufficient, reject the report honestly.
+
+Authenticated source report JSON:
+{source_report}
+
+Exact preserved diff presented for validation:
+{diff}
+"#,
+        source_run_id = source.operation.source_run_id.as_str(),
+        attempt = source.operation.attempt,
+        assignment_id = assignment.id,
+        worktree_path = worktree.path.display(),
+        assigned_paths = display_paths(&assignment.assigned_paths),
+        report_path = report_path.display(),
+        schema_path = schema_path.display(),
+        binding = binding,
+        source_report = source_report,
+        diff = diff,
+    );
+    let measurement = PromptByteMeasurement::new(
+        PromptMeasurementRole::O1ChildOrchestrator,
+        &assignment.id,
+        &prompt,
+        cacheable_prefix,
+        CHILD_ORCHESTRATOR_PROMPT_FIXTURE_CEILING_BYTES,
+    )?;
+    Ok(RenderedPromptWithMeasurements {
+        prompt,
+        measurements: PromptMeasurementsArtifact::new(vec![measurement], None),
+    })
 }
 
 pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guide(

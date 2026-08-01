@@ -823,6 +823,36 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             }
             Ok(())
         }
+        SuperviseSubcommand::Reaudit(args) => {
+            let resolved = resolve_run_id_for_run(
+                &args.repo,
+                RunArtifactFamily::Supervise,
+                args.run_id.as_deref(),
+                args.json,
+            )?;
+            let report = supervise::reaudit_supervisor_assignment(
+                supervise::SupervisorEvidenceOnlyReauditOptions {
+                    repo: resolved.repo,
+                    source_run_id: RunId::new(&args.source_run_id)?,
+                    assignment_id: args.assignment_id,
+                    run_id: resolved.run_id.clone(),
+                    codex_bin: args.codex_bin,
+                    runtime: args.runtime,
+                    allow_dirty_primary: args.allow_dirty_primary,
+                    machine_global_retention: Some(MachineGlobalRetentionBinding {
+                        config: args.machine_global_config,
+                        root_id: args.machine_global_runtime_root_id,
+                        owner: "maco-supervise-reaudit".to_string(),
+                        correction_correlation_id: resolved.run_id.as_str().to_string(),
+                    }),
+                },
+            )?;
+            print_query_report(&report, args.json)?;
+            if !report.success {
+                bail!("supervise evidence-only re-audit refused or rejected");
+            }
+            Ok(())
+        }
         SuperviseSubcommand::Status(args) => {
             let report = supervise::supervisor_status(args.repo, RunId::new(&args.run_id)?)?;
             print_query_report(&report, args.json)
@@ -853,6 +883,9 @@ enum SuperviseSubcommand {
     Plan(PlanSuperviseArgs),
     /// Run a supervisor plan with child Codex CLI orchestrators.
     Run(RunSuperviseArgs),
+    /// Re-run only evidence/report and parent audit stages for a preserved assignment diff.
+    #[command(name = "re-audit")]
+    Reaudit(ReauditSuperviseArgs),
     /// Report durable run artifact status.
     Status(StatusSuperviseArgs),
     /// Resume safe finalization from an authenticated scheduler checkpoint.
@@ -905,6 +938,38 @@ struct RunSuperviseArgs {
     /// Maximum concurrent child assignments: `auto` uses measured host capacity.
     #[arg(long, default_value_t = supervise::SupervisorConcurrencyPolicy::Auto)]
     max_concurrent_children: supervise::SupervisorConcurrencyPolicy,
+    /// Exact reviewed config used to gate private runtime output-staging cleanup.
+    #[arg(long, required = true)]
+    machine_global_config: PathBuf,
+    /// Reviewed root id whose canonical root must contain `/run/user/<uid>`.
+    #[arg(long, required = true)]
+    machine_global_runtime_root_id: String,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ReauditSuperviseArgs {
+    /// Authenticated finalized supervise run containing the evidence-only rejection.
+    source_run_id: String,
+    /// Assignment whose preserved candidate should be re-audited.
+    assignment_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Stable run id for the new authenticated re-audit run. Omit to generate one.
+    #[arg(long)]
+    run_id: Option<String>,
+    /// Codex-compatible executable to invoke. Ignored by the deterministic Fake runtime.
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+    /// Runtime. Fake is deterministic in-process simulation and never publishes.
+    #[arg(long, value_enum, default_value_t = supervise::SupervisorRuntime::Codex)]
+    runtime: supervise::SupervisorRuntime,
+    /// Allow the primary worktree to be dirty while preserving its exact captured state.
+    #[arg(long)]
+    allow_dirty_primary: bool,
     /// Exact reviewed config used to gate private runtime output-staging cleanup.
     #[arg(long, required = true)]
     machine_global_config: PathBuf,
@@ -5046,5 +5111,47 @@ mod tests {
         assert_eq!(resume.run_id, "interrupted-run");
         assert_eq!(resume.repo, PathBuf::from("repo"));
         assert!(resume.json);
+    }
+
+    #[test]
+    fn supervise_reaudit_requires_authenticated_source_scope_and_cleanup_binding() {
+        let parsed = Cli::try_parse_from([
+            "maco",
+            "supervise",
+            "re-audit",
+            "source-run",
+            "child-a",
+            "--run-id",
+            "destination-run",
+            "--repo",
+            "repo",
+            "--machine-global-config",
+            "/tmp/maco-machine-global.json",
+            "--machine-global-runtime-root-id",
+            "runtime",
+            "--json",
+        ])
+        .expect("complete supervise re-audit command should parse");
+        let Command::Supervise(SuperviseCommand {
+            command: SuperviseSubcommand::Reaudit(reaudit),
+        }) = parsed.command
+        else {
+            panic!("expected supervise re-audit command");
+        };
+        assert_eq!(reaudit.source_run_id, "source-run");
+        assert_eq!(reaudit.assignment_id, "child-a");
+        assert_eq!(reaudit.run_id.as_deref(), Some("destination-run"));
+        assert_eq!(reaudit.repo, PathBuf::from("repo"));
+        assert_eq!(
+            reaudit.machine_global_config,
+            PathBuf::from("/tmp/maco-machine-global.json")
+        );
+        assert_eq!(reaudit.machine_global_runtime_root_id, "runtime");
+        assert!(reaudit.json);
+
+        assert!(
+            Cli::try_parse_from(["maco", "supervise", "re-audit", "source-run", "child-a",])
+                .is_err()
+        );
     }
 }

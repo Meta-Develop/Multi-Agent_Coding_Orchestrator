@@ -190,6 +190,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
         assignment_schedule,
         coverage_gaps: Vec::new(),
         run_budget: SupervisorBudgetConfig::default(),
+        evidence_only_reaudit: None,
     };
     let (plan, plan_metadata) = validate_supervisor_plan(plan, metadata)?;
     Ok(LoadedSupervisorPlan {
@@ -290,6 +291,13 @@ fn supervisor_plan_metadata_from_value(
         })
         .transpose()?
         .unwrap_or_default();
+    let evidence_only_reaudit = value
+        .get("evidence_only_reaudit")
+        .map(|operation| {
+            serde_json::from_value::<EvidenceOnlyReauditPlan>(operation.clone())
+                .context("evidence_only_reaudit is invalid")
+        })
+        .transpose()?;
     let raw_assignments = value
         .get("assignments")
         .and_then(Value::as_array)
@@ -297,6 +305,7 @@ fn supervisor_plan_metadata_from_value(
     let mut metadata = SupervisorPlanMetadata {
         spec_fragment_ids,
         run_budget,
+        evidence_only_reaudit,
         ..SupervisorPlanMetadata::default()
     };
     collect_assignment_plan_metadata(
@@ -693,6 +702,13 @@ pub(super) fn supervisor_plan_value(
                 .context("failed to serialize run_budget plan field")?,
         );
     }
+    if let Some(operation) = &plan_metadata.evidence_only_reaudit {
+        object.insert(
+            "evidence_only_reaudit".to_string(),
+            serde_json::to_value(operation)
+                .context("failed to serialize evidence_only_reaudit plan field")?,
+        );
+    }
     if !consultant.is_default() {
         object.insert(
             "consultant".to_string(),
@@ -728,6 +744,288 @@ pub fn run_supervisor_plan_file_with_max_concurrent_children(
         max_concurrent_children,
         &external_runner,
     )
+}
+
+pub fn reaudit_supervisor_assignment(
+    request: SupervisorEvidenceOnlyReauditOptions,
+) -> Result<SupervisorEvidenceOnlyReauditReport> {
+    if request.source_run_id == request.run_id {
+        bail!("evidence-only re-audit source and destination run ids must differ");
+    }
+    let repo = discover_repo_root(&request.repo)?;
+    let assignment_id = normalize_agent_id(&request.assignment_id)
+        .context("evidence-only re-audit assignment id is invalid")?;
+    let source_denial =
+        source_auditor_repair_denial(&repo, &request.source_run_id, &assignment_id)?;
+    if matches!(
+        source_denial.reason,
+        GateDenialReason::AuditorRepair {
+            rejection: AuditorRejectionKind::ImplementationDefect
+        }
+    ) {
+        return Ok(SupervisorEvidenceOnlyReauditReport {
+            source_run_id: request.source_run_id,
+            assignment_id,
+            run_id: request.run_id,
+            success: false,
+            gate_denial: Some(source_denial),
+            final_report: None,
+        });
+    }
+    let loaded =
+        evidence_only_reaudit_plan_from_source(&repo, &request.source_run_id, &assignment_id)?;
+    let options = SupervisorRunOptions {
+        repo: repo.clone(),
+        plan_file: PathBuf::from("evidence-only-reaudit"),
+        run_id: request.run_id,
+        codex_bin: request.codex_bin,
+        runtime: request.runtime,
+        allow_dirty_primary: request.allow_dirty_primary,
+        machine_global_retention: request.machine_global_retention,
+    };
+    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
+    let final_report = run_supervisor_plan_with_runner_and_creation(
+        loaded,
+        options,
+        1,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::ExistingOnly,
+        runtime_model_catalog,
+        &run_external_agent_cancellable_reviewed,
+    )?;
+    Ok(SupervisorEvidenceOnlyReauditReport {
+        source_run_id: request.source_run_id,
+        assignment_id,
+        run_id: final_report.run_id.clone(),
+        success: final_report.success,
+        gate_denial: final_report.gate_denials.last().cloned(),
+        final_report: Some(final_report),
+    })
+}
+
+fn source_auditor_repair_denial(
+    repo: &Path,
+    source_run_id: &RunId,
+    assignment_id: &str,
+) -> Result<GateDenial> {
+    let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Supervise, source_run_id)
+        .context("evidence-only re-audit source is not an authenticated finalized run")?;
+    let report = read_supervisor_final_report(&reader)?;
+    let child = report
+        .orchestrator_reports
+        .iter()
+        .find(|child| child.id == assignment_id)
+        .with_context(|| {
+            format!(
+                "authenticated source run has no report for assignment '{}'",
+                assignment_id
+            )
+        })?;
+    let denials = child
+        .gate_denials
+        .iter()
+        .filter(|denial| {
+            denial.context.owner == assignment_id
+                && matches!(denial.reason, GateDenialReason::AuditorRepair { .. })
+        })
+        .collect::<Vec<_>>();
+    denials
+        .iter()
+        .copied()
+        .find(|denial| {
+            matches!(
+                denial.reason,
+                GateDenialReason::AuditorRepair {
+                    rejection: AuditorRejectionKind::ImplementationDefect
+                }
+            )
+        })
+        .or_else(|| denials.first().copied())
+        .cloned()
+        .context("source assignment has no typed parent-auditor rejection")
+}
+
+pub(super) fn evidence_only_reaudit_plan_from_source(
+    repo: &Path,
+    source_run_id: &RunId,
+    assignment_id: &str,
+) -> Result<LoadedSupervisorPlan> {
+    let assignment_id = normalize_agent_id(assignment_id)
+        .context("evidence-only re-audit assignment id is invalid")?;
+    let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Supervise, source_run_id)
+        .context("evidence-only re-audit source is not an authenticated finalized run")?;
+    let source_report = read_supervisor_final_report(&reader)?;
+    let source_plan_bytes = reader
+        .read("assignments/supervisor-plan.json")
+        .context("authenticated source run has no normalized supervisor plan")?;
+    let source_plan_text = String::from_utf8(source_plan_bytes)
+        .context("authenticated source supervisor plan is not UTF-8")?;
+    let source_loaded = parse_supervisor_plan_with_consultant(&source_plan_text)?;
+    let source_assignment = source_loaded
+        .plan
+        .assignments
+        .iter()
+        .find(|assignment| assignment.id == assignment_id)
+        .cloned()
+        .with_context(|| {
+            format!(
+                "authenticated source plan has no assignment '{}'",
+                assignment_id
+            )
+        })?;
+    let attempt = source_report
+        .evidence_only_reaudit
+        .as_ref()
+        .map(|record| record.attempt.saturating_add(1))
+        .unwrap_or(1);
+    let binding = source_report
+        .assignment_traceability
+        .iter()
+        .find(|trace| trace.assignment_id == assignment_id)
+        .and_then(|trace| trace.produced_diff_binding.clone())
+        .context("evidence-only re-audit source has no preserved candidate binding")?;
+    let operation = EvidenceOnlyReauditPlan {
+        source_run_id: source_run_id.clone(),
+        assignment_id: assignment_id.clone(),
+        attempt,
+        preserved_candidate_binding: binding,
+    };
+    verify_evidence_only_reaudit_source(repo, &operation, &source_assignment)?;
+
+    let mut plan = source_loaded.plan;
+    plan.task = format!(
+        "Evidence-only re-audit of assignment '{}' from authenticated run '{}'",
+        assignment_id,
+        source_run_id.as_str()
+    );
+    plan.task_file = None;
+    plan.max_child_assignments = 1;
+    plan.max_child_retries = 0;
+    plan.max_gate_corrections = 0;
+    plan.assignments = vec![source_assignment.clone()];
+    let mut assignment_metadata = source_loaded.assignment_metadata;
+    assignment_metadata.retain(|(owner, _), _| owner == &assignment_id);
+    let fragments = source_loaded
+        .plan_metadata
+        .spec_fragment_ids_by_assignment
+        .get(&assignment_id)
+        .cloned()
+        .unwrap_or_default();
+    let mut fragments_by_assignment = BTreeMap::new();
+    fragments_by_assignment.insert(assignment_id.clone(), fragments.clone());
+    let plan_metadata = SupervisorPlanMetadata {
+        spec_fragment_ids: fragments,
+        spec_fragment_ids_by_assignment: fragments_by_assignment,
+        assignment_schedule: vec![AssignmentScheduleEntry {
+            assignment_id,
+            parent_assignment_id: None,
+            depth: MIN_SUPERVISOR_DEPTH,
+            flattened_index: 0,
+        }],
+        coverage_gaps: Vec::new(),
+        run_budget: source_loaded.plan_metadata.run_budget,
+        evidence_only_reaudit: Some(operation),
+    };
+    let (plan, plan_metadata) = validate_supervisor_plan(plan, plan_metadata)?;
+    Ok(LoadedSupervisorPlan {
+        plan,
+        consultant: SupervisorConsultantPlan::default(),
+        assignment_metadata,
+        plan_metadata,
+    })
+}
+
+pub(super) fn verify_evidence_only_reaudit_source(
+    repo: &Path,
+    operation: &EvidenceOnlyReauditPlan,
+    expected_assignment: &OrchestratorAssignment,
+) -> Result<EvidenceOnlyReauditSource> {
+    let reader =
+        ArtifactRunReader::open(repo, RunArtifactFamily::Supervise, &operation.source_run_id)
+            .context("evidence-only re-audit source is not an authenticated finalized run")?;
+    let source_report = read_supervisor_final_report(&reader)?;
+    let source_plan_bytes = reader
+        .read("assignments/supervisor-plan.json")
+        .context("authenticated source run has no normalized supervisor plan")?;
+    let source_plan_text = String::from_utf8(source_plan_bytes)
+        .context("authenticated source supervisor plan is not UTF-8")?;
+    let source_loaded = parse_supervisor_plan_with_consultant(&source_plan_text)?;
+    let source_assignment = source_loaded
+        .plan
+        .assignments
+        .iter()
+        .find(|assignment| assignment.id == operation.assignment_id)
+        .context("authenticated source plan does not contain the re-audit assignment")?;
+    if source_assignment != expected_assignment {
+        bail!("evidence-only re-audit assignment differs from its authenticated source plan");
+    }
+    let source_child = source_report
+        .orchestrator_reports
+        .iter()
+        .find(|report| report.id == operation.assignment_id)
+        .cloned()
+        .context("authenticated source run has no report for the re-audit assignment")?;
+    if !report_failed(&source_child) {
+        bail!("evidence-only re-audit source assignment was not rejected");
+    }
+    let implementation_defect_denial = source_child.gate_denials.iter().any(|denial| {
+        denial.context.owner == operation.assignment_id
+            && matches!(
+                denial.reason,
+                GateDenialReason::AuditorRepair {
+                    rejection: AuditorRejectionKind::ImplementationDefect
+                }
+            )
+    });
+    if implementation_defect_denial {
+        bail!("evidence-only re-audit refused: source includes an implementation-defect rejection");
+    }
+    let evidence_denial = source_child.gate_denials.iter().any(|denial| {
+        denial.context.owner == operation.assignment_id
+            && matches!(
+                denial.reason,
+                GateDenialReason::AuditorRepair {
+                    rejection: AuditorRejectionKind::EvidenceQuality
+                }
+            )
+    });
+    if !evidence_denial {
+        bail!("evidence-only re-audit refused: source rejection is not typed as evidence quality");
+    }
+    let source_attempt = source_report
+        .evidence_only_reaudit
+        .as_ref()
+        .map(|record| {
+            if record.assignment_id != operation.assignment_id
+                || record.source_run_id == operation.source_run_id
+                || record.preserved_candidate_binding != operation.preserved_candidate_binding
+                || record.accepted
+            {
+                bail!("authenticated source re-audit lineage is inconsistent");
+            }
+            Ok(record.attempt)
+        })
+        .transpose()?
+        .unwrap_or(0);
+    if operation.attempt != source_attempt.saturating_add(1)
+        || operation.attempt == 0
+        || operation.attempt > MAX_EVIDENCE_ONLY_REAUDITS
+    {
+        bail!("evidence-only re-audit attempt does not extend the authenticated bounded lineage");
+    }
+    let source_binding = source_report
+        .assignment_traceability
+        .iter()
+        .find(|trace| trace.assignment_id == operation.assignment_id)
+        .and_then(|trace| trace.produced_diff_binding.as_ref())
+        .context("authenticated source assignment has no preserved candidate binding")?;
+    if source_binding != &operation.preserved_candidate_binding {
+        bail!("evidence-only re-audit candidate binding differs from its authenticated source");
+    }
+    Ok(EvidenceOnlyReauditSource {
+        operation: operation.clone(),
+        report: source_child,
+    })
 }
 
 fn run_supervisor_plan_file_with_runner_and_max_concurrent_children(
@@ -1112,6 +1410,7 @@ pub fn collect_supervisor_run(
         rejected: true,
         status: ReviewStatus::Missing,
         run_lifecycle: lifecycle,
+        evidence_only_reaudit: None,
         assigned_paths: Vec::new(),
         semantic_symbols: Vec::new(),
         semantic_modules: Vec::new(),

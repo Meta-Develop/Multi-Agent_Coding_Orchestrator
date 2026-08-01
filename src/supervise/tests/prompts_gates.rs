@@ -884,6 +884,7 @@ fn auditor_rejection_reenters_child_and_parent_auditor() {
                 auditor.status = ReviewStatus::Rejected;
                 auditor.accepted = false;
                 auditor.rejected = true;
+                auditor.rejection_kind = Some(AuditorRejectionKind::ImplementationDefect);
                 auditor.findings.push(Finding {
                     severity: FindingSeverity::Error,
                     message: raw_injection.to_string(),
@@ -920,7 +921,7 @@ fn auditor_rejection_reenters_child_and_parent_auditor() {
     );
     assert_eq!(child_invocations, 2);
     assert_eq!(auditor_invocations, 2);
-    assert!(correction_prompt.contains("Reason: auditor repair"));
+    assert!(correction_prompt.contains("Reason: auditor implementation repair"));
     assert!(!correction_prompt.contains(raw_injection));
     assert_eq!(
         report.gate_correction_outcomes[0].terminal_class,
@@ -954,6 +955,7 @@ fn repeated_auditor_denial_uses_one_correlation_across_prompts_and_journal() {
                 auditor.status = ReviewStatus::Rejected;
                 auditor.accepted = false;
                 auditor.rejected = true;
+                auditor.rejection_kind = Some(AuditorRejectionKind::ImplementationDefect);
                 auditor.findings.push(Finding {
                     severity: FindingSeverity::Error,
                     message: "bounded repeated auditor rejection".to_string(),

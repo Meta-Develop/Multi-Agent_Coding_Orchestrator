@@ -23,9 +23,9 @@ use crate::{
         FieldGuideLimits, FieldGuideStore, ParentFieldGuideProvenance, FIELD_GUIDE_PROMPT_HEADER,
     },
     gate_denial::{
-        BudgetAdmissionDenial, ExternalSideEffectState, GateApplyBlocker, GateCheckSource,
-        GateDenial, GateDenialReason, GateDenialRoute, GateRetryability, ResumeCheckpointDenial,
-        VerifiedGateContext,
+        AuditorRejectionKind, BudgetAdmissionDenial, ExternalSideEffectState, GateApplyBlocker,
+        GateCheckSource, GateDenial, GateDenialReason, GateDenialRoute, GateRetryability,
+        ResumeCheckpointDenial, VerifiedGateContext,
     },
     llm::provider::{ModelPricing, Usage},
     merge::{
@@ -150,6 +150,7 @@ const DEFAULT_MAX_CHILD_RETRIES: u8 = 0;
 const MAX_CHILD_RETRIES_LIMIT: u8 = 2;
 const DEFAULT_MAX_GATE_CORRECTIONS: u8 = 0;
 const MAX_GATE_CORRECTIONS_LIMIT: u8 = 4;
+const MAX_EVIDENCE_ONLY_REAUDITS: u8 = 2;
 const MIN_SUPERVISOR_DEPTH: u8 = 2;
 const MAX_SUPERVISOR_DEPTH: u8 = 32;
 const SUPERVISOR_SCHEMA_VERSION: u32 = 1;
@@ -245,6 +246,30 @@ pub struct SupervisorRunOptions {
     /// config/root pair and so simulation-only tests can exercise preparation
     /// without claiming that they performed a host cleanup.
     pub machine_global_retention: Option<crate::machine_global::MachineGlobalRetentionBinding>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SupervisorEvidenceOnlyReauditOptions {
+    pub repo: PathBuf,
+    pub source_run_id: RunId,
+    pub assignment_id: String,
+    pub run_id: RunId,
+    pub codex_bin: PathBuf,
+    pub runtime: SupervisorRuntime,
+    pub allow_dirty_primary: bool,
+    pub machine_global_retention: Option<crate::machine_global::MachineGlobalRetentionBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SupervisorEvidenceOnlyReauditReport {
+    pub source_run_id: RunId,
+    pub assignment_id: String,
+    pub run_id: RunId,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_denial: Option<GateDenial>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_report: Option<SupervisorFinalReport>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
@@ -533,6 +558,13 @@ struct SupervisorPlanMetadata {
     assignment_schedule: Vec<AssignmentScheduleEntry>,
     coverage_gaps: Vec<SupervisorCoverageGap>,
     run_budget: SupervisorBudgetConfig,
+    evidence_only_reaudit: Option<EvidenceOnlyReauditPlan>,
+}
+
+#[derive(Debug, Clone)]
+struct EvidenceOnlyReauditSource {
+    operation: EvidenceOnlyReauditPlan,
+    report: OrchestratorReviewReport,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -775,6 +807,8 @@ pub struct AuditorReport {
     pub validation_results: Vec<ValidationResult>,
     #[serde(default)]
     pub findings: Vec<Finding>,
+    #[serde(default)]
+    pub rejection_kind: Option<AuditorRejectionKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_further_delegation: Option<bool>,
     #[serde(default)]
@@ -855,6 +889,8 @@ pub struct SupervisorFinalReport {
     pub status: ReviewStatus,
     #[serde(default)]
     pub run_lifecycle: SupervisorRunLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_only_reaudit: Option<EvidenceOnlyReauditRecord>,
     #[serde(default, serialize_with = "serialize_paths")]
     pub assigned_paths: Vec<PathBuf>,
     #[serde(default)]
@@ -927,6 +963,27 @@ pub struct SupervisorFinalReport {
     pub semantic_release_errors: Vec<String>,
     pub remaining_risk: String,
     pub next_safe_action: String,
+}
+
+/// Content-addressed evidence-only operation embedded in a normalized plan.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceOnlyReauditPlan {
+    pub source_run_id: RunId,
+    pub assignment_id: String,
+    pub attempt: u8,
+    pub preserved_candidate_binding: CandidateValidationBinding,
+}
+
+/// Durable lineage and outcome for one assignment-scoped evidence-only re-audit.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceOnlyReauditRecord {
+    pub source_run_id: RunId,
+    pub assignment_id: String,
+    pub attempt: u8,
+    pub preserved_candidate_binding: CandidateValidationBinding,
+    pub accepted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1462,6 +1519,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         environment_failures: Vec::new(),
         validation_results: vec![validation.clone()],
         findings: Vec::new(),
+        rejection_kind: None,
         no_further_delegation: Some(true),
         read_only: true,
         accepted: true,
@@ -1512,6 +1570,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         rejected: false,
         status: ReviewStatus::Succeeded,
         run_lifecycle: SupervisorRunLifecycle::Finalized,
+        evidence_only_reaudit: None,
         assigned_paths: files_changed.clone(),
         semantic_symbols: Vec::new(),
         semantic_modules: Vec::new(),
@@ -1899,6 +1958,7 @@ enum ChildAttemptCorrection {
 #[derive(Debug, Clone, Copy)]
 enum SupervisorWorktreeCreation<'a> {
     Bound(&'a RepositoryCleanlinessCapability),
+    ExistingOnly,
     #[cfg(test)]
     TestOnly,
 }
@@ -2209,6 +2269,7 @@ struct AssignmentExecutionContext<'a, 'writer> {
     consultant: &'a SupervisorConsultantPlan,
     assignment_metadata: &'a AssignmentMetadata,
     assignment: &'a OrchestratorAssignment,
+    evidence_only_reaudit: Option<&'a EvidenceOnlyReauditSource>,
     options: &'a SupervisorRunOptions,
     repo: &'a Path,
     run_dir: &'a Path,
@@ -2583,6 +2644,28 @@ fn run_supervisor_plan_with_budget_catalog_and_runner(
 }
 
 #[cfg(test)]
+fn run_loaded_supervisor_plan_with_runner(
+    loaded: LoadedSupervisorPlan,
+    options: SupervisorRunOptions,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand, bool) -> ExternalAgentRun + Send),
+) -> Result<SupervisorFinalReport> {
+    let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
+    let serialized_runner = Mutex::new(external_runner);
+    run_supervisor_plan_with_runner_and_creation(
+        loaded,
+        options,
+        1,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        SupervisorWorktreeCreation::TestOnly,
+        Ok(runtime_model_catalog),
+        &|command, _cancellation, review_runtime| match serialized_runner.lock() {
+            Ok(mut runner) => runner(command, review_runtime.is_some()),
+            Err(poisoned) => poisoned.into_inner()(command, review_runtime.is_some()),
+        },
+    )
+}
+
+#[cfg(test)]
 fn run_supervisor_plan_with_concurrent_runner(
     plan: SupervisorPlan,
     consultant: SupervisorConsultantPlan,
@@ -2694,6 +2777,7 @@ struct ChildReportCollectionContext<'a> {
     worktree_path: &'a Path,
     child_base_head: &'a Oid,
     worker_journals: &'a WorkerExecutionJournalEvidenceSet,
+    evidence_only_source: Option<&'a OrchestratorReviewReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -180,6 +180,7 @@ struct AssignmentSchedulerContext<'context, 'writer> {
     budget_config: &'context SupervisorBudgetConfig,
     consultant: &'context SupervisorConsultantPlan,
     assignment_metadata: &'context AssignmentMetadata,
+    evidence_only_reaudit: Option<&'context EvidenceOnlyReauditSource>,
     options: &'context SupervisorRunOptions,
     repo: &'context Path,
     run_dir: &'context Path,
@@ -390,6 +391,7 @@ fn run_serial_assignment_schedule(
             consultant: context.consultant,
             assignment_metadata: context.assignment_metadata,
             assignment,
+            evidence_only_reaudit: context.evidence_only_reaudit,
             options: context.options,
             repo: context.repo,
             run_dir: context.run_dir,
@@ -548,6 +550,7 @@ fn run_concurrent_assignment_schedule(
                             consultant: context.consultant,
                             assignment_metadata: context.assignment_metadata,
                             assignment,
+                            evidence_only_reaudit: context.evidence_only_reaudit,
                             options: context.options,
                             repo: context.repo,
                             run_dir: context.run_dir,
@@ -729,6 +732,7 @@ struct SupervisorFinalReportConstruction<'context> {
     publishable: bool,
     success: bool,
     run_budget_report: Option<RunBudgetReport>,
+    evidence_only_reaudit: Option<EvidenceOnlyReauditPlan>,
     role_usage: BTreeMap<AgentRole, RoleUsageReport>,
     review_lens_usage: Vec<ReviewLensUsageReport>,
     review_lens_total_usage: Option<Usage>,
@@ -770,6 +774,7 @@ fn build_supervisor_final_report(
         publishable,
         success,
         run_budget_report,
+        evidence_only_reaudit,
         role_usage,
         review_lens_usage,
         review_lens_total_usage,
@@ -815,6 +820,13 @@ fn build_supervisor_final_report(
             ReviewStatus::Failed
         },
         run_lifecycle: SupervisorRunLifecycle::Finalized,
+        evidence_only_reaudit: evidence_only_reaudit.map(|operation| EvidenceOnlyReauditRecord {
+            source_run_id: operation.source_run_id,
+            assignment_id: operation.assignment_id,
+            attempt: operation.attempt,
+            preserved_candidate_binding: operation.preserved_candidate_binding,
+            accepted: success,
+        }),
         assigned_paths: plan
             .assignments
             .iter()
@@ -1175,6 +1187,7 @@ struct PreparedSupervisorRun {
     runtime: SupervisorRuntime,
     repo: PathBuf,
     assignment_schedule: Vec<AssignmentScheduleEntry>,
+    evidence_only_reaudit: Option<EvidenceOnlyReauditSource>,
     artifact_writer: ArtifactRunWriter,
     checkpoint_writer: SupervisorCheckpointWriter,
     run_dir: PathBuf,
@@ -1208,6 +1221,11 @@ fn prepare_supervisor_run(
         {
             bail!("verified worktree creation capability requires the verified supervisor runtime")
         }
+        SupervisorWorktreeCreation::ExistingOnly
+            if execution_runtime != SupervisorExecutionRuntime::Verified =>
+        {
+            bail!("existing-only worktree execution requires the verified supervisor runtime")
+        }
         #[cfg(test)]
         SupervisorWorktreeCreation::TestOnly
             if execution_runtime != SupervisorExecutionRuntime::NonpublishableSimulation =>
@@ -1218,6 +1236,17 @@ fn prepare_supervisor_run(
     }
     let runtime = options.runtime;
     let repo = discover_repo_root(&options.repo)?;
+    let evidence_only_reaudit = plan_metadata
+        .evidence_only_reaudit
+        .as_ref()
+        .map(|operation| {
+            let assignment = plan
+                .assignments
+                .first()
+                .context("evidence-only re-audit plan has no assignment")?;
+            verify_evidence_only_reaudit_source(&repo, operation, assignment)
+        })
+        .transpose()?;
     let assignment_schedule = validated_scheduler_assignment_schedule(&plan, &plan_metadata)?;
     let artifact_writer = ArtifactRunWriter::reserve(
         &repo,
@@ -1257,6 +1286,7 @@ fn prepare_supervisor_run(
         runtime,
         repo,
         assignment_schedule,
+        evidence_only_reaudit,
         artifact_writer,
         checkpoint_writer,
         run_dir,
@@ -1284,6 +1314,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         runtime,
         repo,
         assignment_schedule,
+        evidence_only_reaudit,
         mut artifact_writer,
         mut checkpoint_writer,
         run_dir,
@@ -1379,6 +1410,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 budget_config,
                 consultant: &consultant,
                 assignment_metadata: &assignment_metadata,
+                evidence_only_reaudit: evidence_only_reaudit.as_ref(),
                 options: &options,
                 repo: &repo,
                 run_dir: &run_dir,
@@ -1656,6 +1688,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         publishable,
         success,
         run_budget_report,
+        evidence_only_reaudit: plan_metadata.evidence_only_reaudit.clone(),
         role_usage,
         review_lens_usage,
         review_lens_total_usage,
@@ -1855,6 +1888,7 @@ mod decomposition_tests {
                 budget_config: &budget_config,
                 consultant: &consultant,
                 assignment_metadata: &assignment_metadata,
+                evidence_only_reaudit: None,
                 options: &options,
                 repo: &repo,
                 run_dir: &run_dir,
@@ -1931,6 +1965,7 @@ mod decomposition_tests {
                 budget_config: &budget_config,
                 consultant: &consultant,
                 assignment_metadata: &assignment_metadata,
+                evidence_only_reaudit: None,
                 options: &options,
                 repo: &repo,
                 run_dir: &run_dir,
@@ -1969,6 +2004,7 @@ mod decomposition_tests {
             publishable: false,
             success: true,
             run_budget_report: None,
+            evidence_only_reaudit: None,
             role_usage: BTreeMap::new(),
             review_lens_usage: Vec::new(),
             review_lens_total_usage: None,

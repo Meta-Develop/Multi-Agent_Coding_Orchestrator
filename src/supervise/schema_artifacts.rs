@@ -506,6 +506,7 @@ pub(super) fn auditor_report_schema_value() -> serde_json::Value {
             "environment_failures",
             "validation_results",
             "findings",
+            "rejection_kind",
             "no_further_delegation",
             "read_only",
             "accepted",
@@ -523,6 +524,10 @@ pub(super) fn auditor_report_schema_value() -> serde_json::Value {
             "environment_failures": {"type": "array", "items": environment_failure_schema_value()},
             "validation_results": {"type": "array", "items": validation_result_schema_value()},
             "findings": {"type": "array", "items": finding_schema_value()},
+            "rejection_kind": {
+                "type": ["string", "null"],
+                "enum": ["implementation_defect", "evidence_quality", null]
+            },
             "no_further_delegation": {"type": "boolean", "const": true},
             "read_only": {"type": "boolean", "const": true},
             "accepted": {"type": "boolean"},

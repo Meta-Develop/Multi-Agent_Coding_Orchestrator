@@ -308,6 +308,33 @@ pub(super) fn validate_supervisor_plan(
             );
         }
     }
+    if let Some(operation) = metadata.evidence_only_reaudit.as_mut() {
+        if plan.assignments.len() != 1 {
+            bail!("evidence_only_reaudit must contain exactly one assignment");
+        }
+        operation.assignment_id = normalize_agent_id(&operation.assignment_id)
+            .context("evidence_only_reaudit assignment_id is invalid")?;
+        if operation.assignment_id != plan.assignments[0].id {
+            bail!("evidence_only_reaudit assignment_id must match the sole assignment");
+        }
+        if operation.attempt == 0 || operation.attempt > MAX_EVIDENCE_ONLY_REAUDITS {
+            bail!(
+                "evidence_only_reaudit attempt must be between 1 and {}",
+                MAX_EVIDENCE_ONLY_REAUDITS
+            );
+        }
+        operation.preserved_candidate_binding = operation
+            .preserved_candidate_binding
+            .clone()
+            .canonicalized()
+            .context("evidence_only_reaudit preserved candidate binding is invalid")?;
+        if operation.preserved_candidate_binding.agent_id != operation.assignment_id {
+            bail!("evidence_only_reaudit preserved candidate binding names a different assignment");
+        }
+        if plan.max_child_retries != 0 || plan.max_gate_corrections != 0 {
+            bail!("evidence_only_reaudit does not permit child retries or in-run gate corrections");
+        }
+    }
     validate_orchestrator_assignment_collisions(&plan.assignments, &metadata.assignment_schedule)?;
 
     metadata.spec_fragment_ids =
