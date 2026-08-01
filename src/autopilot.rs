@@ -611,6 +611,10 @@ fn run_autopilot_plan_file_disabled_legacy(
             // Autopilot already ran the real primary-change preflight; nested
             // supervise should not reject autopilot's own runtime artifacts.
             allow_dirty_primary: true,
+            // Autopilot run remains disabled under Issue #22. If that entrypoint
+            // reaches supervise before it grows an explicit CLI binding, the
+            // verified child preparation path must fail closed.
+            machine_global_retention: None,
         }) {
             Ok(supervisor) => supervisor,
             Err(error) => {

@@ -804,10 +804,16 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 SupervisorRunOptions {
                     repo: resolved.repo,
                     plan_file: args.supervisor_plan,
-                    run_id: resolved.run_id,
+                    run_id: resolved.run_id.clone(),
                     codex_bin: args.codex_bin,
                     runtime: args.runtime,
                     allow_dirty_primary: args.allow_dirty_primary,
+                    machine_global_retention: Some(MachineGlobalRetentionBinding {
+                        config: args.machine_global_config,
+                        root_id: args.machine_global_runtime_root_id,
+                        owner: "maco-supervise".to_string(),
+                        correction_correlation_id: resolved.run_id.as_str().to_string(),
+                    }),
                 },
                 args.max_concurrent_children,
             )?;
@@ -889,6 +895,12 @@ struct RunSuperviseArgs {
     /// Maximum concurrent child assignments: `auto` uses measured host capacity.
     #[arg(long, default_value_t = supervise::SupervisorConcurrencyPolicy::Auto)]
     max_concurrent_children: supervise::SupervisorConcurrencyPolicy,
+    /// Exact reviewed config used to gate private runtime output-staging cleanup.
+    #[arg(long, required = true)]
+    machine_global_config: PathBuf,
+    /// Reviewed root id whose canonical root must contain `/run/user/<uid>`.
+    #[arg(long, required = true)]
+    machine_global_runtime_root_id: String,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -4592,6 +4604,61 @@ mod tests {
     use git2::Signature;
 
     use super::*;
+
+    #[test]
+    fn supervise_run_requires_complete_machine_global_binding() {
+        let complete = Cli::try_parse_from([
+            "maco",
+            "supervise",
+            "run",
+            "plan.json",
+            "--machine-global-config",
+            "/tmp/maco-machine-global.json",
+            "--machine-global-runtime-root-id",
+            "runtime",
+        ])
+        .expect("complete supervise machine-global binding should parse");
+        let Command::Supervise(SuperviseCommand {
+            command: SuperviseSubcommand::Run(complete),
+        }) = complete.command
+        else {
+            panic!("expected supervise run command");
+        };
+        assert_eq!(
+            complete.machine_global_config,
+            PathBuf::from("/tmp/maco-machine-global.json")
+        );
+        assert_eq!(complete.machine_global_runtime_root_id, "runtime");
+
+        for incomplete in [
+            vec!["maco", "supervise", "run", "plan.json"],
+            vec![
+                "maco",
+                "supervise",
+                "run",
+                "plan.json",
+                "--machine-global-config",
+                "/tmp/maco-machine-global.json",
+            ],
+            vec![
+                "maco",
+                "supervise",
+                "run",
+                "plan.json",
+                "--machine-global-runtime-root-id",
+                "runtime",
+            ],
+        ] {
+            let error = Cli::try_parse_from(incomplete)
+                .expect_err("missing or partial supervise binding must fail closed");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("--machine-global-config")
+                    || rendered.contains("--machine-global-runtime-root-id"),
+                "binding refusal must name the missing obligation: {rendered}"
+            );
+        }
+    }
 
     #[test]
     fn merge_arbitration_is_an_explicit_typed_opt_in() {

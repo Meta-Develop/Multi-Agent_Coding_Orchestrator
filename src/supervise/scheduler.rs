@@ -1623,6 +1623,7 @@ mod decomposition_tests {
             codex_bin: PathBuf::from("unused-test-codex"),
             runtime: SupervisorRuntime::Fake,
             allow_dirty_primary: true,
+            machine_global_retention: None,
         }
     }
 

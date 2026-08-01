@@ -231,6 +231,14 @@ pub struct SupervisorRunOptions {
     pub codex_bin: PathBuf,
     pub runtime: SupervisorRuntime,
     pub allow_dirty_primary: bool,
+    /// Explicit reviewed binding for recoverable cleanup of every private
+    /// output-staging directory created by this supervise run.
+    ///
+    /// Verified execution refuses before dispatch when this is absent. The
+    /// optional representation exists so callers cannot manufacture a partial
+    /// config/root pair and so simulation-only tests can exercise preparation
+    /// without claiming that they performed a host cleanup.
+    pub machine_global_retention: Option<crate::machine_global::MachineGlobalRetentionBinding>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]

@@ -1046,6 +1046,12 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         codex_bin: PathBuf::from("unused-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+            config: temp.path().join("unused-machine-global.json"),
+            root_id: "runtime".to_string(),
+            owner: "maco-supervise".to_string(),
+            correction_correlation_id: "unverified-containment-stops-followups".to_string(),
+        }),
     };
 
     let child_report = |id: &str| OrchestratorReviewReport {
