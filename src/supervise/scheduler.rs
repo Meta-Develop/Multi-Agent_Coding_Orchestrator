@@ -690,6 +690,7 @@ struct SupervisorFinalReportConstruction<'context> {
     assignment_traceability: Vec<AssignmentTraceability>,
     coverage_gaps: Vec<SupervisorCoverageGap>,
     supervisor_breaker_trip: Option<SupervisorBreakerTrip>,
+    autonomy_kpis: AutonomyKpiReport,
     released_claims: Vec<PathClaim>,
     release_errors: Vec<String>,
     released_semantic_intents: Vec<SemanticIntent>,
@@ -730,6 +731,7 @@ fn build_supervisor_final_report(
         assignment_traceability,
         coverage_gaps,
         supervisor_breaker_trip,
+        autonomy_kpis,
         released_claims,
         release_errors,
         released_semantic_intents,
@@ -804,6 +806,7 @@ fn build_supervisor_final_report(
         gate_denials: collected.gate_denials,
         pre_action_review_metrics: collected.pre_action_review_metrics,
         gate_correction_outcomes: collected.gate_correction_outcomes,
+        autonomy_kpis,
         files_changed: collected
             .orchestrator_reports
             .iter()
@@ -970,6 +973,7 @@ fn persist_supervisor_final_report(
             "rejected": final_report.rejected,
             "breaker_trip": final_report.breaker_trip,
             "run_budget": final_report.run_budget,
+            "autonomy_kpis": final_report.autonomy_kpis,
         }),
     );
     record_orchestration_event(
@@ -984,8 +988,15 @@ fn persist_supervisor_final_report(
             "result": final_report.status,
             "success": final_report.success,
             "run_budget": final_report.run_budget,
+            "autonomy_kpis": final_report.autonomy_kpis,
         }),
     );
+    if !orchestration_journal_observable(orchestration_journal) {
+        final_report.autonomy_kpis = AutonomyKpiReport::not_process_observable();
+        if let Some(trip) = &mut final_report.breaker_trip {
+            trip.autonomy_kpis = final_report.autonomy_kpis.clone();
+        }
+    }
     write_final_report(&mut artifact_writer, &final_report)?;
     artifact_writer.finalize(
         RunArtifactFamily::Supervise.final_report_relative_path(),
@@ -1187,6 +1198,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     let mut field_guide_store_slot = None;
     let mut field_guide_prompt_slot = None;
     let mut orchestration_journal = None;
+    let mut autonomy_kpi_collector = AutonomyKpiCollector::default();
     let mut collected = CollectedAssignmentOutcomes::default();
     if runtime == SupervisorRuntime::Fake {
         collected.findings.push(Finding {
@@ -1251,6 +1263,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
             let shared_artifacts = Mutex::new(SharedSupervisorArtifacts {
                 writer: &mut artifact_writer,
                 journal: &mut orchestration_journal,
+                autonomy_kpis: &mut autonomy_kpi_collector,
             });
             let semantic_block_gate = SemanticBlockGate::default();
             let serial_semantic_warn_intents = Mutex::new(Vec::<(usize, SemanticIntent)>::new());
@@ -1328,9 +1341,10 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         });
     }
     let breaker_tripped = circuit_breaker_trip.is_some();
-    let supervisor_breaker_trip = circuit_breaker_trip.map(|trip| SupervisorBreakerTrip {
+    let mut supervisor_breaker_trip = circuit_breaker_trip.map(|trip| SupervisorBreakerTrip {
         reason: trip.reason,
         window: trip.window,
+        autonomy_kpis: AutonomyKpiReport::default(),
         recovery_guidance: BREAKER_RECOVERY_GUIDANCE.to_string(),
     });
     if let Some(trip) = &supervisor_breaker_trip {
@@ -1476,6 +1490,11 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
             true
         }
     };
+    let autonomy_kpis =
+        autonomy_kpi_collector.report(orchestration_journal_observable(&orchestration_journal));
+    if let Some(trip) = &mut supervisor_breaker_trip {
+        trip.autonomy_kpis = autonomy_kpis.clone();
+    }
     let environment_failures =
         aggregate_environment_failures(&collected.command_records, &collected.orchestrator_reports);
     let failed = run_result.is_err()
@@ -1546,6 +1565,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         assignment_traceability,
         coverage_gaps,
         supervisor_breaker_trip,
+        autonomy_kpis,
         released_claims,
         release_errors,
         released_semantic_intents,
@@ -1689,9 +1709,11 @@ mod decomposition_tests {
             let field_guide =
                 SupervisorFieldGuidePrompt::empty().expect("empty scheduler field guide");
             let mut journal = initialize_orchestration_event_journal(&repo, &options.run_id);
+            let mut autonomy_kpis = AutonomyKpiCollector::default();
             let shared_artifacts = Mutex::new(SharedSupervisorArtifacts {
                 writer: &mut artifact_writer,
                 journal: &mut journal,
+                autonomy_kpis: &mut autonomy_kpis,
             });
             let runtime_model_catalog = RuntimeModelCatalog::LocalDeterministicFake;
             let runner = |_: &ExternalAgentCommand,
@@ -1762,9 +1784,11 @@ mod decomposition_tests {
             let field_guide =
                 SupervisorFieldGuidePrompt::empty().expect("empty scheduler field guide");
             let mut journal = initialize_orchestration_event_journal(&repo, &options.run_id);
+            let mut autonomy_kpis = AutonomyKpiCollector::default();
             let shared_artifacts = Mutex::new(SharedSupervisorArtifacts {
                 writer: &mut artifact_writer,
                 journal: &mut journal,
+                autonomy_kpis: &mut autonomy_kpis,
             });
             let runtime_model_catalog = RuntimeModelCatalog::LocalDeterministicFake;
             let runner = |_: &ExternalAgentCommand,
@@ -1831,6 +1855,7 @@ mod decomposition_tests {
             assignment_traceability: Vec::new(),
             coverage_gaps: Vec::new(),
             supervisor_breaker_trip: None,
+            autonomy_kpis: AutonomyKpiReport::default(),
             released_claims: Vec::new(),
             release_errors: Vec::new(),
             released_semantic_intents: Vec::new(),

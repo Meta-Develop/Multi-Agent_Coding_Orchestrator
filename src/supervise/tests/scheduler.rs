@@ -1070,12 +1070,22 @@ fn cascade_breaker_stops_admission_drains_active_and_releases_claims() {
     let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
         .expect("open finalized breaker artifacts");
     let events = read_finalized_orchestration_events(&reader);
-    assert!(events.iter().any(|event| {
-        event.kind == OrchestrationEventKind::Gate
-            && event.payload["gate"] == "swarm_health_circuit_breaker"
-            && event.payload["transition"] == "closed_to_open"
-            && event.payload["trip"]["reason"]["kind"] == "repeated_rejection_loop"
-    }));
+    let breaker_event = events
+        .iter()
+        .find(|event| {
+            event.kind == OrchestrationEventKind::Gate
+                && event.payload["gate"] == "swarm_health_circuit_breaker"
+                && event.payload["transition"] == "closed_to_open"
+                && event.payload["trip"]["reason"]["kind"] == "repeated_rejection_loop"
+        })
+        .expect("typed breaker transition event");
+    assert_eq!(
+        breaker_event.payload["autonomy_kpis"]["coverage"]["rate_denominators"]["observation"],
+        "not_process_observable"
+    );
+    assert!(breaker_event.payload["autonomy_kpis"]
+        .get("denial_rate")
+        .is_none());
 }
 
 #[test]

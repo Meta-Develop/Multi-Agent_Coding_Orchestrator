@@ -461,11 +461,13 @@ fn gate_terminal_append_failure_retains_active_denial_without_false_outcome() {
     .expect("construct canonical strict gate denial");
     let mut tracker = GateCorrectionTracker::new(1);
     let mut health_signals = Vec::new();
+    let mut autonomy_kpis = AutonomyKpiCollector::default();
 
     {
         let artifacts = Mutex::new(SharedSupervisorArtifacts {
             writer: &mut writer,
             journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
         });
         let authorized = tracker
             .authorize(
@@ -492,6 +494,19 @@ fn gate_terminal_append_failure_retains_active_denial_without_false_outcome() {
         assert!(format!("{disabled_error:#}")
             .contains("strict gate correction lifecycle journal is disabled"));
     }
+
+    let append_successes = autonomy_kpis.report(true);
+    assert!(
+        append_successes.gate_lifecycles.is_empty(),
+        "an unreviewed validation lifecycle must stay outside reviewed-action KPIs"
+    );
+    assert_eq!(append_successes.self_corrections, Some(0));
+    assert_eq!(append_successes.self_correction_rate, None);
+    assert_eq!(
+        autonomy_kpis.report(false),
+        AutonomyKpiReport::default(),
+        "disabled journal must replace partial counters with an unmeasured report"
+    );
 
     let active = tracker
         .active
@@ -1106,6 +1121,24 @@ fn gate_budget_exhaustion_feeds_existing_breaker() {
         .breaker_trip
         .expect("correction retry loop must trip the existing breaker");
     assert_eq!(trip.window.retries, usize::from(MAX_GATE_CORRECTIONS_LIMIT));
+    assert_eq!(
+        trip.autonomy_kpis.observation,
+        RoleUsageObservation::SupervisorAggregate
+    );
+    assert_eq!(
+        trip.autonomy_kpis.self_corrections,
+        Some(0),
+        "breaker health must retain the reviewed-denial KPI population"
+    );
+    assert_eq!(trip.autonomy_kpis.self_correction_rate, None);
+    assert!(
+        trip.autonomy_kpis.gate_lifecycles.is_empty(),
+        "an unreviewed validation denial must not enter reviewed-action KPIs"
+    );
+    assert_eq!(
+        trip.autonomy_kpis.population,
+        AutonomyKpiPopulation::ReviewedGateActions
+    );
 }
 
 #[test]

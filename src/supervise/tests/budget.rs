@@ -83,6 +83,56 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
                 .iter()
                 .any(|reason| reason == "missing_provider_usage"))
     );
+    let autonomy = &schema["properties"]["autonomy_kpis"];
+    let required = autonomy["required"]
+        .as_array()
+        .expect("autonomy KPI required fields");
+    for field in [
+        "population",
+        "coverage",
+        "actions_reviewed",
+        "denials",
+        "self_corrections",
+        "human_escalations",
+        "interrupted",
+    ] {
+        assert!(
+            required.iter().any(|value| value == field),
+            "autonomy KPI schema omitted {field}"
+        );
+    }
+    assert!(autonomy["properties"]["observation"]["enum"]
+        .as_array()
+        .is_some_and(|observations| observations
+            .iter()
+            .any(|observation| observation == "not_process_observable")));
+    assert_eq!(
+        autonomy["properties"]["population"]["const"],
+        "reviewed_gate_actions"
+    );
+    let coverage = &autonomy["properties"]["coverage"];
+    let coverage_required = coverage["required"]
+        .as_array()
+        .expect("autonomy KPI coverage required fields");
+    for field in [
+        "review_decisions",
+        "reviewed_denial_terminal_lifecycles",
+        "human_follow_up_responses",
+        "scheduler_budget_denial_lifecycles",
+        "rate_denominators",
+    ] {
+        assert!(
+            coverage_required.iter().any(|value| value == field),
+            "autonomy KPI coverage schema omitted {field}"
+        );
+        assert!(
+            coverage["properties"][field]["properties"]["observation"]["enum"]
+                .as_array()
+                .is_some_and(|observations| observations
+                    .iter()
+                    .any(|observation| observation == "not_process_observable"))
+        );
+    }
 }
 
 #[test]
@@ -225,6 +275,29 @@ fn budget_integration_auditor_admission_refusal_reaches_typed_child_and_final_re
         .findings
         .iter()
         .all(|finding| !finding.message.contains("BudgetAdmissionRefusal")));
+    assert_eq!(
+        report.autonomy_kpis.observation,
+        RoleUsageObservation::SupervisorAggregate
+    );
+    assert_eq!(
+        report.autonomy_kpis.population,
+        AutonomyKpiPopulation::ReviewedGateActions
+    );
+    assert_eq!(
+        report
+            .autonomy_kpis
+            .coverage
+            .scheduler_budget_denial_lifecycles
+            .observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+    assert!(report
+        .autonomy_kpis
+        .coverage
+        .scheduler_budget_denial_lifecycles
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("do not produce gate correction lifecycle")));
 }
 
 #[test]

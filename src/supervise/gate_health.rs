@@ -1,5 +1,224 @@
 use super::*;
 
+const HUMAN_INTERRUPTION_RATE_GAP: &str =
+    "the run was interrupted by required human intervention before its rate denominators could be finalized";
+const BREAKER_SNAPSHOT_RATE_GAP: &str =
+    "the breaker-trip health artifact is a point-in-time snapshot emitted before active assignments finish draining";
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum GateCorrectionJournalState {
+    Blocked,
+    CorrectionAttempt,
+    Terminal(GateCorrectionTerminalClass),
+}
+
+impl GateCorrectionJournalState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::CorrectionAttempt => "correction_attempt",
+            Self::Terminal(GateCorrectionTerminalClass::SelfCorrected) => "self_corrected",
+            Self::Terminal(GateCorrectionTerminalClass::Exhausted) => "exhausted",
+            Self::Terminal(GateCorrectionTerminalClass::Escalated) => "escalated",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct AutonomyKpiCollector {
+    reviewed_actions: BTreeMap<String, ReviewedGateActionKpi>,
+    gate_lifecycles: BTreeMap<(String, String), GateCorrectionLifecycleKpi>,
+    eligible_reviewed_runs: BTreeSet<String>,
+    human_interrupted_runs: BTreeSet<String>,
+}
+
+impl AutonomyKpiCollector {
+    pub(super) fn observe_pre_action_event(&mut self, record: &PreActionJournalRecord) {
+        if record.phase != PreActionJournalPhase::ReviewDecision {
+            return;
+        }
+        let (Some(request), Some(allowed)) = (record.request.as_ref(), record.allowed) else {
+            return;
+        };
+        let human_intervention = matches!(
+            record.rationale,
+            PreActionJournalRationale::HumanInterventionRequired
+        )
+        .then_some(HumanInterventionRecord {
+            target: HumanInterventionTarget::Human,
+            outcome: HumanInterventionOutcome::InterventionRequired,
+        });
+        let (correction_correlation_id, denial_id) = record
+            .denial
+            .as_ref()
+            .map(|denial| {
+                (
+                    Some(denial.correction_correlation_id.as_str().to_string()),
+                    Some(denial.denial_id.as_str().to_string()),
+                )
+            })
+            .unwrap_or((None, None));
+        self.reviewed_actions.insert(
+            request.request_id.clone(),
+            ReviewedGateActionKpi {
+                action_gate_id: request.request_id.clone(),
+                correction_correlation_id,
+                denial_id,
+                allowed,
+                human_intervention,
+            },
+        );
+        self.eligible_reviewed_runs.insert(record.run_id.clone());
+        if matches!(
+            record.rationale,
+            PreActionJournalRationale::HumanInterventionRequired
+        ) {
+            self.human_interrupted_runs.insert(record.run_id.clone());
+        }
+    }
+
+    pub(super) fn observe_gate_correction_event(
+        &mut self,
+        denial: &GateDenial,
+        state: GateCorrectionJournalState,
+        correction_attempt: Option<u8>,
+    ) {
+        let lifecycle = self
+            .gate_lifecycles
+            .entry((
+                denial.denial_id.as_str().to_string(),
+                denial.correction_correlation_id.as_str().to_string(),
+            ))
+            .or_insert_with(|| GateCorrectionLifecycleKpi {
+                denial_id: denial.denial_id.as_str().to_string(),
+                correction_correlation_id: denial.correction_correlation_id.as_str().to_string(),
+                route: denial.route,
+                correction_attempts: 0,
+                terminal_outcome: None,
+            });
+        if let Some(attempt) = correction_attempt {
+            lifecycle.correction_attempts = lifecycle.correction_attempts.max(attempt);
+        }
+        if let GateCorrectionJournalState::Terminal(outcome) = state {
+            lifecycle.terminal_outcome = Some(outcome);
+        }
+    }
+
+    pub(super) fn report(&self, journal_observable: bool) -> AutonomyKpiReport {
+        self.report_with_rate_gap(journal_observable, None)
+    }
+
+    fn breaker_trip_report(&self, journal_observable: bool) -> AutonomyKpiReport {
+        self.report_with_rate_gap(journal_observable, Some(BREAKER_SNAPSHOT_RATE_GAP))
+    }
+
+    fn report_with_rate_gap(
+        &self,
+        journal_observable: bool,
+        point_in_time_rate_gap: Option<&'static str>,
+    ) -> AutonomyKpiReport {
+        if !journal_observable {
+            return AutonomyKpiReport::not_process_observable();
+        }
+        let actions_reviewed = self.reviewed_actions.len() as u64;
+        let denials = self
+            .reviewed_actions
+            .values()
+            .filter(|action| !action.allowed)
+            .count() as u64;
+        // Self-correction is defined only over reviewed denials. Requiring both typed
+        // correlation fields prevents unrelated gate populations from entering either
+        // the numerator or denominator merely because they also produce lifecycle events.
+        let reviewed_denials = self
+            .reviewed_actions
+            .values()
+            .filter(|action| !action.allowed)
+            .filter_map(|action| {
+                action
+                    .denial_id
+                    .as_deref()
+                    .zip(action.correction_correlation_id.as_deref())
+            })
+            .collect::<BTreeSet<_>>();
+        let reviewed_gate_lifecycles = self
+            .gate_lifecycles
+            .values()
+            .filter(|lifecycle| {
+                reviewed_denials.contains(&(
+                    lifecycle.denial_id.as_str(),
+                    lifecycle.correction_correlation_id.as_str(),
+                ))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let terminal_denials = reviewed_gate_lifecycles
+            .iter()
+            .filter(|lifecycle| lifecycle.terminal_outcome.is_some())
+            .count() as u64;
+        let self_corrections = reviewed_gate_lifecycles
+            .iter()
+            .filter(|lifecycle| {
+                lifecycle.terminal_outcome == Some(GateCorrectionTerminalClass::SelfCorrected)
+            })
+            .count() as u64;
+        let human_escalations = self
+            .reviewed_actions
+            .values()
+            .filter(|action| action.human_intervention.is_some())
+            .count() as u64;
+        let eligible_reviewed_runs = self.eligible_reviewed_runs.len() as u64;
+        let interrupted_runs = self.human_interrupted_runs.len() as u64;
+        let interrupted = interrupted_runs > 0;
+        // A human-required review cancels its turn at the producer. Its raw typed events
+        // remain sound, but the stopped run cannot establish complete rate denominators.
+        // A breaker transition artifact has the same limitation until active work drains.
+        let rate_denominators_unavailable_reason = if interrupted {
+            Some(HUMAN_INTERRUPTION_RATE_GAP)
+        } else {
+            point_in_time_rate_gap
+        };
+        let rate_denominators_observable = rate_denominators_unavailable_reason.is_none();
+        AutonomyKpiReport {
+            observation: RoleUsageObservation::SupervisorAggregate,
+            population: AutonomyKpiPopulation::ReviewedGateActions,
+            coverage: AutonomyKpiCoverage::journal_observable(rate_denominators_unavailable_reason),
+            actions_reviewed: Some(actions_reviewed),
+            denials: Some(denials),
+            self_corrections: Some(self_corrections),
+            human_escalations: Some(human_escalations),
+            interrupted: Some(interrupted),
+            denial_rate: (rate_denominators_observable && actions_reviewed > 0).then_some(
+                RatioMetric {
+                    numerator: denials,
+                    denominator: actions_reviewed,
+                },
+            ),
+            self_correction_rate: (rate_denominators_observable && terminal_denials > 0).then_some(
+                RatioMetric {
+                    numerator: self_corrections,
+                    denominator: terminal_denials,
+                },
+            ),
+            interruption_rate: (rate_denominators_observable && eligible_reviewed_runs > 0)
+                .then_some(RatioMetric {
+                    numerator: interrupted_runs,
+                    denominator: eligible_reviewed_runs,
+                }),
+            reviewed_actions: self.reviewed_actions.values().cloned().collect(),
+            gate_lifecycles: reviewed_gate_lifecycles,
+            unavailable_reason: None,
+        }
+    }
+}
+
+pub(super) fn orchestration_journal_observable(
+    journal: &Option<OrchestrationEventJournal>,
+) -> bool {
+    journal
+        .as_ref()
+        .is_some_and(OrchestrationEventJournal::is_enabled)
+}
+
 pub(super) fn with_supervisor_artifacts<T>(
     artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
     operation: impl FnOnce(&mut ArtifactRunWriter, &mut Option<OrchestrationEventJournal>) -> Result<T>,
@@ -7,7 +226,9 @@ pub(super) fn with_supervisor_artifacts<T>(
     let mut guard = artifacts
         .lock()
         .map_err(|_| anyhow!("supervisor artifact writer mutex was poisoned"))?;
-    let SharedSupervisorArtifacts { writer, journal } = &mut *guard;
+    let SharedSupervisorArtifacts {
+        writer, journal, ..
+    } = &mut *guard;
     operation(writer, journal)
 }
 
@@ -30,25 +251,33 @@ pub(super) fn record_gate_correction_event(
     entity_id: &str,
     parent_id: &str,
     denial: &GateDenial,
-    state: &str,
+    state: GateCorrectionJournalState,
     correction_attempt: Option<u8>,
 ) -> Result<()> {
-    with_supervisor_artifacts(artifacts, |writer, journal| {
-        record_gate_correction_event_strict(
-            journal,
-            writer,
-            entity_id,
-            Some(parent_id),
-            OrchestrationRole::Orchestrator,
-            json!({
-                "state": state,
-                "denial_id": denial.denial_id.as_str(),
-                "correction_correlation_id": denial.correction_correlation_id.as_str(),
-                "route": denial.route,
-                "correction_attempt": correction_attempt,
-            }),
-        )
-    })
+    let mut guard = artifacts
+        .lock()
+        .map_err(|_| anyhow!("supervisor artifact writer mutex was poisoned"))?;
+    let SharedSupervisorArtifacts {
+        writer,
+        journal,
+        autonomy_kpis,
+    } = &mut *guard;
+    record_gate_correction_event_strict(
+        journal,
+        writer,
+        entity_id,
+        Some(parent_id),
+        OrchestrationRole::Orchestrator,
+        json!({
+            "state": state.as_str(),
+            "denial_id": denial.denial_id.as_str(),
+            "correction_correlation_id": denial.correction_correlation_id.as_str(),
+            "route": denial.route,
+            "correction_attempt": correction_attempt,
+        }),
+    )?;
+    autonomy_kpis.observe_gate_correction_event(denial, state, correction_attempt);
+    Ok(())
 }
 
 pub(super) fn gate_correlation_id(assignment_id: &str, ordinal: usize) -> String {
@@ -300,8 +529,22 @@ pub(super) fn record_breaker_trip(
     run_id: &RunId,
     trip: &CircuitBreakerTrip,
 ) -> Result<()> {
-    record_shared_orchestration_event(
-        artifacts,
+    let mut guard = artifacts
+        .lock()
+        .map_err(|_| anyhow!("supervisor artifact writer mutex was poisoned"))?;
+    let SharedSupervisorArtifacts {
+        writer,
+        journal,
+        autonomy_kpis,
+    } = &mut *guard;
+    // The transition event precedes the scheduler's active-assignment drain, so its KPI
+    // payload is deliberately a counter-only snapshot. Final reporting runs after the
+    // drain and may expose rates for its closed, strictly journaled event population.
+    let autonomy_kpis =
+        autonomy_kpis.breaker_trip_report(orchestration_journal_observable(journal));
+    record_orchestration_event(
+        journal,
+        writer,
         run_id.as_str(),
         None,
         OrchestrationRole::Supervisor,
@@ -310,9 +553,11 @@ pub(super) fn record_breaker_trip(
             "gate": "swarm_health_circuit_breaker",
             "transition": "closed_to_open",
             "trip": trip,
+            "autonomy_kpis": autonomy_kpis,
             "drain_policy": "finish_active_without_admitting_pending",
         }),
-    )
+    );
+    Ok(())
 }
 
 pub(super) fn record_assignment_spawn_failure(
