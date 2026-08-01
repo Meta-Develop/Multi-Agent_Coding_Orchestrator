@@ -9959,7 +9959,7 @@ mod tests {
     fn prepare_holds_and_releases_worktree_and_repository_locks() {
         enum PreparationEvent {
             LocksHeld,
-            Completed(Result<PrPublicationReport>),
+            Completed(Box<Result<PrPublicationReport>>),
         }
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -9984,7 +9984,7 @@ mod tests {
                     release_rx.recv().expect("release preparation locks");
                 },
             );
-            let _ = event_tx.send(PreparationEvent::Completed(result));
+            let _ = event_tx.send(PreparationEvent::Completed(Box::new(result)));
         });
 
         match event_rx.recv().expect("observe preparation lifecycle") {
@@ -10015,7 +10015,7 @@ mod tests {
         release_tx.send(()).expect("release preparation");
         match event_rx.recv().expect("observe preparation completion") {
             PreparationEvent::Completed(result) => {
-                result.expect("complete preparation");
+                (*result).expect("complete preparation");
             }
             PreparationEvent::LocksHeld => panic!("preparation published its lock point twice"),
         }
@@ -10061,7 +10061,7 @@ mod tests {
     fn standalone_publish_excludes_same_worktree_for_full_lifecycle() {
         enum PublicationEvent {
             LocksHeld,
-            Completed(Result<PrPublicationReport>),
+            Completed(Box<Result<PrPublicationReport>>),
         }
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -10083,7 +10083,7 @@ mod tests {
                     release_rx.recv().expect("release publication");
                 },
             );
-            let _ = event_tx.send(PublicationEvent::Completed(result));
+            let _ = event_tx.send(PublicationEvent::Completed(Box::new(result)));
         });
 
         match event_rx.recv().expect("observe publication lifecycle") {
@@ -10117,7 +10117,7 @@ mod tests {
 
         release_tx.send(()).expect("release publication lifecycle");
         let report = match event_rx.recv().expect("observe publication completion") {
-            PublicationEvent::Completed(result) => result.expect("complete fake publication"),
+            PublicationEvent::Completed(result) => (*result).expect("complete fake publication"),
             PublicationEvent::LocksHeld => panic!("publication published its lock point twice"),
         };
         publisher.join().expect("join publisher");

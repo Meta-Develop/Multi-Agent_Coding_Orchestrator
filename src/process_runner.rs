@@ -12955,11 +12955,10 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
             // shell only after its escaped stdin/pipe holder is ready, then keep the safety bound
             // focused on finalization proving the complete contained tree empty.
             fs::write(&release_target_path, b"release").expect("release escaped pipe holder");
-            let output = worker
+            worker
                 .join()
                 .expect("escaped pipe holder worker")
-                .expect("run escaped pipe holder");
-            output
+                .expect("run escaped pipe holder")
         });
 
         let escaped_pid = std::fs::read_to_string(&escaped_pid_path)
