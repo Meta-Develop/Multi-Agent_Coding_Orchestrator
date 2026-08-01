@@ -22,7 +22,7 @@ impl GateCorrectionJournalState {
 #[derive(Debug, Default)]
 pub(super) struct AutonomyKpiCollector {
     reviewed_actions: BTreeMap<String, ReviewedGateActionKpi>,
-    gate_lifecycles: BTreeMap<String, GateCorrectionLifecycleKpi>,
+    gate_lifecycles: BTreeMap<(String, String), GateCorrectionLifecycleKpi>,
     eligible_reviewed_runs: BTreeSet<String>,
     human_interrupted_runs: BTreeSet<String>,
 }
@@ -80,7 +80,10 @@ impl AutonomyKpiCollector {
     ) {
         let lifecycle = self
             .gate_lifecycles
-            .entry(denial.denial_id.as_str().to_string())
+            .entry((
+                denial.denial_id.as_str().to_string(),
+                denial.correction_correlation_id.as_str().to_string(),
+            ))
             .or_insert_with(|| GateCorrectionLifecycleKpi {
                 denial_id: denial.denial_id.as_str().to_string(),
                 correction_correlation_id: denial.correction_correlation_id.as_str().to_string(),
@@ -119,16 +122,15 @@ impl AutonomyKpiCollector {
                     .as_deref()
                     .zip(action.correction_correlation_id.as_deref())
             })
-            .collect::<BTreeMap<_, _>>();
+            .collect::<BTreeSet<_>>();
         let reviewed_gate_lifecycles = self
             .gate_lifecycles
             .values()
             .filter(|lifecycle| {
-                reviewed_denials
-                    .get(lifecycle.denial_id.as_str())
-                    .is_some_and(|correlation_id| {
-                        *correlation_id == lifecycle.correction_correlation_id
-                    })
+                reviewed_denials.contains(&(
+                    lifecycle.denial_id.as_str(),
+                    lifecycle.correction_correlation_id.as_str(),
+                ))
             })
             .cloned()
             .collect::<Vec<_>>();

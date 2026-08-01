@@ -259,10 +259,16 @@ fn legacy_autonomy_kpi_report_defaults_new_population_and_coverage_fields() {
     );
 }
 
-#[test]
-fn producer_paths_join_terminal_lifecycles_only_to_reviewed_denials() {
+fn producer_path_join_report(
+    unreviewed_first: bool,
+) -> (AutonomyKpiReport, GateDenial, GateDenial) {
     let (_temp, repo_path) = injected_repository();
-    let run_id = RunId::new("autonomy-kpi-producer-join").expect("valid producer-path run id");
+    let run_id = RunId::new(if unreviewed_first {
+        "autonomy-kpi-producer-reverse"
+    } else {
+        "autonomy-kpi-producer-forward"
+    })
+    .expect("valid producer-path run id");
     let mut writer = ArtifactRunWriter::reserve(
         &repo_path,
         RunArtifactFamily::Supervise,
@@ -304,38 +310,41 @@ fn producer_paths_join_terminal_lifecycles_only_to_reviewed_denials() {
             ))
             .expect("produce reviewed denial through strict journal sink");
 
+        let lifecycle_order = if unreviewed_first {
+            [unreviewed.clone(), reviewed.clone()]
+        } else {
+            [reviewed.clone(), unreviewed.clone()]
+        };
         let mut tracker = GateCorrectionTracker::new(2);
         let mut health_signals = Vec::new();
-        assert!(tracker
-            .authorize(
-                reviewed.clone(),
-                &artifacts,
-                "child-a",
-                run_id.as_str(),
-                &mut health_signals,
-            )
-            .expect("authorize correction for reviewed denial")
-            .is_some());
-        tracker
-            .self_corrected(&artifacts, "child-a", run_id.as_str())
-            .expect("terminalize reviewed denial through gate tracker");
-
-        assert!(tracker
-            .authorize(
-                unreviewed,
-                &artifacts,
-                "child-a",
-                run_id.as_str(),
-                &mut health_signals,
-            )
-            .expect("authorize correction for unrelated gate population")
-            .is_some());
-        tracker
-            .self_corrected(&artifacts, "child-a", run_id.as_str())
-            .expect("terminalize unrelated gate lifecycle through gate tracker");
+        for denial in lifecycle_order {
+            assert!(tracker
+                .authorize(
+                    denial,
+                    &artifacts,
+                    "child-a",
+                    run_id.as_str(),
+                    &mut health_signals,
+                )
+                .expect("authorize correction through gate tracker")
+                .is_some());
+            tracker
+                .self_corrected(&artifacts, "child-a", run_id.as_str())
+                .expect("terminalize correction through gate tracker");
+        }
     }
 
-    let report = collector.report(true);
+    (collector.report(true), reviewed, unreviewed)
+}
+
+#[test]
+fn producer_paths_join_terminal_lifecycles_only_to_reviewed_denials() {
+    let (report, reviewed, unreviewed) = producer_path_join_report(false);
+    assert_eq!(reviewed.denial_id, unreviewed.denial_id);
+    assert_ne!(
+        reviewed.correction_correlation_id,
+        unreviewed.correction_correlation_id
+    );
     assert_eq!(report.denials, Some(1));
     assert_eq!(report.self_corrections, Some(1));
     assert_eq!(
@@ -349,6 +358,42 @@ fn producer_paths_join_terminal_lifecycles_only_to_reviewed_denials() {
     assert_eq!(
         report.gate_lifecycles[0].denial_id,
         reviewed.denial_id.as_str()
+    );
+    assert_eq!(
+        report.gate_lifecycles[0].correction_correlation_id,
+        reviewed.correction_correlation_id.as_str()
+    );
+}
+
+#[test]
+fn producer_paths_reverse_order_join_is_full_identity_and_order_independent() {
+    let (reverse_report, reviewed, unreviewed) = producer_path_join_report(true);
+    let (forward_report, _, _) = producer_path_join_report(false);
+
+    assert_eq!(reviewed.denial_id, unreviewed.denial_id);
+    assert_ne!(
+        reviewed.correction_correlation_id,
+        unreviewed.correction_correlation_id
+    );
+    assert_eq!(reverse_report.denials, Some(1));
+    assert_eq!(reverse_report.self_corrections, Some(1));
+    assert_eq!(reverse_report.denials, forward_report.denials);
+    assert_eq!(
+        reverse_report.self_corrections,
+        forward_report.self_corrections
+    );
+    assert_eq!(
+        reverse_report.self_correction_rate,
+        forward_report.self_correction_rate
+    );
+    assert_eq!(
+        reverse_report.gate_lifecycles,
+        forward_report.gate_lifecycles
+    );
+    assert_eq!(reverse_report.gate_lifecycles.len(), 1);
+    assert_eq!(
+        reverse_report.gate_lifecycles[0].correction_correlation_id,
+        reviewed.correction_correlation_id.as_str()
     );
 }
 
