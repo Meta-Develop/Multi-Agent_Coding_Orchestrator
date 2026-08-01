@@ -1408,6 +1408,12 @@ struct ParentAuditorLensExecution<'a> {
     required_coverage: &'a ReviewCoverageRequirement,
 }
 
+/// Creates a process-owned, uniquely named workspace for one review-lens run.
+///
+/// `TempDir::drop` recursively removes this workspace. That machine-global
+/// cleanup is an audited known bypass: unlike external-agent output staging,
+/// no caller selects or adopts this path. Keep the operator inventory in the
+/// README in sync if this ownership or cleanup mechanism changes.
 pub(super) fn create_review_lens_scope_workspace() -> Result<tempfile::TempDir> {
     let workspace = tempfile::Builder::new()
         .prefix("maco-review-lens-")
