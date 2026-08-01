@@ -9959,11 +9959,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn prepare_holds_and_releases_worktree_and_repository_locks() {
+        enum PreparationEvent {
+            LocksHeld,
+            Completed(Result<PrPublicationReport>),
+        }
+
         let temp = tempfile::tempdir().expect("tempdir");
         let (repo_path, manager, agent_a, agent_b) = create_publication_lease_fixture(temp.path());
         fs::write(agent_a.path.join("README.md"), "# Lock candidate\n")
             .expect("write lock candidate");
-        let (ready_tx, ready_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let publisher_repo = repo_path.clone();
         let publisher_manager = manager.clone();
@@ -9971,26 +9976,25 @@ mod tests {
             let write_lease = publisher_manager
                 .acquire_write_execution_lease("agent-a")
                 .expect("publisher write lease");
-            prepare_pr_candidate_with_write_lease_after_preview(
+            let result = prepare_pr_candidate_with_write_lease_after_preview(
                 fake_publication_options(&publisher_repo, "agent-a"),
                 &write_lease,
                 |_| {
-                    ready_tx.send(()).expect("signal held preparation locks");
-                    release_rx
-                        .recv_timeout(Duration::from_secs(5))
-                        .expect("release preparation locks");
+                    event_tx
+                        .send(PreparationEvent::LocksHeld)
+                        .expect("signal held preparation locks");
+                    release_rx.recv().expect("release preparation locks");
                 },
-            )
+            );
+            let _ = event_tx.send(PreparationEvent::Completed(result));
         });
 
-        // Candidate preview performs a bounded status capture with a 60-second
-        // total budget. Under a parallel test load that capture can take more
-        // than five seconds even though the publication locks are behaving
-        // correctly. Keep this coordination assertion above that production
-        // budget so safe bounded work is not mistaken for a lock failure.
-        ready_rx
-            .recv_timeout(Duration::from_secs(65))
-            .expect("preparation acquired both locks");
+        match event_rx.recv().expect("observe preparation lifecycle") {
+            PreparationEvent::LocksHeld => {}
+            PreparationEvent::Completed(result) => {
+                panic!("preparation completed before the strict pre-publication lock point: {result:?}")
+            }
+        }
         manager
             .acquire_read_execution_lease("agent-a")
             .expect_err("preparation writer excludes readers");
@@ -10011,10 +10015,13 @@ mod tests {
         drop(unrelated);
 
         release_tx.send(()).expect("release preparation");
-        publisher
-            .join()
-            .expect("join preparation")
-            .expect("complete preparation");
+        match event_rx.recv().expect("observe preparation completion") {
+            PreparationEvent::Completed(result) => {
+                result.expect("complete preparation");
+            }
+            PreparationEvent::LocksHeld => panic!("preparation published its lock point twice"),
+        }
+        publisher.join().expect("join preparation");
         drop(
             manager
                 .acquire_read_execution_lease("agent-a")
