@@ -264,7 +264,7 @@ fn interrupted_final_report_checkpoint(
         .assignment_started(
             &assignment,
             0,
-            writer.resume_binding().expect("assignment start binding"),
+            Some(writer.resume_binding().expect("assignment start binding")),
             ledger.report().expect("assignment start budget"),
         )
         .expect("checkpoint assignment start");
@@ -306,9 +306,11 @@ fn interrupted_final_report_checkpoint(
         .assignment_completed(
             &assignment,
             0,
-            writer
-                .resume_binding()
-                .expect("assignment completion binding"),
+            Some(
+                writer
+                    .resume_binding()
+                    .expect("assignment completion binding"),
+            ),
             budget.clone(),
             None,
             vec![retained_claim.token.get()],
@@ -607,9 +609,11 @@ fn resume_refuses_dispatch_started_without_durable_completion_as_uncertain() {
         .assignment_started(
             &assignment,
             0,
-            writer
-                .resume_binding()
-                .expect("uncertain assignment binding"),
+            Some(
+                writer
+                    .resume_binding()
+                    .expect("uncertain assignment binding"),
+            ),
             ledger.report().expect("uncertain assignment budget"),
         )
         .expect("checkpoint uncertain assignment start");

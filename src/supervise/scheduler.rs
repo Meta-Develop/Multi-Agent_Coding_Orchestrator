@@ -1056,17 +1056,20 @@ fn persist_supervisor_final_report(
     let report_bytes = encode_final_report(&final_report)?;
     let mut checkpoint_writer = checkpoint_writer;
     if let Some(checkpoint) = checkpoint_writer.as_deref_mut() {
-        checkpoint.final_report_planned(
-            &final_report,
-            &report_bytes,
-            artifact_writer.resume_binding()?,
-        )?;
+        let artifact_binding = artifact_writer
+            .resume_binding()
+            .context("failed to write normalized supervisor final report")?;
+        checkpoint
+            .final_report_planned(&final_report, &report_bytes, artifact_binding)
+            .context("failed to write normalized supervisor final report")?;
     }
-    artifact_writer.write_bytes(
-        RunArtifactFamily::Supervise.final_report_relative_path(),
-        &report_bytes,
-        ArtifactFileDisposition::PrivateEvidence,
-    )?;
+    artifact_writer
+        .write_bytes(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            &report_bytes,
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .context("failed to write normalized supervisor final report")?;
     if let Some(checkpoint) = checkpoint_writer.as_deref_mut() {
         checkpoint.final_report_committed(
             &final_report,
@@ -1690,7 +1693,9 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         {
             false
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            return Err(error).context("failed to write normalized supervisor final report")
+        }
     };
     persist_supervisor_final_report(
         final_report,

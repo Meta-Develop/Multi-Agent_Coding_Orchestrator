@@ -74,7 +74,8 @@ struct PreparedCheckpoint {
 struct AssignmentCheckpoint {
     version: u32,
     index: usize,
-    artifact: ArtifactRunResumeBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artifact: Option<ArtifactRunResumeBinding>,
     budget: RunBudgetReport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     worktree: Option<CheckpointWorktreeBinding>,
@@ -286,7 +287,7 @@ impl SupervisorCheckpointWriter {
         &mut self,
         assignment: &OrchestratorAssignment,
         index: usize,
-        artifact: ArtifactRunResumeBinding,
+        artifact: Option<ArtifactRunResumeBinding>,
         budget: RunBudgetReport,
     ) -> Result<()> {
         if self.assignment_states.get(&assignment.id) != Some(&AssignmentResumeState::Pending) {
@@ -313,7 +314,7 @@ impl SupervisorCheckpointWriter {
         &mut self,
         assignment: &OrchestratorAssignment,
         index: usize,
-        artifact: ArtifactRunResumeBinding,
+        artifact: Option<ArtifactRunResumeBinding>,
         budget: RunBudgetReport,
         worktree: Option<&WorktreeRecord>,
         claim_tokens: Vec<u64>,
@@ -508,13 +509,13 @@ pub(super) fn record_assignment_started_checkpoint(
         return Ok(());
     }
     let artifact = match guard.writer.resume_binding() {
-        Ok(binding) => binding,
+        Ok(binding) => Some(binding),
         Err(error)
             if error
                 .to_string()
                 .contains("not at a resumable manifest boundary") =>
         {
-            return Ok(())
+            None
         }
         Err(error) => return Err(error),
     };
@@ -541,13 +542,13 @@ pub(super) fn record_assignment_completed_checkpoint(
         return Ok(());
     }
     let artifact = match guard.writer.resume_binding() {
-        Ok(binding) => binding,
+        Ok(binding) => Some(binding),
         Err(error)
             if error
                 .to_string()
                 .contains("not at a resumable manifest boundary") =>
         {
-            return Ok(())
+            None
         }
         Err(error) => return Err(error),
     };
