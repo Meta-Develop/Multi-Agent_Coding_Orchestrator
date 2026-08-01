@@ -592,7 +592,7 @@ fn prepare_child_attempt<'a>(
         options.run_id.as_str(),
         &assignment.id,
     );
-    command = bind_supervisor_machine_global_staging_cleanup(command, options, *execution_runtime)?;
+    command = bind_supervisor_machine_global_staging_cleanup(command, options)?;
     command =
         apply_canonical_environment_requirements(command, &preflight.environment_requirements);
     command = configure_writable_child_command(command, &assignment.assigned_paths)?;
@@ -1436,16 +1436,12 @@ pub(super) fn configure_review_lens_execution_boundary(
 fn bind_supervisor_machine_global_staging_cleanup(
     command: ExternalAgentCommand,
     options: &SupervisorRunOptions,
-    execution_runtime: SupervisorExecutionRuntime,
 ) -> Result<ExternalAgentCommand> {
-    match options.machine_global_retention.as_ref() {
-        Some(binding) => Ok(command.with_machine_global_retention(binding.clone())),
-        None if execution_runtime == SupervisorExecutionRuntime::Verified => bail!(
-            "verified supervise dispatch requires --machine-global-config and \
-             --machine-global-runtime-root-id for private output-staging cleanup"
-        ),
-        None => Ok(command),
-    }
+    let binding = options.machine_global_retention.as_ref().context(
+        "supervise dispatch requires --machine-global-config and \
+         --machine-global-runtime-root-id for private output-staging cleanup",
+    )?;
+    Ok(command.with_machine_global_retention(binding.clone()))
 }
 
 fn prepare_parent_auditor<'a>(
@@ -1570,11 +1566,7 @@ fn prepare_parent_auditor<'a>(
                 options.run_id.as_str(),
                 &auditor_id,
             );
-    auditor_command = bind_supervisor_machine_global_staging_cleanup(
-        auditor_command,
-        options,
-        *execution_runtime,
-    )?;
+    auditor_command = bind_supervisor_machine_global_staging_cleanup(auditor_command, options)?;
     auditor_command = apply_canonical_environment_requirements(
         auditor_command,
         &preflight.environment_requirements,
@@ -3072,7 +3064,7 @@ mod decomposition_tests {
     }
 
     #[test]
-    fn verified_supervise_dispatch_refuses_a_missing_staging_cleanup_binding() {
+    fn supervise_dispatch_refuses_a_missing_staging_cleanup_binding() {
         let options = SupervisorRunOptions {
             repo: PathBuf::from("/unused/repo"),
             plan_file: PathBuf::from("/unused/plan.json"),
@@ -3090,12 +3082,8 @@ mod decomposition_tests {
             "/unused/report.json",
             Duration::from_secs(1),
         );
-        let error = bind_supervisor_machine_global_staging_cleanup(
-            command,
-            &options,
-            SupervisorExecutionRuntime::Verified,
-        )
-        .expect_err("verified supervise cleanup must not take the unbound bypass");
+        let error = bind_supervisor_machine_global_staging_cleanup(command, &options)
+            .expect_err("supervise cleanup must not take the unbound bypass");
         let rendered = error.to_string();
         assert!(rendered.contains("--machine-global-config"));
         assert!(rendered.contains("--machine-global-runtime-root-id"));
@@ -3192,7 +3180,6 @@ done
                 Duration::from_secs(10),
             ),
             &options,
-            SupervisorExecutionRuntime::NonpublishableSimulation,
         )?;
         assert_eq!(
             command.machine_global_retention,
