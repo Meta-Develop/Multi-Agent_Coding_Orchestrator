@@ -376,6 +376,12 @@ fn run_serial_assignment_schedule(
         };
         pending.remove(&index);
         let assignment = &context.plan.assignments[index];
+        record_assignment_started_checkpoint(
+            context.artifacts,
+            assignment,
+            index,
+            context.budget_ledger,
+        )?;
         let outcome = execute_supervisor_assignment(AssignmentExecutionContext {
             index,
             concurrent_mode: false,
@@ -422,6 +428,7 @@ fn run_serial_assignment_schedule(
         }
         let abort = outcome.requires_scheduler_abort();
         let budget_stopped = outcome.budget_dispatch_stopped;
+        record_completed_assignment_checkpoint(context, index, &outcome)?;
         progress.indexed_outcomes[index] = Some(outcome);
         if abort || budget_stopped {
             progress.budget_prevented_dispatch |= budget_stopped;
@@ -513,6 +520,12 @@ fn run_concurrent_assignment_schedule(
                     };
                     pending.remove(&index);
                     let assignment = &context.plan.assignments[index];
+                    record_assignment_started_checkpoint(
+                        context.artifacts,
+                        assignment,
+                        index,
+                        context.budget_ledger,
+                    )?;
                     let semantic_block_order = (context.plan.semantic_coordination
                         == SemanticCoordinationMode::Block)
                         .then(|| {
@@ -580,6 +593,10 @@ fn run_concurrent_assignment_schedule(
                                 &assignment.id,
                                 &error,
                             )?;
+                            let outcome = progress.indexed_outcomes[index]
+                                .as_ref()
+                                .context("spawn failure outcome disappeared")?;
+                            record_completed_assignment_checkpoint(context, index, outcome)?;
                             break;
                         }
                     }
@@ -647,6 +664,7 @@ fn run_concurrent_assignment_schedule(
                     stop_scheduling = true;
                 }
             }
+            record_completed_assignment_checkpoint(context, completed_index, &outcome)?;
             progress.indexed_outcomes[completed_index] = Some(outcome);
         }
 
@@ -659,10 +677,46 @@ fn run_concurrent_assignment_schedule(
                 )),
             };
             release_concurrent_assignment(&mut outcome, context.sync_store, context.semantic_store);
+            record_completed_assignment_checkpoint(context, index, &outcome)?;
             progress.indexed_outcomes[index] = Some(outcome);
         }
         Ok(())
     })
+}
+
+fn record_completed_assignment_checkpoint(
+    context: &AssignmentSchedulerContext<'_, '_>,
+    index: usize,
+    outcome: &AssignmentExecutionOutcome,
+) -> Result<()> {
+    let assignment = context
+        .plan
+        .assignments
+        .get(index)
+        .context("checkpoint completion index is outside the supervisor plan")?;
+    let worktrees = context.manager.list()?;
+    let worktree = worktrees.iter().find(|record| record.name == assignment.id);
+    let claim_tokens = outcome
+        .claim_tokens
+        .iter()
+        .map(|token| token.get())
+        .chain(
+            outcome
+                .released_claims
+                .iter()
+                .map(|claim| claim.token.get()),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    record_assignment_completed_checkpoint(
+        context.artifacts,
+        assignment,
+        index,
+        context.budget_ledger,
+        worktree,
+        claim_tokens,
+    )
 }
 
 struct SupervisorFinalReportConstruction<'context> {
@@ -760,6 +814,7 @@ fn build_supervisor_final_report(
         } else {
             ReviewStatus::Failed
         },
+        run_lifecycle: SupervisorRunLifecycle::Finalized,
         assigned_paths: plan
             .assignments
             .iter()
@@ -957,6 +1012,7 @@ fn persist_supervisor_final_report(
     mut final_report: SupervisorFinalReport,
     orchestration_journal: &mut Option<OrchestrationEventJournal>,
     mut artifact_writer: ArtifactRunWriter,
+    checkpoint_writer: Option<&mut SupervisorCheckpointWriter>,
 ) -> Result<SupervisorFinalReport> {
     enforce_supervisor_final_environment_failure_outcome(&mut final_report);
     record_orchestration_event(
@@ -997,11 +1053,35 @@ fn persist_supervisor_final_report(
             trip.autonomy_kpis = final_report.autonomy_kpis.clone();
         }
     }
-    write_final_report(&mut artifact_writer, &final_report)?;
+    let report_bytes = encode_final_report(&final_report)?;
+    let mut checkpoint_writer = checkpoint_writer;
+    if let Some(checkpoint) = checkpoint_writer.as_deref_mut() {
+        checkpoint.final_report_planned(
+            &final_report,
+            &report_bytes,
+            artifact_writer.resume_binding()?,
+        )?;
+    }
+    artifact_writer.write_bytes(
+        RunArtifactFamily::Supervise.final_report_relative_path(),
+        &report_bytes,
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+    if let Some(checkpoint) = checkpoint_writer.as_deref_mut() {
+        checkpoint.final_report_committed(
+            &final_report,
+            &report_bytes,
+            artifact_writer.resume_binding()?,
+        )?;
+        checkpoint.finalization_started(&final_report, &report_bytes)?;
+    }
     artifact_writer.finalize(
         RunArtifactFamily::Supervise.final_report_relative_path(),
         final_report.publishable,
     )?;
+    if let Some(checkpoint) = checkpoint_writer {
+        checkpoint.finalized(&final_report, &report_bytes)?;
+    }
     Ok(final_report)
 }
 
@@ -1093,6 +1173,7 @@ struct PreparedSupervisorRun {
     repo: PathBuf,
     assignment_schedule: Vec<AssignmentScheduleEntry>,
     artifact_writer: ArtifactRunWriter,
+    checkpoint_writer: SupervisorCheckpointWriter,
     run_dir: PathBuf,
     dirs: RunDirs,
     manager: WorktreeManager,
@@ -1141,6 +1222,23 @@ fn prepare_supervisor_run(
         options.run_id.clone(),
         "maco-supervise",
     )?;
+    let primary_base = current_head_oid(&repo)?;
+    let normalized_plan_sha256 = normalized_supervisor_plan_sha256(
+        &plan,
+        &consultant,
+        &assignment_metadata,
+        &plan_metadata,
+    )?;
+    let checkpoint_writer = SupervisorCheckpointWriter::create(
+        &repo,
+        &options.run_id,
+        &primary_base,
+        normalized_plan_sha256,
+        max_concurrent_children,
+        &plan,
+        artifact_writer.resume_binding()?,
+        budget_ledger.report()?,
+    )?;
     let run_dir = artifact_writer.run_dir().to_path_buf();
     let dirs = RunDirs::for_writer(&artifact_writer);
     let manager = WorktreeManager::new(&repo);
@@ -1155,6 +1253,7 @@ fn prepare_supervisor_run(
         repo,
         assignment_schedule,
         artifact_writer,
+        checkpoint_writer,
         run_dir,
         dirs,
         manager,
@@ -1181,6 +1280,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         repo,
         assignment_schedule,
         mut artifact_writer,
+        mut checkpoint_writer,
         run_dir,
         dirs,
         manager,
@@ -1264,6 +1364,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 writer: &mut artifact_writer,
                 journal: &mut orchestration_journal,
                 autonomy_kpis: &mut autonomy_kpi_collector,
+                checkpoint: Some(&mut checkpoint_writer),
             });
             let semantic_block_gate = SemanticBlockGate::default();
             let serial_semantic_warn_intents = Mutex::new(Vec::<(usize, SemanticIntent)>::new());
@@ -1577,7 +1678,26 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         breaker_tripped,
         field_guide_mutation_failed,
     });
-    persist_supervisor_final_report(final_report, &mut orchestration_journal, artifact_writer)
+    let checkpoint_finalization = match artifact_writer.resume_binding() {
+        Ok(binding) => {
+            checkpoint_writer.scheduler_closed(binding, budget_ledger.report()?)?;
+            true
+        }
+        Err(error)
+            if error
+                .to_string()
+                .contains("not at a resumable manifest boundary") =>
+        {
+            false
+        }
+        Err(error) => return Err(error),
+    };
+    persist_supervisor_final_report(
+        final_report,
+        &mut orchestration_journal,
+        artifact_writer,
+        checkpoint_finalization.then_some(&mut checkpoint_writer),
+    )
 }
 
 #[cfg(test)]
@@ -1714,6 +1834,7 @@ mod decomposition_tests {
                 writer: &mut artifact_writer,
                 journal: &mut journal,
                 autonomy_kpis: &mut autonomy_kpis,
+                checkpoint: None,
             });
             let runtime_model_catalog = RuntimeModelCatalog::LocalDeterministicFake;
             let runner = |_: &ExternalAgentCommand,
@@ -1789,6 +1910,7 @@ mod decomposition_tests {
                 writer: &mut artifact_writer,
                 journal: &mut journal,
                 autonomy_kpis: &mut autonomy_kpis,
+                checkpoint: None,
             });
             let runtime_model_catalog = RuntimeModelCatalog::LocalDeterministicFake;
             let runner = |_: &ExternalAgentCommand,
@@ -2271,9 +2393,40 @@ mod decomposition_tests {
         assert!(journal.is_some());
         let plan = test_plan(Vec::new());
         let report = build_supervisor_final_report(test_report_construction(&plan, run_id.clone()));
+        let consultant = SupervisorConsultantPlan::default();
+        let assignment_metadata = AssignmentMetadata::new();
+        let plan_metadata = SupervisorPlanMetadata::default();
+        let budget_ledger =
+            RunBudgetLedger::new(RunBudgetLimits::default()).expect("checkpoint budget ledger");
+        let mut checkpoint = SupervisorCheckpointWriter::create(
+            &repo,
+            &run_id,
+            &current_head_oid(&repo).expect("checkpoint primary base"),
+            normalized_supervisor_plan_sha256(
+                &plan,
+                &consultant,
+                &assignment_metadata,
+                &plan_metadata,
+            )
+            .expect("checkpoint normalized plan binding"),
+            1,
+            &plan,
+            writer
+                .resume_binding()
+                .expect("checkpoint artifact binding"),
+            budget_ledger.report().expect("checkpoint initial budget"),
+        )
+        .expect("create supervise checkpoint");
+        checkpoint
+            .scheduler_closed(
+                writer.resume_binding().expect("scheduler close binding"),
+                budget_ledger.report().expect("scheduler close budget"),
+            )
+            .expect("close checkpoint scheduler");
 
-        let persisted = persist_supervisor_final_report(report, &mut journal, writer)
-            .expect("persist scheduler final report directly");
+        let persisted =
+            persist_supervisor_final_report(report, &mut journal, writer, Some(&mut checkpoint))
+                .expect("persist scheduler final report directly");
 
         assert_eq!(persisted.run_id, run_id);
         let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)

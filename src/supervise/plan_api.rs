@@ -757,11 +757,275 @@ fn run_supervisor_plan_file_with_runner_and_max_concurrent_children(
     )
 }
 
+pub fn resume_supervisor_run(
+    repo: impl AsRef<Path>,
+    run_id: RunId,
+) -> Result<SupervisorResumeReport> {
+    let repo = discover_repo_root(repo.as_ref())?;
+    let run_dir = run_dir(&repo, &run_id);
+    if let Some(report) = read_finalized_supervisor_report(&repo, &run_id, &run_dir)? {
+        return Ok(SupervisorResumeReport {
+            run_id,
+            repo: PathBuf::from("."),
+            lifecycle: SupervisorRunLifecycle::Finalized,
+            success: true,
+            resumed: false,
+            budget_reconciled_from_checkpoint: false,
+            run_budget: report.run_budget.clone(),
+            completed_assignments: report
+                .orchestrator_reports
+                .iter()
+                .map(|child| child.id.clone())
+                .collect(),
+            pending_assignments: Vec::new(),
+            uncertain_assignments: Vec::new(),
+            gate_denial: None,
+            final_report: Some(report),
+        });
+    }
+
+    let (mut checkpoint, snapshot) = match open_supervisor_checkpoint(&repo, &run_id) {
+        Ok(opened) => opened,
+        Err(error) => {
+            return resume_refusal(
+                &run_id,
+                SupervisorRunLifecycle::Interrupted,
+                ResumeCheckpointDenial::IntegrityFailure,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Some(format!("{error:#}")),
+            )
+        }
+    };
+    if !snapshot.uncertain_assignments.is_empty() {
+        let denial = GateDenial::new(
+            run_id.as_str(),
+            GateDenialReason::ExternalSideEffect {
+                state: ExternalSideEffectState::Ambiguous,
+            },
+            VerifiedGateContext::new(
+                run_id.as_str(),
+                GateCheckSource::ExternalSideEffect,
+                std::iter::empty::<&Path>(),
+            )?,
+        )?;
+        return Ok(SupervisorResumeReport {
+            run_id,
+            repo: PathBuf::from("."),
+            lifecycle: SupervisorRunLifecycle::Uncertain,
+            success: false,
+            resumed: false,
+            budget_reconciled_from_checkpoint: false,
+            run_budget: None,
+            completed_assignments: snapshot.completed_assignments,
+            pending_assignments: snapshot.pending_assignments,
+            uncertain_assignments: snapshot.uncertain_assignments,
+            gate_denial: Some(denial),
+            final_report: None,
+        });
+    }
+    let Some(plan) = snapshot.final_report.as_ref() else {
+        return resume_refusal(
+            &run_id,
+            SupervisorRunLifecycle::Interrupted,
+            ResumeCheckpointDenial::UnsupportedLifecycle,
+            snapshot.completed_assignments,
+            snapshot.pending_assignments,
+            snapshot.uncertain_assignments,
+            None,
+        );
+    };
+    if snapshot.finalized {
+        return resume_refusal(
+            &run_id,
+            SupervisorRunLifecycle::Interrupted,
+            ResumeCheckpointDenial::IntegrityFailure,
+            snapshot.completed_assignments,
+            snapshot.pending_assignments,
+            snapshot.uncertain_assignments,
+            Some(
+                "checkpoint claims finalization but the authenticated artifact marker is missing"
+                    .to_string(),
+            ),
+        );
+    }
+    let manager = WorktreeManager::new(&repo);
+    if let Err(error) = snapshot.verify_completed_worktrees(&manager) {
+        return resume_refusal(
+            &run_id,
+            SupervisorRunLifecycle::Interrupted,
+            ResumeCheckpointDenial::IntegrityFailure,
+            snapshot.completed_assignments,
+            snapshot.pending_assignments,
+            snapshot.uncertain_assignments,
+            Some(format!("{error:#}")),
+        );
+    }
+    let sync_store = SyncStore::open(&repo)?;
+    if let Err(error) = snapshot.verify_claim_disposition(&sync_store, &plan.report) {
+        return resume_refusal(
+            &run_id,
+            SupervisorRunLifecycle::Interrupted,
+            ResumeCheckpointDenial::IntegrityFailure,
+            snapshot.completed_assignments,
+            snapshot.pending_assignments,
+            snapshot.uncertain_assignments,
+            Some(format!("{error:#}")),
+        );
+    }
+
+    let report_path = RunArtifactFamily::Supervise.final_report_relative_path();
+    let artifact_writer_result = if plan.artifact_committed {
+        ArtifactRunWriter::reopen_unfinalized(&repo, &plan.artifact)
+    } else {
+        let recovery = ArtifactRecoveryFile {
+            relative: &report_path,
+            contents: &plan.report_bytes,
+            disposition: ArtifactFileDisposition::PrivateEvidence,
+        };
+        ArtifactRunWriter::reopen_unfinalized_with_recovery(&repo, &plan.artifact, &[recovery])
+    };
+    let artifact_writer = match artifact_writer_result {
+        Ok(writer) => writer,
+        Err(error) => {
+            return resume_refusal(
+                &run_id,
+                SupervisorRunLifecycle::Interrupted,
+                ResumeCheckpointDenial::IntegrityFailure,
+                snapshot.completed_assignments,
+                snapshot.pending_assignments,
+                snapshot.uncertain_assignments,
+                Some(format!("{error:#}")),
+            )
+        }
+    };
+    if !plan.artifact_committed {
+        checkpoint.final_report_committed(
+            &plan.report,
+            &plan.report_bytes,
+            artifact_writer.resume_binding()?,
+        )?;
+    }
+    if !snapshot.finalization_started {
+        checkpoint.finalization_started(&plan.report, &plan.report_bytes)?;
+    }
+    artifact_writer.finalize(&report_path, plan.publish_requested)?;
+    checkpoint.finalized(&plan.report, &plan.report_bytes)?;
+    let report = read_finalized_supervisor_report(&repo, &run_id, &run_dir)?
+        .context("resumed supervise finalization did not publish a verified final report")?;
+    if report != plan.report {
+        bail!("resumed finalized report differs from its authenticated checkpoint plan");
+    }
+    Ok(SupervisorResumeReport {
+        run_id,
+        repo: PathBuf::from("."),
+        lifecycle: SupervisorRunLifecycle::Finalized,
+        success: true,
+        resumed: true,
+        budget_reconciled_from_checkpoint: true,
+        run_budget: report.run_budget.clone(),
+        completed_assignments: snapshot.completed_assignments,
+        pending_assignments: snapshot.pending_assignments,
+        uncertain_assignments: snapshot.uncertain_assignments,
+        gate_denial: None,
+        final_report: Some(report),
+    })
+}
+
+fn resume_refusal(
+    run_id: &RunId,
+    lifecycle: SupervisorRunLifecycle,
+    denial: ResumeCheckpointDenial,
+    completed_assignments: Vec<String>,
+    pending_assignments: Vec<String>,
+    uncertain_assignments: Vec<String>,
+    diagnostic: Option<String>,
+) -> Result<SupervisorResumeReport> {
+    let gate_denial = GateDenial::new(
+        run_id.as_str(),
+        GateDenialReason::ResumeCheckpoint { denial },
+        VerifiedGateContext::new(
+            run_id.as_str(),
+            GateCheckSource::AuthenticatedCheckpoint,
+            std::iter::empty::<&Path>(),
+        )?,
+    )?;
+    let _ = diagnostic;
+    Ok(SupervisorResumeReport {
+        run_id: run_id.clone(),
+        repo: PathBuf::from("."),
+        lifecycle,
+        success: false,
+        resumed: false,
+        budget_reconciled_from_checkpoint: false,
+        run_budget: None,
+        completed_assignments,
+        pending_assignments,
+        uncertain_assignments,
+        gate_denial: Some(gate_denial),
+        final_report: None,
+    })
+}
+
 pub fn supervisor_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<SupervisorStatusReport> {
     let repo = discover_repo_root(repo.as_ref())?;
     let run_dir = run_dir(&repo, &run_id);
     let final_report_path = supervisor_final_report_path(&run_dir);
     let final_report = read_finalized_supervisor_report(&repo, &run_id, &run_dir)?;
+    let (lifecycle, resume_gate_denial) = if final_report.is_some() {
+        (SupervisorRunLifecycle::Finalized, None)
+    } else {
+        match open_supervisor_checkpoint(&repo, &run_id) {
+            Ok((_writer, snapshot)) if !snapshot.uncertain_assignments.is_empty() => {
+                let denial = GateDenial::new(
+                    run_id.as_str(),
+                    GateDenialReason::ExternalSideEffect {
+                        state: ExternalSideEffectState::Ambiguous,
+                    },
+                    VerifiedGateContext::new(
+                        run_id.as_str(),
+                        GateCheckSource::ExternalSideEffect,
+                        std::iter::empty::<&Path>(),
+                    )?,
+                )?;
+                (SupervisorRunLifecycle::Uncertain, Some(denial))
+            }
+            Ok((_writer, snapshot)) if snapshot.final_report.is_some() => {
+                (SupervisorRunLifecycle::Resumable, None)
+            }
+            Ok((_writer, _snapshot)) => {
+                let refusal = resume_refusal(
+                    &run_id,
+                    SupervisorRunLifecycle::Interrupted,
+                    ResumeCheckpointDenial::UnsupportedLifecycle,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                )?;
+                (SupervisorRunLifecycle::Interrupted, refusal.gate_denial)
+            }
+            Err(error)
+                if error.to_string().contains("active elsewhere")
+                    || error.to_string().contains("instance is active") =>
+            {
+                (SupervisorRunLifecycle::Active, None)
+            }
+            Err(_) => {
+                let refusal = resume_refusal(
+                    &run_id,
+                    SupervisorRunLifecycle::Interrupted,
+                    ResumeCheckpointDenial::IntegrityFailure,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                )?;
+                (SupervisorRunLifecycle::Interrupted, refusal.gate_denial)
+            }
+        }
+    };
     Ok(SupervisorStatusReport {
         run_id,
         repo: PathBuf::from("."),
@@ -770,6 +1034,8 @@ pub fn supervisor_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<Superv
             .map(Path::to_path_buf)
             .unwrap_or_else(|_| RunArtifactFamily::Supervise.run_root()),
         final_report_exists: final_report.is_some(),
+        lifecycle,
+        resume_gate_denial,
         final_report_path: final_report_path
             .strip_prefix(&repo)
             .map(Path::to_path_buf)
@@ -788,6 +1054,32 @@ pub fn collect_supervisor_run(
     if let Some(report) = read_finalized_supervisor_report(&repo, &run_id, &run_dir)? {
         return Ok(report);
     }
+    let status = supervisor_status(&repo, run_id.clone())?;
+    let lifecycle = status.lifecycle;
+    let gate_denials = status.resume_gate_denial.into_iter().collect::<Vec<_>>();
+    let (remaining_risk, next_safe_action) = match lifecycle {
+        SupervisorRunLifecycle::Active => (
+            "the supervise scheduler is still active and no finalized report exists".to_string(),
+            "wait for the active scheduler or inspect status without starting a second run"
+                .to_string(),
+        ),
+        SupervisorRunLifecycle::Resumable => (
+            "the authenticated checkpoint can safely resume artifact finalization only".to_string(),
+            format!("run `maco supervise resume {}`", run_id.as_str()),
+        ),
+        SupervisorRunLifecycle::Uncertain => (
+            "an authenticated dispatch start lacks durable completion; repeating it could duplicate side effects".to_string(),
+            "reconcile or explicitly abandon the uncertain attempt under a new identity; do not rerun it blindly".to_string(),
+        ),
+        SupervisorRunLifecycle::Interrupted => (
+            "run artifacts are incomplete and the authenticated lifecycle is not safely resumable".to_string(),
+            "inspect the typed checkpoint gate denial and start a new run only after reconciliation".to_string(),
+        ),
+        SupervisorRunLifecycle::Finalized => (
+            "the finalized marker and report disagree".to_string(),
+            "inspect authenticated artifact integrity before proceeding".to_string(),
+        ),
+    };
 
     Ok(SupervisorFinalReport {
         version: SUPERVISOR_SCHEMA_VERSION,
@@ -805,6 +1097,7 @@ pub fn collect_supervisor_run(
         accepted: false,
         rejected: true,
         status: ReviewStatus::Missing,
+        run_lifecycle: lifecycle,
         assigned_paths: Vec::new(),
         semantic_symbols: Vec::new(),
         semantic_modules: Vec::new(),
@@ -822,7 +1115,7 @@ pub fn collect_supervisor_run(
         commands_run: Vec::new(),
         environment_failures: Vec::new(),
         sandbox_denials: Vec::new(),
-        gate_denials: Vec::new(),
+        gate_denials,
         pre_action_review_metrics: Vec::new(),
         gate_correction_outcomes: Vec::new(),
         autonomy_kpis: AutonomyKpiReport::default(),
@@ -843,8 +1136,8 @@ pub fn collect_supervisor_run(
         release_errors: Vec::new(),
         released_semantic_intents: Vec::new(),
         semantic_release_errors: Vec::new(),
-        remaining_risk: "run artifacts are incomplete".to_string(),
-        next_safe_action: "rerun supervise run for this run id".to_string(),
+        remaining_risk,
+        next_safe_action,
     })
 }
 

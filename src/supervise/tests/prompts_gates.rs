@@ -468,6 +468,7 @@ fn gate_terminal_append_failure_retains_active_denial_without_false_outcome() {
             writer: &mut writer,
             journal: &mut journal,
             autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
         });
         let authorized = tracker
             .authorize(

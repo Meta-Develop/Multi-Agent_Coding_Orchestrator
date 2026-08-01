@@ -189,6 +189,7 @@ pub enum GateCheckSource {
     Containment,
     PrimaryIntegrity,
     ExternalSideEffect,
+    AuthenticatedCheckpoint,
     FutureApprovalReview,
 }
 
@@ -232,6 +233,9 @@ pub enum GateDenialReason {
     },
     ContainmentFailure,
     PrimaryIntegrityFailure,
+    ResumeCheckpoint {
+        denial: ResumeCheckpointDenial,
+    },
     ExternalSideEffect {
         state: ExternalSideEffectState,
     },
@@ -277,6 +281,14 @@ pub enum BudgetAdmissionDenial {
     HardCostCeiling,
 }
 
+/// Authenticated supervise-resume conditions that cannot authorize progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeCheckpointDenial {
+    IntegrityFailure,
+    UnsupportedLifecycle,
+}
+
 /// A typed, non-executable description of the next safe operation.
 ///
 /// Variants are policy vocabulary, not shell commands or reviewer-supplied text.
@@ -294,6 +306,7 @@ pub enum NextSafeOperation {
     RemediateExcludedReference,
     RestoreContainment,
     RestorePrimaryIntegrity,
+    InspectAuthenticatedCheckpoint,
     ReconcileExternalSideEffect,
     EscalateSandboxPolicy,
     ReplanDestructiveTargets,
@@ -959,6 +972,9 @@ fn validate_context_source(reason: &GateDenialReason, source: GateCheckSource) -
         },
         GateDenialReason::ContainmentFailure => source == GateCheckSource::Containment,
         GateDenialReason::PrimaryIntegrityFailure => source == GateCheckSource::PrimaryIntegrity,
+        GateDenialReason::ResumeCheckpoint { .. } => {
+            source == GateCheckSource::AuthenticatedCheckpoint
+        }
         GateDenialReason::ExternalSideEffect { .. } => {
             source == GateCheckSource::ExternalSideEffect
         }
@@ -976,6 +992,7 @@ fn retryability_for(reason: &GateDenialReason) -> GateRetryability {
         GateDenialReason::BudgetAdmission { .. }
         | GateDenialReason::ContainmentFailure
         | GateDenialReason::PrimaryIntegrityFailure
+        | GateDenialReason::ResumeCheckpoint { .. }
         | GateDenialReason::ExternalSideEffect { .. }
         | GateDenialReason::Sandbox { .. }
         | GateDenialReason::DestructiveTarget { .. }
@@ -993,6 +1010,7 @@ fn is_non_retryable_safety_class(reason: &GateDenialReason) -> bool {
         reason,
         GateDenialReason::ContainmentFailure
             | GateDenialReason::PrimaryIntegrityFailure
+            | GateDenialReason::ResumeCheckpoint { .. }
             | GateDenialReason::ExternalSideEffect { .. }
             | GateDenialReason::Sandbox { .. }
             | GateDenialReason::DestructiveTarget { .. }
@@ -1015,6 +1033,7 @@ fn route_for(reason: &GateDenialReason) -> GateDenialRoute {
         | GateDenialReason::ApprovalReview { .. } => GateDenialRoute::ChildController,
         GateDenialReason::MergeRemediation { .. }
         | GateDenialReason::PrimaryIntegrityFailure
+        | GateDenialReason::ResumeCheckpoint { .. }
         | GateDenialReason::ExternalSideEffect { .. } => GateDenialRoute::IntegrationController,
     }
 }
@@ -1037,6 +1056,9 @@ fn next_safe_operation_for(reason: &GateDenialReason) -> NextSafeOperation {
         },
         GateDenialReason::ContainmentFailure => NextSafeOperation::RestoreContainment,
         GateDenialReason::PrimaryIntegrityFailure => NextSafeOperation::RestorePrimaryIntegrity,
+        GateDenialReason::ResumeCheckpoint { .. } => {
+            NextSafeOperation::InspectAuthenticatedCheckpoint
+        }
         GateDenialReason::ExternalSideEffect { .. } => {
             NextSafeOperation::ReconcileExternalSideEffect
         }
@@ -1144,6 +1166,14 @@ fn reason_label(reason: &GateDenialReason) -> &'static str {
         },
         GateDenialReason::ContainmentFailure => "containment failure",
         GateDenialReason::PrimaryIntegrityFailure => "primary integrity failure",
+        GateDenialReason::ResumeCheckpoint { denial } => match denial {
+            ResumeCheckpointDenial::IntegrityFailure => {
+                "authenticated resume checkpoint integrity failure"
+            }
+            ResumeCheckpointDenial::UnsupportedLifecycle => {
+                "authenticated resume checkpoint lifecycle is not safely resumable"
+            }
+        },
         GateDenialReason::ExternalSideEffect {
             state: ExternalSideEffectState::Ambiguous,
         } => "ambiguous external side effect",
@@ -1236,6 +1266,7 @@ fn check_source_label(value: GateCheckSource) -> &'static str {
         GateCheckSource::Containment => "containment",
         GateCheckSource::PrimaryIntegrity => "primary integrity",
         GateCheckSource::ExternalSideEffect => "external side effect",
+        GateCheckSource::AuthenticatedCheckpoint => "authenticated resume checkpoint",
         GateCheckSource::FutureApprovalReview => "future approval review",
     }
 }
@@ -1274,6 +1305,9 @@ fn next_safe_operation_instruction(value: NextSafeOperation) -> &'static str {
         }
         NextSafeOperation::RestorePrimaryIntegrity => {
             "restore and verify primary integrity; do not retry this attempt."
+        }
+        NextSafeOperation::InspectAuthenticatedCheckpoint => {
+            "inspect the authenticated checkpoint and begin a new run; do not infer or repair missing authority."
         }
         NextSafeOperation::ReconcileExternalSideEffect => {
             "reconcile the external receipt or state; do not repeat the external call."
@@ -1861,6 +1895,7 @@ mod tests {
             GateCheckSource::Containment,
             GateCheckSource::PrimaryIntegrity,
             GateCheckSource::ExternalSideEffect,
+            GateCheckSource::AuthenticatedCheckpoint,
             GateCheckSource::FutureApprovalReview,
         ];
         assert_eq!(
@@ -1880,6 +1915,7 @@ mod tests {
                 "containment",
                 "primary_integrity",
                 "external_side_effect",
+                "authenticated_checkpoint",
                 "future_approval_review"
             ])
         );
@@ -1911,6 +1947,12 @@ mod tests {
                     state: ExternalSideEffectState::Completed,
                 },
                 GateCheckSource::ExternalSideEffect,
+            ),
+            (
+                GateDenialReason::ResumeCheckpoint {
+                    denial: ResumeCheckpointDenial::IntegrityFailure,
+                },
+                GateCheckSource::AuthenticatedCheckpoint,
             ),
             (
                 GateDenialReason::Sandbox {

@@ -827,6 +827,14 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             let report = supervise::supervisor_status(args.repo, RunId::new(&args.run_id)?)?;
             print_query_report(&report, args.json)
         }
+        SuperviseSubcommand::Resume(args) => {
+            let report = supervise::resume_supervisor_run(args.repo, RunId::new(&args.run_id)?)?;
+            print_query_report(&report, args.json)?;
+            if !report.success {
+                bail!("supervise resume refused");
+            }
+            Ok(())
+        }
         SuperviseSubcommand::Collect(args) => {
             let report = supervise::collect_supervisor_run(args.repo, RunId::new(&args.run_id)?)?;
             print_query_report(&report, args.json)?;
@@ -847,6 +855,8 @@ enum SuperviseSubcommand {
     Run(RunSuperviseArgs),
     /// Report durable run artifact status.
     Status(StatusSuperviseArgs),
+    /// Resume safe finalization from an authenticated scheduler checkpoint.
+    Resume(ResumeSuperviseArgs),
     /// Collect the durable supervisor final report.
     Collect(CollectSuperviseArgs),
     /// List, inspect, or prune durable run artifacts.
@@ -909,6 +919,18 @@ struct RunSuperviseArgs {
 #[derive(Debug, Args)]
 struct StatusSuperviseArgs {
     /// Run id to inspect.
+    run_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ResumeSuperviseArgs {
+    /// Interrupted supervise run id to resume.
     run_id: String,
     /// Repository path.
     #[arg(long, default_value = ".")]
@@ -5001,5 +5023,28 @@ mod tests {
             "goal.md",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn supervise_resume_accepts_run_identity_and_query_output_options() {
+        let parsed = Cli::try_parse_from([
+            "maco",
+            "supervise",
+            "resume",
+            "interrupted-run",
+            "--repo",
+            "repo",
+            "--json",
+        ])
+        .expect("supervise resume should parse");
+        let Command::Supervise(SuperviseCommand {
+            command: SuperviseSubcommand::Resume(resume),
+        }) = parsed.command
+        else {
+            panic!("expected supervise resume command");
+        };
+        assert_eq!(resume.run_id, "interrupted-run");
+        assert_eq!(resume.repo, PathBuf::from("repo"));
+        assert!(resume.json);
     }
 }

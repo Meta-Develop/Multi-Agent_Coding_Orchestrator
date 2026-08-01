@@ -39,6 +39,10 @@ pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
         "title": "SupervisorFinalReport",
         "type": "object",
         "properties": {
+            "run_lifecycle": {
+                "type": "string",
+                "enum": ["active", "interrupted", "uncertain", "resumable", "finalized"]
+            },
             "gate_denials": {
                 "type": "array",
                 "items": gate_denial_schema_value()
@@ -1009,20 +1013,32 @@ fn write_schema(
     .with_context(|| format!("failed to write schema {}", relative.display()))
 }
 
+pub(super) fn encode_final_report(report: &SupervisorFinalReport) -> Result<Vec<u8>> {
+    let mut normalized_report = report.clone();
+    enforce_supervisor_final_environment_failure_outcome(&mut normalized_report);
+    let mut contents = serde_json::to_vec_pretty(&normalized_report)
+        .context("failed to serialize normalized supervisor final report")?;
+    contents.push(b'\n');
+    if contents.len() > MAX_SUPERVISOR_REPORT_BYTES {
+        bail!("normalized supervisor final report exceeds its bounded size");
+    }
+    Ok(contents)
+}
+
+#[cfg(test)]
 pub(super) fn write_final_report(
     writer: &mut ArtifactRunWriter,
     report: &SupervisorFinalReport,
 ) -> Result<()> {
-    let mut normalized_report = report.clone();
-    enforce_supervisor_final_environment_failure_outcome(&mut normalized_report);
-    write_artifact_json(
-        writer,
-        &RunArtifactFamily::Supervise.final_report_relative_path(),
-        &normalized_report,
-        MAX_SUPERVISOR_REPORT_BYTES,
-        ArtifactFileDisposition::PrivateEvidence,
-    )
-    .context("failed to write normalized supervisor final report")
+    let contents = encode_final_report(report)?;
+    writer
+        .write_bytes(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            &contents,
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .context("failed to write normalized supervisor final report")?;
+    Ok(())
 }
 
 pub(super) fn read_supervisor_final_report(

@@ -5,7 +5,8 @@ pub use crate::supervise_budget::{
 use crate::{
     artifacts::{
         repository_authenticator_key_only, state_auth::random_identifier, ArtifactFileDisposition,
-        ArtifactRunReader, ArtifactRunWriter, ArtifactScratchDirectory, RunArtifactFamily,
+        ArtifactRecoveryFile, ArtifactRunReader, ArtifactRunWriter, ArtifactScratchDirectory,
+        RunArtifactFamily,
     },
     external_agent::{
         codex_usage_from_jsonl, load_codex_runtime_model_catalog,
@@ -23,7 +24,8 @@ use crate::{
     },
     gate_denial::{
         BudgetAdmissionDenial, ExternalSideEffectState, GateApplyBlocker, GateCheckSource,
-        GateDenial, GateDenialReason, GateDenialRoute, GateRetryability, VerifiedGateContext,
+        GateDenial, GateDenialReason, GateDenialRoute, GateRetryability, ResumeCheckpointDenial,
+        VerifiedGateContext,
     },
     llm::provider::{ModelPricing, Usage},
     merge::{
@@ -117,6 +119,9 @@ pub use gate_health::*;
 
 mod journal;
 use journal::*;
+
+mod checkpoint;
+use checkpoint::*;
 
 mod acceptance;
 use acceptance::*;
@@ -848,6 +853,8 @@ pub struct SupervisorFinalReport {
     pub accepted: bool,
     pub rejected: bool,
     pub status: ReviewStatus,
+    #[serde(default)]
+    pub run_lifecycle: SupervisorRunLifecycle,
     #[serde(default, serialize_with = "serialize_paths")]
     pub assigned_paths: Vec<PathBuf>,
     #[serde(default)]
@@ -1251,7 +1258,49 @@ pub struct SupervisorStatusReport {
     #[serde(serialize_with = "serialize_path")]
     pub final_report_path: PathBuf,
     pub final_report_exists: bool,
+    pub lifecycle: SupervisorRunLifecycle,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_gate_denial: Option<GateDenial>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_report: Option<SupervisorFinalReport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorRunLifecycle {
+    Active,
+    Interrupted,
+    Uncertain,
+    Resumable,
+    Finalized,
+}
+
+impl Default for SupervisorRunLifecycle {
+    fn default() -> Self {
+        Self::Finalized
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SupervisorResumeReport {
+    pub run_id: RunId,
+    #[serde(serialize_with = "serialize_path")]
+    pub repo: PathBuf,
+    pub lifecycle: SupervisorRunLifecycle,
+    pub success: bool,
+    pub resumed: bool,
+    pub budget_reconciled_from_checkpoint: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_budget: Option<RunBudgetReport>,
+    #[serde(default)]
+    pub completed_assignments: Vec<String>,
+    #[serde(default)]
+    pub pending_assignments: Vec<String>,
+    #[serde(default)]
+    pub uncertain_assignments: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_denial: Option<GateDenial>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_report: Option<SupervisorFinalReport>,
 }
 
@@ -1467,6 +1516,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         accepted: true,
         rejected: false,
         status: ReviewStatus::Succeeded,
+        run_lifecycle: SupervisorRunLifecycle::Finalized,
         assigned_paths: files_changed.clone(),
         semantic_symbols: Vec::new(),
         semantic_modules: Vec::new(),
@@ -1862,6 +1912,7 @@ struct SharedSupervisorArtifacts<'a> {
     writer: &'a mut ArtifactRunWriter,
     journal: &'a mut Option<OrchestrationEventJournal>,
     autonomy_kpis: &'a mut AutonomyKpiCollector,
+    checkpoint: Option<&'a mut SupervisorCheckpointWriter>,
 }
 
 struct SupervisorPreActionJournalSink<'artifacts, 'writer> {
@@ -1880,6 +1931,7 @@ impl PreActionJournalSink for SupervisorPreActionJournalSink<'_, '_> {
             writer,
             journal,
             autonomy_kpis,
+            ..
         } = &mut *guard;
         record_pre_action_event_strict(journal, writer, self.node, self.parent, record)?;
         autonomy_kpis.observe_pre_action_event(record);
