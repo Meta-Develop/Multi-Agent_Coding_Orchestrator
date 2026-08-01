@@ -261,6 +261,7 @@ pub(super) fn record_gate_correction_event(
         writer,
         journal,
         autonomy_kpis,
+        ..
     } = &mut *guard;
     record_gate_correction_event_strict(
         journal,
@@ -536,6 +537,7 @@ pub(super) fn record_breaker_trip(
         writer,
         journal,
         autonomy_kpis,
+        ..
     } = &mut *guard;
     // The transition event precedes the scheduler's active-assignment drain, so its KPI
     // payload is deliberately a counter-only snapshot. Final reporting runs after the

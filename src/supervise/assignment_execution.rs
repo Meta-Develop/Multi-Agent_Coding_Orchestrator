@@ -784,6 +784,7 @@ fn dispatch_and_collect_child_attempt<'a>(
                 })?;
                 return Err(error);
             }
+            record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 external_runner(
                     &command,
@@ -814,6 +815,7 @@ fn dispatch_and_collect_child_attempt<'a>(
                 })?;
                 return Err(error);
             }
+            record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
             deterministic_fake_child_run(
                 &command,
                 assignment,
@@ -823,6 +825,7 @@ fn dispatch_and_collect_child_attempt<'a>(
             )
         }
     };
+    record_dispatch_checkpoint(artifacts, false, true, &assignment.id, attempt)?;
     let external_run = match external_run_result {
         Ok(run) => run,
         Err(error) => {
@@ -1794,6 +1797,7 @@ fn dispatch_and_collect_parent_auditor(
                 })?;
                 return Err(error);
             }
+            record_dispatch_checkpoint(artifacts, true, false, &auditor_id, auditor_attempt)?;
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 external_runner(&auditor_command, cancellation, None)
             })) {
@@ -1825,9 +1829,11 @@ fn dispatch_and_collect_parent_auditor(
                 })?;
                 return Err(error);
             }
+            record_dispatch_checkpoint(artifacts, true, false, &auditor_id, auditor_attempt)?;
             deterministic_fake_auditor_run(&auditor_command, &auditor_id, assignment, child_report)
         }
     };
+    record_dispatch_checkpoint(artifacts, true, true, &auditor_id, auditor_attempt)?;
     let auditor_run = match auditor_run_result {
         Ok(run) => run,
         Err(error) => {
@@ -2841,6 +2847,7 @@ mod decomposition_tests {
             writer: &mut artifact_writer,
             journal: &mut journal,
             autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
         });
         let runner = unused_external_runner;
         let context = AssignmentExecutionContext {

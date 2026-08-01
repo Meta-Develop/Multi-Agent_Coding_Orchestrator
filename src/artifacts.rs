@@ -319,6 +319,29 @@ pub struct ArtifactRunWriter {
     run_lock: BoundArtifactLock,
 }
 
+/// Authenticated-journal payload required to reopen one unfinalized artifact run.
+///
+/// This value is not authority by itself. Callers must obtain it from repository-
+/// authenticated state; reopening revalidates the repository, run-directory and
+/// writer-lock identities plus every manifested byte before returning a writer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArtifactRunResumeBinding {
+    version: u32,
+    repository: ArtifactRepositoryBinding,
+    family: RunArtifactFamily,
+    run_id: String,
+    provenance: ArtifactProvenance,
+    writer_evidence: ArtifactWriterEvidence,
+    files: Vec<ArtifactFileRecord>,
+}
+
+pub(crate) struct ArtifactRecoveryFile<'a> {
+    pub(crate) relative: &'a Path,
+    pub(crate) contents: &'a [u8],
+    pub(crate) disposition: ArtifactFileDisposition,
+}
+
 /// An identity-bound capability for a child-writable directory reserved inside
 /// one artifact run. The directory must be discarded through the writer after
 /// every process that could mutate it has stopped. Dropping this capability
@@ -529,6 +552,142 @@ impl ArtifactRunWriter {
                 total_bytes: 0,
                 run_lock,
             })
+        })();
+        finish_with_artifact_lock_verification(result, root_lock.verify(&run_root))
+    }
+
+    pub(crate) fn resume_binding(&self) -> Result<ArtifactRunResumeBinding> {
+        self.run_lock.verify(&self.run)?;
+        if !self.outstanding_scratches.is_empty() || !self.poisoned_appends.is_empty() {
+            bail!("artifact run is not at a resumable manifest boundary");
+        }
+        let audited = audit_artifact_tree(&self.run, true)?;
+        verify_manifest_paths(&self.files, &audited)?;
+        verify_manifest_contents(&self.run, self.files.values())?;
+        Ok(ArtifactRunResumeBinding {
+            version: ARTIFACT_FORMAT_VERSION,
+            repository: self.repository.binding.clone(),
+            family: self.family,
+            run_id: self.run_id.as_str().to_string(),
+            provenance: self.provenance.clone(),
+            writer_evidence: self.writer_evidence.clone(),
+            files: self.files.values().cloned().collect(),
+        })
+    }
+
+    pub(crate) fn reopen_unfinalized(
+        repo: impl AsRef<Path>,
+        binding: &ArtifactRunResumeBinding,
+    ) -> Result<Self> {
+        Self::reopen_unfinalized_with_recovery(repo, binding, &[])
+    }
+
+    pub(crate) fn reopen_unfinalized_with_recovery(
+        repo: impl AsRef<Path>,
+        binding: &ArtifactRunResumeBinding,
+        recoverable_files: &[ArtifactRecoveryFile<'_>],
+    ) -> Result<Self> {
+        validate_artifact_resume_binding(binding)?;
+        let repository = discover_artifact_repository(repo.as_ref())?;
+        if binding.repository != repository.binding {
+            bail!("artifact resume binding belongs to a different repository");
+        }
+        let run_id = RunId::new(&binding.run_id)?;
+        if run_id.as_str() != binding.run_id {
+            bail!("artifact resume binding run id is not canonical");
+        }
+        let run_root = open_existing_run_root(&repository, binding.family)?;
+        ensure_private_directory(run_root.path())?;
+        let root_lock = BoundArtifactLock::acquire(&run_root, ROOT_LOCK_FILE)?;
+        root_lock.verify(&run_root)?;
+        let result = (|| -> Result<Self> {
+            let reserved = run_root
+                .bind_existing_direct_child_directory(run_id.as_str())
+                .context("artifact resume run directory is missing or unsafe")?;
+            let run = SafeRoot::open_existing(reserved.path())?;
+            ensure_private_directory(run.path())?;
+            if run.direct_child_exists(FINALIZATION_MARKER)? {
+                bail!("artifact resume run is already finalized");
+            }
+            let run_lock = BoundArtifactLock::acquire(&run, RUN_LOCK_FILE)?;
+            if binding.writer_evidence.run_root_identity != *run_root.identity()
+                || binding.writer_evidence.run_identity != *run.identity()
+                || binding.writer_evidence.writer_lock_identity != run_lock.lock_identity
+            {
+                bail!("artifact resume writer identity binding changed");
+            }
+            verify_writer_evidence(&binding.writer_evidence, &run_root, &run)?;
+
+            let mut files = binding
+                .files
+                .iter()
+                .cloned()
+                .map(|record| (record.path.clone(), record))
+                .collect::<BTreeMap<_, _>>();
+            if files.len() != binding.files.len() {
+                bail!("artifact resume binding contains duplicate manifest paths");
+            }
+            let mut total_bytes = binding.files.iter().try_fold(0_u64, |total, record| {
+                total
+                    .checked_add(record.bytes)
+                    .context("artifact resume manifest byte total overflowed")
+            })?;
+            verify_manifest_contents(&run, files.values())?;
+
+            let mut recovery_paths = BTreeSet::new();
+            for recovery in recoverable_files {
+                let relative = validate_artifact_relative_path(recovery.relative)?;
+                if files.contains_key(&relative) || !recovery_paths.insert(relative) {
+                    bail!("artifact recovery file conflicts with the authenticated manifest");
+                }
+            }
+            let audited = audit_artifact_tree(&run, true)?;
+            let manifested = files.keys().cloned().collect::<BTreeSet<_>>();
+            if !audited.is_superset(&manifested)
+                || !audited
+                    .difference(&manifested)
+                    .all(|path| recovery_paths.contains(path))
+            {
+                bail!("artifact tree contains state not authorized by the resume checkpoint");
+            }
+
+            let mut writer = Self {
+                repository,
+                family: binding.family,
+                run_id,
+                run_root: run_root.clone(),
+                run,
+                provenance: binding.provenance.clone(),
+                writer_evidence: binding.writer_evidence.clone(),
+                files: std::mem::take(&mut files),
+                outstanding_scratches: BTreeMap::new(),
+                poisoned_appends: BTreeSet::new(),
+                total_bytes,
+                run_lock,
+            };
+            for recovery in recoverable_files {
+                let relative = validate_artifact_relative_path(recovery.relative)?;
+                if audited.contains(&relative) {
+                    let observed = BoundedRegularReader::read_relative(
+                        writer.run.path(),
+                        &relative,
+                        MAX_ARTIFACT_FILE_BYTES,
+                    )?;
+                    if observed != recovery.contents {
+                        bail!("recoverable artifact contents do not match the checkpoint plan");
+                    }
+                }
+                let record =
+                    writer.write_bytes(&relative, recovery.contents, recovery.disposition)?;
+                total_bytes = total_bytes
+                    .checked_add(record.bytes)
+                    .context("artifact recovery byte total overflowed")?;
+            }
+            if writer.total_bytes != total_bytes {
+                bail!("artifact recovery byte accounting is inconsistent");
+            }
+            writer.resume_binding()?;
+            Ok(writer)
         })();
         finish_with_artifact_lock_verification(result, root_lock.verify(&run_root))
     }
@@ -2338,6 +2497,44 @@ fn validate_producer(producer: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_artifact_resume_binding(binding: &ArtifactRunResumeBinding) -> Result<()> {
+    if binding.version != ARTIFACT_FORMAT_VERSION {
+        bail!("artifact resume binding format version is unsupported");
+    }
+    validate_producer(&binding.provenance.producer)?;
+    validate_writer_evidence(&binding.writer_evidence)?;
+    let run_id = RunId::new(&binding.run_id)?;
+    if run_id.as_str() != binding.run_id {
+        bail!("artifact resume binding run id is not canonical");
+    }
+    if let Some(revision) = &binding.provenance.source_revision {
+        if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("artifact resume source revision is not a full Git object id");
+        }
+    }
+    if binding.files.len() > MAX_ARTIFACT_FILES {
+        bail!("artifact resume binding exceeds its manifest file limit");
+    }
+    let mut seen = BTreeSet::new();
+    let mut total = 0_u64;
+    for record in &binding.files {
+        let path = validate_artifact_relative_path(&record.path)?;
+        if path != record.path || !seen.insert(path) {
+            bail!("artifact resume binding contains a duplicate or noncanonical path");
+        }
+        if record.bytes > MAX_ARTIFACT_FILE_BYTES || !is_canonical_lower_hex_64(&record.sha256) {
+            bail!("artifact resume binding contains an invalid file record");
+        }
+        total = total
+            .checked_add(record.bytes)
+            .context("artifact resume manifest byte total overflowed")?;
+        if total > MAX_ARTIFACT_TOTAL_BYTES {
+            bail!("artifact resume binding exceeds its aggregate byte limit");
+        }
+    }
+    Ok(())
+}
+
 fn validate_finalization(finalization: &ArtifactFinalization) -> Result<()> {
     if finalization.version != ARTIFACT_FORMAT_VERSION {
         bail!("artifact finalization format version is unsupported");
@@ -3505,6 +3702,122 @@ mod tests {
             .expect("finalize after recovered append failure");
         ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
             .expect("open finalized recovered run");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_resume_binding_reopens_only_the_exact_unfinalized_manifest() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("artifact-resume-exact").expect("run id");
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "supervise",
+        )
+        .expect("reserve writer");
+        writer
+            .write_bytes(
+                "evidence/completed.txt",
+                b"completed once\n",
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write completed evidence");
+        let binding = writer.resume_binding().expect("capture resume binding");
+        drop(writer);
+
+        let mut tampered = binding.clone();
+        tampered.files[0].sha256 = "0".repeat(64);
+        let error = match ArtifactRunWriter::reopen_unfinalized(&repo, &tampered) {
+            Ok(_) => panic!("tampered manifest binding must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("digest/length"));
+
+        let mut resumed = ArtifactRunWriter::reopen_unfinalized(&repo, &binding)
+            .expect("reopen exact authenticated binding");
+        assert_eq!(
+            fs::read(resumed.run_dir().join("evidence/completed.txt"))
+                .expect("read completed evidence"),
+            b"completed once\n"
+        );
+        resumed
+            .write_json(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                &serde_json::json!({"status":"succeeded"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write resumed final report");
+        resumed
+            .finalize(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                false,
+            )
+            .expect("finalize resumed writer");
+        ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
+            .expect("open finalized resumed run");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_resume_recovers_only_checkpoint_planned_extra_file() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("artifact-resume-recovery").expect("run id");
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "supervise",
+        )
+        .expect("reserve writer");
+        writer
+            .write_bytes(
+                "evidence/completed.txt",
+                b"completed once\n",
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write completed evidence");
+        let binding = writer.resume_binding().expect("capture resume binding");
+        let report_path = RunArtifactFamily::Supervise.final_report_relative_path();
+        let planned_report = b"{\n  \"status\": \"succeeded\"\n}\n";
+        writer
+            .write_bytes(
+                &report_path,
+                planned_report,
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("simulate report write after planned checkpoint");
+        drop(writer);
+
+        let wrong = ArtifactRecoveryFile {
+            relative: &report_path,
+            contents: b"different\n",
+            disposition: ArtifactFileDisposition::PrivateEvidence,
+        };
+        let error =
+            match ArtifactRunWriter::reopen_unfinalized_with_recovery(&repo, &binding, &[wrong]) {
+                Ok(_) => panic!("mismatched planned bytes must fail closed"),
+                Err(error) => error,
+            };
+        assert!(error.to_string().contains("do not match"));
+
+        let recovery = ArtifactRecoveryFile {
+            relative: &report_path,
+            contents: planned_report,
+            disposition: ArtifactFileDisposition::PrivateEvidence,
+        };
+        let resumed =
+            ArtifactRunWriter::reopen_unfinalized_with_recovery(&repo, &binding, &[recovery])
+                .expect("recover exact checkpoint-planned report");
+        resumed
+            .finalize(&report_path, false)
+            .expect("finalize recovered report");
+        let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
+            .expect("open recovered finalized run");
+        assert_eq!(
+            reader.read(&report_path).expect("read recovered report"),
+            planned_report
+        );
     }
 
     #[cfg(unix)]

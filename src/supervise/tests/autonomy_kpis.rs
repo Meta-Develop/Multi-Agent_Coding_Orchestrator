@@ -310,6 +310,7 @@ fn human_intervention_cancellation_producer_path_suppresses_partial_run_rates() 
             writer: &mut writer,
             journal: &mut journal,
             autonomy_kpis: &mut collector,
+            checkpoint: None,
         });
         let mut review_sink = SupervisorPreActionJournalSink {
             artifacts: &artifacts,
@@ -476,6 +477,7 @@ fn producer_path_join_report(
             writer: &mut writer,
             journal: &mut journal,
             autonomy_kpis: &mut collector,
+            checkpoint: None,
         });
         let mut review_sink = SupervisorPreActionJournalSink {
             artifacts: &artifacts,
@@ -610,6 +612,7 @@ fn terminal_and_peer_routing_events_do_not_count_as_reviewed_human_actions() {
             writer: &mut writer,
             journal: &mut journal,
             autonomy_kpis: &mut collector,
+            checkpoint: None,
         });
         record_shared_orchestration_event(
             &artifacts,

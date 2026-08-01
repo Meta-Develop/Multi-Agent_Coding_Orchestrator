@@ -506,6 +506,7 @@ fn artifact_test_final_report(run_id: &RunId) -> SupervisorFinalReport {
         accepted: false,
         rejected: false,
         status: ReviewStatus::Succeeded,
+        run_lifecycle: SupervisorRunLifecycle::Finalized,
         assigned_paths: Vec::new(),
         semantic_symbols: Vec::new(),
         semantic_modules: Vec::new(),
