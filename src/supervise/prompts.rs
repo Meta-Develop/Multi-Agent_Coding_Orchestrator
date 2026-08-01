@@ -433,8 +433,9 @@ pub(super) fn render_evidence_only_reaudit_prompt(
     diff: &str,
 ) -> Result<RenderedPromptWithMeasurements> {
     let cacheable_prefix = r#"You are the evidence-only report stage for an assignment-scoped MACO re-audit.
-The implementation candidate is immutable for this operation. Do not edit repository content, apply patches, commit, reset, clean, delegate, launch workers, or change Git state.
+The implementation candidate is mounted read-only for this operation. Do not edit repository content, apply patches, commit, reset, clean, delegate, launch workers, or change Git state.
 Run only validation and inspection needed to correct the report evidence. Every tool action remains subject to the supervisor pre-action review boundary.
+Redirect every build output and cache to the private writable $TMPDIR outside the preserved worktree. For Cargo, set CARGO_TARGET_DIR="$TMPDIR/maco-evidence-target" and use --locked so validation cannot generate or update a lockfile. Treat any validation that requires source generation as unavailable instead of changing the candidate.
 Return one OrchestratorReviewReport JSON value through the configured output-last-message path.
 "#;
     let role_prefix = supervise_role_prefix(

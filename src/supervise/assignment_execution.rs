@@ -678,7 +678,11 @@ fn prepare_child_attempt<'a>(
     command = bind_supervisor_machine_global_staging_cleanup(command, options)?;
     command =
         apply_canonical_environment_requirements(command, &preflight.environment_requirements);
-    command = configure_writable_child_command(command, &assignment.assigned_paths)?;
+    command = if evidence_only_reaudit.is_some() {
+        configure_read_only_auditor_command(command)?
+    } else {
+        configure_writable_child_command(command, &assignment.assigned_paths)?
+    };
 
     let primary_before = primary_worktree_snapshot(repo, *execution_runtime)?;
     if let Some(error) = primary_before.inspection_problem() {
@@ -2254,37 +2258,22 @@ fn decide_parent_auditor_gate(
             (Some(before), Ok(after)) if before == &after => {
                 traceability_candidate = Some(after);
             }
-            (Some(before), Ok(after)) if !child_report.decomposition_completions.is_empty() => {
+            (Some(before), Ok(after)) => {
                 let error = anyhow!(
                     "candidate content, paths, or base changed across parent auditor review: before={before:?}, after={after:?}"
                 );
-                reject_supervisor_decomposition_binding(
-                    &mut child_report,
-                    final_report_path,
-                    &error,
-                );
+                reject_supervisor_candidate_binding(&mut child_report, final_report_path, &error);
             }
-            (Some(_), Err(error)) if !child_report.decomposition_completions.is_empty() => {
-                let error = anyhow!(
-                    "failed to recapture decomposition candidate after parent auditor review: {error:#}"
-                );
-                reject_supervisor_decomposition_binding(
-                    &mut child_report,
-                    final_report_path,
-                    &error,
-                );
+            (Some(_), Err(error)) => {
+                let error =
+                    anyhow!("failed to recapture candidate after parent auditor review: {error:#}");
+                reject_supervisor_candidate_binding(&mut child_report, final_report_path, &error);
             }
-            (None, _) if !child_report.decomposition_completions.is_empty() => {
-                let error = anyhow!(
-                    "accepted decomposition evidence has no pre-auditor supervisor candidate binding"
-                );
-                reject_supervisor_decomposition_binding(
-                    &mut child_report,
-                    final_report_path,
-                    &error,
-                );
+            (None, _) => {
+                let error =
+                    anyhow!("accepted report has no pre-auditor supervisor candidate binding");
+                reject_supervisor_candidate_binding(&mut child_report, final_report_path, &error);
             }
-            _ => {}
         }
     }
     if !report_failed(&child_report) || evidence_only_rejection {
@@ -2293,13 +2282,7 @@ fn decide_parent_auditor_gate(
                 let error = anyhow!(
                     "supervisor-observed candidate paths differ from the accepted child report"
                 );
-                if !child_report.decomposition_completions.is_empty() {
-                    reject_supervisor_decomposition_binding(
-                        &mut child_report,
-                        final_report_path,
-                        &error,
-                    );
-                }
+                reject_supervisor_candidate_binding(&mut child_report, final_report_path, &error);
                 traceability_candidate = None;
             }
         }
@@ -2522,7 +2505,7 @@ fn execute_supervisor_assignment_inner(
                 }
                 Ok(None) => None,
                 Err(error) => {
-                    reject_supervisor_decomposition_binding(
+                    reject_supervisor_candidate_binding(
                         &mut child_report,
                         &final_report_path,
                         &error,

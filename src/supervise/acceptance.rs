@@ -581,7 +581,7 @@ pub(super) fn bind_supervisor_decomposition_candidate(
     Ok(Some(inspection))
 }
 
-pub(super) fn reject_supervisor_decomposition_binding(
+pub(super) fn reject_supervisor_candidate_binding(
     report: &mut OrchestratorReviewReport,
     report_path: &Path,
     error: &anyhow::Error,
@@ -592,7 +592,7 @@ pub(super) fn reject_supervisor_decomposition_binding(
     report.findings.push(Finding {
         severity: FindingSeverity::Error,
         message: format!(
-            "supervisor could not bind the exact decomposition candidate reviewed by the parent auditor: {error:#}"
+            "supervisor could not bind the exact candidate reviewed by the parent auditor: {error:#}"
         ),
         paths: vec![report_path.to_path_buf()],
     });
