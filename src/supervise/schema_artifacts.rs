@@ -47,6 +47,7 @@ pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
                 "type": "array",
                 "items": gate_correction_outcome_schema_value()
             },
+            "autonomy_kpis": autonomy_kpi_report_schema_value(),
             "run_budget": run_budget_report_schema_value(),
             "review_lens_usage": {
                 "type": "array",
@@ -79,6 +80,101 @@ pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
                 "type": "array",
                 "items": environment_failure_schema_value()
             }
+        }
+    })
+}
+
+fn autonomy_kpi_report_schema_value() -> serde_json::Value {
+    let optional_count = || json!({"type": ["integer", "null"], "minimum": 0});
+    let ratio = || {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["numerator", "denominator"],
+            "properties": {
+                "numerator": {"type": "integer", "minimum": 0},
+                "denominator": {"type": "integer", "minimum": 1}
+            }
+        })
+    };
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "observation",
+            "actions_reviewed",
+            "denials",
+            "self_corrections",
+            "human_escalations",
+            "interrupted"
+        ],
+        "properties": {
+            "observation": {
+                "type": "string",
+                "enum": ["supervisor_aggregate", "not_process_observable"]
+            },
+            "actions_reviewed": optional_count(),
+            "denials": optional_count(),
+            "self_corrections": optional_count(),
+            "human_escalations": optional_count(),
+            "interrupted": {"type": ["boolean", "null"]},
+            "denial_rate": ratio(),
+            "self_correction_rate": ratio(),
+            "interruption_rate": ratio(),
+            "reviewed_actions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["action_gate_id", "allowed"],
+                    "properties": {
+                        "action_gate_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "correction_correlation_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "denial_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                        "allowed": {"type": "boolean"},
+                        "human_intervention": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["target", "outcome"],
+                            "properties": {
+                                "target": {"type": "string", "const": "human"},
+                                "outcome": {"type": "string", "const": "intervention_required"}
+                            }
+                        }
+                    }
+                }
+            },
+            "gate_lifecycles": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "denial_id",
+                        "correction_correlation_id",
+                        "route",
+                        "correction_attempts"
+                    ],
+                    "properties": {
+                        "denial_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                        "correction_correlation_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "route": {
+                            "type": "string",
+                            "enum": ["planner_parent", "child_controller", "integration_controller"]
+                        },
+                        "correction_attempts": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": MAX_GATE_CORRECTIONS_LIMIT
+                        },
+                        "terminal_outcome": {
+                            "type": "string",
+                            "enum": ["self_corrected", "exhausted", "escalated"]
+                        }
+                    }
+                }
+            },
+            "unavailable_reason": {"type": "string"}
         }
     })
 }

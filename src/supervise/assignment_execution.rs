@@ -2836,9 +2836,11 @@ mod decomposition_tests {
         let runtime_model_catalog = RuntimeModelCatalog::LocalDeterministicFake;
         let cancellation = ProcessCancellation::new();
         let mut journal = initialize_orchestration_event_journal(&repo, &options.run_id);
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
         let artifacts = Mutex::new(SharedSupervisorArtifacts {
             writer: &mut artifact_writer,
             journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
         });
         let runner = unused_external_runner;
         let context = AssignmentExecutionContext {

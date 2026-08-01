@@ -825,6 +825,7 @@ pub fn collect_supervisor_run(
         gate_denials: Vec::new(),
         pre_action_review_metrics: Vec::new(),
         gate_correction_outcomes: Vec::new(),
+        autonomy_kpis: AutonomyKpiReport::default(),
         files_changed: Vec::new(),
         validation_results: Vec::new(),
         findings: vec![Finding {

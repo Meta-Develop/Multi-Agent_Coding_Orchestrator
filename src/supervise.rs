@@ -13,8 +13,9 @@ use crate::{
         CodexRuntimeModelCatalog, EnvironmentFailure, EnvironmentFailureCategory,
         EnvironmentPreflightResult, EnvironmentRemediation, EnvironmentRemediationScope,
         EnvironmentRequirement, ExternalAgentCommand, ExternalAgentRun,
-        ExternalPreActionReviewRuntime, ExternalProgramTrust, PreActionJournalRecord,
-        PreActionJournalSink, SandboxDenialEvidence,
+        ExternalPreActionReviewRuntime, ExternalProgramTrust, PreActionJournalPhase,
+        PreActionJournalRationale, PreActionJournalRecord, PreActionJournalSink,
+        SandboxDenialEvidence,
     },
     field_guide::{
         decode_canonical_prompt_entry_line, DecodedFieldGuidePromptEntry, FieldGuideDraft,
@@ -34,7 +35,7 @@ use crate::{
     },
     orchestrator::{RunId, SemanticCoordinationMode},
     planning,
-    pre_action_review::{RepoPathRule, ReviewContext, ReviewMetricSnapshot},
+    pre_action_review::{RatioMetric, RepoPathRule, ReviewContext, ReviewMetricSnapshot},
     process_runner::{
         read_bounded_regular_file_nofollow, run_process, trusted_system_executable,
         EnvironmentMode, HostProcessCapacity, ProcessCancellation, ProcessSpec,
@@ -889,6 +890,8 @@ pub struct SupervisorFinalReport {
     pub pre_action_review_metrics: Vec<ReviewMetricSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gate_correction_outcomes: Vec<GateCorrectionOutcomeRecord>,
+    #[serde(default)]
+    pub autonomy_kpis: AutonomyKpiReport,
     #[serde(default, serialize_with = "serialize_paths")]
     pub files_changed: Vec<PathBuf>,
     #[serde(default)]
@@ -936,6 +939,96 @@ pub struct GateCorrectionOutcomeRecord {
     pub correction_attempts: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanInterventionTarget {
+    Human,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanInterventionOutcome {
+    InterventionRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct HumanInterventionRecord {
+    pub target: HumanInterventionTarget,
+    pub outcome: HumanInterventionOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ReviewedGateActionKpi {
+    pub action_gate_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correction_correlation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denial_id: Option<String>,
+    pub allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_intervention: Option<HumanInterventionRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GateCorrectionLifecycleKpi {
+    pub denial_id: String,
+    pub correction_correlation_id: String,
+    pub route: GateDenialRoute,
+    pub correction_attempts: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_outcome: Option<GateCorrectionTerminalClass>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AutonomyKpiReport {
+    pub observation: RoleUsageObservation,
+    pub actions_reviewed: Option<u64>,
+    pub denials: Option<u64>,
+    pub self_corrections: Option<u64>,
+    pub human_escalations: Option<u64>,
+    pub interrupted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denial_rate: Option<RatioMetric>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_correction_rate: Option<RatioMetric>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interruption_rate: Option<RatioMetric>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewed_actions: Vec<ReviewedGateActionKpi>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gate_lifecycles: Vec<GateCorrectionLifecycleKpi>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+impl AutonomyKpiReport {
+    fn not_process_observable() -> Self {
+        Self {
+            observation: RoleUsageObservation::NotProcessObservable,
+            actions_reviewed: None,
+            denials: None,
+            self_corrections: None,
+            human_escalations: None,
+            interrupted: None,
+            denial_rate: None,
+            self_correction_rate: None,
+            interruption_rate: None,
+            reviewed_actions: Vec::new(),
+            gate_lifecycles: Vec::new(),
+            unavailable_reason: Some(
+                "the orchestration event journal was unavailable or disabled; autonomy KPIs were not measured"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+impl Default for AutonomyKpiReport {
+    fn default() -> Self {
+        Self::not_process_observable()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct RoleUsageReport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -979,6 +1072,8 @@ pub enum RoleUsageObservation {
 pub struct SupervisorBreakerTrip {
     pub reason: CircuitBreakerTripReason,
     pub window: SwarmHealthSnapshot,
+    #[serde(default)]
+    pub autonomy_kpis: AutonomyKpiReport,
     pub recovery_guidance: String,
 }
 
@@ -1289,6 +1384,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         gate_denials: Vec::new(),
         pre_action_review_metrics: Vec::new(),
         gate_correction_outcomes: Vec::new(),
+        autonomy_kpis: AutonomyKpiReport::default(),
         files_changed,
         validation_results: vec![validation],
         findings: Vec::new(),
@@ -1662,6 +1758,7 @@ enum SupervisorWorktreeCreation<'a> {
 struct SharedSupervisorArtifacts<'a> {
     writer: &'a mut ArtifactRunWriter,
     journal: &'a mut Option<OrchestrationEventJournal>,
+    autonomy_kpis: &'a mut AutonomyKpiCollector,
 }
 
 struct SupervisorPreActionJournalSink<'artifacts, 'writer> {
@@ -1672,9 +1769,18 @@ struct SupervisorPreActionJournalSink<'artifacts, 'writer> {
 
 impl PreActionJournalSink for SupervisorPreActionJournalSink<'_, '_> {
     fn append(&mut self, record: &PreActionJournalRecord) -> Result<()> {
-        with_supervisor_artifacts(self.artifacts, |writer, journal| {
-            record_pre_action_event_strict(journal, writer, self.node, self.parent, record)
-        })
+        let mut guard = self
+            .artifacts
+            .lock()
+            .map_err(|_| anyhow!("supervisor artifact writer mutex was poisoned"))?;
+        let SharedSupervisorArtifacts {
+            writer,
+            journal,
+            autonomy_kpis,
+        } = &mut *guard;
+        record_pre_action_event_strict(journal, writer, self.node, self.parent, record)?;
+        autonomy_kpis.observe_pre_action_event(record);
+        Ok(())
     }
 }
 
@@ -1783,7 +1889,7 @@ impl GateCorrectionTracker {
             entity_id,
             parent_id,
             &authorized_denial,
-            "correction_attempt",
+            GateCorrectionJournalState::CorrectionAttempt,
             Some(correction_attempt),
         )?;
         self.used = self.used.saturating_add(1);
@@ -1867,7 +1973,14 @@ impl GateCorrectionTracker {
                 denial.denial_id.as_str()
             );
         }
-        record_gate_correction_event(artifacts, entity_id, parent_id, &denial, "blocked", None)?;
+        record_gate_correction_event(
+            artifacts,
+            entity_id,
+            parent_id,
+            &denial,
+            GateCorrectionJournalState::Blocked,
+            None,
+        )?;
         self.denials.push(denial.clone());
         self.active = Some(ActiveGateCorrection {
             denial,
@@ -1887,17 +2000,12 @@ impl GateCorrectionTracker {
             .active
             .as_ref()
             .context("gate correction terminal disposition has no active denial")?;
-        let terminal_state = match terminal_class {
-            GateCorrectionTerminalClass::SelfCorrected => "self_corrected",
-            GateCorrectionTerminalClass::Exhausted => "exhausted",
-            GateCorrectionTerminalClass::Escalated => "escalated",
-        };
         record_gate_correction_event(
             artifacts,
             entity_id,
             parent_id,
             &active.denial,
-            terminal_state,
+            GateCorrectionJournalState::Terminal(terminal_class),
             Some(active.correction_attempts),
         )?;
         let active = self

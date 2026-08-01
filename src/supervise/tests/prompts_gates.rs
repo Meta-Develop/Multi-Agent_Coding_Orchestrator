@@ -463,9 +463,11 @@ fn gate_terminal_append_failure_retains_active_denial_without_false_outcome() {
     let mut health_signals = Vec::new();
 
     {
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
         let artifacts = Mutex::new(SharedSupervisorArtifacts {
             writer: &mut writer,
             journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
         });
         let authorized = tracker
             .authorize(
