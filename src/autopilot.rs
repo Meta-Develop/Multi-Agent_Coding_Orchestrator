@@ -3646,7 +3646,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn strict_prepublication_orders_prepare_validate_review_publish_under_one_lease() {
-        let _fixture_guard = lock_prepublication_fixture_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let agent_id = "order-agent";
         let (repo, manager, candidate) =
@@ -3701,7 +3700,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn real_publication_rejects_fake_blocking_and_failed_review_before_publish() {
-        let _fixture_guard = lock_prepublication_fixture_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let agent_id = "review-gate-agent";
         let (repo, manager, candidate) =
@@ -3877,7 +3875,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn prepublication_retry_reuses_prepared_commit_without_duplicate_effect() {
-        let _fixture_guard = lock_prepublication_fixture_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let agent_id = "retry-agent";
         let (repo, manager, candidate) =
@@ -3917,7 +3914,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn publication_hook_report_forge_and_base_mismatch_are_nonretryable() {
-        let _fixture_guard = lock_prepublication_fixture_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let agent_id = "hook-mismatch-agent";
         let (repo, manager, candidate) =
