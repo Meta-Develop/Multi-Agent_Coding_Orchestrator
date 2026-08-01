@@ -703,6 +703,7 @@ fn run_autopilot_plan_file_disabled_legacy(
                     plan.external_source.clone(),
                 )
             },
+            candidate_clean: repository_worktree_is_clean,
         };
         let outcome = run_prepublication_attempt(
             &repo,
@@ -1348,11 +1349,12 @@ impl AutopilotPrepublicationOutcome {
     }
 }
 
-struct PrepublicationHooks<P, V, R, U> {
+struct PrepublicationHooks<P, V, R, U, C> {
     prepare: P,
     validate: V,
     review: R,
     publish: U,
+    candidate_clean: C,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1381,19 +1383,20 @@ fn stopped_prepublication(
     }
 }
 
-fn run_prepublication_attempt<P, V, R, U>(
+fn run_prepublication_attempt<P, V, R, U, C>(
     repo: &Path,
     agent_id: &str,
     attempt: usize,
     plan: &AutopilotPlan,
     lease: &ManagedWorktreeWriteLease,
-    hooks: &mut PrepublicationHooks<P, V, R, U>,
+    hooks: &mut PrepublicationHooks<P, V, R, U, C>,
 ) -> AutopilotPrepublicationOutcome
 where
     P: FnMut(PrPublicationOptions) -> Result<PrPublicationReport>,
     V: FnMut(PathBuf) -> Result<Vec<ValidationReport>>,
     R: FnMut(ReviewPrOptions) -> Result<review::PublicationReviewResult>,
     U: FnMut(PrPublicationOptions, BoundValidationEvidenceBundle) -> Result<PrPublicationReport>,
+    C: FnMut(&Path) -> Result<bool>,
 {
     let skipped_validation = || AutopilotValidationSummary {
         status: AutopilotValidationStatus::Skipped,
@@ -1439,24 +1442,28 @@ where
             Some(prepared_report),
         );
     }
-    let prepared =
-        match prepared_candidate_from_report(&prepared_report, repo, agent_id, forge, lease) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                return stopped_prepublication(
-                    "preparation_invalid",
-                    format!(
-                        "candidate preparation did not return a clean exact preview: {error:#}"
-                    ),
-                    true,
-                    skipped_validation(),
-                    None,
-                    None,
-                    None,
-                    Some(prepared_report),
-                )
-            }
-        };
+    let prepared = match prepared_candidate_from_report(
+        &prepared_report,
+        repo,
+        agent_id,
+        forge,
+        lease,
+        &mut hooks.candidate_clean,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return stopped_prepublication(
+                "preparation_invalid",
+                format!("candidate preparation did not return a clean exact preview: {error:#}"),
+                true,
+                skipped_validation(),
+                None,
+                None,
+                None,
+                Some(prepared_report),
+            )
+        }
+    };
     let prepared_binding = prepared.binding.clone();
 
     let validation_reports = match (hooks.validate)(lease.path().to_path_buf()) {
@@ -1510,6 +1517,7 @@ where
         &prepared.binding,
         lease,
         &mut hooks.prepare,
+        &mut hooks.candidate_clean,
         "after validation",
         validation.clone(),
         None,
@@ -1649,6 +1657,7 @@ where
         &prepared.binding,
         lease,
         &mut hooks.prepare,
+        &mut hooks.candidate_clean,
         "after independent review",
         validation.clone(),
         Some(review_report.clone()),
@@ -1711,6 +1720,7 @@ where
         &prepared.binding,
         lease,
         &mut hooks.prepare,
+        &mut hooks.candidate_clean,
         "after publication",
         validation.clone(),
         Some(review_report.clone()),
@@ -1740,12 +1750,13 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn reverify_prepared_candidate<P>(
+fn reverify_prepared_candidate<P, C>(
     options: PrPublicationOptions,
     agent_id: &str,
     expected_binding: &CandidateValidationBinding,
     lease: &ManagedWorktreeWriteLease,
     prepare: &mut P,
+    candidate_clean: &mut C,
     phase: &str,
     validation: AutopilotValidationSummary,
     review: Option<ReviewReport>,
@@ -1753,6 +1764,7 @@ fn reverify_prepared_candidate<P>(
 ) -> std::result::Result<(), Box<AutopilotPrepublicationOutcome>>
 where
     P: FnMut(PrPublicationOptions) -> Result<PrPublicationReport>,
+    C: FnMut(&Path) -> Result<bool>,
 {
     let expected_repo = options.repo.clone();
     let expected_forge = options.forge;
@@ -1789,6 +1801,7 @@ where
         agent_id,
         expected_forge,
         lease,
+        candidate_clean,
     ) {
         Ok(current) => current,
         Err(error) => {
@@ -1819,13 +1832,17 @@ where
     Ok(())
 }
 
-fn prepared_candidate_from_report(
+fn prepared_candidate_from_report<C>(
     report: &PrPublicationReport,
     expected_repo: &Path,
     agent_id: &str,
     expected_forge: ForgeKind,
     lease: &ManagedWorktreeWriteLease,
-) -> Result<PreparedAutopilotCandidate> {
+    candidate_clean: &mut C,
+) -> Result<PreparedAutopilotCandidate>
+where
+    C: FnMut(&Path) -> Result<bool>,
+{
     if report.status != PrPublicationStatus::Preview
         || report.readiness == ApplyReadinessStatus::Blocked
     {
@@ -1871,7 +1888,7 @@ fn prepared_candidate_from_report(
     {
         bail!("prepared candidate report metadata disagrees with its exact validation binding");
     }
-    if !repository_worktree_is_clean(&report.preview.candidate.metadata.worktree_path)? {
+    if !(candidate_clean)(&report.preview.candidate.metadata.worktree_path)? {
         bail!("prepared candidate worktree is not clean");
     }
     Ok(PreparedAutopilotCandidate {
@@ -2843,9 +2860,7 @@ mod tests {
         cell::{Cell, RefCell},
         fs::File,
         rc::Rc,
-        sync::{mpsc, Mutex, MutexGuard, OnceLock},
-        thread,
-        time::Duration,
+        sync::{Mutex, MutexGuard, OnceLock},
     };
 
     // These fixtures each perform several bounded, strict-containment Git snapshots. Running them
@@ -3104,6 +3119,214 @@ mod tests {
         )
         .expect("edit candidate README");
         (repo, manager, record.path)
+    }
+
+    #[cfg(target_os = "linux")]
+    struct DeterministicPreparedCandidate {
+        metadata: crate::merge::WorktreeMergeMetadata,
+        binding: CandidateValidationBinding,
+        raw_diff: Vec<u8>,
+        snapshot_tree: git2::Oid,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_deterministic_prepublication_fixture(
+        root: &Path,
+        agent_id: &str,
+    ) -> (PathBuf, WorktreeManager, DeterministicPreparedCandidate) {
+        let (repo, manager) = create_managed_worktree_fixture(root, agent_id);
+        let record = manager
+            .get_managed_verified(agent_id)
+            .expect("verified managed worktree");
+        fs::write(
+            record.path.join("README.md"),
+            format!("# Prepared candidate for {agent_id}\n"),
+        )
+        .expect("edit candidate README");
+
+        let candidate_repo = Repository::open(&record.path).expect("open candidate repository");
+        let parent = candidate_repo
+            .head()
+            .expect("candidate HEAD")
+            .peel_to_commit()
+            .expect("candidate parent commit");
+        let primary_head = parent.id();
+        let mut index = candidate_repo.index().expect("open candidate index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("stage candidate README");
+        index.write().expect("write candidate index");
+        let snapshot_tree = index.write_tree().expect("write candidate tree");
+        let tree = candidate_repo
+            .find_tree(snapshot_tree)
+            .expect("find candidate tree");
+        let signature = git2::Signature::now("maco test", "maco-test@example.invalid")
+            .expect("candidate signature");
+        let agent_head = candidate_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "prepared candidate",
+                &tree,
+                &[&parent],
+            )
+            .expect("commit prepared candidate");
+        drop(tree);
+        drop(parent);
+        drop(candidate_repo);
+
+        let metadata = crate::merge::WorktreeMergeMetadata {
+            agent_id: agent_id.to_string(),
+            worktree_path: record.path,
+            branch: record.branch,
+            primary_repo_root: repo.clone(),
+            primary_head: Some(primary_head.to_string()),
+            agent_head: Some(agent_head.to_string()),
+            merge_base: Some(primary_head.to_string()),
+            base_matches_primary: Some(true),
+        };
+        let raw_diff =
+            format!("diff --git a/README.md b/README.md\n+Prepared candidate for {agent_id}\n")
+                .into_bytes();
+        let binding = crate::merge::candidate_validation_binding(&metadata, &raw_diff)
+            .expect("deterministic candidate binding");
+        (
+            repo,
+            manager,
+            DeterministicPreparedCandidate {
+                metadata,
+                binding,
+                raw_diff,
+                snapshot_tree,
+            },
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn passed_merge_safety_check() -> crate::merge::SafetyCheck {
+        crate::merge::SafetyCheck {
+            status: SafetyCheckStatus::Passed,
+            message: None,
+            paths: Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn deterministic_prepared_report(
+        candidate: &DeterministicPreparedCandidate,
+        forge: ForgeKind,
+    ) -> PrPublicationReport {
+        let changed_paths = vec![PathBuf::from("README.md")];
+        let diff_summary = crate::merge::OutputSummary {
+            text: String::from_utf8_lossy(&candidate.raw_diff).into_owned(),
+            truncated: false,
+        };
+        let preview = crate::merge::MergeApplyPreview {
+            candidate: crate::merge::MergeCandidate {
+                metadata: candidate.metadata.clone(),
+                claimed_paths: changed_paths.clone(),
+                changed_paths: changed_paths.clone(),
+                changes: vec![crate::merge::ChangedPath {
+                    path: PathBuf::from("README.md"),
+                    kind: crate::merge::ChangeKind::Modified,
+                }],
+                unclaimed_changed_paths: Vec::new(),
+                diff: crate::merge::DiffOutput {
+                    summary: diff_summary.clone(),
+                    full: Some(diff_summary.text.clone()),
+                },
+                validations: Vec::new(),
+                validation_binding: candidate.binding.clone(),
+                validation_evidence: ValidationEvidenceBundle::default(),
+                raw_diff: candidate.raw_diff.clone(),
+                snapshot_tree: candidate.snapshot_tree,
+            },
+            safety: crate::merge::MergeApplySafety {
+                primary_state_unchanged: passed_merge_safety_check(),
+                dirty_primary: passed_merge_safety_check(),
+                stale_base: passed_merge_safety_check(),
+                apply_check: passed_merge_safety_check(),
+                unclaimed_edits: passed_merge_safety_check(),
+                validation: passed_merge_safety_check(),
+                validation_evidence: crate::merge::ValidationEvidenceCheck {
+                    status: SafetyCheckStatus::Passed,
+                    binding_status: crate::merge::ValidationBindingStatus::NotRequired,
+                    message: None,
+                    paths: Vec::new(),
+                },
+                megafile: passed_merge_safety_check(),
+                megafile_warnings: Vec::new(),
+                megafile_decomposition_target: None,
+                megafile_decomposition_evidence: None,
+                megafile_blocking: false,
+                validation_required: false,
+                candidate_validation_commands: Vec::new(),
+                force_options: crate::merge::MergeForceOptions::default(),
+                apply_mode: crate::merge::ApplyMode::Direct,
+                semantic_conflicts:
+                    crate::merge_semantic::SemanticConflictClassification::no_conflict(),
+                readiness: crate::merge::ApplyReadiness {
+                    status: ApplyReadinessStatus::Safe,
+                    blockers: Vec::new(),
+                    forced: Vec::new(),
+                    details: Vec::new(),
+                },
+            },
+        };
+        let agent_head = candidate
+            .binding
+            .agent_head
+            .clone()
+            .expect("deterministic candidate HEAD");
+        PrPublicationReport {
+            status: PrPublicationStatus::Preview,
+            agent_id: candidate.metadata.agent_id.clone(),
+            branch: candidate.metadata.branch.clone(),
+            base: "main".to_string(),
+            base_head: candidate.binding.primary_head.clone(),
+            remote: None,
+            forge,
+            draft: true,
+            title: "Prepared candidate".to_string(),
+            body_summary: crate::merge::OutputSummary {
+                text: "Prepared candidate".to_string(),
+                truncated: false,
+            },
+            changed_paths,
+            validation_status: SafetyCheckStatus::Passed,
+            validation_required: false,
+            readiness: ApplyReadinessStatus::Safe,
+            blockers: Vec::new(),
+            commit_id: Some(agent_head.clone()),
+            head_id: Some(agent_head),
+            pr_url: None,
+            pushed: false,
+            created: false,
+            publication_receipt: None,
+            next_action: "validate the deterministic candidate".to_string(),
+            preview,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn deterministic_fake_publication_report(
+        candidate: &DeterministicPreparedCandidate,
+    ) -> PrPublicationReport {
+        let mut report = deterministic_prepared_report(candidate, ForgeKind::Fake);
+        report.status = PrPublicationStatus::Published;
+        report.created = true;
+        report.pr_url = Some(format!(
+            "https://example.invalid/fake/{}",
+            candidate.metadata.agent_id
+        ));
+        report.next_action = "review the deterministic fake publication".to_string();
+        report
+    }
+
+    #[cfg(target_os = "linux")]
+    fn deterministic_candidate_is_clean(_: &Path) -> Result<bool> {
+        Ok(true)
     }
 
     #[cfg(target_os = "linux")]
@@ -3426,7 +3649,8 @@ mod tests {
         let _fixture_guard = lock_prepublication_fixture_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let agent_id = "order-agent";
-        let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
+        let (repo, manager, candidate) =
+            create_deterministic_prepublication_fixture(temp.path(), agent_id);
         let lease = acquire_autopilot_worktree_write_lease(&manager, agent_id)
             .expect("autopilot write lease");
         let plan =
@@ -3434,9 +3658,9 @@ mod tests {
         let trace = RefCell::new(Vec::new());
         let publish_calls = Cell::new(0usize);
         let mut hooks = PrepublicationHooks {
-            prepare: |options| {
+            prepare: |options: PrPublicationOptions| {
                 trace.borrow_mut().push("prepare");
-                publication::prepare_pr_candidate_with_write_lease(options, &lease)
+                Ok(deterministic_prepared_report(&candidate, options.forge))
             },
             validate: |_| {
                 trace.borrow_mut().push("validate");
@@ -3449,11 +3673,12 @@ mod tests {
                     ReviewReportStatus::Passed,
                 ))
             },
-            publish: |options, evidence| {
+            publish: |_, _| {
                 trace.borrow_mut().push("publish");
                 publish_calls.set(publish_calls.get() + 1);
-                publication::publish_prepared_pr_with_write_lease(options, &evidence, &lease)
+                Ok(deterministic_fake_publication_report(&candidate))
             },
+            candidate_clean: deterministic_candidate_is_clean,
         };
 
         let outcome = run_prepublication_attempt(&repo, agent_id, 1, &plan, &lease, &mut hooks);
@@ -3479,13 +3704,18 @@ mod tests {
         let _fixture_guard = lock_prepublication_fixture_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let agent_id = "review-gate-agent";
-        let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
+        let (repo, manager, candidate) =
+            create_deterministic_prepublication_fixture(temp.path(), agent_id);
         let lease = acquire_autopilot_worktree_write_lease(&manager, agent_id)
             .expect("autopilot write lease");
         let review_calls = Cell::new(0usize);
         let publish_calls = Cell::new(0usize);
+        let prepare_calls = Cell::new(0usize);
         let mut hooks = PrepublicationHooks {
-            prepare: |options| publication::prepare_pr_candidate_with_write_lease(options, &lease),
+            prepare: |options: PrPublicationOptions| {
+                prepare_calls.set(prepare_calls.get() + 1);
+                Ok(deterministic_prepared_report(&candidate, options.forge))
+            },
             validate: |_| Ok(passed_prepublication_validation()),
             review: |options: ReviewPrOptions| {
                 review_calls.set(review_calls.get() + 1);
@@ -3500,6 +3730,7 @@ mod tests {
                 publish_calls.set(publish_calls.get() + 1);
                 bail!("publish must not be called for rejected review")
             },
+            candidate_clean: deterministic_candidate_is_clean,
         };
 
         let fake_plan = prepublication_test_plan(AutopilotForgeMode::Git, ReviewerMode::Fake);
@@ -3524,6 +3755,7 @@ mod tests {
         assert!(!failed.publication_attempted);
         assert_eq!(review_calls.get(), 2);
         assert_eq!(publish_calls.get(), 0);
+        assert_eq!(prepare_calls.get(), 6);
         assert_no_remote_publication_state(&repo);
     }
 
@@ -3553,6 +3785,7 @@ mod tests {
                 publish_calls.set(publish_calls.get() + 1);
                 bail!("empty validation must stop before publication")
             },
+            candidate_clean: repository_worktree_is_clean,
         };
 
         let outcome = run_prepublication_attempt(&repo, agent_id, 1, &plan, &lease, &mut hooks);
@@ -3593,6 +3826,7 @@ mod tests {
                 publish_calls.set(publish_calls.get() + 1);
                 bail!("mutated review candidate must not publish")
             },
+            candidate_clean: repository_worktree_is_clean,
         };
 
         let outcome = run_prepublication_attempt(&repo, agent_id, 1, &plan, &lease, &mut hooks);
@@ -3622,6 +3856,7 @@ mod tests {
                 publish_calls.set(publish_calls.get() + 1);
                 publication::publish_prepared_pr_with_write_lease(options, &evidence, &lease)
             },
+            candidate_clean: repository_worktree_is_clean,
         };
 
         let outcome = run_prepublication_attempt(&repo, agent_id, 1, &plan, &lease, &mut hooks);
@@ -3645,20 +3880,26 @@ mod tests {
         let _fixture_guard = lock_prepublication_fixture_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let agent_id = "retry-agent";
-        let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
+        let (repo, manager, candidate) =
+            create_deterministic_prepublication_fixture(temp.path(), agent_id);
         let lease = acquire_autopilot_worktree_write_lease(&manager, agent_id)
             .expect("autopilot write lease");
         let mut plan = prepublication_test_plan(AutopilotForgeMode::Fake, ReviewerMode::Fake);
         plan.reviewer.blocking_attempts = 1;
         let publish_calls = Cell::new(0usize);
+        let prepare_calls = Cell::new(0usize);
         let mut hooks = PrepublicationHooks {
-            prepare: |options| publication::prepare_pr_candidate_with_write_lease(options, &lease),
+            prepare: |options: PrPublicationOptions| {
+                prepare_calls.set(prepare_calls.get() + 1);
+                Ok(deterministic_prepared_report(&candidate, options.forge))
+            },
             validate: |_| Ok(passed_prepublication_validation()),
             review: review::review_pr_for_publication,
-            publish: |options, evidence| {
+            publish: |_, _| {
                 publish_calls.set(publish_calls.get() + 1);
-                publication::publish_prepared_pr_with_write_lease(options, &evidence, &lease)
+                Ok(deterministic_fake_publication_report(&candidate))
             },
+            candidate_clean: deterministic_candidate_is_clean,
         };
 
         let first = run_prepublication_attempt(&repo, agent_id, 1, &plan, &lease, &mut hooks);
@@ -3669,6 +3910,7 @@ mod tests {
         let second = run_prepublication_attempt(&repo, agent_id, 2, &plan, &lease, &mut hooks);
         assert_eq!(second.disposition, PrepublicationDisposition::Published);
         assert_eq!(publish_calls.get(), 1);
+        assert_eq!(prepare_calls.get(), 6);
         assert_no_remote_publication_state(&repo);
     }
 
@@ -3678,14 +3920,19 @@ mod tests {
         let _fixture_guard = lock_prepublication_fixture_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let agent_id = "hook-mismatch-agent";
-        let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
+        let (repo, manager, candidate) =
+            create_deterministic_prepublication_fixture(temp.path(), agent_id);
         let lease = acquire_autopilot_worktree_write_lease(&manager, agent_id)
             .expect("autopilot write lease");
         let plan = prepublication_test_plan(AutopilotForgeMode::Git, ReviewerMode::ExternalCommand);
         let publish_calls = Cell::new(0usize);
+        let prepare_calls = Cell::new(0usize);
         let return_base_mismatch = Cell::new(false);
         let mut hooks = PrepublicationHooks {
-            prepare: |options| publication::prepare_pr_candidate_with_write_lease(options, &lease),
+            prepare: |options: PrPublicationOptions| {
+                prepare_calls.set(prepare_calls.get() + 1);
+                Ok(deterministic_prepared_report(&candidate, options.forge))
+            },
             validate: |_| Ok(passed_prepublication_validation()),
             review: |options| {
                 Ok(injected_external_publication_review(
@@ -3693,15 +3940,12 @@ mod tests {
                     ReviewReportStatus::Passed,
                 ))
             },
-            publish: |mut options: PrPublicationOptions,
-                      evidence: BoundValidationEvidenceBundle| {
+            publish: |_: PrPublicationOptions, _: BoundValidationEvidenceBundle| {
                 publish_calls.set(publish_calls.get() + 1);
-                options.forge = ForgeKind::Fake;
-                let mut report =
-                    publication::publish_prepared_pr_with_write_lease(options, &evidence, &lease)?;
+                let mut report = deterministic_fake_publication_report(&candidate);
                 if return_base_mismatch.get() {
-                    let expected_head = evidence
-                        .binding()
+                    let expected_head = candidate
+                        .binding
                         .agent_head
                         .clone()
                         .context("bound evidence HEAD")?;
@@ -3734,6 +3978,7 @@ mod tests {
                 }
                 Ok(report)
             },
+            candidate_clean: deterministic_candidate_is_clean,
         };
 
         let wrong_forge = run_prepublication_attempt(&repo, agent_id, 1, &plan, &lease, &mut hooks);
@@ -3748,6 +3993,7 @@ mod tests {
         assert!(wrong_base.publication_effect_observed);
         assert!(!wrong_base.retryable);
         assert_eq!(publish_calls.get(), 2);
+        assert_eq!(prepare_calls.get(), 6);
         assert_no_remote_publication_state(&repo);
     }
 
@@ -3785,6 +4031,7 @@ mod tests {
                     publish_calls.set(publish_calls.get() + 1);
                     bail!("review error must stop before publication")
                 },
+                candidate_clean: repository_worktree_is_clean,
             };
             run_prepublication_attempt(&repo, agent_id, 1, &plan, &lease, &mut hooks)
         };
@@ -3801,20 +4048,8 @@ mod tests {
     fn injected_autopilot_lease_barrier_blocks_removal_until_quiescence() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (_repo, manager) = create_managed_worktree_fixture(temp.path(), "barrier-agent");
-        let worker_manager = manager.clone();
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            let lease = acquire_autopilot_worktree_write_lease(&worker_manager, "barrier-agent")
-                .expect("acquire autopilot write lease");
-            ready_tx.send(()).expect("publish lease barrier");
-            release_rx.recv().expect("release lease barrier");
-            drop(lease);
-        });
-
-        ready_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("autopilot write lease barrier became ready");
+        let lease = acquire_autopilot_worktree_write_lease(&manager, "barrier-agent")
+            .expect("acquire autopilot write lease");
         let removal_error = manager
             .remove("barrier-agent", true, false)
             .expect_err("active autopilot write lease must exclude removal");
@@ -3826,8 +4061,7 @@ mod tests {
         let second_writer = format!("{second_writer:#}");
         assert!(second_writer.contains("exclusive") && second_writer.contains("lease"));
 
-        release_tx.send(()).expect("release autopilot writer");
-        worker.join().expect("join lease barrier");
+        drop(lease);
         manager
             .remove("barrier-agent", true, false)
             .expect("removal succeeds after final quiescence");
