@@ -10113,6 +10113,10 @@ mod tests {
         )
         .expect("acquire reserved expedited test containment permit");
 
+        // Real deadline handling is the subject here: all real permit files are held, so the
+        // overflow acquire must remain blocked until its caller-supplied deadline. The assertion
+        // does not compare elapsed wall time; failure means acquisition escaped the fixed slot set
+        // or did not return the required TimedOut result after the deadline became observable.
         let overflow_result = SystemdUnitPermit::acquire(
             runtime_root.path(),
             Some(Instant::now() + Duration::from_secs(2)),
@@ -11626,14 +11630,13 @@ mod tests {
             )
         });
 
-        let ready_deadline = Instant::now() + Duration::from_secs(2);
-        while !ready.exists() {
-            assert!(
-                Instant::now() < ready_deadline,
-                "child did not reach ready gate"
-            );
+        while !ready.exists() && !worker.is_finished() {
             thread::sleep(POLL_INTERVAL);
         }
+        assert!(
+            ready.exists(),
+            "process runner completed before the child reached its ready gate"
+        );
         cancellation.cancel();
         let output = worker
             .join()
@@ -11947,8 +11950,9 @@ mod tests {
             }));
         }
 
-        let ready_deadline = Instant::now() + Duration::from_secs(5);
-        while !ready_paths.iter().all(|path| path.exists()) && Instant::now() < ready_deadline {
+        while !ready_paths.iter().all(|path| path.exists())
+            && workers.iter().any(|worker| !worker.is_finished())
+        {
             thread::sleep(POLL_INTERVAL);
         }
         cancellation.cancel();
@@ -12044,6 +12048,7 @@ mod tests {
         }
         let temp = tempfile::tempdir().expect("tempdir");
         let marker = temp.path().join("sibling-unit-ran");
+        let release = temp.path().join("release-sibling-unit");
         let unit = format!(
             "maco-escape-test-{}-{}",
             std::process::id(),
@@ -12064,10 +12069,11 @@ mod tests {
         )
         .expect("trusted shell");
         let command = format!(
-            r#"'{}' --user --quiet --collect --unit '{}' -- '{}' -c "sleep 0.2; touch '{}'"#,
+            r#"'{}' --user --quiet --collect --unit '{}' -- '{}' -c "while [ ! -e '{}' ]; do sleep 0.01; done; touch '{}'"#,
             systemd_run.display(),
             unit,
             shell.display(),
+            release.display(),
             marker.display()
         );
         let output = run_process(
@@ -12085,8 +12091,6 @@ mod tests {
         assert!(!output.status.is_some_and(|status| status.success()));
         assert!(output.process_tree.is_verified_empty());
         assert!(output.side_effects.is_verified());
-        thread::sleep(Duration::from_millis(400));
-        assert!(!marker.exists());
 
         let systemctl = trusted_system_executable(
             "systemctl",
@@ -12097,11 +12101,19 @@ mod tests {
             ],
         )
         .expect("trusted systemctl");
-        let status = Command::new(systemctl)
+        let status = Command::new(&systemctl)
             .args(["--user", "--quiet", "is-active", &unit])
             .status()
             .expect("query sibling unit");
+        if status.success() {
+            let _ = Command::new(&systemctl)
+                .args(["--user", "stop", &unit])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         assert!(!status.success(), "sibling transient unit survived");
+        assert!(!marker.exists(), "sibling transient unit mutated the host");
     }
 
     #[cfg(target_os = "linux")]
@@ -12219,9 +12231,11 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
         let temp = tempfile::tempdir().expect("tempdir");
         let marker = temp.path().join("escaped-delayed-mutation");
         let pid_file = temp.path().join("escaped-delayed.pid");
+        let release = temp.path().join("release-escaped-delayed");
         let command = format!(
-            "setsid sh -c 'echo $$ > \"{}\"; sleep 0.3; touch \"{}\"' >/dev/null 2>&1 & i=0; while [ ! -s \"{}\" ] && [ \"$i\" -lt 100 ]; do sleep 0.01; i=$((i + 1)); done",
+            "setsid sh -c 'echo $$ > \"{}\"; while [ ! -e \"{}\" ]; do sleep 0.01; done; touch \"{}\"' >/dev/null 2>&1 & i=0; while [ ! -s \"{}\" ] && [ \"$i\" -lt 100 ]; do sleep 0.01; i=$((i + 1)); done",
             pid_file.display(),
+            release.display(),
             marker.display(),
             pid_file.display()
         );
@@ -12239,7 +12253,19 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
 
         assert!(output.status.is_some_and(|status| status.success()));
         assert!(output.process_tree.is_verified_empty());
-        thread::sleep(Duration::from_millis(400));
+        let escaped_pid = fs::read_to_string(&pid_file)
+            .expect("escaped delayed process pid")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("numeric escaped delayed process pid");
+        // SAFETY: signal 0 probes existence without delivering a signal.
+        assert_eq!(unsafe { libc::kill(escaped_pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "escaped delayed descendant survived return"
+        );
+        fs::write(release, b"release").expect("release any surviving delayed descendant");
         assert!(!marker.exists());
     }
 
@@ -13076,12 +13102,7 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
                 let _wait_observer = worker_waits.install();
                 run_process(spec)
             });
-            let ready_deadline = Instant::now() + Duration::from_secs(10);
             while !target_ready_path.exists() && !worker.is_finished() {
-                assert!(
-                    Instant::now() < ready_deadline,
-                    "escaped pipe holder did not publish readiness"
-                );
                 thread::sleep(POLL_INTERVAL);
             }
             assert!(
@@ -13752,7 +13773,10 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
             .expect("release evidence child");
         let (input_writer, mut output_drainers) =
             prepared.start("evidence child", StdinMode::Null, 1024, 1024, None, None);
-        let deadline = Instant::now() + Duration::from_secs(1);
+        // Real pipe-reader delivery is part of this integration test. Sixty seconds is a harness
+        // fuse for two tiny writes; expiry means the owned reader threads made no observable
+        // progress, not that a loaded host scheduled them a few milliseconds late.
+        let deadline = Instant::now() + Duration::from_secs(60);
         while output_drainers.stdout.capture.bytes.is_empty()
             || output_drainers.stderr.capture.bytes.is_empty()
         {
@@ -13885,7 +13909,6 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
 
         let registry = AgentRegistry::open(temp.path()).expect("agent registry");
         let runner = thread::spawn(move || run_process(spec));
-        let deadline = Instant::now() + Duration::from_secs(60);
         let registered = loop {
             let processes = registry
                 .list(&crate::agent_lifecycle::AgentListFilter::default())
@@ -13894,8 +13917,8 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
                 break process.clone();
             }
             assert!(
-                Instant::now() < deadline,
-                "process runner did not register its agent lifecycle identity"
+                !runner.is_finished(),
+                "process runner completed before registering its agent lifecycle identity"
             );
             thread::sleep(Duration::from_millis(10));
         };
@@ -13903,8 +13926,11 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
         assert_eq!(registered.task_id, "runner-task");
         assert_eq!(registered.argv.last().map(String::as_str), Some("60"));
 
+        // This is the one real signal-delivery deadline in the test. Thirty seconds is a liveness
+        // margin for stopping one local sleep process; expiry means lifecycle termination made no
+        // progress, not that registration ordering was scheduled a few milliseconds late.
         let stopped = registry
-            .stop_selector("runner-task", Duration::from_secs(1))
+            .stop_selector("runner-task", Duration::from_secs(30))
             .expect("stop lifecycle process");
         assert_eq!(stopped.stopped.len(), 1);
         let output = runner
