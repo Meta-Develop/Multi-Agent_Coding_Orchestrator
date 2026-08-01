@@ -9301,8 +9301,14 @@ mod tests {
         first_provider.block_invoke = Some((started_tx, release_rx));
         let first_repo = repo.path().to_path_buf();
         let first_request = request.clone();
-        let first = std::thread::spawn(move || {
-            execute_external_effect_exactly_once(&first_repo, first_request, &mut first_provider)
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let _first = std::thread::spawn(move || {
+            let result = execute_external_effect_exactly_once(
+                &first_repo,
+                first_request,
+                &mut first_provider,
+            );
+            let _ = completed_tx.send(result);
         });
         recv_test_event(&started_rx, "first provider reached invocation");
         let mut contender = FakeExternalProvider::new(remote.clone());
@@ -9310,7 +9316,8 @@ mod tests {
             execute_external_effect_exactly_once(repo.path(), request, &mut contender).is_err()
         );
         release_tx.send(()).expect("release first provider");
-        first.join().expect("first thread").expect("first effect");
+        recv_test_event(&completed_rx, "first provider completed after release")
+            .expect("first effect");
         assert_eq!(remote.lock().expect("remote").invoke_calls, 1);
     }
 

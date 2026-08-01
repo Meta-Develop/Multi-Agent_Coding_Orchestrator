@@ -8437,8 +8437,6 @@ fn terminate_unix_process_group(
 
 #[cfg(unix)]
 fn wait_for_lifecycle_progress(duration: Duration) {
-    #[cfg(test)]
-    record_test_finalization_wait(duration);
     thread::sleep(duration);
 }
 
@@ -9113,78 +9111,6 @@ struct OwnedIoThread {
     cancel: Arc<AtomicBool>,
 }
 
-/// Test-only accounting for waits requested by lifecycle finalization. The observer is installed
-/// per thread, so concurrently executing tests cannot contribute to one another's logical budget.
-/// Its gate lets a test exclude setup and start-gate contention from a post-release assertion.
-#[cfg(test)]
-#[derive(Clone)]
-struct TestFinalizationWaitObserver {
-    enabled: Arc<AtomicBool>,
-    requested_nanos: Arc<AtomicU64>,
-}
-
-#[cfg(test)]
-impl TestFinalizationWaitObserver {
-    fn new() -> Self {
-        Self {
-            enabled: Arc::new(AtomicBool::new(false)),
-            requested_nanos: Arc::new(AtomicU64::new(0)),
-        }
-    }
-
-    fn install(&self) -> TestFinalizationWaitGuard {
-        let previous = TEST_FINALIZATION_WAIT_OBSERVER
-            .with(|observer| observer.borrow_mut().replace(self.clone()));
-        TestFinalizationWaitGuard { previous }
-    }
-
-    fn start(&self) {
-        self.enabled.store(true, Ordering::Release);
-    }
-
-    fn requested(&self) -> Duration {
-        Duration::from_nanos(self.requested_nanos.load(Ordering::Acquire))
-    }
-}
-
-#[cfg(test)]
-struct TestFinalizationWaitGuard {
-    previous: Option<TestFinalizationWaitObserver>,
-}
-
-#[cfg(test)]
-impl Drop for TestFinalizationWaitGuard {
-    fn drop(&mut self) {
-        TEST_FINALIZATION_WAIT_OBSERVER.with(|observer| {
-            *observer.borrow_mut() = self.previous.take();
-        });
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_FINALIZATION_WAIT_OBSERVER: std::cell::RefCell<Option<TestFinalizationWaitObserver>>
-        = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-fn record_test_finalization_wait(duration: Duration) {
-    let requested_nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
-    TEST_FINALIZATION_WAIT_OBSERVER.with(|observer| {
-        let observer = observer.borrow();
-        let Some(observer) = observer.as_ref() else {
-            return;
-        };
-        if observer.enabled.load(Ordering::Acquire) {
-            let _ = observer.requested_nanos.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |current| Some(current.saturating_add(requested_nanos)),
-            );
-        }
-    });
-}
-
 trait IoThreadClock {
     type Deadline;
 
@@ -9235,7 +9161,6 @@ impl IoThreadClock for TestIoFinalizationClock {
     }
 
     fn wait(&self, duration: Duration) {
-        record_test_finalization_wait(duration);
         thread::sleep(duration);
         self.elapsed
             .set(self.elapsed.get().saturating_add(duration));
@@ -11697,11 +11622,18 @@ mod tests {
         .with_containment(ContainmentPolicy::TrustedBestEffort)
         .with_timeout(Some(Duration::from_secs(2)));
 
-        let finalization_waits = TestFinalizationWaitObserver::new();
-        let _wait_observer = finalization_waits.install();
-        finalization_waits.start();
-
-        let output = run_process(spec).expect("run descendant-spawning command");
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let _worker = thread::spawn(move || {
+            let _ = completion_tx.send(run_process(spec));
+        });
+        // Prompt whole-call completion is the contract here. The event is emitted only after
+        // `run_process` has completed process-tree cleanup, pipe finalization, and its internal
+        // joins. Three seconds preserves the original bound; expiry means lifecycle completion
+        // itself stopped being prompt. There is no unbounded JoinHandle wait on this path.
+        let output = completion_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("descendant pipe lifecycle completed within its three-second contract")
+            .expect("run descendant-spawning command");
 
         assert!(!output.timed_out);
         assert!(output.status.is_some_and(|status| status.success()));
@@ -11718,11 +11650,6 @@ mod tests {
             .contains("descendant-error"));
         let pid = std::fs::read_to_string(descendant_pid).expect("descendant pid");
         assert_process_not_executable(&pid, "output-pipe descendant");
-        assert!(
-            finalization_waits.requested() < Duration::from_secs(3),
-            "descendant pipe finalization exceeded its three-second logical wait contract: {:?}",
-            finalization_waits.requested()
-        );
     }
 
     #[cfg(unix)]
@@ -13095,13 +13022,11 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
         // Allow shared systemd-slot and setup contention to settle before the target publishes
         // readiness; the post-ready cleanup remains independently bounded below.
         .with_timeout(Some(Duration::from_secs(10)));
-        let finalization_waits = TestFinalizationWaitObserver::new();
-        let output = thread::scope(|scope| {
-            let worker_waits = finalization_waits.clone();
-            let worker = scope.spawn(move || {
-                let _wait_observer = worker_waits.install();
-                run_process(spec)
-            });
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = completion_tx.send(run_process(spec));
+        });
+        let output = {
             while !target_ready_path.exists() && !worker.is_finished() {
                 thread::sleep(POLL_INTERVAL);
             }
@@ -13112,14 +13037,17 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
 
             // Shared systemd-slot and setup contention is not kill latency. Release the main
             // shell only after its escaped stdin/pipe holder is ready, then keep the safety bound
-            // focused on finalization proving the complete contained tree empty.
-            finalization_waits.start();
+            // focused on finalization proving the complete contained tree empty. The completion
+            // event is emitted after the complete `run_process` call, including its blocking
+            // containment commands and internal I/O joins. Two seconds preserves the original
+            // post-release contract; expiry means cleanup itself stopped being prompt. Avoiding a
+            // JoinHandle wait ensures a regression fails this test instead of hanging the suite.
             fs::write(&release_target_path, b"release").expect("release escaped pipe holder");
-            worker
-                .join()
-                .expect("escaped pipe holder worker")
+            completion_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("escaped pipe holder completed within its two-second post-release contract")
                 .expect("run escaped pipe holder")
-        });
+        };
 
         let escaped_pid = std::fs::read_to_string(&escaped_pid_path)
             .expect("escaped process pid")
@@ -13137,11 +13065,6 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH),
             "escaped descendant survived return"
-        );
-        assert!(
-            finalization_waits.requested() < Duration::from_secs(2),
-            "post-release containment and I/O finalization exceeded its two-second logical wait contract: {:?}",
-            finalization_waits.requested()
         );
     }
 
