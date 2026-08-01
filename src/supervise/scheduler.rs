@@ -1855,6 +1855,7 @@ mod decomposition_tests {
             assignment_traceability: Vec::new(),
             coverage_gaps: Vec::new(),
             supervisor_breaker_trip: None,
+            autonomy_kpis: AutonomyKpiReport::default(),
             released_claims: Vec::new(),
             release_errors: Vec::new(),
             released_semantic_intents: Vec::new(),

@@ -416,6 +416,15 @@ fn fake_supervise_run_finalizes_manifested_report_tree_events() {
         .reviewed_paths
         .iter()
         .any(|path| path == Path::new("README.md")));
+    assert_eq!(
+        report.autonomy_kpis.observation,
+        RoleUsageObservation::SupervisorAggregate
+    );
+    assert_eq!(report.autonomy_kpis.actions_reviewed, Some(0));
+    assert_eq!(report.autonomy_kpis.denials, Some(0));
+    assert_eq!(report.autonomy_kpis.self_corrections, Some(0));
+    assert_eq!(report.autonomy_kpis.human_escalations, Some(0));
+    assert_eq!(report.autonomy_kpis.interrupted, Some(false));
 
     let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
         .expect("open finalized fake supervise run");
@@ -441,6 +450,22 @@ fn fake_supervise_run_finalizes_manifested_report_tree_events() {
         assert_eq!(event.run, run_id.as_str());
         assert_eq!(event.ts.len(), 20);
         assert!(event.ts.ends_with('Z'));
+    }
+    for kind in [OrchestrationEventKind::Gate, OrchestrationEventKind::Status] {
+        let final_event = events
+            .iter()
+            .find(|event| {
+                event.node == run_id.as_str()
+                    && event.role == OrchestrationRole::Supervisor
+                    && event.kind == kind
+                    && event.payload["autonomy_kpis"].is_object()
+            })
+            .expect("final gate and status events expose autonomy KPIs");
+        assert_eq!(final_event.payload["autonomy_kpis"]["actions_reviewed"], 0);
+        assert_eq!(
+            final_event.payload["autonomy_kpis"]["observation"],
+            "supervisor_aggregate"
+        );
     }
 
     assert!(events.iter().any(|event| {
@@ -1001,6 +1026,12 @@ fn journal_append_failure_does_not_block_fake_run_finalization() {
     )
     .expect("journal failure must not abort supervise finalization");
     assert!(report.success, "unexpected failed report: {report:#?}");
+    assert_eq!(report.autonomy_kpis, AutonomyKpiReport::default());
+    assert_eq!(
+        report.autonomy_kpis.observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+    assert_eq!(report.autonomy_kpis.actions_reviewed, None);
     let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
         .expect("open finalized run after journal failure");
     assert!(reader
@@ -1008,11 +1039,10 @@ fn journal_append_failure_does_not_block_fake_run_finalization() {
         .expect_err("disabled journal must not create an unmanifested artifact")
         .to_string()
         .contains("not present in the finalized manifest"));
-    assert!(
-        read_supervisor_final_report(&reader)
-            .expect("read finalized report after journal failure")
-            .success
-    );
+    let restored =
+        read_supervisor_final_report(&reader).expect("read finalized report after journal failure");
+    assert!(restored.success);
+    assert_eq!(restored.autonomy_kpis, AutonomyKpiReport::default());
 }
 
 #[test]

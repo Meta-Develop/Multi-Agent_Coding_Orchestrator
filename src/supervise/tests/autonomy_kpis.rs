@@ -1,0 +1,253 @@
+use super::*;
+use crate::{
+    gate_denial::ApprovalReviewDenial,
+    pre_action_review::{
+        ActionKind, BlastRadius, CommandClass, DecisionSource, RedactedClassifierAction,
+        RedactedClassifierRequest,
+    },
+};
+
+fn approval_denial(correlation_id: &str, reason: ApprovalReviewDenial) -> GateDenial {
+    GateDenial::from_approval_review(
+        correlation_id,
+        "child-a",
+        reason,
+        std::iter::empty::<&Path>(),
+    )
+    .expect("construct typed approval denial")
+}
+
+fn review_decision_event(
+    request_id: &str,
+    allowed: bool,
+    denial: Option<GateDenial>,
+    rationale: PreActionJournalRationale,
+) -> PreActionJournalRecord {
+    PreActionJournalRecord {
+        version: 1,
+        run_id: "autonomy-kpi-run".to_string(),
+        review_session_id: "autonomy-kpi-review-session".to_string(),
+        phase: PreActionJournalPhase::ReviewDecision,
+        thread_id: Some("thread-a".to_string()),
+        turn_id: Some("turn-a".to_string()),
+        item_id: Some(request_id.to_string()),
+        request: Some(RedactedClassifierRequest {
+            version: 1,
+            run_id: "autonomy-kpi-run".to_string(),
+            request_id: request_id.to_string(),
+            owner: "child-a".to_string(),
+            intent_summary: "redacted test intent".to_string(),
+            claims: Vec::new(),
+            sensitive_paths: Vec::new(),
+            action: RedactedClassifierAction {
+                kind: ActionKind::FileChange,
+                program: None,
+                arguments: Vec::new(),
+                command_class: CommandClass::WorkspaceMutation,
+                blast_radius: BlastRadius::SingleClaimedPath,
+                accesses: Vec::new(),
+                access_manifest_complete: false,
+            },
+        }),
+        decision_source: Some(if allowed {
+            DecisionSource::DeterministicAllow
+        } else {
+            DecisionSource::DeterministicDeny
+        }),
+        decision_latency_ms: Some(1),
+        rationale,
+        allowed: Some(allowed),
+        denial,
+        turn_status: None,
+        item_outcomes: Vec::new(),
+        process_exit_code: None,
+        process_tree: None,
+        side_effects: None,
+    }
+}
+
+#[test]
+fn typed_gate_events_report_all_autonomy_kpis_with_explicit_denominators() {
+    let corrected = approval_denial(
+        "correction-reviewed-denial",
+        ApprovalReviewDenial::ClassifierDenied,
+    );
+    let human = approval_denial(
+        "correction-human-denial",
+        ApprovalReviewDenial::HumanReviewRequired,
+    );
+    let mut collector = AutonomyKpiCollector::default();
+    collector.observe_pre_action_event(&review_decision_event(
+        "request-allowed",
+        true,
+        None,
+        PreActionJournalRationale::DeterministicPolicyAllow,
+    ));
+    collector.observe_pre_action_event(&review_decision_event(
+        "request-corrected",
+        false,
+        Some(corrected.clone()),
+        PreActionJournalRationale::DeterministicPolicyDeny,
+    ));
+    collector.observe_pre_action_event(&review_decision_event(
+        "request-human",
+        false,
+        Some(human.clone()),
+        PreActionJournalRationale::HumanInterventionRequired,
+    ));
+    collector.observe_gate_correction_event(&corrected, GateCorrectionJournalState::Blocked, None);
+    collector.observe_gate_correction_event(
+        &corrected,
+        GateCorrectionJournalState::CorrectionAttempt,
+        Some(1),
+    );
+    collector.observe_gate_correction_event(
+        &corrected,
+        GateCorrectionJournalState::Terminal(GateCorrectionTerminalClass::SelfCorrected),
+        Some(1),
+    );
+    collector.observe_gate_correction_event(&human, GateCorrectionJournalState::Blocked, None);
+    collector.observe_gate_correction_event(
+        &human,
+        GateCorrectionJournalState::Terminal(GateCorrectionTerminalClass::Escalated),
+        Some(0),
+    );
+
+    let report = collector.report(true);
+    assert_eq!(
+        report.observation,
+        RoleUsageObservation::SupervisorAggregate
+    );
+    assert_eq!(report.actions_reviewed, Some(3));
+    assert_eq!(report.denials, Some(2));
+    assert_eq!(report.self_corrections, Some(1));
+    assert_eq!(report.human_escalations, Some(1));
+    assert_eq!(report.interrupted, Some(true));
+    assert_eq!(
+        report.denial_rate,
+        Some(RatioMetric {
+            numerator: 2,
+            denominator: 3,
+        })
+    );
+    assert_eq!(
+        report.self_correction_rate,
+        Some(RatioMetric {
+            numerator: 1,
+            denominator: 2,
+        })
+    );
+    assert_eq!(
+        report.interruption_rate,
+        Some(RatioMetric {
+            numerator: 1,
+            denominator: 1,
+        })
+    );
+    let human_action = report
+        .reviewed_actions
+        .iter()
+        .find(|action| action.action_gate_id == "request-human")
+        .expect("human-targeted reviewed action");
+    assert_eq!(
+        human_action.human_intervention,
+        Some(HumanInterventionRecord {
+            target: HumanInterventionTarget::Human,
+            outcome: HumanInterventionOutcome::InterventionRequired,
+        })
+    );
+    assert!(report
+        .reviewed_actions
+        .iter()
+        .filter(|action| action.action_gate_id != "request-human")
+        .all(|action| action.human_intervention.is_none()));
+    assert_eq!(report.gate_lifecycles.len(), 2);
+    assert!(report.gate_lifecycles.iter().any(|lifecycle| {
+        lifecycle.denial_id == corrected.denial_id.as_str()
+            && lifecycle.correction_correlation_id == corrected.correction_correlation_id.as_str()
+            && lifecycle.correction_attempts == 1
+            && lifecycle.terminal_outcome == Some(GateCorrectionTerminalClass::SelfCorrected)
+    }));
+}
+
+#[test]
+fn disabled_journal_reports_unmeasured_instead_of_zero() {
+    let mut collector = AutonomyKpiCollector::default();
+    collector.observe_pre_action_event(&review_decision_event(
+        "request-observed-before-disable",
+        true,
+        None,
+        PreActionJournalRationale::DeterministicPolicyAllow,
+    ));
+
+    let report = collector.report(false);
+    assert_eq!(report, AutonomyKpiReport::default());
+    assert_eq!(
+        report.observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+    assert_eq!(report.actions_reviewed, None);
+    assert_eq!(report.denials, None);
+    assert_eq!(report.self_corrections, None);
+    assert_eq!(report.human_escalations, None);
+    assert_eq!(report.interrupted, None);
+}
+
+#[test]
+fn terminal_and_peer_routing_events_do_not_count_as_reviewed_human_actions() {
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("peer-routing-not-human").expect("valid peer-routing run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "peer-routing-kpi-test",
+    )
+    .expect("reserve peer-routing artifact run");
+    let mut journal = Some(OrchestrationEventJournal::new(
+        "peer-routing-test-repository",
+        run_id.as_str(),
+    ));
+    let mut collector = AutonomyKpiCollector::default();
+    let mut terminal = review_decision_event(
+        "request-terminal",
+        false,
+        None,
+        PreActionJournalRationale::TerminalEvidence,
+    );
+    terminal.phase = PreActionJournalPhase::ProcessTerminal;
+    terminal.request = None;
+    terminal.allowed = None;
+    collector.observe_pre_action_event(&terminal);
+
+    {
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut collector,
+        });
+        record_shared_orchestration_event(
+            &artifacts,
+            "peer-o2",
+            Some(run_id.as_str()),
+            OrchestrationRole::Supervisor,
+            OrchestrationEventKind::Escalate,
+            json!({
+                "origin": "child-a",
+                "target": "peer_o2",
+                "outcome": "routed",
+            }),
+        )
+        .expect("append generic peer-routing escalation");
+    }
+
+    // Only a typed ReviewDecision with HumanInterventionRequired can increment the human
+    // counters, so terminal evidence and the generic peer-routing event leave them at zero.
+    let report = collector.report(true);
+    assert_eq!(report.actions_reviewed, Some(0));
+    assert_eq!(report.denials, Some(0));
+    assert_eq!(report.human_escalations, Some(0));
+    assert_eq!(report.interrupted, Some(false));
+    assert_eq!(report.denial_rate, None);
+    assert_eq!(report.interruption_rate, None);
+}

@@ -1,4 +1,5 @@
 mod acceptance_integrity;
+mod autonomy_kpis;
 mod budget;
 mod environment_controls;
 mod plan_runtime;

@@ -461,9 +461,9 @@ fn gate_terminal_append_failure_retains_active_denial_without_false_outcome() {
     .expect("construct canonical strict gate denial");
     let mut tracker = GateCorrectionTracker::new(1);
     let mut health_signals = Vec::new();
+    let mut autonomy_kpis = AutonomyKpiCollector::default();
 
     {
-        let mut autonomy_kpis = AutonomyKpiCollector::default();
         let artifacts = Mutex::new(SharedSupervisorArtifacts {
             writer: &mut writer,
             journal: &mut journal,
@@ -494,6 +494,16 @@ fn gate_terminal_append_failure_retains_active_denial_without_false_outcome() {
         assert!(format!("{disabled_error:#}")
             .contains("strict gate correction lifecycle journal is disabled"));
     }
+
+    let append_successes = autonomy_kpis.report(true);
+    assert_eq!(append_successes.gate_lifecycles.len(), 1);
+    assert_eq!(append_successes.gate_lifecycles[0].correction_attempts, 1);
+    assert_eq!(append_successes.gate_lifecycles[0].terminal_outcome, None);
+    assert_eq!(
+        autonomy_kpis.report(false),
+        AutonomyKpiReport::default(),
+        "disabled journal must replace partial counters with an unmeasured report"
+    );
 
     let active = tracker
         .active
@@ -1108,6 +1118,22 @@ fn gate_budget_exhaustion_feeds_existing_breaker() {
         .breaker_trip
         .expect("correction retry loop must trip the existing breaker");
     assert_eq!(trip.window.retries, usize::from(MAX_GATE_CORRECTIONS_LIMIT));
+    assert_eq!(
+        trip.autonomy_kpis.observation,
+        RoleUsageObservation::SupervisorAggregate
+    );
+    assert_eq!(
+        trip.autonomy_kpis.self_corrections,
+        Some(0),
+        "breaker health must retain the measured terminal-outcome KPI"
+    );
+    assert_eq!(
+        trip.autonomy_kpis.self_correction_rate,
+        Some(RatioMetric {
+            numerator: 0,
+            denominator: 1,
+        })
+    );
 }
 
 #[test]

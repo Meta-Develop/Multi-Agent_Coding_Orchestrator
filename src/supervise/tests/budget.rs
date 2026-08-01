@@ -83,6 +83,27 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
                 .iter()
                 .any(|reason| reason == "missing_provider_usage"))
     );
+    let autonomy = &schema["properties"]["autonomy_kpis"];
+    let required = autonomy["required"]
+        .as_array()
+        .expect("autonomy KPI required fields");
+    for field in [
+        "actions_reviewed",
+        "denials",
+        "self_corrections",
+        "human_escalations",
+        "interrupted",
+    ] {
+        assert!(
+            required.iter().any(|value| value == field),
+            "autonomy KPI schema omitted {field}"
+        );
+    }
+    assert!(autonomy["properties"]["observation"]["enum"]
+        .as_array()
+        .is_some_and(|observations| observations
+            .iter()
+            .any(|observation| observation == "not_process_observable")));
 }
 
 #[test]
@@ -225,6 +246,12 @@ fn budget_integration_auditor_admission_refusal_reaches_typed_child_and_final_re
         .findings
         .iter()
         .all(|finding| !finding.message.contains("BudgetAdmissionRefusal")));
+    assert_eq!(
+        report.autonomy_kpis.observation,
+        RoleUsageObservation::SupervisorAggregate
+    );
+    assert_eq!(report.autonomy_kpis.actions_reviewed, Some(0));
+    assert_eq!(report.autonomy_kpis.denials, Some(0));
 }
 
 #[test]
