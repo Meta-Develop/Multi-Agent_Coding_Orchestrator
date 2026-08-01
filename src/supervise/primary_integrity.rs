@@ -814,17 +814,23 @@ pub(super) fn claim_conflict_details(
     sync_store: &SyncStore,
     requested_paths: &[PathBuf],
 ) -> Vec<ClaimConflictDetail> {
-    match sync_store.snapshot() {
+    match sync_store.status_snapshot() {
         Ok(claims) => claims
             .iter()
             .flat_map(|claim| {
-                claim.paths.iter().filter_map(|claimed| {
+                claim.claim.paths.iter().filter_map(|claimed| {
                     requested_paths
                         .iter()
                         .find(|requested| paths_overlap(claimed, requested))
                         .map(|requested| ClaimConflictDetail {
                             path: requested.clone(),
-                            owner: format!("{} (token {})", claim.agent_id, claim.token.get()),
+                            owner: format!(
+                                "{} (token {}, run {}, owner_run_state={})",
+                                claim.claim.agent_id,
+                                claim.claim.token.get(),
+                                claim.owner_run_id.as_deref().unwrap_or("<unattributed>"),
+                                claim.owner_run_state.as_str(),
+                            ),
                         })
                 })
             })

@@ -119,7 +119,8 @@ fn prepare_assignment_execution<'a>(
     };
     let mut effective_assignment = (*assignment).clone();
     let claim = loop {
-        match sync_store.claim_paths(
+        match sync_store.claim_paths_for_run(
+            &options.run_id,
             &effective_assignment.id,
             effective_assignment.assigned_paths.iter(),
         ) {

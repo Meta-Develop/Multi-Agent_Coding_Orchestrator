@@ -46,7 +46,9 @@ use crate::{
     state_migration,
     supervise::{self, SupervisorRunOptions},
     sync::{normalize_repo_relative_path, ClaimToken},
-    sync_store::{ClaimTelemetryOutcome, MegafileClaimWarning, OwnerReport, SyncStore},
+    sync_store::{
+        ClaimStatusReport, ClaimTelemetryOutcome, MegafileClaimWarning, OwnerReport, SyncStore,
+    },
     worktree::{
         RepositoryInfo, WorktreeCreateOptions, WorktreeGcOptions, WorktreeGcReason,
         WorktreeGcReport, WorktreeGcStatus, WorktreeManager, WorktreeRecord,
@@ -1964,8 +1966,8 @@ impl SyncCommand {
             }
             SyncSubcommand::Status(args) => {
                 let store = SyncStore::open(args.repo)?;
-                let claims = store.snapshot()?;
-                print_claims(&claims, args.json, "No active claims.")
+                let claims = store.status_snapshot()?;
+                print_claim_statuses(&claims, args.json)
             }
         }
     }
@@ -4603,6 +4605,33 @@ fn print_claims(claims: &[crate::sync::PathClaim], json: bool, empty_message: &s
                 .collect::<Vec<_>>()
                 .join(", ");
             println!("{}\t{}\t{}", claim.token.get(), claim.agent_id, paths);
+        }
+    }
+    Ok(())
+}
+
+fn print_claim_statuses(claims: &[ClaimStatusReport], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(claims)?);
+    } else if claims.is_empty() {
+        println!("No active claims.");
+    } else {
+        for status in claims {
+            let paths = status
+                .claim
+                .paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "{}\t{}\trun={}\tstate={}\t{}",
+                status.claim.token.get(),
+                status.claim.agent_id,
+                status.owner_run_id.as_deref().unwrap_or("<unattributed>"),
+                status.owner_run_state.as_str(),
+                paths,
+            );
         }
     }
     Ok(())

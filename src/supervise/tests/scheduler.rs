@@ -614,8 +614,13 @@ fn semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead() 
 fn claim_and_semantic_block_conflicts_fail_only_the_affected_assignment() {
     let (temp, repo_path) = injected_repository();
     let sync_store = SyncStore::open(&repo_path).expect("open injected sync store");
+    let retained_run = RunId::new("retained-claim-run").expect("valid retained run id");
     let external_claim = sync_store
-        .claim_paths("external-owner", [PathBuf::from("README.md")])
+        .claim_paths_for_run(
+            &retained_run,
+            "external-owner",
+            [PathBuf::from("README.md")],
+        )
         .expect("reserve injected conflicting claim");
     let assignments = vec![
         injected_named_assignment("claim-blocked", "README.md"),
@@ -660,10 +665,21 @@ fn claim_and_semantic_block_conflicts_fail_only_the_affected_assignment() {
             .unwrap_or_else(|poisoned| poisoned.into_inner()),
         vec!["claim-healthy".to_string()]
     );
-    assert!(report
+    let blocking_finding = report
         .findings
         .iter()
-        .any(|finding| finding.message.contains("claim")));
+        .find(|finding| finding.message.contains("failed to claim paths"))
+        .expect("claim conflict must produce a named blocking finding");
+    assert!(blocking_finding.message.contains("external-owner"));
+    assert!(blocking_finding
+        .message
+        .contains(&format!("token {}", external_claim.token.get())));
+    assert!(blocking_finding.message.contains("run retained-claim-run"));
+    assert!(blocking_finding.message.contains("owner_run_state=active"));
+    assert!(report
+        .gate_denials
+        .iter()
+        .any(|denial| denial.reason == GateDenialReason::ClaimConflict));
 
     #[derive(Default)]
     struct SemanticConflictState {
@@ -902,6 +918,67 @@ fn concurrent_failure_isolated_and_retry_retains_assignment_slot() {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len(),
         2
+    );
+}
+
+#[test]
+fn nonaccepted_run_releases_claim_and_followup_reacquires_same_path() {
+    let (temp, repo_path) = injected_repository();
+    let failed_assignment = injected_named_assignment("failed-scope", "README.md");
+    let failed_plan = injected_multi_plan(vec![failed_assignment.clone()], 0);
+    let failed_options = injected_options(&repo_path, temp.path(), "claim-disposition-nonaccepted");
+    let failed_runner = move |command: &ExternalAgentCommand| {
+        let mut report = injected_child_report(&failed_assignment);
+        report.accepted = false;
+        report.rejected = true;
+        report.status = ReviewStatus::Failed;
+        write_injected_json(&command.output_last_message, &report);
+        injected_verified_run(command)
+    };
+
+    let failed_report = run_supervisor_plan_with_concurrent_runner(
+        failed_plan,
+        SupervisorConsultantPlan::default(),
+        failed_options,
+        1,
+        &failed_runner,
+    )
+    .expect("nonaccepted run remains reportable");
+
+    assert!(!failed_report.success);
+    assert_eq!(failed_report.released_claims.len(), 1);
+    assert_eq!(failed_report.released_claims[0].agent_id, "failed-scope");
+    assert!(failed_report.release_errors.is_empty());
+    let store = SyncStore::open(&repo_path).expect("reopen claims after nonaccepted run");
+    assert!(store
+        .status_snapshot()
+        .expect("status after nonaccepted run")
+        .is_empty());
+
+    let followup_assignment = injected_named_assignment("followup-scope", "README.md");
+    let followup_plan = injected_multi_plan(vec![followup_assignment.clone()], 0);
+    let followup_options = injected_options(&repo_path, temp.path(), "claim-disposition-followup");
+    let followup_runner = move |command: &ExternalAgentCommand| {
+        write_injected_assignment_report(command, &followup_assignment);
+        injected_verified_run(command)
+    };
+    let followup_report = run_supervisor_plan_with_concurrent_runner(
+        followup_plan,
+        SupervisorConsultantPlan::default(),
+        followup_options,
+        1,
+        &followup_runner,
+    )
+    .expect("followup run reacquires released path");
+
+    assert!(
+        followup_report.success,
+        "followup run failed to reacquire path: {followup_report:#?}"
+    );
+    assert_eq!(followup_report.released_claims.len(), 1);
+    assert_eq!(
+        followup_report.released_claims[0].agent_id,
+        "followup-scope"
     );
 }
 
