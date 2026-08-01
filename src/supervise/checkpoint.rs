@@ -151,11 +151,25 @@ pub(super) struct SupervisorCheckpointSnapshot {
     pub(super) final_report: Option<FinalReportResumePlan>,
     pub(super) finalization_started: bool,
     pub(super) finalized: bool,
+    primary_base: Oid,
     worktrees: BTreeMap<String, CheckpointWorktreeBinding>,
     claims: BTreeMap<u64, (String, Vec<PathBuf>)>,
 }
 
 impl SupervisorCheckpointSnapshot {
+    pub(super) fn verify_primary_binding(
+        &self,
+        repo: &Path,
+        manager: &WorktreeManager,
+    ) -> Result<RepositoryCleanlinessCapability> {
+        if current_head_oid(repo)? != self.primary_base {
+            bail!("primary HEAD changed after the authenticated supervise checkpoint");
+        }
+        manager
+            .acquire_repository_cleanliness()
+            .context("primary worktree is not clean at resume reconciliation")
+    }
+
     pub(super) fn verify_completed_worktrees(&self, manager: &WorktreeManager) -> Result<()> {
         let observed = manager
             .list()?
@@ -622,10 +636,11 @@ fn analyze_checkpoint_records(
     }
     let prepared: PreparedCheckpoint = decode_payload(first)?;
     validate_version(prepared.version)?;
+    let primary_base = Oid::from_str(&prepared.primary_base)
+        .context("authenticated supervise primary base is malformed")?;
     if prepared.run_id != run_id.as_str()
         || prepared.assignment_ids.len() != prepared.assignment_claim_paths.len()
         || !is_canonical_lower_hex_64(&prepared.normalized_plan_sha256)
-        || Oid::from_str(&prepared.primary_base).is_err()
     {
         bail!("authenticated supervise prepared checkpoint binding is invalid");
     }
@@ -825,6 +840,7 @@ fn analyze_checkpoint_records(
         final_report,
         finalization_started,
         finalized,
+        primary_base,
         worktrees,
         claims,
     })

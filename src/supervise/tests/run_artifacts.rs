@@ -495,6 +495,35 @@ fn resume_refuses_truncated_checkpoint_as_integrity_failure() {
 }
 
 #[test]
+fn resume_refuses_primary_head_drift_from_authenticated_binding() {
+    let (_temp, repo) = injected_repository();
+    let run_id = RunId::new("authenticated-resume-primary-drift").expect("valid drift run id");
+    let _ = interrupted_final_report_checkpoint(&repo, &run_id);
+    fs::write(repo.join("primary-drift.txt"), "drift after checkpoint\n")
+        .expect("write primary drift");
+    commit_injected_repository(&repo, "commit primary drift after checkpoint");
+
+    let refusal =
+        resume_supervisor_run(&repo, run_id.clone()).expect("typed primary drift refusal");
+    assert_eq!(refusal.lifecycle, SupervisorRunLifecycle::Interrupted);
+    assert!(matches!(
+        refusal.gate_denial,
+        Some(GateDenial {
+            reason: GateDenialReason::ResumeCheckpoint {
+                denial: ResumeCheckpointDenial::IntegrityFailure,
+            },
+            retryability: GateRetryability::NotRetryable,
+            ..
+        })
+    ));
+    assert!(!repo
+        .join(RunArtifactFamily::Supervise.run_root())
+        .join(run_id.as_str())
+        .join(ARTIFACT_FINALIZATION_MARKER)
+        .exists());
+}
+
+#[test]
 fn resume_refuses_pre_finalization_lifecycle_with_typed_reason() {
     let (_temp, repo) = injected_repository();
     let run_id = RunId::new("authenticated-resume-unsupported").expect("valid unsupported run id");

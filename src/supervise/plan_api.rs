@@ -851,6 +851,20 @@ pub fn resume_supervisor_run(
         );
     }
     let manager = WorktreeManager::new(&repo);
+    let _primary_cleanliness = match snapshot.verify_primary_binding(&repo, &manager) {
+        Ok(cleanliness) => cleanliness,
+        Err(error) => {
+            return resume_refusal(
+                &run_id,
+                SupervisorRunLifecycle::Interrupted,
+                ResumeCheckpointDenial::IntegrityFailure,
+                snapshot.completed_assignments,
+                snapshot.pending_assignments,
+                snapshot.uncertain_assignments,
+                Some(format!("{error:#}")),
+            )
+        }
+    };
     if let Err(error) = snapshot.verify_completed_worktrees(&manager) {
         return resume_refusal(
             &run_id,
