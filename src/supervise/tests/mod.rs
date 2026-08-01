@@ -4,6 +4,7 @@ mod budget;
 mod environment_controls;
 mod plan_runtime;
 mod prompts_gates;
+mod reaudit;
 mod run_artifacts;
 mod scheduler;
 use super::*;
@@ -507,6 +508,7 @@ fn artifact_test_final_report(run_id: &RunId) -> SupervisorFinalReport {
         rejected: false,
         status: ReviewStatus::Succeeded,
         run_lifecycle: SupervisorRunLifecycle::Finalized,
+        evidence_only_reaudit: None,
         assigned_paths: Vec::new(),
         semantic_symbols: Vec::new(),
         semantic_modules: Vec::new(),
@@ -632,6 +634,7 @@ fn injected_auditor_report(
             message: None,
         }],
         findings: Vec::new(),
+        rejection_kind: None,
         no_further_delegation: Some(true),
         read_only: true,
         accepted: true,

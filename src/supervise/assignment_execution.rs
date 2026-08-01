@@ -84,6 +84,7 @@ fn prepare_assignment_execution<'a>(
         worktree_creation,
         manager,
         reused,
+        evidence_only_reaudit,
         sync_store,
         semantic_store,
         prepared_semantic_token,
@@ -222,6 +223,15 @@ fn prepare_assignment_execution<'a>(
     outcome.claim_tokens.push(claim.token);
     let current_primary_head = current_head_oid(repo)?;
     if !reused {
+        if evidence_only_reaudit.is_some() {
+            record_isolated_assignment_failure(
+                outcome,
+                &effective_assignment,
+                "preserved worktree lookup",
+                &anyhow!("evidence-only re-audit requires the preserved managed child worktree"),
+            );
+            return Ok(AssignmentExecutionDisposition::Complete);
+        }
         let create_options = WorktreeCreateOptions {
             agent_id: effective_assignment.id.clone(),
             branch: None,
@@ -237,6 +247,9 @@ fn prepare_assignment_execution<'a>(
                         effective_assignment.id
                     )
                 }),
+            SupervisorWorktreeCreation::ExistingOnly => {
+                bail!("existing-only supervisor operation cannot create a child worktree")
+            }
             #[cfg(test)]
             SupervisorWorktreeCreation::TestOnly => manager.create_for_test(create_options),
         };
@@ -271,11 +284,54 @@ fn prepare_assignment_execution<'a>(
     };
     let worktree = worktree_write_lease.record().clone();
     if *reused {
-        if let Err(error) = ensure_reusable_child_worktree(&worktree, &current_primary_head) {
+        let reusable = if let Some(source) = evidence_only_reaudit {
+            inspect_supervisor_candidate(repo, &effective_assignment, &worktree_write_lease)
+                .and_then(|inspection| {
+                    if inspection.binding != source.operation.preserved_candidate_binding {
+                        bail!(
+                            "preserved candidate binding changed: expected {:?}, observed {:?}",
+                            source.operation.preserved_candidate_binding,
+                            inspection.binding
+                        );
+                    }
+                    Ok(())
+                })
+        } else {
+            ensure_reusable_child_worktree(&worktree, &current_primary_head)
+        };
+        if let Err(error) = reusable {
+            if evidence_only_reaudit.is_some() {
+                let denial = GateDenial::new(
+                    gate_correlation_id(&effective_assignment.id, 1),
+                    GateDenialReason::MergeRemediation {
+                        blocker: GateApplyBlocker::StaleBase,
+                    },
+                    VerifiedGateContext::new(
+                        &effective_assignment.id,
+                        GateCheckSource::ValidationBinding,
+                        &effective_assignment.assigned_paths,
+                    )?,
+                )
+                .context("failed to construct preserved-candidate binding denial")?;
+                outcome
+                    .gate_tracker
+                    .as_mut()
+                    .context("gate correction tracker was not initialized")?
+                    .escalate(
+                        denial,
+                        artifacts,
+                        &effective_assignment.id,
+                        journal_parent_id,
+                    )?;
+            }
             record_isolated_assignment_failure(
                 outcome,
                 &effective_assignment,
-                "reusable worktree validation",
+                if evidence_only_reaudit.is_some() {
+                    "preserved candidate content binding"
+                } else {
+                    "reusable worktree validation"
+                },
                 &error,
             );
             return Ok(AssignmentExecutionDisposition::Complete);
@@ -458,6 +514,7 @@ fn prepare_child_attempt<'a>(
         budget_config,
         consultant,
         assignment_metadata,
+        evidence_only_reaudit,
         options,
         repo,
         run_dir,
@@ -496,55 +553,81 @@ fn prepare_child_attempt<'a>(
     let RenderedPromptWithMeasurements {
         prompt,
         mut measurements,
-    } = render_child_orchestrator_prompt_with_incoming_root_and_field_guide(
-        ChildOrchestratorPromptContext {
-            plan,
+    } = if let Some(source) = evidence_only_reaudit {
+        let preserved_base = source
+            .operation
+            .preserved_candidate_binding
+            .primary_head
+            .as_deref()
+            .context("preserved candidate binding has no primary HEAD")?
+            .parse::<Oid>()
+            .context("preserved candidate binding primary HEAD is invalid")?;
+        let diff = collect_diff_since_base(
+            &worktree.path,
+            &preserved_base,
+            REVIEW_LENS_REQUEST_LIMIT_BYTES,
+        )?;
+        render_evidence_only_reaudit_prompt(
             assignment,
-            run_dir,
             worktree,
-            report_path: &attempt_artifacts.report_path,
+            &attempt_artifacts.report_path,
             schema_path,
-            worker_schema_path,
-            auditor_schema_path,
-            consultant,
-            claim_context: ChildPromptClaimContext {
-                claim: &preflight.claim,
-                semantic_intent_token: preflight.semantic_token,
+            source,
+            &diff,
+        )?
+    } else {
+        render_child_orchestrator_prompt_with_incoming_root_and_field_guide(
+            ChildOrchestratorPromptContext {
+                plan,
+                assignment,
+                run_dir,
+                worktree,
+                report_path: &attempt_artifacts.report_path,
+                schema_path,
+                worker_schema_path,
+                auditor_schema_path,
+                consultant,
+                claim_context: ChildPromptClaimContext {
+                    claim: &preflight.claim,
+                    semantic_intent_token: preflight.semantic_token,
+                },
             },
-        },
-        &incoming_path,
-        assignment_metadata,
-        field_guide,
-    )?;
-    record_field_guide_prompt_injection_strict(
-        artifacts,
-        &assignment.id,
-        Some(journal_parent_id),
-        OrchestrationRole::Orchestrator,
-        SupervisePromptRole::O1ChildOrchestrator,
-        field_guide,
-        attempt,
-    )?;
-    for worker in &assignment.worker_assignments {
+            &incoming_path,
+            assignment_metadata,
+            field_guide,
+        )?
+    };
+    if evidence_only_reaudit.is_none() {
         record_field_guide_prompt_injection_strict(
             artifacts,
-            &worker.id,
+            &assignment.id,
+            Some(journal_parent_id),
+            OrchestrationRole::Orchestrator,
+            SupervisePromptRole::O1ChildOrchestrator,
+            field_guide,
+            attempt,
+        )?;
+        for worker in &assignment.worker_assignments {
+            record_field_guide_prompt_injection_strict(
+                artifacts,
+                &worker.id,
+                Some(&assignment.id),
+                OrchestrationRole::Worker,
+                SupervisePromptRole::TerminalWorker,
+                field_guide,
+                attempt,
+            )?;
+        }
+        record_field_guide_prompt_injection_strict(
+            artifacts,
+            &format!("{}-review-auditor", assignment.id),
             Some(&assignment.id),
-            OrchestrationRole::Worker,
-            SupervisePromptRole::TerminalWorker,
+            OrchestrationRole::Auditor,
+            SupervisePromptRole::ReviewAuditor,
             field_guide,
             attempt,
         )?;
     }
-    record_field_guide_prompt_injection_strict(
-        artifacts,
-        &format!("{}-review-auditor", assignment.id),
-        Some(&assignment.id),
-        OrchestrationRole::Auditor,
-        SupervisePromptRole::ReviewAuditor,
-        field_guide,
-        attempt,
-    )?;
     let attempt_prompt = match retry_feedback {
         Some(ChildAttemptCorrection::StructuralReport) => prompt_with_structural_retry(&prompt),
         Some(ChildAttemptCorrection::Gate(denial)) => prompt_with_gate_correction(&prompt, denial)?,
@@ -595,7 +678,11 @@ fn prepare_child_attempt<'a>(
     command = bind_supervisor_machine_global_staging_cleanup(command, options)?;
     command =
         apply_canonical_environment_requirements(command, &preflight.environment_requirements);
-    command = configure_writable_child_command(command, &assignment.assigned_paths)?;
+    command = if evidence_only_reaudit.is_some() {
+        configure_read_only_auditor_command(command)?
+    } else {
+        configure_writable_child_command(command, &assignment.assigned_paths)?
+    };
 
     let primary_before = primary_worktree_snapshot(repo, *execution_runtime)?;
     if let Some(error) = primary_before.inspection_problem() {
@@ -934,6 +1021,7 @@ fn dispatch_and_collect_child_attempt<'a>(
             worktree_path: &worktree.path,
             child_base_head: &preflight.child_base_head,
             worker_journals: &worker_journal_evidence,
+            evidence_only_source: context.evidence_only_reaudit.map(|source| &source.report),
         });
     Ok(CollectedChildAttempt {
         attempt_report,
@@ -2037,6 +2125,28 @@ fn parent_auditor_repair_eligible(
         && !auditor_environment_blocked
 }
 
+fn parent_auditor_rejection_kind(
+    assignment: &OrchestratorAssignment,
+    child_report: &OrchestratorReviewReport,
+) -> Option<AuditorRejectionKind> {
+    let rejecting = child_report
+        .audit_reports
+        .iter()
+        .filter(|report| is_parent_auditor_id(assignment, &report.id) && report_failed(*report))
+        .collect::<Vec<_>>();
+    if !rejecting.is_empty()
+        && rejecting
+            .iter()
+            .all(|report| report.rejection_kind == Some(AuditorRejectionKind::EvidenceQuality))
+    {
+        Some(AuditorRejectionKind::EvidenceQuality)
+    } else if !rejecting.is_empty() {
+        Some(AuditorRejectionKind::ImplementationDefect)
+    } else {
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decide_parent_auditor_gate(
     context: &AssignmentExecutionContext<'_, '_>,
@@ -2074,6 +2184,9 @@ fn decide_parent_auditor_gate(
                 .iter()
                 .any(|report| report.id == parent_auditor_id(assignment) && report_failed(report))
         });
+    let auditor_rejection_kind = parent_auditor_rejection_kind(assignment, &child_report);
+    let evidence_only_rejection = parent_auditor_failed
+        && auditor_rejection_kind == Some(AuditorRejectionKind::EvidenceQuality);
     if parent_auditor_repair_eligible(
         parent_auditor_failed,
         assignment_containment_verified,
@@ -2089,7 +2202,10 @@ fn decide_parent_auditor_gate(
             .correlation_id_for_observation(&assignment.id);
         let denial = GateDenial::new(
             correction_correlation_id,
-            GateDenialReason::AuditorRepair,
+            GateDenialReason::AuditorRepair {
+                rejection: auditor_rejection_kind
+                    .unwrap_or(AuditorRejectionKind::ImplementationDefect),
+            },
             VerifiedGateContext::new(
                 &assignment.id,
                 GateCheckSource::Auditor,
@@ -2097,27 +2213,35 @@ fn decide_parent_auditor_gate(
             )?,
         )
         .context("failed to construct parent-auditor gate denial")?;
-        let authorized_denial = outcome
-            .gate_tracker
-            .as_mut()
-            .context("gate correction tracker was not initialized")?
-            .authorize(
-                denial,
-                artifacts,
-                &assignment.id,
-                journal_parent_id,
-                &mut outcome.health_signals,
-            )?;
-        if let Some(authorized_denial) = authorized_denial {
-            *retry_feedback = Some(ChildAttemptCorrection::Gate(authorized_denial));
-            return Ok(ParentAuditorGateDisposition::Retry);
+        if evidence_only_rejection {
+            outcome
+                .gate_tracker
+                .as_mut()
+                .context("gate correction tracker was not initialized")?
+                .escalate(denial, artifacts, &assignment.id, journal_parent_id)?;
+        } else {
+            let authorized_denial = outcome
+                .gate_tracker
+                .as_mut()
+                .context("gate correction tracker was not initialized")?
+                .authorize(
+                    denial,
+                    artifacts,
+                    &assignment.id,
+                    journal_parent_id,
+                    &mut outcome.health_signals,
+                )?;
+            if let Some(authorized_denial) = authorized_denial {
+                *retry_feedback = Some(ChildAttemptCorrection::Gate(authorized_denial));
+                return Ok(ParentAuditorGateDisposition::Retry);
+            }
         }
     } else if matches!(
         outcome
             .gate_tracker
             .as_ref()
             .and_then(GateCorrectionTracker::active_reason),
-        Some(GateDenialReason::AuditorRepair)
+        Some(GateDenialReason::AuditorRepair { .. })
     ) && !parent_auditor_failed
     {
         outcome
@@ -2127,64 +2251,43 @@ fn decide_parent_auditor_gate(
             .self_corrected(artifacts, &assignment.id, journal_parent_id)?;
     }
     let mut traceability_candidate = None;
-    if !report_failed(&child_report) {
+    if !report_failed(&child_report) || evidence_only_rejection {
         let post_auditor_candidate =
             inspect_supervisor_candidate(repo, assignment, &preflight.worktree_write_lease);
         match (pre_auditor_candidate.as_ref(), post_auditor_candidate) {
             (Some(before), Ok(after)) if before == &after => {
                 traceability_candidate = Some(after);
             }
-            (Some(before), Ok(after)) if !child_report.decomposition_completions.is_empty() => {
+            (Some(before), Ok(after)) => {
                 let error = anyhow!(
                     "candidate content, paths, or base changed across parent auditor review: before={before:?}, after={after:?}"
                 );
-                reject_supervisor_decomposition_binding(
-                    &mut child_report,
-                    final_report_path,
-                    &error,
-                );
+                reject_supervisor_candidate_binding(&mut child_report, final_report_path, &error);
             }
-            (Some(_), Err(error)) if !child_report.decomposition_completions.is_empty() => {
-                let error = anyhow!(
-                    "failed to recapture decomposition candidate after parent auditor review: {error:#}"
-                );
-                reject_supervisor_decomposition_binding(
-                    &mut child_report,
-                    final_report_path,
-                    &error,
-                );
+            (Some(_), Err(error)) => {
+                let error =
+                    anyhow!("failed to recapture candidate after parent auditor review: {error:#}");
+                reject_supervisor_candidate_binding(&mut child_report, final_report_path, &error);
             }
-            (None, _) if !child_report.decomposition_completions.is_empty() => {
-                let error = anyhow!(
-                    "accepted decomposition evidence has no pre-auditor supervisor candidate binding"
-                );
-                reject_supervisor_decomposition_binding(
-                    &mut child_report,
-                    final_report_path,
-                    &error,
-                );
+            (None, _) => {
+                let error =
+                    anyhow!("accepted report has no pre-auditor supervisor candidate binding");
+                reject_supervisor_candidate_binding(&mut child_report, final_report_path, &error);
             }
-            _ => {}
         }
     }
-    if !report_failed(&child_report) {
+    if !report_failed(&child_report) || evidence_only_rejection {
         if let Some(candidate) = traceability_candidate.as_ref() {
             if candidate.changed_paths != child_report.files_changed {
                 let error = anyhow!(
                     "supervisor-observed candidate paths differ from the accepted child report"
                 );
-                if !child_report.decomposition_completions.is_empty() {
-                    reject_supervisor_decomposition_binding(
-                        &mut child_report,
-                        final_report_path,
-                        &error,
-                    );
-                }
+                reject_supervisor_candidate_binding(&mut child_report, final_report_path, &error);
                 traceability_candidate = None;
             }
         }
     }
-    if report_failed(&child_report) {
+    if report_failed(&child_report) && !evidence_only_rejection {
         traceability_candidate = None;
     }
     let tracker = outcome
@@ -2402,7 +2505,7 @@ fn execute_supervisor_assignment_inner(
                 }
                 Ok(None) => None,
                 Err(error) => {
-                    reject_supervisor_decomposition_binding(
+                    reject_supervisor_candidate_binding(
                         &mut child_report,
                         &final_report_path,
                         &error,
@@ -2413,6 +2516,41 @@ fn execute_supervisor_assignment_inner(
         } else {
             None
         };
+        if let Some(source) = context.evidence_only_reaudit {
+            let binding_matches = pre_auditor_candidate.as_ref().is_some_and(|inspection| {
+                inspection.binding == source.operation.preserved_candidate_binding
+            });
+            if !binding_matches {
+                let denial = GateDenial::new(
+                    gate_correlation_id(&assignment.id, 1),
+                    GateDenialReason::MergeRemediation {
+                        blocker: GateApplyBlocker::StaleBase,
+                    },
+                    VerifiedGateContext::new(
+                        &assignment.id,
+                        GateCheckSource::ValidationBinding,
+                        &assignment.assigned_paths,
+                    )?,
+                )
+                .context("failed to construct evidence-only content-binding denial")?;
+                outcome
+                    .gate_tracker
+                    .as_mut()
+                    .context("gate correction tracker was not initialized")?
+                    .escalate(denial, artifacts, &assignment.id, journal_parent_id)?;
+                child_report.status = ReviewStatus::Failed;
+                child_report.accepted = false;
+                child_report.rejected = true;
+                child_report.findings.push(Finding {
+                    severity: FindingSeverity::Error,
+                    message:
+                        "evidence-only report stage changed or lost the preserved candidate binding"
+                            .to_string(),
+                    paths: assignment.assigned_paths.clone(),
+                });
+                child_gate_terminal = true;
+            }
+        }
         with_supervisor_artifacts(artifacts, |writer, _| {
             write_child_report(writer, &final_report_relative, &child_report)
         })?;
@@ -2448,9 +2586,22 @@ fn execute_supervisor_assignment_inner(
             }
             let child_transcript = String::from_utf8(child_transcript_bytes)
                 .context("child transcript evidence is not valid UTF-8")?;
+            let review_base = context
+                .evidence_only_reaudit
+                .and_then(|source| {
+                    source
+                        .operation
+                        .preserved_candidate_binding
+                        .primary_head
+                        .as_deref()
+                })
+                .map(str::parse::<Oid>)
+                .transpose()
+                .context("preserved candidate binding primary HEAD is invalid")?
+                .unwrap_or(preflight.child_base_head);
             let diff = collect_diff_since_base(
                 &preflight.worktree.path,
-                &preflight.child_base_head,
+                &review_base,
                 REVIEW_LENS_REQUEST_LIMIT_BYTES,
             )?;
             let output_report = serde_json::to_string(&child_report)
@@ -2858,6 +3009,7 @@ mod decomposition_tests {
             consultant: &consultant,
             assignment_metadata: &assignment_metadata,
             assignment: &assignment,
+            evidence_only_reaudit: None,
             options: &options,
             repo: &repo,
             run_dir: &run_dir,

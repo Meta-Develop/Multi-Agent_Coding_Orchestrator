@@ -587,6 +587,23 @@ fn resume_refuses_dispatch_started_without_durable_completion_as_uncertain() {
     let run_id = RunId::new("authenticated-resume-uncertain").expect("valid uncertain run id");
     let assignment = injected_assignment(false);
     let plan = injected_plan(assignment.clone(), 0);
+    let plan_metadata = SupervisorPlanMetadata {
+        evidence_only_reaudit: Some(EvidenceOnlyReauditPlan {
+            source_run_id: RunId::new("authenticated-reaudit-source")
+                .expect("valid evidence source run id"),
+            assignment_id: assignment.id.clone(),
+            attempt: 1,
+            preserved_candidate_binding: CandidateValidationBinding {
+                version: 1,
+                agent_id: assignment.id.clone(),
+                primary_head: Some("1111111111111111111111111111111111111111".to_string()),
+                agent_head: Some("2222222222222222222222222222222222222222".to_string()),
+                merge_base: Some("1111111111111111111111111111111111111111".to_string()),
+                diff_oid: "3333333333333333333333333333333333333333".to_string(),
+            },
+        }),
+        ..SupervisorPlanMetadata::default()
+    };
     let ledger = RunBudgetLedger::new(RunBudgetLimits::default()).expect("uncertain budget ledger");
     let writer = ArtifactRunWriter::reserve(
         &repo,
@@ -604,7 +621,7 @@ fn resume_refuses_dispatch_started_without_durable_completion_as_uncertain() {
                 &plan,
                 &SupervisorConsultantPlan::default(),
                 &AssignmentMetadata::new(),
-                &SupervisorPlanMetadata::default(),
+                &plan_metadata,
             )
             .expect("uncertain normalized plan"),
             1,
@@ -1623,6 +1640,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         environment_failures: Vec::new(),
         validation_results: Vec::new(),
         findings: Vec::new(),
+        rejection_kind: None,
         no_further_delegation: Some(true),
         read_only: true,
         accepted: true,

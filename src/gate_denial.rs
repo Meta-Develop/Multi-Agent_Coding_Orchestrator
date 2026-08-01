@@ -224,7 +224,9 @@ pub enum GateDenialReason {
     BudgetAdmission {
         denial: BudgetAdmissionDenial,
     },
-    AuditorRepair,
+    AuditorRepair {
+        rejection: AuditorRejectionKind,
+    },
     ValidationRepair {
         blocker: ApplyBlocker,
     },
@@ -248,6 +250,18 @@ pub enum GateDenialReason {
     ApprovalReview {
         denial: ApprovalReviewDenial,
     },
+}
+
+/// Parent-auditor rejection class selected by the auditor's typed report.
+///
+/// Evidence-only re-audit is authorized only for [`Self::EvidenceQuality`].
+/// An implementation defect remains routed through the ordinary child repair
+/// lifecycle so this type cannot become a textual gate-skipping convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditorRejectionKind {
+    ImplementationDefect,
+    EvidenceQuality,
 }
 
 /// Whether the denied operation may be attempted again after correction.
@@ -298,6 +312,7 @@ pub enum NextSafeOperation {
     NarrowOrReplanClaimOwnership,
     ReviewRunBudgetAndStartNewRun,
     RepairAuditorFindings,
+    EvidenceOnlyReaudit,
     RepairValidation,
     RestoreCleanPrimary,
     RefreshCandidateBase,
@@ -930,7 +945,7 @@ fn validate_context_source(reason: &GateDenialReason, source: GateCheckSource) -
             source == GateCheckSource::DestructiveTargetPreflight
         }
         GateDenialReason::BudgetAdmission { .. } => source == GateCheckSource::BudgetAdmission,
-        GateDenialReason::AuditorRepair => {
+        GateDenialReason::AuditorRepair { .. } => {
             matches!(
                 source,
                 GateCheckSource::Auditor | GateCheckSource::FutureApprovalReview
@@ -956,7 +971,9 @@ fn validate_context_source(reason: &GateDenialReason, source: GateCheckSource) -
             ApplyBlocker::StaleBase => {
                 matches!(
                     source,
-                    GateCheckSource::PrimaryDrift | GateCheckSource::MergeScope
+                    GateCheckSource::PrimaryDrift
+                        | GateCheckSource::MergeScope
+                        | GateCheckSource::ValidationBinding
                 )
             }
             ApplyBlocker::ApplyCheckFailed => {
@@ -1025,7 +1042,7 @@ fn route_for(reason: &GateDenialReason) -> GateDenialRoute {
     match reason {
         GateDenialReason::ClaimConflict => GateDenialRoute::PlannerParent,
         GateDenialReason::BudgetAdmission { .. }
-        | GateDenialReason::AuditorRepair
+        | GateDenialReason::AuditorRepair { .. }
         | GateDenialReason::ValidationRepair { .. }
         | GateDenialReason::ContainmentFailure
         | GateDenialReason::Sandbox { .. }
@@ -1044,7 +1061,12 @@ fn next_safe_operation_for(reason: &GateDenialReason) -> NextSafeOperation {
         GateDenialReason::BudgetAdmission { .. } => {
             NextSafeOperation::ReviewRunBudgetAndStartNewRun
         }
-        GateDenialReason::AuditorRepair => NextSafeOperation::RepairAuditorFindings,
+        GateDenialReason::AuditorRepair {
+            rejection: AuditorRejectionKind::ImplementationDefect,
+        } => NextSafeOperation::RepairAuditorFindings,
+        GateDenialReason::AuditorRepair {
+            rejection: AuditorRejectionKind::EvidenceQuality,
+        } => NextSafeOperation::EvidenceOnlyReaudit,
         GateDenialReason::ValidationRepair { .. } => NextSafeOperation::RepairValidation,
         GateDenialReason::MergeRemediation { blocker } => match blocker {
             ApplyBlocker::DirtyPrimary => NextSafeOperation::RestoreCleanPrimary,
@@ -1148,7 +1170,12 @@ fn reason_label(reason: &GateDenialReason) -> &'static str {
                 "run budget hard cost ceiling denied dispatch"
             }
         },
-        GateDenialReason::AuditorRepair => "auditor repair",
+        GateDenialReason::AuditorRepair {
+            rejection: AuditorRejectionKind::ImplementationDefect,
+        } => "auditor implementation repair",
+        GateDenialReason::AuditorRepair {
+            rejection: AuditorRejectionKind::EvidenceQuality,
+        } => "auditor evidence repair",
         GateDenialReason::ValidationRepair { blocker } => match blocker {
             ApplyBlocker::ValidationMissing => "validation evidence missing",
             ApplyBlocker::ValidationNotRun => "validation not run",
@@ -1281,6 +1308,9 @@ fn next_safe_operation_instruction(value: NextSafeOperation) -> &'static str {
         }
         NextSafeOperation::RepairAuditorFindings => {
             "return verified auditor repair to the child or controller."
+        }
+        NextSafeOperation::EvidenceOnlyReaudit => {
+            "request an assignment-scoped evidence-only re-audit against the preserved candidate binding."
         }
         NextSafeOperation::RepairValidation => {
             "return verified validation repair to the child or controller."
@@ -1525,7 +1555,9 @@ mod tests {
 
         let auditor = GateDenial::new(
             "audit-fix",
-            GateDenialReason::AuditorRepair,
+            GateDenialReason::AuditorRepair {
+                rejection: AuditorRejectionKind::ImplementationDefect,
+            },
             VerifiedGateContext::new(
                 "worker-a",
                 GateCheckSource::Auditor,

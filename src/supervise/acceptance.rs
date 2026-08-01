@@ -12,6 +12,7 @@ pub(super) fn collect_child_report(
         worktree_path,
         child_base_head,
         worker_journals,
+        evidence_only_source,
     } = context;
     if external_run.environment_blocked() {
         return (
@@ -115,17 +116,54 @@ pub(super) fn collect_child_report(
         });
     }
     validate_worker_report_delegation_attestations(assignment, report_path, &mut report);
-    verify_child_report_paths(assignment, worktree_path, child_base_head, &mut report);
+    if evidence_only_source.is_none() {
+        verify_child_report_paths(assignment, worktree_path, child_base_head, &mut report);
+    }
     validate_worker_report_evidence(assignment, assignment_metadata, report_path, &mut report);
     validate_assignment_report_plumbing(assignment, assignment_metadata, report_path, &mut report);
-    validate_worker_execution_journal_evidence(
-        assignment,
-        report_path,
-        worker_journals,
-        &mut report,
-    );
+    if let Some(source) = evidence_only_source {
+        validate_evidence_only_report_preservation(source, report_path, &mut report);
+    } else {
+        validate_worker_execution_journal_evidence(
+            assignment,
+            report_path,
+            worker_journals,
+            &mut report,
+        );
+    }
     enforce_orchestrator_environment_failure_outcome(&mut report);
     (report, report_shape_problems)
+}
+
+fn validate_evidence_only_report_preservation(
+    source: &OrchestratorReviewReport,
+    report_path: &Path,
+    report: &mut OrchestratorReviewReport,
+) {
+    let preserved = report.assigned_paths == source.assigned_paths
+        && report.semantic_symbols == source.semantic_symbols
+        && report.semantic_modules == source.semantic_modules
+        && report.files_changed == source.files_changed
+        && report.field_guide_entries == source.field_guide_entries
+        && report.worker_reports == source.worker_reports
+        && report.decomposition_completions == source.decomposition_completions
+        && report.audit_reports.is_empty();
+    if preserved {
+        return;
+    }
+    report.status = ReviewStatus::Failed;
+    report.accepted = false;
+    report.rejected = true;
+    report.findings.push(Finding {
+        severity: FindingSeverity::Error,
+        message: "evidence-only report changed preserved implementation evidence or self-asserted auditor evidence"
+            .to_string(),
+        paths: vec![report_path.to_path_buf()],
+    });
+    report.remaining_risk =
+        "the evidence-only report is not bound to the authenticated source report".to_string();
+    report.next_safe_action =
+        "discard this report and retain the authenticated source assignment".to_string();
 }
 
 pub(super) fn collect_parent_auditor_report(
@@ -215,7 +253,14 @@ pub(super) fn review_lens_verdict_from_auditor(
         && !report.commands_run.is_empty()
         && !report.validation_results.is_empty()
         && !report.remaining_risk.trim().is_empty()
-        && !report.next_safe_action.trim().is_empty();
+        && !report.next_safe_action.trim().is_empty()
+        && if report.accepted && !report.rejected && report.status == ReviewStatus::Succeeded {
+            report.rejection_kind.is_none()
+        } else if report.rejected || report.status == ReviewStatus::Rejected {
+            report.rejection_kind.is_some()
+        } else {
+            true
+        };
     let verdict = if process_procedural_failure || !structurally_valid {
         ReviewLensVerdictStatus::ProceduralFailure
     } else if report.accepted && !report.rejected && report.status == ReviewStatus::Succeeded {
@@ -536,7 +581,7 @@ pub(super) fn bind_supervisor_decomposition_candidate(
     Ok(Some(inspection))
 }
 
-pub(super) fn reject_supervisor_decomposition_binding(
+pub(super) fn reject_supervisor_candidate_binding(
     report: &mut OrchestratorReviewReport,
     report_path: &Path,
     error: &anyhow::Error,
@@ -547,7 +592,7 @@ pub(super) fn reject_supervisor_decomposition_binding(
     report.findings.push(Finding {
         severity: FindingSeverity::Error,
         message: format!(
-            "supervisor could not bind the exact decomposition candidate reviewed by the parent auditor: {error:#}"
+            "supervisor could not bind the exact candidate reviewed by the parent auditor: {error:#}"
         ),
         paths: vec![report_path.to_path_buf()],
     });
