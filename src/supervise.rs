@@ -979,9 +979,93 @@ pub struct GateCorrectionLifecycleKpi {
     pub terminal_outcome: Option<GateCorrectionTerminalClass>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutonomyKpiPopulation {
+    #[default]
+    ReviewedGateActions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AutonomyKpiCoverageMarker {
+    pub observation: RoleUsageObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+impl AutonomyKpiCoverageMarker {
+    fn supervisor_aggregate() -> Self {
+        Self {
+            observation: RoleUsageObservation::SupervisorAggregate,
+            unavailable_reason: None,
+        }
+    }
+
+    fn not_process_observable(reason: impl Into<String>) -> Self {
+        Self {
+            observation: RoleUsageObservation::NotProcessObservable,
+            unavailable_reason: Some(reason.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AutonomyKpiCoverage {
+    pub review_decisions: AutonomyKpiCoverageMarker,
+    pub reviewed_denial_terminal_lifecycles: AutonomyKpiCoverageMarker,
+    pub human_follow_up_responses: AutonomyKpiCoverageMarker,
+    pub scheduler_budget_denial_lifecycles: AutonomyKpiCoverageMarker,
+}
+
+impl AutonomyKpiCoverage {
+    fn journal_observable() -> Self {
+        Self {
+            review_decisions: AutonomyKpiCoverageMarker::supervisor_aggregate(),
+            reviewed_denial_terminal_lifecycles:
+                AutonomyKpiCoverageMarker::supervisor_aggregate(),
+            human_follow_up_responses: AutonomyKpiCoverageMarker::not_process_observable(
+                "pre-action events record that human intervention is required but do not record a later human response",
+            ),
+            scheduler_budget_denial_lifecycles:
+                AutonomyKpiCoverageMarker::not_process_observable(
+                    "scheduler budget denials do not produce gate correction lifecycle events",
+                ),
+        }
+    }
+
+    fn journal_not_process_observable() -> Self {
+        let journal_reason =
+            "the orchestration event journal was unavailable or disabled".to_string();
+        Self {
+            review_decisions: AutonomyKpiCoverageMarker::not_process_observable(
+                journal_reason.clone(),
+            ),
+            reviewed_denial_terminal_lifecycles:
+                AutonomyKpiCoverageMarker::not_process_observable(journal_reason),
+            human_follow_up_responses: AutonomyKpiCoverageMarker::not_process_observable(
+                "pre-action events record that human intervention is required but do not record a later human response",
+            ),
+            scheduler_budget_denial_lifecycles:
+                AutonomyKpiCoverageMarker::not_process_observable(
+                    "scheduler budget denials do not produce gate correction lifecycle events",
+                ),
+        }
+    }
+}
+
+impl Default for AutonomyKpiCoverage {
+    fn default() -> Self {
+        Self::journal_not_process_observable()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct AutonomyKpiReport {
     pub observation: RoleUsageObservation,
+    #[serde(default)]
+    pub population: AutonomyKpiPopulation,
+    #[serde(default)]
+    pub coverage: AutonomyKpiCoverage,
     pub actions_reviewed: Option<u64>,
     pub denials: Option<u64>,
     pub self_corrections: Option<u64>,
@@ -1005,6 +1089,8 @@ impl AutonomyKpiReport {
     fn not_process_observable() -> Self {
         Self {
             observation: RoleUsageObservation::NotProcessObservable,
+            population: AutonomyKpiPopulation::ReviewedGateActions,
+            coverage: AutonomyKpiCoverage::journal_not_process_observable(),
             actions_reviewed: None,
             denials: None,
             self_corrections: None,

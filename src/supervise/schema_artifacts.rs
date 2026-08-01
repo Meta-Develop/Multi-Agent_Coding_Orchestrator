@@ -86,6 +86,20 @@ pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
 
 fn autonomy_kpi_report_schema_value() -> serde_json::Value {
     let optional_count = || json!({"type": ["integer", "null"], "minimum": 0});
+    let coverage_marker = || {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["observation"],
+            "properties": {
+                "observation": {
+                    "type": "string",
+                    "enum": ["supervisor_aggregate", "not_process_observable"]
+                },
+                "unavailable_reason": {"type": "string"}
+            }
+        })
+    };
     let ratio = || {
         json!({
             "type": "object",
@@ -102,6 +116,8 @@ fn autonomy_kpi_report_schema_value() -> serde_json::Value {
         "additionalProperties": false,
         "required": [
             "observation",
+            "population",
+            "coverage",
             "actions_reviewed",
             "denials",
             "self_corrections",
@@ -112,6 +128,26 @@ fn autonomy_kpi_report_schema_value() -> serde_json::Value {
             "observation": {
                 "type": "string",
                 "enum": ["supervisor_aggregate", "not_process_observable"]
+            },
+            "population": {
+                "type": "string",
+                "const": "reviewed_gate_actions"
+            },
+            "coverage": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "review_decisions",
+                    "reviewed_denial_terminal_lifecycles",
+                    "human_follow_up_responses",
+                    "scheduler_budget_denial_lifecycles"
+                ],
+                "properties": {
+                    "review_decisions": coverage_marker(),
+                    "reviewed_denial_terminal_lifecycles": coverage_marker(),
+                    "human_follow_up_responses": coverage_marker(),
+                    "scheduler_budget_denial_lifecycles": coverage_marker()
+                }
             },
             "actions_reviewed": optional_count(),
             "denials": optional_count(),

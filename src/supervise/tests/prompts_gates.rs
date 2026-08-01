@@ -1125,14 +1125,16 @@ fn gate_budget_exhaustion_feeds_existing_breaker() {
     assert_eq!(
         trip.autonomy_kpis.self_corrections,
         Some(0),
-        "breaker health must retain the measured terminal-outcome KPI"
+        "breaker health must retain the reviewed-denial KPI population"
+    );
+    assert_eq!(trip.autonomy_kpis.self_correction_rate, None);
+    assert!(
+        trip.autonomy_kpis.gate_lifecycles.is_empty(),
+        "an unreviewed validation denial must not enter reviewed-action KPIs"
     );
     assert_eq!(
-        trip.autonomy_kpis.self_correction_rate,
-        Some(RatioMetric {
-            numerator: 0,
-            denominator: 1,
-        })
+        trip.autonomy_kpis.population,
+        AutonomyKpiPopulation::ReviewedGateActions
     );
 }
 

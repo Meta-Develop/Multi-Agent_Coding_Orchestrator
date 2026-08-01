@@ -118,6 +118,32 @@ fn typed_gate_events_report_all_autonomy_kpis_with_explicit_denominators() {
         report.observation,
         RoleUsageObservation::SupervisorAggregate
     );
+    assert_eq!(
+        report.population,
+        AutonomyKpiPopulation::ReviewedGateActions
+    );
+    assert_eq!(
+        report.coverage.review_decisions.observation,
+        RoleUsageObservation::SupervisorAggregate
+    );
+    assert_eq!(
+        report
+            .coverage
+            .reviewed_denial_terminal_lifecycles
+            .observation,
+        RoleUsageObservation::SupervisorAggregate
+    );
+    assert_eq!(
+        report.coverage.human_follow_up_responses.observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+    assert_eq!(
+        report
+            .coverage
+            .scheduler_budget_denial_lifecycles
+            .observation,
+        RoleUsageObservation::NotProcessObservable
+    );
     assert_eq!(report.actions_reviewed, Some(3));
     assert_eq!(report.denials, Some(2));
     assert_eq!(report.self_corrections, Some(1));
@@ -191,6 +217,139 @@ fn disabled_journal_reports_unmeasured_instead_of_zero() {
     assert_eq!(report.self_corrections, None);
     assert_eq!(report.human_escalations, None);
     assert_eq!(report.interrupted, None);
+    assert_eq!(
+        report.coverage.review_decisions.observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+    assert_eq!(
+        report
+            .coverage
+            .reviewed_denial_terminal_lifecycles
+            .observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+}
+
+#[test]
+fn legacy_autonomy_kpi_report_defaults_new_population_and_coverage_fields() {
+    let report = serde_json::from_value::<AutonomyKpiReport>(json!({
+        "observation": "supervisor_aggregate",
+        "actions_reviewed": 1,
+        "denials": 0,
+        "self_corrections": 0,
+        "human_escalations": 0,
+        "interrupted": false
+    }))
+    .expect("deserialize pre-coverage autonomy KPI report");
+
+    assert_eq!(
+        report.population,
+        AutonomyKpiPopulation::ReviewedGateActions
+    );
+    assert_eq!(
+        report.coverage.review_decisions.observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+    assert_eq!(
+        report
+            .coverage
+            .scheduler_budget_denial_lifecycles
+            .observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+}
+
+#[test]
+fn producer_paths_join_terminal_lifecycles_only_to_reviewed_denials() {
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("autonomy-kpi-producer-join").expect("valid producer-path run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "autonomy-kpi-producer-join-test",
+    )
+    .expect("reserve producer-path artifact run");
+    let mut journal = Some(OrchestrationEventJournal::new(
+        "autonomy-kpi-producer-repository",
+        run_id.as_str(),
+    ));
+    let mut collector = AutonomyKpiCollector::default();
+    let reviewed = approval_denial(
+        "producer-reviewed-correlation",
+        ApprovalReviewDenial::ClassifierDenied,
+    );
+    let unreviewed = approval_denial(
+        "producer-unreviewed-correlation",
+        ApprovalReviewDenial::ClassifierDenied,
+    );
+
+    {
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut collector,
+        });
+        let mut review_sink = SupervisorPreActionJournalSink {
+            artifacts: &artifacts,
+            node: "child-a",
+            parent: Some(run_id.as_str()),
+        };
+        review_sink
+            .append(&review_decision_event(
+                "producer-reviewed-request",
+                false,
+                Some(reviewed.clone()),
+                PreActionJournalRationale::DeterministicPolicyDeny,
+            ))
+            .expect("produce reviewed denial through strict journal sink");
+
+        let mut tracker = GateCorrectionTracker::new(2);
+        let mut health_signals = Vec::new();
+        assert!(tracker
+            .authorize(
+                reviewed.clone(),
+                &artifacts,
+                "child-a",
+                run_id.as_str(),
+                &mut health_signals,
+            )
+            .expect("authorize correction for reviewed denial")
+            .is_some());
+        tracker
+            .self_corrected(&artifacts, "child-a", run_id.as_str())
+            .expect("terminalize reviewed denial through gate tracker");
+
+        assert!(tracker
+            .authorize(
+                unreviewed,
+                &artifacts,
+                "child-a",
+                run_id.as_str(),
+                &mut health_signals,
+            )
+            .expect("authorize correction for unrelated gate population")
+            .is_some());
+        tracker
+            .self_corrected(&artifacts, "child-a", run_id.as_str())
+            .expect("terminalize unrelated gate lifecycle through gate tracker");
+    }
+
+    let report = collector.report(true);
+    assert_eq!(report.denials, Some(1));
+    assert_eq!(report.self_corrections, Some(1));
+    assert_eq!(
+        report.self_correction_rate,
+        Some(RatioMetric {
+            numerator: 1,
+            denominator: 1,
+        })
+    );
+    assert_eq!(report.gate_lifecycles.len(), 1);
+    assert_eq!(
+        report.gate_lifecycles[0].denial_id,
+        reviewed.denial_id.as_str()
+    );
 }
 
 #[test]

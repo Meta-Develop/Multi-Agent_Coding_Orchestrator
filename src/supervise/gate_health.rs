@@ -106,14 +106,38 @@ impl AutonomyKpiCollector {
             .values()
             .filter(|action| !action.allowed)
             .count() as u64;
-        let terminal_denials = self
+        // Self-correction is defined only over reviewed denials. Requiring both typed
+        // correlation fields prevents unrelated gate populations from entering either
+        // the numerator or denominator merely because they also produce lifecycle events.
+        let reviewed_denials = self
+            .reviewed_actions
+            .values()
+            .filter(|action| !action.allowed)
+            .filter_map(|action| {
+                action
+                    .denial_id
+                    .as_deref()
+                    .zip(action.correction_correlation_id.as_deref())
+            })
+            .collect::<BTreeMap<_, _>>();
+        let reviewed_gate_lifecycles = self
             .gate_lifecycles
             .values()
+            .filter(|lifecycle| {
+                reviewed_denials
+                    .get(lifecycle.denial_id.as_str())
+                    .is_some_and(|correlation_id| {
+                        *correlation_id == lifecycle.correction_correlation_id
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let terminal_denials = reviewed_gate_lifecycles
+            .iter()
             .filter(|lifecycle| lifecycle.terminal_outcome.is_some())
             .count() as u64;
-        let self_corrections = self
-            .gate_lifecycles
-            .values()
+        let self_corrections = reviewed_gate_lifecycles
+            .iter()
             .filter(|lifecycle| {
                 lifecycle.terminal_outcome == Some(GateCorrectionTerminalClass::SelfCorrected)
             })
@@ -127,6 +151,8 @@ impl AutonomyKpiCollector {
         let interrupted_runs = self.human_interrupted_runs.len() as u64;
         AutonomyKpiReport {
             observation: RoleUsageObservation::SupervisorAggregate,
+            population: AutonomyKpiPopulation::ReviewedGateActions,
+            coverage: AutonomyKpiCoverage::journal_observable(),
             actions_reviewed: Some(actions_reviewed),
             denials: Some(denials),
             self_corrections: Some(self_corrections),
@@ -145,7 +171,7 @@ impl AutonomyKpiCollector {
                 denominator: eligible_reviewed_runs,
             }),
             reviewed_actions: self.reviewed_actions.values().cloned().collect(),
-            gate_lifecycles: self.gate_lifecycles.values().cloned().collect(),
+            gate_lifecycles: reviewed_gate_lifecycles,
             unavailable_reason: None,
         }
     }
