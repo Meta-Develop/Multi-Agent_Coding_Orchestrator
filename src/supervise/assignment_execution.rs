@@ -592,6 +592,7 @@ fn prepare_child_attempt<'a>(
         options.run_id.as_str(),
         &assignment.id,
     );
+    command = bind_supervisor_machine_global_staging_cleanup(command, options)?;
     command =
         apply_canonical_environment_requirements(command, &preflight.environment_requirements);
     command = configure_writable_child_command(command, &assignment.assigned_paths)?;
@@ -1407,6 +1408,12 @@ struct ParentAuditorLensExecution<'a> {
     required_coverage: &'a ReviewCoverageRequirement,
 }
 
+/// Creates a process-owned, uniquely named workspace for one review-lens run.
+///
+/// `TempDir::drop` recursively removes this workspace. That machine-global
+/// cleanup is an audited known bypass: unlike external-agent output staging,
+/// no caller selects or adopts this path. Keep the operator inventory in the
+/// README in sync if this ownership or cleanup mechanism changes.
 pub(super) fn create_review_lens_scope_workspace() -> Result<tempfile::TempDir> {
     let workspace = tempfile::Builder::new()
         .prefix("maco-review-lens-")
@@ -1430,6 +1437,17 @@ pub(super) fn configure_review_lens_execution_boundary(
     Ok(configure_read_only_auditor_command(command)?
         .with_hidden_root(primary_root)
         .with_hidden_root(child_root))
+}
+
+fn bind_supervisor_machine_global_staging_cleanup(
+    command: ExternalAgentCommand,
+    options: &SupervisorRunOptions,
+) -> Result<ExternalAgentCommand> {
+    let binding = options.machine_global_retention.as_ref().context(
+        "supervise dispatch requires --machine-global-config and \
+         --machine-global-runtime-root-id for private output-staging cleanup",
+    )?;
+    Ok(command.with_machine_global_retention(binding.clone()))
 }
 
 fn prepare_parent_auditor<'a>(
@@ -1554,6 +1572,7 @@ fn prepare_parent_auditor<'a>(
                 options.run_id.as_str(),
                 &auditor_id,
             );
+    auditor_command = bind_supervisor_machine_global_staging_cleanup(auditor_command, options)?;
     auditor_command = apply_canonical_environment_requirements(
         auditor_command,
         &preflight.environment_requirements,
@@ -1826,6 +1845,9 @@ fn dispatch_and_collect_parent_auditor(
         }
     };
     let auditor_environment_blocked = auditor_run.environment_blocked();
+    outcome
+        .gate_denials
+        .extend(auditor_run.gate_denials().iter().cloned());
     let usage_settlement =
         auditor_budget_reservation.settle(&auditor_run, options.runtime, &auditor_command)?;
     match usage_settlement.reliable_usage() {
@@ -2584,7 +2606,15 @@ fn execute_supervisor_assignment_inner(
 #[cfg(test)]
 mod decomposition_tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::external_agent::run_external_agent_nonpublishable_simulation;
+    #[cfg(target_os = "linux")]
+    use crate::machine_global::{GateOutcome, MachineGlobalStore};
     use git2::Signature;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "linux")]
+    use std::time::Instant;
 
     fn commit_fixture_repository(path: &Path) {
         let repo = Repository::open(path).expect("open fixture repository");
@@ -2775,6 +2805,12 @@ mod decomposition_tests {
             codex_bin: PathBuf::from("unused-codex"),
             runtime: SupervisorRuntime::Fake,
             allow_dirty_primary: false,
+            machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+                config: temp.path().join("unused-machine-global.json"),
+                root_id: "runtime".to_string(),
+                owner: "maco-supervise".to_string(),
+                correction_correlation_id: "direct-assignment-phases".to_string(),
+            }),
         };
         let mut artifact_writer = ArtifactRunWriter::reserve(
             &repo,
@@ -2875,6 +2911,10 @@ mod decomposition_tests {
         };
         assert!(prepared.attempt_artifacts.prompt_path.exists());
         assert!(!prepared.corrective_retry_used);
+        assert_eq!(
+            prepared.command.machine_global_retention,
+            options.machine_global_retention
+        );
         let collected = dispatch_and_collect_child_attempt(
             &context,
             &mut outcome,
@@ -2968,6 +3008,10 @@ mod decomposition_tests {
         };
         assert_eq!(auditor_attempt, 1);
         assert!(prepared_auditor.auditor_artifacts.prompt_path.exists());
+        assert_eq!(
+            prepared_auditor.auditor_command.machine_global_retention,
+            options.machine_global_retention
+        );
         let auditor_collection = dispatch_and_collect_parent_auditor(
             &context,
             &mut outcome,
@@ -3023,6 +3067,206 @@ mod decomposition_tests {
         assert!(outcome.report.is_some());
         assert_eq!(outcome.command_records.len(), 2);
         assert!(!outcome.external_containment_failed);
+    }
+
+    #[test]
+    fn supervise_dispatch_refuses_a_missing_staging_cleanup_binding() {
+        let options = SupervisorRunOptions {
+            repo: PathBuf::from("/unused/repo"),
+            plan_file: PathBuf::from("/unused/plan.json"),
+            run_id: RunId::new("missing-machine-global-binding").expect("valid run id"),
+            codex_bin: PathBuf::from("unused-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: false,
+            machine_global_retention: None,
+        };
+        let command = ExternalAgentCommand::codex(
+            "unused-codex",
+            "/unused/worktree",
+            "/unused/prompt.md",
+            "/unused/events.jsonl",
+            "/unused/report.json",
+            Duration::from_secs(1),
+        );
+        let error = bind_supervisor_machine_global_staging_cleanup(command, &options)
+            .expect_err("supervise cleanup must not take the unbound bypass");
+        let rendered = error.to_string();
+        assert!(rendered.contains("--machine-global-config"));
+        assert!(rendered.contains("--machine-global-runtime-root-id"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervise_bound_staging_cleanup_refuses_active_claim_and_preserves_content() -> Result<()> {
+        let runtime_root = crate::process_runner::trusted_linux_runtime_root()?;
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("workspace");
+        let state_root = temp.path().join("machine-global-state");
+        let output_root = temp.path().join("output");
+        for path in [&workspace, &state_root, &output_root] {
+            fs::create_dir(path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+        Repository::init(&workspace)?;
+        for protected_root in [".maco", ".maco-cache", ".codex", ".agents"] {
+            fs::create_dir(workspace.join(protected_root))?;
+        }
+
+        let config = temp.path().join("machine-global.json");
+        fs::write(
+            &config,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "state_root": state_root,
+                "roots": [{
+                    "id": "runtime",
+                    "path": runtime_root,
+                    "protected_paths": [],
+                    "quarantine_grace_seconds": 60
+                }]
+            }))?,
+        )?;
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
+
+        let ready = temp.path().join("agent-ready");
+        let release = temp.path().join("agent-release");
+        let marker = format!("issue54-preserved-staging-{}", std::process::id());
+        let agent = workspace.join("staging-agent.sh");
+        fs::write(
+            &agent,
+            format!(
+                r#"#!/bin/sh
+set -eu
+report=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    report=$1
+  fi
+  shift
+done
+while IFS= read -r _line; do
+  :
+done
+printf '%s' '{marker}' > "$report"
+: > '{}'
+while [ ! -e '{}' ]; do
+  /run/current-system/sw/bin/sleep 0.01
+done
+"#,
+                ready.display(),
+                release.display()
+            ),
+        )?;
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+        let prompt = workspace.join("prompt.md");
+        fs::write(&prompt, "exercise supervise staging cleanup\n")?;
+
+        let options = SupervisorRunOptions {
+            repo: workspace.clone(),
+            plan_file: workspace.join("plan.json"),
+            run_id: RunId::new("active-claim-preserves-supervise-staging")?,
+            codex_bin: agent.clone(),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: false,
+            machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+                config: config.clone(),
+                root_id: "runtime".to_string(),
+                owner: "maco-supervise".to_string(),
+                correction_correlation_id: "active-claim-preserves-supervise-staging".to_string(),
+            }),
+        };
+        let command = bind_supervisor_machine_global_staging_cleanup(
+            ExternalAgentCommand::codex(
+                &agent,
+                &workspace,
+                &prompt,
+                output_root.join("events.jsonl"),
+                output_root.join("report.json"),
+                Duration::from_secs(10),
+            ),
+            &options,
+        )?;
+        assert_eq!(
+            command.machine_global_retention,
+            options.machine_global_retention
+        );
+
+        let worker =
+            std::thread::spawn(move || run_external_agent_nonpublishable_simulation(&command));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && !worker.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !ready.exists() {
+            fs::write(&release, b"release failed setup\n")?;
+            let report = worker
+                .join()
+                .unwrap_or_else(|_| panic!("staging agent thread panicked during setup"));
+            panic!("staging agent did not reach the claim rendezvous: {report:?}");
+        }
+
+        let staging_root = fs::read_dir(&runtime_root)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".maco-external-output-"))
+                    && fs::read(candidate.join("last-message.raw"))
+                        .is_ok_and(|contents| contents == marker.as_bytes())
+            })
+            .context("could not locate the supervised runtime staging directory")?;
+        let store = MachineGlobalStore::open_config(&config)?;
+        let coordinate = store.coordinate_for_existing_directory("runtime", &staging_root)?;
+        let claim = match store.claim(
+            "repair-agent",
+            "repairing-supervise-staging",
+            vec![coordinate.clone()],
+        )? {
+            GateOutcome::Allowed(claim) => claim,
+            GateOutcome::Denied(denial) => {
+                panic!("fixture repair claim was unexpectedly denied: {denial:?}")
+            }
+        };
+        fs::write(&release, b"release staged agent\n")?;
+        let report = worker
+            .join()
+            .unwrap_or_else(|_| panic!("staging agent thread panicked"));
+
+        assert!(report.machine_global_bypasses().is_empty());
+        assert_eq!(report.gate_denials().len(), 1, "{report:?}");
+        assert!(matches!(
+            &report.gate_denials()[0].reason,
+            GateDenialReason::DestructiveTarget { denial }
+                if matches!(
+                    denial.as_ref(),
+                    crate::gate_denial::DestructiveTargetDenial::ActiveClaimIntersection {
+                        target,
+                        active_claim
+                    } if target == &coordinate && active_claim == &coordinate
+                )
+        ));
+        assert!(
+            report
+                .error
+                .as_deref()
+                .is_some_and(|error| error
+                    .contains("machine-global gate denied private output-staging cleanup")),
+            "{report:?}"
+        );
+        assert_eq!(
+            fs::read(staging_root.join("last-message.raw"))?,
+            marker.as_bytes()
+        );
+        assert!(staging_root.exists());
+        assert!(store.status()?.retention_operations.is_empty());
+
+        assert!(store.release("repair-agent", claim.token)?);
+        fs::remove_file(staging_root.join("last-message.raw"))?;
+        fs::remove_dir(staging_root)?;
+        Ok(())
     }
 
     #[test]

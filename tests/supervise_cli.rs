@@ -33,6 +33,8 @@ use tempfile::TempDir;
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 const SUPERVISE_RUN_UNSUPPORTED: &str =
     "supervisor assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input";
+const UNUSED_MACHINE_GLOBAL_CONFIG: &str = "/tmp/maco-supervise-cli-test-machine-global.json";
+const UNUSED_MACHINE_GLOBAL_RUNTIME_ROOT_ID: &str = "runtime";
 
 #[test]
 fn field_guide_suggestion_public_contract_accepts_content_only_and_rejects_provenance() -> Result<()>
@@ -193,8 +195,9 @@ fn codex_runtime_custom_bin_fails_closed_and_cannot_mutate_primary() -> Result<(
     let plan_path = temp.path().join("codex-fail-closed.json");
     write_simple_plan(&plan_path, "codex-child")?;
 
-    let output = Command::new(&private_bin)
-        .args([
+    let output = command_with_test_machine_global_binding(
+        &private_bin,
+        &[
             "supervise",
             "run",
             path_str(&plan_path)?,
@@ -207,8 +210,9 @@ fn codex_runtime_custom_bin_fails_closed_and_cannot_mutate_primary() -> Result<(
             "--runtime",
             "codex",
             "--json",
-        ])
-        .output()?;
+        ],
+    )
+    .output()?;
     assert!(!output.status.success());
     if !output.stdout.is_empty() {
         let report: Value = serde_json::from_slice(&output.stdout)?;
@@ -1159,8 +1163,8 @@ fn supervise_primary_git_snapshots_ignore_ambient_repository_redirects() -> Resu
     let trace = temp.path().join("git-trace.log");
     let trace2 = temp.path().join("git-trace2.json");
     let redirected = temp.path().join("git-stderr.log");
-    let output = Command::new(BIN)
-        .args(["supervise", "run"])
+    let mut command = command_with_test_machine_global_binding(BIN, &["supervise", "run"]);
+    let output = command
         .arg(&plan_path)
         .arg("--repo")
         .arg(&repo_path)
@@ -1238,7 +1242,9 @@ fn copy_cargo_built_cli(root: &Path) -> Result<std::path::PathBuf> {
 }
 
 fn run_success_json(args: &[&str]) -> Result<Value> {
-    let output = Command::new(BIN).args(args).output().context("run maco")?;
+    let output = command_with_test_machine_global_binding(BIN, args)
+        .output()
+        .context("run maco")?;
     if !output.status.success() {
         anyhow::bail!(
             "maco command failed: stdout={} stderr={}",
@@ -1250,11 +1256,30 @@ fn run_success_json(args: &[&str]) -> Result<Value> {
 }
 
 fn run_failure_stderr(args: &[&str]) -> Result<String> {
-    let output = Command::new(BIN).args(args).output().context("run maco")?;
+    let output = command_with_test_machine_global_binding(BIN, args)
+        .output()
+        .context("run maco")?;
     if output.status.success() {
         anyhow::bail!("maco command unexpectedly succeeded");
     }
     Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+fn command_with_test_machine_global_binding(bin: impl AsRef<Path>, args: &[&str]) -> Command {
+    let mut command = Command::new(bin.as_ref());
+    command.args(args);
+    if args.first() == Some(&"supervise") && args.get(1) == Some(&"run") {
+        // These fixtures are expected to refuse before external staging exists, so the
+        // config need not be opened. Supplying both values keeps their tested refusal
+        // boundary behind the production all-or-none CLI contract.
+        command.args([
+            "--machine-global-config",
+            UNUSED_MACHINE_GLOBAL_CONFIG,
+            "--machine-global-runtime-root-id",
+            UNUSED_MACHINE_GLOBAL_RUNTIME_ROOT_ID,
+        ]);
+    }
+    command
 }
 
 fn create_committed_repo(root: &Path) -> Result<std::path::PathBuf> {

@@ -71,7 +71,9 @@ The current implementation covers a local-first command-line slice:
 - `maco supervise run` selects the Codex runtime by default, but verified
   writable child release currently fails closed before launch because the
   Codex 0.144.4 app-server protocol cannot force a blocking client callback for
-  every in-sandbox action. It still acquires the repository-cleanliness
+  every in-sandbox action. It requires `--machine-global-config` and
+  `--machine-global-runtime-root-id` so private runtime output-staging cleanup
+  cannot silently take the unbound deletion bypass. It still acquires the repository-cleanliness
   capability and creates capability-bound managed child worktrees before that
   safety gate. The in-process Fake file-entry simulation path returns
   `Unsupported`. `maco supervise plan/status/collect` remain available. The
@@ -791,6 +793,16 @@ the retention operation ID, while the purge token remains in a mode-0600 private
 receipt beside the JSON log. This is a launch-time obligation for that orchestrator
 path, not protection against commands launched outside it.
 
+`supervise run` requires the same `--machine-global-config` and
+`--machine-global-runtime-root-id` pair. Every child-orchestrator launch and every
+parent acceptance-auditor review-lens launch carries that binding to its private
+output-staging cleanup. Missing programmatic bindings fail before verified dispatch;
+the CLI rejects missing or partial pairs. Cleanup denials remain typed `GateDenial`
+values and preserve the staged directory. Nested workers and the child-side advisory
+auditor run inside the enclosing child session rather than as separate host
+`ExternalAgentCommand` launches, so the child-orchestrator staging gate covers that
+session's host output staging.
+
 `worktree gc` accepts `--machine-global-config`,
 `--machine-global-worktree-root-id`, and `--machine-global-correlation` as one
 all-or-none binding. A destructive run that discovers unregistered directories refuses
@@ -803,8 +815,10 @@ public retention operation ID only; it does not serialize the bearer purge token
 The audit was performed from mutation sinks outward, rather than from cleanup command
 names inward. It enumerated direct filesystem removal, descriptor-relative unlink,
 rename/replacement, truncating/open-for-write operations, the safe-state recursive
-removal and quarantine wrappers, Git worktree/reference mutation, and spawned command
-or systemd cleanup. Each production caller's target was then traced to one of:
+removal and quarantine wrappers, Git worktree/reference mutation, spawned command or
+systemd cleanup, explicit Rust `Drop` implementations, and dependency-owned RAII
+destructors such as `tempfile::TempDir`. Each production caller's target was then
+traced to one of:
 repository worktree, separate Git common directory, managed external worktree root,
 private runtime/temp root, user-selected output root, or machine-global state/config
 root. Finally, CLI path-bearing arguments and generic child-process destinations were
@@ -818,8 +832,9 @@ The current cleanup/retention audit is:
 | Unregistered direct-child directories found by `worktree gc` | Routed | These may be nonempty arbitrary external directories and therefore match the destructive incident shape; treating routing as optional would be unjustified. GC requires an explicit reviewed binding when such targets exist, preflights the complete orphan set, quarantines allowed targets, and reports a typed denial plus logical actor `maco-worktree-gc` when refused. |
 | Pre-worktree final reservation and staging setup rollback/recovery/finalization | Known transactional bypass, attributed | These paths exist before the child is a repository worktree, but they are not adopted retention targets: MACO creates the exclusive reservation and authenticated create intent, binds the exact inode, removes only a still-empty reservation/staging root, and preserves changed, nonempty, or unbound paths for manual recovery. Final replacement accepts only the verified clean staged worktree. Routing these transaction-internal names into retention quarantine would break the idempotent create protocol rather than protect pre-existing data. While retained, the authenticated operation records agent, phase, root/path identity, and branch; each direct mutation also emits its fixed operation label with `process_attribution=not_process_observable`. |
 | Machine-global state-root lock/state/temp maintenance | Known infrastructure bypass | The state root is deliberately disjoint from declared data roots: the gate must lock and replace its own bounded authenticated state before it can evaluate a claim, so recursively gating that state is ill-founded. State writes and temp cleanup are identity-bound, bounded, and lock-fenced. The fixed private state root and filenames identify the machine-global subsystem, but successful bootstrap/temp cleanup is not durably process-observable. Retention purge is not included in this bypass: it rechecks the gate and retains its owner, operation ID, coordinates, identities, and final `purged` phase. |
-| External-agent output staging used by `merge arbitrate` | Routed | The exact existing staging directory is resolved beneath the explicitly declared root ID and revalidated. Refusals use `GateDenial`; allowed operations use the existing retention record. |
-| External-agent output staging used without a machine-global binding | Known bypass, attributed | Completed cleanup records `actor=maco-external-agent`, `operation=delete_private_output_staging`, the reason, and `process_attribution=not_process_observable` in the serialized run; early `Drop` cleanup emits the same actor/operation marker before deletion. This identifies the cooperative bypass without claiming process-level observation. |
+| External-agent output staging used by `merge arbitrate` or `supervise run` | Routed | The exact existing staging directory is resolved beneath the explicitly declared root ID and revalidated. Supervise applies the binding to child-orchestrator and parent review-lens auditor launches; review-lens temporary Git workspaces therefore reach this same runtime-staging cleanup path. Refusals use `GateDenial`; allowed operations use the existing retention record. |
+| Parent review-lens isolated Git workspaces under `/tmp/maco-review-lens-*` | Known process-owned ephemeral bypass | `tempfile` creates an unpredictable, exclusively owned directory for one lens; no operator, sibling agent, or caller supplies or adopts its path. `TempDir::drop` recursively removes that leaf, so this is a distinct deletion from the routed `/run/user/<uid>` output staging. Its hazard is materially weaker than shared staging, while routing it through the runtime-root binding would misrepresent an independently created `/tmp` leaf as part of that reviewed root. The supervisor run and lens identity provide logical context while their artifacts remain, but successful `Drop` cleanup is not durably process-observable. Any change that accepts a caller path or permits adoption must route the cleanup instead of relying on this exception. |
+| External-agent output staging used without a machine-global binding by other entrypoints | Known bypass, attributed | `supervise run` and `merge arbitrate` do not take this path. For callers that genuinely lack a reviewed binding, completed cleanup records `actor=maco-external-agent`, `operation=delete_private_output_staging`, the reason, and `process_attribution=not_process_observable` in the serialized run; early `Drop` cleanup emits the same actor/operation marker before deletion. This identifies the cooperative bypass without claiming process-level observation. |
 | External-agent staging setup rollback | Known empty-directory bypass, attributed | If exclusive output reservation fails, setup emits `actor=maco-external-agent`, `operation=delete_empty_output_staging_setup_rollback`, and `process_attribution=not_process_observable` before removing only the newly created, still-empty staging directory. No external data was accepted into that directory. |
 | Bounded worktree-status crash scavenging under `/tmp/maco-worktree-status-<uid>` | Known bypass | It removes only identity-bound, bounded files from MACO's per-user status root, but no reviewed root configuration is available at that call site. The call site and per-user root identify the subsystem; the deleting process is not durably observed. |
 | Merge private-runtime orphan scavenging and close cleanup under `/run/user/<uid>` or `/tmp/maco-runtime-<uid>` | Known bypass | Runtime teardown and orphan recovery must also work before a repository/configuration is available. Owner records carry PID, process start time, boot ID, and runtime kind while present, but successful deletion removes those records; this is not durable deletion attribution. |
@@ -2083,9 +2098,15 @@ cargo run -- supervise plan --from-goal goal.md --repo . --json
 # Preserve the positional form for either plain-text tasks or authored JSON plans:
 cargo run -- supervise plan supervisor-plan.json --repo . --json
 # Selects the default Codex runtime; writable child release currently fails closed:
-cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-demo --codex-bin codex --json
+cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-demo \
+  --codex-bin codex \
+  --machine-global-config /exact/path/to/machine-global.json \
+  --machine-global-runtime-root-id runtime --json
 # Explicit serial opt-out:
-cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-serial --codex-bin codex --max-concurrent-children 1 --json
+cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-serial \
+  --codex-bin codex --max-concurrent-children 1 \
+  --machine-global-config /exact/path/to/machine-global.json \
+  --machine-global-runtime-root-id runtime --json
 cargo run -- supervise status supervise-demo --repo . --json
 cargo run -- supervise collect supervise-demo --repo . --json
 cargo run -- supervise artifacts latest --repo . --json

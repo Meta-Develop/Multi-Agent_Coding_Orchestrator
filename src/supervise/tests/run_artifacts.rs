@@ -212,6 +212,8 @@ fn supervise_status_distinguishes_absent_active_finalized_and_corrupt_runs() {
 #[cfg(target_os = "linux")]
 #[test]
 fn verified_run_entry_creates_and_materializes_assignment_worktree() {
+    use std::os::unix::fs::PermissionsExt;
+
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(false);
     let plan = injected_plan(assignment.clone(), 0);
@@ -221,6 +223,36 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
         "verified-capability-assignment-create",
     );
     options.allow_dirty_primary = false;
+    let runtime_root = crate::process_runner::trusted_linux_runtime_root()
+        .expect("resolve trusted runtime root for bound staging cleanup");
+    let machine_global_state = temp.path().join("machine-global-state");
+    fs::create_dir(&machine_global_state).expect("create machine-global test state");
+    fs::set_permissions(&machine_global_state, fs::Permissions::from_mode(0o700))
+        .expect("secure machine-global test state");
+    let machine_global_config = temp.path().join("machine-global.json");
+    fs::write(
+        &machine_global_config,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "state_root": machine_global_state,
+            "roots": [{
+                "id": "runtime",
+                "path": runtime_root,
+                "protected_paths": [],
+                "quarantine_grace_seconds": 60
+            }]
+        }))
+        .expect("serialize machine-global test config"),
+    )
+    .expect("write machine-global test config");
+    fs::set_permissions(&machine_global_config, fs::Permissions::from_mode(0o600))
+        .expect("secure machine-global test config");
+    options.machine_global_retention = Some(crate::machine_global::MachineGlobalRetentionBinding {
+        config: machine_global_config,
+        root_id: "runtime".to_string(),
+        owner: "maco-supervise".to_string(),
+        correction_correlation_id: options.run_id.as_str().to_string(),
+    });
     fs::write(
         &options.plan_file,
         serde_json::to_vec(&plan).expect("serialize verified supervisor plan"),
@@ -1046,6 +1078,12 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         codex_bin: PathBuf::from("unused-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+            config: temp.path().join("unused-machine-global.json"),
+            root_id: "runtime".to_string(),
+            owner: "maco-supervise".to_string(),
+            correction_correlation_id: "unverified-containment-stops-followups".to_string(),
+        }),
     };
 
     let child_report = |id: &str| OrchestratorReviewReport {

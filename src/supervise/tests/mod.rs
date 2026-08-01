@@ -466,6 +466,17 @@ fn write_injected_usage(command: &ExternalAgentCommand, input_tokens: usize, out
         .expect("write injected Codex usage");
 }
 
+fn injected_machine_global_retention(
+    root: &Path,
+) -> crate::machine_global::MachineGlobalRetentionBinding {
+    crate::machine_global::MachineGlobalRetentionBinding {
+        config: root.join("unused-machine-global.json"),
+        root_id: "runtime".to_string(),
+        owner: "maco-supervise-test".to_string(),
+        correction_correlation_id: "injected-supervise-test".to_string(),
+    }
+}
+
 fn injected_options(repo: &Path, root: &Path, run_id: &str) -> SupervisorRunOptions {
     SupervisorRunOptions {
         repo: repo.to_path_buf(),
@@ -474,6 +485,7 @@ fn injected_options(repo: &Path, root: &Path, run_id: &str) -> SupervisorRunOpti
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
+        machine_global_retention: Some(injected_machine_global_retention(root)),
     }
 }
 
