@@ -5514,7 +5514,23 @@ impl PublicationGitContext {
         worktree_path: &Path,
         remote_url: &str,
         operation: PublicationGitOperation,
+        value_for: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self> {
+        Self::create_with_token_source_and_runtime_observer(
+            worktree_path,
+            remote_url,
+            operation,
+            value_for,
+            |_| {},
+        )
+    }
+
+    fn create_with_token_source_and_runtime_observer(
+        worktree_path: &Path,
+        remote_url: &str,
+        operation: PublicationGitOperation,
         mut value_for: impl FnMut(&str) -> Option<String>,
+        mut observe_runtime: impl FnMut(&Path),
     ) -> Result<Self> {
         let transport = publication_remote_transport(remote_url)?;
         let repo = Repository::open(worktree_path).with_context(|| {
@@ -5528,6 +5544,9 @@ impl PublicationGitContext {
             merge::PrivateRuntimeKind::PublicationGit,
         )?;
         let directory = runtime_directory.path().to_path_buf();
+        // Production supplies a no-op observer. Tests can bind cleanup assertions to this exact
+        // allocation instead of sampling the host-global runtime root while peers use it.
+        observe_runtime(&directory);
         let result = (|| -> Result<PublicationGitContextSetup> {
             let objects = directory.join("objects");
             merge::create_private_directory(&objects)?;
@@ -8766,7 +8785,22 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use crate::worktree::{WorktreeCreateOptions, WorktreeRecord};
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::{
+        sync::{mpsc, Arc, Mutex},
+        time::Duration,
+    };
+
+    // Lifecycle ordering is asserted by the channel event, not by elapsed time. This generous
+    // bound is only a suite liveness fuse above the longest 120-second local snapshot command;
+    // expiry means the expected event was never published, not that scheduling was milliseconds
+    // late.
+    const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(180);
+
+    fn recv_test_event<T>(receiver: &mpsc::Receiver<T>, context: &str) -> T {
+        receiver
+            .recv_timeout(TEST_EVENT_TIMEOUT)
+            .unwrap_or_else(|error| panic!("{context} within the test liveness bound: {error}"))
+    }
 
     #[cfg(unix)]
     #[test]
@@ -8868,7 +8902,7 @@ mod tests {
                 started
                     .send(())
                     .expect("signal blocked provider invocation");
-                release.recv().expect("release blocked provider invocation");
+                recv_test_event(&release, "release blocked provider invocation");
             }
             if self.response_loss {
                 bail!("injected provider response loss");
@@ -9267,18 +9301,23 @@ mod tests {
         first_provider.block_invoke = Some((started_tx, release_rx));
         let first_repo = repo.path().to_path_buf();
         let first_request = request.clone();
-        let first = std::thread::spawn(move || {
-            execute_external_effect_exactly_once(&first_repo, first_request, &mut first_provider)
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let _first = std::thread::spawn(move || {
+            let result = execute_external_effect_exactly_once(
+                &first_repo,
+                first_request,
+                &mut first_provider,
+            );
+            let _ = completed_tx.send(result);
         });
-        started_rx
-            .recv()
-            .expect("first provider reached invocation");
+        recv_test_event(&started_rx, "first provider reached invocation");
         let mut contender = FakeExternalProvider::new(remote.clone());
         assert!(
             execute_external_effect_exactly_once(repo.path(), request, &mut contender).is_err()
         );
         release_tx.send(()).expect("release first provider");
-        first.join().expect("first thread").expect("first effect");
+        recv_test_event(&completed_rx, "first provider completed after release")
+            .expect("first effect");
         assert_eq!(remote.lock().expect("remote").invoke_calls, 1);
     }
 
@@ -9981,13 +10020,13 @@ mod tests {
                     event_tx
                         .send(PreparationEvent::LocksHeld)
                         .expect("signal held preparation locks");
-                    release_rx.recv().expect("release preparation locks");
+                    recv_test_event(&release_rx, "release preparation locks");
                 },
             );
             let _ = event_tx.send(PreparationEvent::Completed(Box::new(result)));
         });
 
-        match event_rx.recv().expect("observe preparation lifecycle") {
+        match recv_test_event(&event_rx, "observe preparation lifecycle") {
             PreparationEvent::LocksHeld => {}
             PreparationEvent::Completed(result) => {
                 panic!("preparation completed before the strict pre-publication lock point: {result:?}")
@@ -10013,7 +10052,7 @@ mod tests {
         drop(unrelated);
 
         release_tx.send(()).expect("release preparation");
-        match event_rx.recv().expect("observe preparation completion") {
+        match recv_test_event(&event_rx, "observe preparation completion") {
             PreparationEvent::Completed(result) => {
                 (*result).expect("complete preparation");
             }
@@ -10080,13 +10119,13 @@ mod tests {
                     event_tx
                         .send(PublicationEvent::LocksHeld)
                         .expect("signal held publication locks");
-                    release_rx.recv().expect("release publication");
+                    recv_test_event(&release_rx, "release publication");
                 },
             );
             let _ = event_tx.send(PublicationEvent::Completed(Box::new(result)));
         });
 
-        match event_rx.recv().expect("observe publication lifecycle") {
+        match recv_test_event(&event_rx, "observe publication lifecycle") {
             PublicationEvent::LocksHeld => {}
             PublicationEvent::Completed(result) => {
                 panic!("publication completed before its lifecycle lock point: {result:?}")
@@ -10116,7 +10155,7 @@ mod tests {
         drop(unrelated);
 
         release_tx.send(()).expect("release publication lifecycle");
-        let report = match event_rx.recv().expect("observe publication completion") {
+        let report = match recv_test_event(&event_rx, "observe publication completion") {
             PublicationEvent::Completed(result) => (*result).expect("complete fake publication"),
             PublicationEvent::LocksHeld => panic!("publication published its lock point twice"),
         };
@@ -11350,26 +11389,22 @@ mod tests {
         let repo_path = temp.path().join("repo");
         let repo = Repository::init(&repo_path).expect("init repo");
         merge::ensure_repo_common_state_directory(&repo).expect("state");
-        let runtime_root = merge::trusted_runtime_root(&repo_path).expect("runtime root");
-        let before = fs::read_dir(&runtime_root)
-            .expect("runtime root")
-            .map(|entry| entry.expect("runtime entry").file_name())
-            .collect::<BTreeSet<_>>();
-        assert!(PublicationGitContext::create_with_token_source(
-            &repo_path,
-            "https://github.example/owner/repo.git",
-            test_observe_operation(),
-            |key| (key == "GH_HOST").then(|| "github.example".to_string()),
-        )
-        .is_err());
-        let after = fs::read_dir(&runtime_root)
-            .expect("runtime root after failure")
-            .map(|entry| entry.expect("runtime entry after failure").file_name())
-            .collect::<BTreeSet<_>>();
+        let mut allocated_runtime = None;
         assert!(
-            after.is_subset(&before),
-            "failed setup left a new private runtime entry: {:?}",
-            after.difference(&before).collect::<Vec<_>>()
+            PublicationGitContext::create_with_token_source_and_runtime_observer(
+                &repo_path,
+                "https://github.example/owner/repo.git",
+                test_observe_operation(),
+                |key| (key == "GH_HOST").then(|| "github.example".to_string()),
+                |path| allocated_runtime = Some(path.to_path_buf()),
+            )
+            .is_err()
+        );
+        let allocated_runtime = allocated_runtime.expect("observe allocated publication runtime");
+        assert!(
+            !allocated_runtime.exists(),
+            "failed setup left its exact private runtime entry: {}",
+            allocated_runtime.display()
         );
     }
 

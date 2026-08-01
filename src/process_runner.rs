@@ -1963,7 +1963,14 @@ fn run_process_cancellable_with_interaction(
             };
         }
 
-        if status.is_none() && cancellation.is_cancelled() {
+        let loop_decision = process_loop_decision(
+            status.is_some(),
+            cancellation.is_cancelled(),
+            operation_deadline,
+            Instant::now(),
+        );
+
+        if loop_decision == ProcessLoopDecision::Cancel {
             let cleanup =
                 process_tree.cleanup(&mut child, false, &spec.label, "cancellation termination");
             process_tree_evidence = cleanup.process_tree;
@@ -2021,7 +2028,7 @@ fn run_process_cancellable_with_interaction(
             break;
         }
 
-        if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if loop_decision == ProcessLoopDecision::Timeout {
             timed_out = true;
             let cleanup = process_tree.cleanup(
                 &mut child,
@@ -2079,7 +2086,7 @@ fn run_process_cancellable_with_interaction(
             break;
         }
 
-        if status.is_some() {
+        if loop_decision == ProcessLoopDecision::Complete {
             let cleanup = process_tree.cleanup(
                 &mut child,
                 true,
@@ -2122,6 +2129,33 @@ fn run_process_cancellable_with_interaction(
         process_error,
         stdin_error,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessLoopDecision {
+    Cancel,
+    Timeout,
+    Complete,
+    Continue,
+}
+
+fn process_loop_decision(
+    status_observed: bool,
+    cancelled: bool,
+    operation_deadline: Option<Instant>,
+    observed_at: Instant,
+) -> ProcessLoopDecision {
+    if !status_observed && cancelled {
+        ProcessLoopDecision::Cancel
+    } else if operation_deadline.is_some_and(|deadline| observed_at >= deadline) {
+        // The deadline governs when completion is observed, not when the child happened to exit.
+        // Keep this check ahead of `Complete` so a late first observation remains a timeout.
+        ProcessLoopDecision::Timeout
+    } else if status_observed {
+        ProcessLoopDecision::Complete
+    } else {
+        ProcessLoopDecision::Continue
+    }
 }
 
 impl ProcessRunError {
@@ -7669,7 +7703,7 @@ impl SystemdUnit {
                         ),
                     ));
                 }
-                Some(false) => thread::sleep(IO_CANCEL_POLL_INTERVAL),
+                Some(false) => wait_for_lifecycle_progress(IO_CANCEL_POLL_INTERVAL),
                 Some(true) if Instant::now() >= deadline => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
@@ -7679,7 +7713,7 @@ impl SystemdUnit {
                         ),
                     ));
                 }
-                Some(true) => thread::sleep(IO_CANCEL_POLL_INTERVAL),
+                Some(true) => wait_for_lifecycle_progress(IO_CANCEL_POLL_INTERVAL),
             }
         }
     }
@@ -8393,7 +8427,17 @@ fn terminate_unix_process_group(
     child_already_exited: bool,
     label: &str,
 ) -> Option<String> {
-    terminate_unix_process_group_with_wait(child, child_already_exited, label, thread::sleep)
+    terminate_unix_process_group_with_wait(
+        child,
+        child_already_exited,
+        label,
+        wait_for_lifecycle_progress,
+    )
+}
+
+#[cfg(unix)]
+fn wait_for_lifecycle_progress(duration: Duration) {
+    thread::sleep(duration);
 }
 
 #[cfg(unix)]
@@ -9807,6 +9851,38 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn assert_process_gone(pid: &str, context: &str) {
+        let pid = pid
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap_or_else(|error| panic!("parse {context} pid: {error}"));
+        // Reaping is the behavior under test, so this remains a real-time liveness fuse. Thirty
+        // seconds is deliberately much wider than the three-second operation contract below;
+        // expiry means the PID remained allocated, not that ordinary cleanup was slightly late.
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(30))
+            .expect("representable process-reaping deadline");
+        loop {
+            // SAFETY: signal 0 probes whether the captured PID still exists without delivering a
+            // signal. A zombie must continue to return success here and therefore cannot pass.
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(libc::ESRCH),
+                    "probe {context} existence: {error}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{context} PID still existed after the process-reaping liveness margin"
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn nonpublishable_trusted_compatibility_interactive_session_round_trips() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -9994,6 +10070,10 @@ mod tests {
         )
         .expect("acquire reserved expedited test containment permit");
 
+        // Real deadline handling is the subject here: all real permit files are held, so the
+        // overflow acquire must remain blocked until its caller-supplied deadline. The assertion
+        // does not compare elapsed wall time; failure means acquisition escaped the fixed slot set
+        // or did not return the required TimedOut result after the deadline became observable.
         let overflow_result = SystemdUnitPermit::acquire(
             runtime_root.path(),
             Some(Instant::now() + Duration::from_secs(2)),
@@ -11507,14 +11587,13 @@ mod tests {
             )
         });
 
-        let ready_deadline = Instant::now() + Duration::from_secs(2);
-        while !ready.exists() {
-            assert!(
-                Instant::now() < ready_deadline,
-                "child did not reach ready gate"
-            );
+        while !ready.exists() && !worker.is_finished() {
             thread::sleep(POLL_INTERVAL);
         }
+        assert!(
+            ready.exists(),
+            "process runner completed before the child reached its ready gate"
+        );
         cancellation.cancel();
         let output = worker
             .join()
@@ -11535,25 +11614,32 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn completion_first_observed_after_deadline_is_a_timeout() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let spec = ProcessSpec::shell(
-            "deadline-racing command",
-            Shell::UnixSh,
-            "sleep 0.06",
-            temp.path(),
-            128,
-        )
-        .with_containment(ContainmentPolicy::TrustedBestEffort)
-        .with_timeout(Some(Duration::from_millis(50)));
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(Duration::from_millis(50))
+            .expect("representable deadline");
+        let before_deadline = started
+            .checked_add(Duration::from_millis(40))
+            .expect("representable early observation");
+        let after_deadline = started
+            .checked_add(Duration::from_millis(60))
+            .expect("representable late observation");
 
-        let output = run_process(spec).expect("run deadline-racing command");
-
-        assert!(output.timed_out);
+        assert_eq!(
+            process_loop_decision(true, false, Some(deadline), before_deadline),
+            ProcessLoopDecision::Complete
+        );
+        assert_eq!(
+            process_loop_decision(true, false, Some(deadline), after_deadline),
+            ProcessLoopDecision::Timeout
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn normal_exit_terminates_descendants_holding_pipes() {
+        const WHOLE_CALL_BOUND: Duration = Duration::from_secs(3);
+
         let temp = tempfile::tempdir().expect("tempdir");
         let descendant_pid = temp.path().join("descendant.pid");
         let command = format!(
@@ -11570,7 +11656,25 @@ mod tests {
         .with_containment(ContainmentPolicy::TrustedBestEffort)
         .with_timeout(Some(Duration::from_secs(2)));
 
-        let output = run_process(spec).expect("run descendant-spawning command");
+        let (completion_tx, completion_rx) = mpsc::channel();
+        // Start before `thread::spawn`: worker creation and scheduling are part of the whole call.
+        let whole_call_started = Instant::now();
+        let _worker = thread::spawn(move || {
+            let _ = completion_tx.send(run_process(spec));
+        });
+        // Prompt whole-call completion is the contract here. The event is emitted only after
+        // `run_process` has completed process-tree cleanup, pipe finalization, and its internal
+        // joins. Three seconds preserves the original bound; expiry means lifecycle completion
+        // itself stopped being prompt. There is no unbounded JoinHandle wait on this path.
+        let completion = completion_rx
+            .recv_timeout(WHOLE_CALL_BOUND.saturating_sub(whole_call_started.elapsed()))
+            .expect("descendant pipe lifecycle completed within its three-second contract");
+        let whole_call_elapsed = whole_call_started.elapsed();
+        assert!(
+            whole_call_elapsed < WHOLE_CALL_BOUND,
+            "descendant pipe lifecycle exceeded its whole-call three-second contract: {whole_call_elapsed:?}"
+        );
+        let output = completion.expect("run descendant-spawning command");
 
         assert!(!output.timed_out);
         assert!(output.status.is_some_and(|status| status.success()));
@@ -11586,7 +11690,7 @@ mod tests {
             .text
             .contains("descendant-error"));
         let pid = std::fs::read_to_string(descendant_pid).expect("descendant pid");
-        assert_process_not_executable(&pid, "output-pipe descendant");
+        assert_process_gone(&pid, "output-pipe descendant");
     }
 
     #[cfg(unix)]
@@ -11814,8 +11918,9 @@ mod tests {
             }));
         }
 
-        let ready_deadline = Instant::now() + Duration::from_secs(5);
-        while !ready_paths.iter().all(|path| path.exists()) && Instant::now() < ready_deadline {
+        while !ready_paths.iter().all(|path| path.exists())
+            && workers.iter().any(|worker| !worker.is_finished())
+        {
             thread::sleep(POLL_INTERVAL);
         }
         cancellation.cancel();
@@ -11911,6 +12016,7 @@ mod tests {
         }
         let temp = tempfile::tempdir().expect("tempdir");
         let marker = temp.path().join("sibling-unit-ran");
+        let release = temp.path().join("release-sibling-unit");
         let unit = format!(
             "maco-escape-test-{}-{}",
             std::process::id(),
@@ -11931,10 +12037,11 @@ mod tests {
         )
         .expect("trusted shell");
         let command = format!(
-            r#"'{}' --user --quiet --collect --unit '{}' -- '{}' -c "sleep 0.2; touch '{}'"#,
+            r#"'{}' --user --quiet --collect --unit '{}' -- '{}' -c "while [ ! -e '{}' ]; do sleep 0.01; done; touch '{}'"#,
             systemd_run.display(),
             unit,
             shell.display(),
+            release.display(),
             marker.display()
         );
         let output = run_process(
@@ -11952,8 +12059,6 @@ mod tests {
         assert!(!output.status.is_some_and(|status| status.success()));
         assert!(output.process_tree.is_verified_empty());
         assert!(output.side_effects.is_verified());
-        thread::sleep(Duration::from_millis(400));
-        assert!(!marker.exists());
 
         let systemctl = trusted_system_executable(
             "systemctl",
@@ -11964,11 +12069,19 @@ mod tests {
             ],
         )
         .expect("trusted systemctl");
-        let status = Command::new(systemctl)
+        let status = Command::new(&systemctl)
             .args(["--user", "--quiet", "is-active", &unit])
             .status()
             .expect("query sibling unit");
+        if status.success() {
+            let _ = Command::new(&systemctl)
+                .args(["--user", "stop", &unit])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         assert!(!status.success(), "sibling transient unit survived");
+        assert!(!marker.exists(), "sibling transient unit mutated the host");
     }
 
     #[cfg(target_os = "linux")]
@@ -12086,9 +12199,11 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
         let temp = tempfile::tempdir().expect("tempdir");
         let marker = temp.path().join("escaped-delayed-mutation");
         let pid_file = temp.path().join("escaped-delayed.pid");
+        let release = temp.path().join("release-escaped-delayed");
         let command = format!(
-            "setsid sh -c 'echo $$ > \"{}\"; sleep 0.3; touch \"{}\"' >/dev/null 2>&1 & i=0; while [ ! -s \"{}\" ] && [ \"$i\" -lt 100 ]; do sleep 0.01; i=$((i + 1)); done",
+            "setsid sh -c 'echo $$ > \"{}\"; while [ ! -e \"{}\" ]; do sleep 0.01; done; touch \"{}\"' >/dev/null 2>&1 & i=0; while [ ! -s \"{}\" ] && [ \"$i\" -lt 100 ]; do sleep 0.01; i=$((i + 1)); done",
             pid_file.display(),
+            release.display(),
             marker.display(),
             pid_file.display()
         );
@@ -12106,7 +12221,19 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
 
         assert!(output.status.is_some_and(|status| status.success()));
         assert!(output.process_tree.is_verified_empty());
-        thread::sleep(Duration::from_millis(400));
+        let escaped_pid = fs::read_to_string(&pid_file)
+            .expect("escaped delayed process pid")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("numeric escaped delayed process pid");
+        // SAFETY: signal 0 probes existence without delivering a signal.
+        assert_eq!(unsafe { libc::kill(escaped_pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "escaped delayed descendant survived return"
+        );
+        fs::write(release, b"release").expect("release any surviving delayed descendant");
         assert!(!marker.exists());
     }
 
@@ -12910,6 +13037,9 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
     #[cfg(unix)]
     #[test]
     fn required_containment_kills_setsid_pipe_and_stdin_holders() {
+        const READINESS_FUSE: Duration = Duration::from_secs(10);
+        const POST_RELEASE_BOUND: Duration = Duration::from_secs(2);
+
         if !strict_backend_available_for_tests() {
             return;
         }
@@ -12936,13 +13066,20 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
         // Allow shared systemd-slot and setup contention to settle before the target publishes
         // readiness; the post-ready cleanup remains independently bounded below.
         .with_timeout(Some(Duration::from_secs(10)));
-        let output = thread::scope(|scope| {
-            let worker = scope.spawn(move || run_process(spec));
-            let ready_deadline = Instant::now() + Duration::from_secs(10);
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = completion_tx.send(run_process(spec));
+        });
+        let output = {
+            // This fuse is independent of the process timeout and post-release bound. Expiry
+            // means the strict target made no observable readiness progress for ten seconds.
+            let readiness_deadline = Instant::now()
+                .checked_add(READINESS_FUSE)
+                .expect("representable strict readiness deadline");
             while !target_ready_path.exists() && !worker.is_finished() {
                 assert!(
-                    Instant::now() < ready_deadline,
-                    "escaped pipe holder did not publish readiness"
+                    Instant::now() < readiness_deadline,
+                    "escaped pipe holder did not publish readiness within ten seconds"
                 );
                 thread::sleep(POLL_INTERVAL);
             }
@@ -12953,13 +13090,25 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
 
             // Shared systemd-slot and setup contention is not kill latency. Release the main
             // shell only after its escaped stdin/pipe holder is ready, then keep the safety bound
-            // focused on finalization proving the complete contained tree empty.
+            // focused on finalization proving the complete contained tree empty. The completion
+            // event is emitted after the complete `run_process` call, including its blocking
+            // containment commands and internal I/O joins. Two seconds preserves the original
+            // post-release contract; expiry means cleanup itself stopped being prompt. Avoiding a
+            // JoinHandle wait ensures a regression fails this test instead of hanging the suite.
+            let release_started = Instant::now();
             fs::write(&release_target_path, b"release").expect("release escaped pipe holder");
-            worker
-                .join()
-                .expect("escaped pipe holder worker")
-                .expect("run escaped pipe holder")
-        });
+            let completion = completion_rx
+                .recv_timeout(POST_RELEASE_BOUND.saturating_sub(release_started.elapsed()))
+                .expect(
+                    "escaped pipe holder completed within its two-second post-release contract",
+                );
+            let post_release_elapsed = release_started.elapsed();
+            assert!(
+                post_release_elapsed < POST_RELEASE_BOUND,
+                "escaped pipe holder exceeded its whole post-release two-second contract: {post_release_elapsed:?}"
+            );
+            completion.expect("run escaped pipe holder")
+        };
 
         let escaped_pid = std::fs::read_to_string(&escaped_pid_path)
             .expect("escaped process pid")
@@ -13608,7 +13757,10 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
             .expect("release evidence child");
         let (input_writer, mut output_drainers) =
             prepared.start("evidence child", StdinMode::Null, 1024, 1024, None, None);
-        let deadline = Instant::now() + Duration::from_secs(1);
+        // Real pipe-reader delivery is part of this integration test. Sixty seconds is a harness
+        // fuse for two tiny writes; expiry means the owned reader threads made no observable
+        // progress, not that a loaded host scheduled them a few milliseconds late.
+        let deadline = Instant::now() + Duration::from_secs(60);
         while output_drainers.stdout.capture.bytes.is_empty()
             || output_drainers.stderr.capture.bytes.is_empty()
         {
@@ -13741,7 +13893,6 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
 
         let registry = AgentRegistry::open(temp.path()).expect("agent registry");
         let runner = thread::spawn(move || run_process(spec));
-        let deadline = Instant::now() + Duration::from_secs(60);
         let registered = loop {
             let processes = registry
                 .list(&crate::agent_lifecycle::AgentListFilter::default())
@@ -13750,8 +13901,8 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
                 break process.clone();
             }
             assert!(
-                Instant::now() < deadline,
-                "process runner did not register its agent lifecycle identity"
+                !runner.is_finished(),
+                "process runner completed before registering its agent lifecycle identity"
             );
             thread::sleep(Duration::from_millis(10));
         };
@@ -13759,8 +13910,11 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
         assert_eq!(registered.task_id, "runner-task");
         assert_eq!(registered.argv.last().map(String::as_str), Some("60"));
 
+        // This is the one real signal-delivery deadline in the test. Thirty seconds is a liveness
+        // margin for stopping one local sleep process; expiry means lifecycle termination made no
+        // progress, not that registration ordering was scheduled a few milliseconds late.
         let stopped = registry
-            .stop_selector("runner-task", Duration::from_secs(1))
+            .stop_selector("runner-task", Duration::from_secs(30))
             .expect("stop lifecycle process");
         assert_eq!(stopped.stopped.len(), 1);
         let output = runner
