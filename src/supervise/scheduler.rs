@@ -1234,13 +1234,15 @@ fn prepare_supervisor_run(
     )?;
     let checkpoint_writer = SupervisorCheckpointWriter::create(
         &repo,
-        &options.run_id,
-        &primary_base,
-        normalized_plan_sha256,
-        max_concurrent_children,
-        &plan,
-        artifact_writer.resume_binding()?,
-        budget_ledger.report()?,
+        SupervisorCheckpointPreparation::new(
+            &options.run_id,
+            &primary_base,
+            normalized_plan_sha256,
+            max_concurrent_children,
+            &plan,
+            artifact_writer.resume_binding()?,
+            budget_ledger.report()?,
+        ),
     )?;
     let run_dir = artifact_writer.run_dir().to_path_buf();
     let dirs = RunDirs::for_writer(&artifact_writer);
@@ -2411,21 +2413,23 @@ mod decomposition_tests {
         );
         let mut checkpoint = SupervisorCheckpointWriter::create(
             &repo,
-            &run_id,
-            &current_head_oid(&repo).expect("checkpoint primary base"),
-            normalized_supervisor_plan_sha256(
+            SupervisorCheckpointPreparation::new(
+                &run_id,
+                &current_head_oid(&repo).expect("checkpoint primary base"),
+                normalized_supervisor_plan_sha256(
+                    &plan,
+                    &consultant,
+                    &assignment_metadata,
+                    &plan_metadata,
+                )
+                .expect("checkpoint normalized plan binding"),
+                1,
                 &plan,
-                &consultant,
-                &assignment_metadata,
-                &plan_metadata,
-            )
-            .expect("checkpoint normalized plan binding"),
-            1,
-            &plan,
-            writer
-                .resume_binding()
-                .expect("checkpoint artifact binding"),
-            budget_ledger.report().expect("checkpoint initial budget"),
+                writer
+                    .resume_binding()
+                    .expect("checkpoint artifact binding"),
+                budget_ledger.report().expect("checkpoint initial budget"),
+            ),
         )
         .expect("create supervise checkpoint");
         checkpoint

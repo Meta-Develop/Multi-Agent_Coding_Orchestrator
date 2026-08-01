@@ -235,17 +235,52 @@ pub(super) struct SupervisorCheckpointWriter {
     assignment_states: BTreeMap<String, AssignmentResumeState>,
 }
 
+pub(super) struct SupervisorCheckpointPreparation<'a> {
+    run_id: &'a RunId,
+    primary_base: &'a Oid,
+    normalized_plan_sha256: String,
+    max_concurrent_children: usize,
+    plan: &'a SupervisorPlan,
+    artifact: ArtifactRunResumeBinding,
+    budget: RunBudgetReport,
+}
+
+impl<'a> SupervisorCheckpointPreparation<'a> {
+    pub(super) fn new(
+        run_id: &'a RunId,
+        primary_base: &'a Oid,
+        normalized_plan_sha256: String,
+        max_concurrent_children: usize,
+        plan: &'a SupervisorPlan,
+        artifact: ArtifactRunResumeBinding,
+        budget: RunBudgetReport,
+    ) -> Self {
+        Self {
+            run_id,
+            primary_base,
+            normalized_plan_sha256,
+            max_concurrent_children,
+            plan,
+            artifact,
+            budget,
+        }
+    }
+}
+
 impl SupervisorCheckpointWriter {
     pub(super) fn create(
         repo: &Path,
-        run_id: &RunId,
-        primary_base: &Oid,
-        normalized_plan_sha256: String,
-        max_concurrent_children: usize,
-        plan: &SupervisorPlan,
-        artifact: ArtifactRunResumeBinding,
-        budget: RunBudgetReport,
+        preparation: SupervisorCheckpointPreparation<'_>,
     ) -> Result<Self> {
+        let SupervisorCheckpointPreparation {
+            run_id,
+            primary_base,
+            normalized_plan_sha256,
+            max_concurrent_children,
+            plan,
+            artifact,
+            budget,
+        } = preparation;
         let authenticator = repository_auth_writer(repo)?.into_authenticator()?;
         let assignment_ids = plan
             .assignments

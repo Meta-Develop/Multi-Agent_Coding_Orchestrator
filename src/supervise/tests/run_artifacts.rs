@@ -187,19 +187,21 @@ fn supervise_status_distinguishes_absent_active_finalized_and_corrupt_runs() {
     let ledger = RunBudgetLedger::new(RunBudgetLimits::default()).expect("status budget ledger");
     let checkpoint = SupervisorCheckpointWriter::create(
         &repo_path,
-        &run_id,
-        &current_head_oid(&repo_path).expect("status primary base"),
-        normalized_supervisor_plan_sha256(
+        SupervisorCheckpointPreparation::new(
+            &run_id,
+            &current_head_oid(&repo_path).expect("status primary base"),
+            normalized_supervisor_plan_sha256(
+                &plan,
+                &SupervisorConsultantPlan::default(),
+                &AssignmentMetadata::new(),
+                &SupervisorPlanMetadata::default(),
+            )
+            .expect("status normalized plan"),
+            1,
             &plan,
-            &SupervisorConsultantPlan::default(),
-            &AssignmentMetadata::new(),
-            &SupervisorPlanMetadata::default(),
-        )
-        .expect("status normalized plan"),
-        1,
-        &plan,
-        writer.resume_binding().expect("status artifact binding"),
-        ledger.report().expect("status initial budget"),
+            writer.resume_binding().expect("status artifact binding"),
+            ledger.report().expect("status initial budget"),
+        ),
     )
     .expect("create active authenticated checkpoint");
     let active = supervisor_status(&repo_path, run_id.clone()).expect("status active run");
@@ -250,14 +252,21 @@ fn interrupted_final_report_checkpoint(
     .expect("reserve interrupted artifact run");
     let mut checkpoint = SupervisorCheckpointWriter::create(
         repo,
-        run_id,
-        &current_head_oid(repo).expect("checkpoint primary base"),
-        normalized_supervisor_plan_sha256(&plan, &consultant, &assignment_metadata, &plan_metadata)
+        SupervisorCheckpointPreparation::new(
+            run_id,
+            &current_head_oid(repo).expect("checkpoint primary base"),
+            normalized_supervisor_plan_sha256(
+                &plan,
+                &consultant,
+                &assignment_metadata,
+                &plan_metadata,
+            )
             .expect("normalized checkpoint plan"),
-        1,
-        &plan,
-        writer.resume_binding().expect("prepared artifact binding"),
-        ledger.report().expect("initial budget report"),
+            1,
+            &plan,
+            writer.resume_binding().expect("prepared artifact binding"),
+            ledger.report().expect("initial budget report"),
+        ),
     )
     .expect("create authenticated supervise checkpoint");
     checkpoint
@@ -536,21 +545,23 @@ fn resume_refuses_pre_finalization_lifecycle_with_typed_reason() {
     .expect("reserve unsupported artifact run");
     let checkpoint = SupervisorCheckpointWriter::create(
         &repo,
-        &run_id,
-        &current_head_oid(&repo).expect("unsupported primary base"),
-        normalized_supervisor_plan_sha256(
+        SupervisorCheckpointPreparation::new(
+            &run_id,
+            &current_head_oid(&repo).expect("unsupported primary base"),
+            normalized_supervisor_plan_sha256(
+                &plan,
+                &SupervisorConsultantPlan::default(),
+                &AssignmentMetadata::new(),
+                &SupervisorPlanMetadata::default(),
+            )
+            .expect("unsupported normalized plan"),
+            1,
             &plan,
-            &SupervisorConsultantPlan::default(),
-            &AssignmentMetadata::new(),
-            &SupervisorPlanMetadata::default(),
-        )
-        .expect("unsupported normalized plan"),
-        1,
-        &plan,
-        writer
-            .resume_binding()
-            .expect("unsupported artifact binding"),
-        ledger.report().expect("unsupported initial budget"),
+            writer
+                .resume_binding()
+                .expect("unsupported artifact binding"),
+            ledger.report().expect("unsupported initial budget"),
+        ),
     )
     .expect("create unsupported checkpoint");
     drop(checkpoint);
@@ -586,19 +597,21 @@ fn resume_refuses_dispatch_started_without_durable_completion_as_uncertain() {
     .expect("reserve uncertain artifact run");
     let mut checkpoint = SupervisorCheckpointWriter::create(
         &repo,
-        &run_id,
-        &current_head_oid(&repo).expect("uncertain primary base"),
-        normalized_supervisor_plan_sha256(
+        SupervisorCheckpointPreparation::new(
+            &run_id,
+            &current_head_oid(&repo).expect("uncertain primary base"),
+            normalized_supervisor_plan_sha256(
+                &plan,
+                &SupervisorConsultantPlan::default(),
+                &AssignmentMetadata::new(),
+                &SupervisorPlanMetadata::default(),
+            )
+            .expect("uncertain normalized plan"),
+            1,
             &plan,
-            &SupervisorConsultantPlan::default(),
-            &AssignmentMetadata::new(),
-            &SupervisorPlanMetadata::default(),
-        )
-        .expect("uncertain normalized plan"),
-        1,
-        &plan,
-        writer.resume_binding().expect("uncertain prepared binding"),
-        ledger.report().expect("uncertain initial budget"),
+            writer.resume_binding().expect("uncertain prepared binding"),
+            ledger.report().expect("uncertain initial budget"),
+        ),
     )
     .expect("create uncertain checkpoint");
     checkpoint

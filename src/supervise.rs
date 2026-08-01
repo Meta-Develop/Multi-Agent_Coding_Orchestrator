@@ -1265,20 +1265,15 @@ pub struct SupervisorStatusReport {
     pub final_report: Option<SupervisorFinalReport>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SupervisorRunLifecycle {
     Active,
     Interrupted,
     Uncertain,
     Resumable,
+    #[default]
     Finalized,
-}
-
-impl Default for SupervisorRunLifecycle {
-    fn default() -> Self {
-        Self::Finalized
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
