@@ -8767,8 +8767,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     use crate::worktree::{WorktreeCreateOptions, WorktreeRecord};
     use std::sync::{mpsc, Arc, Mutex};
-    #[cfg(target_os = "linux")]
-    use std::time::Duration;
 
     #[cfg(unix)]
     #[test]
@@ -9273,7 +9271,7 @@ mod tests {
             execute_external_effect_exactly_once(&first_repo, first_request, &mut first_provider)
         });
         started_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv()
             .expect("first provider reached invocation");
         let mut contender = FakeExternalProvider::new(remote.clone());
         assert!(
@@ -10061,30 +10059,39 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn standalone_publish_excludes_same_worktree_for_full_lifecycle() {
+        enum PublicationEvent {
+            LocksHeld,
+            Completed(Result<PrPublicationReport>),
+        }
+
         let temp = tempfile::tempdir().expect("tempdir");
         let (repo_path, manager, agent_a, agent_b) = create_publication_lease_fixture(temp.path());
         fs::write(agent_a.path.join("README.md"), "# Lifecycle authority\n")
             .expect("edit agent worktree");
-        let (ready_tx, ready_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let publish_repo = repo_path.clone();
         let publisher = std::thread::spawn(move || {
-            publish_pr_with_validation_evidence_after_lock(
+            let result = publish_pr_with_validation_evidence_after_lock(
                 fake_publication_options(&publish_repo, "agent-a"),
                 false,
                 ValidationEvidenceBundle::default(),
                 || {
-                    ready_tx.send(()).expect("signal held publication locks");
-                    release_rx
-                        .recv_timeout(Duration::from_secs(5))
-                        .expect("release publication");
+                    event_tx
+                        .send(PublicationEvent::LocksHeld)
+                        .expect("signal held publication locks");
+                    release_rx.recv().expect("release publication");
                 },
-            )
+            );
+            let _ = event_tx.send(PublicationEvent::Completed(result));
         });
 
-        ready_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("publication acquired lifecycle locks");
+        match event_rx.recv().expect("observe publication lifecycle") {
+            PublicationEvent::LocksHeld => {}
+            PublicationEvent::Completed(result) => {
+                panic!("publication completed before its lifecycle lock point: {result:?}")
+            }
+        }
         manager
             .acquire_read_execution_lease("agent-a")
             .expect_err("publication writer excludes concurrent reader");
@@ -10109,10 +10116,11 @@ mod tests {
         drop(unrelated);
 
         release_tx.send(()).expect("release publication lifecycle");
-        let report = publisher
-            .join()
-            .expect("join publisher")
-            .expect("complete fake publication");
+        let report = match event_rx.recv().expect("observe publication completion") {
+            PublicationEvent::Completed(result) => result.expect("complete fake publication"),
+            PublicationEvent::LocksHeld => panic!("publication published its lock point twice"),
+        };
+        publisher.join().expect("join publisher");
         assert_eq!(report.status, PrPublicationStatus::Published);
         drop(
             manager
@@ -10198,6 +10206,10 @@ mod tests {
             .acquire_read_execution_lease("agent-a")
             .expect("existing shared reader");
 
+        // This deliberately remains a real-process integration test: preview must traverse the
+        // isolated Git snapshot path while a reader is held. That path has a 120-second command
+        // margin. Expiry means the host could not complete one local Git snapshot command inside
+        // that wide bound; it is not interpreted as a publication-lock ordering failure.
         let report = preview_pr_with_validation_evidence(
             fake_publication_options(&repo_path, "agent-a"),
             false,

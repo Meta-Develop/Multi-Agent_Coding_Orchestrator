@@ -2789,8 +2789,13 @@ fn finish_child_io(
     input_writer: &mut InputWriter,
     process_error: &mut Option<String>,
 ) {
-    let output_deadline = Instant::now() + EXIT_AND_DRAIN_GRACE;
-    if !output_drainers.finish_until(output_deadline) {
+    #[cfg(test)]
+    let clock = TestIoFinalizationClock::default();
+    #[cfg(not(test))]
+    let clock = RealIoThreadClock;
+
+    let output_deadline = clock.deadline_after(EXIT_AND_DRAIN_GRACE);
+    if !output_drainers.finish_with_clock(&clock, &output_deadline) {
         *process_error = append_error(
             process_error.take(),
             Some(format!(
@@ -2803,8 +2808,8 @@ fn finish_child_io(
             output_drainers.cancel_incomplete(label),
         );
     }
-    let input_deadline = Instant::now() + EXIT_AND_DRAIN_GRACE;
-    if !input_writer.finish_until(input_deadline) {
+    let input_deadline = clock.deadline_after(EXIT_AND_DRAIN_GRACE);
+    if !input_writer.finish_with_clock(&clock, &input_deadline) {
         *process_error = append_error(
             process_error.take(),
             Some(format!(
@@ -2814,6 +2819,19 @@ fn finish_child_io(
         );
         *process_error = append_error(process_error.take(), input_writer.cancel_incomplete(label));
     }
+}
+
+fn finish_output_drainers_after_exit(
+    output_drainers: &mut OutputDrainers,
+    grace: Duration,
+) -> bool {
+    #[cfg(test)]
+    let clock = TestIoFinalizationClock::default();
+    #[cfg(not(test))]
+    let clock = RealIoThreadClock;
+
+    let deadline = clock.deadline_after(grace);
+    output_drainers.finish_with_clock(&clock, &deadline)
 }
 
 fn prepare_tees(
@@ -7777,7 +7795,7 @@ fn run_control_command_capture_bounded(
             let detail = cleanup.unwrap_or_else(|| {
                 format!("{label} exceeded its bounded deadline and was terminated with {status}")
             });
-            let _ = drainers.finish_until(Instant::now() + EXIT_AND_DRAIN_GRACE);
+            let _ = finish_output_drainers_after_exit(&mut drainers, EXIT_AND_DRAIN_GRACE);
             let _ = drainers.cancel_incomplete(label);
             return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, detail));
         }
@@ -7785,7 +7803,7 @@ fn run_control_command_capture_bounded(
             thread::sleep(POLL_INTERVAL);
         }
     };
-    if !drainers.finish_until(Instant::now() + EXIT_AND_DRAIN_GRACE) {
+    if !finish_output_drainers_after_exit(&mut drainers, EXIT_AND_DRAIN_GRACE) {
         let cleanup = drainers.cancel_incomplete(label);
         return Err(std::io::Error::other(
             cleanup.unwrap_or_else(|| format!("{label} output pipes did not close")),
@@ -9077,6 +9095,34 @@ impl IoThreadClock for RealIoThreadClock {
     }
 }
 
+/// Unit-test finalization advances by the waits the poller requested, excluding time when the
+/// poller itself was descheduled by unrelated host load. Production always uses
+/// `RealIoThreadClock`, while focused deadline tests can inject their own clocks directly.
+#[cfg(test)]
+#[derive(Default)]
+struct TestIoFinalizationClock {
+    elapsed: std::cell::Cell<Duration>,
+}
+
+#[cfg(test)]
+impl IoThreadClock for TestIoFinalizationClock {
+    type Deadline = Duration;
+
+    fn deadline_after(&self, duration: Duration) -> Self::Deadline {
+        self.elapsed.get().saturating_add(duration)
+    }
+
+    fn before(&self, deadline: &Self::Deadline) -> bool {
+        self.elapsed.get() < *deadline
+    }
+
+    fn wait(&self, duration: Duration) {
+        thread::sleep(duration);
+        self.elapsed
+            .set(self.elapsed.get().saturating_add(duration));
+    }
+}
+
 impl OwnedIoThread {
     fn request_cancel(&self, label: &str) -> Option<IoThreadCleanupError> {
         self.cancel.store(true, Ordering::Release);
@@ -9251,16 +9297,16 @@ impl InputWriter {
         }
     }
 
-    fn finish_until(&mut self, deadline: Instant) -> bool {
+    fn finish_with_clock<C: IoThreadClock>(&mut self, clock: &C, deadline: &C::Deadline) -> bool {
         loop {
             self.drain_ready();
             if self.is_complete() {
                 return true;
             }
-            if Instant::now() >= deadline {
+            if !clock.before(deadline) {
                 return false;
             }
-            thread::sleep(POLL_INTERVAL);
+            clock.wait(POLL_INTERVAL);
         }
     }
 
@@ -9377,17 +9423,17 @@ impl OutputDrainers {
         self.stdout.complete && self.stderr.complete
     }
 
-    fn finish_until(&mut self, deadline: Instant) -> bool {
+    fn finish_with_clock<C: IoThreadClock>(&mut self, clock: &C, deadline: &C::Deadline) -> bool {
         loop {
             let backlog = self.drain_ready();
             if self.is_complete() {
                 return true;
             }
-            if Instant::now() >= deadline {
+            if !clock.before(deadline) {
                 return false;
             }
             if !backlog {
-                thread::sleep(POLL_INTERVAL);
+                clock.wait(POLL_INTERVAL);
             }
         }
     }
