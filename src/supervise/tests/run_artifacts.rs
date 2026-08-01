@@ -333,9 +333,7 @@ fn interrupted_final_report_checkpoint(
             writer.resume_binding().expect("final report plan binding"),
         )
         .expect_err("crash injection must stop after durable final report plan");
-    assert!(error
-        .to_string()
-        .contains("after phase 'final_report_planned'"));
+    assert!(format!("{error:#}").contains("after phase 'final_report_planned'"));
     drop(checkpoint);
     drop(writer);
     (budget, side_effect, retained_claim)
@@ -407,9 +405,7 @@ fn scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch() 
         &mut runner,
     )
     .expect_err("injected process death after the authenticated report plan must interrupt");
-    assert!(error
-        .to_string()
-        .contains("after phase 'final_report_planned'"));
+    assert!(format!("{error:#}").contains("after phase 'final_report_planned'"));
     assert!(!repo
         .join(RunArtifactFamily::Supervise.run_root())
         .join(run_id.as_str())
