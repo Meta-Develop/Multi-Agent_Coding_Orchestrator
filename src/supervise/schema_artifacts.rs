@@ -140,13 +140,15 @@ fn autonomy_kpi_report_schema_value() -> serde_json::Value {
                     "review_decisions",
                     "reviewed_denial_terminal_lifecycles",
                     "human_follow_up_responses",
-                    "scheduler_budget_denial_lifecycles"
+                    "scheduler_budget_denial_lifecycles",
+                    "rate_denominators"
                 ],
                 "properties": {
                     "review_decisions": coverage_marker(),
                     "reviewed_denial_terminal_lifecycles": coverage_marker(),
                     "human_follow_up_responses": coverage_marker(),
-                    "scheduler_budget_denial_lifecycles": coverage_marker()
+                    "scheduler_budget_denial_lifecycles": coverage_marker(),
+                    "rate_denominators": coverage_marker()
                 }
             },
             "actions_reviewed": optional_count(),

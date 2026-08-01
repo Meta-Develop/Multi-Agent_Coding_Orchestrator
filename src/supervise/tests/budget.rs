@@ -119,6 +119,7 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
         "reviewed_denial_terminal_lifecycles",
         "human_follow_up_responses",
         "scheduler_budget_denial_lifecycles",
+        "rate_denominators",
     ] {
         assert!(
             coverage_required.iter().any(|value| value == field),

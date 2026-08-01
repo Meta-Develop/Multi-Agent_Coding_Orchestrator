@@ -1007,6 +1007,12 @@ impl AutonomyKpiCoverageMarker {
             unavailable_reason: Some(reason.into()),
         }
     }
+
+    fn legacy_rate_denominators_not_process_observable() -> Self {
+        Self::not_process_observable(
+            "rate-denominator coverage was not recorded by this report version",
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1015,10 +1021,14 @@ pub struct AutonomyKpiCoverage {
     pub reviewed_denial_terminal_lifecycles: AutonomyKpiCoverageMarker,
     pub human_follow_up_responses: AutonomyKpiCoverageMarker,
     pub scheduler_budget_denial_lifecycles: AutonomyKpiCoverageMarker,
+    #[serde(
+        default = "AutonomyKpiCoverageMarker::legacy_rate_denominators_not_process_observable"
+    )]
+    pub rate_denominators: AutonomyKpiCoverageMarker,
 }
 
 impl AutonomyKpiCoverage {
-    fn journal_observable() -> Self {
+    fn journal_observable(rate_denominators_unavailable_reason: Option<&str>) -> Self {
         Self {
             review_decisions: AutonomyKpiCoverageMarker::supervisor_aggregate(),
             reviewed_denial_terminal_lifecycles:
@@ -1030,6 +1040,10 @@ impl AutonomyKpiCoverage {
                 AutonomyKpiCoverageMarker::not_process_observable(
                     "scheduler budget denials do not produce gate correction lifecycle events",
                 ),
+            rate_denominators: match rate_denominators_unavailable_reason {
+                Some(reason) => AutonomyKpiCoverageMarker::not_process_observable(reason),
+                None => AutonomyKpiCoverageMarker::supervisor_aggregate(),
+            },
         }
     }
 
@@ -1049,6 +1063,9 @@ impl AutonomyKpiCoverage {
                 AutonomyKpiCoverageMarker::not_process_observable(
                     "scheduler budget denials do not produce gate correction lifecycle events",
                 ),
+            rate_denominators: AutonomyKpiCoverageMarker::not_process_observable(
+                "the orchestration event journal was unavailable or disabled",
+            ),
         }
     }
 }

@@ -1,5 +1,10 @@
 use super::*;
 
+const HUMAN_INTERRUPTION_RATE_GAP: &str =
+    "the run was interrupted by required human intervention before its rate denominators could be finalized";
+const BREAKER_SNAPSHOT_RATE_GAP: &str =
+    "the breaker-trip health artifact is a point-in-time snapshot emitted before active assignments finish draining";
+
 #[derive(Clone, Copy, Debug)]
 pub(super) enum GateCorrectionJournalState {
     Blocked,
@@ -100,6 +105,18 @@ impl AutonomyKpiCollector {
     }
 
     pub(super) fn report(&self, journal_observable: bool) -> AutonomyKpiReport {
+        self.report_with_rate_gap(journal_observable, None)
+    }
+
+    fn breaker_trip_report(&self, journal_observable: bool) -> AutonomyKpiReport {
+        self.report_with_rate_gap(journal_observable, Some(BREAKER_SNAPSHOT_RATE_GAP))
+    }
+
+    fn report_with_rate_gap(
+        &self,
+        journal_observable: bool,
+        point_in_time_rate_gap: Option<&'static str>,
+    ) -> AutonomyKpiReport {
         if !journal_observable {
             return AutonomyKpiReport::not_process_observable();
         }
@@ -151,27 +168,42 @@ impl AutonomyKpiCollector {
             .count() as u64;
         let eligible_reviewed_runs = self.eligible_reviewed_runs.len() as u64;
         let interrupted_runs = self.human_interrupted_runs.len() as u64;
+        let interrupted = interrupted_runs > 0;
+        // A human-required review cancels its turn at the producer. Its raw typed events
+        // remain sound, but the stopped run cannot establish complete rate denominators.
+        // A breaker transition artifact has the same limitation until active work drains.
+        let rate_denominators_unavailable_reason = if interrupted {
+            Some(HUMAN_INTERRUPTION_RATE_GAP)
+        } else {
+            point_in_time_rate_gap
+        };
+        let rate_denominators_observable = rate_denominators_unavailable_reason.is_none();
         AutonomyKpiReport {
             observation: RoleUsageObservation::SupervisorAggregate,
             population: AutonomyKpiPopulation::ReviewedGateActions,
-            coverage: AutonomyKpiCoverage::journal_observable(),
+            coverage: AutonomyKpiCoverage::journal_observable(rate_denominators_unavailable_reason),
             actions_reviewed: Some(actions_reviewed),
             denials: Some(denials),
             self_corrections: Some(self_corrections),
             human_escalations: Some(human_escalations),
-            interrupted: Some(interrupted_runs > 0),
-            denial_rate: (actions_reviewed > 0).then_some(RatioMetric {
-                numerator: denials,
-                denominator: actions_reviewed,
-            }),
-            self_correction_rate: (terminal_denials > 0).then_some(RatioMetric {
-                numerator: self_corrections,
-                denominator: terminal_denials,
-            }),
-            interruption_rate: (eligible_reviewed_runs > 0).then_some(RatioMetric {
-                numerator: interrupted_runs,
-                denominator: eligible_reviewed_runs,
-            }),
+            interrupted: Some(interrupted),
+            denial_rate: (rate_denominators_observable && actions_reviewed > 0).then_some(
+                RatioMetric {
+                    numerator: denials,
+                    denominator: actions_reviewed,
+                },
+            ),
+            self_correction_rate: (rate_denominators_observable && terminal_denials > 0).then_some(
+                RatioMetric {
+                    numerator: self_corrections,
+                    denominator: terminal_denials,
+                },
+            ),
+            interruption_rate: (rate_denominators_observable && eligible_reviewed_runs > 0)
+                .then_some(RatioMetric {
+                    numerator: interrupted_runs,
+                    denominator: eligible_reviewed_runs,
+                }),
             reviewed_actions: self.reviewed_actions.values().cloned().collect(),
             gate_lifecycles: reviewed_gate_lifecycles,
             unavailable_reason: None,
@@ -505,7 +537,11 @@ pub(super) fn record_breaker_trip(
         journal,
         autonomy_kpis,
     } = &mut *guard;
-    let autonomy_kpis = autonomy_kpis.report(orchestration_journal_observable(journal));
+    // The transition event precedes the scheduler's active-assignment drain, so its KPI
+    // payload is deliberately a counter-only snapshot. Final reporting runs after the
+    // drain and may expose rates for its closed, strictly journaled event population.
+    let autonomy_kpis =
+        autonomy_kpis.breaker_trip_report(orchestration_journal_observable(journal));
     record_orchestration_event(
         journal,
         writer,

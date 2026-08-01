@@ -67,7 +67,7 @@ fn review_decision_event(
 }
 
 #[test]
-fn typed_gate_events_report_all_autonomy_kpis_with_explicit_denominators() {
+fn interrupted_typed_gate_events_keep_counters_without_confident_rates() {
     let corrected = approval_denial(
         "correction-reviewed-denial",
         ApprovalReviewDenial::ClassifierDenied,
@@ -150,26 +150,18 @@ fn typed_gate_events_report_all_autonomy_kpis_with_explicit_denominators() {
     assert_eq!(report.human_escalations, Some(1));
     assert_eq!(report.interrupted, Some(true));
     assert_eq!(
-        report.denial_rate,
-        Some(RatioMetric {
-            numerator: 2,
-            denominator: 3,
-        })
+        report.coverage.rate_denominators.observation,
+        RoleUsageObservation::NotProcessObservable
     );
-    assert_eq!(
-        report.self_correction_rate,
-        Some(RatioMetric {
-            numerator: 1,
-            denominator: 2,
-        })
-    );
-    assert_eq!(
-        report.interruption_rate,
-        Some(RatioMetric {
-            numerator: 1,
-            denominator: 1,
-        })
-    );
+    assert!(report
+        .coverage
+        .rate_denominators
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("interrupted by required human intervention")));
+    assert_eq!(report.denial_rate, None);
+    assert_eq!(report.self_correction_rate, None);
+    assert_eq!(report.interruption_rate, None);
     let human_action = report
         .reviewed_actions
         .iter()
@@ -194,6 +186,64 @@ fn typed_gate_events_report_all_autonomy_kpis_with_explicit_denominators() {
             && lifecycle.correction_attempts == 1
             && lifecycle.terminal_outcome == Some(GateCorrectionTerminalClass::SelfCorrected)
     }));
+}
+
+#[test]
+fn completed_typed_gate_events_report_explicit_denominators() {
+    let corrected = approval_denial(
+        "completed-correction-reviewed-denial",
+        ApprovalReviewDenial::ClassifierDenied,
+    );
+    let mut collector = AutonomyKpiCollector::default();
+    collector.observe_pre_action_event(&review_decision_event(
+        "completed-request-allowed",
+        true,
+        None,
+        PreActionJournalRationale::DeterministicPolicyAllow,
+    ));
+    collector.observe_pre_action_event(&review_decision_event(
+        "completed-request-corrected",
+        false,
+        Some(corrected.clone()),
+        PreActionJournalRationale::DeterministicPolicyDeny,
+    ));
+    collector.observe_gate_correction_event(
+        &corrected,
+        GateCorrectionJournalState::Terminal(GateCorrectionTerminalClass::SelfCorrected),
+        Some(1),
+    );
+
+    let report = collector.report(true);
+    assert_eq!(report.actions_reviewed, Some(2));
+    assert_eq!(report.denials, Some(1));
+    assert_eq!(report.self_corrections, Some(1));
+    assert_eq!(report.human_escalations, Some(0));
+    assert_eq!(report.interrupted, Some(false));
+    assert_eq!(
+        report.coverage.rate_denominators.observation,
+        RoleUsageObservation::SupervisorAggregate
+    );
+    assert_eq!(
+        report.denial_rate,
+        Some(RatioMetric {
+            numerator: 1,
+            denominator: 2,
+        })
+    );
+    assert_eq!(
+        report.self_correction_rate,
+        Some(RatioMetric {
+            numerator: 1,
+            denominator: 1,
+        })
+    );
+    assert_eq!(
+        report.interruption_rate,
+        Some(RatioMetric {
+            numerator: 0,
+            denominator: 1,
+        })
+    );
 }
 
 #[test]
@@ -231,6 +281,99 @@ fn disabled_journal_reports_unmeasured_instead_of_zero() {
 }
 
 #[test]
+fn human_intervention_cancellation_producer_path_suppresses_partial_run_rates() {
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("human-cancellation-rate-gap").expect("valid cancellation run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "human-cancellation-rate-gap-test",
+    )
+    .expect("reserve cancellation artifact run");
+    let mut journal = Some(OrchestrationEventJournal::new(
+        "human-cancellation-test-repository",
+        run_id.as_str(),
+    ));
+    let mut collector = AutonomyKpiCollector::default();
+    let corrected = approval_denial(
+        "producer-completed-before-human",
+        ApprovalReviewDenial::ClassifierDenied,
+    );
+    let human = approval_denial(
+        "producer-human-cancellation",
+        ApprovalReviewDenial::HumanReviewRequired,
+    );
+
+    {
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut collector,
+        });
+        let mut review_sink = SupervisorPreActionJournalSink {
+            artifacts: &artifacts,
+            node: "child-a",
+            parent: Some(run_id.as_str()),
+        };
+        review_sink
+            .append(&review_decision_event(
+                "producer-completed-request",
+                false,
+                Some(corrected.clone()),
+                PreActionJournalRationale::DeterministicPolicyDeny,
+            ))
+            .expect("produce completed reviewed denial through strict journal sink");
+        let mut tracker = GateCorrectionTracker::new(1);
+        let mut health_signals = Vec::new();
+        assert!(tracker
+            .authorize(
+                corrected,
+                &artifacts,
+                "child-a",
+                run_id.as_str(),
+                &mut health_signals,
+            )
+            .expect("produce correction lifecycle through gate tracker")
+            .is_some());
+        tracker
+            .self_corrected(&artifacts, "child-a", run_id.as_str())
+            .expect("produce self-corrected terminal lifecycle");
+
+        // external_agent emits this exact typed rationale when it returns
+        // ApprovalReview::cancel for a required human intervention.
+        review_sink
+            .append(&review_decision_event(
+                "producer-human-request",
+                false,
+                Some(human),
+                PreActionJournalRationale::HumanInterventionRequired,
+            ))
+            .expect("produce human-intervention cancellation through strict journal sink");
+    }
+
+    let report = collector.report(true);
+    assert_eq!(report.actions_reviewed, Some(2));
+    assert_eq!(report.denials, Some(2));
+    assert_eq!(report.self_corrections, Some(1));
+    assert_eq!(report.human_escalations, Some(1));
+    assert_eq!(report.interrupted, Some(true));
+    assert_eq!(report.denial_rate, None);
+    assert_eq!(report.self_correction_rate, None);
+    assert_eq!(report.interruption_rate, None);
+    assert_eq!(
+        report.coverage.rate_denominators.observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+    assert!(report
+        .coverage
+        .rate_denominators
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("interrupted by required human intervention")));
+}
+
+#[test]
 fn legacy_autonomy_kpi_report_defaults_new_population_and_coverage_fields() {
     let report = serde_json::from_value::<AutonomyKpiReport>(json!({
         "observation": "supervisor_aggregate",
@@ -257,6 +400,44 @@ fn legacy_autonomy_kpi_report_defaults_new_population_and_coverage_fields() {
             .observation,
         RoleUsageObservation::NotProcessObservable
     );
+
+    let legacy_nested_coverage = serde_json::from_value::<AutonomyKpiReport>(json!({
+        "observation": "supervisor_aggregate",
+        "population": "reviewed_gate_actions",
+        "coverage": {
+            "review_decisions": {"observation": "supervisor_aggregate"},
+            "reviewed_denial_terminal_lifecycles": {
+                "observation": "supervisor_aggregate"
+            },
+            "human_follow_up_responses": {
+                "observation": "not_process_observable",
+                "unavailable_reason": "legacy gap"
+            },
+            "scheduler_budget_denial_lifecycles": {
+                "observation": "not_process_observable",
+                "unavailable_reason": "legacy gap"
+            }
+        },
+        "actions_reviewed": 1,
+        "denials": 0,
+        "self_corrections": 0,
+        "human_escalations": 0,
+        "interrupted": false
+    }))
+    .expect("deserialize report with pre-rate-denominator coverage");
+    assert_eq!(
+        legacy_nested_coverage
+            .coverage
+            .rate_denominators
+            .observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+    assert!(legacy_nested_coverage
+        .coverage
+        .rate_denominators
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("not recorded by this report version")));
 }
 
 fn producer_path_join_report(
