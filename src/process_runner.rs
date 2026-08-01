@@ -9851,6 +9851,38 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn assert_process_gone(pid: &str, context: &str) {
+        let pid = pid
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap_or_else(|error| panic!("parse {context} pid: {error}"));
+        // Reaping is the behavior under test, so this remains a real-time liveness fuse. Thirty
+        // seconds is deliberately much wider than the three-second operation contract below;
+        // expiry means the PID remained allocated, not that ordinary cleanup was slightly late.
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(30))
+            .expect("representable process-reaping deadline");
+        loop {
+            // SAFETY: signal 0 probes whether the captured PID still exists without delivering a
+            // signal. A zombie must continue to return success here and therefore cannot pass.
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(libc::ESRCH),
+                    "probe {context} existence: {error}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{context} PID still existed after the process-reaping liveness margin"
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn nonpublishable_trusted_compatibility_interactive_session_round_trips() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -11606,6 +11638,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn normal_exit_terminates_descendants_holding_pipes() {
+        const WHOLE_CALL_BOUND: Duration = Duration::from_secs(3);
+
         let temp = tempfile::tempdir().expect("tempdir");
         let descendant_pid = temp.path().join("descendant.pid");
         let command = format!(
@@ -11623,6 +11657,8 @@ mod tests {
         .with_timeout(Some(Duration::from_secs(2)));
 
         let (completion_tx, completion_rx) = mpsc::channel();
+        // Start before `thread::spawn`: worker creation and scheduling are part of the whole call.
+        let whole_call_started = Instant::now();
         let _worker = thread::spawn(move || {
             let _ = completion_tx.send(run_process(spec));
         });
@@ -11630,10 +11666,15 @@ mod tests {
         // `run_process` has completed process-tree cleanup, pipe finalization, and its internal
         // joins. Three seconds preserves the original bound; expiry means lifecycle completion
         // itself stopped being prompt. There is no unbounded JoinHandle wait on this path.
-        let output = completion_rx
-            .recv_timeout(Duration::from_secs(3))
-            .expect("descendant pipe lifecycle completed within its three-second contract")
-            .expect("run descendant-spawning command");
+        let completion = completion_rx
+            .recv_timeout(WHOLE_CALL_BOUND.saturating_sub(whole_call_started.elapsed()))
+            .expect("descendant pipe lifecycle completed within its three-second contract");
+        let whole_call_elapsed = whole_call_started.elapsed();
+        assert!(
+            whole_call_elapsed < WHOLE_CALL_BOUND,
+            "descendant pipe lifecycle exceeded its whole-call three-second contract: {whole_call_elapsed:?}"
+        );
+        let output = completion.expect("run descendant-spawning command");
 
         assert!(!output.timed_out);
         assert!(output.status.is_some_and(|status| status.success()));
@@ -11649,7 +11690,7 @@ mod tests {
             .text
             .contains("descendant-error"));
         let pid = std::fs::read_to_string(descendant_pid).expect("descendant pid");
-        assert_process_not_executable(&pid, "output-pipe descendant");
+        assert_process_gone(&pid, "output-pipe descendant");
     }
 
     #[cfg(unix)]
@@ -12996,6 +13037,9 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
     #[cfg(unix)]
     #[test]
     fn required_containment_kills_setsid_pipe_and_stdin_holders() {
+        const READINESS_FUSE: Duration = Duration::from_secs(10);
+        const POST_RELEASE_BOUND: Duration = Duration::from_secs(2);
+
         if !strict_backend_available_for_tests() {
             return;
         }
@@ -13027,7 +13071,16 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
             let _ = completion_tx.send(run_process(spec));
         });
         let output = {
+            // This fuse is independent of the process timeout and post-release bound. Expiry
+            // means the strict target made no observable readiness progress for ten seconds.
+            let readiness_deadline = Instant::now()
+                .checked_add(READINESS_FUSE)
+                .expect("representable strict readiness deadline");
             while !target_ready_path.exists() && !worker.is_finished() {
+                assert!(
+                    Instant::now() < readiness_deadline,
+                    "escaped pipe holder did not publish readiness within ten seconds"
+                );
                 thread::sleep(POLL_INTERVAL);
             }
             assert!(
@@ -13042,11 +13095,19 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
             // containment commands and internal I/O joins. Two seconds preserves the original
             // post-release contract; expiry means cleanup itself stopped being prompt. Avoiding a
             // JoinHandle wait ensures a regression fails this test instead of hanging the suite.
+            let release_started = Instant::now();
             fs::write(&release_target_path, b"release").expect("release escaped pipe holder");
-            completion_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("escaped pipe holder completed within its two-second post-release contract")
-                .expect("run escaped pipe holder")
+            let completion = completion_rx
+                .recv_timeout(POST_RELEASE_BOUND.saturating_sub(release_started.elapsed()))
+                .expect(
+                    "escaped pipe holder completed within its two-second post-release contract",
+                );
+            let post_release_elapsed = release_started.elapsed();
+            assert!(
+                post_release_elapsed < POST_RELEASE_BOUND,
+                "escaped pipe holder exceeded its whole post-release two-second contract: {post_release_elapsed:?}"
+            );
+            completion.expect("run escaped pipe holder")
         };
 
         let escaped_pid = std::fs::read_to_string(&escaped_pid_path)
