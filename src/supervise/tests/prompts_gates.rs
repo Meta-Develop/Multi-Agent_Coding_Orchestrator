@@ -496,9 +496,12 @@ fn gate_terminal_append_failure_retains_active_denial_without_false_outcome() {
     }
 
     let append_successes = autonomy_kpis.report(true);
-    assert_eq!(append_successes.gate_lifecycles.len(), 1);
-    assert_eq!(append_successes.gate_lifecycles[0].correction_attempts, 1);
-    assert_eq!(append_successes.gate_lifecycles[0].terminal_outcome, None);
+    assert!(
+        append_successes.gate_lifecycles.is_empty(),
+        "an unreviewed validation lifecycle must stay outside reviewed-action KPIs"
+    );
+    assert_eq!(append_successes.self_corrections, Some(0));
+    assert_eq!(append_successes.self_correction_rate, None);
     assert_eq!(
         autonomy_kpis.report(false),
         AutonomyKpiReport::default(),
