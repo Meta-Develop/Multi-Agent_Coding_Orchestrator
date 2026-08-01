@@ -1623,7 +1623,12 @@ mod decomposition_tests {
             codex_bin: PathBuf::from("unused-test-codex"),
             runtime: SupervisorRuntime::Fake,
             allow_dirty_primary: true,
-            machine_global_retention: None,
+            machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+                config: repo.join("unused-machine-global.json"),
+                root_id: "runtime".to_string(),
+                owner: "maco-supervise-test".to_string(),
+                correction_correlation_id: run_id.to_string(),
+            }),
         }
     }
 
