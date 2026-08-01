@@ -694,6 +694,10 @@ fn record_completed_assignment_checkpoint(
         .assignments
         .get(index)
         .context("checkpoint completion index is outside the supervisor plan")?;
+    let mut checkpoint_assignment = assignment.clone();
+    if !outcome.claimed_paths.is_empty() {
+        checkpoint_assignment.assigned_paths = outcome.claimed_paths.clone();
+    }
     let worktrees = context.manager.list()?;
     let worktree = worktrees.iter().find(|record| record.name == assignment.id);
     let claim_tokens = outcome
@@ -711,7 +715,7 @@ fn record_completed_assignment_checkpoint(
         .collect();
     record_assignment_completed_checkpoint(
         context.artifacts,
-        assignment,
+        &checkpoint_assignment,
         index,
         context.budget_ledger,
         worktree,

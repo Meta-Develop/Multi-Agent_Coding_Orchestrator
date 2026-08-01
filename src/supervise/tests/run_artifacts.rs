@@ -450,6 +450,73 @@ fn scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch() 
 }
 
 #[test]
+fn narrowed_assignment_crash_after_final_report_plan_resumes_against_actual_claim_scope() {
+    let (temp, repo) = injected_repository();
+    fs::write(repo.join("FREE.md"), "free\n").expect("write unclaimed path");
+    commit_injected_repository(&repo, "add unclaimed path");
+
+    let mut assignment = injected_assignment(false);
+    assignment.assigned_paths = vec![PathBuf::from("README.md"), PathBuf::from("FREE.md")];
+    let mut plan = injected_plan(assignment.clone(), 0);
+    plan.max_gate_corrections = 1;
+    let run_id = RunId::new("narrowed-final-report-resume").expect("valid narrowed resume id");
+    let options = injected_options(&repo, temp.path(), run_id.as_str());
+    let store = SyncStore::open(&repo).expect("open narrowed resume claim store");
+    let conflicting_claim = store
+        .claim_paths("other-owner", [PathBuf::from("README.md")])
+        .expect("claim path that forces safe narrowing");
+    let narrowed = OrchestratorAssignment {
+        assigned_paths: vec![PathBuf::from("FREE.md")],
+        ..assignment
+    };
+    let mut runner = |command: &ExternalAgentCommand| {
+        write_injected_assignment_report(command, &narrowed);
+        injected_verified_run(command)
+    };
+    install_checkpoint_failure(run_id.as_str(), "after:final_report_planned");
+
+    let error = run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut runner,
+    )
+    .expect_err("injected crash after narrowed terminal report plan must interrupt");
+    assert!(format!("{error:#}").contains("after phase 'final_report_planned'"));
+    let active_claims = store
+        .snapshot()
+        .expect("snapshot claims before narrowed resume");
+    let retained_claim = active_claims
+        .iter()
+        .find(|claim| claim.agent_id == "child-a")
+        .expect("narrowed supervise claim remains active")
+        .clone();
+    assert_eq!(retained_claim.paths, vec![PathBuf::from("FREE.md")]);
+
+    let resumed = resume_supervisor_run(&repo, run_id).expect("resume narrowed terminal plan");
+    assert!(resumed.success, "narrowed resume refused: {resumed:#?}");
+    assert!(resumed.resumed);
+    assert_eq!(
+        resumed
+            .final_report
+            .expect("resumed narrowed final report")
+            .released_claims,
+        vec![retained_claim]
+    );
+    assert_eq!(
+        store
+            .snapshot()
+            .expect("snapshot claims after narrowed resume"),
+        vec![conflicting_claim.clone()],
+        "resume must release only the narrowed run's exact claim"
+    );
+    store
+        .release(conflicting_claim.token)
+        .expect("release narrowing fixture claim");
+}
+
+#[test]
 fn resume_refuses_checkpoint_after_authentication_tag_is_neutered() {
     let (_temp, repo) = injected_repository();
     let run_id = RunId::new("authenticated-resume-tampered").expect("valid tamper run id");

@@ -443,28 +443,6 @@ impl SyncStore {
             .claim)
     }
 
-    #[cfg(test)]
-    pub(crate) fn claim_paths_for_run_with_process<I, P>(
-        &self,
-        run_id: &RunId,
-        agent_id: impl AsRef<str>,
-        paths: I,
-        process: ClaimProcessIdentity,
-    ) -> Result<PathClaim>
-    where
-        I: IntoIterator<Item = P>,
-        P: AsRef<Path>,
-    {
-        Ok(self
-            .claim_paths_with_telemetry_thresholds_internal(
-                agent_id,
-                paths,
-                MegafileThresholds::provisional_bootstrap(),
-                Some((run_id.as_str().to_string(), process)),
-            )?
-            .claim)
-    }
-
     /// Persists the authenticated claim first, then records authoritative
     /// megafile telemetry. A telemetry failure is returned to the caller so
     /// work cannot proceed silently without its required history.

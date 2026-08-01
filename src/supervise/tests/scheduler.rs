@@ -766,31 +766,114 @@ fn claim_and_semantic_block_conflicts_fail_only_the_affected_assignment() {
 #[cfg(target_os = "linux")]
 #[test]
 fn external_termination_named_conflict_release_and_reacquisition_form_one_recovery_sequence() {
+    const HOLDER_PROCESS_ENV: &str = "MACO_ISSUE51_SUPERVISE_HOLDER_PROCESS";
+    const HOLDER_REPO_ENV: &str = "MACO_ISSUE51_SUPERVISE_HOLDER_REPO";
+    const HOLDER_ROOT_ENV: &str = "MACO_ISSUE51_SUPERVISE_HOLDER_ROOT";
+    const HOLDER_READY_ENV: &str = "MACO_ISSUE51_SUPERVISE_HOLDER_READY";
+
+    if std::env::var_os(HOLDER_PROCESS_ENV).is_some() {
+        let repo_path = PathBuf::from(
+            std::env::var_os(HOLDER_REPO_ENV).expect("holder subprocess repository path"),
+        );
+        let root = PathBuf::from(
+            std::env::var_os(HOLDER_ROOT_ENV).expect("holder subprocess fixture root"),
+        );
+        let ready = PathBuf::from(
+            std::env::var_os(HOLDER_READY_ENV).expect("holder subprocess ready marker"),
+        );
+        let assignment = injected_named_assignment("interrupted-scope", "README.md");
+        let plan = injected_multi_plan(vec![assignment], 0);
+        let options = injected_options(&repo_path, &root, "externally-terminated-run");
+        let runner = move |_command: &ExternalAgentCommand| -> ExternalAgentRun {
+            fs::write(&ready, b"claim acquired\n").expect("publish holder readiness");
+            loop {
+                std::thread::park_timeout(Duration::from_secs(60));
+            }
+        };
+        let result = run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            1,
+            &runner,
+        );
+        panic!("holder supervise run returned before external termination: {result:#?}");
+    }
+
+    struct KillOnDrop(Option<std::process::Child>);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
     let (temp, repo_path) = injected_repository();
-    let store = SyncStore::open(&repo_path).expect("open recovery-sequence sync store");
-    let mut holder = std::process::Command::new("sleep")
-        .arg("60")
+    let ready = temp.path().join("issue-51-supervise-holder-ready");
+    let holder = std::process::Command::new(
+        std::env::current_exe().expect("resolve current supervise test executable"),
+    )
+        .args([
+            "--exact",
+            "supervise::tests::scheduler::external_termination_named_conflict_release_and_reacquisition_form_one_recovery_sequence",
+            "--nocapture",
+        ])
+        .env(HOLDER_PROCESS_ENV, "1")
+        .env(HOLDER_REPO_ENV, &repo_path)
+        .env(HOLDER_ROOT_ENV, temp.path())
+        .env(HOLDER_READY_ENV, &ready)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
-        .expect("spawn external claim holder");
-    let holder_pid = holder.id();
-    let holder_identity = crate::live_claim::ClaimProcessIdentity {
-        pid: holder_pid,
-        process_start_time: Some(
-            crate::agent_lifecycle::process_start_time(holder_pid)
-                .expect("read external claim-holder identity"),
-        ),
-    };
-    let interrupted_run = RunId::new("externally-terminated-run").expect("valid interrupted run");
-    let retained = store
-        .claim_paths_for_run_with_process(
-            &interrupted_run,
-            "interrupted-scope",
-            [PathBuf::from("README.md")],
-            holder_identity,
-        )
-        .expect("record externally held claim");
-    holder.kill().expect("terminate external claim holder");
-    holder.wait().expect("reap external claim holder");
+        .expect("spawn real supervise holder process");
+    let mut holder = KillOnDrop(Some(holder));
+    let holder_pid = holder.0.as_ref().expect("live holder process").id();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !ready.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "real supervise holder did not reach its production dispatch path"
+        );
+        let status = holder
+            .0
+            .as_mut()
+            .expect("live holder process")
+            .try_wait()
+            .expect("inspect supervise holder process");
+        assert!(
+            status.is_none(),
+            "real supervise holder exited before external termination: {status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let store = SyncStore::open(&repo_path).expect("open recovery-sequence sync store");
+    let live = store
+        .status_snapshot()
+        .expect("inspect production claim before external termination");
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].claim.agent_id, "interrupted-scope");
+    assert_eq!(
+        live[0].owner_run_id.as_deref(),
+        Some("externally-terminated-run")
+    );
+    assert_eq!(live[0].owner_process_id, Some(holder_pid));
+    assert_eq!(
+        live[0].owner_run_state,
+        crate::sync_store::ClaimOwnerRunState::Active
+    );
+    let retained = live[0].claim.clone();
+
+    let mut holder_process = holder.0.take().expect("take supervise holder process");
+    holder_process
+        .kill()
+        .expect("externally terminate supervise holder process");
+    holder_process
+        .wait()
+        .expect("reap supervise holder process");
 
     let leftover = store
         .status_snapshot()

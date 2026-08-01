@@ -221,6 +221,7 @@ fn prepare_assignment_execution<'a>(
         }
     };
     outcome.claim_tokens.push(claim.token);
+    outcome.claimed_paths = claim.paths.clone();
     let current_primary_head = current_head_oid(repo)?;
     if !reused {
         let create_options = WorktreeCreateOptions {
