@@ -231,7 +231,10 @@ fn supervise_status_distinguishes_absent_active_finalized_and_corrupt_runs() {
     );
 }
 
-fn interrupted_final_report_checkpoint(repo: &Path, run_id: &RunId) -> (RunBudgetReport, PathBuf) {
+fn interrupted_final_report_checkpoint(
+    repo: &Path,
+    run_id: &RunId,
+) -> (RunBudgetReport, PathBuf, PathClaim) {
     let assignment = injected_assignment(false);
     let plan = injected_plan(assignment.clone(), 0);
     let consultant = SupervisorConsultantPlan::default();
@@ -295,6 +298,10 @@ fn interrupted_final_report_checkpoint(repo: &Path, run_id: &RunId) -> (RunBudge
         )
         .expect("reconcile completed assignment budget");
     let budget = ledger.report().expect("reconciled budget report");
+    let retained_claim = SyncStore::open(repo)
+        .expect("open resume claim store")
+        .claim_paths(&assignment.id, &assignment.assigned_paths)
+        .expect("record retained claim checkpoint fixture");
     checkpoint
         .assignment_completed(
             &assignment,
@@ -304,7 +311,7 @@ fn interrupted_final_report_checkpoint(repo: &Path, run_id: &RunId) -> (RunBudge
                 .expect("assignment completion binding"),
             budget.clone(),
             None,
-            Vec::new(),
+            vec![retained_claim.token.get()],
         )
         .expect("checkpoint assignment completion");
     checkpoint
@@ -329,14 +336,14 @@ fn interrupted_final_report_checkpoint(repo: &Path, run_id: &RunId) -> (RunBudge
         .contains("after phase 'final_report_planned'"));
     drop(checkpoint);
     drop(writer);
-    (budget, side_effect)
+    (budget, side_effect, retained_claim)
 }
 
 #[test]
 fn authenticated_resume_finalizes_without_reexecuting_completed_work_and_preserves_budget() {
     let (_temp, repo) = injected_repository();
     let run_id = RunId::new("authenticated-resume-valid").expect("valid resume run id");
-    let (budget, side_effect) = interrupted_final_report_checkpoint(&repo, &run_id);
+    let (budget, side_effect, retained_claim) = interrupted_final_report_checkpoint(&repo, &run_id);
     let before = fs::read(&side_effect).expect("read completed side effect before resume");
     let status = supervisor_status(&repo, run_id.clone()).expect("status resumable checkpoint");
     assert_eq!(status.lifecycle, SupervisorRunLifecycle::Resumable);
@@ -365,15 +372,68 @@ fn authenticated_resume_finalizes_without_reexecuting_completed_work_and_preserv
         before,
         "resume must not repeat or rewrite completed assignment side effects"
     );
+    assert_eq!(
+        SyncStore::open(&repo)
+            .expect("reopen retained claim store")
+            .snapshot()
+            .expect("snapshot retained claim after resume"),
+        vec![retained_claim],
+        "resume must reconcile but not silently release issue #51 retained claims"
+    );
     ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
         .expect("resume publishes authenticated finalization marker");
+}
+
+#[test]
+fn scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch() {
+    let (temp, repo) = injected_repository();
+    let assignment = injected_assignment(false);
+    let plan = injected_plan(assignment, 0);
+    let run_id = RunId::new("scheduler-final-report-resume").expect("valid scheduler resume id");
+    let mut options = injected_options(&repo, temp.path(), run_id.as_str());
+    options.runtime = SupervisorRuntime::Fake;
+    let mut runner = |_command: &ExternalAgentCommand| -> ExternalAgentRun {
+        panic!("fake scheduler resume fixture must not dispatch the external runner")
+    };
+    install_checkpoint_failure(run_id.as_str(), "after:final_report_planned");
+
+    let error = run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut runner,
+    )
+    .expect_err("injected process death after the authenticated report plan must interrupt");
+    assert!(error
+        .to_string()
+        .contains("after phase 'final_report_planned'"));
+    assert!(!repo
+        .join(RunArtifactFamily::Supervise.run_root())
+        .join(run_id.as_str())
+        .join(ARTIFACT_FINALIZATION_MARKER)
+        .exists());
+
+    let status = supervisor_status(&repo, run_id.clone()).expect("status interrupted scheduler");
+    assert_eq!(status.lifecycle, SupervisorRunLifecycle::Resumable);
+    let resumed = resume_supervisor_run(&repo, run_id.clone()).expect("resume scheduler report");
+    assert!(resumed.success);
+    assert!(resumed.resumed);
+    assert_eq!(resumed.completed_assignments, vec!["child-a"]);
+    let report = resumed
+        .final_report
+        .expect("resumed scheduler final report");
+    assert_eq!(report.orchestrator_reports.len(), 1);
+    assert_eq!(report.orchestrator_reports[0].id, "child-a");
+    ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
+        .expect("scheduler resume finalizes the exact planned report");
 }
 
 #[test]
 fn resume_refuses_checkpoint_after_authentication_tag_is_neutered() {
     let (_temp, repo) = injected_repository();
     let run_id = RunId::new("authenticated-resume-tampered").expect("valid tamper run id");
-    interrupted_final_report_checkpoint(&repo, &run_id);
+    let _ = interrupted_final_report_checkpoint(&repo, &run_id);
     let authenticator = repository_authenticator_key_only(&repo).expect("repository authenticator");
     let journal_root = crate::state_journal::StateJournal::existing_root(&authenticator)
         .expect("authenticated journal root");
@@ -404,6 +464,83 @@ fn resume_refuses_checkpoint_after_authentication_tag_is_neutered() {
         .join(run_id.as_str())
         .join(ARTIFACT_FINALIZATION_MARKER)
         .exists());
+}
+
+#[test]
+fn resume_refuses_truncated_checkpoint_as_integrity_failure() {
+    let (_temp, repo) = injected_repository();
+    let run_id = RunId::new("authenticated-resume-truncated").expect("valid truncated run id");
+    let _ = interrupted_final_report_checkpoint(&repo, &run_id);
+    let authenticator = repository_authenticator_key_only(&repo).expect("repository authenticator");
+    let journal_root = crate::state_journal::StateJournal::existing_root(&authenticator)
+        .expect("authenticated journal root");
+    let record_path = journal_root
+        .path()
+        .join(run_id.as_str())
+        .join("00000000000000000001.json");
+    fs::write(&record_path, b"{").expect("truncate checkpoint record");
+
+    let refusal = resume_supervisor_run(&repo, run_id).expect("typed torn-checkpoint refusal");
+    assert!(!refusal.success);
+    assert!(matches!(
+        refusal.gate_denial,
+        Some(GateDenial {
+            reason: GateDenialReason::ResumeCheckpoint {
+                denial: ResumeCheckpointDenial::IntegrityFailure,
+            },
+            retryability: GateRetryability::NotRetryable,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn resume_refuses_pre_finalization_lifecycle_with_typed_reason() {
+    let (_temp, repo) = injected_repository();
+    let run_id = RunId::new("authenticated-resume-unsupported").expect("valid unsupported run id");
+    let plan = injected_plan(injected_assignment(false), 0);
+    let ledger = RunBudgetLedger::new(RunBudgetLimits::default()).expect("unsupported budget");
+    let writer = ArtifactRunWriter::reserve(
+        &repo,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "unsupported-resume-test",
+    )
+    .expect("reserve unsupported artifact run");
+    let checkpoint = SupervisorCheckpointWriter::create(
+        &repo,
+        &run_id,
+        &current_head_oid(&repo).expect("unsupported primary base"),
+        normalized_supervisor_plan_sha256(
+            &plan,
+            &SupervisorConsultantPlan::default(),
+            &AssignmentMetadata::new(),
+            &SupervisorPlanMetadata::default(),
+        )
+        .expect("unsupported normalized plan"),
+        1,
+        &plan,
+        writer
+            .resume_binding()
+            .expect("unsupported artifact binding"),
+        ledger.report().expect("unsupported initial budget"),
+    )
+    .expect("create unsupported checkpoint");
+    drop(checkpoint);
+    drop(writer);
+
+    let refusal = resume_supervisor_run(&repo, run_id).expect("typed unsupported refusal");
+    assert_eq!(refusal.lifecycle, SupervisorRunLifecycle::Interrupted);
+    assert!(matches!(
+        refusal.gate_denial,
+        Some(GateDenial {
+            reason: GateDenialReason::ResumeCheckpoint {
+                denial: ResumeCheckpointDenial::UnsupportedLifecycle,
+            },
+            retryability: GateRetryability::NotRetryable,
+            ..
+        })
+    ));
 }
 
 #[test]

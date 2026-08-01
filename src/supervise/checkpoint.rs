@@ -178,14 +178,27 @@ impl SupervisorCheckpointSnapshot {
         store: &SyncStore,
         report: &SupervisorFinalReport,
     ) -> Result<()> {
-        let released = report.claim_tokens.iter().copied().collect::<BTreeSet<_>>();
+        let released = report
+            .released_claims
+            .iter()
+            .map(|claim| (claim.token.get(), claim))
+            .collect::<BTreeMap<_, _>>();
+        if released.len() != report.released_claims.len()
+            || report.claim_tokens.iter().copied().collect::<BTreeSet<_>>()
+                != released.keys().copied().collect()
+        {
+            bail!("final report released-claim identity is internally inconsistent");
+        }
         let active = store
             .snapshot()?
             .into_iter()
             .map(|claim| (claim.token.get(), claim))
             .collect::<BTreeMap<_, _>>();
         for (token, (assignment, paths)) in &self.claims {
-            if released.contains(token) {
+            if let Some(released_claim) = released.get(token) {
+                if &released_claim.agent_id != assignment || &released_claim.paths != paths {
+                    bail!("released checkpoint claim token {token} changed identity or scope");
+                }
                 if active.contains_key(token) {
                     bail!("released checkpoint claim token {token} remains active");
                 }
