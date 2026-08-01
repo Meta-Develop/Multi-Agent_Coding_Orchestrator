@@ -192,6 +192,7 @@ impl SupervisorCheckpointSnapshot {
         &self,
         store: &SyncStore,
         report: &SupervisorFinalReport,
+        allow_active_terminal_release_plan: bool,
     ) -> Result<()> {
         let released = report
             .released_claims
@@ -214,8 +215,15 @@ impl SupervisorCheckpointSnapshot {
                 if &released_claim.agent_id != assignment || &released_claim.paths != paths {
                     bail!("released checkpoint claim token {token} changed identity or scope");
                 }
-                if active.contains_key(token) {
-                    bail!("released checkpoint claim token {token} remains active");
+                if let Some(active_claim) = active.get(token) {
+                    if &active_claim.agent_id != assignment || &active_claim.paths != paths {
+                        bail!(
+                            "active terminal-release claim token {token} changed identity or scope"
+                        );
+                    }
+                    if !allow_active_terminal_release_plan {
+                        bail!("released checkpoint claim token {token} remains active");
+                    }
                 }
                 continue;
             }

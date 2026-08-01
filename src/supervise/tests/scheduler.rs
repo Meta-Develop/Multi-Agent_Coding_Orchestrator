@@ -763,6 +763,111 @@ fn claim_and_semantic_block_conflicts_fail_only_the_affected_assignment() {
         .contains("semantic coordination blocked assignment 'child-b'")));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn external_termination_named_conflict_release_and_reacquisition_form_one_recovery_sequence() {
+    let (temp, repo_path) = injected_repository();
+    let store = SyncStore::open(&repo_path).expect("open recovery-sequence sync store");
+    let mut holder = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn external claim holder");
+    let holder_pid = holder.id();
+    let holder_identity = crate::live_claim::ClaimProcessIdentity {
+        pid: holder_pid,
+        process_start_time: Some(
+            crate::agent_lifecycle::process_start_time(holder_pid)
+                .expect("read external claim-holder identity"),
+        ),
+    };
+    let interrupted_run = RunId::new("externally-terminated-run").expect("valid interrupted run");
+    let retained = store
+        .claim_paths_for_run_with_process(
+            &interrupted_run,
+            "interrupted-scope",
+            [PathBuf::from("README.md")],
+            holder_identity,
+        )
+        .expect("record externally held claim");
+    holder.kill().expect("terminate external claim holder");
+    holder.wait().expect("reap external claim holder");
+
+    let leftover = store
+        .status_snapshot()
+        .expect("inspect claim after external termination");
+    assert_eq!(leftover.len(), 1);
+    assert_eq!(leftover[0].claim, retained);
+    assert_eq!(
+        leftover[0].owner_run_state,
+        crate::sync_store::ClaimOwnerRunState::Interrupted
+    );
+
+    let blocked_assignment = injected_named_assignment("blocked-retry", "README.md");
+    let blocked_plan = injected_multi_plan(vec![blocked_assignment.clone()], 0);
+    let blocked_options = injected_options(
+        &repo_path,
+        temp.path(),
+        "external-termination-blocked-retry",
+    );
+    let blocked_runner = move |command: &ExternalAgentCommand| {
+        write_injected_assignment_report(command, &blocked_assignment);
+        injected_verified_run(command)
+    };
+    let blocked = run_supervisor_plan_with_concurrent_runner(
+        blocked_plan,
+        SupervisorConsultantPlan::default(),
+        blocked_options,
+        1,
+        &blocked_runner,
+    )
+    .expect("retained claim produces a reportable typed refusal");
+    let conflict = blocked
+        .findings
+        .iter()
+        .find(|finding| finding.message.contains("failed to claim paths"))
+        .expect("reacquisition must name the blocking claim");
+    assert!(conflict.message.contains("interrupted-scope"));
+    assert!(conflict
+        .message
+        .contains(&format!("token {}", retained.token.get())));
+    assert!(conflict.message.contains("run externally-terminated-run"));
+    assert!(conflict.message.contains("owner_run_state=interrupted"));
+    assert!(blocked
+        .gate_denials
+        .iter()
+        .any(|denial| denial.reason == GateDenialReason::ClaimConflict));
+
+    assert_eq!(
+        store
+            .release(retained.token)
+            .expect("explicitly release interrupted claim"),
+        retained
+    );
+
+    let recovered_assignment = injected_named_assignment("recovered-retry", "README.md");
+    let recovered_plan = injected_multi_plan(vec![recovered_assignment.clone()], 0);
+    let recovered_options = injected_options(
+        &repo_path,
+        temp.path(),
+        "external-termination-recovered-retry",
+    );
+    let recovered_runner = move |command: &ExternalAgentCommand| {
+        write_injected_assignment_report(command, &recovered_assignment);
+        injected_verified_run(command)
+    };
+    let recovered = run_supervisor_plan_with_concurrent_runner(
+        recovered_plan,
+        SupervisorConsultantPlan::default(),
+        recovered_options,
+        1,
+        &recovered_runner,
+    )
+    .expect("reacquisition after explicit disposition succeeds");
+    assert!(recovered.success, "recovered run failed: {recovered:#?}");
+    assert_eq!(recovered.released_claims.len(), 1);
+    assert_eq!(recovered.released_claims[0].agent_id, "recovered-retry");
+}
+
 #[test]
 fn concurrent_failure_isolated_and_retry_retains_assignment_slot() {
     #[derive(Default)]
@@ -980,6 +1085,100 @@ fn nonaccepted_run_releases_claim_and_followup_reacquires_same_path() {
         followup_report.released_claims[0].agent_id,
         "followup-scope"
     );
+}
+
+#[test]
+fn serial_assignment_terminal_checkpoint_precedes_claim_release() {
+    let (temp, repo_path) = injected_repository();
+    let assignments = vec![
+        injected_named_assignment("serial-terminal-a", "README.md"),
+        injected_named_assignment("serial-terminal-b", "README.md"),
+    ];
+    let plan = injected_multi_plan(assignments.clone(), 0);
+    let run_id = RunId::new("serial-terminal-before-release").expect("valid serial run id");
+    let options = injected_options(&repo_path, temp.path(), run_id.as_str());
+    let runner = move |command: &ExternalAgentCommand| {
+        let id = injected_command_assignment_id(command);
+        let assignment = assignments
+            .iter()
+            .find(|assignment| assignment.id == id)
+            .expect("serial checkpoint assignment");
+        write_injected_assignment_report(command, assignment);
+        injected_verified_run(command)
+    };
+    install_checkpoint_failure(run_id.as_str(), "after:assignment_completed");
+
+    let _report = run_supervisor_plan_with_concurrent_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        1,
+        &runner,
+    )
+    .expect("checkpoint failure remains reportable after terminal finalization");
+
+    let (_checkpoint, snapshot) =
+        open_supervisor_checkpoint(&repo_path, &run_id).expect("open serial terminal checkpoint");
+    assert_eq!(snapshot.completed_assignments.len(), 1);
+    let completed = &snapshot.completed_assignments[0];
+    let store = SyncStore::open(&repo_path).expect("open serial terminal claims");
+    let active = store.snapshot().expect("snapshot serial terminal claims");
+    let retained = active
+        .iter()
+        .find(|claim| &claim.agent_id == completed)
+        .expect("journaled serial assignment claim must remain active before release");
+    store
+        .release(retained.token)
+        .expect("release retained serial terminal claim");
+}
+
+#[test]
+fn concurrent_assignment_terminal_checkpoint_precedes_claim_release() {
+    let (temp, repo_path) = injected_repository();
+    let assignments = vec![
+        injected_named_assignment("concurrent-terminal-a", "README.md"),
+        injected_named_assignment("concurrent-terminal-b", "src/lib.rs"),
+    ];
+    let plan = injected_multi_plan(assignments.clone(), 0);
+    let run_id = RunId::new("concurrent-terminal-before-release").expect("valid concurrent run id");
+    let options = injected_options(&repo_path, temp.path(), run_id.as_str());
+    let runner = move |command: &ExternalAgentCommand| {
+        let id = injected_command_assignment_id(command);
+        if id == "concurrent-terminal-b" {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let assignment = assignments
+            .iter()
+            .find(|assignment| assignment.id == id)
+            .expect("concurrent checkpoint assignment");
+        write_injected_assignment_report(command, assignment);
+        injected_verified_run(command)
+    };
+    install_checkpoint_failure(run_id.as_str(), "after:assignment_completed");
+
+    let _report = run_supervisor_plan_with_concurrent_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        2,
+        &runner,
+    )
+    .expect("concurrent checkpoint failure remains reportable after terminal finalization");
+
+    let (_checkpoint, snapshot) = open_supervisor_checkpoint(&repo_path, &run_id)
+        .expect("open concurrent terminal checkpoint");
+    assert_eq!(snapshot.completed_assignments.len(), 1);
+    let completed = &snapshot.completed_assignments[0];
+    let store = SyncStore::open(&repo_path).expect("open concurrent terminal claims");
+    let active = store
+        .snapshot()
+        .expect("snapshot concurrent terminal claims");
+    assert!(active.iter().any(|claim| &claim.agent_id == completed));
+    for claim in active {
+        store
+            .release(claim.token)
+            .expect("release retained concurrent terminal claim");
+    }
 }
 
 #[test]

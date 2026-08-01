@@ -420,6 +420,13 @@ fn scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch() 
         .join(run_id.as_str())
         .join(ARTIFACT_FINALIZATION_MARKER)
         .exists());
+    let active_claims = SyncStore::open(&repo)
+        .expect("open terminal-plan claim store")
+        .snapshot()
+        .expect("snapshot claim between terminal plan and release");
+    assert_eq!(active_claims.len(), 1);
+    assert_eq!(active_claims[0].agent_id, "child-a");
+    let retained_claim = active_claims[0].clone();
 
     let status = supervisor_status(&repo, run_id.clone()).expect("status interrupted scheduler");
     assert_eq!(status.lifecycle, SupervisorRunLifecycle::Resumable);
@@ -432,6 +439,12 @@ fn scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch() 
         .expect("resumed scheduler final report");
     assert_eq!(report.orchestrator_reports.len(), 1);
     assert_eq!(report.orchestrator_reports[0].id, "child-a");
+    assert_eq!(report.released_claims, vec![retained_claim]);
+    assert!(SyncStore::open(&repo)
+        .expect("reopen terminal-plan claim store")
+        .snapshot()
+        .expect("snapshot claims after resumed release")
+        .is_empty());
     ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
         .expect("scheduler resume finalizes the exact planned report");
 }
