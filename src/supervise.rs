@@ -402,18 +402,21 @@ enum RuntimeModelCatalog {
     LocalDeterministicFake,
 }
 
+type RuntimeModelCatalogAcquisition =
+    std::result::Result<RuntimeModelCatalog, Box<EnvironmentFailure>>;
+
 impl RuntimeModelCatalog {
-    fn for_supervisor(options: &SupervisorRunOptions, repo: &Path) -> Result<Self> {
+    fn for_supervisor(
+        options: &SupervisorRunOptions,
+        repo: &Path,
+    ) -> RuntimeModelCatalogAcquisition {
         match options.runtime {
             SupervisorRuntime::Codex => load_codex_runtime_model_catalog(
                 &options.codex_bin,
                 repo,
                 CODEX_MODEL_CATALOG_TIMEOUT,
             )
-            .map(Self::Codex)
-            .context(
-                "failed to acquire a verified runtime model catalog before supervisor dispatch",
-            ),
+            .map(Self::Codex),
             SupervisorRuntime::Fake => Ok(Self::LocalDeterministicFake),
         }
     }
@@ -1391,7 +1394,7 @@ fn run_supervisor_plan_file_with_runner(
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
-    let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime);
+    let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
     let serialized_runner = Mutex::new(external_runner);
     run_supervisor_plan_with_runner_and_creation(
         loaded,
@@ -1399,7 +1402,7 @@ fn run_supervisor_plan_file_with_runner(
         1,
         SupervisorExecutionRuntime::Verified,
         SupervisorWorktreeCreation::Bound(&cleanliness),
-        runtime_model_catalog,
+        Ok(runtime_model_catalog),
         &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),
             Err(poisoned) => poisoned.into_inner()(command),
@@ -2597,7 +2600,7 @@ fn run_supervisor_plan_with_runtime_model_catalog_and_runner(
     consultant: SupervisorConsultantPlan,
     options: SupervisorRunOptions,
     execution_runtime: SupervisorExecutionRuntime,
-    runtime_model_catalog: Result<RuntimeModelCatalog>,
+    runtime_model_catalog: RuntimeModelCatalogAcquisition,
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
 ) -> Result<SupervisorFinalReport> {
     run_supervisor_plan_with_budget_catalog_and_runner(
@@ -2618,7 +2621,7 @@ fn run_supervisor_plan_with_budget_catalog_and_runner(
     run_budget: SupervisorBudgetConfig,
     options: SupervisorRunOptions,
     execution_runtime: SupervisorExecutionRuntime,
-    runtime_model_catalog: Result<RuntimeModelCatalog>,
+    runtime_model_catalog: RuntimeModelCatalogAcquisition,
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
 ) -> Result<SupervisorFinalReport> {
     let serialized_runner = Mutex::new(external_runner);

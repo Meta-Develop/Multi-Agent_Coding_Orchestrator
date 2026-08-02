@@ -728,7 +728,7 @@ fn record_completed_assignment_checkpoint(
 
 struct SupervisorFinalReportConstruction<'context> {
     plan: &'context SupervisorPlan,
-    runtime_model_catalog: &'context RuntimeModelCatalog,
+    runtime_model_catalog: Option<&'context RuntimeModelCatalog>,
     run_id: RunId,
     report_plan_file: PathBuf,
     report_run_dir: PathBuf,
@@ -860,9 +860,8 @@ fn build_supervisor_final_report(
             .iter()
             .map(|intent| intent.token.get())
             .collect(),
-        role_economics_profile: Some(
-            plan.effective_role_economics_profile_for_runtime(runtime_model_catalog),
-        ),
+        role_economics_profile: runtime_model_catalog
+            .map(|catalog| plan.effective_role_economics_profile_for_runtime(catalog)),
         run_budget: run_budget_report,
         role_usage,
         review_lens_usage,
@@ -913,7 +912,7 @@ fn build_supervisor_final_report(
             "no failed child orchestrator reports; worker changes remain isolated in child worktrees"
                 .to_string()
         } else if !environment_failures.is_empty() {
-            "one or more assignments were blocked by unsatisfied structured environment requirements"
+            "the supervisor or one or more assignments were blocked by a structured environment failure"
                 .to_string()
         } else if external_containment_failed {
             "one or more external agent process trees lacked verified-empty containment; delayed child activity cannot be ruled out"
@@ -942,7 +941,7 @@ fn build_supervisor_final_report(
             "review child worktree diffs before any separate merge preview or apply step"
                 .to_string()
         } else if !environment_failures.is_empty() {
-            "apply the structured environment remediation without auto-installing software, injecting secrets, enabling networking, or broadening confinement, then rerun the blocked assignment"
+            "apply the structured environment remediation without auto-installing software, injecting secrets, enabling networking, or broadening confinement, then rerun the blocked preflight"
                 .to_string()
         } else if external_containment_failed {
             "do not trust or merge child outputs; restore the primary worktree if needed, fix host containment support, and rerun supervise"
@@ -1260,7 +1259,7 @@ struct PreparedSupervisorRun {
     consultant: SupervisorConsultantPlan,
     assignment_metadata: AssignmentMetadata,
     plan_metadata: SupervisorPlanMetadata,
-    runtime_model_catalog: RuntimeModelCatalog,
+    runtime_model_catalog: RuntimeModelCatalogAcquisition,
     budget_ledger: RunBudgetLedger,
     runtime: SupervisorRuntime,
     repo: PathBuf,
@@ -1279,7 +1278,7 @@ fn prepare_supervisor_run(
     max_concurrent_children: usize,
     execution_runtime: SupervisorExecutionRuntime,
     worktree_creation: SupervisorWorktreeCreation<'_>,
-    runtime_model_catalog: Result<RuntimeModelCatalog>,
+    runtime_model_catalog: RuntimeModelCatalogAcquisition,
 ) -> Result<PreparedSupervisorRun> {
     let LoadedSupervisorPlan {
         plan,
@@ -1287,9 +1286,6 @@ fn prepare_supervisor_run(
         assignment_metadata,
         plan_metadata,
     } = loaded;
-    let runtime_model_catalog = runtime_model_catalog.context(
-        "runtime model availability could not be established; refusing supervisor dispatch",
-    )?;
     validate_max_concurrent_children(max_concurrent_children)?;
     let budget_ledger = RunBudgetLedger::new(plan_metadata.run_budget.limits)
         .context("failed to initialize the supervise run budget ledger")?;
@@ -1373,13 +1369,100 @@ fn prepare_supervisor_run(
     })
 }
 
+struct RuntimeModelCatalogFailureFinalization<'context, 'checkpoint> {
+    plan: &'context SupervisorPlan,
+    plan_metadata: &'context SupervisorPlanMetadata,
+    options: &'context SupervisorRunOptions,
+    repo: &'context Path,
+    budget_ledger: &'context RunBudgetLedger,
+    artifact_writer: ArtifactRunWriter,
+    checkpoint_writer: &'checkpoint mut SupervisorCheckpointWriter,
+    run_dir: &'context Path,
+}
+
+fn persist_runtime_model_catalog_environment_failure(
+    finalization: RuntimeModelCatalogFailureFinalization<'_, '_>,
+    failure: EnvironmentFailure,
+) -> Result<SupervisorFinalReport> {
+    let RuntimeModelCatalogFailureFinalization {
+        plan,
+        plan_metadata,
+        options,
+        repo,
+        budget_ledger,
+        artifact_writer,
+        checkpoint_writer,
+        run_dir,
+    } = finalization;
+    let run_budget_report = budget_ledger.report()?;
+    let (report_plan_file, report_run_dir) =
+        supervisor_report_paths(repo, &options.plan_file, run_dir, &options.run_id);
+    let mut collected = CollectedAssignmentOutcomes::default();
+    collected.findings.push(Finding {
+        severity: FindingSeverity::Error,
+        message: "runtime model catalog preflight blocked supervisor dispatch; inspect the typed environment_failures entry"
+            .to_string(),
+        paths: Vec::new(),
+    });
+    let final_report = build_supervisor_final_report(SupervisorFinalReportConstruction {
+        plan,
+        runtime_model_catalog: None,
+        run_id: options.run_id.clone(),
+        report_plan_file,
+        report_run_dir,
+        runtime: options.runtime,
+        publishable: false,
+        success: false,
+        run_budget_report: Some(run_budget_report.clone()),
+        evidence_only_reaudit: plan_metadata.evidence_only_reaudit.clone(),
+        role_usage: BTreeMap::new(),
+        review_lens_usage: Vec::new(),
+        review_lens_total_usage: None,
+        review_lens_total_cost_usd: None,
+        total_usage: None,
+        total_cost_usd: None,
+        usage_complete: true,
+        environment_failures: vec![failure],
+        sandbox_denials: Vec::new(),
+        collected,
+        bloated_file_flags: Vec::new(),
+        decomposition_candidates: Vec::new(),
+        assignment_traceability: Vec::new(),
+        coverage_gaps: plan_metadata.coverage_gaps.clone(),
+        supervisor_breaker_trip: None,
+        autonomy_kpis: AutonomyKpiReport::default(),
+        released_claims: Vec::new(),
+        release_errors: Vec::new(),
+        released_semantic_intents: Vec::new(),
+        semantic_release_errors: Vec::new(),
+        external_containment_failed: false,
+        final_primary_integrity_failed: false,
+        budget_prevented_dispatch: false,
+        budget_accounting_failed: false,
+        breaker_tripped: false,
+        field_guide_mutation_failed: false,
+    });
+    let binding = artifact_writer
+        .resume_binding()
+        .context("failed to establish runtime-catalog preflight report boundary")?;
+    checkpoint_writer.scheduler_closed(binding, run_budget_report)?;
+    let mut orchestration_journal = None;
+    persist_supervisor_final_report(
+        final_report,
+        &mut orchestration_journal,
+        artifact_writer,
+        Some(checkpoint_writer),
+        || Ok(()),
+    )
+}
+
 pub(super) fn run_supervisor_plan_with_runner_and_creation(
     loaded: LoadedSupervisorPlan,
     options: SupervisorRunOptions,
     max_concurrent_children: usize,
     execution_runtime: SupervisorExecutionRuntime,
     worktree_creation: SupervisorWorktreeCreation<'_>,
-    runtime_model_catalog: Result<RuntimeModelCatalog>,
+    runtime_model_catalog: RuntimeModelCatalogAcquisition,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
     let PreparedSupervisorRun {
@@ -1406,6 +1489,27 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         worktree_creation,
         runtime_model_catalog,
     )?;
+    // Runtime catalog acquisition is the first dispatch-capable environment preflight. A typed
+    // failure is finalized here and deliberately short-circuits every assignment environment
+    // preflight, which can begin only inside `external_runner` below.
+    let runtime_model_catalog = match runtime_model_catalog {
+        Ok(catalog) => catalog,
+        Err(failure) => {
+            return persist_runtime_model_catalog_environment_failure(
+                RuntimeModelCatalogFailureFinalization {
+                    plan: &plan,
+                    plan_metadata: &plan_metadata,
+                    options: &options,
+                    repo: &repo,
+                    budget_ledger: &budget_ledger,
+                    artifact_writer,
+                    checkpoint_writer: &mut checkpoint_writer,
+                    run_dir: &run_dir,
+                },
+                *failure,
+            );
+        }
+    };
     let budget_config = &plan_metadata.run_budget;
     let mut sync_store_slot = None;
     let mut semantic_store_slot = None;
@@ -1760,7 +1864,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     let external_containment_failed = collected.external_containment_failed;
     let mut final_report = build_supervisor_final_report(SupervisorFinalReportConstruction {
         plan: &plan,
-        runtime_model_catalog: &runtime_model_catalog,
+        runtime_model_catalog: Some(&runtime_model_catalog),
         run_id: options.run_id,
         report_plan_file,
         report_run_dir,
@@ -2104,7 +2208,7 @@ mod decomposition_tests {
     ) -> SupervisorFinalReportConstruction<'_> {
         SupervisorFinalReportConstruction {
             plan,
-            runtime_model_catalog: &TEST_RUNTIME_MODEL_CATALOG,
+            runtime_model_catalog: Some(&TEST_RUNTIME_MODEL_CATALOG),
             run_id,
             report_plan_file: PathBuf::from("plan.json"),
             report_run_dir: PathBuf::from(".maco/o2/runs/test"),
@@ -2406,31 +2510,36 @@ mod decomposition_tests {
     }
 
     #[test]
-    fn preflight_retains_runtime_catalog_error_context() {
+    fn preflight_preserves_typed_runtime_catalog_failure_for_materialization() {
+        let (_temp, repo) = test_repository();
         let loaded = LoadedSupervisorPlan {
             plan: test_plan(Vec::new()),
             consultant: SupervisorConsultantPlan::default(),
             assignment_metadata: AssignmentMetadata::new(),
             plan_metadata: SupervisorPlanMetadata::default(),
         };
-        let options = test_options(Path::new("/does/not/need/to/exist"), "direct-preflight");
+        let options = test_options(&repo, "direct-preflight");
+        let failure = Box::new(EnvironmentFailure::runtime_model_catalog(
+            "catalog probe failed".to_string(),
+        ));
 
-        let result = prepare_supervisor_run(
+        let prepared = prepare_supervisor_run(
             loaded,
             &options,
             1,
             SupervisorExecutionRuntime::NonpublishableSimulation,
             SupervisorWorktreeCreation::TestOnly,
-            Err(anyhow!("catalog probe failed")),
-        );
-        let error = match result {
-            Ok(_) => panic!("catalog failure must stop before repository discovery"),
-            Err(error) => error,
-        };
+            Err(failure.clone()),
+        )
+        .expect("typed catalog failure must survive preparation for final-report materialization");
+        let retained = prepared
+            .runtime_model_catalog
+            .expect_err("catalog failure must remain typed until supervisor finalization");
 
+        assert_eq!(retained, failure);
         assert_eq!(
-            format!("{error:#}"),
-            "runtime model availability could not be established; refusing supervisor dispatch: catalog probe failed"
+            retained.category,
+            EnvironmentFailureCategory::RuntimeModelCatalogUnavailable
         );
     }
 

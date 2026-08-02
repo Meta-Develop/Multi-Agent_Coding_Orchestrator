@@ -426,6 +426,9 @@ fn environment_failure_category_name(category: EnvironmentFailureCategory) -> &'
         EnvironmentFailureCategory::NetworkForbidden => "network_forbidden",
         EnvironmentFailureCategory::SandboxUnavailable => "sandbox_unavailable",
         EnvironmentFailureCategory::ProbeFailed => "probe_failed",
+        EnvironmentFailureCategory::RuntimeModelCatalogUnavailable => {
+            "runtime_model_catalog_unavailable"
+        }
     }
 }
 
@@ -484,6 +487,18 @@ fn sanitize_environment_failure(mut failure: EnvironmentFailure) -> EnvironmentF
                 "inspect the fixed preflight probe evidence and correct the project or host environment before rerunning"
                     .to_string(),
         }],
+        EnvironmentFailureCategory::RuntimeModelCatalogUnavailable => vec![
+            EnvironmentRemediation {
+                scope: EnvironmentRemediationScope::CapabilityPolicy,
+                guidance: "restore the trusted system Codex runtime-catalog path and verified confinement; do not substitute a custom executable or broaden the sandbox"
+                    .to_string(),
+            },
+            EnvironmentRemediation {
+                scope: EnvironmentRemediationScope::CredentialConfiguration,
+                guidance: "validate the existing Codex auth source without copying secret material into the repository or plan"
+                    .to_string(),
+            },
+        ],
     };
     failure
 }

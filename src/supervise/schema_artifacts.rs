@@ -831,7 +831,8 @@ fn environment_failure_schema_value() -> serde_json::Value {
                     "missing_credential",
                     "network_forbidden",
                     "sandbox_unavailable",
-                    "probe_failed"
+                    "probe_failed",
+                    "runtime_model_catalog_unavailable"
                 ]
             },
             "requirement": environment_requirement_schema_value(),
