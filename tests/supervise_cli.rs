@@ -25,17 +25,12 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
 };
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
-const SUPERVISE_RUN_UNSUPPORTED: &str =
-    "supervisor assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input";
-const UNUSED_MACHINE_GLOBAL_CONFIG: &str = "/tmp/maco-supervise-cli-test-machine-global.json";
-const UNUSED_MACHINE_GLOBAL_RUNTIME_ROOT_ID: &str = "runtime";
-
 #[test]
 fn field_guide_suggestion_public_contract_accepts_content_only_and_rejects_provenance() -> Result<()>
 {
@@ -68,7 +63,8 @@ fn fake_runtime_never_executes_codex_bin_or_task_text_and_is_never_publishable()
     let head_before = repo.head()?.target().context("HEAD target")?;
     let index_path = repo.path().join("index");
     let index_before = fs::read(&index_path).context("read index")?;
-    let scratch = repo_path.join("preexisting-untracked.txt");
+    let scratch = repo_path.join(".maco/preexisting-runtime.txt");
+    fs::create_dir_all(scratch.parent().context("runtime scratch parent")?)?;
     fs::write(&scratch, "preserve\n").context("write scratch")?;
 
     let script_marker = temp.path().join("malicious-script-ran");
@@ -99,7 +95,7 @@ fn fake_runtime_never_executes_codex_bin_or_task_text_and_is_never_publishable()
     });
     fs::write(&plan_path, serde_json::to_vec_pretty(&plan)?)?;
 
-    let stderr = run_failure_stderr(&[
+    let report = run_success_json(&[
         "supervise",
         "run",
         path_str(&plan_path)?,
@@ -114,7 +110,9 @@ fn fake_runtime_never_executes_codex_bin_or_task_text_and_is_never_publishable()
         "--allow-dirty-primary",
         "--json",
     ])?;
-    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
+    assert_eq!(report["runtime"], "fake");
+    assert_eq!(report["success"], true);
+    assert_eq!(report["publishable"], false);
     assert!(!script_marker.exists());
     assert!(!network_marker.exists());
     assert!(!task_marker.exists());
@@ -125,12 +123,13 @@ fn fake_runtime_never_executes_codex_bin_or_task_text_and_is_never_publishable()
     assert_eq!(fs::read_to_string(&scratch)?, "preserve\n");
     assert_eq!(fs::read(&index_path)?, index_before);
     assert_eq!(repo.head()?.target(), Some(head_before));
-    assert!(!repo_path
+    assert!(repo_path
         .join(".maco/o2/runs/deterministic-fake-invariant")
         .exists());
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn deterministic_fake_cli_emits_stable_shape_artifacts_and_cleans_claims() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
@@ -148,7 +147,7 @@ fn deterministic_fake_cli_emits_stable_shape_artifacts_and_cleans_claims() -> Re
         }))?,
     )?;
 
-    let stderr = run_failure_stderr(&[
+    let report = run_success_json(&[
         "supervise",
         "run",
         path_str(&plan_path)?,
@@ -158,14 +157,22 @@ fn deterministic_fake_cli_emits_stable_shape_artifacts_and_cleans_claims() -> Re
         "deterministic-shape",
         "--runtime",
         "fake",
+        "--max-concurrent-children",
+        "1",
         "--json",
     ])?;
-    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
+    assert_eq!(report["runtime"], "fake");
+    assert_eq!(report["success"], true);
+    assert_eq!(report["publishable"], false);
+    assert_eq!(
+        report["orchestrator_reports"].as_array().map(Vec::len),
+        Some(2)
+    );
     let final_report =
         repo_path.join(".maco/o2/runs/deterministic-shape/reports/supervisor-final.json");
-    assert!(!final_report.exists());
+    assert!(final_report.exists());
     let run_root = repo_path.join(".maco/o2/runs/deterministic-shape");
-    assert!(!run_root.exists());
+    assert!(run_root.exists());
 
     let claims = run_success_json(&["sync", "status", "--repo", path_str(&repo_path)?, "--json"])?;
     assert!(claims.as_array().context("claim status")?.is_empty());
@@ -225,7 +232,7 @@ fn codex_runtime_custom_bin_fails_closed_and_cannot_mutate_primary() -> Result<(
         assert!(
             stderr.contains("process-tree ownership")
                 || stderr.contains("containment guardian")
-                || stderr.contains(SUPERVISE_RUN_UNSUPPORTED),
+                || stderr.contains("verified writable external Codex execution is disabled"),
             "unexpected fail-closed stderr: {stderr}"
         );
     }
@@ -748,7 +755,7 @@ fn supervise_run_rejects_zero_bound_before_reserving_state_and_accepts_one() -> 
     let claims = run_success_json(&["sync", "status", "--repo", path_str(&repo_path)?, "--json"])?;
     assert!(claims.as_array().context("claim status")?.is_empty());
 
-    let one_stderr = run_failure_stderr(&[
+    let one = run_success_json(&[
         "supervise",
         "run",
         path_str(&plan_path)?,
@@ -762,18 +769,19 @@ fn supervise_run_rejects_zero_bound_before_reserving_state_and_accepts_one() -> 
         "1",
         "--json",
     ])?;
-    assert!(one_stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
-    assert!(!repo_path.join(".maco/o2/runs/bounded-one").exists());
+    assert_eq!(one["success"], true);
+    assert_eq!(one["runtime"], "fake");
+    assert!(repo_path.join(".maco/o2/runs/bounded-one").exists());
     Ok(())
 }
 
 #[test]
-fn supervise_run_accepts_concurrent_bound_before_fake_runtime_safety_refusal() -> Result<()> {
+fn supervise_run_executes_fake_runtime_with_explicit_and_auto_concurrency() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("concurrent-run.json");
     write_simple_plan(&plan_path, "concurrent-child")?;
-    let stderr = run_failure_stderr(&[
+    let explicit = run_success_json(&[
         "supervise",
         "run",
         path_str(&plan_path)?,
@@ -787,13 +795,15 @@ fn supervise_run_accepts_concurrent_bound_before_fake_runtime_safety_refusal() -
         "2",
         "--json",
     ])?;
-    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
-    assert!(!repo_path.join(".maco/o2/runs/bounded-two").exists());
+    assert_eq!(explicit["success"], true);
+    assert!(repo_path.join(".maco/o2/runs/bounded-two").exists());
 
-    let auto_stderr = run_failure_stderr(&[
+    let auto_plan_path = temp.path().join("auto-run.json");
+    write_simple_plan(&auto_plan_path, "auto-child")?;
+    let automatic = run_success_json(&[
         "supervise",
         "run",
-        path_str(&plan_path)?,
+        path_str(&auto_plan_path)?,
         "--repo",
         path_str(&repo_path)?,
         "--run-id",
@@ -804,8 +814,8 @@ fn supervise_run_accepts_concurrent_bound_before_fake_runtime_safety_refusal() -
         "auto",
         "--json",
     ])?;
-    assert!(auto_stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
-    assert!(!repo_path.join(".maco/o2/runs/bounded-auto").exists());
+    assert_eq!(automatic["success"], true);
+    assert!(repo_path.join(".maco/o2/runs/bounded-auto").exists());
     Ok(())
 }
 
@@ -827,10 +837,10 @@ fn supervise_run_id_reuse_is_refused_and_artifacts_remain_collectable() -> Resul
         "fake",
         "--json",
     ];
-    let first = run_failure_stderr(&args)?;
-    assert!(first.contains(SUPERVISE_RUN_UNSUPPORTED));
+    let first = run_success_json(&args)?;
+    assert_eq!(first["success"], true);
     let second = run_failure_stderr(&args)?;
-    assert!(second.contains(SUPERVISE_RUN_UNSUPPORTED));
+    assert!(second.contains("already exists"));
 
     let status = run_success_json(&[
         "supervise",
@@ -840,10 +850,10 @@ fn supervise_run_id_reuse_is_refused_and_artifacts_remain_collectable() -> Resul
         path_str(&repo_path)?,
         "--json",
     ])?;
-    assert_eq!(status["final_report_exists"], false);
+    assert_eq!(status["final_report_exists"], true);
     assert_eq!(status["repo"], ".");
     assert_eq!(status["run_dir"], ".maco/o2/runs/artifact-run");
-    assert!(status["final_report"].is_null());
+    assert_eq!(status["final_report"]["success"], true);
     Ok(())
 }
 
@@ -870,7 +880,7 @@ fn fake_prompt_keeps_role_assignment_and_consultant_contract_as_data() -> Result
             }]
         }))?,
     )?;
-    let stderr = run_failure_stderr(&[
+    let report = run_success_json(&[
         "supervise",
         "run",
         path_str(&plan_path)?,
@@ -882,11 +892,13 @@ fn fake_prompt_keeps_role_assignment_and_consultant_contract_as_data() -> Result
         "fake",
         "--json",
     ])?;
-    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
+    assert_eq!(report["success"], true);
     let prompt = fs::read_to_string(
         repo_path.join(".maco/o2/runs/prompt-contract/assignments/prompt-child.prompt.md"),
-    );
-    assert!(prompt.is_err());
+    )?;
+    assert!(prompt.contains("child override $(touch must-not-run)"));
+    assert!(prompt.contains("terminal worker/researcher"));
+    assert!(prompt.contains("no_further_delegation"));
     assert!(!repo_path.join("must-not-run").exists());
     Ok(())
 }
@@ -898,7 +910,7 @@ fn supervise_generates_run_ids_refuses_reuse_and_lists_artifacts() -> Result<()>
     let plan_path = temp.path().join("generated-id.json");
     write_simple_plan(&plan_path, "generated-child")?;
 
-    let stderr = run_failure_stderr(&[
+    let report = run_success_json(&[
         "supervise",
         "run",
         path_str(&plan_path)?,
@@ -908,7 +920,8 @@ fn supervise_generates_run_ids_refuses_reuse_and_lists_artifacts() -> Result<()>
         "fake",
         "--json",
     ])?;
-    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
+    let run_id = report["run_id"].as_str().context("generated run id")?;
+    assert!(run_id.starts_with("o2-"));
 
     let listed = run_success_json(&[
         "supervise",
@@ -918,7 +931,7 @@ fn supervise_generates_run_ids_refuses_reuse_and_lists_artifacts() -> Result<()>
         path_str(&repo_path)?,
         "--json",
     ])?;
-    assert!(listed["runs"].as_array().context("runs")?.is_empty());
+    assert_eq!(listed["runs"].as_array().context("runs")?.len(), 1);
     Ok(())
 }
 
@@ -1021,7 +1034,7 @@ fn supervise_run_reports_sync_claim_conflict_owner_and_paths() -> Result<()> {
     ])?;
     assert_eq!(claim["agent_id"], "stale-agent");
 
-    let stderr = run_failure_stderr(&[
+    let report = run_failure_json(&[
         "supervise",
         "run",
         path_str(&plan_path)?,
@@ -1033,7 +1046,15 @@ fn supervise_run_reports_sync_claim_conflict_owner_and_paths() -> Result<()> {
         "fake",
         "--json",
     ])?;
-    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
+    assert_eq!(report["success"], false);
+    assert_eq!(
+        report["gate_denials"][0]["reason"]["family"],
+        "claim_conflict"
+    );
+    assert_eq!(
+        report["gate_denials"][0]["context"]["paths"],
+        serde_json::json!(["README.md"])
+    );
     let claims = run_success_json(&["sync", "status", "--repo", path_str(&repo_path)?, "--json"])?;
     assert!(claims
         .as_array()
@@ -1049,7 +1070,7 @@ fn supervise_run_refuses_clean_stale_reused_child_worktree_before_execution() ->
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("stale-worktree.json");
     write_simple_plan(&plan_path, "child-clean")?;
-    let first = run_failure_stderr(&[
+    let first = run_success_json(&[
         "supervise",
         "run",
         path_str(&plan_path)?,
@@ -1061,12 +1082,12 @@ fn supervise_run_refuses_clean_stale_reused_child_worktree_before_execution() ->
         "fake",
         "--json",
     ])?;
-    assert!(first.contains(SUPERVISE_RUN_UNSUPPORTED));
+    assert_eq!(first["success"], true);
     fs::write(repo_path.join("README.md"), "# advanced\n")?;
     let repo = Repository::open(&repo_path)?;
     commit_all(&repo, "advance primary")?;
 
-    let stderr = run_failure_stderr(&[
+    let report = run_failure_json(&[
         "supervise",
         "run",
         path_str(&plan_path)?,
@@ -1078,11 +1099,11 @@ fn supervise_run_refuses_clean_stale_reused_child_worktree_before_execution() ->
         "fake",
         "--json",
     ])?;
-    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
+    assert!(serde_json::to_string(&report)?.contains("stale-base"));
     assert!(!repo_path
         .join(".maco/o2/runs/clean-stale/evidence/incoming/child-clean.json")
         .exists());
-    assert!(!repo_path.join(".maco/o2/runs/clean-stale").exists());
+    assert!(repo_path.join(".maco/o2/runs/clean-first").exists());
     Ok(())
 }
 
@@ -1152,6 +1173,7 @@ fn supervise_plan_enforces_depth_assignment_and_retry_bounds() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn supervise_primary_git_snapshots_ignore_ambient_repository_redirects() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
@@ -1163,12 +1185,22 @@ fn supervise_primary_git_snapshots_ignore_ambient_repository_redirects() -> Resu
     let trace = temp.path().join("git-trace.log");
     let trace2 = temp.path().join("git-trace2.json");
     let redirected = temp.path().join("git-stderr.log");
-    let mut command = command_with_test_machine_global_binding(BIN, &["supervise", "run"]);
+    let mut command = command_with_test_machine_global_binding(
+        BIN,
+        &[
+            "supervise",
+            "run",
+            path_str(&plan_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "ambient-git",
+            "--runtime",
+            "fake",
+            "--json",
+        ],
+    );
     let output = command
-        .arg(&plan_path)
-        .arg("--repo")
-        .arg(&repo_path)
-        .args(["--run-id", "ambient-git", "--runtime", "fake", "--json"])
         .env("GIT_DIR", decoy_path.join(".git"))
         .env("GIT_WORK_TREE", &decoy_path)
         .env("GIT_INDEX_FILE", temp.path().join("ambient-index"))
@@ -1180,8 +1212,11 @@ fn supervise_primary_git_snapshots_ignore_ambient_repository_redirects() -> Resu
         .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
         .env("GIT_CONFIG_VALUE_0", "unsafe-fsmonitor")
         .output()?;
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains(SUPERVISE_RUN_UNSUPPORTED));
+    assert!(
+        output.status.success(),
+        "fake supervise run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!trace.exists());
     assert!(!trace2.exists());
     assert!(!redirected.exists());
@@ -1265,21 +1300,71 @@ fn run_failure_stderr(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
+fn run_failure_json(args: &[&str]) -> Result<Value> {
+    let output = command_with_test_machine_global_binding(BIN, args)
+        .output()
+        .context("run maco")?;
+    if output.status.success() {
+        anyhow::bail!("maco command unexpectedly succeeded");
+    }
+    serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "parse failed-run JSON: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
 fn command_with_test_machine_global_binding(bin: impl AsRef<Path>, args: &[&str]) -> Command {
     let mut command = Command::new(bin.as_ref());
     command.args(args);
     if args.first() == Some(&"supervise") && args.get(1) == Some(&"run") {
-        // These fixtures are expected to refuse before external staging exists, so the
-        // config need not be opened. Supplying both values keeps their tested refusal
-        // boundary behind the production all-or-none CLI contract.
-        command.args([
-            "--machine-global-config",
-            UNUSED_MACHINE_GLOBAL_CONFIG,
-            "--machine-global-runtime-root-id",
-            UNUSED_MACHINE_GLOBAL_RUNTIME_ROOT_ID,
-        ]);
+        let repo = args
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--repo").then_some(Path::new(pair[1])))
+            .expect("supervise run test command must name --repo");
+        let config = write_test_machine_global_config(repo)
+            .expect("write supervise CLI machine-global config");
+        command
+            .arg("--machine-global-config")
+            .arg(config)
+            .args(["--machine-global-runtime-root-id", "runtime"]);
     }
     command
+}
+
+#[cfg(target_os = "linux")]
+fn write_test_machine_global_config(repo: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let fixture_root = repo.parent().context("test repository parent")?;
+    let state_root = fixture_root.join("supervise-machine-global-state");
+    fs::create_dir_all(&state_root)?;
+    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))?;
+    let uid = fs::metadata("/proc/self")?.uid();
+    let runtime_root = PathBuf::from(format!("/run/user/{uid}"));
+    let config = fixture_root.join("supervise-machine-global.json");
+    fs::write(
+        &config,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "state_root": state_root,
+            "roots": [{
+                "id": "runtime",
+                "path": runtime_root,
+                "protected_paths": [],
+                "quarantine_grace_seconds": 60
+            }]
+        }))?,
+    )?;
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
+    Ok(config)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_test_machine_global_config(repo: &Path) -> Result<PathBuf> {
+    Ok(repo.join("unsupported-machine-global-config"))
 }
 
 fn create_committed_repo(root: &Path) -> Result<std::path::PathBuf> {

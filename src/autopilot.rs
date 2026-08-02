@@ -1,7 +1,9 @@
 use crate::{
     artifacts::{ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, RunArtifactFamily},
+    gate_denial::{GateCheckSource, GateDenial},
     live_claim::{self, LiveClock},
     llm::Redactor,
+    machine_global::MachineGlobalRetentionBinding,
     merge::{
         ApplyBlocker, ApplyReadinessStatus, BoundValidationEvidenceBundle,
         CandidateValidationBinding, SafetyCheckStatus, ValidationEvidenceBundle, ValidationReport,
@@ -193,7 +195,7 @@ pub enum AutopilotPublishMode {
     ReadyForReview,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AutopilotFinalReport {
     pub version: u32,
     pub run_id: RunId,
@@ -206,6 +208,11 @@ pub struct AutopilotFinalReport {
     pub reports_created: AutopilotReportsCreated,
     pub plan: AutopilotPlanSummary,
     pub safety: AutopilotSafetyReport,
+    #[serde(default)]
+    pub gate_denials: Vec<GateDenial>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor: Option<SupervisorFinalReport>,
+    pub primary_worktree_untouched: bool,
     pub validation: AutopilotValidationSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<SanitizedPrReport>,
@@ -216,6 +223,7 @@ pub struct AutopilotFinalReport {
     pub check_status: AutopilotCheckStatus,
     pub auto_merge_requested: bool,
     pub auto_merge_performed: bool,
+    pub generated_follow_up_dispatch_performed: bool,
     pub next_action: String,
 }
 
@@ -264,27 +272,7 @@ pub struct AutopilotPlanSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AutopilotSafetyReport {
     pub refused: bool,
-    pub refusals: Vec<AutopilotSafetyRefusal>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct AutopilotSafetyRefusal {
-    pub kind: String,
-    pub message: String,
-    pub paths: Vec<PathBuf>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub lock_details: Vec<AutopilotLockRefusalDetail>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct AutopilotLockRefusalDetail {
-    pub path: PathBuf,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claim_id: Option<String>,
+    pub gate_denials: Vec<GateDenial>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -478,8 +466,246 @@ pub fn autopilot_plan_from_task_file(
     )
 }
 
-pub fn run_autopilot_plan_file(_options: AutopilotRunOptions) -> Result<AutopilotFinalReport> {
-    Err(effectful_autopilot_unavailable_error())
+pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<AutopilotFinalReport> {
+    run_autopilot_plan_file_with_retention(options, None)
+}
+
+pub fn run_autopilot_plan_file_with_retention(
+    options: AutopilotRunOptions,
+    machine_global_retention: Option<MachineGlobalRetentionBinding>,
+) -> Result<AutopilotFinalReport> {
+    let machine_global_retention = machine_global_retention.context(
+        "autopilot run requires --machine-global-config and \
+         --machine-global-runtime-root-id for supervise output-staging cleanup",
+    )?;
+    if options.reviewer_command.is_some() {
+        bail!(
+            "--reviewer-command belongs to the disabled legacy publication loop and cannot be used by the supervise-backed autopilot spine"
+        );
+    }
+
+    let repo = discover_repo_root(&options.repo)?;
+    let plan = autopilot_plan_from_task_file(&repo, &options.plan_file)?;
+    if let Some(source) = &plan.external_source {
+        publication::revalidate_external_source(&repo, source)
+            .context("autopilot source changed immediately before supervised work")?;
+    }
+    let safety = safety_report(
+        &repo,
+        &options.run_id,
+        options.allow_dirty_primary,
+        &plan.assigned_paths,
+    )?;
+    let repository_bindings = RepositoryPathBindings::bind(&repo)?;
+    verify_after_autopilot_safety(&repository_bindings)?;
+
+    let artifacts = artifact_paths();
+    let mut artifact_writer = ArtifactRunWriter::reserve(
+        &repo,
+        RunArtifactFamily::Autopilot,
+        options.run_id.clone(),
+        "autopilot",
+    )?;
+    let run_dir = artifact_writer.run_dir().to_path_buf();
+    write_private_json(&mut artifact_writer, &artifacts.plan, &plan)?;
+
+    if safety.refused {
+        write_skipped_stage_reports(&mut artifact_writer, "typed_preflight_gate_denial")?;
+        let gate_denials = safety.gate_denials.clone();
+        let report = final_report(FinalReportInput {
+            run_id: &options.run_id,
+            status: AutopilotRunStatus::Refused,
+            attempt_count: 0,
+            max_repair_attempts: plan.max_repair_attempts,
+            artifacts,
+            plan: plan_summary(&plan),
+            safety,
+            validation: skipped_autopilot_validation(),
+            pr: None,
+            review: None,
+            attempts: Vec::new(),
+            supervisor: None,
+            gate_denials,
+            primary_worktree_untouched: false,
+            next_action: "correct the typed preflight denial, then start a new autopilot run",
+            auto_merge_requested: plan.auto_merge,
+        });
+        write_private_json(&mut artifact_writer, "final-report.json", &report)?;
+        artifact_writer.finalize("final-report.json", false)?;
+        return Ok(report);
+    }
+
+    // The first safety capture precedes artifact reservation. Recheck every
+    // launch guard after those local writes so a concurrent claim or primary
+    // change cannot hide in the preflight-to-dispatch window.
+    let pre_dispatch_bindings = RepositoryPathBindings::bind(&repo)?;
+    let pre_dispatch_safety = safety_report(
+        &repo,
+        &options.run_id,
+        options.allow_dirty_primary,
+        &plan.assigned_paths,
+    )?;
+    pre_dispatch_bindings
+        .verify()
+        .context("repository changed immediately before supervisor start")?;
+    if pre_dispatch_safety.refused {
+        write_skipped_stage_reports(&mut artifact_writer, "typed_pre_dispatch_gate_denial")?;
+        let gate_denials = pre_dispatch_safety.gate_denials.clone();
+        let report = final_report(FinalReportInput {
+            run_id: &options.run_id,
+            status: AutopilotRunStatus::Refused,
+            attempt_count: 0,
+            max_repair_attempts: plan.max_repair_attempts,
+            artifacts,
+            plan: plan_summary(&plan),
+            safety: pre_dispatch_safety,
+            validation: skipped_autopilot_validation(),
+            pr: None,
+            review: None,
+            attempts: Vec::new(),
+            supervisor: None,
+            gate_denials,
+            primary_worktree_untouched: false,
+            next_action:
+                "correct the typed denial observed immediately before dispatch, then start a new autopilot run",
+            auto_merge_requested: plan.auto_merge,
+        });
+        write_private_json(&mut artifact_writer, "final-report.json", &report)?;
+        artifact_writer.finalize("final-report.json", false)?;
+        return Ok(report);
+    }
+
+    let agent_id = attempt_agent_id(&options.run_id, 1)?;
+    let supervisor_run_id = RunId::new(format!("{}-supervise", options.run_id.as_str()))?;
+    let supervisor_plan = supervisor_plan_for_attempt(&plan, &agent_id, 1, &[]);
+    let supervisor_plan_relative = PathBuf::from("supervisor-plan.json");
+    write_private_json(
+        &mut artifact_writer,
+        &supervisor_plan_relative,
+        &supervisor_plan,
+    )?;
+    let supervisor_plan_path = run_dir.join(&supervisor_plan_relative);
+    let (codex_bin, runtime) = match options.codex_bin {
+        Some(codex_bin) => (codex_bin, SupervisorRuntime::Codex),
+        None => (PathBuf::from("codex-not-executed"), SupervisorRuntime::Fake),
+    };
+    let mut attempt = AutopilotAttemptSummary {
+        attempt: 1,
+        supervisor_run_id: supervisor_run_id.as_str().to_string(),
+        agent_id,
+        supervisor_status: "pending".to_string(),
+        validation_status: AutopilotValidationStatus::Skipped,
+        pr_status: None,
+        review_status: None,
+        blocking_findings: 0,
+        prepared_candidate_binding: None,
+        reviewed_candidate: None,
+        publication_authorized: false,
+        publication_attempted: false,
+        publication_effect_observed: false,
+        prepublication_stage: "not_dispatched_manual_integration".to_string(),
+        repair_reason: None,
+    };
+    let supervisor = match supervise::run_supervisor_plan_file(SupervisorRunOptions {
+        repo: repo.clone(),
+        plan_file: supervisor_plan_path,
+        run_id: supervisor_run_id,
+        codex_bin,
+        runtime,
+        // Autopilot's own authenticated artifacts are local runtime state. The
+        // outer typed dirty-primary gate already handled operator worktree state.
+        allow_dirty_primary: true,
+        machine_global_retention: Some(machine_global_retention),
+    }) {
+        Ok(supervisor) => supervisor,
+        Err(error) => {
+            attempt.supervisor_status = "failed".to_string();
+            write_failed_report(
+                &mut artifact_writer,
+                "supervisor-report.json",
+                "supervisor_entry_failed",
+                &sanitize_text(&repo, &format!("{error:#}")),
+            )?;
+            write_skipped_report(
+                &mut artifact_writer,
+                "pr-report.json",
+                "manual_integration_only",
+            )?;
+            write_skipped_report(
+                &mut artifact_writer,
+                "review-report.json",
+                "manual_integration_only",
+            )?;
+            let report = final_report(FinalReportInput {
+                run_id: &options.run_id,
+                status: AutopilotRunStatus::Failed,
+                attempt_count: 1,
+                max_repair_attempts: plan.max_repair_attempts,
+                artifacts,
+                plan: plan_summary(&plan),
+                safety: pre_dispatch_safety,
+                validation: skipped_autopilot_validation(),
+                pr: None,
+                review: None,
+                attempts: vec![attempt],
+                supervisor: None,
+                gate_denials: Vec::new(),
+                primary_worktree_untouched: false,
+                next_action:
+                    "inspect the supervisor entry failure; no publication, merge, or follow-up dispatch was attempted",
+                auto_merge_requested: plan.auto_merge,
+            });
+            write_private_json(&mut artifact_writer, "final-report.json", &report)?;
+            artifact_writer.finalize("final-report.json", false)?;
+            return Ok(report);
+        }
+    };
+
+    attempt.supervisor_status = review_status_label(supervisor.status).to_string();
+    write_private_json(&mut artifact_writer, "supervisor-report.json", &supervisor)?;
+    write_skipped_report(
+        &mut artifact_writer,
+        "pr-report.json",
+        "manual_integration_only",
+    )?;
+    write_skipped_report(
+        &mut artifact_writer,
+        "review-report.json",
+        "manual_integration_only",
+    )?;
+    let status = if supervisor.success {
+        AutopilotRunStatus::Succeeded
+    } else {
+        AutopilotRunStatus::Failed
+    };
+    let gate_denials = supervisor.gate_denials.clone();
+    let primary_worktree_untouched = supervisor.success;
+    let next_action = if supervisor.success {
+        "inspect the isolated supervise result and use explicit human-approved arbitration or merge preview/apply; autopilot performed no publication, merge, or follow-up dispatch"
+    } else {
+        "inspect the typed supervisor denials and environment failures; autopilot performed no publication, merge, or follow-up dispatch"
+    };
+    let report = final_report(FinalReportInput {
+        run_id: &options.run_id,
+        status,
+        attempt_count: 1,
+        max_repair_attempts: plan.max_repair_attempts,
+        artifacts,
+        plan: plan_summary(&plan),
+        safety: pre_dispatch_safety,
+        validation: skipped_autopilot_validation(),
+        pr: None,
+        review: None,
+        attempts: vec![attempt],
+        supervisor: Some(supervisor),
+        gate_denials,
+        primary_worktree_untouched,
+        next_action,
+        auto_merge_requested: plan.auto_merge,
+    });
+    write_private_json(&mut artifact_writer, "final-report.json", &report)?;
+    artifact_writer.finalize("final-report.json", false)?;
+    Ok(report)
 }
 
 pub(crate) fn effectful_autopilot_unavailable_error() -> anyhow::Error {
@@ -511,11 +737,17 @@ fn run_autopilot_plan_file_disabled_legacy(
     let run_dir = artifact_writer.run_dir().to_path_buf();
     write_private_json(&mut artifact_writer, &artifacts.plan, &plan)?;
 
-    let safety = safety_report(&repo, options.allow_dirty_primary, &plan.assigned_paths)?;
+    let safety = safety_report(
+        &repo,
+        &options.run_id,
+        options.allow_dirty_primary,
+        &plan.assigned_paths,
+    )?;
     let repository_bindings = RepositoryPathBindings::bind(&repo)?;
     verify_after_autopilot_safety(&repository_bindings)?;
     if safety.refused {
         write_skipped_stage_reports(&mut artifact_writer, "safety_refusal")?;
+        let gate_denials = safety.gate_denials.clone();
         let validation = AutopilotValidationSummary {
             status: AutopilotValidationStatus::Skipped,
             reports: Vec::new(),
@@ -532,6 +764,9 @@ fn run_autopilot_plan_file_disabled_legacy(
             pr: None,
             review: None,
             attempts: Vec::new(),
+            supervisor: None,
+            gate_denials,
+            primary_worktree_untouched: false,
             next_action:
                 "resolve the safety refusal, then rerun autopilot; a human reviews and merges manually",
             auto_merge_requested: plan.auto_merge,
@@ -833,6 +1068,9 @@ fn run_autopilot_plan_file_disabled_legacy(
         pr: last_pr,
         review: last_review,
         attempts,
+        supervisor: None,
+        gate_denials: Vec::new(),
+        primary_worktree_untouched: false,
         next_action: &next_action,
         auto_merge_requested: plan.auto_merge,
     });
@@ -1056,45 +1294,41 @@ fn validate_autopilot_path_shape(path: &Path, label: &str) -> Result<()> {
 
 fn safety_report(
     repo: &Path,
+    run_id: &RunId,
     allow_dirty_primary: bool,
     target_paths: &[PathBuf],
 ) -> Result<AutopilotSafetyReport> {
-    let mut refusals = Vec::new();
+    let mut gate_denials = Vec::new();
     if !allow_dirty_primary {
         let dirty_paths = dirty_primary_paths(repo)?;
         if !dirty_paths.is_empty() {
-            refusals.push(AutopilotSafetyRefusal {
-                kind: "dirty_primary".to_string(),
-                message: "primary worktree has local changes".to_string(),
-                paths: dirty_paths,
-                lock_details: Vec::new(),
-            });
+            gate_denials.push(GateDenial::from_apply_blocker(
+                run_id.as_str(),
+                "maco-autopilot",
+                GateCheckSource::PrimaryDrift,
+                ApplyBlocker::DirtyPrimary,
+                dirty_paths,
+            )?);
         }
     }
 
     let sync_claims = SyncStore::open(repo)?.snapshot()?;
-    let mut sync_details = Vec::new();
+    let mut sync_paths = Vec::new();
     for claim in &sync_claims {
         for path in planning::any_path_overlaps(target_paths, &claim.paths) {
-            sync_details.push(AutopilotLockRefusalDetail {
-                path,
-                owner: Some(claim.agent_id.clone()),
-                token: Some(claim.token.get()),
-                claim_id: None,
-            });
+            sync_paths.push(path);
         }
     }
-    if !sync_details.is_empty() {
-        refusals.push(AutopilotSafetyRefusal {
-            kind: "active_sync_claims".to_string(),
-            message: "active durable sync claims overlap autopilot target paths".to_string(),
-            paths: detail_paths(&sync_details),
-            lock_details: sync_details,
-        });
+    if !sync_paths.is_empty() {
+        gate_denials.push(GateDenial::from_claim_conflict(
+            run_id.as_str(),
+            "maco-autopilot",
+            sorted_paths(sync_paths),
+        )?);
     }
 
     let semantic_intents = SemanticIntentStore::open(repo)?.snapshot()?;
-    let mut semantic_details = Vec::new();
+    let mut semantic_paths = Vec::new();
     for intent in &semantic_intents {
         let related_paths = intent
             .paths
@@ -1105,56 +1339,41 @@ fn safety_report(
             .into_iter()
             .collect::<Vec<_>>();
         for path in planning::any_path_overlaps(target_paths, &related_paths) {
-            semantic_details.push(AutopilotLockRefusalDetail {
-                path,
-                owner: Some(intent.agent_id.clone()),
-                token: Some(intent.token.get()),
-                claim_id: None,
-            });
+            semantic_paths.push(path);
         }
     }
-    if !semantic_details.is_empty() {
-        refusals.push(AutopilotSafetyRefusal {
-            kind: "active_semantic_intents".to_string(),
-            message: "active semantic coordination intents overlap autopilot target paths"
-                .to_string(),
-            paths: detail_paths(&semantic_details),
-            lock_details: semantic_details,
-        });
+    if !semantic_paths.is_empty() {
+        gate_denials.push(GateDenial::from_claim_conflict(
+            run_id.as_str(),
+            "maco-autopilot",
+            sorted_paths(semantic_paths),
+        )?);
     }
 
     let live = live_claim::status(repo, &LiveClock::now())?;
-    let mut live_details = Vec::new();
+    let mut live_paths = Vec::new();
     for claim in live.claims.into_iter().filter(|claim| claim.is_lock) {
         for path in planning::any_path_overlaps(target_paths, &claim.owned_files) {
-            live_details.push(AutopilotLockRefusalDetail {
-                path,
-                owner: claim.owner.clone(),
-                token: None,
-                claim_id: Some(claim.claim_id.clone()),
-            });
+            live_paths.push(path);
         }
     }
-    if !live_details.is_empty() {
-        refusals.push(AutopilotSafetyRefusal {
-            kind: "active_live_locks".to_string(),
-            message: "active or blocked live claim locks overlap autopilot target paths"
-                .to_string(),
-            paths: detail_paths(&live_details),
-            lock_details: live_details,
-        });
+    if !live_paths.is_empty() {
+        gate_denials.push(GateDenial::from_claim_conflict(
+            run_id.as_str(),
+            "maco-autopilot",
+            sorted_paths(live_paths),
+        )?);
     }
 
     Ok(AutopilotSafetyReport {
-        refused: !refusals.is_empty(),
-        refusals,
+        refused: !gate_denials.is_empty(),
+        gate_denials,
     })
 }
 
-fn detail_paths(details: &[AutopilotLockRefusalDetail]) -> Vec<PathBuf> {
-    details
-        .iter()
-        .map(|detail| detail.path.clone())
+fn sorted_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths
+        .into_iter()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -2138,6 +2357,9 @@ struct FinalReportInput<'a> {
     pr: Option<SanitizedPrReport>,
     review: Option<ReviewReport>,
     attempts: Vec<AutopilotAttemptSummary>,
+    supervisor: Option<SupervisorFinalReport>,
+    gate_denials: Vec<GateDenial>,
+    primary_worktree_untouched: bool,
     next_action: &'a str,
     auto_merge_requested: bool,
 }
@@ -2161,6 +2383,9 @@ fn final_report(input: FinalReportInput<'_>) -> AutopilotFinalReport {
         artifacts: input.artifacts,
         plan: input.plan,
         safety: input.safety,
+        gate_denials: input.gate_denials,
+        supervisor: input.supervisor,
+        primary_worktree_untouched: input.primary_worktree_untouched,
         validation: input.validation,
         pr: input.pr,
         review: input.review,
@@ -2174,7 +2399,15 @@ fn final_report(input: FinalReportInput<'_>) -> AutopilotFinalReport {
         },
         auto_merge_requested: input.auto_merge_requested,
         auto_merge_performed: false,
+        generated_follow_up_dispatch_performed: false,
         next_action: input.next_action.to_string(),
+    }
+}
+
+fn skipped_autopilot_validation() -> AutopilotValidationSummary {
+    AutopilotValidationSummary {
+        status: AutopilotValidationStatus::Skipped,
+        reports: Vec::new(),
     }
 }
 
@@ -2876,7 +3109,7 @@ mod tests {
     }
 
     #[test]
-    fn effectful_autopilot_fails_closed_before_any_repository_or_runtime_side_effect() {
+    fn autopilot_missing_retention_binding_fails_before_any_repository_or_runtime_side_effect() {
         let temp = tempfile::tempdir().expect("tempdir");
         let sentinel = temp.path().join("sentinel");
         fs::write(&sentinel, b"unchanged").expect("write sentinel");
@@ -2893,10 +3126,10 @@ mod tests {
             plan_file: temp.path().join("plan-must-not-be-read"),
             run_id: RunId::new("failclosed-no-effects").expect("run id"),
             codex_bin: Some(temp.path().join("worker-must-not-run")),
-            reviewer_command: Some("must-not-run".to_string()),
+            reviewer_command: None,
             allow_dirty_primary: true,
         })
-        .expect_err("effectful autopilot must be unconditionally unavailable");
+        .expect_err("autopilot must require the supervise retention binding");
 
         let after = fs::read_dir(temp.path())
             .expect("read temp after")
@@ -2909,7 +3142,7 @@ mod tests {
         assert_eq!(fs::read(&sentinel).expect("read sentinel"), b"unchanged");
         assert!(!safety_hook_called.get());
         assert!(!temp.path().join(".maco").exists());
-        assert!(format!("{error:#}").contains("capability-bound supervisor input bridge"));
+        assert!(format!("{error:#}").contains("--machine-global-config"));
     }
 
     #[cfg(unix)]
@@ -2930,6 +3163,76 @@ mod tests {
             .expect_err("repository root replacement must fail closed");
 
         assert!(format!("{error:#}").contains("repository"));
+    }
+
+    #[test]
+    fn autopilot_rechecks_dirty_primary_immediately_before_supervisor_dispatch() {
+        use crate::gate_denial::GateDenialReason;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo, "main").expect("init repo");
+        fs::write(repo.join("README.md"), "baseline\n").expect("write README");
+        let repository = Repository::open(&repo).expect("open repo");
+        let mut index = repository.index().expect("open index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("stage README");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repository.find_tree(tree_id).expect("find tree");
+        let signature =
+            git2::Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+        repository
+            .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("commit");
+        drop(tree);
+        drop(repository);
+        let plan = temp.path().join("plan.json");
+        fs::write(
+            &plan,
+            r#"{
+              "version": 1,
+              "task": {"title": "TOCTOU", "body": "Refuse drift before dispatch."},
+              "assigned_paths": ["README.md"]
+            }"#,
+        )
+        .expect("write plan");
+        let primary = repo.clone();
+        set_after_autopilot_safety_hook(move || {
+            fs::write(primary.join("README.md"), "changed after preflight\n")
+                .expect("change primary after first preflight");
+        });
+
+        let report = run_autopilot_plan_file_with_retention(
+            AutopilotRunOptions {
+                repo: repo.clone(),
+                plan_file: plan,
+                run_id: RunId::new("predispatch-primary-drift").expect("run id"),
+                codex_bin: None,
+                reviewer_command: None,
+                allow_dirty_primary: false,
+            },
+            Some(MachineGlobalRetentionBinding {
+                config: temp.path().join("must-not-open.json"),
+                root_id: "runtime".to_string(),
+                owner: "maco-autopilot".to_string(),
+                correction_correlation_id: "predispatch-primary-drift".to_string(),
+            }),
+        )
+        .expect("finalize typed pre-dispatch refusal");
+
+        assert_eq!(report.status, AutopilotRunStatus::Refused);
+        assert!(matches!(
+            report.gate_denials.as_slice(),
+            [GateDenial {
+                reason: GateDenialReason::MergeRemediation {
+                    blocker: ApplyBlocker::DirtyPrimary
+                },
+                ..
+            }]
+        ));
+        assert!(!repo.join(".maco/o2").exists());
     }
 
     #[test]

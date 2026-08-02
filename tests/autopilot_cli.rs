@@ -1,13 +1,17 @@
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 use serde_json::Value;
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 
 #[test]
-fn autopilot_run_cli_fails_closed_without_creating_effect_artifacts() -> Result<()> {
+fn autopilot_run_cli_requires_machine_global_binding_before_effect_artifacts() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let mut before = fs::read_dir(&repo_path)
@@ -16,16 +20,37 @@ fn autopilot_run_cli_fails_closed_without_creating_effect_artifacts() -> Result<
         .collect::<std::io::Result<Vec<_>>>()?;
     before.sort();
 
-    let error = run_failure_stderr(&[
-        "autopilot",
-        "run",
-        path_str(&temp.path().join("plan-must-not-be-read"))?,
-        "--repo",
-        path_str(&repo_path)?,
-        "--run-id",
-        "failclosed-no-effects",
-        "--json",
-    ])?;
+    let plan = temp.path().join("plan-must-not-be-read");
+    let config = temp.path().join("machine-global-must-not-be-opened.json");
+    let cases = [
+        (Vec::new(), "--machine-global-config"),
+        (
+            vec!["--machine-global-config", path_str(&config)?],
+            "--machine-global-runtime-root-id",
+        ),
+        (
+            vec!["--machine-global-runtime-root-id", "runtime"],
+            "--machine-global-config",
+        ),
+    ];
+    for (extra, missing_option) in cases {
+        let output = Command::new(BIN)
+            .args([
+                "autopilot",
+                "run",
+                path_str(&plan)?,
+                "--repo",
+                path_str(&repo_path)?,
+                "--run-id",
+                "failclosed-no-effects",
+                "--json",
+            ])
+            .args(extra)
+            .output()
+            .context("run autopilot with an incomplete retention binding")?;
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(missing_option));
+    }
 
     let mut after = fs::read_dir(&repo_path)
         .context("read repository after refusal")?
@@ -33,10 +58,32 @@ fn autopilot_run_cli_fails_closed_without_creating_effect_artifacts() -> Result<
         .collect::<std::io::Result<Vec<_>>>()?;
     after.sort();
     assert_eq!(before, after);
-    assert!(error.contains("capability-bound supervisor input bridge"));
     assert!(!repo_path.join(".maco/autopilot").exists());
     assert!(!repo_path.join(".maco/o2").exists());
     assert!(!repo_path.join(".agents/live").exists());
+    Ok(())
+}
+
+#[test]
+fn legacy_reviewer_command_refuses_before_autopilot_artifacts() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let stderr = run_failure_stderr(&[
+        "autopilot",
+        "run",
+        path_str(&temp.path().join("plan-must-not-be-read"))?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "disabled-reviewer-command",
+        "--reviewer-command",
+        "must-not-run",
+        "--json",
+    ])?;
+
+    assert!(stderr.contains("disabled legacy publication loop"));
+    assert!(!repo_path.join(".maco/autopilot").exists());
+    assert!(!repo_path.join(".maco/o2").exists());
     Ok(())
 }
 
@@ -141,33 +188,104 @@ fn autopilot_plan_proposes_paths_from_plain_and_empty_tasks() -> Result<()> {
 }
 
 #[test]
-fn fake_autopilot_run_creates_durable_nonpublishable_reports() -> Result<()> {
+fn fake_autopilot_depth_two_e2e_is_gated_durable_and_primary_untouched() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
-    let task_path = temp.path().join("task.md");
-    write_file(&task_path, "Update the README through fake autopilot.\n")?;
-
-    assert_autopilot_run_unsupported(
-        &[
-            "autopilot",
-            "run",
-            path_str(&task_path)?,
-            "--repo",
-            path_str(&repo_path)?,
-            "--run-id",
-            "durable",
-            "--json",
-        ],
-        &repo_path,
-        Some("durable"),
+    let task_path = temp.path().join("autopilot-plan.json");
+    write_file(
+        &task_path,
+        r#"{
+          "version": 1,
+          "task": {
+            "title": "Depth two gated run",
+            "body": "Exercise the full Fake supervise flow without applying to primary."
+          },
+          "assigned_paths": ["README.md"],
+          "auto_merge": false
+        }"#,
     )?;
-    assert!(!repo_path.join(".maco/o2").exists());
+    let repo = Repository::open(&repo_path)?;
+    let head_before = repo.head()?.target().context("primary HEAD")?;
+    let index_before = fs::read(repo.path().join("index"))?;
+    let readme_before = fs::read(repo_path.join("README.md"))?;
+    let lib_before = fs::read(repo_path.join("src/lib.rs"))?;
+    let status_before = primary_source_status_paths(&repo)?;
+
+    let report = run_success_json(&[
+        "autopilot",
+        "run",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "durable",
+        "--json",
+    ])?;
+    assert_eq!(report["success"], true);
+    assert_eq!(report["status"], "succeeded");
+    assert_eq!(report["attempt_count"], 1);
+    assert_eq!(report["supervisor"]["runtime"], "fake");
+    assert_eq!(report["supervisor"]["success"], true);
+    assert_eq!(report["supervisor"]["publishable"], false);
+    assert_eq!(report["primary_worktree_untouched"], true);
+    assert_eq!(report["auto_merge_performed"], false);
+    assert_eq!(report["generated_follow_up_dispatch_performed"], false);
+    assert_eq!(
+        report["supervisor"]["orchestrator_reports"][0]["worker_reports"][0]
+            ["no_further_delegation"],
+        true
+    );
+    assert_eq!(
+        report["supervisor"]["orchestrator_reports"][0]["audit_reports"][0]["read_only"],
+        true
+    );
+    assert!(report["supervisor"]["orchestrator_reports"][0]["review_lens_aggregate"].is_object());
+
+    let run_dir = repo_path.join(".maco/autopilot/runs/durable");
+    for artifact in [
+        "plan.json",
+        "supervisor-plan.json",
+        "supervisor-report.json",
+        "pr-report.json",
+        "review-report.json",
+        "final-report.json",
+    ] {
+        assert!(run_dir.join(artifact).exists(), "missing {artifact}");
+    }
+    let supervisor_plan: Value =
+        serde_json::from_slice(&fs::read(run_dir.join("supervisor-plan.json"))?)?;
+    assert_eq!(supervisor_plan["max_depth"], 2);
+    assert_eq!(
+        supervisor_plan["assignments"][0]["worker_assignments"][0]["role"],
+        "worker"
+    );
+    assert!(repo_path.join(".maco/o2/runs/durable-supervise").exists());
+    assert_eq!(repo.head()?.target(), Some(head_before));
+    assert_eq!(fs::read(repo.path().join("index"))?, index_before);
+    assert_eq!(fs::read(repo_path.join("README.md"))?, readme_before);
+    assert_eq!(fs::read(repo_path.join("src/lib.rs"))?, lib_before);
+    assert_eq!(primary_source_status_paths(&repo)?, status_before);
+
+    let machine_global_status = run_success_json(&[
+        "machine-global",
+        "status",
+        "--config",
+        path_str(&test_machine_global_config_path(&repo_path)?)?,
+        "--json",
+    ])?;
+    let retention = machine_global_status["retention_operations"]
+        .as_array()
+        .context("retention operations")?;
+    assert!(
+        retention.is_empty(),
+        "the in-process Fake runtime must not manufacture external output-staging cleanup"
+    );
 
     Ok(())
 }
 
 #[test]
-fn autopilot_run_without_run_id_fails_closed_without_artifacts() -> Result<()> {
+fn autopilot_run_without_run_id_generates_finalized_artifacts() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let task_path = temp.path().join("task.md");
@@ -176,19 +294,21 @@ fn autopilot_run_without_run_id_fails_closed_without_artifacts() -> Result<()> {
         "Update the README through generated autopilot.\n",
     )?;
 
-    assert_autopilot_run_unsupported(
-        &[
-            "autopilot",
-            "run",
-            path_str(&task_path)?,
-            "--repo",
-            path_str(&repo_path)?,
-            "--json",
-        ],
-        &repo_path,
-        None,
-    )?;
-    assert!(!repo_path.join(".maco/autopilot").exists());
+    let report = run_success_json(&[
+        "autopilot",
+        "run",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    let run_id = report["run_id"].as_str().context("generated run id")?;
+    assert!(run_id.starts_with("autopilot-"));
+    assert!(repo_path
+        .join(".maco/autopilot/runs")
+        .join(run_id)
+        .join(".maco-artifact-final.json")
+        .exists());
 
     let corrupt_dir = repo_path.join(".maco/autopilot/runs/zz-corrupt");
     fs::create_dir_all(&corrupt_dir).context("create corrupt run dir")?;
@@ -268,20 +388,18 @@ fn fake_autopilot_nonpublishable_run_ignores_local_runtime_state_without_gitigno
         "Run fake autopilot when runtime files are not ignored.\n",
     )?;
 
-    assert_autopilot_run_unsupported(
-        &[
-            "autopilot",
-            "run",
-            path_str(&task_path)?,
-            "--repo",
-            path_str(&repo_path)?,
-            "--run-id",
-            "unignored-runtime",
-            "--json",
-        ],
-        &repo_path,
-        Some("unignored-runtime"),
-    )?;
+    let report = run_success_json(&[
+        "autopilot",
+        "run",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "unignored-runtime",
+        "--json",
+    ])?;
+    assert_eq!(report["success"], true);
+    assert_eq!(report["primary_worktree_untouched"], true);
 
     assert_eq!(
         fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
@@ -296,7 +414,7 @@ fn fake_autopilot_nonpublishable_run_ignores_local_runtime_state_without_gitigno
 }
 
 #[test]
-fn fake_supervise_flow_is_nonpublishable_and_stops_before_pr_review() -> Result<()> {
+fn fake_supervise_flow_completes_and_legacy_pr_review_stays_unreachable() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("plan.json");
@@ -310,20 +428,22 @@ fn fake_supervise_flow_is_nonpublishable_and_stops_before_pr_review() -> Result<
         }"#,
     )?;
 
-    assert_autopilot_run_unsupported(
-        &[
-            "autopilot",
-            "run",
-            path_str(&plan_path)?,
-            "--repo",
-            path_str(&repo_path)?,
-            "--run-id",
-            "local-flow",
-            "--json",
-        ],
-        &repo_path,
-        Some("local-flow"),
-    )?;
+    let report = run_success_json(&[
+        "autopilot",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "local-flow",
+        "--json",
+    ])?;
+    assert_eq!(report["success"], true);
+    assert_eq!(report["validation"]["status"], "skipped");
+    assert!(report["pr"].is_null());
+    assert!(report["review"].is_null());
+    assert_eq!(report["attempts"][0]["publication_attempted"], false);
+    assert_eq!(report["attempts"][0]["publication_authorized"], false);
     assert_eq!(
         fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
         "# Smoke\n"
@@ -333,7 +453,7 @@ fn fake_supervise_flow_is_nonpublishable_and_stops_before_pr_review() -> Result<
 }
 
 #[test]
-fn fake_supervisor_stops_before_blocking_review_or_repair() -> Result<()> {
+fn legacy_blocking_review_configuration_cannot_start_an_outer_repair_loop() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("blocking-review.json");
@@ -357,26 +477,26 @@ fn fake_supervisor_stops_before_blocking_review_or_repair() -> Result<()> {
         }"#,
     )?;
 
-    assert_autopilot_run_unsupported(
-        &[
-            "autopilot",
-            "run",
-            path_str(&plan_path)?,
-            "--repo",
-            path_str(&repo_path)?,
-            "--run-id",
-            "review-repair",
-            "--json",
-        ],
-        &repo_path,
-        Some("review-repair"),
-    )?;
+    let report = run_success_json(&[
+        "autopilot",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "review-repair",
+        "--json",
+    ])?;
+    assert_eq!(report["attempt_count"], 1);
+    assert_eq!(report["repair_attempts_used"], 0);
+    assert!(report["attempts"][0]["review_status"].is_null());
+    assert_eq!(report["attempts"][0]["blocking_findings"], 0);
 
     Ok(())
 }
 
 #[test]
-fn fake_supervisor_stops_before_validation_repair_loop() -> Result<()> {
+fn legacy_outer_validation_command_cannot_start_a_repair_loop() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("validation-fails.json");
@@ -393,20 +513,21 @@ fn fake_supervisor_stops_before_validation_repair_loop() -> Result<()> {
         }"#,
     )?;
 
-    assert_autopilot_run_unsupported(
-        &[
-            "autopilot",
-            "run",
-            path_str(&plan_path)?,
-            "--repo",
-            path_str(&repo_path)?,
-            "--run-id",
-            "validation-stop",
-            "--json",
-        ],
-        &repo_path,
-        Some("validation-stop"),
-    )?;
+    let report = run_success_json(&[
+        "autopilot",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "validation-stop",
+        "--json",
+    ])?;
+    assert_eq!(report["success"], true);
+    assert_eq!(report["attempt_count"], 1);
+    assert_eq!(report["repair_attempts_used"], 0);
+    assert_eq!(report["validation"]["status"], "skipped");
+    assert_eq!(report["attempts"][0]["publication_attempted"], false);
 
     Ok(())
 }
@@ -433,21 +554,75 @@ fn dirty_primary_refusal_emits_public_json() -> Result<()> {
     }
     write_file(&repo_path.join(".maco-cache/preflight/state.json"), "{}\n")?;
 
-    assert_autopilot_run_unsupported(
-        &[
-            "autopilot",
-            "run",
-            path_str(&task_path)?,
-            "--repo",
-            path_str(&repo_path)?,
-            "--run-id",
-            "dirty",
-            "--json",
-        ],
-        &repo_path,
-        Some("dirty"),
-    )?;
+    let report = run_failure_json(&[
+        "autopilot",
+        "run",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "dirty",
+        "--json",
+    ])?;
+    assert_eq!(report["status"], "refused");
+    assert_eq!(report["safety"]["refused"], true);
+    assert_eq!(report["gate_denials"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        report["gate_denials"][0]["reason"]["family"],
+        "merge_remediation"
+    );
+    assert_eq!(
+        report["gate_denials"][0]["reason"]["blocker"],
+        "dirty_primary"
+    );
+    assert_eq!(
+        report["gate_denials"][0]["context"]["paths"],
+        serde_json::json!(["README.md"])
+    );
+    assert_eq!(report["auto_merge_performed"], false);
 
+    Ok(())
+}
+
+#[test]
+fn runtime_catalog_failure_composes_typed_environment_failure_without_dispatch() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let task_path = temp.path().join("catalog-failure.json");
+    write_file(
+        &task_path,
+        r#"{
+          "version": 1,
+          "task": {"title": "Catalog failure", "body": "Do not dispatch without a catalog."},
+          "assigned_paths": ["README.md"]
+        }"#,
+    )?;
+    let repo = Repository::open(&repo_path)?;
+    let head_before = repo.head()?.target().context("primary HEAD")?;
+    let index_before = fs::read(repo.path().join("index"))?;
+
+    let report = run_failure_json(&[
+        "autopilot",
+        "run",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "typed-catalog-failure",
+        "--codex-bin",
+        path_str(&temp.path().join("missing-codex"))?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["supervisor"]["success"], false);
+    assert_eq!(
+        report["supervisor"]["environment_failures"][0]["category"],
+        "runtime_model_catalog_unavailable"
+    );
+    assert_eq!(report["attempts"][0]["publication_attempted"], false);
+    assert_eq!(repo.head()?.target(), Some(head_before));
+    assert_eq!(fs::read(repo.path().join("index"))?, index_before);
     Ok(())
 }
 
@@ -517,10 +692,9 @@ fn status_and_collect_require_verified_finalization_and_distinguish_active_runs(
 }
 
 #[test]
-fn sync_semantic_and_live_locks_are_preflight_refusals() -> Result<()> {
+fn active_sync_claim_is_a_typed_preflight_refusal() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
-
-    let sync_repo = create_committed_repo(&temp.path().join("sync"))?;
+    let sync_repo = create_committed_repo(temp.path())?;
     run_success_json(&[
         "sync",
         "claim",
@@ -532,22 +706,14 @@ fn sync_semantic_and_live_locks_are_preflight_refusals() -> Result<()> {
     ])?;
     let sync_task = temp.path().join("sync-refusal.md");
     write_file(&sync_task, "Refuse autopilot on README.md.\n")?;
-    assert_autopilot_run_unsupported(
-        &[
-            "autopilot",
-            "run",
-            path_str(&sync_task)?,
-            "--repo",
-            path_str(&sync_repo)?,
-            "--run-id",
-            "sync-refusal",
-            "--json",
-        ],
-        &sync_repo,
-        Some("sync-refusal"),
-    )?;
+    assert_typed_claim_refusal(&sync_repo, &sync_task, "sync-refusal")?;
+    Ok(())
+}
 
-    let semantic_repo = create_committed_repo(&temp.path().join("semantic"))?;
+#[test]
+fn active_semantic_intent_is_a_typed_preflight_refusal() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let semantic_repo = create_committed_repo(temp.path())?;
     run_success_json(&[
         "coord",
         "claim",
@@ -560,40 +726,18 @@ fn sync_semantic_and_live_locks_are_preflight_refusals() -> Result<()> {
     ])?;
     let semantic_task = temp.path().join("semantic-refusal.md");
     write_file(&semantic_task, "Refuse autopilot on README.md.\n")?;
-    assert_autopilot_run_unsupported(
-        &[
-            "autopilot",
-            "run",
-            path_str(&semantic_task)?,
-            "--repo",
-            path_str(&semantic_repo)?,
-            "--run-id",
-            "semantic-refusal",
-            "--json",
-        ],
-        &semantic_repo,
-        Some("semantic-refusal"),
-    )?;
+    assert_typed_claim_refusal(&semantic_repo, &semantic_task, "semantic-refusal")?;
+    Ok(())
+}
 
-    let live_repo = create_committed_repo(&temp.path().join("live"))?;
+#[test]
+fn active_live_lock_is_a_typed_preflight_refusal() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let live_repo = create_committed_repo(temp.path())?;
     write_live_claim(&live_repo, "active-live", "active", "README.md")?;
     let live_task = temp.path().join("live-refusal.md");
     write_file(&live_task, "Refuse autopilot on README.md.\n")?;
-    assert_autopilot_run_unsupported(
-        &[
-            "autopilot",
-            "run",
-            path_str(&live_task)?,
-            "--repo",
-            path_str(&live_repo)?,
-            "--run-id",
-            "live-refusal",
-            "--json",
-        ],
-        &live_repo,
-        Some("live-refusal"),
-    )?;
-
+    assert_typed_claim_refusal(&live_repo, &live_task, "live-refusal")?;
     Ok(())
 }
 
@@ -628,20 +772,19 @@ fn non_overlapping_locks_do_not_refuse_nonpublishable_fake_autopilot() -> Result
 
     let task_path = temp.path().join("readme-task.md");
     write_file(&task_path, "Update README.md through fake autopilot.\n")?;
-    assert_autopilot_run_unsupported(
-        &[
-            "autopilot",
-            "run",
-            path_str(&task_path)?,
-            "--repo",
-            path_str(&repo_path)?,
-            "--run-id",
-            "non-overlap",
-            "--json",
-        ],
-        &repo_path,
-        Some("non-overlap"),
-    )?;
+    let report = run_success_json(&[
+        "autopilot",
+        "run",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "non-overlap",
+        "--json",
+    ])?;
+    assert_eq!(report["success"], true);
+    assert_eq!(report["safety"]["refused"], false);
+    assert!(report["gate_denials"].as_array().is_some_and(Vec::is_empty));
 
     Ok(())
 }
@@ -660,25 +803,30 @@ fn auto_merge_request_is_recorded_but_never_performed() -> Result<()> {
           "auto_merge": true
         }"#,
     )?;
+    let repo = Repository::open(&repo_path)?;
+    let head_before = repo.head()?.target().context("primary HEAD")?;
+    let index_before = fs::read(repo.path().join("index"))?;
+    let readme_before = fs::read(repo_path.join("README.md"))?;
+    let lib_before = fs::read(repo_path.join("src/lib.rs"))?;
 
-    assert_autopilot_run_unsupported(
-        &[
-            "autopilot",
-            "run",
-            path_str(&plan_path)?,
-            "--repo",
-            path_str(&repo_path)?,
-            "--run-id",
-            "no-auto-merge",
-            "--json",
-        ],
-        &repo_path,
-        Some("no-auto-merge"),
-    )?;
-    assert_eq!(
-        fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
-        "# Smoke\n"
-    );
+    let report = run_success_json(&[
+        "autopilot",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "no-auto-merge",
+        "--json",
+    ])?;
+    assert_eq!(report["auto_merge_requested"], true);
+    assert_eq!(report["auto_merge_performed"], false);
+    assert_eq!(report["attempts"][0]["publication_attempted"], false);
+    assert_eq!(report["generated_follow_up_dispatch_performed"], false);
+    assert_eq!(repo.head()?.target(), Some(head_before));
+    assert_eq!(fs::read(repo.path().join("index"))?, index_before);
+    assert_eq!(fs::read(repo_path.join("README.md"))?, readme_before);
+    assert_eq!(fs::read(repo_path.join("src/lib.rs"))?, lib_before);
 
     Ok(())
 }
@@ -690,20 +838,29 @@ fn public_json_shape_is_stable_and_sanitized() -> Result<()> {
     let task_path = temp.path().join("task.md");
     write_file(&task_path, "Check public shape.\n")?;
 
-    assert_autopilot_run_unsupported(
-        &[
-            "autopilot",
-            "run",
-            path_str(&task_path)?,
-            "--repo",
-            path_str(&repo_path)?,
-            "--run-id",
-            "shape",
-            "--json",
-        ],
-        &repo_path,
-        Some("shape"),
-    )?;
+    let report = run_success_json(&[
+        "autopilot",
+        "run",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "shape",
+        "--json",
+    ])?;
+    assert_eq!(report["supervisor"]["runtime"], "fake");
+    assert!(report["supervisor"]["role_economics_profile"].is_object());
+    assert_eq!(
+        report["supervisor"]["autonomy_kpis"]["observation"],
+        "supervisor_aggregate"
+    );
+    assert_eq!(
+        report["supervisor"]["environment_failures"],
+        serde_json::json!([])
+    );
+    assert_eq!(report["gate_denials"], serde_json::json!([]));
+    let serialized = serde_json::to_string(&report)?;
+    assert!(!serialized.contains(&repo_path.display().to_string()));
 
     let review = run_success_json(&[
         "review",
@@ -720,19 +877,28 @@ fn public_json_shape_is_stable_and_sanitized() -> Result<()> {
     Ok(())
 }
 
-fn assert_autopilot_run_unsupported(
-    args: &[&str],
-    repo: &Path,
-    run_id: Option<&str>,
-) -> Result<()> {
-    let stderr = run_failure_stderr(args)?;
-    assert!(stderr.contains("capability-bound supervisor input bridge"));
-    if let Some(run_id) = run_id {
-        assert!(
-            !repo.join(".maco/autopilot/runs").join(run_id).exists(),
-            "unsupported autopilot run created artifacts for {run_id}"
-        );
-    }
+fn assert_typed_claim_refusal(repo: &Path, task: &Path, run_id: &str) -> Result<()> {
+    let report = run_failure_json(&[
+        "autopilot",
+        "run",
+        path_str(task)?,
+        "--repo",
+        path_str(repo)?,
+        "--run-id",
+        run_id,
+        "--json",
+    ])?;
+    assert_eq!(report["status"], "refused");
+    assert_eq!(report["safety"]["refused"], true);
+    assert_eq!(report["gate_denials"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        report["gate_denials"][0]["reason"]["family"],
+        "claim_conflict"
+    );
+    assert_eq!(
+        report["gate_denials"][0]["context"]["paths"],
+        serde_json::json!(["README.md"])
+    );
     Ok(())
 }
 
@@ -759,7 +925,9 @@ fn write_live_claim(repo: &Path, claim_id: &str, status: &str, path: &str) -> Re
 }
 
 fn run_success_json(args: &[&str]) -> Result<Value> {
-    let output = Command::new(BIN).args(args).output().context("run maco")?;
+    let output = command_with_test_machine_global_binding(args)?
+        .output()
+        .context("run maco")?;
     if !output.status.success() {
         anyhow::bail!(
             "maco command failed: {}",
@@ -770,7 +938,9 @@ fn run_success_json(args: &[&str]) -> Result<Value> {
 }
 
 fn run_failure_json(args: &[&str]) -> Result<Value> {
-    let output = Command::new(BIN).args(args).output().context("run maco")?;
+    let output = command_with_test_machine_global_binding(args)?
+        .output()
+        .context("run maco")?;
     if output.status.success() {
         anyhow::bail!("maco command unexpectedly succeeded");
     }
@@ -784,11 +954,70 @@ fn run_failure_json(args: &[&str]) -> Result<Value> {
 }
 
 fn run_failure_stderr(args: &[&str]) -> Result<String> {
-    let output = Command::new(BIN).args(args).output().context("run maco")?;
+    let output = command_with_test_machine_global_binding(args)?
+        .output()
+        .context("run maco")?;
     if output.status.success() {
         anyhow::bail!("maco command unexpectedly succeeded");
     }
     Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+fn command_with_test_machine_global_binding(args: &[&str]) -> Result<Command> {
+    let mut command = Command::new(BIN);
+    command.args(args);
+    if args.first() == Some(&"autopilot") && args.get(1) == Some(&"run") {
+        let repo = args
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--repo").then_some(Path::new(pair[1])))
+            .context("autopilot run test command must name --repo")?;
+        let config = write_test_machine_global_config(repo)?;
+        command
+            .arg("--machine-global-config")
+            .arg(config)
+            .args(["--machine-global-runtime-root-id", "runtime"]);
+    }
+    Ok(command)
+}
+
+#[cfg(target_os = "linux")]
+fn write_test_machine_global_config(repo: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let fixture_root = repo.parent().context("test repository parent")?;
+    let state_root = fixture_root.join("autopilot-machine-global-state");
+    fs::create_dir_all(&state_root)?;
+    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))?;
+    let uid = fs::metadata("/proc/self")?.uid();
+    let runtime_root = PathBuf::from(format!("/run/user/{uid}"));
+    let config = test_machine_global_config_path(repo)?;
+    fs::write(
+        &config,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "state_root": state_root,
+            "roots": [{
+                "id": "runtime",
+                "path": runtime_root,
+                "protected_paths": [],
+                "quarantine_grace_seconds": 60
+            }]
+        }))?,
+    )?;
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
+    Ok(config)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_test_machine_global_config(repo: &Path) -> Result<PathBuf> {
+    Ok(repo.join("unsupported-machine-global-config"))
+}
+
+fn test_machine_global_config_path(repo: &Path) -> Result<PathBuf> {
+    Ok(repo
+        .parent()
+        .context("test repository parent")?
+        .join("autopilot-machine-global.json"))
 }
 
 fn create_committed_repo(root: &Path) -> Result<std::path::PathBuf> {
@@ -866,4 +1095,20 @@ fn write_file(path: &Path, contents: &str) -> Result<()> {
 fn path_str(path: &Path) -> Result<&str> {
     path.to_str()
         .with_context(|| format!("path is not UTF-8: {}", path.display()))
+}
+
+fn primary_source_status_paths(repo: &Repository) -> Result<Vec<String>> {
+    let statuses = repo.statuses(None)?;
+    let mut paths = Vec::new();
+    for entry in statuses.iter() {
+        let path = entry.path().context("Git status path is not UTF-8")?;
+        if !path.starts_with(".maco/")
+            && !path.starts_with(".maco-cache/")
+            && !path.starts_with(".agents/live/")
+        {
+            paths.push(path.to_string());
+        }
+    }
+    paths.sort();
+    Ok(paths)
 }

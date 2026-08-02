@@ -5,7 +5,7 @@ use crate::{
     },
     agent_lifecycle::{AgentListFilter, AgentProcessRecord, AgentRegistry, AgentStopReport},
     artifacts::{self, ResolvedRunId, RunArtifactFamily},
-    autopilot,
+    autopilot::{self, AutopilotRunOptions},
     consult::{self, ConsultAskOptions, ConsultantRuntime, DEFAULT_CONSULT_TIMEOUT_SECONDS},
     inbox::{self, InboxPermissionMode, InboxScanOptions, InboxWorkspaceScanOptions},
     live_claim::{self, LiveClock},
@@ -1414,7 +1414,35 @@ impl AutopilotCommand {
                 let plan = autopilot::autopilot_plan_from_task_file(args.repo, args.task_file)?;
                 print_query_report(&plan, args.json)
             }
-            AutopilotSubcommand::Run(_) => Err(autopilot::effectful_autopilot_unavailable_error()),
+            AutopilotSubcommand::Run(args) => {
+                let resolved = resolve_run_id_for_run(
+                    &args.repo,
+                    RunArtifactFamily::Autopilot,
+                    args.run_id.as_deref(),
+                    args.json,
+                )?;
+                let report = autopilot::run_autopilot_plan_file_with_retention(
+                    AutopilotRunOptions {
+                        repo: resolved.repo,
+                        plan_file: args.task_file,
+                        run_id: resolved.run_id.clone(),
+                        codex_bin: args.codex_bin,
+                        reviewer_command: args.reviewer_command,
+                        allow_dirty_primary: args.allow_dirty_primary,
+                    },
+                    Some(MachineGlobalRetentionBinding {
+                        config: args.machine_global_config,
+                        root_id: args.machine_global_runtime_root_id,
+                        owner: "maco-autopilot".to_string(),
+                        correction_correlation_id: resolved.run_id.as_str().to_string(),
+                    }),
+                )?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("autopilot run failed");
+                }
+                Ok(())
+            }
             AutopilotSubcommand::Status(args) => {
                 let report = autopilot::autopilot_status(args.repo, RunId::new(&args.run_id)?)?;
                 print_query_report(&report, args.json)
@@ -1441,7 +1469,7 @@ impl AutopilotCommand {
 enum AutopilotSubcommand {
     /// Normalize a task file or JSON autopilot plan without running it.
     Plan(PlanAutopilotArgs),
-    /// Run the fake-first autopilot workflow.
+    /// Run one depth-2 plan through the live supervise gates without applying to primary.
     Run(RunAutopilotArgs),
     /// Report durable autopilot run artifact state.
     Status(StatusAutopilotArgs),
@@ -1476,12 +1504,18 @@ struct RunAutopilotArgs {
     /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
     #[arg(long)]
     codex_bin: Option<PathBuf>,
-    /// Legacy reviewer shell string; retained only to return a fail-closed error.
+    /// Disabled legacy reviewer shell string; supplying it fails closed.
     #[arg(long)]
     reviewer_command: Option<String>,
     /// Allow autopilot to run when the primary worktree is dirty.
     #[arg(long)]
     allow_dirty_primary: bool,
+    /// Exact reviewed config used to gate private runtime output-staging cleanup.
+    #[arg(long, required = true)]
+    machine_global_config: PathBuf,
+    /// Reviewed root id whose canonical root must contain `/run/user/<uid>`.
+    #[arg(long, required = true)]
+    machine_global_runtime_root_id: String,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
