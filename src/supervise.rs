@@ -151,6 +151,13 @@ const MAX_CHILD_RETRIES_LIMIT: u8 = 2;
 const DEFAULT_MAX_GATE_CORRECTIONS: u8 = 0;
 const MAX_GATE_CORRECTIONS_LIMIT: u8 = 4;
 const MAX_EVIDENCE_ONLY_REAUDITS: u8 = 2;
+const MAX_LICENSED_BREAKAGE_DEPENDENTS: usize = 16;
+const MAX_LICENSED_BREAKAGE_PATHS_PER_DEPENDENT: usize = 16;
+const MAX_LICENSED_BREAKAGE_INTERFACES_PER_DEPENDENT: usize = 16;
+const MAX_LICENSED_BREAKAGE_RATIONALE_BYTES: usize = 8 * 1024;
+const MAX_LICENSED_BREAKAGE_FAILURE_SIGNATURE_BYTES: usize = 16 * 1024;
+const LICENSED_BREAKAGE_CASCADE_DEPTH: u8 = 1;
+const LICENSED_BREAKAGE_AUDIT_VALIDATION_NAME: &str = "licensed_breakage_declaration";
 const MIN_SUPERVISOR_DEPTH: u8 = 2;
 const MAX_SUPERVISOR_DEPTH: u8 = 32;
 const SUPERVISOR_SCHEMA_VERSION: u32 = 1;
@@ -600,7 +607,76 @@ pub struct OrchestratorAssignment {
     #[serde(default)]
     pub environment_requirements: Vec<EnvironmentRequirement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licensed_breakage: Option<LicensedBreakageDeclaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+}
+
+/// Immutable plan authority for one intentionally breaking assignment.
+///
+/// Reports cannot create this authority. The supervisor accepts it only while
+/// validating the normalized plan, before any child is dispatched.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LicensedBreakageDeclaration {
+    pub migration_rationale: String,
+    pub dependents: Vec<LicensedBreakageDependentScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LicensedBreakageDependentScope {
+    pub dependent_id: String,
+    #[serde(default, serialize_with = "serialize_paths")]
+    pub paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub interfaces: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LicensedDependentFailure {
+    pub dependent_id: String,
+    pub validation_name: String,
+    pub failure_signature: String,
+    #[serde(default, serialize_with = "serialize_paths")]
+    pub paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub interfaces: Vec<String>,
+}
+
+/// Supervisor-owned packet presented to every parent review lens.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LicensedBreakageReview {
+    pub declaration_sha256: String,
+    pub migration_rationale: String,
+    pub failures: Vec<LicensedDependentFailure>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratedFollowUpDispatchStatus {
+    DeferredForPlannedRun,
+}
+
+/// Durable, dispatch-shaped work produced by an accepted licensed failure.
+///
+/// Dispatch is deliberately deferred: inserting work into an active scheduler
+/// would bypass its prepared checkpoint and budget closure. A later planned run
+/// can submit `assignment` through the ordinary claim, child, and auditor gates.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneratedFollowUpTaskRecord {
+    pub assignment: OrchestratorAssignment,
+    pub breaking_assignment_id: String,
+    pub breaking_change: CandidateValidationBinding,
+    pub declaration_sha256: String,
+    pub failure_signature: String,
+    pub migration_rationale: String,
+    pub cascade_depth: u8,
+    pub dispatch_status: GeneratedFollowUpDispatchStatus,
+    pub handoff: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -859,6 +935,10 @@ pub struct OrchestratorReviewReport {
     pub review_lens_aggregate: Option<ReviewLensAggregate>,
     #[serde(default)]
     pub decomposition_completions: Vec<DecompositionCompletion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licensed_breakage_review: Option<LicensedBreakageReview>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_follow_up_tasks: Vec<GeneratedFollowUpTaskRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gate_denials: Vec<GateDenial>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -948,6 +1028,8 @@ pub struct SupervisorFinalReport {
     pub bloated_file_flags: Vec<BloatedFileFlag>,
     #[serde(default)]
     pub decomposition_candidates: Vec<DecompositionCompletion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_follow_up_tasks: Vec<GeneratedFollowUpTaskRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assignment_traceability: Vec<AssignmentTraceability>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1155,6 +1237,13 @@ pub struct AutonomyKpiReport {
     pub self_corrections: Option<u64>,
     pub human_escalations: Option<u64>,
     pub interrupted: Option<bool>,
+    /// Licensed failures are observable work-generation outcomes, not gate
+    /// denials or correction attempts, and therefore never enter rate
+    /// numerators or denominators.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licensed_dependent_failures: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_follow_up_tasks: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denial_rate: Option<RatioMetric>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1180,6 +1269,8 @@ impl AutonomyKpiReport {
             self_corrections: None,
             human_escalations: None,
             interrupted: None,
+            licensed_dependent_failures: None,
+            generated_follow_up_tasks: None,
             denial_rate: None,
             self_correction_rate: None,
             interruption_rate: None,
@@ -1549,6 +1640,8 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         audit_reports: vec![audit],
         review_lens_aggregate: None,
         decomposition_completions: vec![completion.clone()],
+        licensed_breakage_review: None,
+        generated_follow_up_tasks: Vec::new(),
         gate_denials: Vec::new(),
         gate_correction_outcomes: Vec::new(),
         accepted: true,
@@ -1600,6 +1693,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         findings: Vec::new(),
         bloated_file_flags: Vec::new(),
         decomposition_candidates: vec![completion],
+        generated_follow_up_tasks: Vec::new(),
         assignment_traceability: Vec::new(),
         coverage_gaps: Vec::new(),
         breaker_trip: None,

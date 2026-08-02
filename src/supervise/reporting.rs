@@ -698,6 +698,8 @@ pub(super) fn environment_blocked_child_report(
         audit_reports: Vec::new(),
         review_lens_aggregate: None,
         decomposition_completions: Vec::new(),
+        licensed_breakage_review: None,
+        generated_follow_up_tasks: Vec::new(),
         gate_denials: Vec::new(),
         gate_correction_outcomes: Vec::new(),
         accepted: false,
@@ -741,6 +743,8 @@ pub(super) fn missing_child_report(
         audit_reports: Vec::new(),
         review_lens_aggregate: None,
         decomposition_completions: Vec::new(),
+        licensed_breakage_review: None,
+        generated_follow_up_tasks: Vec::new(),
         gate_denials: Vec::new(),
         gate_correction_outcomes: Vec::new(),
         accepted: false,
@@ -1112,6 +1116,8 @@ pub(super) fn deterministic_fake_child_run(
         audit_reports: Vec::new(),
         review_lens_aggregate: None,
         decomposition_completions,
+        licensed_breakage_review: None,
+        generated_follow_up_tasks: Vec::new(),
         gate_denials: Vec::new(),
         gate_correction_outcomes: Vec::new(),
         accepted: true,
@@ -1161,6 +1167,20 @@ pub(super) fn deterministic_fake_auditor_run(
     if command.model.is_some() {
         bail!("deterministic fake auditor command retained a provider model slug");
     }
+    let mut validation_results = vec![ValidationResult {
+        name: "deterministic fake auditor validation".to_string(),
+        status: ReviewStatus::Succeeded,
+        command: Vec::new(),
+        message: None,
+    }];
+    if let Some(review) = child_report.licensed_breakage_review.as_ref() {
+        validation_results.push(ValidationResult {
+            name: LICENSED_BREAKAGE_AUDIT_VALIDATION_NAME.to_string(),
+            status: ReviewStatus::Succeeded,
+            command: Vec::new(),
+            message: Some(review.declaration_sha256.clone()),
+        });
+    }
     let report = AuditorReport {
         id: expected_id.to_string(),
         role: AgentRole::Auditor,
@@ -1168,12 +1188,7 @@ pub(super) fn deterministic_fake_auditor_run(
         reviewed_paths: required_auditor_review_paths(assignment, child_report),
         commands_run: Vec::new(),
         environment_failures: Vec::new(),
-        validation_results: vec![ValidationResult {
-            name: "deterministic fake auditor validation".to_string(),
-            status: ReviewStatus::Succeeded,
-            command: Vec::new(),
-            message: None,
-        }],
+        validation_results,
         findings: Vec::new(),
         rejection_kind: None,
         no_further_delegation: Some(true),

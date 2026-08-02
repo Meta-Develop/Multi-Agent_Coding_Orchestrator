@@ -2,6 +2,7 @@ mod acceptance_integrity;
 mod autonomy_kpis;
 mod budget;
 mod environment_controls;
+mod licensed_breakage;
 mod plan_runtime;
 mod prompts_gates;
 mod reaudit;
@@ -328,6 +329,7 @@ fn injected_assignment(with_worker: bool) -> OrchestratorAssignment {
             .into_iter()
             .collect(),
         environment_requirements: Vec::new(),
+        licensed_breakage: None,
         notes: None,
     }
 }
@@ -342,6 +344,7 @@ fn injected_named_assignment(id: &str, path: &str) -> OrchestratorAssignment {
         task: None,
         worker_assignments: Vec::new(),
         environment_requirements: Vec::new(),
+        licensed_breakage: None,
         notes: None,
     }
 }
@@ -535,6 +538,7 @@ fn artifact_test_final_report(run_id: &RunId) -> SupervisorFinalReport {
         findings: Vec::new(),
         bloated_file_flags: Vec::new(),
         decomposition_candidates: Vec::new(),
+        generated_follow_up_tasks: Vec::new(),
         assignment_traceability: Vec::new(),
         coverage_gaps: Vec::new(),
         breaker_trip: None,
@@ -606,6 +610,8 @@ fn injected_child_report(assignment: &OrchestratorAssignment) -> OrchestratorRev
         audit_reports: Vec::new(),
         review_lens_aggregate: None,
         decomposition_completions: Vec::new(),
+        licensed_breakage_review: None,
+        generated_follow_up_tasks: Vec::new(),
         gate_denials: Vec::new(),
         gate_correction_outcomes: Vec::new(),
         accepted: true,

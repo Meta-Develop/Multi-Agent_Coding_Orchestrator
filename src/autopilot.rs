@@ -1199,6 +1199,7 @@ fn supervisor_plan_for_attempt(
                 report_path: None,
             }],
             environment_requirements: Vec::new(),
+            licensed_breakage: None,
             notes: Some(format!("autopilot attempt {attempt}")),
         }],
     }

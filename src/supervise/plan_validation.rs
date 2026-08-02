@@ -292,6 +292,18 @@ pub(super) fn validate_supervisor_plan(
                 )
             },
         )?;
+        validate_licensed_breakage_declaration(assignment)?;
+        if assignment.licensed_breakage.is_some()
+            && plan
+                .review_lenses
+                .iter()
+                .any(|lens| lens.information_scope == ReviewInformationScope::DiffOnly)
+        {
+            bail!(
+                "assignment '{}' licensed_breakage requires every auditor lens to receive the output report containing the declaration",
+                assignment.id
+            );
+        }
         validate_worker_assignments(assignment)?;
         canonical_environment_requirements(assignment)?;
 
@@ -380,6 +392,178 @@ pub(super) fn validate_supervisor_plan(
         .collect();
 
     Ok((plan, metadata))
+}
+
+pub(super) fn licensed_breakage_declaration_sha256(
+    declaration: &LicensedBreakageDeclaration,
+) -> Result<String> {
+    let bytes = serde_json::to_vec(declaration)
+        .context("failed to serialize licensed breakage declaration")?;
+    Ok(crate::artifacts::state_auth::sha256_hex(&bytes))
+}
+
+fn validate_licensed_breakage_declaration(assignment: &mut OrchestratorAssignment) -> Result<()> {
+    let Some(declaration) = assignment.licensed_breakage.as_mut() else {
+        return Ok(());
+    };
+    let rationale = declaration.migration_rationale.trim();
+    if rationale.is_empty() {
+        bail!(
+            "assignment '{}' licensed_breakage requires a migration_rationale",
+            assignment.id
+        );
+    }
+    if rationale != declaration.migration_rationale {
+        bail!(
+            "assignment '{}' licensed_breakage migration_rationale must not have surrounding whitespace",
+            assignment.id
+        );
+    }
+    if rationale.len() > MAX_LICENSED_BREAKAGE_RATIONALE_BYTES
+        || rationale.chars().any(char::is_control)
+    {
+        bail!(
+            "assignment '{}' licensed_breakage migration_rationale is not bounded printable text",
+            assignment.id
+        );
+    }
+    if declaration.dependents.is_empty()
+        || declaration.dependents.len() > MAX_LICENSED_BREAKAGE_DEPENDENTS
+    {
+        bail!(
+            "assignment '{}' licensed_breakage must name between 1 and {} dependents",
+            assignment.id,
+            MAX_LICENSED_BREAKAGE_DEPENDENTS
+        );
+    }
+
+    let mut dependent_ids = BTreeSet::new();
+    let mut licensed_paths = Vec::<(String, PathBuf)>::new();
+    for dependent in &mut declaration.dependents {
+        dependent.dependent_id =
+            normalize_agent_id(&dependent.dependent_id).with_context(|| {
+                format!(
+                    "assignment '{}' licensed_breakage dependent id is invalid",
+                    assignment.id
+                )
+            })?;
+        if dependent.dependent_id == assignment.id {
+            bail!(
+                "assignment '{}' cannot license breakage attributed to itself",
+                assignment.id
+            );
+        }
+        if !dependent_ids.insert(dependent.dependent_id.clone()) {
+            bail!(
+                "assignment '{}' licensed_breakage repeats dependent '{}'",
+                assignment.id,
+                dependent.dependent_id
+            );
+        }
+        if dependent.paths.is_empty()
+            || dependent.paths.len() > MAX_LICENSED_BREAKAGE_PATHS_PER_DEPENDENT
+        {
+            bail!(
+                "assignment '{}' licensed dependent '{}' must name between 1 and {} paths",
+                assignment.id,
+                dependent.dependent_id,
+                MAX_LICENSED_BREAKAGE_PATHS_PER_DEPENDENT
+            );
+        }
+        if let Some(path) = dependent.paths.iter().find(|path| {
+            path.as_os_str().is_empty()
+                || path.as_path() == Path::new(".")
+                || path.components().count() < 2
+        }) {
+            bail!(
+                "assignment '{}' licensed dependent '{}' path '{}' is over-broad; name a repository subtree or file below a top-level directory",
+                assignment.id,
+                dependent.dependent_id,
+                path.display()
+            );
+        }
+        dependent.paths =
+            normalize_paths(std::mem::take(&mut dependent.paths)).with_context(|| {
+                format!(
+                    "assignment '{}' licensed dependent '{}' has invalid paths",
+                    assignment.id, dependent.dependent_id
+                )
+            })?;
+        for path in &dependent.paths {
+            if assignment
+                .assigned_paths
+                .iter()
+                .any(|assigned| paths_overlap(path, assigned))
+            {
+                bail!(
+                    "assignment '{}' licensed dependent '{}' path '{}' overlaps the breaking assignment scope",
+                    assignment.id,
+                    dependent.dependent_id,
+                    path.display()
+                );
+            }
+            if let Some((owner, existing)) = licensed_paths
+                .iter()
+                .find(|(_, existing)| paths_overlap(path, existing))
+            {
+                bail!(
+                    "assignment '{}' licensed dependent '{}' path '{}' overlaps dependent '{}' path '{}'",
+                    assignment.id,
+                    dependent.dependent_id,
+                    path.display(),
+                    owner,
+                    existing.display()
+                );
+            }
+            licensed_paths.push((dependent.dependent_id.clone(), path.clone()));
+        }
+        if dependent.interfaces.is_empty()
+            || dependent.interfaces.len() > MAX_LICENSED_BREAKAGE_INTERFACES_PER_DEPENDENT
+        {
+            bail!(
+                "assignment '{}' licensed dependent '{}' must name between 1 and {} interfaces",
+                assignment.id,
+                dependent.dependent_id,
+                MAX_LICENSED_BREAKAGE_INTERFACES_PER_DEPENDENT
+            );
+        }
+        dependent.interfaces = normalize_semantic_symbols(&dependent.interfaces);
+        if dependent.interfaces.is_empty() {
+            bail!(
+                "assignment '{}' licensed dependent '{}' has no canonical interface names",
+                assignment.id,
+                dependent.dependent_id
+            );
+        }
+        if let Some(interface) = dependent.interfaces.iter().find(|interface| {
+            !interface.contains("::")
+                || interface.len() > 512
+                || interface.split("::").any(|segment| {
+                    segment.is_empty()
+                        || !segment
+                            .chars()
+                            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+                })
+        }) {
+            bail!(
+                "assignment '{}' licensed dependent '{}' interface '{}' must be a bounded qualified identifier without wildcards",
+                assignment.id,
+                dependent.dependent_id,
+                interface
+            );
+        }
+    }
+    declaration
+        .dependents
+        .sort_by(|left, right| left.dependent_id.cmp(&right.dependent_id));
+    let digest = licensed_breakage_declaration_sha256(declaration)?;
+    if digest.len() != 64 {
+        bail!(
+            "assignment '{}' licensed_breakage declaration digest is not canonical",
+            assignment.id
+        );
+    }
+    Ok(())
 }
 
 fn validate_orchestrator_assignment_collisions(

@@ -2087,6 +2087,7 @@ fn dispatch_and_collect_parent_auditor(
         &expected_request,
         &auditor_id,
         &auditor_report,
+        child_report.licensed_breakage_review.as_ref(),
         !auditor_containment_verified
             || auditor_primary_integrity_failed
             || auditor_sandbox_denied
@@ -2288,6 +2289,28 @@ fn decide_parent_auditor_gate(
                 traceability_candidate = None;
             }
         }
+    }
+    if !parent_auditor_failed
+        && child_report
+            .licensed_breakage_review
+            .as_ref()
+            .is_some_and(|review| !review.failures.is_empty())
+    {
+        let candidate = traceability_candidate.as_ref().context(
+            "accepted licensed breakage has no supervisor-inspected breaking-change identity",
+        )?;
+        let tasks = generated_licensed_follow_up_tasks(
+            context.plan,
+            assignment,
+            &child_report,
+            &candidate.binding,
+        )?;
+        let review = child_report
+            .licensed_breakage_review
+            .as_ref()
+            .context("licensed breakage review packet disappeared before task journaling")?;
+        record_licensed_breakage_follow_up_tasks(artifacts, &assignment.id, review, &tasks)?;
+        child_report.generated_follow_up_tasks = tasks;
     }
     if report_failed(&child_report) && !evidence_only_rejection {
         traceability_candidate = None;
@@ -2936,6 +2959,7 @@ mod decomposition_tests {
             task: None,
             worker_assignments: Vec::new(),
             environment_requirements: Vec::new(),
+            licensed_breakage: None,
             notes: None,
         };
         let plan = SupervisorPlan {

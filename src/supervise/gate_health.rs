@@ -30,6 +30,8 @@ pub(super) struct AutonomyKpiCollector {
     gate_lifecycles: BTreeMap<(String, String), GateCorrectionLifecycleKpi>,
     eligible_reviewed_runs: BTreeSet<String>,
     human_interrupted_runs: BTreeSet<String>,
+    licensed_dependent_failures: u64,
+    generated_follow_up_tasks: u64,
 }
 
 impl AutonomyKpiCollector {
@@ -106,6 +108,23 @@ impl AutonomyKpiCollector {
 
     pub(super) fn report(&self, journal_observable: bool) -> AutonomyKpiReport {
         self.report_with_rate_gap(journal_observable, None)
+    }
+
+    pub(super) fn observe_licensed_breakage(
+        &mut self,
+        licensed_dependent_failures: usize,
+        generated_follow_up_tasks: usize,
+    ) {
+        let licensed_dependent_failures =
+            u64::try_from(licensed_dependent_failures).unwrap_or(u64::MAX);
+        let generated_follow_up_tasks =
+            u64::try_from(generated_follow_up_tasks).unwrap_or(u64::MAX);
+        self.licensed_dependent_failures = self
+            .licensed_dependent_failures
+            .saturating_add(licensed_dependent_failures);
+        self.generated_follow_up_tasks = self
+            .generated_follow_up_tasks
+            .saturating_add(generated_follow_up_tasks);
     }
 
     fn breaker_trip_report(&self, journal_observable: bool) -> AutonomyKpiReport {
@@ -187,6 +206,8 @@ impl AutonomyKpiCollector {
             self_corrections: Some(self_corrections),
             human_escalations: Some(human_escalations),
             interrupted: Some(interrupted),
+            licensed_dependent_failures: Some(self.licensed_dependent_failures),
+            generated_follow_up_tasks: Some(self.generated_follow_up_tasks),
             denial_rate: (rate_denominators_observable && actions_reviewed > 0).then_some(
                 RatioMetric {
                     numerator: denials,
@@ -209,6 +230,72 @@ impl AutonomyKpiCollector {
             unavailable_reason: None,
         }
     }
+}
+
+pub(super) fn record_licensed_breakage_follow_up_tasks(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    source_assignment_id: &str,
+    review: &LicensedBreakageReview,
+    tasks: &[GeneratedFollowUpTaskRecord],
+) -> Result<()> {
+    if tasks.is_empty() || tasks.len() != review.failures.len() {
+        bail!("licensed dependent failures must produce exactly one durable follow-up task each");
+    }
+    for (failure, task) in review.failures.iter().zip(tasks) {
+        if task.breaking_assignment_id != source_assignment_id
+            || task.breaking_change.agent_id != source_assignment_id
+            || task.breaking_change.diff_oid.is_empty()
+            || task.declaration_sha256 != review.declaration_sha256
+            || task.failure_signature != failure.failure_signature
+            || task.migration_rationale != review.migration_rationale
+            || task.assignment.assigned_paths != failure.paths
+            || task.assignment.semantic_symbols != failure.interfaces
+            || task.assignment.licensed_breakage.is_some()
+            || task.assignment.task.as_deref().is_none_or(str::is_empty)
+            || task.cascade_depth != LICENSED_BREAKAGE_CASCADE_DEPTH
+            || task.dispatch_status != GeneratedFollowUpDispatchStatus::DeferredForPlannedRun
+            || task.handoff.trim().is_empty()
+        {
+            bail!(
+                "licensed dependent failure '{}' has an incomplete or misattributed follow-up task",
+                failure.dependent_id
+            );
+        }
+    }
+    let mut guard = artifacts
+        .lock()
+        .map_err(|_| anyhow!("supervisor artifact writer mutex was poisoned"))?;
+    let SharedSupervisorArtifacts {
+        writer,
+        journal,
+        autonomy_kpis,
+        ..
+    } = &mut *guard;
+    let active_journal = journal
+        .as_mut()
+        .context("licensed breakage requires an enabled orchestration event journal")?;
+    if !active_journal.is_enabled() {
+        bail!("licensed breakage orchestration event journal is disabled");
+    }
+    for task in tasks {
+        active_journal
+            .append(
+                writer,
+                &task.assignment.id,
+                Some(source_assignment_id),
+                OrchestrationRole::Orchestrator,
+                OrchestrationEventKind::Journal,
+                json!({
+                    "licensed_breakage_follow_up": task,
+                }),
+            )
+            .context("failed to journal licensed breakage follow-up task")?;
+        if !active_journal.is_enabled() {
+            bail!("licensed breakage orchestration event journal became disabled");
+        }
+    }
+    autonomy_kpis.observe_licensed_breakage(review.failures.len(), tasks.len());
+    Ok(())
 }
 
 pub(super) fn orchestration_journal_observable(

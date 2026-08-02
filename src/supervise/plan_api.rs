@@ -114,6 +114,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
             )),
             worker_assignments: Vec::new(),
             environment_requirements: Vec::new(),
+            licensed_breakage: None,
             notes: Some(
                 "MACO-visible read-only planning root; its execution child is parent-gated"
                     .to_string(),
@@ -152,6 +153,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
             task: Some(assignment.task),
             worker_assignments: vec![worker],
             environment_requirements: Vec::new(),
+            licensed_breakage: None,
             notes: Some(format!(
                 "Execution child admitted only after read-only planning root '{planning_id}' succeeds"
             )),
@@ -1454,6 +1456,7 @@ pub fn collect_supervisor_run(
         }],
         bloated_file_flags: Vec::new(),
         decomposition_candidates: Vec::new(),
+        generated_follow_up_tasks: Vec::new(),
         assignment_traceability: Vec::new(),
         coverage_gaps: Vec::new(),
         breaker_trip: None,

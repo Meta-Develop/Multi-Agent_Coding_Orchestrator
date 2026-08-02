@@ -83,7 +83,8 @@ pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
             "environment_failures": {
                 "type": "array",
                 "items": environment_failure_schema_value()
-            }
+            },
+            "generated_follow_up_tasks": generated_follow_up_tasks_schema_value()
         }
     })
 }
@@ -160,6 +161,8 @@ fn autonomy_kpi_report_schema_value() -> serde_json::Value {
             "self_corrections": optional_count(),
             "human_escalations": optional_count(),
             "interrupted": {"type": ["boolean", "null"]},
+            "licensed_dependent_failures": optional_count(),
+            "generated_follow_up_tasks": optional_count(),
             "denial_rate": ratio(),
             "self_correction_rate": ratio(),
             "interruption_rate": ratio(),
@@ -392,6 +395,8 @@ pub(super) fn orchestrator_report_schema_value() -> serde_json::Value {
                 "uniqueItems": true,
                 "items": decomposition_completion_object_schema_value()
             },
+            "licensed_breakage_review": licensed_breakage_review_schema_value(),
+            "generated_follow_up_tasks": generated_follow_up_tasks_schema_value(),
             "gate_denials": {"type": "array", "items": gate_denial_schema_value()},
             "gate_correction_outcomes": {
                 "type": "array",
@@ -404,6 +409,101 @@ pub(super) fn orchestrator_report_schema_value() -> serde_json::Value {
             "next_safe_action": {"type": "string"}
         },
         "allOf": [orchestrator_environment_failure_outcome_schema_value()]
+    })
+}
+
+fn licensed_breakage_review_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["declaration_sha256", "migration_rationale", "failures"],
+        "properties": {
+            "declaration_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "migration_rationale": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_LICENSED_BREAKAGE_RATIONALE_BYTES
+            },
+            "failures": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "dependent_id",
+                        "validation_name",
+                        "failure_signature",
+                        "paths",
+                        "interfaces"
+                    ],
+                    "properties": {
+                        "dependent_id": {"type": "string", "minLength": 1},
+                        "validation_name": {"type": "string", "minLength": 1},
+                        "failure_signature": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_LICENSED_BREAKAGE_FAILURE_SIGNATURE_BYTES
+                        },
+                        "paths": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {"type": "string", "minLength": 1}
+                        },
+                        "interfaces": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {"type": "string", "minLength": 1}
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn generated_follow_up_tasks_schema_value() -> serde_json::Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "assignment",
+                "breaking_assignment_id",
+                "breaking_change",
+                "declaration_sha256",
+                "failure_signature",
+                "migration_rationale",
+                "cascade_depth",
+                "dispatch_status",
+                "handoff"
+            ],
+            "properties": {
+                "assignment": {"type": "object"},
+                "breaking_assignment_id": {"type": "string", "minLength": 1},
+                "breaking_change": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "version", "agent_id", "primary_head", "agent_head", "merge_base", "diff_oid"
+                    ],
+                    "properties": {
+                        "version": {"type": "integer"},
+                        "agent_id": {"type": "string", "minLength": 1},
+                        "primary_head": {"type": ["string", "null"]},
+                        "agent_head": {"type": ["string", "null"]},
+                        "merge_base": {"type": ["string", "null"]},
+                        "diff_oid": {"type": "string", "minLength": 1}
+                    }
+                },
+                "declaration_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "failure_signature": {"type": "string", "minLength": 1},
+                "migration_rationale": {"type": "string", "minLength": 1},
+                "cascade_depth": {"type": "integer", "const": LICENSED_BREAKAGE_CASCADE_DEPTH},
+                "dispatch_status": {"type": "string", "const": "deferred_for_planned_run"},
+                "handoff": {"type": "string", "minLength": 1}
+            }
+        }
     })
 }
 

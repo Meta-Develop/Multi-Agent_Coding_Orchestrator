@@ -115,10 +115,25 @@ pub(super) fn collect_child_report(
             paths: vec![report_path.to_path_buf()],
         });
     }
+    if report.licensed_breakage_review.take().is_some()
+        || !report.generated_follow_up_tasks.is_empty()
+    {
+        report.generated_follow_up_tasks.clear();
+        report.status = ReviewStatus::Failed;
+        report.accepted = false;
+        report.rejected = true;
+        report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: "child report attempted to self-assert supervisor-owned licensed breakage authority or generated follow-up tasks"
+                .to_string(),
+            paths: vec![report_path.to_path_buf()],
+        });
+    }
     validate_worker_report_delegation_attestations(assignment, report_path, &mut report);
     if evidence_only_source.is_none() {
         verify_child_report_paths(assignment, worktree_path, child_base_head, &mut report);
     }
+    prepare_licensed_breakage_review(assignment, &mut report);
     validate_worker_report_evidence(assignment, assignment_metadata, report_path, &mut report);
     validate_assignment_report_plumbing(assignment, assignment_metadata, report_path, &mut report);
     if let Some(source) = evidence_only_source {
@@ -133,6 +148,317 @@ pub(super) fn collect_child_report(
     }
     enforce_orchestrator_environment_failure_outcome(&mut report);
     (report, report_shape_problems)
+}
+
+#[derive(Clone, Copy)]
+struct FailedValidationSource<'a> {
+    validation: &'a ValidationResult,
+    findings: &'a [Finding],
+}
+
+pub(super) fn prepare_licensed_breakage_review(
+    assignment: &OrchestratorAssignment,
+    report: &mut OrchestratorReviewReport,
+) {
+    let Some(declaration) = assignment.licensed_breakage.as_ref() else {
+        return;
+    };
+    let Ok(declaration_sha256) = licensed_breakage_declaration_sha256(declaration) else {
+        return;
+    };
+    report.licensed_breakage_review = Some(LicensedBreakageReview {
+        declaration_sha256,
+        migration_rationale: declaration.migration_rationale.clone(),
+        failures: Vec::new(),
+    });
+    if !report.environment_failures.is_empty()
+        || report.audit_reports.iter().any(|audit| {
+            report_failed(audit)
+                || !audit.environment_failures.is_empty()
+                || audit
+                    .findings
+                    .iter()
+                    .any(|finding| finding.severity == FindingSeverity::Error)
+        })
+    {
+        return;
+    }
+
+    let mut sources = report
+        .validation_results
+        .iter()
+        .filter(|validation| validation_failed(validation))
+        .map(|validation| FailedValidationSource {
+            validation,
+            findings: &report.findings,
+        })
+        .collect::<Vec<_>>();
+    sources.extend(report.worker_reports.iter().flat_map(|worker| {
+        worker
+            .validation_results
+            .iter()
+            .filter(|validation| validation_failed(validation))
+            .map(|validation| FailedValidationSource {
+                validation,
+                findings: &worker.findings,
+            })
+    }));
+    if sources.is_empty() {
+        return;
+    }
+    let Some(failures) = sources
+        .iter()
+        .map(|source| classify_licensed_dependent_failure(declaration, *source))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return;
+    };
+    if failures.len() != sources.len()
+        || !all_error_findings_are_licensed(report, &failures)
+        || !all_failed_commands_are_licensed(report, &failures)
+    {
+        return;
+    }
+    let licensed_signatures = failures
+        .iter()
+        .map(|failure| failure.failure_signature.as_str())
+        .collect::<BTreeSet<_>>();
+    for worker in &mut report.worker_reports {
+        let has_licensed_failure = worker.validation_results.iter().any(|validation| {
+            validation_failed(validation)
+                && validation
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| licensed_signatures.contains(message))
+        });
+        if has_licensed_failure {
+            worker.accepted = true;
+            worker.rejected = false;
+            worker.status = ReviewStatus::Succeeded;
+        }
+    }
+    report.accepted = true;
+    report.rejected = false;
+    report.status = ReviewStatus::Succeeded;
+    if let Some(review) = report.licensed_breakage_review.as_mut() {
+        review.failures = failures;
+    }
+}
+
+fn classify_licensed_dependent_failure(
+    declaration: &LicensedBreakageDeclaration,
+    source: FailedValidationSource<'_>,
+) -> Option<LicensedDependentFailure> {
+    let signature = source.validation.message.as_deref()?.trim();
+    if signature.is_empty()
+        || signature != source.validation.message.as_deref()?
+        || signature.len() > MAX_LICENSED_BREAKAGE_FAILURE_SIGNATURE_BYTES
+        || signature.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let dependent = declaration
+        .dependents
+        .iter()
+        .find(|dependent| dependent.dependent_id == source.validation.name)?;
+    let matching_findings = source
+        .findings
+        .iter()
+        .filter(|finding| {
+            finding.severity == FindingSeverity::Error && finding.message == signature
+        })
+        .collect::<Vec<_>>();
+    if matching_findings.is_empty() {
+        return None;
+    }
+    let paths = normalize_paths(
+        matching_findings
+            .iter()
+            .flat_map(|finding| finding.paths.iter().cloned())
+            .collect(),
+    )
+    .ok()?;
+    if paths.is_empty()
+        || paths.iter().any(|path| {
+            !dependent
+                .paths
+                .iter()
+                .any(|licensed| path_is_covered_by_claim(path, licensed))
+        })
+    {
+        return None;
+    }
+    let interfaces = dependent
+        .interfaces
+        .iter()
+        .filter(|interface| failure_signature_references_interface(signature, interface))
+        .cloned()
+        .collect::<Vec<_>>();
+    if interfaces.is_empty() {
+        return None;
+    }
+    Some(LicensedDependentFailure {
+        dependent_id: dependent.dependent_id.clone(),
+        validation_name: source.validation.name.clone(),
+        failure_signature: signature.to_string(),
+        paths,
+        interfaces,
+    })
+}
+
+fn failure_signature_references_interface(signature: &str, interface: &str) -> bool {
+    signature.match_indices(interface).any(|(start, _)| {
+        let end = start.saturating_add(interface.len());
+        let boundary = |character: Option<char>| {
+            character.is_none_or(|character| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '_' | ':')
+            })
+        };
+        boundary(signature[..start].chars().next_back())
+            && boundary(signature[end..].chars().next())
+    })
+}
+
+fn all_error_findings_are_licensed(
+    report: &OrchestratorReviewReport,
+    failures: &[LicensedDependentFailure],
+) -> bool {
+    let signatures = failures
+        .iter()
+        .map(|failure| failure.failure_signature.as_str())
+        .collect::<BTreeSet<_>>();
+    report
+        .findings
+        .iter()
+        .chain(
+            report
+                .worker_reports
+                .iter()
+                .flat_map(|worker| worker.findings.iter()),
+        )
+        .filter(|finding| finding.severity == FindingSeverity::Error)
+        .all(|finding| signatures.contains(finding.message.as_str()))
+}
+
+fn all_failed_commands_are_licensed(
+    report: &OrchestratorReviewReport,
+    failures: &[LicensedDependentFailure],
+) -> bool {
+    let signatures = failures
+        .iter()
+        .map(|failure| failure.failure_signature.as_str())
+        .collect::<Vec<_>>();
+    report
+        .commands_run
+        .iter()
+        .chain(
+            report
+                .worker_reports
+                .iter()
+                .flat_map(|worker| worker.commands_run.iter()),
+        )
+        .filter(|command| command.status != ReviewStatus::Succeeded)
+        .all(|command| {
+            !command.timed_out
+                && command.error.is_none()
+                && command.environment_failures.is_empty()
+                && signatures.iter().any(|signature| {
+                    command.stdout.contains(*signature) || command.stderr.contains(*signature)
+                })
+        })
+}
+
+pub(super) fn generated_licensed_follow_up_tasks(
+    plan: &SupervisorPlan,
+    assignment: &OrchestratorAssignment,
+    report: &OrchestratorReviewReport,
+    breaking_change: &CandidateValidationBinding,
+) -> Result<Vec<GeneratedFollowUpTaskRecord>> {
+    let Some(review) = report.licensed_breakage_review.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if report_failed(report) {
+        bail!(
+            "cannot generate licensed follow-up tasks before assignment '{}' passes its auditor gate",
+            assignment.id
+        );
+    }
+    if !report.generated_follow_up_tasks.is_empty() {
+        bail!(
+            "assignment '{}' already contains supervisor-owned generated follow-up tasks",
+            assignment.id
+        );
+    }
+    if review.failures.is_empty() {
+        bail!(
+            "assignment '{}' licensed dependent failures generated no follow-up task inputs",
+            assignment.id
+        );
+    }
+    let existing_ids = plan
+        .assignments
+        .iter()
+        .flat_map(|assignment| {
+            std::iter::once(assignment.id.as_str()).chain(
+                assignment
+                    .worker_assignments
+                    .iter()
+                    .map(|worker| worker.id.as_str()),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut generated_ids = BTreeSet::new();
+    review
+        .failures
+        .iter()
+        .enumerate()
+        .map(|(index, failure)| {
+            let ordinal = index.saturating_add(1);
+            let id = normalize_agent_id(&format!(
+                "{}-licensed-update-{ordinal:02}",
+                assignment.id
+            ))?;
+            if existing_ids.contains(id.as_str()) || !generated_ids.insert(id.clone()) {
+                bail!(
+                    "generated licensed follow-up assignment id '{}' collides with the task tree",
+                    id
+                );
+            }
+            let follow_up_assignment = OrchestratorAssignment {
+                id,
+                role: AgentRole::ChildOrchestrator,
+                assigned_paths: failure.paths.clone(),
+                semantic_symbols: failure.interfaces.clone(),
+                semantic_modules: Vec::new(),
+                task: Some(format!(
+                    "Update dependent '{}' for the licensed breaking change from assignment '{}'. Migration rationale: {} Failure signature: {}",
+                    failure.dependent_id,
+                    assignment.id,
+                    review.migration_rationale,
+                    failure.failure_signature
+                )),
+                worker_assignments: Vec::new(),
+                environment_requirements: Vec::new(),
+                licensed_breakage: None,
+                notes: Some(
+                    "Generated licensed-breakage follow-up; dispatch only through a newly validated supervisor plan"
+                        .to_string(),
+                ),
+            };
+            Ok(GeneratedFollowUpTaskRecord {
+                assignment: follow_up_assignment,
+                breaking_assignment_id: assignment.id.clone(),
+                breaking_change: breaking_change.clone(),
+                declaration_sha256: review.declaration_sha256.clone(),
+                failure_signature: failure.failure_signature.clone(),
+                migration_rationale: review.migration_rationale.clone(),
+                cascade_depth: LICENSED_BREAKAGE_CASCADE_DEPTH,
+                dispatch_status: GeneratedFollowUpDispatchStatus::DeferredForPlannedRun,
+                handoff: "Insert this assignment into a new validated plan; ordinary claims, budget admission, child gates, review lenses, and checkpoints remain mandatory"
+                    .to_string(),
+            })
+        })
+        .collect()
 }
 
 fn validate_evidence_only_report_preservation(
@@ -235,6 +561,7 @@ pub(super) fn review_lens_verdict_from_auditor(
     expected_request: &ReviewLensRequest,
     expected_auditor_id: &str,
     report: &AuditorReport,
+    licensed_breakage_review: Option<&LicensedBreakageReview>,
     process_procedural_failure: bool,
 ) -> Result<ReviewLensVerdict> {
     let normalized_paths = normalize_paths(report.reviewed_paths.clone()).ok();
@@ -252,6 +579,7 @@ pub(super) fn review_lens_verdict_from_auditor(
         && report.read_only
         && !report.commands_run.is_empty()
         && !report.validation_results.is_empty()
+        && auditor_accepted_licensed_breakage(report, licensed_breakage_review)
         && !report.remaining_risk.trim().is_empty()
         && !report.next_safe_action.trim().is_empty()
         && if report.accepted && !report.rejected && report.status == ReviewStatus::Succeeded {
@@ -290,6 +618,25 @@ pub(super) fn review_lens_verdict_from_auditor(
         coverage,
         evidence,
     )
+}
+
+fn auditor_accepted_licensed_breakage(
+    report: &AuditorReport,
+    review: Option<&LicensedBreakageReview>,
+) -> bool {
+    let markers = report
+        .validation_results
+        .iter()
+        .filter(|validation| validation.name == LICENSED_BREAKAGE_AUDIT_VALIDATION_NAME)
+        .collect::<Vec<_>>();
+    match review {
+        None => markers.is_empty(),
+        Some(review) => {
+            markers.len() == 1
+                && markers[0].status == ReviewStatus::Succeeded
+                && markers[0].message.as_deref() == Some(review.declaration_sha256.as_str())
+        }
+    }
 }
 
 pub(super) fn validate_auditor_reports(
@@ -351,6 +698,16 @@ pub(super) fn validate_auditor_reports(
         if audit_report.next_safe_action.trim().is_empty() {
             valid = false;
             messages.push("auditor report omitted next_safe_action evidence".to_string());
+        }
+        if !auditor_accepted_licensed_breakage(
+            audit_report,
+            report.licensed_breakage_review.as_ref(),
+        ) {
+            valid = false;
+            messages.push(
+                "auditor report did not accept the exact supervisor-bound licensed breakage declaration"
+                    .to_string(),
+            );
         }
         if !audit_report.accepted
             || audit_report.rejected
@@ -497,6 +854,7 @@ pub(super) fn parent_auditor_required(
 ) -> bool {
     (!assignment.worker_assignments.is_empty() && !report.worker_reports.is_empty())
         || (assignment.worker_assignments.is_empty() && !report.files_changed.is_empty())
+        || report.licensed_breakage_review.is_some()
         || report_has_field_guide_suggestions(report)
 }
 
@@ -608,7 +966,10 @@ fn required_auditor_review_subject_ids(
     report: &OrchestratorReviewReport,
 ) -> BTreeSet<String> {
     if assignment.worker_assignments.is_empty() {
-        if report.files_changed.is_empty() && !report_has_field_guide_suggestions(report) {
+        if report.files_changed.is_empty()
+            && !report_has_field_guide_suggestions(report)
+            && report.licensed_breakage_review.is_none()
+        {
             BTreeSet::new()
         } else {
             BTreeSet::from([report.id.clone()])
@@ -1247,6 +1608,22 @@ pub(super) fn validate_worker_report_evidence(
     if report.worker_reports.is_empty() {
         return;
     }
+    let licensed_worker_failures = report
+        .licensed_breakage_review
+        .as_ref()
+        .map(|review| {
+            review
+                .failures
+                .iter()
+                .map(|failure| {
+                    (
+                        failure.validation_name.clone(),
+                        failure.failure_signature.clone(),
+                    )
+                })
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
 
     let workers_by_id = assignment
         .worker_assignments
@@ -1368,12 +1745,22 @@ pub(super) fn validate_worker_report_evidence(
             blocking_messages.push((message, unauthorized_paths));
         }
 
+        let all_failed_validations_are_licensed = worker_report
+            .validation_results
+            .iter()
+            .filter(|validation| validation_failed(validation))
+            .all(|validation| {
+                validation.message.as_ref().is_some_and(|signature| {
+                    licensed_worker_failures.contains(&(validation.name.clone(), signature.clone()))
+                })
+            });
         if worker_report.accepted
             && worker_report.status == ReviewStatus::Succeeded
             && worker_report
                 .validation_results
                 .iter()
                 .any(validation_failed)
+            && !all_failed_validations_are_licensed
         {
             let failed_validation_paths = if normalized_files_changed.is_empty() {
                 vec![report_path.to_path_buf()]
