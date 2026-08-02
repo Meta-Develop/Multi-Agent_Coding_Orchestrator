@@ -23,9 +23,12 @@ const ISSUE33_PINNED_WRAPPER_SHA256: &str =
 const ISSUE33_PINNED_CHECKOUT_HEAD: &str = "66f59aa253868d1dd909b012e04c548e7b669d2f";
 const ISSUE33_CLAIMS_V1: &[u8] = include_bytes!("fixtures/issue33/agent-files-claims-v1.json");
 const ISSUE33_CLAIMS_V1_SHA256: &str =
-    "85ca48c7b658a3f28b4d3758268a41319b86f9b9bef78637bda7069cc2b83111";
+    "58076fb067d6bbc560926628b8930075d0674eae025b945619f0890000995291";
 const ISSUE33_PHYSICAL_JOURNAL_ID: &str =
-    "6ce2913c16ab9fe3388b4d29719afd3b2549aa6d90975b2cf8ddc4173d0999f4";
+    "d9741d2f810d605133ddfb24bca389e7f1e96fd2a3da1bc5ca236da56519306f";
+#[cfg(unix)]
+const ISSUE33_OPTIONAL_LOGICAL_ANCHOR: &str =
+    ".snapshot-init-a61808fe40feb8b3433778bbc2ececcaa47c8c47fc1657f054c239efd3f0e984.json";
 const ISSUE33_PHYSICAL_JOURNAL_MANIFEST: &str =
     include_str!("fixtures/issue33/authenticated-claims-state-v1.sha256");
 
@@ -139,7 +142,7 @@ fn cli_issue33_quarantine_then_attested_migration_restores_claim_consumers() -> 
     );
     assert!(
         quarantined_journal.is_dir(),
-        "the captured physical journal must remain inside the quarantined namespace"
+        "the synthetic physical journal must remain inside the quarantined namespace"
     );
 
     Ok(())
@@ -254,9 +257,10 @@ fn install_issue33_unanchored_claim_state(temp: &TempDir) -> Result<Issue33Insta
     let physical_journal = journal_root.join(ISSUE33_PHYSICAL_JOURNAL_ID);
     let verified_manifest_files = verify_issue33_physical_journal_fixture()?;
     let copied_files = copy_issue33_physical_journal_fixture(&physical_journal)?;
+    copy_issue33_optional_logical_anchor_fixture(&journal_root)?;
     assert_eq!(
         copied_files, verified_manifest_files,
-        "the regression must install every captured physical-journal file"
+        "the regression must install every synthetic physical-journal file"
     );
 
     Ok(Issue33InstalledState {
@@ -507,7 +511,7 @@ fn verify_issue33_physical_journal_fixture() -> Result<usize> {
         let relative = Path::new(relative);
         anyhow::ensure!(
             relative.parent() == Some(expected_parent.as_path()),
-            "physical-journal manifest line {} is outside the captured journal",
+            "physical-journal manifest line {} is outside the synthetic journal",
             index + 1
         );
         let file_name = relative
@@ -552,25 +556,25 @@ fn verify_issue33_physical_journal_fixture() -> Result<usize> {
 
     manifest_names.sort();
     let source = issue33_physical_journal_fixture();
-    let mut captured_names = Vec::new();
+    let mut fixture_names = Vec::new();
     for entry in fs::read_dir(&source)
-        .with_context(|| format!("enumerate captured journal {}", source.display()))?
+        .with_context(|| format!("enumerate synthetic journal {}", source.display()))?
     {
-        let entry = entry.context("inspect captured physical-journal entry")?;
+        let entry = entry.context("inspect synthetic physical-journal entry")?;
         let metadata = entry
             .metadata()
-            .context("inspect captured physical-journal metadata")?;
+            .context("inspect synthetic physical-journal metadata")?;
         anyhow::ensure!(
             metadata.is_file(),
-            "captured physical-journal entry is not a regular file: {}",
+            "synthetic physical-journal entry is not a regular file: {}",
             entry.path().display()
         );
-        captured_names.push(entry.file_name());
+        fixture_names.push(entry.file_name());
     }
-    captured_names.sort();
+    fixture_names.sort();
     anyhow::ensure!(
-        captured_names == manifest_names,
-        "physical-journal manifest does not name the complete captured journal"
+        fixture_names == manifest_names,
+        "physical-journal manifest does not name the complete synthetic journal"
     );
 
     Ok(manifest_names.len())
@@ -590,21 +594,21 @@ fn copy_issue33_physical_journal_fixture(destination: &Path) -> Result<usize> {
 
     let mut copied_files = 0usize;
     for entry in fs::read_dir(&source)
-        .with_context(|| format!("enumerate captured journal {}", source.display()))?
+        .with_context(|| format!("enumerate synthetic journal {}", source.display()))?
     {
-        let entry = entry.context("inspect captured physical-journal entry")?;
+        let entry = entry.context("inspect synthetic physical-journal entry")?;
         let metadata = entry
             .metadata()
-            .context("inspect captured physical-journal metadata")?;
+            .context("inspect synthetic physical-journal metadata")?;
         if !metadata.is_file() {
             anyhow::bail!(
-                "captured physical-journal entry is not a regular file: {}",
+                "synthetic physical-journal entry is not a regular file: {}",
                 entry.path().display()
             );
         }
         let copied = destination.join(entry.file_name());
         fs::copy(entry.path(), &copied)
-            .with_context(|| format!("copy captured journal file {}", entry.path().display()))?;
+            .with_context(|| format!("copy synthetic journal file {}", entry.path().display()))?;
         fs::set_permissions(&copied, fs::Permissions::from_mode(0o600)).with_context(|| {
             format!(
                 "make copied journal file {} owner-private",
@@ -613,9 +617,28 @@ fn copy_issue33_physical_journal_fixture(destination: &Path) -> Result<usize> {
         })?;
         copied_files = copied_files
             .checked_add(1)
-            .context("captured journal file count overflowed")?;
+            .context("synthetic journal file count overflowed")?;
     }
     Ok(copied_files)
+}
+
+#[cfg(unix)]
+fn copy_issue33_optional_logical_anchor_fixture(destination: &Path) -> Result<()> {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/issue33/authenticated-claims-state-v1")
+        .join(ISSUE33_OPTIONAL_LOGICAL_ANCHOR);
+    if !source.exists() {
+        return Ok(());
+    }
+    let copied = destination.join(ISSUE33_OPTIONAL_LOGICAL_ANCHOR);
+    fs::copy(&source, &copied)
+        .with_context(|| format!("copy synthetic logical anchor {}", source.display()))?;
+    fs::set_permissions(&copied, fs::Permissions::from_mode(0o600)).with_context(|| {
+        format!(
+            "make synthetic logical anchor {} owner-private",
+            copied.display()
+        )
+    })
 }
 
 #[test]
