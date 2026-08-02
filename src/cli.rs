@@ -1415,13 +1415,18 @@ impl AutopilotCommand {
                 print_query_report(&plan, args.json)
             }
             AutopilotSubcommand::Run(args) => {
+                let profile = args
+                    .profile
+                    .as_ref()
+                    .map(autopilot::autopilot_profile_from_file)
+                    .transpose()?;
                 let resolved = resolve_run_id_for_run(
                     &args.repo,
                     RunArtifactFamily::Autopilot,
                     args.run_id.as_deref(),
                     args.json,
                 )?;
-                let report = autopilot::run_autopilot_plan_file_with_retention(
+                let report = autopilot::run_autopilot_plan_file_with_profile_and_retention(
                     AutopilotRunOptions {
                         repo: resolved.repo,
                         plan_file: args.task_file,
@@ -1430,6 +1435,7 @@ impl AutopilotCommand {
                         reviewer_command: args.reviewer_command,
                         allow_dirty_primary: args.allow_dirty_primary,
                     },
+                    profile,
                     Some(MachineGlobalRetentionBinding {
                         config: args.machine_global_config,
                         root_id: args.machine_global_runtime_root_id,
@@ -1504,6 +1510,9 @@ struct RunAutopilotArgs {
     /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
     #[arg(long)]
     codex_bin: Option<PathBuf>,
+    /// Versioned role/model, pricing, and review-lens profile manifest.
+    #[arg(long)]
+    profile: Option<PathBuf>,
     /// Disabled legacy reviewer shell string; supplying it fails closed.
     #[arg(long)]
     reviewer_command: Option<String>,

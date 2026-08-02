@@ -89,6 +89,32 @@ fn legacy_reviewer_command_refuses_before_autopilot_artifacts() -> Result<()> {
 }
 
 #[test]
+fn autopilot_profile_manifest_rejects_unsupported_version_before_effect_artifacts() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let profile_path = temp.path().join("unsupported-profile.json");
+    write_file(&profile_path, r#"{"version": 2}"#)?;
+
+    let stderr = run_failure_stderr(&[
+        "autopilot",
+        "run",
+        path_str(&temp.path().join("plan-must-not-be-read"))?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--profile",
+        path_str(&profile_path)?,
+        "--run-id",
+        "unsupported-profile-version",
+        "--json",
+    ])?;
+
+    assert!(stderr.contains("unsupported autopilot profile version 2"));
+    assert!(!repo_path.join(".maco/autopilot").exists());
+    assert!(!repo_path.join(".maco/o2").exists());
+    Ok(())
+}
+
+#[test]
 fn autopilot_plan_json_normalizes_defaults_and_aliases() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -272,6 +298,128 @@ fn fake_autopilot_depth_two_e2e_is_gated_durable_and_primary_untouched() -> Resu
     assert!(
         retention.is_empty(),
         "the in-process Fake runtime must not manufacture external output-staging cleanup"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn autopilot_run_reports_matching_effective_nondefault_profile() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let plan_path = temp.path().join("profiled-plan.json");
+    write_file(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": {
+            "title": "Profile-bound run",
+            "body": "Exercise a non-default supervisor profile through autopilot."
+          },
+          "assigned_paths": ["README.md"]
+        }"#,
+    )?;
+    let profile_path = temp.path().join("profile.json");
+    write_file(
+        &profile_path,
+        r#"{
+          "version": 1,
+          "role_models": {
+            "worker": {
+              "model": "profile-worker-model",
+              "reasoning_effort": "medium",
+              "unavailable_model_fallback": "local_deterministic_fake"
+            }
+          },
+          "model_pricing": {
+            "profile-worker-model": {
+              "input_usd_per_million_tokens": 1.25,
+              "output_usd_per_million_tokens": 5.5
+            },
+            "profile-review-model": {
+              "input_usd_per_million_tokens": 2.0,
+              "output_usd_per_million_tokens": 8.0
+            }
+          },
+          "review_lenses": [{
+            "id": "profile-diff-review",
+            "backend": {
+              "kind": "model",
+              "backend_id": "profile-provider",
+              "model": "profile-review-model",
+              "reasoning_effort": "high"
+            },
+            "information_scope": "diff_only"
+          }],
+          "review_aggregation_policy": {"kind": "all_must_accept"}
+        }"#,
+    )?;
+
+    let report = run_success_json(&[
+        "autopilot",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--profile",
+        path_str(&profile_path)?,
+        "--run-id",
+        "profile-bound",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "succeeded");
+    assert_eq!(report["profile_binding"]["version"], 1);
+    assert_eq!(report["profile_binding"]["status"], "matched");
+    assert!(report["profile_binding"].get("failure").is_none());
+    assert_eq!(
+        report["profile_binding"]["requested"],
+        report["profile_binding"]["effective"]
+    );
+    assert_eq!(
+        report["profile_binding"]["effective"]["role_models"]["worker"]["model"],
+        "profile-worker-model"
+    );
+    assert_eq!(
+        report["profile_binding"]["effective"]["model_pricing"]["profile-review-model"]
+            ["output_usd_per_million_tokens"],
+        8.0
+    );
+    assert_eq!(
+        report["profile_binding"]["effective"]["review_lenses"][0]["id"],
+        "profile-diff-review"
+    );
+    assert_eq!(
+        report["supervisor"]["role_economics_profile"]["overridden_roles"],
+        serde_json::json!(["worker"])
+    );
+    assert_eq!(
+        report["supervisor"]["role_economics_profile"]["role_models"]["worker"]["model"],
+        "profile-worker-model"
+    );
+    let executed_lens = &report["supervisor"]["orchestrator_reports"][0]["review_lens_aggregate"]
+        ["lens_verdicts"][0]["lens"];
+    assert_eq!(executed_lens["id"], "profile-diff-review");
+    assert_eq!(executed_lens["model"], "profile-review-model");
+
+    let supervisor_plan: Value = serde_json::from_slice(&fs::read(
+        repo_path.join(".maco/autopilot/runs/profile-bound/supervisor-plan.json"),
+    )?)?;
+    assert_eq!(
+        supervisor_plan["role_models"],
+        report["profile_binding"]["requested"]["role_models"]
+    );
+    assert_eq!(
+        supervisor_plan["model_pricing"],
+        report["profile_binding"]["requested"]["model_pricing"]
+    );
+    assert_eq!(
+        supervisor_plan["review_lenses"],
+        report["profile_binding"]["requested"]["review_lenses"]
+    );
+    assert_eq!(
+        supervisor_plan["review_aggregation_policy"],
+        report["profile_binding"]["requested"]["review_aggregation_policy"]
     );
 
     Ok(())
