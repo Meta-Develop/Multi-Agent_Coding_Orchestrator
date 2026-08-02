@@ -151,6 +151,13 @@ const MAX_CHILD_RETRIES_LIMIT: u8 = 2;
 const DEFAULT_MAX_GATE_CORRECTIONS: u8 = 0;
 const MAX_GATE_CORRECTIONS_LIMIT: u8 = 4;
 const MAX_EVIDENCE_ONLY_REAUDITS: u8 = 2;
+const MAX_LICENSED_BREAKAGE_DEPENDENTS: usize = 16;
+const MAX_LICENSED_BREAKAGE_PATHS_PER_DEPENDENT: usize = 16;
+const MAX_LICENSED_BREAKAGE_INTERFACES_PER_DEPENDENT: usize = 16;
+const MAX_LICENSED_BREAKAGE_RATIONALE_BYTES: usize = 8 * 1024;
+const MAX_LICENSED_BREAKAGE_FAILURE_SIGNATURE_BYTES: usize = 16 * 1024;
+const LICENSED_BREAKAGE_CASCADE_DEPTH: u8 = 1;
+const LICENSED_BREAKAGE_AUDIT_VALIDATION_NAME: &str = "licensed_breakage_declaration";
 const MIN_SUPERVISOR_DEPTH: u8 = 2;
 const MAX_SUPERVISOR_DEPTH: u8 = 32;
 const SUPERVISOR_SCHEMA_VERSION: u32 = 1;
@@ -562,6 +569,7 @@ struct SupervisorPlanMetadata {
     coverage_gaps: Vec<SupervisorCoverageGap>,
     run_budget: SupervisorBudgetConfig,
     evidence_only_reaudit: Option<EvidenceOnlyReauditPlan>,
+    generated_follow_up: Option<GeneratedFollowUpPlanContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -600,8 +608,164 @@ pub struct OrchestratorAssignment {
     #[serde(default)]
     pub environment_requirements: Vec<EnvironmentRequirement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licensed_breakage: Option<LicensedBreakageDeclaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 }
+
+/// Immutable plan authority for one intentionally breaking assignment.
+///
+/// Reports cannot create this authority. The supervisor accepts it only while
+/// validating the normalized plan, before any child is dispatched.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LicensedBreakageDeclaration {
+    pub migration_rationale: String,
+    pub dependents: Vec<LicensedBreakageDependentScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LicensedBreakageDependentScope {
+    pub dependent_id: String,
+    #[serde(default, serialize_with = "serialize_paths")]
+    pub paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub interfaces: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LicensedDependentFailure {
+    pub dependent_id: String,
+    pub validation_name: String,
+    pub failure_signature: String,
+    #[serde(default, serialize_with = "serialize_paths")]
+    pub paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub interfaces: Vec<String>,
+}
+
+/// Supervisor-owned packet presented to every parent review lens.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LicensedBreakageReview {
+    pub declaration_sha256: String,
+    pub migration_rationale: String,
+    pub failures: Vec<LicensedDependentFailure>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratedFollowUpDispatchStatus {
+    DeferredForPlannedRun,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneratedFollowUpOperatorDefault {
+    pub field: String,
+    pub value: String,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneratedFollowUpPlanContext {
+    pub breaking_assignment_id: String,
+    pub breaking_change: CandidateValidationBinding,
+    pub declaration_sha256: String,
+    pub failure_signature: String,
+    pub migration_rationale: String,
+    pub cascade_depth: u8,
+    pub dispatch_status: GeneratedFollowUpDispatchStatus,
+    pub handoff: String,
+    pub operator_defaults: Vec<GeneratedFollowUpOperatorDefault>,
+}
+
+/// A complete ordinary supervisor-plan document generated for one dependent
+/// update. Every field is serialized explicitly so an operator can write this
+/// value directly to a plan file without supplying schedule, budget, or gate
+/// metadata.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneratedFollowUpSupervisorPlan {
+    pub version: u32,
+    pub task: String,
+    #[serde(serialize_with = "serialize_optional_path")]
+    pub task_file: Option<PathBuf>,
+    pub max_depth: u8,
+    pub max_child_assignments: usize,
+    pub max_child_retries: u8,
+    pub max_gate_corrections: u8,
+    pub child_timeout_seconds: u64,
+    pub semantic_coordination: SemanticCoordinationMode,
+    pub role_models: BTreeMap<AgentRole, RoleModelSelection>,
+    pub model_pricing: BTreeMap<String, ModelPricing>,
+    pub review_lenses: Vec<ReviewLensConfig>,
+    pub review_aggregation_policy: ReviewAggregationPolicy,
+    pub assignments: Vec<OrchestratorAssignment>,
+    pub spec_fragment_ids: Vec<String>,
+    pub assignment_schedule: Vec<AssignmentScheduleEntry>,
+    pub run_budget: SupervisorBudgetConfig,
+    pub consultant: SupervisorConsultantPlan,
+    pub generated_follow_up: GeneratedFollowUpPlanContext,
+}
+
+impl GeneratedFollowUpSupervisorPlan {
+    fn ordinary_plan(&self) -> SupervisorPlan {
+        SupervisorPlan {
+            version: self.version,
+            task: self.task.clone(),
+            task_file: self.task_file.clone(),
+            max_depth: self.max_depth,
+            max_child_assignments: self.max_child_assignments,
+            max_child_retries: self.max_child_retries,
+            max_gate_corrections: self.max_gate_corrections,
+            child_timeout_seconds: self.child_timeout_seconds,
+            semantic_coordination: self.semantic_coordination,
+            role_models: self.role_models.clone(),
+            model_pricing: self.model_pricing.clone(),
+            review_lenses: self.review_lenses.clone(),
+            review_aggregation_policy: self.review_aggregation_policy,
+            assignments: self.assignments.clone(),
+        }
+    }
+
+    fn assignment(&self) -> Result<&OrchestratorAssignment> {
+        if self.assignments.len() != 1 {
+            bail!("generated follow-up supervisor plan must contain exactly one assignment");
+        }
+        self.assignments
+            .first()
+            .context("generated follow-up supervisor plan has no assignment")
+    }
+}
+
+/// Durable, dispatchable planned work produced by an accepted licensed
+/// failure. Automatic dispatch remains deliberately deferred: inserting work
+/// into an active scheduler would bypass its prepared checkpoint and budget
+/// closure. `supervisor_plan` itself is ready for the ordinary plan-loading,
+/// claim, child, and auditor paths.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneratedFollowUpTaskRecord {
+    pub supervisor_plan: GeneratedFollowUpSupervisorPlan,
+    pub breaking_assignment_id: String,
+    pub breaking_change: CandidateValidationBinding,
+    pub declaration_sha256: String,
+    pub failure_signature: String,
+    pub migration_rationale: String,
+    pub cascade_depth: u8,
+    pub dispatch_status: GeneratedFollowUpDispatchStatus,
+    pub handoff: String,
+}
+
+// Generated records are constructed only after ordinary plan validation, which
+// rejects non-finite budget and pricing values. Their validated numeric domain
+// therefore has total equality even though the reusable plan types also model
+// pre-validation floating-point input.
+impl Eq for GeneratedFollowUpTaskRecord {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct AssignmentScheduleEntry {
@@ -859,6 +1023,10 @@ pub struct OrchestratorReviewReport {
     pub review_lens_aggregate: Option<ReviewLensAggregate>,
     #[serde(default)]
     pub decomposition_completions: Vec<DecompositionCompletion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licensed_breakage_review: Option<LicensedBreakageReview>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_follow_up_tasks: Vec<GeneratedFollowUpTaskRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gate_denials: Vec<GateDenial>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -948,6 +1116,8 @@ pub struct SupervisorFinalReport {
     pub bloated_file_flags: Vec<BloatedFileFlag>,
     #[serde(default)]
     pub decomposition_candidates: Vec<DecompositionCompletion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_follow_up_tasks: Vec<GeneratedFollowUpTaskRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assignment_traceability: Vec<AssignmentTraceability>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1155,6 +1325,13 @@ pub struct AutonomyKpiReport {
     pub self_corrections: Option<u64>,
     pub human_escalations: Option<u64>,
     pub interrupted: Option<bool>,
+    /// Licensed failures are observable work-generation outcomes, not gate
+    /// denials or correction attempts, and therefore never enter rate
+    /// numerators or denominators.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licensed_dependent_failures: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_follow_up_tasks: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denial_rate: Option<RatioMetric>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1180,6 +1357,8 @@ impl AutonomyKpiReport {
             self_corrections: None,
             human_escalations: None,
             interrupted: None,
+            licensed_dependent_failures: None,
+            generated_follow_up_tasks: None,
             denial_rate: None,
             self_correction_rate: None,
             interruption_rate: None,
@@ -1549,6 +1728,8 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         audit_reports: vec![audit],
         review_lens_aggregate: None,
         decomposition_completions: vec![completion.clone()],
+        licensed_breakage_review: None,
+        generated_follow_up_tasks: Vec::new(),
         gate_denials: Vec::new(),
         gate_correction_outcomes: Vec::new(),
         accepted: true,
@@ -1600,6 +1781,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         findings: Vec::new(),
         bloated_file_flags: Vec::new(),
         decomposition_candidates: vec![completion],
+        generated_follow_up_tasks: Vec::new(),
         assignment_traceability: Vec::new(),
         coverage_gaps: Vec::new(),
         breaker_trip: None,

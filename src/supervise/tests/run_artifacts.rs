@@ -1643,6 +1643,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
                 report_path: None,
             }],
             environment_requirements: Vec::new(),
+            licensed_breakage: None,
             notes: None,
         }],
     };
@@ -1703,6 +1704,8 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         audit_reports: Vec::new(),
         review_lens_aggregate: None,
         decomposition_completions: Vec::new(),
+        licensed_breakage_review: None,
+        generated_follow_up_tasks: Vec::new(),
         gate_denials: Vec::new(),
         gate_correction_outcomes: Vec::new(),
         accepted: true,

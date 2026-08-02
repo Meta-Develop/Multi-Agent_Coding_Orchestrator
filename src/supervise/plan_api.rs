@@ -114,6 +114,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
             )),
             worker_assignments: Vec::new(),
             environment_requirements: Vec::new(),
+            licensed_breakage: None,
             notes: Some(
                 "MACO-visible read-only planning root; its execution child is parent-gated"
                     .to_string(),
@@ -152,6 +153,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
             task: Some(assignment.task),
             worker_assignments: vec![worker],
             environment_requirements: Vec::new(),
+            licensed_breakage: None,
             notes: Some(format!(
                 "Execution child admitted only after read-only planning root '{planning_id}' succeeds"
             )),
@@ -191,6 +193,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
         coverage_gaps: Vec::new(),
         run_budget: SupervisorBudgetConfig::default(),
         evidence_only_reaudit: None,
+        generated_follow_up: None,
     };
     let (plan, plan_metadata) = validate_supervisor_plan(plan, metadata)?;
     Ok(LoadedSupervisorPlan {
@@ -298,6 +301,14 @@ fn supervisor_plan_metadata_from_value(
                 .context("evidence_only_reaudit is invalid")
         })
         .transpose()?;
+    let generated_follow_up = value
+        .get("generated_follow_up")
+        .map(|context| {
+            validate_generated_follow_up_document_sections(value)?;
+            serde_json::from_value::<GeneratedFollowUpPlanContext>(context.clone())
+                .context("generated_follow_up is invalid")
+        })
+        .transpose()?;
     let raw_assignments = value
         .get("assignments")
         .and_then(Value::as_array)
@@ -306,6 +317,7 @@ fn supervisor_plan_metadata_from_value(
         spec_fragment_ids,
         run_budget,
         evidence_only_reaudit,
+        generated_follow_up,
         ..SupervisorPlanMetadata::default()
     };
     collect_assignment_plan_metadata(
@@ -332,6 +344,34 @@ fn supervisor_plan_metadata_from_value(
         metadata.assignment_schedule = supplied_schedule;
     }
     Ok(metadata)
+}
+
+fn validate_generated_follow_up_document_sections(value: &Value) -> Result<()> {
+    for field in [
+        "version",
+        "task",
+        "task_file",
+        "max_depth",
+        "max_child_assignments",
+        "max_child_retries",
+        "max_gate_corrections",
+        "child_timeout_seconds",
+        "semantic_coordination",
+        "role_models",
+        "model_pricing",
+        "review_lenses",
+        "review_aggregation_policy",
+        "assignments",
+        "spec_fragment_ids",
+        "assignment_schedule",
+        "run_budget",
+        "consultant",
+    ] {
+        if value.get(field).is_none() {
+            bail!("generated follow-up supervisor plan requires explicit '{field}' section");
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn validate_assignment_schedule(
@@ -676,7 +716,7 @@ pub(super) fn supervisor_plan_value(
     let object = value
         .as_object_mut()
         .context("normalized supervisor plan did not serialize to an object")?;
-    if !plan_metadata.spec_fragment_ids.is_empty() {
+    if !plan_metadata.spec_fragment_ids.is_empty() || plan_metadata.generated_follow_up.is_some() {
         object.insert(
             "spec_fragment_ids".to_string(),
             serde_json::to_value(&plan_metadata.spec_fragment_ids)
@@ -709,7 +749,26 @@ pub(super) fn supervisor_plan_value(
                 .context("failed to serialize evidence_only_reaudit plan field")?,
         );
     }
-    if !consultant.is_default() {
+    if let Some(context) = &plan_metadata.generated_follow_up {
+        object.insert("task_file".to_string(), Value::Null);
+        object
+            .entry("role_models".to_string())
+            .or_insert_with(|| json!({}));
+        object
+            .entry("model_pricing".to_string())
+            .or_insert_with(|| json!({}));
+        object.insert(
+            "generated_follow_up".to_string(),
+            serde_json::to_value(context)
+                .context("failed to serialize generated_follow_up plan field")?,
+        );
+        object.insert(
+            "run_budget".to_string(),
+            serde_json::to_value(&plan_metadata.run_budget)
+                .context("failed to serialize generated follow-up run_budget field")?,
+        );
+    }
+    if !consultant.is_default() || plan_metadata.generated_follow_up.is_some() {
         object.insert(
             "consultant".to_string(),
             serde_json::to_value(consultant)
@@ -925,6 +984,7 @@ pub(super) fn evidence_only_reaudit_plan_from_source(
         coverage_gaps: Vec::new(),
         run_budget: source_loaded.plan_metadata.run_budget,
         evidence_only_reaudit: Some(operation),
+        generated_follow_up: None,
     };
     let (plan, plan_metadata) = validate_supervisor_plan(plan, plan_metadata)?;
     Ok(LoadedSupervisorPlan {
@@ -1454,6 +1514,7 @@ pub fn collect_supervisor_run(
         }],
         bloated_file_flags: Vec::new(),
         decomposition_candidates: Vec::new(),
+        generated_follow_up_tasks: Vec::new(),
         assignment_traceability: Vec::new(),
         coverage_gaps: Vec::new(),
         breaker_trip: None,

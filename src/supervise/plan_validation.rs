@@ -292,6 +292,18 @@ pub(super) fn validate_supervisor_plan(
                 )
             },
         )?;
+        validate_licensed_breakage_declaration(assignment)?;
+        if assignment.licensed_breakage.is_some()
+            && plan
+                .review_lenses
+                .iter()
+                .any(|lens| lens.information_scope == ReviewInformationScope::DiffOnly)
+        {
+            bail!(
+                "assignment '{}' licensed_breakage requires every auditor lens to receive the output report containing the declaration",
+                assignment.id
+            );
+        }
         validate_worker_assignments(assignment)?;
         canonical_environment_requirements(assignment)?;
 
@@ -335,6 +347,7 @@ pub(super) fn validate_supervisor_plan(
             bail!("evidence_only_reaudit does not permit child retries or in-run gate corrections");
         }
     }
+    validate_generated_follow_up_plan(&plan, &mut metadata)?;
     validate_orchestrator_assignment_collisions(&plan.assignments, &metadata.assignment_schedule)?;
 
     metadata.spec_fragment_ids =
@@ -380,6 +393,330 @@ pub(super) fn validate_supervisor_plan(
         .collect();
 
     Ok((plan, metadata))
+}
+
+pub(super) fn generated_follow_up_operator_defaults() -> Vec<GeneratedFollowUpOperatorDefault> {
+    vec![
+        GeneratedFollowUpOperatorDefault {
+            field: "task_file".to_string(),
+            value: "null".to_string(),
+            rationale: "the journaled generated plan document is the authoritative inline task source"
+                .to_string(),
+        },
+        GeneratedFollowUpOperatorDefault {
+            field: "spec_fragment_ids".to_string(),
+            value: "[]".to_string(),
+            rationale: "the dependent failure and breaking candidate binding provide traceability; no operator-authored spec fragment mapping exists"
+                .to_string(),
+        },
+    ]
+}
+
+pub(super) fn derived_generated_follow_up_budget(
+    plan: &SupervisorPlan,
+    source: &SupervisorBudgetConfig,
+) -> Result<SupervisorBudgetConfig> {
+    let child_tokens = source
+        .reservation_tokens(AgentRole::ChildOrchestrator)
+        .context("source run budget has no child_orchestrator token reservation")?;
+    let auditor_tokens = source
+        .reservation_tokens(AgentRole::Auditor)
+        .context("source run budget has no auditor token reservation")?;
+    let attempts = usize::from(plan.max_child_retries)
+        .checked_add(usize::from(plan.max_gate_corrections))
+        .and_then(|count| count.checked_add(1))
+        .context("generated follow-up maximum attempt count overflowed")?;
+    let auditor_dispatches = attempts
+        .checked_mul(plan.review_lenses.len())
+        .context("generated follow-up auditor dispatch count overflowed")?;
+    let child_budget = attempts
+        .checked_mul(child_tokens)
+        .context("generated follow-up child token closure overflowed")?;
+    let auditor_budget = auditor_dispatches
+        .checked_mul(auditor_tokens)
+        .context("generated follow-up auditor token closure overflowed")?;
+    let token_closure = child_budget
+        .checked_add(auditor_budget)
+        .context("generated follow-up token closure overflowed")?;
+    Ok(SupervisorBudgetConfig {
+        limits: RunBudgetLimits {
+            soft_tokens: Some(token_closure),
+            hard_tokens: Some(token_closure),
+            // Token ceilings close over this generated plan's exact dispatch
+            // shape. Cost ceilings cannot be recomputed without assuming
+            // provider usage, so preserve the source run's safety envelope.
+            soft_cost_usd: source.limits.soft_cost_usd,
+            hard_cost_usd: source.limits.hard_cost_usd,
+        },
+        role_token_reservations: BTreeMap::from([
+            (AgentRole::ChildOrchestrator, child_tokens),
+            (AgentRole::Auditor, auditor_tokens),
+        ]),
+    })
+}
+
+fn validate_generated_follow_up_plan(
+    plan: &SupervisorPlan,
+    metadata: &mut SupervisorPlanMetadata,
+) -> Result<()> {
+    let Some(context) = metadata.generated_follow_up.as_mut() else {
+        return Ok(());
+    };
+    if metadata.evidence_only_reaudit.is_some() {
+        bail!("generated_follow_up and evidence_only_reaudit cannot share one supervisor plan");
+    }
+    if plan.assignments.len() != 1 {
+        bail!("generated_follow_up supervisor plan must contain exactly one assignment");
+    }
+    let assignment = plan
+        .assignments
+        .first()
+        .context("generated_follow_up supervisor plan has no assignment")?;
+    if assignment.licensed_breakage.is_some() {
+        bail!("generated_follow_up assignment cannot carry a new licensed_breakage declaration");
+    }
+    if metadata.assignment_schedule.len() != 1
+        || metadata.assignment_schedule[0].assignment_id != assignment.id
+        || metadata.assignment_schedule[0]
+            .parent_assignment_id
+            .is_some()
+        || metadata.assignment_schedule[0].depth != MIN_SUPERVISOR_DEPTH
+        || metadata.assignment_schedule[0].flattened_index != 0
+    {
+        bail!("generated_follow_up assignment_schedule must contain its sole assignment as one root entry");
+    }
+    if plan.task_file.is_some() || !metadata.spec_fragment_ids.is_empty() {
+        bail!("generated_follow_up operator defaults require null task_file and empty spec_fragment_ids");
+    }
+    if context.operator_defaults != generated_follow_up_operator_defaults() {
+        bail!("generated_follow_up operator defaults are incomplete or undocumented");
+    }
+    context.breaking_assignment_id = normalize_agent_id(&context.breaking_assignment_id)
+        .context("generated_follow_up breaking_assignment_id is invalid")?;
+    if context.breaking_assignment_id == assignment.id {
+        bail!("generated_follow_up assignment cannot be its own breaking assignment");
+    }
+    context.breaking_change = context
+        .breaking_change
+        .clone()
+        .canonicalized()
+        .context("generated_follow_up breaking_change is invalid")?;
+    if context.breaking_change.agent_id != context.breaking_assignment_id
+        || context.breaking_change.diff_oid.is_empty()
+    {
+        bail!("generated_follow_up breaking_change does not identify its breaking assignment");
+    }
+    if context.declaration_sha256.len() != 64
+        || !context
+            .declaration_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("generated_follow_up declaration_sha256 is not canonical lowercase SHA-256");
+    }
+    for (field, value, limit) in [
+        (
+            "failure_signature",
+            context.failure_signature.as_str(),
+            MAX_LICENSED_BREAKAGE_FAILURE_SIGNATURE_BYTES,
+        ),
+        (
+            "migration_rationale",
+            context.migration_rationale.as_str(),
+            MAX_LICENSED_BREAKAGE_RATIONALE_BYTES,
+        ),
+        ("handoff", context.handoff.as_str(), 8 * 1024),
+    ] {
+        if value.is_empty()
+            || value.trim() != value
+            || value.len() > limit
+            || value.chars().any(char::is_control)
+        {
+            bail!("generated_follow_up {field} must be bounded printable text");
+        }
+    }
+    if context.cascade_depth != LICENSED_BREAKAGE_CASCADE_DEPTH
+        || context.dispatch_status != GeneratedFollowUpDispatchStatus::DeferredForPlannedRun
+    {
+        bail!("generated_follow_up cascade depth or dispatch status is invalid");
+    }
+    let expected_budget = derived_generated_follow_up_budget(plan, &metadata.run_budget)?;
+    if metadata.run_budget != expected_budget {
+        bail!("generated_follow_up run_budget does not close its maximum child and auditor dispatches");
+    }
+    Ok(())
+}
+
+pub(super) fn licensed_breakage_declaration_sha256(
+    declaration: &LicensedBreakageDeclaration,
+) -> Result<String> {
+    let bytes = serde_json::to_vec(declaration)
+        .context("failed to serialize licensed breakage declaration")?;
+    Ok(crate::artifacts::state_auth::sha256_hex(&bytes))
+}
+
+fn validate_licensed_breakage_declaration(assignment: &mut OrchestratorAssignment) -> Result<()> {
+    let Some(declaration) = assignment.licensed_breakage.as_mut() else {
+        return Ok(());
+    };
+    let rationale = declaration.migration_rationale.trim();
+    if rationale.is_empty() {
+        bail!(
+            "assignment '{}' licensed_breakage requires a migration_rationale",
+            assignment.id
+        );
+    }
+    if rationale != declaration.migration_rationale {
+        bail!(
+            "assignment '{}' licensed_breakage migration_rationale must not have surrounding whitespace",
+            assignment.id
+        );
+    }
+    if rationale.len() > MAX_LICENSED_BREAKAGE_RATIONALE_BYTES
+        || rationale.chars().any(char::is_control)
+    {
+        bail!(
+            "assignment '{}' licensed_breakage migration_rationale is not bounded printable text",
+            assignment.id
+        );
+    }
+    if declaration.dependents.is_empty()
+        || declaration.dependents.len() > MAX_LICENSED_BREAKAGE_DEPENDENTS
+    {
+        bail!(
+            "assignment '{}' licensed_breakage must name between 1 and {} dependents",
+            assignment.id,
+            MAX_LICENSED_BREAKAGE_DEPENDENTS
+        );
+    }
+
+    let mut dependent_ids = BTreeSet::new();
+    let mut licensed_paths = Vec::<(String, PathBuf)>::new();
+    for dependent in &mut declaration.dependents {
+        dependent.dependent_id =
+            normalize_agent_id(&dependent.dependent_id).with_context(|| {
+                format!(
+                    "assignment '{}' licensed_breakage dependent id is invalid",
+                    assignment.id
+                )
+            })?;
+        if dependent.dependent_id == assignment.id {
+            bail!(
+                "assignment '{}' cannot license breakage attributed to itself",
+                assignment.id
+            );
+        }
+        if !dependent_ids.insert(dependent.dependent_id.clone()) {
+            bail!(
+                "assignment '{}' licensed_breakage repeats dependent '{}'",
+                assignment.id,
+                dependent.dependent_id
+            );
+        }
+        if dependent.paths.is_empty()
+            || dependent.paths.len() > MAX_LICENSED_BREAKAGE_PATHS_PER_DEPENDENT
+        {
+            bail!(
+                "assignment '{}' licensed dependent '{}' must name between 1 and {} paths",
+                assignment.id,
+                dependent.dependent_id,
+                MAX_LICENSED_BREAKAGE_PATHS_PER_DEPENDENT
+            );
+        }
+        if let Some(path) = dependent.paths.iter().find(|path| {
+            path.as_os_str().is_empty()
+                || path.as_path() == Path::new(".")
+                || path.components().count() < 2
+        }) {
+            bail!(
+                "assignment '{}' licensed dependent '{}' path '{}' is over-broad; name a repository subtree or file below a top-level directory",
+                assignment.id,
+                dependent.dependent_id,
+                path.display()
+            );
+        }
+        dependent.paths =
+            normalize_paths(std::mem::take(&mut dependent.paths)).with_context(|| {
+                format!(
+                    "assignment '{}' licensed dependent '{}' has invalid paths",
+                    assignment.id, dependent.dependent_id
+                )
+            })?;
+        for path in &dependent.paths {
+            if assignment
+                .assigned_paths
+                .iter()
+                .any(|assigned| paths_overlap(path, assigned))
+            {
+                bail!(
+                    "assignment '{}' licensed dependent '{}' path '{}' overlaps the breaking assignment scope",
+                    assignment.id,
+                    dependent.dependent_id,
+                    path.display()
+                );
+            }
+            if let Some((owner, existing)) = licensed_paths
+                .iter()
+                .find(|(_, existing)| paths_overlap(path, existing))
+            {
+                bail!(
+                    "assignment '{}' licensed dependent '{}' path '{}' overlaps dependent '{}' path '{}'",
+                    assignment.id,
+                    dependent.dependent_id,
+                    path.display(),
+                    owner,
+                    existing.display()
+                );
+            }
+            licensed_paths.push((dependent.dependent_id.clone(), path.clone()));
+        }
+        if dependent.interfaces.is_empty()
+            || dependent.interfaces.len() > MAX_LICENSED_BREAKAGE_INTERFACES_PER_DEPENDENT
+        {
+            bail!(
+                "assignment '{}' licensed dependent '{}' must name between 1 and {} interfaces",
+                assignment.id,
+                dependent.dependent_id,
+                MAX_LICENSED_BREAKAGE_INTERFACES_PER_DEPENDENT
+            );
+        }
+        dependent.interfaces = normalize_semantic_symbols(&dependent.interfaces);
+        if dependent.interfaces.is_empty() {
+            bail!(
+                "assignment '{}' licensed dependent '{}' has no canonical interface names",
+                assignment.id,
+                dependent.dependent_id
+            );
+        }
+        if let Some(interface) = dependent.interfaces.iter().find(|interface| {
+            !interface.contains("::")
+                || interface.len() > 512
+                || interface.split("::").any(|segment| {
+                    segment.is_empty()
+                        || !segment
+                            .chars()
+                            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+                })
+        }) {
+            bail!(
+                "assignment '{}' licensed dependent '{}' interface '{}' must be a bounded qualified identifier without wildcards",
+                assignment.id,
+                dependent.dependent_id,
+                interface
+            );
+        }
+    }
+    declaration
+        .dependents
+        .sort_by(|left, right| left.dependent_id.cmp(&right.dependent_id));
+    let digest = licensed_breakage_declaration_sha256(declaration)?;
+    if digest.len() != 64 {
+        bail!(
+            "assignment '{}' licensed_breakage declaration digest is not canonical",
+            assignment.id
+        );
+    }
+    Ok(())
 }
 
 fn validate_orchestrator_assignment_collisions(

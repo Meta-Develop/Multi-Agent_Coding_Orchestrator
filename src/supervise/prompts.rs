@@ -218,6 +218,8 @@ Required behavior:
 - OrchestratorReviewReport may also propose bounded field_guide_entries containing finding and context only. Do not copy unreviewed or rejected worker suggestions into this field.
 - Preserve each worker assignment_kind and target_path in WorkerReport. A successful megafile_decomposition worker must report the exact canonical target_path in files_changed and include decomposition_completion with that target plus at least one concrete canonical replacement_path also present in files_changed. OrchestratorReviewReport must aggregate the exact accepted worker evidence in decomposition_completions; this evidence does not bypass claims, journals, validation, audit, or later merge gates.
 - Include at least one accepted review-auditor report in audit_reports that covers all assigned worker ids; MACO rejects child reports with worker assignments that omit terminal audit evidence.
+- A licensed_breakage declaration in the assignment is immutable plan authority, not permission you may create or widen. For each dependent validation failure, use the exact declared dependent_id as ValidationResult.name, preserve the exact bounded compiler/build signature in message (including the declared interface name), and add an Error finding with the identical message and exact affected dependent paths. Unmatched failures remain ordinary assignment failures.
+- Never emit licensed_breakage_review or generated_follow_up_tasks. They are supervisor-owned gate and journal records; attempting to self-assert them fails the assignment.
 
 Safety requirements:
 - Do not edit outside the assigned paths, symbols, or modules.
@@ -306,6 +308,7 @@ Review requirements:
 - Set role="auditor", no_further_delegation=true, read_only=true.
 - Set rejection_kind=null for acceptance. For every rejection, set rejection_kind="implementation_defect" when the preserved implementation must change, or rejection_kind="evidence_quality" only when the implementation is sound and validation/report evidence alone must be corrected.
 - Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
+- If the child report contains licensed_breakage_review, verify that every failed validation is attributable to its exact named dependent, path, and interface scope and that the migration rationale is adequate. Accepting that license requires one succeeded validation_results entry whose name is "licensed_breakage_declaration" and whose message is the exact declaration_sha256. Omitting or changing that marker refuses the license and must reject the report.
 - Include reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining_risk, and next_safe_action.
 - Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
 "#,
@@ -447,6 +450,8 @@ Return one OrchestratorReviewReport JSON value through the configured output-las
         .context("failed to serialize authenticated source report for evidence-only re-audit")?;
     let binding = serde_json::to_string_pretty(&source.operation.preserved_candidate_binding)
         .context("failed to serialize preserved candidate binding")?;
+    let assignment_json = serde_json::to_string_pretty(assignment)
+        .context("failed to serialize evidence-only assignment")?;
     let prompt = format!(
         r#"{cacheable_prefix}{role_prefix}
 Evidence-only operation:
@@ -460,14 +465,18 @@ Evidence-only operation:
 - Required candidate binding: {binding}
 
 Report contract:
-- Preserve assigned_paths, semantic_symbols, semantic_modules, files_changed, field_guide_entries, worker_reports, and decomposition_completions exactly from the authenticated source report.
+- Preserve assigned_paths, semantic_symbols, semantic_modules, files_changed, field_guide_entries, worker_reports, and decomposition_completions exactly from the authenticated source report. The immutable assignment JSON still carries any licensed_breakage declaration into this re-audit.
 - Set audit_reports=[], review_lens_aggregate=null, gate_denials=[], and gate_correction_outcomes=[]; these are supervisor-owned.
+- Do not emit licensed_breakage_review or generated_follow_up_tasks; the supervisor reconstructs those fields from the immutable declaration and current evidence.
 - Update only commands_run, validation_results, findings, environment_failures, accepted/rejected/status, remaining_risk, next_safe_action, and current claim/semantic tokens as supported by evidence you actually observe.
 - Do not claim timings, counts, versions, disk state, lock history, or side effects unless the evidence in this operation establishes them.
 - Acceptance requires sufficient accurate validation evidence for the exact preserved diff below. If validation remains insufficient, reject the report honestly.
 
 Authenticated source report JSON:
 {source_report}
+
+Immutable assignment JSON:
+{assignment_json}
 
 Exact preserved diff presented for validation:
 {diff}
@@ -481,6 +490,7 @@ Exact preserved diff presented for validation:
         schema_path = schema_path.display(),
         binding = binding,
         source_report = source_report,
+        assignment_json = assignment_json,
         diff = diff,
     );
     let measurement = PromptByteMeasurement::new(
@@ -1236,6 +1246,7 @@ mod regression_tests {
             task: Some("complete the bounded prompt-chain assignment".to_string()),
             worker_assignments: vec![worker],
             environment_requirements: Vec::new(),
+            licensed_breakage: None,
             notes: None,
         };
         let plan = SupervisorPlan {
@@ -1331,6 +1342,8 @@ mod regression_tests {
             audit_reports: Vec::new(),
             review_lens_aggregate: None,
             decomposition_completions: Vec::new(),
+            licensed_breakage_review: None,
+            generated_follow_up_tasks: Vec::new(),
             gate_denials: Vec::new(),
             gate_correction_outcomes: Vec::new(),
             accepted: true,
@@ -1390,6 +1403,7 @@ mod regression_tests {
                 })
                 .collect(),
             environment_requirements: Vec::new(),
+            licensed_breakage: None,
             notes: None,
         };
         let plan = SupervisorPlan {
@@ -1633,6 +1647,7 @@ mod regression_tests {
             task: Some("review the bounded change".to_string()),
             worker_assignments: Vec::new(),
             environment_requirements: Vec::new(),
+            licensed_breakage: None,
             notes: None,
         };
         let diff_lens = ReviewLensConfig {
@@ -1784,6 +1799,7 @@ mod regression_tests {
             task: None,
             worker_assignments: Vec::new(),
             environment_requirements: Vec::new(),
+            licensed_breakage: None,
             notes: None,
         };
         let lens = ReviewLensConfig {

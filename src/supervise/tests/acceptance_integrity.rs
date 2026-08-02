@@ -1437,6 +1437,7 @@ fn supervisor_required_optional_and_vector_paths_share_reversible_serialization(
                 report_path: Some(path.clone()),
             }],
             environment_requirements: Vec::new(),
+            licensed_breakage: None,
             notes: None,
         }],
     };
