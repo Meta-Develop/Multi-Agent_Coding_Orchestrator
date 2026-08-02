@@ -75,8 +75,10 @@ The current implementation covers a local-first command-line slice:
   `--machine-global-runtime-root-id` so private runtime output-staging cleanup
   cannot silently take the unbound deletion bypass. It still acquires the repository-cleanliness
   capability and creates capability-bound managed child worktrees before that
-  safety gate. The in-process Fake file-entry simulation path returns
-  `Unsupported`. `maco supervise plan/status/collect` remain available. The
+  safety gate. The in-process Fake runtime executes the same depth, claim,
+  journal, review-lens, economics, KPI, and final primary-integrity gates
+  without launching an external executable; its successful output is always
+  non-publishable. `maco supervise plan/status/collect` remain available. The
   supervisor scheduler launches opt-in O1 child orchestrators through the
   Codex CLI in isolated child worktrees under an O2 supervisor, with
   automatic resource-bounded fan-out as the default. It measures host capacity
@@ -115,10 +117,11 @@ The current implementation covers a local-first command-line slice:
   `NEXT_O2_TASKS.tsv` durable queue state and run ledgers such as `STATE.tsv`,
   `HEARTBEAT.tsv`, task prompts, captured outputs, and `SUMMARY.md`.
 - `maco autopilot plan/run/status/collect` provides the first local-first
-  autopilot workflow: normalize a task or plan, run a supervised child worker in
-  fake/local mode by default, publish through the PR safety gates, run an
-  independent reviewer, and write public-safe reports under
-  `.maco/autopilot/runs/<run-id>/`.
+  autopilot workflow: normalize a task or plan and pass one hand-authored plan
+  through the live depth-2 supervisor path in fake/local mode by default. It
+  writes public-safe reports under `.maco/autopilot/runs/<run-id>/` but never
+  publishes, merges, applies to the primary worktree, or automatically dispatches
+  generated follow-up plans.
 - `maco autopilot artifacts list/latest/prune` inspects or prunes durable
   autopilot run artifacts.
 - `maco review pr <number|url>` emits an independent fake structured review
@@ -159,9 +162,9 @@ Known limitations and roadmap for 0.3.0:
    fake adapter without network access. Remote push, PR creation, and the
    post-create receipt check are not one globally atomic operation; the durable
    receipt supports detection and retry reconciliation rather than claiming
-   cross-service atomicity. Autopilot keeps the same boundary:
-   GitHub publication is selected only by a plan's explicit
-   `forge_mode: "github"`. Inbox intake keeps deterministic fake data as the default;
+   cross-service atomicity. The supervise-backed Autopilot spine does not call
+   either forge; legacy `forge_mode` plan data is inert there. Inbox intake
+   keeps deterministic fake data as the default;
    GitHub inbox scanning is selected only with an explicit GitHub source.
    Issue triage metadata remains minimal.
 4. Real LLM providers remain post-0.3.0 roadmap work and must be opt-in,
@@ -2345,38 +2348,29 @@ credentials, or a real Codex login.
 
 Run the fake-first autopilot workflow:
 
-> **Temporary safety limitation:** `maco autopilot run` currently fails closed
-> before opening the repository, reading the plan, reserving artifacts or
-> claims, creating a worktree, starting a supervisor, or publishing anything.
-> Effectful execution remains disabled until the supervisor receives repository
-> inputs through a capability-bound bridge. `autopilot plan`, `status`,
-> `collect`, artifact `list`/`latest`, and `prune --dry-run` remain read-only
-> entry points; non-dry-run prune is separate explicit maintenance. Unsupported
-> effectful CLI commands follow the global CLI contract and return the fixed
-> error on stderr even when `--json` is present. The bounded
-> repository inventory rejects mount crossings, unsafe Git index state,
-> submodules, object alternates, and pathname-association changes, but it does
-> not claim to prevent a hostile same-UID process from performing undetectable
-> in-place writes or ABA changes. Inventory and map output is discarded when
-> the bounded before/after captures differ, but matching captures are not a
-> same-UID safety guarantee. Effectful Inbox run/watch entry points, managed
-> worktree creation, non-force managed worktree removal, `orchestrate run`,
-> `agent run`, and Inbox run/watch/workspace run/watch are disabled at their
-> public entry points for the same reason. `supervise run` is not part of this
-> disabled group: its default Codex runtime internally acquires the
-> repository-cleanliness capability and creates capability-bound managed child
-> worktrees. Inbox scan/status,
-> worktree list/pending, worktree gc, and force cleanup remain available. `maco worktree
-> pending` opens only an existing authenticated snapshot and existing locks;
-> absent state returns no operations, and crash residue or transitional state is
-> refused without recovery or mutation. Operators must inspect preserved manual
-> recovery evidence before using `remove --force` for explicitly authorized
-> cleanup; force cleanup only unlinks children whose exact identity was persisted.
-> The read-only Git
-> subprocess still lacks descriptor transfer, so matching captures do not raise
-> its pathname inputs above the documented same-UID trust boundary. A
-> future descriptor-transfer design is kept separate from this temporary
-> fail-closed boundary.
+`maco autopilot run` is a deliberately narrow capability spine. One command
+normalizes one hand-authored task/plan, performs typed preflight checks, builds a
+single supervisor plan with `max_depth: 2`, and invokes the public
+`supervise run` implementation. Omit `--codex-bin` for the deterministic
+in-process Fake runtime. Every run must name the reviewed machine-global
+configuration and runtime root used by supervise output-staging cleanup.
+The spine shape is fixed: an omitted `max_depth` or integer `max_depth: 2` is
+accepted. Any other integer depth, or any non-empty
+`assignments[*].child_assignments`, is a typed
+`approval_review`/`permission_expansion` refusal before supervise dispatch;
+malformed or non-integer depth input is invalid. Moving decomposition and deeper
+recursion into the tool remains Issue #22 step 2, along with automatic dispatch
+of generated follow-up plans.
+
+This increment does not revive the legacy Autopilot repair/publication loop.
+Plan fields for outer validation, reviewer, forge, repair count, publish mode,
+and `auto_merge` remain accepted for input compatibility but cannot dispatch
+those effects. Supplying the legacy `--reviewer-command` fails closed. The
+supervisor's own worker/auditor gates are authoritative. A successful result is
+isolated and non-publishable in Fake mode; Autopilot never applies it to the
+primary worktree, publishes it, merges it, or automatically dispatches Issue
+#20 generated follow-up plans. Human-reviewed arbitration and explicit
+preview/apply remain separate commands.
 
 ```json
 {
@@ -2401,7 +2395,9 @@ Run the fake-first autopilot workflow:
 
 ```bash
 cargo run -- autopilot plan autopilot-plan.json --repo . --json
-cargo run -- autopilot run autopilot-plan.json --repo . --run-id readme-demo --json
+cargo run -- autopilot run autopilot-plan.json --repo . --run-id readme-demo \
+  --machine-global-config /etc/maco/machine-global.json \
+  --machine-global-runtime-root-id runtime --json
 cargo run -- autopilot status readme-demo --repo . --json
 cargo run -- autopilot collect readme-demo --repo . --json
 cargo run -- autopilot artifacts latest --repo . --json
@@ -2416,18 +2412,25 @@ task wording instead of defaulting only to `README.md`. The helper is only a
 starting point: hard sync claims, semantic coordination, live locks, and PR
 safety gates remain authoritative, and ambiguous tasks are kept conservative.
 Autopilot stores
-`plan.json`, `supervisor-report.json`, `pr-report.json`, `review-report.json`,
-and `final-report.json` under `.maco/autopilot/runs/<run-id>/`. These reports
-use repo-relative paths and omit nested merge-preview paths and full diffs.
+`plan.json`, `supervisor-plan.json`, `supervisor-report.json`, `pr-report.json`,
+`review-report.json`, and `final-report.json` under
+`.maco/autopilot/runs/<run-id>/`. The final report embeds the exact typed
+`SupervisorFinalReport`: `GateDenial`, `EnvironmentFailure` (including
+`runtime_model_catalog_unavailable`), role economics/usage attribution, and
+autonomy KPIs are composed rather than translated into a second vocabulary.
+Autopilot does not recompute KPI rates or denominators; the supervisor aggregate
+is the only KPI observation. Reports use repo-relative paths and omit nested
+merge-preview paths and full diffs.
 
-The disabled effectful implementation is designed around a deterministic fake
-child subprocess, fake forge, and fake reviewer, while `--codex-bin` and
-`forge_mode: github` describe future opt-in execution surfaces. None of those
-workers, subprocesses, pushes, or PR operations are currently reached by
-`autopilot run`. The legacy
+The disabled legacy implementation remains source-only design reference for a
+deterministic child subprocess, forge, reviewer, repair loop, and publication
+receipts. It is not called by `autopilot run`; forge, PR, review, validation,
+repair, push, and merge operations in that loop remain unreachable. The legacy
 `--reviewer-command` shell-string option is retained only for an explicit
-fail-closed compatibility error and cannot grant real review authority. A JSON
-reviewer configuration opts in with `mode: "external_command"`, a canonical
+fail-closed compatibility error and cannot grant real review authority. The
+following external-review rules document that disabled reference surface, not
+an active Autopilot dispatch. A JSON reviewer configuration uses
+`mode: "external_command"`, a canonical
 repo-relative or absolute `program`, and bounded `args`. PATH lookup, shell
 strings, and shell `-c` are refused. The independent review report uses a
 separate reviewer identity from the child worker, includes
@@ -2530,26 +2533,43 @@ API VFS surface. Those remain confidentiality boundaries; the source worktree
 and ignored files are instead required to stay behind verified inaccessible
 masks.
 
-When effectful execution is re-enabled, Autopilot is designed to refuse launch
-when the primary worktree is dirty unless `--allow-dirty-primary` is supplied,
-when active sync claims overlap its target paths, when active semantic intents
-overlap those paths, or when active/blocked live claim locks overlap those
-paths. Refusal JSON includes the refusal kind,
-paths, and lock details such as owner, sync or semantic token, or live claim id
-when available. It also relies on the existing supervise and PR safety gates for
-stale/dirty child worktree reuse and unclaimed edits. Blocking review findings
-or failed validation trigger repair attempts up to `max_repair_attempts`.
-Autopilot accepts at most two repair attempts and 128 validation commands. An
-omitted validation timeout defaults to 600 seconds; explicit timeouts must be
-between 1 and 86400 seconds. Plan files and nested task, path, semantic, review,
-and command collections are bounded and validated before a run directory or
-worker is created.
+Autopilot refuses launch when the primary worktree is dirty unless
+`--allow-dirty-primary` is supplied, or when active sync claims, semantic
+intents, or active/blocked live claim locks overlap its target paths. These
+checks run before artifact reservation and again immediately before supervisor
+dispatch. Refusal JSON uses the shared `GateDenial` envelope. The supervisor
+then remains responsible for bounded depth, claim admission, repository
+cleanliness, journal, breaker, child/auditor acceptance, evidence-only re-audit,
+and final primary-integrity checks. Plan files and nested task, path, semantic,
+review, and command collections remain bounded and validated before dispatch.
 External finding summaries, suggested fixes, next actions, diagnostics, and
 finding paths remain available in bounded review artifacts but are never copied
 into a later supervisor task. Retry prompts contain only a parent-selected
 fixed reason code and validated blocking/severity counts.
 Autopilot never auto-merges: `auto_merge=true` is accepted and reported as
 requested, but `auto_merge_performed` is always `false`.
+
+### Autopilot spine safety ledger
+
+| Protection re-enabled or consumed | Satisfaction and retained failure path | Fail-capable evidence |
+| --- | --- | --- |
+| Repository-cleanliness capability and primary isolation | Issue #11 (`42f51aa`) capability-binds managed worktree creation. Autopilot checks dirty primary and repository bindings twice; supervise compares its final primary snapshot and fails the run on drift. The E2E independently compares complete HEAD identity/tree, exact index storage/entries, every HEAD- or index-tracked worktree path's content or link target, mode, missing/type state, and raw porcelain-v2 status flags. No result is applied to primary. | `autopilot_rechecks_dirty_primary_immediately_before_supervisor_dispatch`, `dirty_primary_refusal_emits_public_json`, and `fake_autopilot_depth_two_e2e_is_gated_durable_and_primary_untouched` fail if the pre-dispatch guard, typed dirty denial, or complete before/after snapshot equality regresses. `primary_git_snapshot_detects_complete_state_drift` independently fails unless otherwise omitted tracked content, mode, index storage/entries, status flags, and HEAD/tree changes are observable. |
+| Typed path ownership | Issue #29 (`a38d6bc`) provides `GateDenial`. Overlapping durable sync claims, semantic intents, and live locks all become `claim_conflict`; the command finalizes a refusal without starting supervise. | `active_sync_claim_is_a_typed_preflight_refusal`, `active_semantic_intent_is_a_typed_preflight_refusal`, and `active_live_lock_is_a_typed_preflight_refusal` independently seed each store and fail if its guard is bypassed. |
+| Depth, scheduling, journal, and breaker gates | Issues #9 (`1a9642e`, `6bc7e44`), #10 (`9b87d2d` through `61d1179`), and #24 (`d5b46ee`) made these live supervise gates. Autopilot accepts only the fixed depth-2, non-recursive spine and calls that public path; other integer depths and non-empty recursive assignments become a typed `approval_review`/`permission_expansion` refusal before supervise dispatch, while malformed depth is invalid. In-tool decomposition and deeper recursion remain Issue #22 step 2. | `fake_autopilot_depth_two_e2e_is_gated_durable_and_primary_untouched` requires a terminal worker, read-only auditor, review-lens aggregate, and durable supervise report. `autopilot_run_refuses_max_depth_three_with_typed_permission_expansion` and `autopilot_run_refuses_recursive_assignments_with_typed_permission_expansion` require a nonzero CLI result, the exact typed denial, a null embedded supervisor result, and no `.maco/o2` dispatch artifacts. Existing supervise journal/scheduler/breaker tests remain unchanged. |
+| Writable-child containment ceiling | Issue #28 (`c5e086c`) permanently refuses verified-writable external Codex children when the protocol cannot enforce every action callback. Autopilot does not bypass that refusal. Fake executes in process and never invokes `codex_bin` or task text. | `codex_runtime_custom_bin_fails_closed_and_cannot_mutate_primary` still expects the containment refusal; `fake_runtime_never_executes_codex_bin_or_task_text_and_is_never_publishable` fails if Fake launches an executable or becomes publishable. |
+| Acceptance lenses, megafile evidence, re-audit, claim lifecycle, and timing | Issues #16 (`9a88d44`), #19 (`098eb6a`), #30 (`80cce22`), structural extractions #45 (`bfb59ba`) and #49 (`8399ad8`, merged by `8bda772`), #50 (`f9b4b33`), #51 (`76bc21c`), and #53 (`469e3a6`) are consumed through the complete supervisor report rather than reimplemented. Their own failure paths continue to make the supervisor non-successful/non-publishable. | The depth-2 E2E requires worker, auditor, and `review_lens_aggregate` output. Existing focused supervise tests for each gate remain load-bearing and unchanged by the Autopilot wrapper. |
+| Typed environment failures | Issues #31 (`5655419`) and #47 (`74369ac`) provide `EnvironmentFailure`, including `runtime_model_catalog_unavailable`. Autopilot embeds the supervisor report unchanged and performs no dispatch/publication after catalog failure. | `runtime_catalog_failure_composes_typed_environment_failure_without_dispatch` uses a missing Codex runtime and fails unless the exact typed category is nested in the Autopilot report. |
+| Economics and KPI composition | Issues #34 (`285c517`) and #35 (`60ad4f9`) provide role economics, honest usage attribution including `not_process_observable`, and supervisor KPIs. Autopilot passes those fields through without inventing cost observations or recomputing rates. | `public_json_shape_is_stable_and_sanitized` requires the nested role-economics profile and `supervisor_aggregate` KPI observation. Existing supervisor economics/KPI gate tests retain their refusal assertions. |
+| Machine-global destructive staging cleanup | Issues #44 (`0217cfb`), #48 (`5b3d8ba`), and #54 (`4491bf3`, merged by `a76a4b9`) bind both child-orchestrator and parent review-lens auditor staging cleanup through `SupervisorRunOptions`. CLI omission fails in argument parsing; programmatic omission fails before repository/plan effects; missing/partial or denied binding refuses cleanup and preserves staging. Fake creates no external staging and therefore records no fabricated cleanup. | `autopilot_run_cli_requires_machine_global_binding_before_effect_artifacts`, `autopilot_missing_retention_binding_fails_before_any_repository_or_runtime_side_effect`, and existing `supervise_dispatch_refuses_a_missing_staging_cleanup_binding` plus child/auditor binding tests fail if any reached destructive launch loses its binding. |
+| Human-only integration | Issue #17 (`9f92b3e`) exposes arbitration only as an opt-in proposal. Autopilot never calls publication, arbitration, merge preview/apply, or generated-follow-up dispatch; legacy `auto_merge` is recorded only. | `auto_merge_request_is_recorded_but_never_performed` asserts the false capability fields and exact primary HEAD/index/files; `legacy_reviewer_command_refuses_before_autopilot_artifacts` and the legacy validation/reviewer plan tests fail if the outer loop becomes reachable. |
+
+The load-bearing CLI contract changed explicitly: previously every
+`AutopilotSubcommand::Run` returned one unconditional unavailable error and its
+integration test required zero run artifacts. It now requires a complete
+machine-global binding, performs typed preflight and pre-dispatch checks, and
+delegates exactly once to live supervise; the missing-binding test retains the
+old before-effects refusal boundary. Effectful Inbox run/watch callers remain
+disabled and do not inherit this narrower capability.
 
 Run the fake-first inbox reaction loop:
 
