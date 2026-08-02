@@ -145,7 +145,10 @@ impl WorktreeManager {
         let names = repo.worktrees().context("failed to list worktrees")?;
         let mut records = Vec::new();
 
-        for name in names.iter().flatten() {
+        for name in names.iter() {
+            let Some(name) = name.context("worktree name is not valid UTF-8")? else {
+                continue;
+            };
             let worktree = repo
                 .find_worktree(name)
                 .with_context(|| format!("failed to open worktree '{name}'"))?;
@@ -173,7 +176,11 @@ fn repository_info(repo: &Repository) -> Result<RepositoryInfo> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| repo.path().to_path_buf());
     let head = match repo.head() {
-        Ok(head) => head.shorthand().map(ToOwned::to_owned),
+        Ok(head) => Some(
+            head.shorthand()
+                .map(ToOwned::to_owned)
+                .context("repository HEAD shorthand is not valid UTF-8")?,
+        ),
         Err(error) if error.code() == ErrorCode::UnbornBranch => None,
         Err(error) if error.code() == ErrorCode::NotFound => None,
         Err(error) => return Err(error).context("failed to read repository HEAD"),
@@ -234,7 +241,7 @@ fn default_worktree_root(repo: &Repository) -> PathBuf {
 fn read_worktree_branch(path: &Path) -> Option<String> {
     let repo = Repository::open(path).ok()?;
     let head = repo.head().ok()?;
-    head.shorthand().map(ToOwned::to_owned)
+    head.shorthand().ok().map(ToOwned::to_owned)
 }
 
 fn sanitize_path_segment(input: &str) -> String {

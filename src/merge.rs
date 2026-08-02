@@ -514,9 +514,8 @@ fn collect_changed_paths(repo: &Repository) -> Result<Vec<ChangedPath>> {
     let mut changes = BTreeMap::<PathBuf, ChangeKind>::new();
 
     for entry in statuses.iter() {
-        if let Some(path) = entry.path() {
-            changes.insert(PathBuf::from(path), classify_status(entry.status()));
-        }
+        let path = entry.path().context("git status path is not valid UTF-8")?;
+        changes.insert(PathBuf::from(path), classify_status(entry.status()));
     }
 
     Ok(changes

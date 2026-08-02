@@ -1809,12 +1809,12 @@ fn collect_status_paths(repo: &Repository) -> Result<Vec<PathBuf>> {
     let statuses = repo
         .statuses(Some(&mut options))
         .context("failed to inspect git status")?;
-    let mut paths = statuses
-        .iter()
-        .filter_map(|entry| entry.path().map(PathBuf::from))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
+    let mut paths = BTreeSet::new();
+    for entry in statuses.iter() {
+        let path = entry.path().context("git status path is not valid UTF-8")?;
+        paths.insert(PathBuf::from(path));
+    }
+    let mut paths = paths.into_iter().collect::<Vec<_>>();
     paths.sort();
     Ok(paths)
 }
