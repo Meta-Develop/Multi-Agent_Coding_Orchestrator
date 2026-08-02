@@ -442,8 +442,11 @@ pub(super) fn derived_generated_follow_up_budget(
         limits: RunBudgetLimits {
             soft_tokens: Some(token_closure),
             hard_tokens: Some(token_closure),
-            soft_cost_usd: None,
-            hard_cost_usd: None,
+            // Token ceilings close over this generated plan's exact dispatch
+            // shape. Cost ceilings cannot be recomputed without assuming
+            // provider usage, so preserve the source run's safety envelope.
+            soft_cost_usd: source.limits.soft_cost_usd,
+            hard_cost_usd: source.limits.hard_cost_usd,
         },
         role_token_reservations: BTreeMap::from([
             (AgentRole::ChildOrchestrator, child_tokens),

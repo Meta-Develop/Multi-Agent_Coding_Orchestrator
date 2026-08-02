@@ -377,18 +377,30 @@ fn generated_follow_up_plan_inherits_gate_context_and_closes_budget() {
     let mut report = injected_child_report(&assignment);
     report.licensed_breakage_review = Some(review);
     let mut source_plan = injected_plan(assignment.clone(), 1);
+    source_plan.max_depth = 4;
+    source_plan.max_child_assignments = 5;
     source_plan.max_gate_corrections = 2;
+    source_plan.child_timeout_seconds = 47;
+    source_plan.semantic_coordination = SemanticCoordinationMode::Block;
     let mut second_lens = source_plan.review_lenses[0].clone();
     second_lens.id = "second-acceptance".to_string();
     source_plan.review_lenses.push(second_lens);
     source_plan.review_aggregation_policy =
         ReviewAggregationPolicy::ValidatedQuorum { minimum_accepts: 2 };
+    inject_priced_process_roles(&mut source_plan, "licensed-follow-up-model", 3.25);
     let source_consultant = SupervisorConsultantPlan {
         enabled: true,
         runtime: "codex".to_string(),
         max_consultations: 2,
     };
-    let source_budget = injected_run_budget(Some(500), Some(1_000), None, None, 7, 11);
+    let mut source_budget =
+        injected_run_budget(Some(500), Some(1_000), Some(25.0), Some(30.0), 7, 11);
+    source_budget
+        .role_token_reservations
+        .insert(AgentRole::Worker, 13);
+    source_budget
+        .role_token_reservations
+        .insert(AgentRole::GateClassifier, 17);
 
     let tasks = generated_licensed_follow_up_tasks(
         &source_plan,
@@ -408,8 +420,22 @@ fn generated_follow_up_plan_inherits_gate_context_and_closes_budget() {
     .expect("generate context-derived follow-up plan");
     let generated = &tasks[0].supervisor_plan;
 
+    assert_eq!(generated.max_depth, source_plan.max_depth);
+    // The generated schedule contains one assignment, so its capacity is
+    // deliberately narrowed instead of copying unused source capacity.
+    assert_eq!(generated.max_child_assignments, 1);
     assert_eq!(generated.max_child_retries, 1);
     assert_eq!(generated.max_gate_corrections, 2);
+    assert_eq!(
+        generated.child_timeout_seconds,
+        source_plan.child_timeout_seconds
+    );
+    assert_eq!(
+        generated.semantic_coordination,
+        source_plan.semantic_coordination
+    );
+    assert_eq!(generated.role_models, source_plan.role_models);
+    assert_eq!(generated.model_pricing, source_plan.model_pricing);
     assert_eq!(generated.review_lenses, source_plan.review_lenses);
     assert_eq!(
         generated.review_aggregation_policy,
@@ -418,12 +444,48 @@ fn generated_follow_up_plan_inherits_gate_context_and_closes_budget() {
     assert_eq!(generated.consultant, source_consultant);
     assert_eq!(
         generated.run_budget.role_token_reservations,
-        source_budget.role_token_reservations
+        BTreeMap::from([(AgentRole::ChildOrchestrator, 7), (AgentRole::Auditor, 11),])
     );
+    assert!(!generated
+        .run_budget
+        .role_token_reservations
+        .contains_key(&AgentRole::Worker));
+    assert!(!generated
+        .run_budget
+        .role_token_reservations
+        .contains_key(&AgentRole::GateClassifier));
     // Four maximum child attempts plus two lenses per attempt:
     // 4 * 7 child tokens + 8 * 11 auditor tokens = 116.
     assert_eq!(generated.run_budget.limits.soft_tokens, Some(116));
     assert_eq!(generated.run_budget.limits.hard_tokens, Some(116));
+    assert_eq!(generated.run_budget.limits.soft_cost_usd, Some(25.0));
+    assert_eq!(generated.run_budget.limits.hard_cost_usd, Some(30.0));
+
+    let generated_document =
+        serde_json::to_string(generated).expect("serialize generated follow-up plan");
+    assert!(generated_document.contains("\"soft_cost_usd\":25.0"));
+    assert!(generated_document.contains("\"hard_cost_usd\":30.0"));
+    let loaded = parse_supervisor_plan_with_consultant(&generated_document)
+        .expect("real plan loader accepts generated cost ceilings");
+    assert_eq!(loaded.plan.max_depth, source_plan.max_depth);
+    assert_eq!(
+        loaded.plan.child_timeout_seconds,
+        source_plan.child_timeout_seconds
+    );
+    assert_eq!(
+        loaded.plan.semantic_coordination,
+        source_plan.semantic_coordination
+    );
+    assert_eq!(loaded.plan.role_models, source_plan.role_models);
+    assert_eq!(loaded.plan.model_pricing, source_plan.model_pricing);
+    assert_eq!(
+        loaded.plan_metadata.run_budget.limits.soft_cost_usd,
+        Some(25.0)
+    );
+    assert_eq!(
+        loaded.plan_metadata.run_budget.limits.hard_cost_usd,
+        Some(30.0)
+    );
 }
 
 #[test]
