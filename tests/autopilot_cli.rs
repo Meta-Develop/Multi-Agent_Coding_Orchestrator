@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
-use git2::{Oid, Repository, Signature};
+use git2::{ObjectType, Oid, Repository, Signature};
 use serde_json::Value;
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -200,16 +201,12 @@ fn fake_autopilot_depth_two_e2e_is_gated_durable_and_primary_untouched() -> Resu
             "title": "Depth two gated run",
             "body": "Exercise the full Fake supervise flow without applying to primary."
           },
+          "max_depth": 2,
           "assigned_paths": ["README.md"],
           "auto_merge": false
         }"#,
     )?;
-    let repo = Repository::open(&repo_path)?;
-    let head_before = repo.head()?.target().context("primary HEAD")?;
-    let index_before = fs::read(repo.path().join("index"))?;
-    let readme_before = fs::read(repo_path.join("README.md"))?;
-    let lib_before = fs::read(repo_path.join("src/lib.rs"))?;
-    let status_before = primary_source_status_paths(&repo)?;
+    let primary_before = primary_git_snapshot(&repo_path)?;
 
     let report = run_success_json(&[
         "autopilot",
@@ -260,11 +257,7 @@ fn fake_autopilot_depth_two_e2e_is_gated_durable_and_primary_untouched() -> Resu
         "worker"
     );
     assert!(repo_path.join(".maco/o2/runs/durable-supervise").exists());
-    assert_eq!(repo.head()?.target(), Some(head_before));
-    assert_eq!(fs::read(repo.path().join("index"))?, index_before);
-    assert_eq!(fs::read(repo_path.join("README.md"))?, readme_before);
-    assert_eq!(fs::read(repo_path.join("src/lib.rs"))?, lib_before);
-    assert_eq!(primary_source_status_paths(&repo)?, status_before);
+    assert_eq!(primary_git_snapshot(&repo_path)?, primary_before);
 
     let machine_global_status = run_success_json(&[
         "machine-global",
@@ -280,6 +273,140 @@ fn fake_autopilot_depth_two_e2e_is_gated_durable_and_primary_untouched() -> Resu
         retention.is_empty(),
         "the in-process Fake runtime must not manufacture external output-staging cleanup"
     );
+
+    Ok(())
+}
+
+#[test]
+fn autopilot_run_refuses_max_depth_three_with_typed_permission_expansion() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let plan_path = temp.path().join("depth-three.json");
+    write_file(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": {"title": "Depth three", "body": "Request unsupported depth."},
+          "max_depth": 3,
+          "assigned_paths": ["README.md"]
+        }"#,
+    )?;
+
+    let report = run_failure_json(&[
+        "autopilot",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "depth-three-refusal",
+        "--json",
+    ])?;
+
+    assert_depth_permission_expansion_refusal(&report);
+    assert!(!repo_path.join(".maco/o2").exists());
+    Ok(())
+}
+
+#[test]
+fn autopilot_run_refuses_recursive_assignments_with_typed_permission_expansion() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let plan_path = temp.path().join("recursive-assignments.json");
+    write_file(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": {"title": "Recursive plan", "body": "Request unsupported recursion."},
+          "max_depth": 2,
+          "assigned_paths": ["README.md"],
+          "assignments": [{
+            "id": "depth-two",
+            "child_assignments": [{"id": "depth-three"}]
+          }]
+        }"#,
+    )?;
+
+    let report = run_failure_json(&[
+        "autopilot",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "recursive-depth-refusal",
+        "--json",
+    ])?;
+
+    assert_depth_permission_expansion_refusal(&report);
+    assert!(!repo_path.join(".maco/o2").exists());
+    Ok(())
+}
+
+#[test]
+fn primary_git_snapshot_detects_complete_state_drift() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let omitted_path = repo_path.join("otherwise-omitted.txt");
+    write_file(&omitted_path, "baseline\n")?;
+    let repo = Repository::open(&repo_path)?;
+    commit_all(&repo, "add otherwise omitted path")?;
+    let baseline = primary_git_snapshot(&repo_path)?;
+
+    write_file(&omitted_path, "worktree content changed\n")?;
+    let content_changed = primary_git_snapshot(&repo_path)?;
+    assert_ne!(content_changed.worktree, baseline.worktree);
+    assert_ne!(
+        content_changed.status_porcelain_v2,
+        baseline.status_porcelain_v2
+    );
+    write_file(&omitted_path, "baseline\n")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let original_mode = fs::symlink_metadata(&omitted_path)?.permissions().mode();
+        let mut changed_permissions = fs::symlink_metadata(&omitted_path)?.permissions();
+        changed_permissions.set_mode(original_mode ^ 0o100);
+        fs::set_permissions(&omitted_path, changed_permissions)?;
+        let mode_changed = primary_git_snapshot(&repo_path)?;
+        assert_ne!(mode_changed.worktree, baseline.worktree);
+        assert_ne!(
+            mode_changed.status_porcelain_v2,
+            baseline.status_porcelain_v2
+        );
+        let mut original_permissions = fs::symlink_metadata(&omitted_path)?.permissions();
+        original_permissions.set_mode(original_mode);
+        fs::set_permissions(&omitted_path, original_permissions)?;
+    }
+
+    write_file(&omitted_path, "index content changed\n")?;
+    let mut index = repo.index()?;
+    index.add_path(Path::new("otherwise-omitted.txt"))?;
+    index.write()?;
+    write_file(&omitted_path, "baseline\n")?;
+    let index_changed = primary_git_snapshot(&repo_path)?;
+    assert_ne!(index_changed.index_storage, baseline.index_storage);
+    assert_ne!(index_changed.index_entries, baseline.index_entries);
+    assert_ne!(
+        index_changed.status_porcelain_v2,
+        baseline.status_porcelain_v2
+    );
+
+    let head_fixture_root = temp.path().join("head-fixture");
+    fs::create_dir_all(&head_fixture_root)?;
+    let head_repo_path = create_committed_repo(&head_fixture_root)?;
+    let head_repo = Repository::open(&head_repo_path)?;
+    let head_before = primary_git_snapshot(&head_repo_path)?;
+    write_file(
+        &head_repo_path.join("new-head-tree-entry.txt"),
+        "new tree\n",
+    )?;
+    commit_all(&head_repo, "change head tree")?;
+    let head_changed = primary_git_snapshot(&head_repo_path)?;
+    assert_ne!(head_changed.head, head_before.head);
+    assert_ne!(head_changed.head_tree, head_before.head_tree);
 
     Ok(())
 }
@@ -902,6 +1029,25 @@ fn assert_typed_claim_refusal(repo: &Path, task: &Path, run_id: &str) -> Result<
     Ok(())
 }
 
+fn assert_depth_permission_expansion_refusal(report: &Value) {
+    assert_eq!(report["status"], "refused");
+    assert_eq!(report["success"], false);
+    assert_eq!(report["attempt_count"], 0);
+    assert!(report["supervisor"].is_null());
+    assert_eq!(report["safety"]["refused"], true);
+    assert_eq!(report["gate_denials"].as_array().map(Vec::len), Some(1));
+    let denial = &report["gate_denials"][0];
+    assert_eq!(denial["reason"]["family"], "approval_review");
+    assert_eq!(denial["reason"]["denial"], "permission_expansion");
+    assert_eq!(denial["retryability"], "retry_after_correction");
+    assert_eq!(denial["context"]["source"], "future_approval_review");
+    assert_eq!(denial["route"], "child_controller");
+    assert_eq!(
+        denial["next_safe_operation"],
+        "narrow_action_or_choose_another_tool"
+    );
+}
+
 fn write_live_claim(repo: &Path, claim_id: &str, status: &str, path: &str) -> Result<()> {
     let claims_dir = repo.join(".agents/live/claims");
     fs::create_dir_all(&claims_dir).context("create live claims")?;
@@ -1097,18 +1243,202 @@ fn path_str(path: &Path) -> Result<&str> {
         .with_context(|| format!("path is not UTF-8: {}", path.display()))
 }
 
-fn primary_source_status_paths(repo: &Repository) -> Result<Vec<String>> {
-    let statuses = repo.statuses(None)?;
-    let mut paths = Vec::new();
-    for entry in statuses.iter() {
-        let path = entry.path().context("Git status path is not UTF-8")?;
-        if !path.starts_with(".maco/")
-            && !path.starts_with(".maco-cache/")
-            && !path.starts_with(".agents/live/")
-        {
-            paths.push(path.to_string());
-        }
+#[derive(Debug, PartialEq, Eq)]
+struct PrimaryGitSnapshot {
+    head: PrimaryHeadSnapshot,
+    head_tree: Vec<u8>,
+    index_storage: Vec<u8>,
+    index_entries: Vec<u8>,
+    worktree: BTreeMap<Vec<u8>, TrackedWorktreePathSnapshot>,
+    status_porcelain_v2: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PrimaryHeadSnapshot {
+    detached: bool,
+    reference_name: Option<Vec<u8>>,
+    symbolic_target: Option<Vec<u8>>,
+    target: Option<Oid>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TrackedWorktreePathSnapshot {
+    Missing,
+    File { mode: u32, id: Oid },
+    Symlink { mode: u32, target: PathBuf },
+    Directory { mode: u32 },
+    Other { mode: u32 },
+}
+
+fn primary_git_snapshot(repo_path: &Path) -> Result<PrimaryGitSnapshot> {
+    let repo = Repository::open(repo_path).context("open primary snapshot repository")?;
+    let reference = repo.head().context("capture primary HEAD")?;
+    let head = PrimaryHeadSnapshot {
+        detached: repo
+            .head_detached()
+            .context("capture detached HEAD state")?,
+        reference_name: Some(reference.name_bytes().to_vec()),
+        symbolic_target: reference.symbolic_target_bytes().map(<[u8]>::to_vec),
+        target: reference.target(),
+    };
+    let head_tree = primary_git_stdout(
+        repo_path,
+        &["ls-tree", "-r", "-t", "-z", "--full-tree", "HEAD"],
+        "HEAD tree",
+    )?;
+    let head_paths = primary_git_stdout(
+        repo_path,
+        &["ls-tree", "-r", "-z", "--name-only", "--full-tree", "HEAD"],
+        "HEAD paths",
+    )?;
+    let index_entries = primary_git_stdout(
+        repo_path,
+        &["ls-files", "--stage", "-v", "-z", "--sparse"],
+        "index entries",
+    )?;
+    let index_paths = primary_git_stdout(
+        repo_path,
+        &["ls-files", "--cached", "-z", "--sparse"],
+        "index paths",
+    )?;
+    let status_porcelain_v2 = primary_git_stdout(
+        repo_path,
+        &[
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--branch",
+            "--untracked-files=all",
+            "--ignored=no",
+            "--ignore-submodules=none",
+        ],
+        "porcelain-v2 status",
+    )?;
+    let index_storage = fs::read(repo.path().join("index")).context("read exact index storage")?;
+
+    let mut tracked_paths = BTreeSet::new();
+    for output in [&head_paths, &index_paths] {
+        tracked_paths.extend(
+            output
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .map(<[u8]>::to_vec),
+        );
     }
-    paths.sort();
-    Ok(paths)
+    let mut worktree = BTreeMap::new();
+    for raw_path in tracked_paths {
+        let relative_path = path_from_git_bytes(&raw_path)?;
+        let absolute_path = repo_path.join(&relative_path);
+        let state = match fs::symlink_metadata(&absolute_path) {
+            Ok(metadata) => {
+                let mode = primary_snapshot_mode(&metadata);
+                let file_type = metadata.file_type();
+                if file_type.is_symlink() {
+                    TrackedWorktreePathSnapshot::Symlink {
+                        mode,
+                        target: fs::read_link(&absolute_path).with_context(|| {
+                            format!("read tracked symlink {}", relative_path.display())
+                        })?,
+                    }
+                } else if file_type.is_file() {
+                    TrackedWorktreePathSnapshot::File {
+                        mode,
+                        id: Oid::hash_file(ObjectType::Blob, &absolute_path).with_context(
+                            || format!("hash tracked file {}", relative_path.display()),
+                        )?,
+                    }
+                } else if file_type.is_dir() {
+                    TrackedWorktreePathSnapshot::Directory { mode }
+                } else {
+                    TrackedWorktreePathSnapshot::Other { mode }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                TrackedWorktreePathSnapshot::Missing
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect tracked path {}", relative_path.display()));
+            }
+        };
+        worktree.insert(raw_path, state);
+    }
+
+    Ok(PrimaryGitSnapshot {
+        head,
+        head_tree,
+        index_storage,
+        index_entries,
+        worktree,
+        status_porcelain_v2,
+    })
+}
+
+fn primary_git_stdout(repo_path: &Path, args: &[&str], label: &str) -> Result<Vec<u8>> {
+    let mut command = Command::new("git");
+    command
+        .current_dir(repo_path)
+        .args([
+            "--no-pager",
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+        ])
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("LANG", "C")
+        .env("LC_ALL", "C");
+    for variable in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ] {
+        command.env_remove(variable);
+    }
+    let output = command
+        .output()
+        .with_context(|| format!("capture primary {label}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "primary {label} capture failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
+#[cfg(unix)]
+fn path_from_git_bytes(path: &[u8]) -> Result<PathBuf> {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    Ok(PathBuf::from(OsStr::from_bytes(path)))
+}
+
+#[cfg(not(unix))]
+fn path_from_git_bytes(path: &[u8]) -> Result<PathBuf> {
+    Ok(PathBuf::from(std::str::from_utf8(path).context(
+        "tracked Git path is not UTF-8 on this platform",
+    )?))
+}
+
+#[cfg(unix)]
+fn primary_snapshot_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.mode()
+}
+
+#[cfg(not(unix))]
+fn primary_snapshot_mode(metadata: &fs::Metadata) -> u32 {
+    u32::from(metadata.permissions().readonly())
 }

@@ -1,6 +1,6 @@
 use crate::{
     artifacts::{ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, RunArtifactFamily},
-    gate_denial::{GateCheckSource, GateDenial},
+    gate_denial::{ApprovalReviewDenial, GateCheckSource, GateDenial},
     live_claim::{self, LiveClock},
     llm::Redactor,
     machine_global::MachineGlobalRetentionBinding,
@@ -79,6 +79,7 @@ const AUTOPILOT_STATUS_MAX_DURATION: Duration = Duration::from_secs(120);
 const AUTOPILOT_ACTIVE_ARTIFACT_MAX_ENTRIES: usize = 256;
 const AUTOPILOT_ACTIVE_ARTIFACT_MAX_TOTAL_PATH_BYTES: usize = 1024 * 1024;
 const AUTOPILOT_ACTIVE_ARTIFACT_MAX_DURATION: Duration = Duration::from_secs(2);
+const AUTOPILOT_SPINE_MAX_DEPTH: &str = "2";
 const AUTOPILOT_EFFECTFUL_UNAVAILABLE_MESSAGE: &str =
     "autopilot effectful execution is temporarily unsupported: the capability-bound supervisor input bridge is not implemented";
 
@@ -414,10 +415,44 @@ struct FailedStageReport {
     message: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AutopilotInputShape {
+    requested_max_depth: Option<String>,
+    recursive_child_assignments: bool,
+}
+
+impl AutopilotInputShape {
+    fn requests_permission_expansion(&self) -> bool {
+        self.requested_max_depth
+            .as_deref()
+            .is_some_and(|depth| depth != AUTOPILOT_SPINE_MAX_DEPTH)
+            || self.recursive_child_assignments
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadedAutopilotPlan {
+    plan: AutopilotPlan,
+    input_shape: AutopilotInputShape,
+}
+
 pub fn autopilot_plan_from_task_file(
     repo: impl AsRef<Path>,
     task_file: impl AsRef<Path>,
 ) -> Result<AutopilotPlan> {
+    let loaded = load_autopilot_plan_from_task_file(repo, task_file)?;
+    if loaded.input_shape.requests_permission_expansion() {
+        bail!(
+            "autopilot plan requests an unsupported supervisor shape; autopilot run supports exactly max_depth 2 and no recursive child_assignments"
+        );
+    }
+    Ok(loaded.plan)
+}
+
+fn load_autopilot_plan_from_task_file(
+    repo: impl AsRef<Path>,
+    task_file: impl AsRef<Path>,
+) -> Result<LoadedAutopilotPlan> {
     let repo = discover_repo_root(repo.as_ref())?;
     let task_file = task_file.as_ref();
     let contents =
@@ -425,8 +460,37 @@ pub fn autopilot_plan_from_task_file(
             .with_context(|| {
                 format!("failed to read autopilot task file {}", task_file.display())
             })?;
-    match serde_json::from_str::<AutopilotPlan>(&contents) {
-        Ok(plan) => return validate_autopilot_plan(&repo, plan),
+    match serde_json::from_str::<Value>(&contents) {
+        Ok(value) => {
+            let input_shape = autopilot_input_shape(&value).with_context(|| {
+                format!(
+                    "failed to validate autopilot plan shape {}",
+                    task_file.display()
+                )
+            })?;
+            match serde_json::from_value::<AutopilotPlan>(value) {
+                Ok(plan) => {
+                    return Ok(LoadedAutopilotPlan {
+                        plan: validate_autopilot_plan(&repo, plan)?,
+                        input_shape,
+                    });
+                }
+                Err(error)
+                    if matches!(
+                        contents.trim_start().as_bytes().first(),
+                        Some(b'{') | Some(b'[')
+                    ) =>
+                {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to parse JSON-looking autopilot plan {}",
+                            task_file.display()
+                        )
+                    });
+                }
+                Err(_) => {}
+            }
+        }
         Err(error)
             if matches!(
                 contents.trim_start().as_bytes().first(),
@@ -443,27 +507,95 @@ pub fn autopilot_plan_from_task_file(
         Err(_) => {}
     }
 
-    validate_autopilot_plan(
-        &repo,
-        AutopilotPlan {
-            version: AUTOPILOT_SCHEMA_VERSION,
-            task: AutopilotTask {
-                title: title_from_plain_task(&contents),
-                body: contents,
+    Ok(LoadedAutopilotPlan {
+        plan: validate_autopilot_plan(
+            &repo,
+            AutopilotPlan {
+                version: AUTOPILOT_SCHEMA_VERSION,
+                task: AutopilotTask {
+                    title: title_from_plain_task(&contents),
+                    body: contents,
+                },
+                assigned_paths: Vec::new(),
+                path_proposal: planning::TaskPathProposalDiagnostics::default(),
+                semantic_symbols: Vec::new(),
+                semantic_modules: Vec::new(),
+                validation_commands: Vec::new(),
+                max_repair_attempts: default_max_repair_attempts(),
+                forge_mode: AutopilotForgeMode::Fake,
+                reviewer: ReviewerConfig::default(),
+                publish_mode: AutopilotPublishMode::DraftOnly,
+                auto_merge: false,
+                external_source: None,
             },
-            assigned_paths: Vec::new(),
-            path_proposal: planning::TaskPathProposalDiagnostics::default(),
-            semantic_symbols: Vec::new(),
-            semantic_modules: Vec::new(),
-            validation_commands: Vec::new(),
-            max_repair_attempts: default_max_repair_attempts(),
-            forge_mode: AutopilotForgeMode::Fake,
-            reviewer: ReviewerConfig::default(),
-            publish_mode: AutopilotPublishMode::DraftOnly,
-            auto_merge: false,
-            external_source: None,
-        },
-    )
+        )?,
+        input_shape: AutopilotInputShape::default(),
+    })
+}
+
+fn autopilot_input_shape(value: &Value) -> Result<AutopilotInputShape> {
+    let requested_max_depth = value
+        .get("max_depth")
+        .map(|depth| {
+            let number = depth
+                .as_number()
+                .context("autopilot max_depth must be an integer")?;
+            if !number.is_i64() && !number.is_u64() {
+                bail!("autopilot max_depth must be an integer");
+            }
+            Ok(number.to_string())
+        })
+        .transpose()?;
+    let recursive_child_assignments = value
+        .get("assignments")
+        .map(recursive_child_assignments_requested)
+        .transpose()?
+        .unwrap_or(false);
+    Ok(AutopilotInputShape {
+        requested_max_depth,
+        recursive_child_assignments,
+    })
+}
+
+fn recursive_child_assignments_requested(assignments: &Value) -> Result<bool> {
+    let assignments = assignments
+        .as_array()
+        .context("autopilot assignments must be an array when supplied")?;
+    for assignment in assignments {
+        let assignment = assignment
+            .as_object()
+            .context("autopilot assignment entries must be objects")?;
+        let Some(children) = assignment.get("child_assignments") else {
+            continue;
+        };
+        let children = children
+            .as_array()
+            .context("autopilot child_assignments must be an array")?;
+        if !children.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn apply_autopilot_input_shape_gate(
+    safety: &mut AutopilotSafetyReport,
+    run_id: &RunId,
+    assigned_paths: &[PathBuf],
+    input_shape: &AutopilotInputShape,
+) -> Result<()> {
+    if !input_shape.requests_permission_expansion() {
+        return Ok(());
+    }
+    let denial = GateDenial::from_approval_review(
+        run_id.as_str(),
+        "maco-autopilot",
+        ApprovalReviewDenial::PermissionExpansion,
+        assigned_paths,
+    )?;
+    safety.gate_denials.insert(0, denial);
+    safety.refused = true;
+    Ok(())
 }
 
 pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<AutopilotFinalReport> {
@@ -485,16 +617,23 @@ pub fn run_autopilot_plan_file_with_retention(
     }
 
     let repo = discover_repo_root(&options.repo)?;
-    let plan = autopilot_plan_from_task_file(&repo, &options.plan_file)?;
+    let LoadedAutopilotPlan { plan, input_shape } =
+        load_autopilot_plan_from_task_file(&repo, &options.plan_file)?;
     if let Some(source) = &plan.external_source {
         publication::revalidate_external_source(&repo, source)
             .context("autopilot source changed immediately before supervised work")?;
     }
-    let safety = safety_report(
+    let mut safety = safety_report(
         &repo,
         &options.run_id,
         options.allow_dirty_primary,
         &plan.assigned_paths,
+    )?;
+    apply_autopilot_input_shape_gate(
+        &mut safety,
+        &options.run_id,
+        &plan.assigned_paths,
+        &input_shape,
     )?;
     let repository_bindings = RepositoryPathBindings::bind(&repo)?;
     verify_after_autopilot_safety(&repository_bindings)?;
@@ -3108,6 +3247,32 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn create_committed_autopilot_repo(root: &Path) -> PathBuf {
+        let repo_path = root.join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repository");
+        fs::write(repo_path.join("README.md"), "# Test\n").expect("write README");
+        fs::write(repo_path.join(".gitignore"), ".maco/\n.agents/\n").expect("write gitignore");
+        let repository = Repository::open(&repo_path).expect("open repository");
+        let mut index = repository.index().expect("open index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("stage README");
+        index
+            .add_path(Path::new(".gitignore"))
+            .expect("stage gitignore");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repository.find_tree(tree_id).expect("find tree");
+        let signature =
+            git2::Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+        repository
+            .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("commit fixture");
+        drop(tree);
+        drop(repository);
+        repo_path
+    }
+
     #[test]
     fn autopilot_missing_retention_binding_fails_before_any_repository_or_runtime_side_effect() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -3256,6 +3421,123 @@ mod tests {
             .expect_err("oversized plan must fail before parsing");
         assert!(format!("{error:#}").contains("bounded read limit"));
         assert!(!repo.join(".maco/autopilot").exists());
+    }
+
+    #[test]
+    fn public_autopilot_plan_refuses_unsupported_or_malformed_depth_shape() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = create_committed_autopilot_repo(temp.path());
+        let plan_path = temp.path().join("plan.json");
+        let plan = |shape: &str| {
+            format!(
+                r#"{{
+                  "version": 1,
+                  "task": {{"title": "Depth contract", "body": "Keep depth bounded."}},
+                  "assigned_paths": ["README.md"]
+                  {shape}
+                }}"#
+            )
+        };
+
+        fs::write(&plan_path, plan(", \"max_depth\": 2")).expect("supported plan");
+        autopilot_plan_from_task_file(&repo, &plan_path).expect("depth two remains supported");
+
+        fs::write(&plan_path, plan(", \"max_depth\": 3")).expect("depth three plan");
+        let error = autopilot_plan_from_task_file(&repo, &plan_path)
+            .expect_err("depth three must not be normalized away");
+        assert!(format!("{error:#}").contains("supports exactly max_depth 2"));
+
+        fs::write(
+            &plan_path,
+            plan(
+                r#", "max_depth": 2,
+                  "assignments": [{
+                    "id": "depth-two",
+                    "child_assignments": [{"id": "depth-three"}]
+                  }]"#,
+            ),
+        )
+        .expect("recursive plan");
+        let error = autopilot_plan_from_task_file(&repo, &plan_path)
+            .expect_err("recursive assignments must not be normalized away");
+        assert!(format!("{error:#}").contains("no recursive child_assignments"));
+
+        fs::write(&plan_path, plan(", \"max_depth\": \"2\"")).expect("malformed plan");
+        let error = autopilot_plan_from_task_file(&repo, &plan_path)
+            .expect_err("a non-integer max_depth must be invalid");
+        assert!(format!("{error:#}").contains("max_depth must be an integer"));
+    }
+
+    #[test]
+    fn unsupported_depth_shapes_are_typed_preflight_permission_expansions() {
+        use crate::gate_denial::{
+            GateDenialReason, GateDenialRoute, GateRetryability, NextSafeOperation,
+        };
+
+        let cases = [
+            ("depth-three-refusal", r#""max_depth": 3"#),
+            (
+                "recursive-depth-refusal",
+                r#""max_depth": 2,
+                    "assignments": [{
+                      "id": "depth-two",
+                      "child_assignments": [{"id": "depth-three"}]
+                    }]"#,
+            ),
+        ];
+        for (run_id, shape) in cases {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = create_committed_autopilot_repo(temp.path());
+            let plan_path = temp.path().join("plan.json");
+            fs::write(
+                &plan_path,
+                format!(
+                    r#"{{
+                      "version": 1,
+                      "task": {{"title": "Depth refusal", "body": "Do not expand depth."}},
+                      "assigned_paths": ["README.md"],
+                      {shape}
+                    }}"#
+                ),
+            )
+            .expect("write unsupported plan");
+
+            let report = run_autopilot_plan_file_with_retention(
+                AutopilotRunOptions {
+                    repo: repo.clone(),
+                    plan_file: plan_path,
+                    run_id: RunId::new(run_id).expect("run id"),
+                    codex_bin: None,
+                    reviewer_command: None,
+                    allow_dirty_primary: false,
+                },
+                Some(MachineGlobalRetentionBinding {
+                    config: temp.path().join("must-not-open.json"),
+                    root_id: "runtime".to_string(),
+                    owner: "maco-autopilot".to_string(),
+                    correction_correlation_id: run_id.to_string(),
+                }),
+            )
+            .expect("finalize typed depth refusal");
+
+            assert_eq!(report.status, AutopilotRunStatus::Refused);
+            assert!(!report.success);
+            assert_eq!(report.attempt_count, 0);
+            assert!(report.supervisor.is_none());
+            assert!(matches!(
+                report.gate_denials.as_slice(),
+                [GateDenial {
+                    reason: GateDenialReason::ApprovalReview {
+                        denial: ApprovalReviewDenial::PermissionExpansion
+                    },
+                    retryability: GateRetryability::RetryAfterCorrection,
+                    route: GateDenialRoute::ChildController,
+                    next_safe_operation: NextSafeOperation::NarrowActionOrChooseAnotherTool,
+                    ..
+                }]
+            ));
+            assert!(!repo.join(".maco/o2").exists());
+        }
     }
 
     #[test]
