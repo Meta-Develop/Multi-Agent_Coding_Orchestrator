@@ -242,16 +242,34 @@ pub(super) fn record_licensed_breakage_follow_up_tasks(
         bail!("licensed dependent failures must produce exactly one durable follow-up task each");
     }
     for (failure, task) in review.failures.iter().zip(tasks) {
+        let follow_up_assignment = task.supervisor_plan.assignment().with_context(|| {
+            format!(
+                "licensed dependent failure '{}' has no sole generated assignment",
+                failure.dependent_id
+            )
+        })?;
+        let generated_context = &task.supervisor_plan.generated_follow_up;
         if task.breaking_assignment_id != source_assignment_id
             || task.breaking_change.agent_id != source_assignment_id
             || task.breaking_change.diff_oid.is_empty()
             || task.declaration_sha256 != review.declaration_sha256
             || task.failure_signature != failure.failure_signature
             || task.migration_rationale != review.migration_rationale
-            || task.assignment.assigned_paths != failure.paths
-            || task.assignment.semantic_symbols != failure.interfaces
-            || task.assignment.licensed_breakage.is_some()
-            || task.assignment.task.as_deref().is_none_or(str::is_empty)
+            || follow_up_assignment.assigned_paths != failure.paths
+            || follow_up_assignment.semantic_symbols != failure.interfaces
+            || follow_up_assignment.licensed_breakage.is_some()
+            || follow_up_assignment
+                .task
+                .as_deref()
+                .is_none_or(str::is_empty)
+            || generated_context.breaking_assignment_id != task.breaking_assignment_id
+            || generated_context.breaking_change != task.breaking_change
+            || generated_context.declaration_sha256 != task.declaration_sha256
+            || generated_context.failure_signature != task.failure_signature
+            || generated_context.migration_rationale != task.migration_rationale
+            || generated_context.cascade_depth != task.cascade_depth
+            || generated_context.dispatch_status != task.dispatch_status
+            || generated_context.handoff != task.handoff
             || task.cascade_depth != LICENSED_BREAKAGE_CASCADE_DEPTH
             || task.dispatch_status != GeneratedFollowUpDispatchStatus::DeferredForPlannedRun
             || task.handoff.trim().is_empty()
@@ -278,10 +296,11 @@ pub(super) fn record_licensed_breakage_follow_up_tasks(
         bail!("licensed breakage orchestration event journal is disabled");
     }
     for task in tasks {
+        let follow_up_assignment = task.supervisor_plan.assignment()?;
         active_journal
             .append(
                 writer,
-                &task.assignment.id,
+                &follow_up_assignment.id,
                 Some(source_assignment_id),
                 OrchestrationRole::Orchestrator,
                 OrchestrationEventKind::Journal,

@@ -213,7 +213,7 @@ fn run_licensed_scenario(
 }
 
 #[test]
-fn declared_scoped_breakage_passes_and_journals_dispatch_shaped_follow_up() {
+fn declared_scoped_breakage_passes_and_journals_dispatchable_follow_up_plan() {
     let assignment = licensed_assignment();
     let child = dependent_failure_child(&assignment, "src/client.rs");
     let scenario = run_licensed_scenario(assignment, child, true, "licensed-breakage-e2e");
@@ -224,12 +224,20 @@ fn declared_scoped_breakage_passes_and_journals_dispatch_shaped_follow_up() {
     assert_eq!(task.breaking_assignment_id, "child-a");
     assert_eq!(task.breaking_change.agent_id, "child-a");
     assert!(!task.breaking_change.diff_oid.is_empty());
+    let follow_up_assignment = task
+        .supervisor_plan
+        .assignments
+        .first()
+        .expect("generated plan assignment");
     assert_eq!(
-        task.assignment.assigned_paths,
+        follow_up_assignment.assigned_paths,
         vec![PathBuf::from("src/client.rs")]
     );
-    assert_eq!(task.assignment.semantic_symbols, vec![LICENSED_INTERFACE]);
-    assert!(task.assignment.licensed_breakage.is_none());
+    assert_eq!(
+        follow_up_assignment.semantic_symbols,
+        vec![LICENSED_INTERFACE]
+    );
+    assert!(follow_up_assignment.licensed_breakage.is_none());
     assert_eq!(task.cascade_depth, LICENSED_BREAKAGE_CASCADE_DEPTH);
     assert_eq!(
         task.dispatch_status,
@@ -278,20 +286,43 @@ fn declared_scoped_breakage_passes_and_journals_dispatch_shaped_follow_up() {
         })
     }));
 
-    let follow_up_metadata = SupervisorPlanMetadata {
-        assignment_schedule: vec![AssignmentScheduleEntry {
-            assignment_id: task.assignment.id.clone(),
-            parent_assignment_id: None,
-            depth: MIN_SUPERVISOR_DEPTH,
-            flattened_index: 0,
-        }],
-        ..SupervisorPlanMetadata::default()
-    };
-    validate_supervisor_plan(
-        injected_plan(task.assignment.clone(), 0),
-        follow_up_metadata,
+    assert_eq!(task.supervisor_plan.assignments.len(), 1);
+    assert_eq!(task.supervisor_plan.max_child_assignments, 1);
+    assert_eq!(
+        task.supervisor_plan.review_lenses,
+        default_supervisor_review_lenses()
+    );
+    assert_eq!(
+        task.supervisor_plan.review_aggregation_policy,
+        ReviewAggregationPolicy::AllMustAccept
+    );
+    assert_eq!(task.supervisor_plan.run_budget.limits.hard_tokens, Some(2));
+    assert_eq!(
+        task.supervisor_plan.generated_follow_up.operator_defaults,
+        generated_follow_up_operator_defaults()
+    );
+    let follow_up_plan_path = scenario._temp.path().join("generated-follow-up-plan.json");
+    fs::write(
+        &follow_up_plan_path,
+        serde_json::to_vec_pretty(&task.supervisor_plan).expect("serialize generated plan"),
     )
-    .expect("generated task remains admissible only through an ordinary validated plan");
+    .expect("write generated plan directly");
+    let loaded = load_supervisor_plan_file_with_consultant(&follow_up_plan_path)
+        .expect("real supervise plan loader accepts generated plan without injected metadata");
+    assert_eq!(loaded.plan, task.supervisor_plan.ordinary_plan());
+    assert_eq!(loaded.consultant, task.supervisor_plan.consultant);
+    assert_eq!(
+        loaded.plan_metadata.assignment_schedule,
+        task.supervisor_plan.assignment_schedule
+    );
+    assert_eq!(
+        loaded.plan_metadata.run_budget,
+        task.supervisor_plan.run_budget
+    );
+    assert_eq!(
+        loaded.plan_metadata.generated_follow_up.as_ref(),
+        Some(&task.supervisor_plan.generated_follow_up)
+    );
 
     let reader = ArtifactRunReader::open(
         &scenario.repo,
@@ -304,7 +335,7 @@ fn declared_scoped_breakage_passes_and_journals_dispatch_shaped_follow_up() {
         .filter(|event| event.payload.get("licensed_breakage_follow_up").is_some())
         .collect::<Vec<_>>();
     assert_eq!(follow_up_events.len(), 1);
-    assert_eq!(follow_up_events[0].node, task.assignment.id);
+    assert_eq!(follow_up_events[0].node, follow_up_assignment.id);
     assert_eq!(follow_up_events[0].parent.as_deref(), Some("child-a"));
     let journaled_task = serde_json::from_value::<GeneratedFollowUpTaskRecord>(
         follow_up_events[0].payload["licensed_breakage_follow_up"].clone(),
@@ -318,13 +349,119 @@ fn declared_scoped_breakage_passes_and_journals_dispatch_shaped_follow_up() {
         collected.generated_follow_up_tasks,
         scenario.report.generated_follow_up_tasks
     );
-    assert!(collected.remaining_risk.contains("remain deferred"));
+    assert!(collected.remaining_risk.contains("automatic dispatch"));
     assert!(supervisor_final_report_schema_value()["properties"]
         .get("generated_follow_up_tasks")
         .is_some());
     assert!(orchestrator_report_schema_value()["properties"]
         .get("licensed_breakage_review")
         .is_some());
+}
+
+#[test]
+fn generated_follow_up_plan_inherits_gate_context_and_closes_budget() {
+    let assignment = licensed_assignment();
+    let declaration = assignment.licensed_breakage.as_ref().expect("declaration");
+    let review = LicensedBreakageReview {
+        declaration_sha256: licensed_breakage_declaration_sha256(declaration)
+            .expect("hash declaration"),
+        migration_rationale: declaration.migration_rationale.clone(),
+        failures: vec![LicensedDependentFailure {
+            dependent_id: "client-a".to_string(),
+            validation_name: "client-a".to_string(),
+            failure_signature: LICENSED_SIGNATURE.to_string(),
+            paths: vec![PathBuf::from("src/client.rs")],
+            interfaces: vec![LICENSED_INTERFACE.to_string()],
+        }],
+    };
+    let mut report = injected_child_report(&assignment);
+    report.licensed_breakage_review = Some(review);
+    let mut source_plan = injected_plan(assignment.clone(), 1);
+    source_plan.max_gate_corrections = 2;
+    let mut second_lens = source_plan.review_lenses[0].clone();
+    second_lens.id = "second-acceptance".to_string();
+    source_plan.review_lenses.push(second_lens);
+    source_plan.review_aggregation_policy =
+        ReviewAggregationPolicy::ValidatedQuorum { minimum_accepts: 2 };
+    let source_consultant = SupervisorConsultantPlan {
+        enabled: true,
+        runtime: "codex".to_string(),
+        max_consultations: 2,
+    };
+    let source_budget = injected_run_budget(Some(500), Some(1_000), None, None, 7, 11);
+
+    let tasks = generated_licensed_follow_up_tasks(
+        &source_plan,
+        &source_consultant,
+        &source_budget,
+        &assignment,
+        &report,
+        &CandidateValidationBinding {
+            version: 1,
+            agent_id: assignment.id.clone(),
+            primary_head: None,
+            agent_head: None,
+            merge_base: None,
+            diff_oid: "2222222222222222222222222222222222222222".to_string(),
+        },
+    )
+    .expect("generate context-derived follow-up plan");
+    let generated = &tasks[0].supervisor_plan;
+
+    assert_eq!(generated.max_child_retries, 1);
+    assert_eq!(generated.max_gate_corrections, 2);
+    assert_eq!(generated.review_lenses, source_plan.review_lenses);
+    assert_eq!(
+        generated.review_aggregation_policy,
+        source_plan.review_aggregation_policy
+    );
+    assert_eq!(generated.consultant, source_consultant);
+    assert_eq!(
+        generated.run_budget.role_token_reservations,
+        source_budget.role_token_reservations
+    );
+    // Four maximum child attempts plus two lenses per attempt:
+    // 4 * 7 child tokens + 8 * 11 auditor tokens = 116.
+    assert_eq!(generated.run_budget.limits.soft_tokens, Some(116));
+    assert_eq!(generated.run_budget.limits.hard_tokens, Some(116));
+}
+
+#[test]
+fn generated_follow_up_real_loader_rejects_stripped_required_section() {
+    let assignment = licensed_assignment();
+    let child = dependent_failure_child(&assignment, "src/client.rs");
+    let scenario = run_licensed_scenario(
+        assignment,
+        child,
+        true,
+        "licensed-breakage-plan-section-neuter",
+    );
+    let task = scenario
+        .report
+        .generated_follow_up_tasks
+        .first()
+        .expect("generated follow-up task");
+    let mut document =
+        serde_json::to_value(&task.supervisor_plan).expect("serialize generated plan value");
+    document
+        .as_object_mut()
+        .expect("generated plan object")
+        .remove("run_budget")
+        .expect("generated run_budget section");
+    let neutered_path = scenario._temp.path().join("neutered-follow-up-plan.json");
+    fs::write(
+        &neutered_path,
+        serde_json::to_vec_pretty(&document).expect("serialize neutered plan"),
+    )
+    .expect("write neutered plan");
+
+    let error = load_supervisor_plan_file_with_consultant(&neutered_path)
+        .expect_err("real supervise plan loader must reject a stripped required section");
+    assert!(
+        format!("{error:#}")
+            .contains("generated follow-up supervisor plan requires explicit 'run_budget' section"),
+        "unexpected loader refusal: {error:#}"
+    );
 }
 
 #[test]
@@ -514,6 +651,8 @@ fn strict_journal_failure_cannot_silently_swallow_generated_tasks() {
     report.licensed_breakage_review = Some(review.clone());
     let tasks = generated_licensed_follow_up_tasks(
         &injected_plan(assignment.clone(), 0),
+        &SupervisorConsultantPlan::default(),
+        &SupervisorBudgetConfig::default(),
         &assignment,
         &report,
         &CandidateValidationBinding {
@@ -522,7 +661,7 @@ fn strict_journal_failure_cannot_silently_swallow_generated_tasks() {
             primary_head: None,
             agent_head: None,
             merge_base: None,
-            diff_oid: "licensed-test-diff".to_string(),
+            diff_oid: "1111111111111111111111111111111111111111".to_string(),
         },
     )
     .expect("generate follow-up task fixture");

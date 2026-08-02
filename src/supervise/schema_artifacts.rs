@@ -468,7 +468,7 @@ fn generated_follow_up_tasks_schema_value() -> serde_json::Value {
             "type": "object",
             "additionalProperties": false,
             "required": [
-                "assignment",
+                "supervisor_plan",
                 "breaking_assignment_id",
                 "breaking_change",
                 "declaration_sha256",
@@ -479,7 +479,7 @@ fn generated_follow_up_tasks_schema_value() -> serde_json::Value {
                 "handoff"
             ],
             "properties": {
-                "assignment": {"type": "object"},
+                "supervisor_plan": generated_follow_up_supervisor_plan_schema_value(),
                 "breaking_assignment_id": {"type": "string", "minLength": 1},
                 "breaking_change": {
                     "type": "object",
@@ -502,6 +502,80 @@ fn generated_follow_up_tasks_schema_value() -> serde_json::Value {
                 "cascade_depth": {"type": "integer", "const": LICENSED_BREAKAGE_CASCADE_DEPTH},
                 "dispatch_status": {"type": "string", "const": "deferred_for_planned_run"},
                 "handoff": {"type": "string", "minLength": 1}
+            }
+        }
+    })
+}
+
+fn generated_follow_up_supervisor_plan_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "version", "task", "task_file", "max_depth", "max_child_assignments",
+            "max_child_retries", "max_gate_corrections", "child_timeout_seconds",
+            "semantic_coordination", "role_models", "model_pricing", "review_lenses",
+            "review_aggregation_policy", "assignments", "spec_fragment_ids",
+            "assignment_schedule", "run_budget", "consultant", "generated_follow_up"
+        ],
+        "properties": {
+            "version": {"type": "integer", "const": SUPERVISOR_SCHEMA_VERSION},
+            "task": {"type": "string", "minLength": 1},
+            "task_file": {"type": ["string", "null"]},
+            "max_depth": {"type": "integer"},
+            "max_child_assignments": {"type": "integer", "const": 1},
+            "max_child_retries": {"type": "integer"},
+            "max_gate_corrections": {"type": "integer"},
+            "child_timeout_seconds": {"type": "integer", "minimum": 1},
+            "semantic_coordination": {"type": "string", "enum": ["off", "warn", "block"]},
+            "role_models": {"type": "object"},
+            "model_pricing": {"type": "object"},
+            "review_lenses": {"type": "array", "minItems": 1},
+            "review_aggregation_policy": {"type": "object"},
+            "assignments": {"type": "array", "minItems": 1, "maxItems": 1},
+            "spec_fragment_ids": {"type": "array", "maxItems": 0},
+            "assignment_schedule": {"type": "array", "minItems": 1, "maxItems": 1},
+            "run_budget": {
+                "type": "object",
+                "required": ["soft_tokens", "hard_tokens", "role_token_reservations"]
+            },
+            "consultant": {"type": "object"},
+            "generated_follow_up": generated_follow_up_plan_context_schema_value()
+        }
+    })
+}
+
+fn generated_follow_up_plan_context_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "breaking_assignment_id", "breaking_change", "declaration_sha256",
+            "failure_signature", "migration_rationale", "cascade_depth",
+            "dispatch_status", "handoff", "operator_defaults"
+        ],
+        "properties": {
+            "breaking_assignment_id": {"type": "string", "minLength": 1},
+            "breaking_change": {"type": "object"},
+            "declaration_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "failure_signature": {"type": "string", "minLength": 1},
+            "migration_rationale": {"type": "string", "minLength": 1},
+            "cascade_depth": {"type": "integer", "const": LICENSED_BREAKAGE_CASCADE_DEPTH},
+            "dispatch_status": {"type": "string", "const": "deferred_for_planned_run"},
+            "handoff": {"type": "string", "minLength": 1},
+            "operator_defaults": {
+                "type": "array",
+                "minItems": 2,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["field", "value", "rationale"],
+                    "properties": {
+                        "field": {"type": "string", "minLength": 1},
+                        "value": {"type": "string"},
+                        "rationale": {"type": "string", "minLength": 1}
+                    }
+                }
             }
         }
     })

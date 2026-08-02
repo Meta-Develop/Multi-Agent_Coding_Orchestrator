@@ -913,7 +913,7 @@ fn build_supervisor_final_report(
             )
         } else if success && generated_follow_up_task_count > 0 {
             format!(
-                "the breaking assignments completed under accepted narrow licenses, but {generated_follow_up_task_count} generated dependent update task(s) remain deferred to a newly validated and budgeted run"
+                "the breaking assignments completed under accepted narrow licenses, but automatic dispatch of {generated_follow_up_task_count} complete generated dependent update plan(s) remains deferred to separate runs"
             )
         } else if success && !publishable {
             "fake supervisor simulation succeeded but is not publishable or acceptable as real model evidence"
@@ -950,7 +950,7 @@ fn build_supervisor_final_report(
             "rerun with the trusted system Codex runtime before treating the generated follow-up records as dispatchable evidence"
                 .to_string()
         } else if success && generated_follow_up_task_count > 0 {
-            "place each generated_follow_up_tasks assignment into a new supervisor plan so ordinary claims, budget admission, checkpoints, child gates, and review lenses apply"
+            "write each generated_follow_up_tasks supervisor_plan directly to a plan file and invoke a new supervise run; ordinary claims, budget admission, checkpoints, child gates, and review lenses are already configured"
                 .to_string()
         } else if success && !publishable {
             "rerun with the trusted system Codex runtime before any real acceptance, merge, or publication"

@@ -370,6 +370,8 @@ fn all_failed_commands_are_licensed(
 
 pub(super) fn generated_licensed_follow_up_tasks(
     plan: &SupervisorPlan,
+    consultant: &SupervisorConsultantPlan,
+    source_budget: &SupervisorBudgetConfig,
     assignment: &OrchestratorAssignment,
     report: &OrchestratorReviewReport,
     breaking_change: &CandidateValidationBinding,
@@ -441,12 +443,39 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 environment_requirements: Vec::new(),
                 licensed_breakage: None,
                 notes: Some(
-                    "Generated licensed-breakage follow-up; dispatch only through a newly validated supervisor plan"
+                    "Generated licensed-breakage follow-up in a complete ordinary supervisor plan; automatic dispatch is deferred"
                         .to_string(),
                 ),
             };
-            Ok(GeneratedFollowUpTaskRecord {
-                assignment: follow_up_assignment,
+            let schedule = vec![AssignmentScheduleEntry {
+                assignment_id: follow_up_assignment.id.clone(),
+                parent_assignment_id: None,
+                depth: MIN_SUPERVISOR_DEPTH,
+                flattened_index: 0,
+            }];
+            let ordinary_plan = SupervisorPlan {
+                version: SUPERVISOR_SCHEMA_VERSION,
+                task: format!(
+                    "Dispatch generated dependent update '{}' for licensed breaking assignment '{}'. The generated_follow_up section documents candidate provenance, automatic-dispatch deferral, and every operator-owned default.",
+                    failure.dependent_id, assignment.id
+                ),
+                task_file: None,
+                max_depth: plan.max_depth,
+                max_child_assignments: 1,
+                max_child_retries: plan.max_child_retries,
+                max_gate_corrections: plan.max_gate_corrections,
+                child_timeout_seconds: plan.child_timeout_seconds,
+                semantic_coordination: plan.semantic_coordination,
+                role_models: plan.role_models.clone(),
+                model_pricing: plan.model_pricing.clone(),
+                review_lenses: plan.review_lenses.clone(),
+                review_aggregation_policy: plan.review_aggregation_policy,
+                assignments: vec![follow_up_assignment],
+            };
+            let run_budget = derived_generated_follow_up_budget(&ordinary_plan, source_budget)?;
+            let handoff = "write supervisor_plan directly to a plan file and load it through maco supervise run; automatic dispatch from the breaking run remains deferred"
+                .to_string();
+            let generated_context = GeneratedFollowUpPlanContext {
                 breaking_assignment_id: assignment.id.clone(),
                 breaking_change: breaking_change.clone(),
                 declaration_sha256: review.declaration_sha256.clone(),
@@ -454,8 +483,53 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 migration_rationale: review.migration_rationale.clone(),
                 cascade_depth: LICENSED_BREAKAGE_CASCADE_DEPTH,
                 dispatch_status: GeneratedFollowUpDispatchStatus::DeferredForPlannedRun,
-                handoff: "Insert this assignment into a new validated plan; ordinary claims, budget admission, child gates, review lenses, and checkpoints remain mandatory"
-                    .to_string(),
+                handoff: handoff.clone(),
+                operator_defaults: generated_follow_up_operator_defaults(),
+            };
+            let supervisor_plan = GeneratedFollowUpSupervisorPlan {
+                version: ordinary_plan.version,
+                task: ordinary_plan.task.clone(),
+                task_file: ordinary_plan.task_file.clone(),
+                max_depth: ordinary_plan.max_depth,
+                max_child_assignments: ordinary_plan.max_child_assignments,
+                max_child_retries: ordinary_plan.max_child_retries,
+                max_gate_corrections: ordinary_plan.max_gate_corrections,
+                child_timeout_seconds: ordinary_plan.child_timeout_seconds,
+                semantic_coordination: ordinary_plan.semantic_coordination,
+                role_models: ordinary_plan.role_models.clone(),
+                model_pricing: ordinary_plan.model_pricing.clone(),
+                review_lenses: ordinary_plan.review_lenses.clone(),
+                review_aggregation_policy: ordinary_plan.review_aggregation_policy,
+                assignments: ordinary_plan.assignments.clone(),
+                spec_fragment_ids: Vec::new(),
+                assignment_schedule: schedule,
+                run_budget,
+                consultant: consultant.clone(),
+                generated_follow_up: generated_context,
+            };
+            let serialized_plan = serde_json::to_string(&supervisor_plan)
+                .context("failed to serialize generated follow-up supervisor plan")?;
+            let loaded = parse_supervisor_plan_with_consultant(&serialized_plan)
+                .context("generated follow-up supervisor plan is not dispatchable")?;
+            if loaded.plan != supervisor_plan.ordinary_plan()
+                || loaded.consultant != supervisor_plan.consultant
+                || loaded.plan_metadata.assignment_schedule != supervisor_plan.assignment_schedule
+                || loaded.plan_metadata.run_budget != supervisor_plan.run_budget
+                || loaded.plan_metadata.generated_follow_up
+                    != Some(supervisor_plan.generated_follow_up.clone())
+            {
+                bail!("generated follow-up supervisor plan changed across the ordinary plan loader");
+            }
+            Ok(GeneratedFollowUpTaskRecord {
+                supervisor_plan,
+                breaking_assignment_id: assignment.id.clone(),
+                breaking_change: breaking_change.clone(),
+                declaration_sha256: review.declaration_sha256.clone(),
+                failure_signature: failure.failure_signature.clone(),
+                migration_rationale: review.migration_rationale.clone(),
+                cascade_depth: LICENSED_BREAKAGE_CASCADE_DEPTH,
+                dispatch_status: GeneratedFollowUpDispatchStatus::DeferredForPlannedRun,
+                handoff,
             })
         })
         .collect()

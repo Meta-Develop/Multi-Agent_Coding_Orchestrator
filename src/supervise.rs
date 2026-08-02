@@ -569,6 +569,7 @@ struct SupervisorPlanMetadata {
     coverage_gaps: Vec<SupervisorCoverageGap>,
     run_budget: SupervisorBudgetConfig,
     evidence_only_reaudit: Option<EvidenceOnlyReauditPlan>,
+    generated_follow_up: Option<GeneratedFollowUpPlanContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -660,15 +661,96 @@ pub enum GeneratedFollowUpDispatchStatus {
     DeferredForPlannedRun,
 }
 
-/// Durable, dispatch-shaped work produced by an accepted licensed failure.
-///
-/// Dispatch is deliberately deferred: inserting work into an active scheduler
-/// would bypass its prepared checkpoint and budget closure. A later planned run
-/// can submit `assignment` through the ordinary claim, child, and auditor gates.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct GeneratedFollowUpOperatorDefault {
+    pub field: String,
+    pub value: String,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneratedFollowUpPlanContext {
+    pub breaking_assignment_id: String,
+    pub breaking_change: CandidateValidationBinding,
+    pub declaration_sha256: String,
+    pub failure_signature: String,
+    pub migration_rationale: String,
+    pub cascade_depth: u8,
+    pub dispatch_status: GeneratedFollowUpDispatchStatus,
+    pub handoff: String,
+    pub operator_defaults: Vec<GeneratedFollowUpOperatorDefault>,
+}
+
+/// A complete ordinary supervisor-plan document generated for one dependent
+/// update. Every field is serialized explicitly so an operator can write this
+/// value directly to a plan file without supplying schedule, budget, or gate
+/// metadata.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneratedFollowUpSupervisorPlan {
+    pub version: u32,
+    pub task: String,
+    #[serde(serialize_with = "serialize_optional_path")]
+    pub task_file: Option<PathBuf>,
+    pub max_depth: u8,
+    pub max_child_assignments: usize,
+    pub max_child_retries: u8,
+    pub max_gate_corrections: u8,
+    pub child_timeout_seconds: u64,
+    pub semantic_coordination: SemanticCoordinationMode,
+    pub role_models: BTreeMap<AgentRole, RoleModelSelection>,
+    pub model_pricing: BTreeMap<String, ModelPricing>,
+    pub review_lenses: Vec<ReviewLensConfig>,
+    pub review_aggregation_policy: ReviewAggregationPolicy,
+    pub assignments: Vec<OrchestratorAssignment>,
+    pub spec_fragment_ids: Vec<String>,
+    pub assignment_schedule: Vec<AssignmentScheduleEntry>,
+    pub run_budget: SupervisorBudgetConfig,
+    pub consultant: SupervisorConsultantPlan,
+    pub generated_follow_up: GeneratedFollowUpPlanContext,
+}
+
+impl GeneratedFollowUpSupervisorPlan {
+    fn ordinary_plan(&self) -> SupervisorPlan {
+        SupervisorPlan {
+            version: self.version,
+            task: self.task.clone(),
+            task_file: self.task_file.clone(),
+            max_depth: self.max_depth,
+            max_child_assignments: self.max_child_assignments,
+            max_child_retries: self.max_child_retries,
+            max_gate_corrections: self.max_gate_corrections,
+            child_timeout_seconds: self.child_timeout_seconds,
+            semantic_coordination: self.semantic_coordination,
+            role_models: self.role_models.clone(),
+            model_pricing: self.model_pricing.clone(),
+            review_lenses: self.review_lenses.clone(),
+            review_aggregation_policy: self.review_aggregation_policy,
+            assignments: self.assignments.clone(),
+        }
+    }
+
+    fn assignment(&self) -> Result<&OrchestratorAssignment> {
+        if self.assignments.len() != 1 {
+            bail!("generated follow-up supervisor plan must contain exactly one assignment");
+        }
+        self.assignments
+            .first()
+            .context("generated follow-up supervisor plan has no assignment")
+    }
+}
+
+/// Durable, dispatchable planned work produced by an accepted licensed
+/// failure. Automatic dispatch remains deliberately deferred: inserting work
+/// into an active scheduler would bypass its prepared checkpoint and budget
+/// closure. `supervisor_plan` itself is ready for the ordinary plan-loading,
+/// claim, child, and auditor paths.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeneratedFollowUpTaskRecord {
-    pub assignment: OrchestratorAssignment,
+    pub supervisor_plan: GeneratedFollowUpSupervisorPlan,
     pub breaking_assignment_id: String,
     pub breaking_change: CandidateValidationBinding,
     pub declaration_sha256: String,
@@ -678,6 +760,12 @@ pub struct GeneratedFollowUpTaskRecord {
     pub dispatch_status: GeneratedFollowUpDispatchStatus,
     pub handoff: String,
 }
+
+// Generated records are constructed only after ordinary plan validation, which
+// rejects non-finite budget and pricing values. Their validated numeric domain
+// therefore has total equality even though the reusable plan types also model
+// pre-validation floating-point input.
+impl Eq for GeneratedFollowUpTaskRecord {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct AssignmentScheduleEntry {

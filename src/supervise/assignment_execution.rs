@@ -2301,6 +2301,8 @@ fn decide_parent_auditor_gate(
         )?;
         let tasks = generated_licensed_follow_up_tasks(
             context.plan,
+            context.consultant,
+            context.budget_config,
             assignment,
             &child_report,
             &candidate.binding,
