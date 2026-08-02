@@ -500,6 +500,7 @@ pub enum EnvironmentFailureCategory {
     NetworkForbidden,
     SandboxUnavailable,
     ProbeFailed,
+    RuntimeModelCatalogUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -526,6 +527,16 @@ pub struct EnvironmentFailure {
     pub requirement: Option<EnvironmentRequirement>,
     pub summary: String,
     pub remediation: Vec<EnvironmentRemediation>,
+}
+
+impl EnvironmentFailure {
+    pub(crate) fn runtime_model_catalog(summary: String) -> Self {
+        environment_failure(
+            EnvironmentFailureCategory::RuntimeModelCatalogUnavailable,
+            None,
+            summary,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -3838,6 +3849,18 @@ fn environment_remediation(category: EnvironmentFailureCategory) -> Vec<Environm
             guidance: "Correct the bounded requirement or fixed project environment, then rerun preflight; MACO will not install software or relax policy automatically."
                 .to_string(),
         }],
+        EnvironmentFailureCategory::RuntimeModelCatalogUnavailable => vec![
+            EnvironmentRemediation {
+                scope: EnvironmentRemediationScope::CapabilityPolicy,
+                guidance: "Restore the trusted system Codex runtime-catalog path and its verified confinement; do not substitute a custom executable or broaden the sandbox."
+                    .to_string(),
+            },
+            EnvironmentRemediation {
+                scope: EnvironmentRemediationScope::CredentialConfiguration,
+                guidance: "Validate the existing Codex auth source without copying secret material into the repository or plan."
+                    .to_string(),
+            },
+        ],
     }
 }
 
@@ -3916,92 +3939,100 @@ pub(crate) fn load_codex_runtime_model_catalog(
     program: &Path,
     cwd: &Path,
     timeout: Duration,
-) -> Result<CodexRuntimeModelCatalog> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (program, cwd, timeout);
-        bail!("Codex runtime model catalog preflight is unsupported on this platform");
-    }
+) -> std::result::Result<CodexRuntimeModelCatalog, Box<EnvironmentFailure>> {
+    let catalog = (|| -> Result<CodexRuntimeModelCatalog> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (program, cwd, timeout);
+            bail!("Codex runtime model catalog preflight is unsupported on this platform");
+        }
 
-    #[cfg(target_os = "linux")]
-    {
-        if program != Path::new("codex") {
-            bail!(
-                "Codex runtime model catalog preflight requires the trusted system Codex executable and verified process-tree ownership; explicit custom executables receive no auth or provider network access"
-            );
-        }
-        if timeout.is_zero() {
-            bail!("Codex runtime model catalog preflight requires a positive timeout");
-        }
-        let resolved_program = resolve_external_program(program, cwd)
-            .context("failed to resolve trusted Codex for model catalog preflight")?;
-        let program_parent = resolved_program.parent().with_context(|| {
-            format!(
-                "trusted Codex executable has no parent: {}",
-                resolved_program.display()
+        #[cfg(target_os = "linux")]
+        {
+            if program != Path::new("codex") {
+                bail!(
+                    "Codex runtime model catalog preflight requires the trusted system Codex executable and verified process-tree ownership; explicit custom executables receive no auth or provider network access"
+                );
+            }
+            if timeout.is_zero() {
+                bail!("Codex runtime model catalog preflight requires a positive timeout");
+            }
+            let resolved_program = resolve_external_program(program, cwd)
+                .context("failed to resolve trusted Codex for model catalog preflight")?;
+            let program_parent = resolved_program.parent().with_context(|| {
+                format!(
+                    "trusted Codex executable has no parent: {}",
+                    resolved_program.display()
+                )
+            })?;
+            let program_identity = external_program_identity(&resolved_program)
+                .context("failed to bind trusted Codex identity for model catalog preflight")?;
+            let auth = ValidatedCodexAuth::load()
+                .context("failed to validate Codex auth for model catalog preflight")?
+                .context(
+                    "Codex runtime model catalog preflight requires a validated auth.json source",
+                )?;
+            auth.verify_source_unchanged()
+                .context("Codex auth changed before model catalog preflight")?;
+
+            let process_spec = ProcessSpec::direct(
+                "Codex runtime model catalog preflight",
+                &resolved_program,
+                ["debug", "models"],
+                cwd,
+                CODEX_MODEL_CATALOG_MAX_BYTES,
             )
-        })?;
-        let program_identity = external_program_identity(&resolved_program)
-            .context("failed to bind trusted Codex identity for model catalog preflight")?;
-        let auth = ValidatedCodexAuth::load()
-            .context("failed to validate Codex auth for model catalog preflight")?
-            .context(
-                "Codex runtime model catalog preflight requires a validated auth.json source",
+            .with_environment(EnvironmentMode::ClearAndSet(allowed_env(
+                ExternalAgentInvocation::CodexSupervisor,
+                ExternalProgramTrust::TrustedSystemCodex,
+            )))
+            .with_stdin(StdinMode::Null)
+            .with_timeout(Some(timeout))
+            .with_private_runtime_home(true)
+            .with_private_runtime_codex_home(true)
+            .with_private_runtime_file("auth.json", auth.bytes.clone())
+            .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(
+                ExternalCodexProfile::read_only(cwd).with_visible_read_only_root(program_parent),
+            ));
+
+            let process_result = run_process_cancellable(process_spec, &ProcessCancellation::new());
+            let current_identity = external_program_identity(&resolved_program)
+                .context("failed to revalidate trusted Codex after model catalog preflight")?;
+            let auth_result = auth
+                .verify_source_unchanged()
+                .context("Codex auth changed during model catalog preflight");
+            if current_identity != program_identity {
+                bail!("trusted Codex executable changed during model catalog preflight");
+            }
+            auth_result?;
+            let output = process_result.context(
+                "Codex runtime model catalog preflight failed before a verified result was available",
             )?;
-        auth.verify_source_unchanged()
-            .context("Codex auth changed before model catalog preflight")?;
+            if !output.safety_sensitive_succeeded() {
+                bail!(
+                    "Codex runtime model catalog preflight failed closed: exit={:?}; timed_out={}; process_tree={:?}; side_effects={:?}; process_error_present={}",
+                    output.status.and_then(|status| status.code()),
+                    output.timed_out,
+                    output.process_tree,
+                    output.side_effects,
+                    output.process_error.is_some()
+                );
+            }
+            if output.stdout.is_truncated() || output.stderr.is_truncated() {
+                bail!(
+                    "Codex runtime model catalog preflight output exceeded the {} byte limit",
+                    CODEX_MODEL_CATALOG_MAX_BYTES
+                );
+            }
+            parse_codex_runtime_model_catalog(output.stdout.as_bytes())
+        }
+    })();
 
-        let process_spec = ProcessSpec::direct(
-            "Codex runtime model catalog preflight",
-            &resolved_program,
-            ["debug", "models"],
-            cwd,
-            CODEX_MODEL_CATALOG_MAX_BYTES,
-        )
-        .with_environment(EnvironmentMode::ClearAndSet(allowed_env(
-            ExternalAgentInvocation::CodexSupervisor,
-            ExternalProgramTrust::TrustedSystemCodex,
+    catalog.map_err(|error| {
+        Box::new(EnvironmentFailure::runtime_model_catalog(format!(
+            "Codex runtime model catalog acquisition failed: {error:#}"
         )))
-        .with_stdin(StdinMode::Null)
-        .with_timeout(Some(timeout))
-        .with_private_runtime_home(true)
-        .with_private_runtime_codex_home(true)
-        .with_private_runtime_file("auth.json", auth.bytes.clone())
-        .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(
-            ExternalCodexProfile::read_only(cwd).with_visible_read_only_root(program_parent),
-        ));
-
-        let process_result = run_process_cancellable(process_spec, &ProcessCancellation::new());
-        let current_identity = external_program_identity(&resolved_program)
-            .context("failed to revalidate trusted Codex after model catalog preflight")?;
-        let auth_result = auth
-            .verify_source_unchanged()
-            .context("Codex auth changed during model catalog preflight");
-        if current_identity != program_identity {
-            bail!("trusted Codex executable changed during model catalog preflight");
-        }
-        auth_result?;
-        let output = process_result.context(
-            "Codex runtime model catalog preflight failed before a verified result was available",
-        )?;
-        if !output.safety_sensitive_succeeded() {
-            bail!(
-                "Codex runtime model catalog preflight failed closed: exit={:?}; timed_out={}; process_tree={:?}; side_effects={:?}; process_error_present={}",
-                output.status.and_then(|status| status.code()),
-                output.timed_out,
-                output.process_tree,
-                output.side_effects,
-                output.process_error.is_some()
-            );
-        }
-        if output.stdout.is_truncated() || output.stderr.is_truncated() {
-            bail!(
-                "Codex runtime model catalog preflight output exceeded the {} byte limit",
-                CODEX_MODEL_CATALOG_MAX_BYTES
-            );
-        }
-        parse_codex_runtime_model_catalog(output.stdout.as_bytes())
-    }
+    })
 }
 
 fn parse_codex_runtime_model_catalog(bytes: &[u8]) -> Result<CodexRuntimeModelCatalog> {
@@ -7002,11 +7033,35 @@ else:
                 "sandbox_unavailable",
             ),
             (EnvironmentFailureCategory::ProbeFailed, "probe_failed"),
+            (
+                EnvironmentFailureCategory::RuntimeModelCatalogUnavailable,
+                "runtime_model_catalog_unavailable",
+            ),
         ];
         for (category, spelling) in categories {
             assert_eq!(serde_json::to_value(category)?, spelling);
         }
         Ok(())
+    }
+
+    #[test]
+    fn runtime_model_catalog_rejects_custom_executable_with_typed_failure() {
+        let failure = load_codex_runtime_model_catalog(
+            Path::new("/tmp/untrusted-custom-codex"),
+            Path::new("."),
+            Duration::from_secs(1),
+        )
+        .expect_err("custom executable must not acquire runtime catalog auth or network access");
+
+        assert_eq!(
+            failure.category,
+            EnvironmentFailureCategory::RuntimeModelCatalogUnavailable
+        );
+        assert!(failure.requirement.is_none());
+        assert!(failure
+            .summary
+            .contains("explicit custom executables receive no auth or provider network access"));
+        assert!(!failure.remediation.is_empty());
     }
 
     #[test]

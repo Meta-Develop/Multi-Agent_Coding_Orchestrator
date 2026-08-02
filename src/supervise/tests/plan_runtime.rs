@@ -1780,7 +1780,7 @@ fn local_deterministic_fake_fallback_reaches_shared_supervisor_core_without_exte
 }
 
 #[test]
-fn model_catalog_failure_fails_closed_before_any_production_dispatch() {
+fn runtime_model_catalog_preflight_is_typed_persisted_and_short_circuits_assignment_preflight() {
     let (temp, repo_path) = injected_repository();
     let plan = injected_plan(injected_assignment(true), 0);
     let options = injected_options(
@@ -1791,22 +1791,48 @@ fn model_catalog_failure_fails_closed_before_any_production_dispatch() {
     let mut invocations = 0usize;
     let mut runner = |_command: &ExternalAgentCommand| {
         invocations = invocations.saturating_add(1);
-        panic!("catalog acquisition failure must prevent assignment dispatch")
+        panic!("catalog preflight failure must prevent assignment environment preflight")
     };
+    let run_id = options.run_id.clone();
 
-    let error = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
-        Err(anyhow!("injected catalog acquisition failure")),
+        Err(Box::new(EnvironmentFailure::runtime_model_catalog(
+            "injected catalog acquisition failure".to_string(),
+        ))),
         &mut runner,
     )
-    .expect_err("missing catalog must fail closed");
+    .expect("typed catalog failure must materialize as a terminal supervisor report");
 
     assert_eq!(invocations, 0);
-    assert!(format!("{error:#}").contains("runtime model availability could not be established"));
-    assert!(format!("{error:#}").contains("injected catalog acquisition failure"));
+    assert!(!report.success);
+    assert!(!report.publishable);
+    assert!(!report.accepted);
+    assert!(report.rejected);
+    assert_eq!(report.status, ReviewStatus::Failed);
+    assert!(report.commands_run.is_empty());
+    assert!(report.orchestrator_reports.is_empty());
+    assert!(report.role_economics_profile.is_none());
+    assert_eq!(report.environment_failures.len(), 1);
+    assert_eq!(
+        report.environment_failures[0].category,
+        EnvironmentFailureCategory::RuntimeModelCatalogUnavailable
+    );
+    assert!(report.environment_failures[0].requirement.is_none());
+    assert_eq!(
+        report.environment_failures[0].summary,
+        "environment preflight reported runtime_model_catalog_unavailable"
+    );
+    assert!(!report.environment_failures[0].remediation.is_empty());
+
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+        .expect("typed catalog failure must finalize authenticated supervisor artifacts");
+    let persisted = read_supervisor_final_report(&reader)
+        .expect("read persisted runtime catalog environment failure report");
+    assert_eq!(persisted, report);
 }
 
 #[test]
