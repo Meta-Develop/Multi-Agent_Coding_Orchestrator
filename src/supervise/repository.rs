@@ -1,5 +1,29 @@
 use super::*;
 
+pub(super) fn planned_claim_releases(
+    store: &SyncStore,
+    tokens: &[ClaimToken],
+) -> Result<Vec<PathClaim>> {
+    let mut active = store
+        .snapshot()?
+        .into_iter()
+        .map(|claim| (claim.token, claim))
+        .collect::<BTreeMap<_, _>>();
+    tokens
+        .iter()
+        .map(|token| {
+            let mut claim = active.remove(token).with_context(|| {
+                format!(
+                    "claim token {} is not active while planning terminal cleanup",
+                    token.get()
+                )
+            })?;
+            sanitize_serialized_paths(&mut claim.paths);
+            Ok(claim)
+        })
+        .collect()
+}
+
 pub(super) fn release_claims(
     store: &SyncStore,
     tokens: Vec<ClaimToken>,
@@ -18,6 +42,30 @@ pub(super) fn release_claims(
     (released, errors)
 }
 
+pub(super) fn planned_semantic_intent_releases(
+    store: &SemanticIntentStore,
+    tokens: &[crate::semantic_coord::SemanticIntentToken],
+) -> Result<Vec<SemanticIntent>> {
+    let mut active = store
+        .snapshot()?
+        .into_iter()
+        .map(|intent| (intent.token, intent))
+        .collect::<BTreeMap<_, _>>();
+    tokens
+        .iter()
+        .map(|token| {
+            let mut intent = active.remove(token).with_context(|| {
+                format!(
+                    "semantic intent token {} is not active while planning terminal cleanup",
+                    token.get()
+                )
+            })?;
+            sanitize_semantic_intent(&mut intent);
+            Ok(intent)
+        })
+        .collect()
+}
+
 pub(super) fn release_semantic_intents(
     store: &SemanticIntentStore,
     tokens: Vec<crate::semantic_coord::SemanticIntentToken>,
@@ -27,11 +75,7 @@ pub(super) fn release_semantic_intents(
     for token in tokens {
         match store.release(token) {
             Ok(mut intent) => {
-                sanitize_serialized_paths(&mut intent.paths);
-                sanitize_serialized_paths(&mut intent.impacted_files);
-                for symbol in &mut intent.symbols {
-                    symbol.file = serializable_path_buf(&symbol.file);
-                }
+                sanitize_semantic_intent(&mut intent);
                 released.push(intent);
             }
             Err(error) => errors.push(format!(
@@ -41,6 +85,97 @@ pub(super) fn release_semantic_intents(
         }
     }
     (released, errors)
+}
+
+pub(super) fn complete_planned_scheduler_resource_release(
+    sync_store: &SyncStore,
+    semantic_store: &SemanticIntentStore,
+    report: &SupervisorFinalReport,
+) -> Result<()> {
+    if report.claim_tokens.iter().copied().collect::<BTreeSet<_>>()
+        != report
+            .released_claims
+            .iter()
+            .map(|claim| claim.token.get())
+            .collect()
+    {
+        bail!("terminal report claim cleanup plan is internally inconsistent");
+    }
+    let mut active_claims = sync_store
+        .snapshot()?
+        .into_iter()
+        .map(|claim| (claim.token, claim))
+        .collect::<BTreeMap<_, _>>();
+    for expected in &report.released_claims {
+        let Some(active) = active_claims.remove(&expected.token) else {
+            continue;
+        };
+        let mut comparable_active = active.clone();
+        sanitize_serialized_paths(&mut comparable_active.paths);
+        if comparable_active != *expected {
+            bail!(
+                "active claim token {} differs from its terminal release plan",
+                expected.token.get()
+            );
+        }
+        let mut released = sync_store.release(expected.token)?;
+        sanitize_serialized_paths(&mut released.paths);
+        if released != *expected {
+            bail!(
+                "released claim token {} differs from its terminal release plan",
+                expected.token.get()
+            );
+        }
+    }
+
+    if report
+        .semantic_intent_tokens
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        != report
+            .released_semantic_intents
+            .iter()
+            .map(|intent| intent.token.get())
+            .collect()
+    {
+        bail!("terminal report semantic cleanup plan is internally inconsistent");
+    }
+    let mut active_intents = semantic_store
+        .snapshot()?
+        .into_iter()
+        .map(|intent| (intent.token, intent))
+        .collect::<BTreeMap<_, _>>();
+    for expected in &report.released_semantic_intents {
+        let Some(active) = active_intents.remove(&expected.token) else {
+            continue;
+        };
+        let mut comparable_active = active.clone();
+        sanitize_semantic_intent(&mut comparable_active);
+        if comparable_active != *expected {
+            bail!(
+                "active semantic intent token {} differs from its terminal release plan",
+                expected.token.get()
+            );
+        }
+        let mut released = semantic_store.release(expected.token)?;
+        sanitize_semantic_intent(&mut released);
+        if released != *expected {
+            bail!(
+                "released semantic intent token {} differs from its terminal release plan",
+                expected.token.get()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn sanitize_semantic_intent(intent: &mut SemanticIntent) {
+    sanitize_serialized_paths(&mut intent.paths);
+    sanitize_serialized_paths(&mut intent.impacted_files);
+    for symbol in &mut intent.symbols {
+        symbol.file = serializable_path_buf(&symbol.file);
+    }
 }
 
 fn sanitize_serialized_paths(paths: &mut [PathBuf]) {

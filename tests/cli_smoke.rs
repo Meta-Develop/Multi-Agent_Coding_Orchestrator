@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
+use multi_agent_coding_orchestrator::{orchestrator::RunId, sync_store::SyncStore};
 use serde_json::Value;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -27,6 +28,38 @@ const ISSUE33_PHYSICAL_JOURNAL_ID: &str =
     "6ce2913c16ab9fe3388b4d29719afd3b2549aa6d90975b2cf8ddc4173d0999f4";
 const ISSUE33_PHYSICAL_JOURNAL_MANIFEST: &str =
     include_str!("fixtures/issue33/authenticated-claims-state-v1.sha256");
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_sync_status_reports_live_supervise_run_ownership() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let run_id = RunId::new("status-live-run")?;
+    let store = SyncStore::open(&repo_path)?;
+    let claim =
+        store.claim_paths_for_run(&run_id, "status-assignment", [PathBuf::from("README.md")])?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+
+    let status = run_success_json(["sync", "status", "--repo", repo, "--json"])?;
+    assert_eq!(status[0]["token"], claim.token.get());
+    assert_eq!(status[0]["agent_id"], "status-assignment");
+    assert_eq!(status[0]["owner_run_id"], "status-live-run");
+    assert_eq!(status[0]["owner_run_state"], "active");
+    assert_eq!(status[0]["owner_process_id"], std::process::id());
+
+    let text = Command::new(BIN)
+        .args(["sync", "status", "--repo", repo])
+        .output()
+        .context("run text sync status")?;
+    assert!(text.status.success());
+    let stdout = String::from_utf8(text.stdout).context("decode text sync status")?;
+    assert!(stdout.contains(&format!("{}\tstatus-assignment", claim.token.get())));
+    assert!(stdout.contains("run=status-live-run"));
+    assert!(stdout.contains("state=active"));
+
+    store.release(claim.token)?;
+    Ok(())
+}
 
 #[cfg(unix)]
 #[test]

@@ -81,6 +81,8 @@ struct AssignmentCheckpoint {
     worktree: Option<CheckpointWorktreeBinding>,
     #[serde(default)]
     claim_tokens: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim_paths: Option<Vec<PathBuf>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +194,7 @@ impl SupervisorCheckpointSnapshot {
         &self,
         store: &SyncStore,
         report: &SupervisorFinalReport,
+        allow_active_terminal_release_plan: bool,
     ) -> Result<()> {
         let released = report
             .released_claims
@@ -214,8 +217,15 @@ impl SupervisorCheckpointSnapshot {
                 if &released_claim.agent_id != assignment || &released_claim.paths != paths {
                     bail!("released checkpoint claim token {token} changed identity or scope");
                 }
-                if active.contains_key(token) {
-                    bail!("released checkpoint claim token {token} remains active");
+                if let Some(active_claim) = active.get(token) {
+                    if &active_claim.agent_id != assignment || &active_claim.paths != paths {
+                        bail!(
+                            "active terminal-release claim token {token} changed identity or scope"
+                        );
+                    }
+                    if !allow_active_terminal_release_plan {
+                        bail!("released checkpoint claim token {token} remains active");
+                    }
                 }
                 continue;
             }
@@ -338,6 +348,7 @@ impl SupervisorCheckpointWriter {
                 budget,
                 worktree: None,
                 claim_tokens: Vec::new(),
+                claim_paths: None,
             },
         )?;
         self.assignment_states
@@ -357,6 +368,7 @@ impl SupervisorCheckpointWriter {
         if self.assignment_states.get(&assignment.id) != Some(&AssignmentResumeState::Started) {
             bail!("supervise checkpoint assignment completion has no unique start");
         }
+        let claim_paths = (!claim_tokens.is_empty()).then(|| assignment.assigned_paths.clone());
         self.append(
             PHASE_ASSIGNMENT_COMPLETED,
             Some(&assignment.id),
@@ -367,6 +379,7 @@ impl SupervisorCheckpointWriter {
                 budget,
                 worktree: worktree.map(CheckpointWorktreeBinding::from),
                 claim_tokens,
+                claim_paths,
             },
         )?;
         self.assignment_states
@@ -726,10 +739,27 @@ fn analyze_checkpoint_records(
                     bail!("checkpoint completion has no unique preceding assignment start");
                 }
                 *state = AssignmentResumeState::Completed;
-                let claim_paths = prepared
+                let prepared_claim_paths = prepared
                     .assignment_claim_paths
                     .get(subject)
                     .context("checkpoint assignment claim scope disappeared")?;
+                let claim_paths = match payload.claim_paths {
+                    Some(paths) => {
+                        if payload.claim_tokens.is_empty()
+                            || paths.is_empty()
+                            || paths.iter().collect::<BTreeSet<_>>().len() != paths.len()
+                            || paths
+                                .iter()
+                                .any(|path| !prepared_claim_paths.contains(path))
+                        {
+                            bail!(
+                                "checkpoint assignment claim scope is not a non-empty subset of its prepared scope"
+                            );
+                        }
+                        paths
+                    }
+                    None => prepared_claim_paths.clone(),
+                };
                 for token in payload.claim_tokens {
                     if claims
                         .insert(token, (subject.to_string(), claim_paths.clone()))

@@ -419,6 +419,7 @@ fn run_serial_assignment_schedule(
             external_runner: context.external_runner,
         });
         let mut outcome = outcome;
+        record_completed_assignment_checkpoint(context, index, &outcome)?;
         if context.release_per_assignment {
             release_concurrent_assignment(&mut outcome, context.sync_store, context.semantic_store);
         }
@@ -430,7 +431,6 @@ fn run_serial_assignment_schedule(
         }
         let abort = outcome.requires_scheduler_abort();
         let budget_stopped = outcome.budget_dispatch_stopped;
-        record_completed_assignment_checkpoint(context, index, &outcome)?;
         progress.indexed_outcomes[index] = Some(outcome);
         if abort || budget_stopped {
             progress.budget_prevented_dispatch |= budget_stopped;
@@ -635,6 +635,7 @@ fn run_concurrent_assignment_schedule(
                     context.plan.assignments[completed_index].id
                 )),
             };
+            record_completed_assignment_checkpoint(context, completed_index, &outcome)?;
             release_concurrent_assignment(&mut outcome, context.sync_store, context.semantic_store);
             if outcome.requires_scheduler_abort() {
                 cancellation.cancel();
@@ -667,7 +668,6 @@ fn run_concurrent_assignment_schedule(
                     stop_scheduling = true;
                 }
             }
-            record_completed_assignment_checkpoint(context, completed_index, &outcome)?;
             progress.indexed_outcomes[completed_index] = Some(outcome);
         }
 
@@ -679,8 +679,8 @@ fn run_concurrent_assignment_schedule(
                     context.plan.assignments[index].id
                 )),
             };
-            release_concurrent_assignment(&mut outcome, context.sync_store, context.semantic_store);
             record_completed_assignment_checkpoint(context, index, &outcome)?;
+            release_concurrent_assignment(&mut outcome, context.sync_store, context.semantic_store);
             progress.indexed_outcomes[index] = Some(outcome);
         }
         Ok(())
@@ -697,6 +697,10 @@ fn record_completed_assignment_checkpoint(
         .assignments
         .get(index)
         .context("checkpoint completion index is outside the supervisor plan")?;
+    let mut checkpoint_assignment = assignment.clone();
+    if !outcome.claimed_paths.is_empty() {
+        checkpoint_assignment.assigned_paths = outcome.claimed_paths.clone();
+    }
     let worktrees = context.manager.list()?;
     let worktree = worktrees.iter().find(|record| record.name == assignment.id);
     let claim_tokens = outcome
@@ -714,7 +718,7 @@ fn record_completed_assignment_checkpoint(
         .collect();
     record_assignment_completed_checkpoint(
         context.artifacts,
-        assignment,
+        &checkpoint_assignment,
         index,
         context.budget_ledger,
         worktree,
@@ -960,6 +964,7 @@ fn build_supervisor_final_report(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ReleasedSchedulerResources {
     released_claims: Vec<PathClaim>,
     release_errors: Vec<String>,
@@ -967,10 +972,80 @@ struct ReleasedSchedulerResources {
     semantic_release_errors: Vec<String>,
 }
 
+#[derive(Default)]
+struct CollectedSchedulerResources {
+    acquired_claim_tokens: Vec<ClaimToken>,
+    acquired_semantic_tokens: Vec<crate::semantic_coord::SemanticIntentToken>,
+    concurrently_released_claims: Vec<PathClaim>,
+    concurrent_release_errors: Vec<String>,
+    concurrently_released_semantic_intents: Vec<SemanticIntent>,
+    concurrent_semantic_release_errors: Vec<String>,
+}
+
+impl CollectedSchedulerResources {
+    fn take_from(collected: &mut CollectedAssignmentOutcomes) -> Self {
+        Self {
+            acquired_claim_tokens: std::mem::take(&mut collected.acquired_claim_tokens),
+            acquired_semantic_tokens: std::mem::take(&mut collected.acquired_semantic_tokens),
+            concurrently_released_claims: std::mem::take(
+                &mut collected.concurrently_released_claims,
+            ),
+            concurrent_release_errors: std::mem::take(&mut collected.concurrent_release_errors),
+            concurrently_released_semantic_intents: std::mem::take(
+                &mut collected.concurrently_released_semantic_intents,
+            ),
+            concurrent_semantic_release_errors: std::mem::take(
+                &mut collected.concurrent_semantic_release_errors,
+            ),
+        }
+    }
+
+    fn already_released(&self) -> ReleasedSchedulerResources {
+        ReleasedSchedulerResources {
+            released_claims: self.concurrently_released_claims.clone(),
+            release_errors: self.concurrent_release_errors.clone(),
+            released_semantic_intents: self.concurrently_released_semantic_intents.clone(),
+            semantic_release_errors: self.concurrent_semantic_release_errors.clone(),
+        }
+    }
+}
+
+fn planned_collected_scheduler_resources(
+    sync_store: Option<&SyncStore>,
+    semantic_store: Option<&SemanticIntentStore>,
+    collected: &CollectedSchedulerResources,
+) -> Result<ReleasedSchedulerResources> {
+    let mut released_claims = match sync_store {
+        Some(store) => planned_claim_releases(store, &collected.acquired_claim_tokens)?,
+        None if collected.acquired_claim_tokens.is_empty() => Vec::new(),
+        None => bail!("supervisor sync store is unavailable for terminal claim cleanup"),
+    };
+    released_claims.extend(collected.concurrently_released_claims.iter().cloned());
+    let mut released_semantic_intents = match semantic_store {
+        Some(store) => {
+            planned_semantic_intent_releases(store, &collected.acquired_semantic_tokens)?
+        }
+        None if collected.acquired_semantic_tokens.is_empty() => Vec::new(),
+        None => bail!("supervisor semantic store is unavailable for terminal intent cleanup"),
+    };
+    released_semantic_intents.extend(
+        collected
+            .concurrently_released_semantic_intents
+            .iter()
+            .cloned(),
+    );
+    Ok(ReleasedSchedulerResources {
+        released_claims,
+        release_errors: collected.concurrent_release_errors.clone(),
+        released_semantic_intents,
+        semantic_release_errors: collected.concurrent_semantic_release_errors.clone(),
+    })
+}
+
 fn release_collected_scheduler_resources(
     sync_store: Option<&SyncStore>,
     semantic_store: Option<&SemanticIntentStore>,
-    collected: &mut CollectedAssignmentOutcomes,
+    collected: &mut CollectedSchedulerResources,
 ) -> ReleasedSchedulerResources {
     let (mut released_claims, mut release_errors) = match sync_store {
         Some(store) => release_claims(store, std::mem::take(&mut collected.acquired_claim_tokens)),
@@ -1025,6 +1100,7 @@ fn persist_supervisor_final_report(
     orchestration_journal: &mut Option<OrchestrationEventJournal>,
     mut artifact_writer: ArtifactRunWriter,
     checkpoint_writer: Option<&mut SupervisorCheckpointWriter>,
+    release_after_terminal_record: impl FnOnce() -> Result<()>,
 ) -> Result<SupervisorFinalReport> {
     enforce_supervisor_final_environment_failure_outcome(&mut final_report);
     record_orchestration_event(
@@ -1070,10 +1146,12 @@ fn persist_supervisor_final_report(
     if let Some(checkpoint) = checkpoint_writer.as_deref_mut() {
         let artifact_binding = artifact_writer
             .resume_binding()
-            .context("failed to write normalized supervisor final report")?;
+            .context("failed to establish a durable terminal supervisor report boundary")?;
         checkpoint
             .final_report_planned(&final_report, &report_bytes, artifact_binding)
-            .context("failed to write normalized supervisor final report")?;
+            .context("failed to persist the terminal supervisor report plan")?;
+        release_after_terminal_record()
+            .context("failed to release scheduler resources after the durable terminal record")?;
     }
     artifact_writer
         .write_bytes(
@@ -1496,16 +1574,18 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         });
     }
 
+    let mut scheduler_resources = CollectedSchedulerResources::take_from(&mut collected);
+    let planned_scheduler_resources = planned_collected_scheduler_resources(
+        sync_store_slot.as_ref(),
+        semantic_store_slot.as_ref(),
+        &scheduler_resources,
+    )?;
     let ReleasedSchedulerResources {
         released_claims,
         release_errors,
         released_semantic_intents,
         semantic_release_errors,
-    } = release_collected_scheduler_resources(
-        sync_store_slot.as_ref(),
-        semantic_store_slot.as_ref(),
-        &mut collected,
-    );
+    } = planned_scheduler_resources.clone();
     let final_primary_integrity_failed = match primary_run_baseline.as_ref() {
         Some(baseline) => match primary_worktree_snapshot(&repo, execution_runtime) {
             Ok(final_snapshot) => {
@@ -1678,7 +1758,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     coverage_gaps.extend(runtime_coverage_gaps);
     let sandbox_denials = aggregate_sandbox_denials(&collected.command_records);
     let external_containment_failed = collected.external_containment_failed;
-    let final_report = build_supervisor_final_report(SupervisorFinalReportConstruction {
+    let mut final_report = build_supervisor_final_report(SupervisorFinalReportConstruction {
         plan: &plan,
         runtime_model_catalog: &runtime_model_catalog,
         run_id: options.run_id,
@@ -1726,6 +1806,21 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 .to_string()
                 .contains("not at a resumable manifest boundary") =>
         {
+            let already_released = scheduler_resources.already_released();
+            final_report.claim_tokens = already_released
+                .released_claims
+                .iter()
+                .map(|claim| claim.token.get())
+                .collect();
+            final_report.semantic_intent_tokens = already_released
+                .released_semantic_intents
+                .iter()
+                .map(|intent| intent.token.get())
+                .collect();
+            final_report.released_claims = already_released.released_claims;
+            final_report.release_errors = already_released.release_errors;
+            final_report.released_semantic_intents = already_released.released_semantic_intents;
+            final_report.semantic_release_errors = already_released.semantic_release_errors;
             false
         }
         Err(error) => {
@@ -1737,6 +1832,19 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         &mut orchestration_journal,
         artifact_writer,
         checkpoint_finalization.then_some(&mut checkpoint_writer),
+        || {
+            let released = release_collected_scheduler_resources(
+                sync_store_slot.as_ref(),
+                semantic_store_slot.as_ref(),
+                &mut scheduler_resources,
+            );
+            if released != planned_scheduler_resources {
+                bail!(
+                    "terminal scheduler cleanup differed from its durable final-report plan: planned={planned_scheduler_resources:?}, observed={released:?}"
+                );
+            }
+            Ok(())
+        },
     )
 }
 
@@ -2234,11 +2342,11 @@ mod decomposition_tests {
             agent_id: "child-a".to_string(),
             paths: vec![PathBuf::from("README.md")],
         };
-        let mut collected = CollectedAssignmentOutcomes {
+        let mut collected = CollectedSchedulerResources {
             concurrently_released_claims: vec![released_claim.clone()],
             concurrent_release_errors: vec!["claim release failed".to_string()],
             concurrent_semantic_release_errors: vec!["semantic release failed".to_string()],
-            ..CollectedAssignmentOutcomes::default()
+            ..CollectedSchedulerResources::default()
         };
 
         let released = release_collected_scheduler_resources(None, None, &mut collected);
@@ -2475,9 +2583,14 @@ mod decomposition_tests {
             )
             .expect("close checkpoint scheduler");
 
-        let persisted =
-            persist_supervisor_final_report(report, &mut journal, writer, Some(&mut checkpoint))
-                .expect("persist scheduler final report directly");
+        let persisted = persist_supervisor_final_report(
+            report,
+            &mut journal,
+            writer,
+            Some(&mut checkpoint),
+            || Ok(()),
+        )
+        .expect("persist scheduler final report directly");
 
         assert_eq!(persisted.run_id, run_id);
         let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)

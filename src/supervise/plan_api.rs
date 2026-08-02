@@ -1175,7 +1175,20 @@ pub fn resume_supervisor_run(
         );
     }
     let sync_store = SyncStore::open(&repo)?;
-    if let Err(error) = snapshot.verify_claim_disposition(&sync_store, &plan.report) {
+    let claim_disposition = (|| -> Result<()> {
+        snapshot.verify_claim_disposition(&sync_store, &plan.report, !plan.artifact_committed)?;
+        if !plan.artifact_committed {
+            let semantic_store = SemanticIntentStore::open(&repo)?;
+            complete_planned_scheduler_resource_release(
+                &sync_store,
+                &semantic_store,
+                &plan.report,
+            )?;
+            snapshot.verify_claim_disposition(&sync_store, &plan.report, false)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = claim_disposition {
         return resume_refusal(
             &run_id,
             SupervisorRunLifecycle::Interrupted,

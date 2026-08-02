@@ -2003,6 +2003,7 @@ struct AssignmentExecutionOutcome {
     candidate_inspection: Option<SupervisorCandidateInspection>,
     findings: Vec<Finding>,
     claim_tokens: Vec<ClaimToken>,
+    claimed_paths: Vec<PathBuf>,
     semantic_tokens: Vec<crate::semantic_coord::SemanticIntentToken>,
     released_claims: Vec<PathClaim>,
     release_errors: Vec<String>,

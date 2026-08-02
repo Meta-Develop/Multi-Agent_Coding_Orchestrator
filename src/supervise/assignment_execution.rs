@@ -120,7 +120,8 @@ fn prepare_assignment_execution<'a>(
     };
     let mut effective_assignment = (*assignment).clone();
     let claim = loop {
-        match sync_store.claim_paths(
+        match sync_store.claim_paths_for_run(
+            &options.run_id,
             &effective_assignment.id,
             effective_assignment.assigned_paths.iter(),
         ) {
@@ -221,6 +222,7 @@ fn prepare_assignment_execution<'a>(
         }
     };
     outcome.claim_tokens.push(claim.token);
+    outcome.claimed_paths = claim.paths.clone();
     let current_primary_head = current_head_oid(repo)?;
     if !reused {
         if evidence_only_reaudit.is_some() {

@@ -7,7 +7,12 @@ use crate::{
         state_auth::{AuthenticationDomain, RepositoryAuthBinding},
     },
     authenticated_snapshot::{AuthenticatedSnapshotStore, SnapshotSpec},
+    live_claim::{
+        claim_process_liveness, current_claim_process_identity, ClaimProcessIdentity,
+        ClaimProcessLiveness,
+    },
     megafile::{MegafileAssessment, MegafileStore, MegafileThresholds},
+    orchestrator::RunId,
     safe_state::{stable_checksum, FileIdentity, KernelStateLock, SafeRoot},
     state_journal::JournalSpec,
     state_migration::{
@@ -19,6 +24,7 @@ use anyhow::{bail, Context, Result};
 use git2::Repository;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -37,6 +43,8 @@ const MAX_SYNC_STATE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SYNC_CLAIMS: usize = 4_096;
 const MAX_SYNC_PATHS: usize = 16_384;
 const MAX_AGENT_ID_BYTES: usize = 128;
+const MAX_RUN_ID_BYTES: usize = 128;
+const MAX_PROCESS_START_TIME_BYTES: usize = 512;
 const MAX_STATE_PATH_BYTES: usize = 4_096;
 const MAX_STATE_PATH_COMPONENTS: usize = 256;
 
@@ -121,6 +129,52 @@ struct AuthenticatedClaimsState {
     repository: RepositoryAuthBinding,
     next_token: u64,
     claims: Vec<PathClaim>,
+    #[serde(default)]
+    run_owners: Vec<AuthenticatedClaimRunOwner>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatedClaimRunOwner {
+    token: ClaimToken,
+    run_id: String,
+    process: ClaimProcessIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimOwnerRunState {
+    Active,
+    Interrupted,
+    Unknown,
+    Unattributed,
+}
+
+impl ClaimOwnerRunState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Interrupted => "interrupted",
+            Self::Unknown => "unknown",
+            Self::Unattributed => "unattributed",
+        }
+    }
+
+    fn is_unattributed(&self) -> bool {
+        *self == Self::Unattributed
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClaimStatusReport {
+    #[serde(flatten)]
+    pub claim: PathClaim,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_process_id: Option<u32>,
+    #[serde(skip_serializing_if = "ClaimOwnerRunState::is_unattributed")]
+    pub owner_run_state: ClaimOwnerRunState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -362,6 +416,33 @@ impl SyncStore {
         Ok(self.claim_paths_with_telemetry(agent_id, paths)?.claim)
     }
 
+    /// Acquires a path claim attributed to one supervise run and its exact
+    /// boot-scoped holder process. Retained claims can therefore be reported as
+    /// live, interrupted, or unknown without treating process death as release
+    /// authority.
+    pub fn claim_paths_for_run<I, P>(
+        &self,
+        run_id: &RunId,
+        agent_id: impl AsRef<str>,
+        paths: I,
+    ) -> Result<PathClaim>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        Ok(self
+            .claim_paths_with_telemetry_thresholds_internal(
+                agent_id,
+                paths,
+                MegafileThresholds::provisional_bootstrap(),
+                Some((
+                    run_id.as_str().to_string(),
+                    current_claim_process_identity(),
+                )),
+            )?
+            .claim)
+    }
+
     /// Persists the authenticated claim first, then records authoritative
     /// megafile telemetry. A telemetry failure is returned to the caller so
     /// work cannot proceed silently without its required history.
@@ -395,14 +476,40 @@ impl SyncStore {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
+        self.claim_paths_with_telemetry_thresholds_internal(agent_id, paths, thresholds, None)
+    }
+
+    fn claim_paths_with_telemetry_thresholds_internal<I, P>(
+        &self,
+        agent_id: impl AsRef<str>,
+        paths: I,
+        thresholds: MegafileThresholds,
+        run_owner: Option<(String, ClaimProcessIdentity)>,
+    ) -> Result<ClaimTelemetryOutcome>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
         thresholds
             .validate()
             .context("configured megafile claim thresholds are invalid")?;
-        let claim = self.with_locked_update(|coordinator| {
-            coordinator
-                .claim_paths(agent_id.as_ref(), paths)
-                .map_err(Into::into)
-        })?;
+        let claim = self.with_locked_update_and_run_owners(
+            |coordinator| {
+                coordinator
+                    .claim_paths(agent_id.as_ref(), paths)
+                    .map_err(Into::into)
+            },
+            |claim, run_owners| {
+                if let Some((run_id, process)) = run_owner {
+                    run_owners.push(AuthenticatedClaimRunOwner {
+                        token: claim.token,
+                        run_id,
+                        process,
+                    });
+                }
+                Ok(())
+            },
+        )?;
         let assessments = (|| {
             MegafileStore::open_with_thresholds(&self.repo_path, thresholds)
                 .context("megafile telemetry could not be opened")?
@@ -455,6 +562,35 @@ impl SyncStore {
         self.with_locked_read(|coordinator| coordinator.snapshot().map_err(Into::into))
     }
 
+    pub fn status_snapshot(&self) -> Result<Vec<ClaimStatusReport>> {
+        let (claims, run_owners) = {
+            let lock = self.state.lock()?;
+            let store = self.open_authenticated_store(&lock)?;
+            let coordinator = SyncCoordinator::from_snapshot(SyncSnapshot {
+                next_token: store.current().value.next_token,
+                claims: store.current().value.claims.clone(),
+            })?;
+            let claims = coordinator.snapshot()?;
+            let run_owners = store
+                .current()
+                .value
+                .run_owners
+                .iter()
+                .cloned()
+                .map(|owner| (owner.token, owner))
+                .collect::<BTreeMap<_, _>>();
+            self.state.verify(&lock)?;
+            (claims, run_owners)
+        };
+        Ok(claims
+            .into_iter()
+            .map(|claim| {
+                let token = claim.token;
+                claim_status_report(claim, run_owners.get(&token))
+            })
+            .collect())
+    }
+
     /// Opens and authenticates the canonical claims schema, then retains its
     /// durable writer lock for a caller that must make a claim-sensitive
     /// decision and complete another operation at the same linearization
@@ -483,15 +619,33 @@ impl SyncStore {
         &self,
         operation: impl FnOnce(&SyncCoordinator) -> Result<T>,
     ) -> Result<T> {
+        self.with_locked_update_and_run_owners(operation, |_, _| Ok(()))
+    }
+
+    fn with_locked_update_and_run_owners<T>(
+        &self,
+        operation: impl FnOnce(&SyncCoordinator) -> Result<T>,
+        update_run_owners: impl FnOnce(&T, &mut Vec<AuthenticatedClaimRunOwner>) -> Result<()>,
+    ) -> Result<T> {
         let lock = self.state.lock()?;
         let mut store = self.open_authenticated_store(&lock)?;
         let coordinator = SyncCoordinator::from_snapshot(SyncSnapshot {
             next_token: store.current().value.next_token,
             claims: store.current().value.claims.clone(),
         })?;
+        let mut run_owners = store.current().value.run_owners.clone();
         let output = operation(&coordinator)?;
         let snapshot = coordinator.to_snapshot()?;
         validate_sync_snapshot(&snapshot)?;
+        let active_tokens = snapshot
+            .claims
+            .iter()
+            .map(|claim| claim.token)
+            .collect::<BTreeSet<_>>();
+        run_owners.retain(|owner| active_tokens.contains(&owner.token));
+        update_run_owners(&output, &mut run_owners)?;
+        run_owners.sort_by_key(|owner| owner.token);
+        validate_claim_run_owners(&snapshot.claims, &run_owners)?;
         let revision = store
             .current()
             .value
@@ -504,6 +658,7 @@ impl SyncStore {
             repository: store.current().value.repository.clone(),
             next_token: snapshot.next_token,
             claims: snapshot.claims,
+            run_owners,
         };
         if revision % 4_096 == 0 {
             let authenticator = repository_authenticator_key_only(&self.repo_path)?;
@@ -568,6 +723,7 @@ impl SyncStore {
                 repository: binding,
                 next_token: 1,
                 claims: Vec::new(),
+                run_owners: Vec::new(),
             },
             LegacyAdoption::Present(bytes) => {
                 let snapshot = match serde_json::from_slice::<PersistedSyncState>(&bytes) {
@@ -601,6 +757,7 @@ impl SyncStore {
                     repository: binding,
                     next_token: snapshot.next_token,
                     claims: snapshot.claims,
+                    run_owners: Vec::new(),
                 }
             }
         };
@@ -644,7 +801,8 @@ impl SyncStore {
         validate_sync_snapshot(&SyncSnapshot {
             next_token: snapshot.value.next_token,
             claims: snapshot.value.claims.clone(),
-        })
+        })?;
+        validate_claim_run_owners(&snapshot.value.claims, &snapshot.value.run_owners)
     }
 
     fn ensure_legacy_retirement(
@@ -689,6 +847,7 @@ impl SyncStore {
             repository: store.current().value.repository.clone(),
             next_token: snapshot.next_token,
             claims: snapshot.claims,
+            run_owners: Vec::new(),
         };
         store.commit(revision, value)?;
         self.state.verify_lock(lock)
@@ -704,6 +863,72 @@ fn sync_state_checksum(state: &PersistedSyncState) -> Result<String> {
     ))
     .context("failed to encode sync state checksum payload")?;
     Ok(stable_checksum(&payload))
+}
+
+fn claim_status_report(
+    claim: PathClaim,
+    run_owner: Option<&AuthenticatedClaimRunOwner>,
+) -> ClaimStatusReport {
+    let owner_run_state = match run_owner.map(|owner| claim_process_liveness(&owner.process)) {
+        Some(ClaimProcessLiveness::Live) => ClaimOwnerRunState::Active,
+        Some(ClaimProcessLiveness::Interrupted) => ClaimOwnerRunState::Interrupted,
+        Some(ClaimProcessLiveness::Unknown) => ClaimOwnerRunState::Unknown,
+        None => ClaimOwnerRunState::Unattributed,
+    };
+    ClaimStatusReport {
+        claim,
+        owner_run_id: run_owner.map(|owner| owner.run_id.clone()),
+        owner_process_id: run_owner.map(|owner| owner.process.pid),
+        owner_run_state,
+    }
+}
+
+fn validate_claim_run_owners(
+    claims: &[PathClaim],
+    run_owners: &[AuthenticatedClaimRunOwner],
+) -> Result<()> {
+    if run_owners.len() > claims.len() {
+        bail!("authenticated claim run-owner count exceeds active claim count");
+    }
+    let active_tokens = claims
+        .iter()
+        .map(|claim| claim.token)
+        .collect::<BTreeSet<_>>();
+    let mut seen_tokens = BTreeSet::new();
+    for owner in run_owners {
+        if !active_tokens.contains(&owner.token) {
+            bail!(
+                "authenticated run owner references inactive claim token {}",
+                owner.token.get()
+            );
+        }
+        if !seen_tokens.insert(owner.token) {
+            bail!(
+                "authenticated claim token {} has duplicate run owners",
+                owner.token.get()
+            );
+        }
+        if owner.run_id.len() > MAX_RUN_ID_BYTES {
+            bail!("authenticated claim run id exceeds {MAX_RUN_ID_BYTES} bytes");
+        }
+        RunId::new(&owner.run_id).context("authenticated claim run id is invalid")?;
+        if owner.process.pid == 0 {
+            bail!("authenticated claim run owner contains PID 0");
+        }
+        if owner
+            .process
+            .process_start_time
+            .as_ref()
+            .is_some_and(|value| {
+                value.is_empty()
+                    || value.len() > MAX_PROCESS_START_TIME_BYTES
+                    || value.chars().any(char::is_control)
+            })
+        {
+            bail!("authenticated claim process start-time identity is invalid");
+        }
+    }
+    Ok(())
 }
 
 fn validate_sync_snapshot(snapshot: &SyncSnapshot) -> Result<()> {
@@ -840,12 +1065,94 @@ mod tests {
         worktree::WorktreeManager,
     };
     use git2::{Oid, Repository, Signature};
+    #[cfg(target_os = "linux")]
+    use std::process::{Child, Command};
     use tempfile::TempDir;
 
     const ISSUE33_CLAIMS_V1: &[u8] =
         include_bytes!("../tests/fixtures/issue33/agent-files-claims-v1.json");
     const ISSUE33_CLAIMS_V1_SHA256: &str =
         "85ca48c7b658a3f28b4d3758268a41319b86f9b9bef78637bda7069cc2b83111";
+
+    #[cfg(target_os = "linux")]
+    struct SleepChild(Child);
+
+    #[cfg(target_os = "linux")]
+    impl SleepChild {
+        fn spawn() -> Self {
+            Self(
+                Command::new("sleep")
+                    .arg("60")
+                    .spawn()
+                    .expect("spawn claim holder process"),
+            )
+        }
+
+        fn identity(&self) -> ClaimProcessIdentity {
+            ClaimProcessIdentity {
+                pid: self.0.id(),
+                process_start_time: Some(
+                    crate::agent_lifecycle::process_start_time(self.0.id())
+                        .expect("read claim holder process identity"),
+                ),
+            }
+        }
+
+        fn terminate(&mut self) {
+            self.0.kill().expect("terminate claim holder process");
+            self.0.wait().expect("reap claim holder process");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for SleepChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_owned_status_distinguishes_live_holder_from_leftover_after_process_exit() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        let mut holder = SleepChild::spawn();
+        let process = holder.identity();
+        let claim = store
+            .claim_paths_with_telemetry_thresholds_internal(
+                "interrupted-assignment",
+                ["README.md"],
+                MegafileThresholds::provisional_bootstrap(),
+                Some(("interrupted-run".to_string(), process)),
+            )
+            .expect("record run-owned claim")
+            .claim;
+
+        let live = store.status_snapshot().expect("status while holder lives");
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].claim, claim);
+        assert_eq!(live[0].owner_run_id.as_deref(), Some("interrupted-run"));
+        assert_eq!(live[0].owner_run_state, ClaimOwnerRunState::Active);
+
+        holder.terminate();
+
+        let leftover = store.status_snapshot().expect("status after holder exit");
+        assert_eq!(leftover.len(), 1);
+        assert_eq!(leftover[0].claim, claim);
+        assert_eq!(leftover[0].owner_run_state, ClaimOwnerRunState::Interrupted);
+        assert_eq!(
+            serde_json::to_value(&leftover[0]).expect("serialize leftover claim status")
+                ["owner_run_state"],
+            "interrupted"
+        );
+        assert_eq!(
+            store.snapshot().expect("retained claim remains active"),
+            vec![claim]
+        );
+    }
 
     #[cfg(unix)]
     #[test]

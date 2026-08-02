@@ -1,4 +1,5 @@
 use crate::{
+    agent_lifecycle::process_start_time,
     artifacts::state_auth::sha256_hex,
     safe_state::{
         stable_checksum, AtomicStateWriter, BoundedRegularReader, FileIdentity, KernelStateLock,
@@ -6,7 +7,7 @@ use crate::{
     },
 };
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
@@ -57,6 +58,55 @@ const CLAIM_FALLBACK_RESIDUE_PREFIX: &str = ".maco-live-old-v1.";
 const CLAIM_FALLBACK_RESIDUE_SUFFIX: &str = ".txn";
 
 static CLAIM_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Boot-scoped identity for the MACO process that acquired a durable path claim.
+///
+/// A PID alone is not enough to decide whether a retained claim still belongs to
+/// a live process because the operating system may reuse it.  The start-time
+/// token comes from the existing agent-lifecycle identity implementation and is
+/// boot-scoped on Linux.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClaimProcessIdentity {
+    pub(crate) pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) process_start_time: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimProcessLiveness {
+    Live,
+    Interrupted,
+    Unknown,
+}
+
+pub(crate) fn current_claim_process_identity() -> ClaimProcessIdentity {
+    let pid = std::process::id();
+    ClaimProcessIdentity {
+        pid,
+        process_start_time: process_start_time(pid).ok(),
+    }
+}
+
+pub(crate) fn claim_process_liveness(identity: &ClaimProcessIdentity) -> ClaimProcessLiveness {
+    let Some(expected_start_time) = identity.process_start_time.as_deref() else {
+        return ClaimProcessLiveness::Unknown;
+    };
+    match process_start_time(identity.pid) {
+        Ok(observed_start_time) if observed_start_time == expected_start_time => {
+            ClaimProcessLiveness::Live
+        }
+        Ok(_) => ClaimProcessLiveness::Interrupted,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            ClaimProcessLiveness::Interrupted
+        }
+        Err(_) => ClaimProcessLiveness::Unknown,
+    }
+}
 
 #[cfg(all(test, target_os = "linux"))]
 std::thread_local! {
