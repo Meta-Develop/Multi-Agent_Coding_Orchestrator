@@ -3417,7 +3417,7 @@ mod tests {
     const ISSUE33_CLAIMS_V1: &[u8] =
         include_bytes!("../tests/fixtures/issue33/agent-files-claims-v1.json");
     const ISSUE33_CLAIMS_V1_SHA256: &str =
-        "85ca48c7b658a3f28b4d3758268a41319b86f9b9bef78637bda7069cc2b83111";
+        "58076fb067d6bbc560926628b8930075d0674eae025b945619f0890000995291";
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
