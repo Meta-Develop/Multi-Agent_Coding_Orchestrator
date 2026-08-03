@@ -32,22 +32,29 @@ material only and is not an execution-budget concept.
 The durable lifecycle distinguishes a fully staged batch, a claimed item that
 has not started, a dispatch-start checkpoint, and a finalized subordinate run.
 A staged batch is completed idempotently. A pre-dispatch profile, primary, or
-retention refusal records its typed denial and releases the claimed item to
-`Enqueued`; an explicit invocation of the same run ID can retry it after the
-operator corrects the refused condition. After dispatch starts, an
-authenticated finalized subordinate outcome, including a subordinate gate
-refusal, is observed and terminal-acknowledged without re-execution. A newly
-observed failure stops sibling admission for that invocation; a later explicit
-invocation of the same run ID may continue remaining pending items but never
-reruns the acknowledged item. A status-classified `Active` subordinate with
-its live bound run lock remains `DispatchStarted`. Only an authenticated
-`Interrupted` or `Uncertain` subordinate becomes `HeldAmbiguous` and requires
-reconciliation rather than silently returning to pending. Once that exact
-subordinate later has an authenticated finalized report, a subsequent
-invocation first compares the subordinate artifact's complete authenticated
-`LoadedSupervisorPlan` with the immutable queued generated plan, then observes
-and acknowledges it without dispatching it again. A same-ID subordinate with a
-different plan stays held and takes a typed permission-expansion refusal.
+retention-identity refusal records its typed denial and releases the claimed
+item to `Enqueued`; an unreadable retention configuration instead uses the
+established typed `EnvironmentFailure` category `probe_failed`, journals that
+failure on the same release, and is equally retryable. An explicit invocation
+of the same run ID can retry after the operator corrects the refused condition.
+After dispatch starts, an authenticated finalized subordinate outcome,
+including a subordinate gate refusal, is observed and terminal-acknowledged
+without re-execution. A newly observed failure stops sibling admission for that
+invocation; a later explicit invocation of the same run ID may continue
+remaining pending items but never reruns the acknowledged item. A
+status-classified `Active` subordinate with its live bound run lock remains
+`DispatchStarted`. Only an authenticated `Interrupted` or `Uncertain`
+subordinate becomes `HeldAmbiguous` and requires reconciliation rather than
+silently returning to pending. Once that exact subordinate later has an
+authenticated finalized report, a subsequent invocation first compares the
+subordinate artifact's complete authenticated `LoadedSupervisorPlan` with the
+immutable queued generated plan, then observes and acknowledges it without
+dispatching it again. A same-ID subordinate with a different plan stays held
+and takes a typed permission-expansion refusal. If the outer Autopilot call
+fails after a durable start marker, it reports `true` only when the subordinate
+child-start checkpoint authenticates. Marker-only or unreadable evidence is
+`not_process_observable`, so Autopilot withholds a final report rather than
+finalizing a false execution claim.
 Direct `supervise run` can resume the same command and run ID from its
 authenticated finalized source artifacts, so it does not rerun the source
 round. It can also recover an Autopilot-origin queue by presenting that exact
