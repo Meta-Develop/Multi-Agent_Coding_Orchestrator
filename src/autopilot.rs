@@ -897,11 +897,62 @@ enum AutopilotRunSource<'a> {
     GoalSpec { goal: &'a str, spec: &'a str },
 }
 
+enum AutopilotCascadeDispatch<'a> {
+    Production(std::marker::PhantomData<&'a ()>),
+    #[cfg(test)]
+    Injected {
+        supervisor_plan: Value,
+        external_runner: &'a mut (dyn FnMut(
+            &crate::external_agent::ExternalAgentCommand,
+        ) -> crate::external_agent::ExternalAgentRun
+                     + Send),
+    },
+}
+
 fn run_autopilot_with_profile_and_retention(
     options: AutopilotRunOptions,
     profile: Option<AutopilotProfile>,
     machine_global_retention: Option<MachineGlobalRetentionBinding>,
     source: AutopilotRunSource<'_>,
+) -> Result<AutopilotFinalReport> {
+    run_autopilot_with_profile_retention_and_dispatch(
+        options,
+        profile,
+        machine_global_retention,
+        source,
+        AutopilotCascadeDispatch::Production(std::marker::PhantomData),
+    )
+}
+
+#[cfg(test)]
+fn run_autopilot_plan_file_with_injected_supervisor_and_runner(
+    options: AutopilotRunOptions,
+    profile: Option<AutopilotProfile>,
+    machine_global_retention: MachineGlobalRetentionBinding,
+    supervisor_plan: Value,
+    external_runner: &mut (dyn FnMut(
+        &crate::external_agent::ExternalAgentCommand,
+    ) -> crate::external_agent::ExternalAgentRun
+              + Send),
+) -> Result<AutopilotFinalReport> {
+    run_autopilot_with_profile_retention_and_dispatch(
+        options,
+        profile,
+        Some(machine_global_retention),
+        AutopilotRunSource::PlanFile,
+        AutopilotCascadeDispatch::Injected {
+            supervisor_plan,
+            external_runner,
+        },
+    )
+}
+
+fn run_autopilot_with_profile_retention_and_dispatch(
+    options: AutopilotRunOptions,
+    profile: Option<AutopilotProfile>,
+    machine_global_retention: Option<MachineGlobalRetentionBinding>,
+    source: AutopilotRunSource<'_>,
+    mut cascade_dispatch: AutopilotCascadeDispatch<'_>,
 ) -> Result<AutopilotFinalReport> {
     let machine_global_retention = machine_global_retention.context(
         "autopilot run requires --machine-global-config and \
@@ -916,11 +967,11 @@ fn run_autopilot_with_profile_and_retention(
     validate_autopilot_profile(&requested_profile)?;
 
     let repo = discover_repo_root(&options.repo)?;
-    let goal_derived_supervisor_plan = matches!(&source, AutopilotRunSource::GoalSpec { .. });
+    let source_is_goal_derived = matches!(&source, AutopilotRunSource::GoalSpec { .. });
     let LoadedAutopilotPlan {
         plan,
         input_shape,
-        derived_supervisor_plan,
+        mut derived_supervisor_plan,
     } = match source {
         AutopilotRunSource::PlanFile => {
             load_autopilot_plan_from_task_file(&repo, &options.plan_file)?
@@ -929,6 +980,17 @@ fn run_autopilot_with_profile_and_retention(
             load_autopilot_plan_from_goal_spec(&repo, goal, spec)?
         }
     };
+    let (injected_supervisor_plan, injected_dispatch) = match &cascade_dispatch {
+        AutopilotCascadeDispatch::Production(_) => (None, false),
+        #[cfg(test)]
+        AutopilotCascadeDispatch::Injected {
+            supervisor_plan, ..
+        } => (Some(supervisor_plan.clone()), true),
+    };
+    if let Some(injected_supervisor_plan) = injected_supervisor_plan {
+        derived_supervisor_plan = Some(injected_supervisor_plan);
+    }
+    let goal_derived_supervisor_plan = source_is_goal_derived || injected_dispatch;
     if let Some(source) = &plan.external_source {
         publication::revalidate_external_source(&repo, source)
             .context("autopilot source changed immediately before supervised work")?;
@@ -1165,12 +1227,25 @@ fn run_autopilot_with_profile_and_retention(
     #[cfg(test)]
     run_before_supervisor_cascade_load_hook(&supervisor_options.plan_file);
     let command_primary_baseline = supervise::verified_whole_primary_snapshot_sha256(&repo)?;
-    let supervisor_result = supervise::run_supervisor_plan_file_cascade_for_autopilot(
-        supervisor_options,
-        cascade_concurrency_policy,
-        &options.run_id,
-        &mut follow_up_profile_gate,
-    );
+    let supervisor_result = match &mut cascade_dispatch {
+        AutopilotCascadeDispatch::Production(_) => {
+            supervise::run_supervisor_plan_file_cascade_for_autopilot(
+                supervisor_options,
+                cascade_concurrency_policy,
+                &options.run_id,
+                &mut follow_up_profile_gate,
+            )
+        }
+        #[cfg(test)]
+        AutopilotCascadeDispatch::Injected {
+            external_runner, ..
+        } => supervise::run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilot(
+            supervisor_options,
+            &options.run_id,
+            &mut follow_up_profile_gate,
+            *external_runner,
+        ),
+    };
     let command_primary_final = supervise::verified_whole_primary_snapshot_sha256(&repo)?;
     let command_primary_worktree_untouched = command_primary_final == command_primary_baseline;
     drop(follow_up_profile_gate);
@@ -4205,7 +4280,15 @@ fn finding_severity_label(severity: FindingSeverity) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worktree::WorktreeCreateOptions;
+    use crate::{
+        external_agent::ExternalAgentCommand,
+        gate_denial::GateDenialReason,
+        supervise::{
+            AuditorReport, Finding, LicensedBreakageDeclaration, LicensedBreakageDependentScope,
+            OrchestratorReviewReport,
+        },
+        worktree::WorktreeCreateOptions,
+    };
     use serde_json::json;
     use std::{
         cell::{Cell, RefCell},
@@ -4864,6 +4947,418 @@ mod tests {
         drop(tree);
         drop(repository);
         repo_path
+    }
+
+    #[cfg(target_os = "linux")]
+    fn secure_autopilot_machine_global_retention(
+        root: &Path,
+        correlation_id: &str,
+    ) -> MachineGlobalRetentionBinding {
+        use std::os::unix::fs::PermissionsExt;
+
+        let runtime_root = crate::process_runner::trusted_linux_runtime_root()
+            .expect("resolve trusted runtime root for injected Autopilot cascade");
+        let state_root = root.join(format!("{correlation_id}-machine-global-state"));
+        fs::create_dir(&state_root).expect("create injected Autopilot machine-global state");
+        fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
+            .expect("secure injected Autopilot machine-global state");
+        let config = root.join(format!("{correlation_id}-machine-global.json"));
+        fs::write(
+            &config,
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "state_root": state_root,
+                "roots": [{
+                    "id": "runtime",
+                    "path": runtime_root,
+                    "protected_paths": [],
+                    "quarantine_grace_seconds": 60
+                }]
+            }))
+            .expect("serialize injected Autopilot machine-global config"),
+        )
+        .expect("write injected Autopilot machine-global config");
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600))
+            .expect("secure injected Autopilot machine-global config");
+        MachineGlobalRetentionBinding {
+            config,
+            root_id: "runtime".to_string(),
+            owner: "maco-autopilot-test".to_string(),
+            correction_correlation_id: correlation_id.to_string(),
+        }
+    }
+
+    fn licensed_autopilot_supervisor_plan() -> (Value, LicensedBreakageDeclaration, String) {
+        let declaration = LicensedBreakageDeclaration {
+            migration_rationale: "Rename callers to crate::api::new_name before dependent dispatch"
+                .to_string(),
+            dependents: vec![LicensedBreakageDependentScope {
+                dependent_id: "client-a".to_string(),
+                paths: vec![PathBuf::from("src/client.rs")],
+                interfaces: vec!["crate::api::new_name".to_string()],
+            }],
+        };
+        let declaration_sha256 = crate::artifacts::state_auth::sha256_hex(
+            &serde_json::to_vec(&declaration).expect("serialize Autopilot license declaration"),
+        );
+        let plan = SupervisorPlan {
+            version: 1,
+            task: "perform licensed source change and bounded dependent update".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 10,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: crate::supervise::default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![OrchestratorAssignment {
+                id: "child-a".to_string(),
+                role: AgentRole::ChildOrchestrator,
+                assigned_paths: vec![PathBuf::from("README.md")],
+                semantic_symbols: Vec::new(),
+                semantic_modules: Vec::new(),
+                task: Some("apply licensed breaking source change".to_string()),
+                worker_assignments: Vec::new(),
+                environment_requirements: Vec::new(),
+                licensed_breakage: Some(declaration.clone()),
+                notes: None,
+            }],
+        };
+        (
+            serde_json::to_value(plan).expect("serialize licensed Autopilot supervisor plan"),
+            declaration,
+            declaration_sha256,
+        )
+    }
+
+    fn injected_autopilot_child_report(
+        id: &str,
+        assigned_paths: Vec<PathBuf>,
+        semantic_symbols: Vec<String>,
+        files_changed: Vec<PathBuf>,
+        licensed_failure: bool,
+    ) -> OrchestratorReviewReport {
+        let (validation_results, findings, accepted, rejected, status) = if licensed_failure {
+            let signature =
+                "error[E0425]: cannot find function crate::api::new_name in dependent client";
+            (
+                vec![ValidationResult {
+                    name: "client-a".to_string(),
+                    status: ReviewStatus::Failed,
+                    command: vec!["cargo".to_string(), "check".to_string()],
+                    message: Some(signature.to_string()),
+                }],
+                vec![Finding {
+                    severity: FindingSeverity::Error,
+                    message: signature.to_string(),
+                    paths: vec![PathBuf::from("src/client.rs")],
+                }],
+                false,
+                true,
+                ReviewStatus::Failed,
+            )
+        } else {
+            (
+                vec![ValidationResult {
+                    name: "injected generated validation".to_string(),
+                    status: ReviewStatus::Succeeded,
+                    command: Vec::new(),
+                    message: None,
+                }],
+                Vec::new(),
+                true,
+                false,
+                ReviewStatus::Succeeded,
+            )
+        };
+        OrchestratorReviewReport {
+            id: id.to_string(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths,
+            semantic_symbols,
+            semantic_modules: Vec::new(),
+            claim_token: None,
+            semantic_intent_token: None,
+            commands_run: Vec::new(),
+            environment_failures: Vec::new(),
+            files_changed,
+            validation_results,
+            findings,
+            field_guide_entries: Vec::new(),
+            worker_reports: Vec::new(),
+            audit_reports: Vec::new(),
+            review_lens_aggregate: None,
+            decomposition_completions: Vec::new(),
+            licensed_breakage_review: None,
+            generated_follow_up_tasks: Vec::new(),
+            gate_denials: Vec::new(),
+            gate_correction_outcomes: Vec::new(),
+            accepted,
+            rejected,
+            status,
+            remaining_risk: if licensed_failure {
+                "declared dependent update remains".to_string()
+            } else {
+                "none".to_string()
+            },
+            next_safe_action: "parent review".to_string(),
+        }
+    }
+
+    fn injected_autopilot_auditor_report(
+        assignment_id: &str,
+        reviewed_paths: Vec<PathBuf>,
+        declaration_sha256: Option<&str>,
+    ) -> AuditorReport {
+        let mut validation_results = vec![ValidationResult {
+            name: "injected auditor validation".to_string(),
+            status: ReviewStatus::Succeeded,
+            command: Vec::new(),
+            message: None,
+        }];
+        if let Some(declaration_sha256) = declaration_sha256 {
+            validation_results.push(ValidationResult {
+                name: "licensed_breakage_declaration".to_string(),
+                status: ReviewStatus::Succeeded,
+                command: Vec::new(),
+                message: Some(declaration_sha256.to_string()),
+            });
+        }
+        AuditorReport {
+            id: format!("{assignment_id}-review-auditor-lens-0"),
+            role: AgentRole::Auditor,
+            reviewed_worker_ids: vec![assignment_id.to_string()],
+            reviewed_paths,
+            commands_run: Vec::new(),
+            environment_failures: Vec::new(),
+            validation_results,
+            findings: Vec::new(),
+            rejection_kind: None,
+            no_further_delegation: Some(true),
+            read_only: true,
+            accepted: true,
+            rejected: false,
+            status: ReviewStatus::Succeeded,
+            remaining_risk: "none".to_string(),
+            next_safe_action: "parent acceptance".to_string(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_injected_licensed_autopilot_cascade(
+        temp_root: &Path,
+        repo: &Path,
+        run_name: &str,
+    ) -> (AutopilotFinalReport, usize) {
+        let outer_plan = temp_root.join(format!("{run_name}-autopilot.json"));
+        fs::write(
+            &outer_plan,
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "task": {
+                    "title": "Licensed cascade",
+                    "body": "Dispatch one bounded generated dependent update."
+                },
+                "assigned_paths": ["README.md"],
+                "auto_merge": false
+            }))
+            .expect("serialize injected Autopilot outer plan"),
+        )
+        .expect("write injected Autopilot outer plan");
+        let (supervisor_plan, _declaration, declaration_sha256) =
+            licensed_autopilot_supervisor_plan();
+        let mut source_child_dispatches = 0_usize;
+        let mut follow_up_child_dispatches = 0_usize;
+        let mut runner = |command: &ExternalAgentCommand| {
+            let output_path = command.output_last_message.to_string_lossy();
+            let is_follow_up = output_path.contains("child-a-licensed-update-01");
+            let is_auditor = output_path.contains("review-auditor");
+            if is_auditor && is_follow_up {
+                supervise::write_injected_json(
+                    &command.output_last_message,
+                    &injected_autopilot_auditor_report(
+                        "child-a-licensed-update-01",
+                        vec![PathBuf::from("src/client.rs")],
+                        None,
+                    ),
+                );
+            } else if is_auditor {
+                supervise::write_injected_json(
+                    &command.output_last_message,
+                    &injected_autopilot_auditor_report(
+                        "child-a",
+                        vec![PathBuf::from("README.md")],
+                        Some(&declaration_sha256),
+                    ),
+                );
+            } else if is_follow_up {
+                follow_up_child_dispatches += 1;
+                assert_eq!(follow_up_child_dispatches, 1, "generated child reran");
+                fs::create_dir_all(command.cwd.join("src"))
+                    .expect("create injected Autopilot dependent dir");
+                fs::write(
+                    command.cwd.join("src/client.rs"),
+                    "pub fn migrated_client() {}\n",
+                )
+                .expect("write injected Autopilot dependent update");
+                supervise::write_injected_json(
+                    &command.output_last_message,
+                    &injected_autopilot_child_report(
+                        "child-a-licensed-update-01",
+                        vec![PathBuf::from("src/client.rs")],
+                        vec!["crate::api::new_name".to_string()],
+                        vec![PathBuf::from("src/client.rs")],
+                        false,
+                    ),
+                );
+            } else {
+                source_child_dispatches += 1;
+                assert_eq!(source_child_dispatches, 1, "Autopilot source child reran");
+                fs::write(command.cwd.join("README.md"), "licensed source change\n")
+                    .expect("write injected Autopilot source candidate");
+                supervise::write_injected_json(
+                    &command.output_last_message,
+                    &injected_autopilot_child_report(
+                        "child-a",
+                        vec![PathBuf::from("README.md")],
+                        Vec::new(),
+                        vec![PathBuf::from("README.md")],
+                        true,
+                    ),
+                );
+            }
+            supervise::write_injected_usage(command, 0, 1);
+            supervise::injected_verified_run(command)
+        };
+        let report = run_autopilot_plan_file_with_injected_supervisor_and_runner(
+            AutopilotRunOptions {
+                repo: repo.to_path_buf(),
+                plan_file: outer_plan,
+                run_id: RunId::new(run_name).expect("injected Autopilot run id"),
+                codex_bin: Some(PathBuf::from("unused-injected-codex")),
+                reviewer_command: None,
+                allow_dirty_primary: false,
+            },
+            None,
+            secure_autopilot_machine_global_retention(temp_root, run_name),
+            supervisor_plan,
+            &mut runner,
+        )
+        .expect("run injected licensed Autopilot cascade");
+        assert_eq!(source_child_dispatches, 1);
+        (report, follow_up_child_dispatches)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn autopilot_authenticated_follow_up_dispatch_sets_boolean_after_real_gates() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = create_committed_autopilot_repo(temp.path());
+        let head_before = Repository::open(&repo)
+            .expect("open injected Autopilot repository")
+            .head()
+            .expect("read injected Autopilot HEAD")
+            .target()
+            .expect("injected Autopilot HEAD oid");
+        let (report, follow_up_child_dispatches) = run_injected_licensed_autopilot_cascade(
+            temp.path(),
+            &repo,
+            "autopilot-licensed-follow-up-allowed",
+        );
+
+        assert_eq!(follow_up_child_dispatches, 1);
+        assert_eq!(report.status, AutopilotRunStatus::Succeeded, "{report:#?}");
+        assert!(report.success, "{report:#?}");
+        assert!(report.generated_follow_up_dispatch_performed);
+        assert!(report.primary_worktree_untouched);
+        assert!(!report.auto_merge_requested);
+        assert!(!report.auto_merge_performed);
+        assert!(report.supervisor.as_ref().is_some_and(|source| {
+            source.success && source.publishable && source.generated_follow_up_tasks.len() == 1
+        }));
+        let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &report.run_id)
+            .expect("open injected Autopilot final artifacts");
+        let cascade = serde_json::from_slice::<supervise::SupervisorCascadeOutcome>(
+            &reader
+                .read(Path::new("follow-up-cascade-report.json"))
+                .expect("read injected Autopilot cascade report"),
+        )
+        .expect("decode injected Autopilot cascade report");
+        assert!(cascade.follow_up_cascade_success, "{cascade:#?}");
+        assert_eq!(
+            cascade
+                .follow_up_queue
+                .expect("injected Autopilot queue summary")
+                .authenticated_child_dispatch_started_count,
+            1
+        );
+        assert_eq!(
+            Repository::open(&repo)
+                .expect("reopen injected Autopilot repository")
+                .head()
+                .expect("reread injected Autopilot HEAD")
+                .target()
+                .expect("reread injected Autopilot HEAD oid"),
+            head_before
+        );
+        assert!(!repo.join("src/client.rs").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn autopilot_generated_plan_refusal_keeps_dispatch_boolean_false() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = create_committed_autopilot_repo(temp.path());
+        supervise::set_before_generated_follow_up_plan_load_hook(|path| {
+            let bytes = fs::read(path).expect("read persisted Autopilot generated plan");
+            let mut value: Value =
+                serde_json::from_slice(&bytes).expect("decode Autopilot generated plan");
+            value["assignments"][0]["assigned_paths"] = json!(["src/client.rs", "src/expanded.rs"]);
+            fs::write(
+                path,
+                serde_json::to_vec_pretty(&value).expect("encode drifted Autopilot generated plan"),
+            )
+            .expect("mutate persisted Autopilot generated plan");
+        });
+
+        let (report, follow_up_child_dispatches) = run_injected_licensed_autopilot_cascade(
+            temp.path(),
+            &repo,
+            "autopilot-licensed-follow-up-refused",
+        );
+
+        assert_eq!(follow_up_child_dispatches, 0);
+        assert_eq!(report.status, AutopilotRunStatus::Failed, "{report:#?}");
+        assert!(!report.success);
+        assert!(!report.generated_follow_up_dispatch_performed);
+        assert!(report.primary_worktree_untouched);
+        assert!(!report.auto_merge_performed);
+        assert!(report.gate_denials.iter().any(|denial| {
+            matches!(
+                denial.reason,
+                GateDenialReason::ApprovalReview {
+                    denial: ApprovalReviewDenial::PermissionExpansion
+                }
+            )
+        }));
+        let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &report.run_id)
+            .expect("open refused injected Autopilot artifacts");
+        let cascade = serde_json::from_slice::<supervise::SupervisorCascadeOutcome>(
+            &reader
+                .read(Path::new("follow-up-cascade-report.json"))
+                .expect("read refused Autopilot cascade report"),
+        )
+        .expect("decode refused Autopilot cascade report");
+        let queue = cascade.follow_up_queue.expect("refused Autopilot queue");
+        assert_eq!(queue.pending_count, 1);
+        assert_eq!(queue.dispatch_started_count, 0);
+        assert_eq!(queue.acknowledged_terminal_count, 0);
+        assert_eq!(queue.authenticated_child_dispatch_started_count, 0);
+        assert!(!repo.join("src/client.rs").exists());
     }
 
     #[test]

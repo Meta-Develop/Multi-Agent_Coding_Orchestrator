@@ -1670,6 +1670,41 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner(
     options: SupervisorRunOptions,
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
 ) -> Result<SupervisorCascadeOutcome> {
+    let mut permit = |_plan: &SupervisorPlan| Ok(true);
+    let outer_run_id = options.run_id.clone();
+    run_supervisor_plan_file_cascade_with_runner_and_gate(
+        options,
+        GeneratedFollowUpQueueEntrypoint::SuperviseRun,
+        &outer_run_id,
+        &mut permit,
+        external_runner,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilot(
+    options: SupervisorRunOptions,
+    outer_command_run_id: &RunId,
+    before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<bool>,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorCascadeOutcome> {
+    run_supervisor_plan_file_cascade_with_runner_and_gate(
+        options,
+        GeneratedFollowUpQueueEntrypoint::AutopilotRun,
+        outer_command_run_id,
+        before_dispatch,
+        external_runner,
+    )
+}
+
+#[cfg(test)]
+fn run_supervisor_plan_file_cascade_with_runner_and_gate(
+    options: SupervisorRunOptions,
+    outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
+    outer_command_run_id: &RunId,
+    before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<bool>,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorCascadeOutcome> {
     validate_max_concurrent_children(1)?;
     if options.runtime == SupervisorRuntime::Fake {
         bail!("publishable generated follow-up cascade tests require the verified runtime path");
@@ -1678,9 +1713,11 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner(
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    if !before_dispatch(&loaded.plan)? {
+        bail!("effective injected supervisor profile changed before exact loaded-plan dispatch");
+    }
     let source_loaded = loaded.clone();
     let template = options.clone();
-    let outer_run_id = options.run_id.clone();
     let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
     let serialized_runner = Mutex::new(external_runner);
     let source_report = run_supervisor_plan_with_runner_and_creation(
@@ -1696,19 +1733,18 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner(
         },
     )?;
     drop(cleanliness);
-    let mut permit = |_plan: &SupervisorPlan| Ok(true);
     run_generated_follow_up_cascade(
         &repo,
         &source_loaded,
         source_report,
         &template,
         FollowUpCascadeInvocation {
-            outer_entrypoint: GeneratedFollowUpQueueEntrypoint::SuperviseRun,
-            outer_command_run_id: &outer_run_id,
+            outer_entrypoint,
+            outer_command_run_id,
             concurrency_policy: SupervisorConcurrencyPolicy::Fixed(NonZeroUsize::MIN),
             runtime_catalog: FollowUpRuntimeCatalog::Injected,
         },
-        &mut permit,
+        before_dispatch,
         &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),
             Err(poisoned) => poisoned.into_inner()(command),
@@ -3390,3 +3426,5 @@ struct PathOwner {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::{injected_verified_run, write_injected_json, write_injected_usage};
