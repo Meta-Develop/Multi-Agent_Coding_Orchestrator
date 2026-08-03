@@ -38,6 +38,24 @@ fn evaluation_cli_runs_committed_fake_manifest_as_json_without_cwd_writes() -> R
     assert_eq!(results["experiment_id"], manifest["experiment_id"]);
     assert_eq!(results["fake_seed"], 26);
     assert_eq!(results["evidence"]["real_provider_executed"], false);
+    assert_eq!(results["dispatch_comparability_claim"]["scope"], "dispatch");
+    assert_eq!(
+        results["dispatch_comparability_claim"]["provider_execution_difference_established"],
+        false
+    );
+    assert_eq!(
+        results["pareto_conclusion"]["status"],
+        "refused_incomparable_dispatch_evidence"
+    );
+    assert!(results["dispatch_comparisons"]
+        .as_array()
+        .context("dispatch comparisons array")?
+        .iter()
+        .all(|comparison| comparison["comparability"] == "incomparable"));
+    assert!(results["pareto_frontier"]
+        .as_array()
+        .context("Pareto frontier array")?
+        .is_empty());
 
     let profiles = manifest["profiles"]
         .as_array()
