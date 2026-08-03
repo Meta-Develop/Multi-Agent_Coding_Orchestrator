@@ -24,6 +24,7 @@ use thiserror::Error;
 
 pub const EVALUATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const EVALUATION_RESULTS_SCHEMA_VERSION: u32 = 1;
+pub const MAX_EVALUATION_PROFILES: usize = 32;
 pub const MAX_EVALUATION_REPETITIONS: u32 = 100;
 pub const MAX_EXECUTION_ERROR_EVIDENCE_BYTES: usize = 256;
 pub const COMMITTED_FIXTURE_FAKE_SEED: u64 = 26;
@@ -138,6 +139,15 @@ impl EvaluationManifest {
                 format!(
                     "must be between 1 and {MAX_EVALUATION_REPETITIONS}, got {}",
                     self.repetitions
+                ),
+            ));
+        }
+        if self.profiles.len() > MAX_EVALUATION_PROFILES {
+            return Err(invalid_manifest(
+                "profiles",
+                format!(
+                    "must contain at most {MAX_EVALUATION_PROFILES} profiles, got {}",
+                    self.profiles.len()
                 ),
             ));
         }
@@ -1122,6 +1132,18 @@ pub fn validate_results_against_manifest(
     }
     results.evidence.validate()?;
     results.dispatch_comparability_claim.validate()?;
+    if results.evidence.kind == EvaluationEvidenceKind::ProvisionalDeterministicFakeOnly
+        && results
+            .runs
+            .iter()
+            .any(|run| run.observed_dispatch.is_some())
+    {
+        return Err(invalid_results(
+            "runs.observed_dispatch",
+            "provisional deterministic Fake evidence cannot retain an observed dispatch record; \
+             grounded dispatch comparisons require separately retained A4 runtime provenance",
+        ));
+    }
 
     let expected_binding = manifest.declared_inputs_binding();
     if results.declared_inputs != expected_binding {
@@ -2648,6 +2670,82 @@ mod tests {
             .expect("descriptive summaries without Pareto");
         assert!(frontier.is_empty());
         assert!(summaries.iter().all(|summary| !summary.pareto_optimal));
+    }
+
+    #[test]
+    fn provisional_fake_results_refuse_forged_observed_dispatch_records() {
+        let manifest = manifest();
+        let mut results = run_fake(&manifest, 73).expect("fake result shell");
+        for run in &mut results.runs {
+            let observed_model = if run.profile_id == manifest.profiles[0].id {
+                "observed-a"
+            } else {
+                "observed-b"
+            };
+            run.observed_dispatch = Some(
+                observed_dispatch_record_from_profile_binding(&complete_observed_binding(
+                    observed_model,
+                    observed_model,
+                ))
+                .expect("complete forged dispatch record"),
+            );
+        }
+
+        results.dispatch_comparisons =
+            compare_same_repetition_dispatches(&manifest, &results.runs).expect("comparisons");
+        results.pareto_conclusion = pareto_conclusion(&results.dispatch_comparisons, &results.runs);
+        let pareto_allowed = results.pareto_conclusion.status == ParetoConclusionStatus::Available;
+        (results.profile_summaries, results.pareto_frontier) =
+            summarize_profiles_with_pareto(&manifest, &results.runs, pareto_allowed)
+                .expect("internally coherent forged aggregates");
+        assert_eq!(
+            results.pareto_conclusion.status,
+            ParetoConclusionStatus::Available
+        );
+
+        let serialized = serde_json::to_vec(&results).expect("serialize forged results");
+        let forged = serde_json::from_slice::<EvaluationResults>(&serialized)
+            .expect("deserialize forged results");
+        let error = forged
+            .validate_against(&manifest)
+            .expect_err("Fake-labelled observations must not license grounded comparisons");
+        assert!(error.to_string().contains("runs.observed_dispatch"));
+        assert!(error
+            .to_string()
+            .contains("require separately retained A4 runtime provenance"));
+    }
+
+    #[test]
+    fn manifest_profile_count_accepts_boundary_and_refuses_excess() {
+        let mut manifest = manifest();
+        manifest.profiles = (0..MAX_EVALUATION_PROFILES)
+            .map(|index| {
+                profile(
+                    &format!("profile-{index}"),
+                    "orchestrator-model",
+                    &format!("worker-model-{index}"),
+                )
+            })
+            .collect();
+        manifest
+            .validate()
+            .expect("maximum profile count remains accepted");
+
+        manifest.profiles.push(profile(
+            "profile-over-limit",
+            "orchestrator-model",
+            "worker-model-over-limit",
+        ));
+        let error = manifest
+            .validate()
+            .expect_err("profile count above the conservative bound must fail closed");
+        assert!(matches!(
+            error,
+            EvaluationError::InvalidManifest { ref field, .. } if field == "profiles"
+        ));
+        assert!(error
+            .to_string()
+            .contains(&format!("at most {MAX_EVALUATION_PROFILES}")));
     }
 
     #[test]
