@@ -1226,7 +1226,10 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     };
     #[cfg(test)]
     run_before_supervisor_cascade_load_hook(&supervisor_options.plan_file);
+    let error_evidence_source_plan_sha256 =
+        supervise::normalized_supervisor_plan_file_sha256(&supervisor_options.plan_file)?;
     let command_primary_baseline = supervise::verified_whole_primary_snapshot_sha256(&repo)?;
+    let error_evidence_source_run_id = supervisor_options.run_id.clone();
     let supervisor_result = match &mut cascade_dispatch {
         AutopilotCascadeDispatch::Production(_) => {
             supervise::run_supervisor_plan_file_cascade_for_autopilot(
@@ -1256,6 +1259,33 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         Ok(cascade) => cascade,
         Err(error) => {
             let profile_refused_before_source_dispatch = !profile_binding.permits_dispatch();
+            let generated_follow_up_dispatch_performed = if profile_refused_before_source_dispatch {
+                false
+            } else {
+                let evidence =
+                    match supervise::generated_follow_up_dispatch_evidence_after_cascade_error(
+                        &repo,
+                        &error_evidence_source_plan_sha256,
+                        &error_evidence_source_run_id,
+                        &options.run_id,
+                    ) {
+                        Ok(evidence) => evidence,
+                        Err(evidence_error) => {
+                            return Err(error.context(format!(
+                            "generated follow-up dispatch is not_process_observable after the cascade error ({evidence_error:#}); refusing to finalize a false execution claim"
+                        )));
+                        }
+                    };
+                match evidence {
+                    supervise::GeneratedFollowUpDispatchEvidence::NoDurableDispatchStart => false,
+                    supervise::GeneratedFollowUpDispatchEvidence::AuthenticatedChildDispatchStarted => true,
+                    supervise::GeneratedFollowUpDispatchEvidence::NotProcessObservable => {
+                        return Err(error.context(
+                            "generated follow-up dispatch is not_process_observable after a durable dispatch marker; refusing to finalize a false execution claim",
+                        ));
+                    }
+                }
+            };
             profile_binding.mark_execution_incomparable(
                 "not_process_observable: supervisor dispatch returned no final report, so its resolved model selections cannot be verified",
             );
@@ -1302,11 +1332,13 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 primary_worktree_untouched: command_primary_worktree_untouched,
                 next_action: if profile_refused_before_source_dispatch {
                     "correct the requested/effective profile mismatch; no supervisor, publication, merge, or follow-up dispatch was attempted"
+                } else if generated_follow_up_dispatch_performed {
+                    "inspect the authenticated generated follow-up queue and subordinate checkpoint: a generated child dispatch started before the cascade failure; no publication or merge was performed"
                 } else {
                     "inspect the supervisor entry failure; no publication, merge, or follow-up dispatch was attempted"
                 },
                 auto_merge_requested: plan.auto_merge,
-                generated_follow_up_dispatch_performed: false,
+                generated_follow_up_dispatch_performed,
             });
             write_private_json(&mut artifact_writer, "final-report.json", &report)?;
             artifact_writer.finalize("final-report.json", false)?;
@@ -1351,7 +1383,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     let next_action = if execution_profile_mismatch {
         "inspect the typed requested/observed profile mismatch; autopilot performed no publication, merge, or follow-up dispatch"
     } else if !follow_up_cascade_success {
-        "inspect the authenticated generated follow-up queue, typed cascade denials, and subordinate reports; no publication or merge was performed"
+        "inspect the generated follow-up cascade report, authenticated queue if present, typed denials or environment failures, and subordinate reports; no publication or merge was performed"
     } else if supervisor.success {
         "inspect the isolated supervise and bounded generated follow-up results, then use explicit human-approved arbitration or merge preview/apply; autopilot performed no publication or merge"
     } else {
@@ -5225,11 +5257,11 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn run_injected_licensed_autopilot_cascade(
+    fn run_injected_licensed_autopilot_cascade_result(
         temp_root: &Path,
         repo: &Path,
         run_name: &str,
-    ) -> (AutopilotFinalReport, usize) {
+    ) -> (Result<AutopilotFinalReport>, usize, usize) {
         let outer_plan = temp_root.join(format!("{run_name}-autopilot.json"));
         fs::write(
             &outer_plan,
@@ -5267,10 +5299,27 @@ mod tests {
             secure_autopilot_machine_global_retention(temp_root, run_name),
             supervisor_plan,
             &mut runner,
+        );
+        (
+            report,
+            source_child_dispatches.load(Ordering::SeqCst),
+            follow_up_child_dispatches.load(Ordering::SeqCst),
         )
-        .expect("run injected licensed Autopilot cascade");
-        assert_eq!(source_child_dispatches.load(Ordering::SeqCst), 1);
-        (report, follow_up_child_dispatches.load(Ordering::SeqCst))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_injected_licensed_autopilot_cascade(
+        temp_root: &Path,
+        repo: &Path,
+        run_name: &str,
+    ) -> (AutopilotFinalReport, usize) {
+        let (report, source_child_dispatches, follow_up_child_dispatches) =
+            run_injected_licensed_autopilot_cascade_result(temp_root, repo, run_name);
+        assert_eq!(source_child_dispatches, 1);
+        (
+            report.expect("run injected licensed Autopilot cascade"),
+            follow_up_child_dispatches,
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -5324,6 +5373,87 @@ mod tests {
                 .target()
                 .expect("reread injected Autopilot HEAD oid"),
             head_before
+        );
+        assert!(!repo.join("src/client.rs").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn autopilot_cascade_error_after_authenticated_follow_up_start_never_reports_false() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = create_committed_autopilot_repo(temp.path());
+        let primary_before = supervise::verified_whole_primary_snapshot_sha256(&repo)
+            .expect("capture primary before post-start failure");
+        supervise::set_interrupt_after_authenticated_follow_up_child_start();
+
+        let (report, source_child_dispatches, follow_up_child_dispatches) =
+            run_injected_licensed_autopilot_cascade_result(
+                temp.path(),
+                &repo,
+                "autopilot-post-authenticated-start-error",
+            );
+        let report = report.expect("return an honest failed Autopilot report");
+
+        assert_eq!(source_child_dispatches, 1);
+        assert_eq!(follow_up_child_dispatches, 1);
+        assert_eq!(report.status, AutopilotRunStatus::Failed, "{report:#?}");
+        assert!(!report.success);
+        assert!(report.generated_follow_up_dispatch_performed);
+        assert!(report.primary_worktree_untouched);
+        assert!(!report.auto_merge_performed);
+        assert!(report.next_action.contains("dispatch started"));
+        let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &report.run_id)
+            .expect("open finalized honest post-start Autopilot report");
+        let final_report: Value = serde_json::from_slice(
+            &reader
+                .read(Path::new("final-report.json"))
+                .expect("read honest post-start final report"),
+        )
+        .expect("decode honest post-start final report");
+        assert_eq!(
+            final_report["generated_follow_up_dispatch_performed"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            supervise::verified_whole_primary_snapshot_sha256(&repo)
+                .expect("capture primary after post-start failure"),
+            primary_before
+        );
+        assert!(!repo.join("src/client.rs").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn autopilot_marker_without_child_checkpoint_refuses_a_false_final_report() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = create_committed_autopilot_repo(temp.path());
+        let run_name = "autopilot-unobservable-generated-dispatch";
+        let run_id = RunId::new(run_name).expect("unobservable Autopilot run id");
+        let primary_before = supervise::verified_whole_primary_snapshot_sha256(&repo)
+            .expect("capture primary before marker-only interruption");
+        supervise::set_interrupt_after_follow_up_dispatch_started();
+
+        let (report, source_child_dispatches, follow_up_child_dispatches) =
+            run_injected_licensed_autopilot_cascade_result(temp.path(), &repo, run_name);
+        let error = report.expect_err("marker-only dispatch state must not finalize false");
+
+        assert_eq!(source_child_dispatches, 1);
+        assert_eq!(follow_up_child_dispatches, 0);
+        let message = format!("{error:#}");
+        assert!(message.contains("not_process_observable"), "{message}");
+        assert!(
+            message.contains("refusing to finalize a false execution claim"),
+            "{message}"
+        );
+        assert!(
+            !crate::artifacts::final_report_path(&repo, RunArtifactFamily::Autopilot, &run_id,)
+                .exists()
+        );
+        assert!(ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &run_id).is_err());
+        assert_eq!(
+            supervise::verified_whole_primary_snapshot_sha256(&repo)
+                .expect("capture primary after marker-only interruption"),
+            primary_before
         );
         assert!(!repo.join("src/client.rs").exists());
     }

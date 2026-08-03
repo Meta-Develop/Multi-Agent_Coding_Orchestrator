@@ -106,8 +106,13 @@ use follow_up_cascade::*;
 #[cfg(test)]
 pub(crate) use follow_up_cascade::{
     clear_generated_follow_up_queue_observer, set_before_generated_follow_up_plan_load_hook,
-    set_generated_follow_up_queue_observer, set_interrupt_after_follow_up_dispatch_started,
-    set_interrupt_after_follow_up_enqueue,
+    set_generated_follow_up_queue_observer,
+    set_interrupt_after_authenticated_follow_up_child_start,
+    set_interrupt_after_follow_up_dispatch_started, set_interrupt_after_follow_up_enqueue,
+};
+pub(crate) use follow_up_cascade::{
+    generated_follow_up_dispatch_evidence_after_cascade_error,
+    normalized_supervisor_plan_file_sha256, GeneratedFollowUpDispatchEvidence,
 };
 
 mod repository;
@@ -1176,6 +1181,8 @@ pub struct SupervisorCascadeOutcome {
     pub follow_up_reports: Vec<SupervisorFinalReport>,
     #[serde(default)]
     pub follow_up_gate_denials: Vec<GateDenial>,
+    #[serde(default)]
+    pub follow_up_environment_failures: Vec<EnvironmentFailure>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -1203,6 +1210,7 @@ pub(crate) struct GeneratedFollowUpQueueTestObservation {
     pub outer_command_run_id: String,
     pub item_ids: Vec<String>,
     pub subordinate_run_ids: Vec<String>,
+    pub environment_failures: Vec<EnvironmentFailure>,
     pub pending_count: usize,
     pub claimed_count: usize,
     pub dispatch_started_count: usize,

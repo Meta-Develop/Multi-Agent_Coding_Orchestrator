@@ -1231,6 +1231,7 @@ fn generated_follow_up_exact_loaded_plan_drift_refuses_before_child_dispatch() {
 enum GeneratedRoundLastMomentMutation {
     Primary,
     MachineGlobalConfig,
+    MachineGlobalConfigDeleted,
 }
 
 #[cfg(target_os = "linux")]
@@ -1241,7 +1242,8 @@ struct GeneratedRoundLastMomentScenario {
     primary_before: String,
     primary_after: String,
     machine_global_config_before: Vec<u8>,
-    machine_global_config_after: Vec<u8>,
+    machine_global_config_after: Option<Vec<u8>>,
+    queue_observations: Vec<GeneratedFollowUpQueueTestObservation>,
     profile_callback_invocations: usize,
     source_child_dispatches: usize,
     generated_runner_dispatches: usize,
@@ -1284,6 +1286,11 @@ fn run_generated_round_last_moment_mutation(
     .expect("hash last-moment gate declaration");
     let primary_before =
         verified_whole_primary_snapshot_sha256(&repo).expect("capture last-moment primary before");
+    let queue_observations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = std::rc::Rc::clone(&queue_observations);
+    set_generated_follow_up_queue_observer(move |observation| {
+        observed.borrow_mut().push(observation);
+    });
     let mut profile_callback_invocations = 0_usize;
     let repo_for_gate = repo.clone();
     let config_for_gate = machine_global_config.clone();
@@ -1304,6 +1311,10 @@ fn run_generated_round_last_moment_mutation(
                     changed.extend_from_slice(b"\n ");
                     fs::write(&config_for_gate, changed)
                         .expect("mutate machine-global config after profile approval");
+                }
+                GeneratedRoundLastMomentMutation::MachineGlobalConfigDeleted => {
+                    fs::remove_file(&config_for_gate)
+                        .expect("delete machine-global config after profile approval");
                 }
             }
         }
@@ -1346,12 +1357,13 @@ fn run_generated_round_last_moment_mutation(
         &mut runner,
     )
     .expect("return typed last-moment generated-round refusal");
+    clear_generated_follow_up_queue_observer();
     drop(before_dispatch);
     drop(runner);
     let primary_after =
         verified_whole_primary_snapshot_sha256(&repo).expect("capture last-moment primary after");
-    let machine_global_config_after =
-        fs::read(&machine_global_config).expect("read final machine-global config");
+    let machine_global_config_after = fs::read(&machine_global_config).ok();
+    let queue_observations = queue_observations.borrow().clone();
 
     GeneratedRoundLastMomentScenario {
         _temp: temp,
@@ -1361,6 +1373,7 @@ fn run_generated_round_last_moment_mutation(
         primary_after,
         machine_global_config_before,
         machine_global_config_after,
+        queue_observations,
         profile_callback_invocations,
         source_child_dispatches,
         generated_runner_dispatches,
@@ -1404,8 +1417,8 @@ fn generated_follow_up_rechecks_primary_after_profile_before_dispatch() {
     assert_eq!(scenario.generated_runner_dispatches, 0);
     assert_ne!(scenario.primary_after, scenario.primary_before);
     assert_eq!(
-        scenario.machine_global_config_after,
-        scenario.machine_global_config_before
+        scenario.machine_global_config_after.as_deref(),
+        Some(scenario.machine_global_config_before.as_slice())
     );
     assert!(!scenario.repo.join("src/client.rs").exists());
 }
@@ -1454,10 +1467,165 @@ fn generated_follow_up_rechecks_machine_global_after_profile_before_dispatch() {
     assert_eq!(scenario.generated_runner_dispatches, 0);
     assert_eq!(scenario.primary_after, scenario.primary_before);
     assert_ne!(
-        scenario.machine_global_config_after,
-        scenario.machine_global_config_before
+        scenario
+            .machine_global_config_after
+            .as_deref()
+            .expect("drifted machine-global config remains readable"),
+        scenario.machine_global_config_before.as_slice()
     );
     assert!(!scenario.repo.join("src/client.rs").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn generated_follow_up_deleted_retention_is_journaled_probe_failed_and_retryable() {
+    let scenario = run_generated_round_last_moment_mutation(
+        "licensed-cascade-last-moment-retention-deleted",
+        GeneratedRoundLastMomentMutation::MachineGlobalConfigDeleted,
+    );
+
+    assert!(
+        scenario.outcome.source_report.success,
+        "{:#?}",
+        scenario.outcome
+    );
+    assert!(!scenario.outcome.follow_up_cascade_success);
+    assert!(!scenario.outcome.generated_follow_up_dispatch_performed());
+    assert_eq!(
+        scenario.outcome.follow_up_primary_worktree_untouched,
+        Some(true)
+    );
+    assert!(scenario.outcome.follow_up_gate_denials.is_empty());
+    assert_eq!(scenario.outcome.follow_up_environment_failures.len(), 1);
+    let failure = &scenario.outcome.follow_up_environment_failures[0];
+    assert_eq!(failure.category, EnvironmentFailureCategory::ProbeFailed);
+    assert!(failure.summary.contains("I/O error kind NotFound"));
+    let queue = scenario
+        .outcome
+        .follow_up_queue
+        .expect("deleted-retention queue summary");
+    assert_eq!(queue.pending_count, 1);
+    assert_eq!(queue.claimed_count, 0);
+    assert_eq!(queue.dispatch_started_count, 0);
+    assert_eq!(queue.acknowledged_terminal_count, 0);
+    assert_eq!(queue.authenticated_child_dispatch_started_count, 0);
+    let journaled = scenario
+        .queue_observations
+        .iter()
+        .find(|observation| observation.label == "environment_failed")
+        .expect("observe journaled environment failure after claim release");
+    assert_eq!(journaled.pending_count, 1);
+    assert_eq!(journaled.claimed_count, 0);
+    assert_eq!(journaled.dispatch_started_count, 0);
+    assert_eq!(journaled.environment_failures.len(), 1);
+    assert_eq!(
+        journaled.environment_failures[0].category,
+        EnvironmentFailureCategory::ProbeFailed
+    );
+    assert_eq!(scenario.profile_callback_invocations, 2);
+    assert_eq!(scenario.source_child_dispatches, 1);
+    assert_eq!(scenario.generated_runner_dispatches, 0);
+    assert_eq!(scenario.primary_after, scenario.primary_before);
+    assert!(scenario.machine_global_config_after.is_none());
+    assert!(!scenario.repo.join("src/client.rs").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn generated_follow_up_initial_deleted_retention_is_typed_without_queue() {
+    let (temp, repo) = injected_repository();
+    let source_assignment = licensed_assignment();
+    let plan = injected_plan(source_assignment.clone(), 0);
+    let run_id = RunId::new("licensed-cascade-initial-retention-deleted")
+        .expect("initial deleted-retention source run id");
+    let plan_file = temp.path().join("initial-retention-deleted.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&plan).expect("serialize initial deleted-retention source plan"),
+    )
+    .expect("write initial deleted-retention source plan");
+    let retention =
+        secure_machine_global_retention(temp.path(), "licensed-cascade-initial-retention-deleted");
+    let config = retention.config.clone();
+    let options = SupervisorRunOptions {
+        repo: repo.clone(),
+        plan_file,
+        run_id,
+        codex_bin: PathBuf::from("unused-injected-codex"),
+        runtime: SupervisorRuntime::Codex,
+        allow_dirty_primary: false,
+        machine_global_retention: Some(retention),
+    };
+    let declaration_sha256 = licensed_breakage_declaration_sha256(
+        source_assignment
+            .licensed_breakage
+            .as_ref()
+            .expect("initial deleted-retention declaration"),
+    )
+    .expect("hash initial deleted-retention declaration");
+    let primary_before = verified_whole_primary_snapshot_sha256(&repo)
+        .expect("capture initial deleted-retention primary before");
+    let mut source_child_dispatches = 0_usize;
+    let mut source_runner = |command: &ExternalAgentCommand| {
+        let is_auditor = command
+            .output_last_message
+            .to_string_lossy()
+            .contains("review-auditor");
+        if is_auditor {
+            write_injected_json(
+                &command.output_last_message,
+                &licensed_auditor_report(&source_assignment, Some(&declaration_sha256)),
+            );
+        } else {
+            source_child_dispatches = source_child_dispatches.saturating_add(1);
+            assert_eq!(source_child_dispatches, 1, "initial source child reran");
+            fs::write(command.cwd.join("README.md"), "licensed breaking change\n")
+                .expect("write initial deleted-retention source candidate");
+            write_injected_json(
+                &command.output_last_message,
+                &dependent_failure_child(&source_assignment, "src/client.rs"),
+            );
+        }
+        write_injected_usage(command, 0, 1);
+        injected_verified_run(command)
+    };
+    let source = run_supervisor_plan_file_with_runner(options.clone(), &mut source_runner)
+        .expect("finalize source before deleting initial retention config");
+    drop(source_runner);
+    assert!(source.success, "{source:#?}");
+    assert_eq!(source.generated_follow_up_tasks.len(), 1);
+    fs::remove_file(&config).expect("delete retention config before cascade initialization");
+    let mut unexpected_generated_dispatches = 0_usize;
+    let mut no_generated_runner = |_command: &ExternalAgentCommand| {
+        unexpected_generated_dispatches = unexpected_generated_dispatches.saturating_add(1);
+        panic!("initial deleted retention reached generated runner");
+    };
+    let outcome =
+        resume_supervisor_plan_file_cascade_with_runner(options, &mut no_generated_runner)
+            .expect("return typed initial retention probe failure");
+    drop(no_generated_runner);
+
+    assert!(!outcome.follow_up_cascade_success);
+    assert!(!outcome.generated_follow_up_dispatch_performed());
+    assert_eq!(outcome.follow_up_primary_worktree_untouched, None);
+    assert!(outcome.follow_up_queue.is_none());
+    assert!(outcome.follow_up_gate_denials.is_empty());
+    assert_eq!(outcome.follow_up_environment_failures.len(), 1);
+    assert_eq!(
+        outcome.follow_up_environment_failures[0].category,
+        EnvironmentFailureCategory::ProbeFailed
+    );
+    assert!(outcome.follow_up_environment_failures[0]
+        .summary
+        .contains("I/O error kind NotFound"));
+    assert_eq!(source_child_dispatches, 1);
+    assert_eq!(unexpected_generated_dispatches, 0);
+    assert_eq!(
+        verified_whole_primary_snapshot_sha256(&repo)
+            .expect("capture initial deleted-retention primary after"),
+        primary_before
+    );
+    assert!(!repo.join("src/client.rs").exists());
 }
 
 #[cfg(target_os = "linux")]

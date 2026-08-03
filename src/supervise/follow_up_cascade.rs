@@ -26,12 +26,20 @@ pub(super) enum FollowUpRuntimeCatalog {
     Injected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GeneratedFollowUpDispatchEvidence {
+    NoDurableDispatchStart,
+    AuthenticatedChildDispatchStarted,
+    NotProcessObservable,
+}
+
 enum FollowUpPreparation {
     Ready {
         plan_file: tempfile::NamedTempFile,
         loaded: LoadedSupervisorPlan,
     },
     Refused(GateDenial),
+    EnvironmentFailed(EnvironmentFailure),
 }
 
 pub(super) fn source_only_cascade_outcome(
@@ -47,6 +55,7 @@ pub(super) fn source_only_cascade_outcome(
         follow_up_queue: None,
         follow_up_reports: Vec::new(),
         follow_up_gate_denials: Vec::new(),
+        follow_up_environment_failures: Vec::new(),
     }
 }
 
@@ -83,7 +92,17 @@ pub(super) fn run_generated_follow_up_cascade(
         .context(
             "generated follow-up cascade requires the inherited machine-global retention binding",
         )?;
-    let retained_binding = GeneratedFollowUpRetentionBinding::from_machine_global(retention)?;
+    let retained_binding = match GeneratedFollowUpRetentionBinding::from_machine_global(retention) {
+        Ok(binding) => binding,
+        Err(error) => {
+            let mut outcome = source_only_cascade_outcome(source_report);
+            outcome.follow_up_cascade_success = false;
+            outcome
+                .follow_up_environment_failures
+                .push(retention_probe_failure(&error));
+            return Ok(outcome);
+        }
+    };
     let authenticator = repository_authenticator_key_only(repo)?;
     let repository_id = authenticator.binding().repository_id.clone();
     let source = GeneratedFollowUpQueueSource::root(
@@ -123,6 +142,7 @@ pub(super) fn run_generated_follow_up_cascade(
     let mut authenticated_child_dispatch_started_count = 0_usize;
     let mut cascade_success = true;
     let mut cascade_gate_denials = Vec::new();
+    let mut cascade_environment_failures = Vec::new();
 
     reconcile_started_items(
         repo,
@@ -164,10 +184,18 @@ pub(super) fn run_generated_follow_up_cascade(
                     &item_id,
                 )?));
             }
-            if !retention_binding_matches(retention, &queue)? {
-                return Ok(FollowUpPreparation::Refused(permission_expansion_denial(
-                    &item_id,
-                )?));
+            match retention_binding_matches(retention, &queue) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(FollowUpPreparation::Refused(permission_expansion_denial(
+                        &item_id,
+                    )?));
+                }
+                Err(error) => {
+                    return Ok(FollowUpPreparation::EnvironmentFailed(
+                        retention_probe_failure(&error),
+                    ));
+                }
             }
 
             let task = queue
@@ -211,10 +239,18 @@ pub(super) fn run_generated_follow_up_cascade(
                     &item_id,
                 )?));
             }
-            if !retention_binding_matches(retention, &queue)? {
-                return Ok(FollowUpPreparation::Refused(permission_expansion_denial(
-                    &item_id,
-                )?));
+            match retention_binding_matches(retention, &queue) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(FollowUpPreparation::Refused(permission_expansion_denial(
+                        &item_id,
+                    )?));
+                }
+                Err(error) => {
+                    return Ok(FollowUpPreparation::EnvironmentFailed(
+                        retention_probe_failure(&error),
+                    ));
+                }
             }
             Ok(FollowUpPreparation::Ready {
                 plan_file,
@@ -227,6 +263,18 @@ pub(super) fn run_generated_follow_up_cascade(
                 queue.release_before_dispatch(&item_id, Some(denial.clone()), Vec::new())?;
                 cascade_gate_denials.push(denial);
                 cascade_success = false;
+                break;
+            }
+            Ok(FollowUpPreparation::EnvironmentFailed(failure)) => {
+                queue.release_before_dispatch(&item_id, None, vec![failure.clone()])?;
+                cascade_environment_failures.push(failure);
+                cascade_success = false;
+                #[cfg(test)]
+                record_queue_test_observation(
+                    "environment_failed",
+                    &queue,
+                    authenticated_child_dispatch_started_count,
+                );
                 break;
             }
             Err(error) => {
@@ -278,6 +326,8 @@ pub(super) fn run_generated_follow_up_cascade(
             invocation.runtime_catalog,
             external_runner,
         );
+        #[cfg(test)]
+        interrupt_after_authenticated_follow_up_child_start(repo, &subordinate_run_id)?;
         // The loader no longer needs the private file once the ordinary call
         // returns; keeping the handle alive across the call prevents path reuse.
         plan_file.as_file_mut().flush()?;
@@ -404,7 +454,113 @@ pub(super) fn run_generated_follow_up_cascade(
         }),
         follow_up_reports,
         follow_up_gate_denials: cascade_gate_denials,
+        follow_up_environment_failures: cascade_environment_failures,
     })
+}
+
+fn retention_probe_failure(error: &anyhow::Error) -> EnvironmentFailure {
+    let diagnostic = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map(|error| format!("I/O error kind {:?}", error.kind()))
+        .unwrap_or_else(|| "content or identity validation failed".to_string());
+    EnvironmentFailure::probe_failed(format!(
+        "machine-global retention config probe failed before generated follow-up dispatch: {diagnostic}"
+    ))
+}
+
+pub(crate) fn generated_follow_up_dispatch_evidence_after_cascade_error(
+    repo: &Path,
+    pre_dispatch_source_plan_sha256: &str,
+    source_supervisor_run_id: &RunId,
+    outer_command_run_id: &RunId,
+) -> Result<GeneratedFollowUpDispatchEvidence> {
+    let (source_plan_sha256, source_lifecycle_observed) =
+        match supervisor_status(repo, source_supervisor_run_id.clone()) {
+            Ok(status) if status.lifecycle == SupervisorRunLifecycle::Finalized => {
+                let reader = ArtifactRunReader::open(
+                    repo,
+                    RunArtifactFamily::Supervise,
+                    source_supervisor_run_id,
+                )
+                .context("finalized cascade source artifact is not authenticated")?;
+                let plan_bytes = reader
+                    .read("assignments/supervisor-plan.json")
+                    .context("finalized cascade source has no authenticated normalized plan")?;
+                let plan_text = String::from_utf8(plan_bytes)
+                    .context("authenticated cascade source plan is not UTF-8")?;
+                let loaded = parse_supervisor_plan_with_consultant(&plan_text)?;
+                (
+                    normalized_supervisor_plan_sha256(
+                        &loaded.plan,
+                        &loaded.consultant,
+                        &loaded.assignment_metadata,
+                        &loaded.plan_metadata,
+                    )?,
+                    true,
+                )
+            }
+            Ok(_) => {
+                // Queue creation is strictly after a finalized source return.
+                return Ok(GeneratedFollowUpDispatchEvidence::NoDurableDispatchStart);
+            }
+            Err(_) => (pre_dispatch_source_plan_sha256.to_string(), false),
+        };
+    let authenticator = repository_authenticator_key_only(repo)?;
+    let Some(queue) = GeneratedFollowUpQueue::open_existing_for_source_execution(
+        authenticator,
+        source_supervisor_run_id.as_str(),
+        &source_plan_sha256,
+    )?
+    else {
+        return Ok(if source_lifecycle_observed {
+            GeneratedFollowUpDispatchEvidence::NoDurableDispatchStart
+        } else {
+            GeneratedFollowUpDispatchEvidence::NotProcessObservable
+        });
+    };
+    let source = queue.snapshot().source();
+    if source.outer_entrypoint() != GeneratedFollowUpQueueEntrypoint::AutopilotRun
+        || source.outer_command_run_id() != outer_command_run_id.as_str()
+    {
+        bail!("generated follow-up error evidence belongs to a different outer command");
+    }
+
+    let mut authenticated_start = false;
+    let mut started_but_not_process_observable = false;
+    for item in queue.snapshot().items().values() {
+        if matches!(
+            item.phase(),
+            GeneratedFollowUpQueuePhase::Enqueued | GeneratedFollowUpQueuePhase::Claimed
+        ) {
+            continue;
+        }
+        let subordinate_run_id = RunId::new(
+            item.subordinate_run_id()
+                .context("durably started generated follow-up has no subordinate run id")?,
+        )?;
+        match authenticated_child_dispatch_started(repo, &subordinate_run_id) {
+            Ok(true) => authenticated_start = true,
+            Ok(false) | Err(_) => started_but_not_process_observable = true,
+        }
+    }
+    if authenticated_start {
+        Ok(GeneratedFollowUpDispatchEvidence::AuthenticatedChildDispatchStarted)
+    } else if started_but_not_process_observable {
+        Ok(GeneratedFollowUpDispatchEvidence::NotProcessObservable)
+    } else {
+        Ok(GeneratedFollowUpDispatchEvidence::NoDurableDispatchStart)
+    }
+}
+
+pub(crate) fn normalized_supervisor_plan_file_sha256(path: &Path) -> Result<String> {
+    let loaded = load_supervisor_plan_file_with_consultant(path)?;
+    normalized_supervisor_plan_sha256(
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )
 }
 
 fn run_follow_up_supervisor_loaded_plan(
@@ -894,6 +1050,31 @@ fn take_interrupt_after_follow_up_dispatch_started() -> bool {
 }
 
 #[cfg(test)]
+thread_local! {
+    static INTERRUPT_AFTER_AUTHENTICATED_FOLLOW_UP_CHILD_START: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn set_interrupt_after_authenticated_follow_up_child_start() {
+    INTERRUPT_AFTER_AUTHENTICATED_FOLLOW_UP_CHILD_START.with(|slot| slot.set(true));
+}
+
+#[cfg(test)]
+fn interrupt_after_authenticated_follow_up_child_start(repo: &Path, run_id: &RunId) -> Result<()> {
+    let interrupted =
+        INTERRUPT_AFTER_AUTHENTICATED_FOLLOW_UP_CHILD_START.with(|slot| slot.replace(false));
+    if interrupted {
+        if !authenticated_child_dispatch_started(repo, run_id)? {
+            bail!("injected post-start interruption did not observe an authenticated child start");
+        }
+        bail!("injected interruption after authenticated generated follow-up child start");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn run_before_generated_follow_up_plan_load_hook(path: &Path) {
     BEFORE_GENERATED_FOLLOW_UP_PLAN_LOAD_HOOK.with(|slot| {
         if let Some(mut hook) = slot.borrow_mut().take() {
@@ -935,6 +1116,12 @@ fn record_queue_test_observation(
         .values()
         .filter_map(|item| item.subordinate_run_id().map(str::to_string))
         .collect();
+    let environment_failures = queue
+        .snapshot()
+        .items()
+        .values()
+        .flat_map(|item| item.last_environment_failures().iter().cloned())
+        .collect();
     let observation = GeneratedFollowUpQueueTestObservation {
         label,
         queue_instance_id: summary.queue_instance_id.clone(),
@@ -942,6 +1129,7 @@ fn record_queue_test_observation(
         outer_command_run_id: summary.outer_command_run_id.clone(),
         item_ids,
         subordinate_run_ids,
+        environment_failures,
         pending_count: summary.enqueued,
         claimed_count: summary.claimed,
         dispatch_started_count: summary.dispatch_started,

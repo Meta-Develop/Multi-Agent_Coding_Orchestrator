@@ -861,6 +861,52 @@ impl GeneratedFollowUpQueue {
         Ok(Self { journal, snapshot })
     }
 
+    /// Opens the queue identified by the immutable source execution identity,
+    /// if that queue has been durably created.
+    ///
+    /// This read path intentionally does not initialize an absent queue. It is
+    /// used after a cascade error to distinguish a conclusively pre-dispatch
+    /// failure from an already-started generated effect without manufacturing
+    /// new queue state while reporting the failure.
+    pub(crate) fn open_existing_for_source_execution(
+        authenticator: RepositoryAuthenticator,
+        source_supervisor_run_id: &str,
+        source_normalized_plan_sha256: &str,
+    ) -> Result<Option<Self>> {
+        validate_source_run_id(source_supervisor_run_id)?;
+        validate_sha256_id(
+            source_normalized_plan_sha256,
+            "source normalized supervisor plan digest",
+        )?;
+        authenticator.verify_epoch()?;
+        let repository_id = authenticator.binding().repository_id.clone();
+        validate_sha256_id(&repository_id, "repository authentication identity")?;
+        let journal_slot_id = queue_journal_slot_id_for_source_execution(
+            source_supervisor_run_id,
+            source_normalized_plan_sha256,
+            &repository_id,
+        )?;
+        if !authenticator
+            .state_root()
+            .direct_child_exists(GENERATED_FOLLOW_UP_QUEUE_ROOT_NAME)?
+        {
+            return Ok(None);
+        }
+        let journal_root = QueueJournal::existing_root(&authenticator)?;
+        if !journal_root.direct_child_exists(&journal_slot_id)? {
+            return Ok(None);
+        }
+        let journal = QueueJournal::open_instance(authenticator, &journal_slot_id)?;
+        let snapshot = replay_queue_records(&journal_slot_id, journal.records())?;
+        if snapshot.source.source_supervisor_run_id() != source_supervisor_run_id
+            || snapshot.source.source_normalized_plan_sha256() != source_normalized_plan_sha256
+            || snapshot.source.repository_id() != repository_id
+        {
+            bail!("generated follow-up queue source execution identity changed across reopen");
+        }
+        Ok(Some(Self { journal, snapshot }))
+    }
+
     pub(crate) fn snapshot(&self) -> &GeneratedFollowUpQueueSnapshot {
         &self.snapshot
     }
@@ -1428,12 +1474,30 @@ fn queue_instance_id(source: &GeneratedFollowUpQueueSource) -> Result<String> {
 
 fn queue_journal_slot_id(source: &GeneratedFollowUpQueueSource) -> Result<String> {
     source.validate()?;
+    queue_journal_slot_id_for_source_execution(
+        source.source_supervisor_run_id(),
+        source.source_normalized_plan_sha256(),
+        source.repository_id(),
+    )
+}
+
+fn queue_journal_slot_id_for_source_execution(
+    source_supervisor_run_id: &str,
+    source_normalized_plan_sha256: &str,
+    repository_id: &str,
+) -> Result<String> {
+    validate_source_run_id(source_supervisor_run_id)?;
+    validate_sha256_id(
+        source_normalized_plan_sha256,
+        "source normalized supervisor plan digest",
+    )?;
+    validate_sha256_id(repository_id, "repository authentication identity")?;
     let digest = domain_separated_sha256(
         QUEUE_SLOT_ID_DOMAIN,
         &[
-            source.source_supervisor_run_id.as_bytes(),
-            source.source_normalized_plan_sha256.as_bytes(),
-            source.repository_id.as_bytes(),
+            source_supervisor_run_id.as_bytes(),
+            source_normalized_plan_sha256.as_bytes(),
+            repository_id.as_bytes(),
         ],
     )?;
     Ok(format!("follow-up-{digest}"))
@@ -2004,6 +2068,40 @@ mod tests {
             GeneratedFollowUpQueue::create_or_open(authenticator(&repo), source, bounds(1))
                 .expect("open existing initialized queue");
         assert_eq!(reopened.journal.records().len(), 1);
+    }
+
+    #[test]
+    fn source_execution_lookup_observes_only_an_existing_authenticated_queue() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-observation");
+        let source_run_id = source.source_supervisor_run_id().to_string();
+        let source_plan_sha256 = source.source_normalized_plan_sha256().to_string();
+
+        assert!(GeneratedFollowUpQueue::open_existing_for_source_execution(
+            authenticator(&repo),
+            &source_run_id,
+            &source_plan_sha256,
+        )
+        .expect("observe absent queue without creating it")
+        .is_none());
+
+        let created =
+            GeneratedFollowUpQueue::create_or_open(authenticator(&repo), source, bounds(1))
+                .expect("create authenticated queue");
+        let expected_instance_id = created.snapshot().queue_instance_id().to_string();
+        drop(created);
+
+        let observed = GeneratedFollowUpQueue::open_existing_for_source_execution(
+            authenticator(&repo),
+            &source_run_id,
+            &source_plan_sha256,
+        )
+        .expect("observe authenticated queue")
+        .expect("existing queue");
+        assert_eq!(
+            observed.snapshot().queue_instance_id(),
+            expected_instance_id
+        );
     }
 
     #[test]
