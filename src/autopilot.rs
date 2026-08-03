@@ -1062,6 +1062,7 @@ fn run_autopilot_with_profile_and_retention(
     run_before_effective_supervisor_plan_load_hook(&supervisor_plan_path);
     let effective_supervisor_plan = supervise::load_supervisor_plan_file(&supervisor_plan_path)
         .context("failed to verify the effective autopilot supervisor profile")?;
+    let follow_up_requested_profile = requested_profile.clone();
     let mut profile_binding = AutopilotProfileBindingReport::from_effective(
         requested_profile,
         &effective_supervisor_plan,
@@ -1143,16 +1144,32 @@ fn run_autopilot_with_profile_and_retention(
     // each create, so overlapping creates can invalidate a peer's held Git-directory generation.
     // Keep only this trusted multi-root source serial until creation itself has a serialized
     // capability boundary; authored one-assignment Autopilot behavior remains unchanged.
-    let supervisor_result = if goal_derived_supervisor_plan {
-        supervise::run_supervisor_plan_file_with_concurrency_policy(
-            supervisor_options,
-            SupervisorConcurrencyPolicy::Fixed(NonZeroUsize::MIN),
-        )
+    let cascade_concurrency_policy = if goal_derived_supervisor_plan {
+        SupervisorConcurrencyPolicy::Fixed(NonZeroUsize::MIN)
     } else {
-        supervise::run_supervisor_plan_file(supervisor_options)
+        SupervisorConcurrencyPolicy::default()
     };
-    let supervisor = match supervisor_result {
-        Ok(supervisor) => supervisor,
+    let mut follow_up_profile_refusal = None;
+    let mut follow_up_profile_gate = |effective: &SupervisorPlan| {
+        let binding = AutopilotProfileBindingReport::from_effective(
+            follow_up_requested_profile.clone(),
+            effective,
+        );
+        let permitted = binding.permits_dispatch();
+        if !permitted {
+            follow_up_profile_refusal = Some(binding);
+        }
+        Ok(permitted)
+    };
+    let supervisor_result = supervise::run_supervisor_plan_file_cascade_for_autopilot(
+        supervisor_options,
+        cascade_concurrency_policy,
+        &options.run_id,
+        &mut follow_up_profile_gate,
+    );
+    drop(follow_up_profile_gate);
+    let cascade = match supervisor_result {
+        Ok(cascade) => cascade,
         Err(error) => {
             profile_binding.mark_execution_incomparable(
                 "not_process_observable: supervisor dispatch returned no final report, so its resolved model selections cannot be verified",
@@ -1199,6 +1216,19 @@ fn run_autopilot_with_profile_and_retention(
             return Ok(report);
         }
     };
+    if let Some(refusal) = follow_up_profile_refusal {
+        profile_binding = refusal;
+    }
+    let generated_follow_up_dispatch_performed =
+        cascade.generated_follow_up_dispatch_performed();
+    let follow_up_cascade_success = cascade.follow_up_cascade_success;
+    let follow_up_gate_denials = cascade.follow_up_gate_denials.clone();
+    write_private_json(
+        &mut artifact_writer,
+        "follow-up-cascade-report.json",
+        &cascade,
+    )?;
+    let supervisor = cascade.source_report;
 
     profile_binding.observe_execution(&supervisor);
     attempt.supervisor_status = review_status_label(supervisor.status).to_string();
@@ -1215,21 +1245,27 @@ fn run_autopilot_with_profile_and_retention(
     )?;
     let execution_profile_mismatch =
         profile_binding.status == AutopilotProfileBindingStatus::Mismatch;
-    let status = if supervisor.success && !execution_profile_mismatch {
+    let status = if supervisor.success
+        && follow_up_cascade_success
+        && !execution_profile_mismatch
+    {
         AutopilotRunStatus::Succeeded
     } else {
         AutopilotRunStatus::Failed
     };
-    let gate_denials = supervisor.gate_denials.clone();
+    let mut gate_denials = supervisor.gate_denials.clone();
+    gate_denials.extend(follow_up_gate_denials);
     let primary_worktree_untouched = supervisor.success;
     let next_action = if execution_profile_mismatch {
         "inspect the typed requested/observed profile mismatch; autopilot performed no publication, merge, or follow-up dispatch"
+    } else if !follow_up_cascade_success {
+        "inspect the authenticated generated follow-up queue, typed cascade denials, and subordinate reports; no publication or merge was performed"
     } else if supervisor.success {
-        "inspect the isolated supervise result and use explicit human-approved arbitration or merge preview/apply; autopilot performed no publication, merge, or follow-up dispatch"
+        "inspect the isolated supervise and bounded generated follow-up results, then use explicit human-approved arbitration or merge preview/apply; autopilot performed no publication or merge"
     } else {
         "inspect the typed supervisor denials and environment failures; autopilot performed no publication, merge, or follow-up dispatch"
     };
-    let report = final_report(FinalReportInput {
+    let mut report = final_report(FinalReportInput {
         run_id: &options.run_id,
         status,
         attempt_count: 1,
@@ -1248,6 +1284,7 @@ fn run_autopilot_with_profile_and_retention(
         next_action,
         auto_merge_requested: plan.auto_merge,
     });
+    report.generated_follow_up_dispatch_performed = generated_follow_up_dispatch_performed;
     write_private_json(&mut artifact_writer, "final-report.json", &report)?;
     artifact_writer.finalize("final-report.json", false)?;
     Ok(report)
