@@ -284,3 +284,36 @@ Raw restored output:
 test supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_refuses_structurally_invalid_checkpoint ... ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1282 filtered out; finished in 0.05s
+
+
+10. Subject-specific assignment-start checkpoint guard
+-------------------------------------------------------
+Neuter: replace the child-dispatch `if !auditor` assignment-state guard with
+`if false && !auditor`, bypassing only the new requirement that the exact child
+assignment have a preceding `assignment_started` transition.
+
+Command:
+CARGO_TARGET_DIR=target/round3-queue CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo test --lib supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_rejects_unknown_assignment_without_start -- --exact --nocapture
+
+Failing exit status: 101
+
+Raw failing output:
+thread 'supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_rejects_unknown_assignment_without_start' panicked at src/supervise/tests/run_artifacts.rs:923:5:
+assertion failed: !authenticated_child_dispatch_started(&repo,
+            &run_id).expect("unknown assignment must not become child dispatch evidence")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_rejects_unknown_assignment_without_start ... FAILED
+
+failures:
+
+failures:
+    supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_rejects_unknown_assignment_without_start
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1285 filtered out; finished in 0.05s
+
+error: test failed, to rerun pass `--lib`
+
+Raw restored output:
+test supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_rejects_unknown_assignment_without_start ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1285 filtered out; finished in 0.05s

@@ -43,7 +43,13 @@ persisted final report, compares that report with the returned or reconciled
 report, and compares the complete authenticated persisted
 `LoadedSupervisorPlan` with the immutable queued generated plan. Only that
 structural plan/report match can record an observation, acknowledge the item, or
-contribute child-start evidence. A mismatched `DispatchStarted` item becomes
+contribute child-start evidence. The queue's raw observation and acknowledgement
+reducers are private, so the compiler rejects direct sibling cascade calls. Its only
+crate-visible terminal transition consumes an opaque, non-cloneable capability
+bound to the queue instance and item; the sibling queue module cannot construct
+that capability, and the cascade constructs it only after the authenticated
+report-byte and exact immutable queued-plan comparisons. A mismatched
+`DispatchStarted` item becomes
 `HeldAmbiguous` with the established typed permission-expansion refusal; an
 already unresolved mismatch remains nonterminal. Direct successful returns,
 immediate-error reconciliation, and later reconciliation share this transition,
@@ -70,6 +76,11 @@ rather than finalizing a false execution claim. Checkpoint MAC authentication
 alone is not semantic execution evidence: the ordinary supervise checkpoint
 analyzer must first accept the complete prepared binding, typed transitions,
 and lifecycle ordering before a `child_dispatch_started` phase can be counted.
+For child dispatch specifically, that exact assignment must have a preceding
+`assignment_started` transition and still be in `Started`: an unknown assignment
+or a prepared-but-pending assignment yields no dispatch evidence, while malformed
+records and a dispatch recorded after assignment completion remain structural
+errors.
 Direct `supervise run` can resume the same command and run ID from its
 authenticated finalized source artifacts, so it does not rerun the source
 round. It can also recover an Autopilot-origin queue by presenting that exact
