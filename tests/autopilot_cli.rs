@@ -304,6 +304,121 @@ fn fake_autopilot_depth_two_e2e_is_gated_durable_and_primary_untouched() -> Resu
 }
 
 #[test]
+fn fake_autopilot_goal_run_dispatches_exact_derived_tree_and_preserves_primary() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let goal_path = temp.path().join("autopilot-goal.md");
+    write_file(
+        &goal_path,
+        "Coordinate the requested repository work.\n\
+         - Update README.md.\n\
+         - Update the ok function in src/lib.rs.\n",
+    )?;
+    let expected_plan = run_success_json(&[
+        "supervise",
+        "plan",
+        "--from-goal",
+        path_str(&goal_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    let primary_before = primary_git_snapshot(&repo_path)?;
+
+    let report = run_success_json(&[
+        "autopilot",
+        "run",
+        "--from-goal",
+        path_str(&goal_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "goal-derived-autopilot",
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], true);
+    assert_eq!(report["status"], "succeeded");
+    assert_eq!(report["supervisor"]["runtime"], "fake");
+    assert_eq!(report["supervisor"]["publishable"], false);
+    assert_eq!(report["primary_worktree_untouched"], true);
+    assert_eq!(report["auto_merge_performed"], false);
+    assert_eq!(report["generated_follow_up_dispatch_performed"], false);
+    assert_eq!(report["profile_binding"]["configuration_status"], "matched");
+    assert_eq!(expected_plan["max_depth"], 3);
+    assert!(expected_plan["assignment_schedule"]
+        .as_array()
+        .context("goal-derived assignment schedule")?
+        .iter()
+        .any(|entry| entry.get("parent_assignment_id").is_some()));
+    assert_eq!(
+        report["supervisor"]["orchestrator_reports"]
+            .as_array()
+            .map(Vec::len),
+        expected_plan["assignments"].as_array().map(Vec::len)
+    );
+    let run_dir = repo_path.join(".maco/autopilot/runs/goal-derived-autopilot");
+    let recorded_goal_plan: Value = serde_json::from_slice(&fs::read(run_dir.join("plan.json"))?)?;
+    let dispatched_plan: Value =
+        serde_json::from_slice(&fs::read(run_dir.join("supervisor-plan.json"))?)?;
+    let supervise_snapshot: Value = serde_json::from_slice(&fs::read(repo_path.join(
+        ".maco/o2/runs/goal-derived-autopilot-supervise/assignments/supervisor-plan.json",
+    ))?)?;
+    assert_eq!(recorded_goal_plan, expected_plan);
+    assert_eq!(dispatched_plan, expected_plan);
+    assert_eq!(supervise_snapshot, expected_plan);
+    assert_eq!(primary_git_snapshot(&repo_path)?, primary_before);
+    Ok(())
+}
+
+#[test]
+fn autopilot_goal_run_refuses_profile_that_would_mutate_the_derived_plan() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let goal_path = temp.path().join("profile-refusal-goal.md");
+    write_file(&goal_path, "Update README.md.\n")?;
+    let profile_path = temp.path().join("nondefault-profile.json");
+    write_file(
+        &profile_path,
+        r#"{
+          "version": 1,
+          "role_models": {
+            "worker": {"model": "would-mutate-derived-plan"}
+          }
+        }"#,
+    )?;
+    let primary_before = primary_git_snapshot(&repo_path)?;
+
+    let report = run_failure_json(&[
+        "autopilot",
+        "run",
+        "--from-goal",
+        path_str(&goal_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--profile",
+        path_str(&profile_path)?,
+        "--run-id",
+        "goal-profile-refusal",
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["attempt_count"], 0);
+    assert_eq!(
+        report["profile_binding"]["configuration_status"],
+        "mismatch"
+    );
+    assert!(report.get("supervisor").is_none());
+    assert!(!repo_path
+        .join(".maco/o2/runs/goal-profile-refusal-supervise")
+        .exists());
+    assert_eq!(primary_git_snapshot(&repo_path)?, primary_before);
+    Ok(())
+}
+
+#[test]
 fn fake_autopilot_run_reports_configured_but_execution_incomparable_profile() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -1281,7 +1396,8 @@ fn run_success_json(args: &[&str]) -> Result<Value> {
         .context("run maco")?;
     if !output.status.success() {
         anyhow::bail!(
-            "maco command failed: {}",
+            "maco command failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
     }

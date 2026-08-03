@@ -21,14 +21,23 @@ pub fn supervisor_plan_document_from_goal_spec(
     goal: &str,
     spec: &str,
 ) -> Result<Value> {
+    Ok(supervisor_plan_and_document_from_goal_spec(repo, goal, spec)?.1)
+}
+
+pub(crate) fn supervisor_plan_and_document_from_goal_spec(
+    repo: impl AsRef<Path>,
+    goal: &str,
+    spec: &str,
+) -> Result<(SupervisorPlan, Value)> {
     let repo = discover_repo_root(repo.as_ref())?;
     let loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
-    supervisor_plan_value(
+    let document = supervisor_plan_value(
         &loaded.plan,
         &loaded.consultant,
         &loaded.assignment_metadata,
         &loaded.plan_metadata,
-    )
+    )?;
+    Ok((loaded.plan, document))
 }
 
 pub fn supervisor_plan_document_from_task_file(
@@ -791,6 +800,44 @@ pub fn run_supervisor_plan_file_with_concurrency_policy(
 ) -> Result<SupervisorFinalReport> {
     let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
     run_supervisor_plan_file_with_max_concurrent_children(options, max_concurrent_children)
+}
+
+pub fn run_supervisor_goal_spec_with_concurrency_policy(
+    options: SupervisorRunOptions,
+    goal: &str,
+    spec: &str,
+    concurrency_policy: SupervisorConcurrencyPolicy,
+) -> Result<SupervisorFinalReport> {
+    let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
+    run_supervisor_goal_spec_with_max_concurrent_children(
+        options,
+        goal,
+        spec,
+        max_concurrent_children,
+    )
+}
+
+fn run_supervisor_goal_spec_with_max_concurrent_children(
+    options: SupervisorRunOptions,
+    goal: &str,
+    spec: &str,
+    max_concurrent_children: usize,
+) -> Result<SupervisorFinalReport> {
+    validate_max_concurrent_children(max_concurrent_children)?;
+    let repo = discover_repo_root(&options.repo)?;
+    let manager = WorktreeManager::new(&repo);
+    let cleanliness = manager.acquire_repository_cleanliness()?;
+    let loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
+    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
+    run_supervisor_plan_with_runner_and_creation(
+        loaded,
+        options,
+        max_concurrent_children,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::Bound(&cleanliness),
+        runtime_model_catalog,
+        &run_external_agent_cancellable_reviewed,
+    )
 }
 
 pub fn run_supervisor_plan_file_with_max_concurrent_children(

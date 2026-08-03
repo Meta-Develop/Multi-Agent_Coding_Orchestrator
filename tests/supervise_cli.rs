@@ -527,6 +527,72 @@ fn supervise_plan_from_goal_emits_nested_traceable_disjoint_workstreams() -> Res
 }
 
 #[test]
+fn supervise_run_from_goal_executes_the_same_validated_plan_and_preserves_primary() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let goal_path = temp.path().join("run-goal.md");
+    fs::write(
+        &goal_path,
+        "Coordinate the requested repository work.\n\
+         - Update README.md.\n\
+         - Update the ok function in src/lib.rs.\n",
+    )?;
+    let expected_plan = run_success_json(&[
+        "supervise",
+        "plan",
+        "--from-goal",
+        path_str(&goal_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    let repo = Repository::open(&repo_path)?;
+    let head_before = repo.head()?.target();
+    let index_before = fs::read(repo.path().join("index"))?;
+    let readme_before = fs::read(repo_path.join("README.md"))?;
+    let lib_before = fs::read(repo_path.join("src/lib.rs"))?;
+
+    let report = run_success_json(&[
+        "supervise",
+        "run",
+        "--from-goal",
+        path_str(&goal_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "goal-derived-supervise",
+        "--runtime",
+        "fake",
+        "--max-concurrent-children",
+        "1",
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], true);
+    assert_eq!(report["publishable"], false);
+    assert_eq!(report["plan_file"], "<external-plan>");
+    assert_eq!(expected_plan["max_depth"], 3);
+    assert!(expected_plan["assignment_schedule"]
+        .as_array()
+        .context("goal-derived assignment schedule")?
+        .iter()
+        .any(|entry| entry.get("parent_assignment_id").is_some()));
+    assert_eq!(
+        report["orchestrator_reports"].as_array().map(Vec::len),
+        expected_plan["assignments"].as_array().map(Vec::len)
+    );
+    let executed_plan: Value = serde_json::from_slice(&fs::read(
+        repo_path.join(".maco/o2/runs/goal-derived-supervise/assignments/supervisor-plan.json"),
+    )?)?;
+    assert_eq!(executed_plan, expected_plan);
+    assert_eq!(Repository::open(&repo_path)?.head()?.target(), head_before);
+    assert_eq!(fs::read(repo.path().join("index"))?, index_before);
+    assert_eq!(fs::read(repo_path.join("README.md"))?, readme_before);
+    assert_eq!(fs::read(repo_path.join("src/lib.rs"))?, lib_before);
+    Ok(())
+}
+
+#[test]
 fn supervise_plan_plain_text_without_actionable_workstreams_is_an_error() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;

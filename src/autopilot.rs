@@ -573,6 +573,7 @@ impl AutopilotInputShape {
 struct LoadedAutopilotPlan {
     plan: AutopilotPlan,
     input_shape: AutopilotInputShape,
+    derived_supervisor_plan: Option<Value>,
 }
 
 pub fn autopilot_plan_from_task_file(
@@ -612,6 +613,7 @@ fn load_autopilot_plan_from_task_file(
                     return Ok(LoadedAutopilotPlan {
                         plan: validate_autopilot_plan(&repo, plan)?,
                         input_shape,
+                        derived_supervisor_plan: None,
                     });
                 }
                 Err(error)
@@ -669,6 +671,63 @@ fn load_autopilot_plan_from_task_file(
             },
         )?,
         input_shape: AutopilotInputShape::default(),
+        derived_supervisor_plan: None,
+    })
+}
+
+fn load_autopilot_plan_from_goal_spec(
+    repo: &Path,
+    goal: &str,
+    spec: &str,
+) -> Result<LoadedAutopilotPlan> {
+    let (supervisor_plan, derived_supervisor_plan) =
+        supervise::supervisor_plan_and_document_from_goal_spec(repo, goal, spec)?;
+    let assigned_paths = supervisor_plan
+        .assignments
+        .iter()
+        .flat_map(|assignment| assignment.assigned_paths.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let semantic_symbols = supervisor_plan
+        .assignments
+        .iter()
+        .flat_map(|assignment| assignment.semantic_symbols.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let semantic_modules = supervisor_plan
+        .assignments
+        .iter()
+        .flat_map(|assignment| assignment.semantic_modules.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let plan = validate_autopilot_plan(
+        repo,
+        AutopilotPlan {
+            version: AUTOPILOT_SCHEMA_VERSION,
+            task: AutopilotTask {
+                title: title_from_plain_task(&supervisor_plan.task),
+                body: supervisor_plan.task,
+            },
+            assigned_paths,
+            path_proposal: planning::TaskPathProposalDiagnostics::default(),
+            semantic_symbols,
+            semantic_modules,
+            validation_commands: Vec::new(),
+            max_repair_attempts: default_max_repair_attempts(),
+            forge_mode: AutopilotForgeMode::Fake,
+            reviewer: ReviewerConfig::default(),
+            publish_mode: AutopilotPublishMode::DraftOnly,
+            auto_merge: false,
+            external_source: None,
+        },
+    )?;
+    Ok(LoadedAutopilotPlan {
+        plan,
+        input_shape: AutopilotInputShape::default(),
+        derived_supervisor_plan: Some(derived_supervisor_plan),
     })
 }
 
@@ -809,6 +868,40 @@ pub fn run_autopilot_plan_file_with_profile_and_retention(
     profile: Option<AutopilotProfile>,
     machine_global_retention: Option<MachineGlobalRetentionBinding>,
 ) -> Result<AutopilotFinalReport> {
+    run_autopilot_with_profile_and_retention(
+        options,
+        profile,
+        machine_global_retention,
+        AutopilotRunSource::PlanFile,
+    )
+}
+
+pub fn run_autopilot_goal_spec_with_profile_and_retention(
+    options: AutopilotRunOptions,
+    goal: &str,
+    spec: &str,
+    profile: Option<AutopilotProfile>,
+    machine_global_retention: Option<MachineGlobalRetentionBinding>,
+) -> Result<AutopilotFinalReport> {
+    run_autopilot_with_profile_and_retention(
+        options,
+        profile,
+        machine_global_retention,
+        AutopilotRunSource::GoalSpec { goal, spec },
+    )
+}
+
+enum AutopilotRunSource<'a> {
+    PlanFile,
+    GoalSpec { goal: &'a str, spec: &'a str },
+}
+
+fn run_autopilot_with_profile_and_retention(
+    options: AutopilotRunOptions,
+    profile: Option<AutopilotProfile>,
+    machine_global_retention: Option<MachineGlobalRetentionBinding>,
+    source: AutopilotRunSource<'_>,
+) -> Result<AutopilotFinalReport> {
     let machine_global_retention = machine_global_retention.context(
         "autopilot run requires --machine-global-config and \
          --machine-global-runtime-root-id for supervise output-staging cleanup",
@@ -822,8 +915,18 @@ pub fn run_autopilot_plan_file_with_profile_and_retention(
     validate_autopilot_profile(&requested_profile)?;
 
     let repo = discover_repo_root(&options.repo)?;
-    let LoadedAutopilotPlan { plan, input_shape } =
-        load_autopilot_plan_from_task_file(&repo, &options.plan_file)?;
+    let LoadedAutopilotPlan {
+        plan,
+        input_shape,
+        derived_supervisor_plan,
+    } = match source {
+        AutopilotRunSource::PlanFile => {
+            load_autopilot_plan_from_task_file(&repo, &options.plan_file)?
+        }
+        AutopilotRunSource::GoalSpec { goal, spec } => {
+            load_autopilot_plan_from_goal_spec(&repo, goal, spec)?
+        }
+    };
     if let Some(source) = &plan.external_source {
         publication::revalidate_external_source(&repo, source)
             .context("autopilot source changed immediately before supervised work")?;
@@ -851,7 +954,15 @@ pub fn run_autopilot_plan_file_with_profile_and_retention(
         "autopilot",
     )?;
     let run_dir = artifact_writer.run_dir().to_path_buf();
-    write_private_json(&mut artifact_writer, &artifacts.plan, &plan)?;
+    if let Some(derived_supervisor_plan) = &derived_supervisor_plan {
+        write_private_json(
+            &mut artifact_writer,
+            &artifacts.plan,
+            derived_supervisor_plan,
+        )?;
+    } else {
+        write_private_json(&mut artifact_writer, &artifacts.plan, &plan)?;
+    }
 
     if safety.refused {
         write_skipped_stage_reports(&mut artifact_writer, "typed_preflight_gate_denial")?;
@@ -927,7 +1038,17 @@ pub fn run_autopilot_plan_file_with_profile_and_retention(
 
     let agent_id = attempt_agent_id(&options.run_id, 1)?;
     let supervisor_run_id = RunId::new(format!("{}-supervise", options.run_id.as_str()))?;
-    let supervisor_plan = supervisor_plan_for_attempt(&plan, &requested_profile, &agent_id, 1, &[]);
+    let supervisor_plan = match derived_supervisor_plan {
+        Some(derived_supervisor_plan) => derived_supervisor_plan,
+        None => serde_json::to_value(supervisor_plan_for_attempt(
+            &plan,
+            &requested_profile,
+            &agent_id,
+            1,
+            &[],
+        ))
+        .context("failed to serialize the effective autopilot supervisor plan")?,
+    };
     let supervisor_plan_relative = PathBuf::from("supervisor-plan.json");
     write_private_json(
         &mut artifact_writer,
