@@ -1442,9 +1442,10 @@ mod tests {
     #[test]
     fn skipped_and_repeated_transitions_are_refused() {
         let (_temp, repo) = repository();
-        let source = source("source-transition-skip");
-        let mut queue = GeneratedFollowUpQueue::create(authenticator(&repo), source, bounds(1))
-            .expect("create queue");
+        let skip_source = source("source-transition-skip");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), skip_source, bounds(1))
+                .expect("create queue");
         queue
             .enqueue_all_before_dispatch(&[generated_task("01")])
             .expect("enqueue");
@@ -1460,9 +1461,10 @@ mod tests {
         assert!(queue.replay_snapshot().is_err());
 
         let (_temp, repo) = repository();
-        let source = source("source-transition-repeat");
-        let mut queue = GeneratedFollowUpQueue::create(authenticator(&repo), source, bounds(1))
-            .expect("create queue");
+        let repeat_source = source("source-transition-repeat");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), repeat_source, bounds(1))
+                .expect("create queue");
         queue
             .enqueue_all_before_dispatch(&[generated_task("02")])
             .expect("enqueue");
