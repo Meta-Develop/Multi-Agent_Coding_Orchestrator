@@ -1058,6 +1058,8 @@ fn run_autopilot_with_profile_and_retention(
         &supervisor_plan,
     )?;
     let supervisor_plan_path = run_dir.join(&supervisor_plan_relative);
+    #[cfg(test)]
+    run_before_effective_supervisor_plan_load_hook(&supervisor_plan_path);
     let effective_supervisor_plan = supervise::load_supervisor_plan_file(&supervisor_plan_path)
         .context("failed to verify the effective autopilot supervisor profile")?;
     let mut profile_binding = AutopilotProfileBindingReport::from_effective(
@@ -3843,6 +3845,29 @@ fn verify_after_autopilot_safety(bindings: &RepositoryPathBindings) -> Result<()
 
 #[cfg(test)]
 thread_local! {
+    static BEFORE_EFFECTIVE_SUPERVISOR_PLAN_LOAD_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_before_effective_supervisor_plan_load_hook(
+    hook: impl FnMut(&Path) + 'static,
+) {
+    BEFORE_EFFECTIVE_SUPERVISOR_PLAN_LOAD_HOOK
+        .with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_before_effective_supervisor_plan_load_hook(path: &Path) {
+    BEFORE_EFFECTIVE_SUPERVISOR_PLAN_LOAD_HOOK.with(|slot| {
+        if let Some(mut hook) = slot.borrow_mut().take() {
+            hook(path);
+        }
+    });
+}
+
+#[cfg(test)]
+thread_local! {
     static AFTER_AUTOPILOT_SAFETY_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         std::cell::RefCell::new(None);
 }
@@ -4910,6 +4935,62 @@ mod tests {
                 ..
             }]
         ));
+        assert!(!repo.join(".maco/o2").exists());
+    }
+
+    #[test]
+    fn autopilot_reloads_effective_profile_at_call_site_before_starting_supervisor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = create_committed_autopilot_repo(temp.path());
+        let plan_path = temp.path().join("plan.json");
+        fs::write(
+            &plan_path,
+            r#"{
+              "version": 1,
+              "task": {"title": "Profile call site", "body": "Refuse persisted drift."},
+              "assigned_paths": ["README.md"]
+            }"#,
+        )
+        .expect("write plan");
+        set_before_effective_supervisor_plan_load_hook(|path| {
+            let bytes = fs::read(path).expect("read persisted supervisor plan");
+            let mut value: Value =
+                serde_json::from_slice(&bytes).expect("decode persisted supervisor plan");
+            value["role_models"] = json!({});
+            fs::write(
+                path,
+                serde_json::to_vec_pretty(&value).expect("encode mutated supervisor plan"),
+            )
+            .expect("mutate persisted supervisor plan");
+        });
+
+        let report = run_autopilot_plan_file_with_profile_and_retention(
+            AutopilotRunOptions {
+                repo: repo.clone(),
+                plan_file: plan_path,
+                run_id: RunId::new("effective-profile-callsite").expect("run id"),
+                codex_bin: None,
+                reviewer_command: None,
+                allow_dirty_primary: false,
+            },
+            Some(nondefault_test_profile()),
+            Some(MachineGlobalRetentionBinding {
+                config: temp.path().join("must-not-open.json"),
+                root_id: "runtime".to_string(),
+                owner: "maco-autopilot".to_string(),
+                correction_correlation_id: "effective-profile-callsite".to_string(),
+            }),
+        )
+        .expect("finalize requested/effective call-site refusal");
+
+        assert_eq!(report.status, AutopilotRunStatus::Failed);
+        assert_eq!(report.attempt_count, 0);
+        assert!(report.supervisor.is_none());
+        assert_eq!(
+            report.profile_binding.configuration_status,
+            AutopilotProfileBindingStatus::Mismatch
+        );
+        assert!(!report.generated_follow_up_dispatch_performed);
         assert!(!repo.join(".maco/o2").exists());
     }
 
