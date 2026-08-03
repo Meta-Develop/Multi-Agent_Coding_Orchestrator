@@ -39,7 +39,7 @@ const MAX_CANONICAL_TASK_BYTES: usize = 7 * 1024 * 1024;
 const MAX_ENQUEUED_TASK_BYTES: usize = 64 * 1024 * 1024;
 const ITEM_ID_DOMAIN: &[u8] = b"MACO\0generated-follow-up-queue-item\0v1\0";
 const QUEUE_ID_DOMAIN: &[u8] = b"MACO\0generated-follow-up-queue-instance\0v1\0";
-const QUEUE_SLOT_ID_DOMAIN: &[u8] = b"MACO\0generated-follow-up-queue-slot\0v1\0";
+const QUEUE_SLOT_ID_DOMAIN: &[u8] = b"MACO\0generated-follow-up-queue-slot\0v2\0";
 const BATCH_ID_DOMAIN: &[u8] = b"MACO\0generated-follow-up-queue-batch\0v1\0";
 
 enum GeneratedFollowUpQueueJournalSpec {}
@@ -256,6 +256,21 @@ impl GeneratedFollowUpQueueSource {
 
     pub(crate) fn machine_global_runtime_root_id(&self) -> &str {
         self.machine_global_retention.root_id()
+    }
+
+    /// The outer command is provenance, not execution identity. A source
+    /// supervisor run may first be entered through Autopilot and later resumed
+    /// through `supervise run`; every field that can change what is dispatched
+    /// must still match exactly before that resume reuses the durable queue.
+    fn has_same_execution_basis(&self, other: &Self) -> bool {
+        self.source_supervisor_run_id == other.source_supervisor_run_id
+            && self.source_normalized_plan_sha256 == other.source_normalized_plan_sha256
+            && self.source_report_accepted == other.source_report_accepted
+            && self.source_report_publishable == other.source_report_publishable
+            && self.repository_id == other.repository_id
+            && self.whole_primary_baseline_sha256 == other.whole_primary_baseline_sha256
+            && self.machine_global_retention == other.machine_global_retention
+            && self.cascade_depth == other.cascade_depth
     }
 
     fn validate(&self) -> Result<()> {
@@ -821,7 +836,7 @@ impl GeneratedFollowUpQueue {
             journal.append(created.phase(), None, &created)?;
         }
         let snapshot = replay_queue_records(&journal_slot_id, journal.records())?;
-        if snapshot.source != source || snapshot.bounds != bounds {
+        if !snapshot.source.has_same_execution_basis(&source) || snapshot.bounds != bounds {
             bail!("generated follow-up queue execution basis changed across create-or-open");
         }
         Ok(Self { journal, snapshot })
@@ -1412,9 +1427,8 @@ fn queue_journal_slot_id(source: &GeneratedFollowUpQueueSource) -> Result<String
     let digest = domain_separated_sha256(
         QUEUE_SLOT_ID_DOMAIN,
         &[
-            source.outer_entrypoint.as_str().as_bytes(),
-            source.outer_command_run_id.as_bytes(),
             source.source_supervisor_run_id.as_bytes(),
+            source.source_normalized_plan_sha256.as_bytes(),
             source.repository_id.as_bytes(),
         ],
     )?;
@@ -1986,6 +2000,111 @@ mod tests {
             GeneratedFollowUpQueue::create_or_open(authenticator(&repo), source, bounds(1))
                 .expect("open existing initialized queue");
         assert_eq!(reopened.journal.records().len(), 1);
+    }
+
+    #[test]
+    fn create_or_open_reuses_original_queue_across_outer_entrypoints() {
+        let (_temp, repo) = repository();
+        let mut autopilot_source = source(&repo, "source-cross-entrypoint");
+        autopilot_source.outer_entrypoint = GeneratedFollowUpQueueEntrypoint::AutopilotRun;
+        autopilot_source.outer_command_run_id = "autopilot-outer-run".to_string();
+        let mut created = GeneratedFollowUpQueue::create_or_open(
+            authenticator(&repo),
+            autopilot_source.clone(),
+            bounds(1),
+        )
+        .expect("create Autopilot-origin queue");
+        created
+            .enqueue_all_before_dispatch(&[generated_task("01")])
+            .expect("enqueue one Autopilot-origin task");
+        let original_queue_id = created.snapshot().queue_instance_id().to_string();
+        let original_item_id = created.snapshot().pending_item_ids()[0].to_string();
+        drop(created);
+
+        let mut direct_source = autopilot_source.clone();
+        direct_source.outer_entrypoint = GeneratedFollowUpQueueEntrypoint::SuperviseRun;
+        direct_source.outer_command_run_id = direct_source.source_supervisor_run_id.clone();
+        let reopened =
+            GeneratedFollowUpQueue::create_or_open(authenticator(&repo), direct_source, bounds(1))
+                .expect("resume Autopilot-origin queue through supervise run");
+
+        assert_eq!(reopened.snapshot().queue_instance_id(), original_queue_id);
+        assert_eq!(
+            reopened.snapshot().pending_item_ids(),
+            vec![original_item_id.as_str()]
+        );
+        assert_eq!(
+            reopened.snapshot().source().outer_entrypoint(),
+            GeneratedFollowUpQueueEntrypoint::AutopilotRun
+        );
+        assert_eq!(
+            reopened.snapshot().source().outer_command_run_id(),
+            "autopilot-outer-run"
+        );
+    }
+
+    #[test]
+    fn cross_entrypoint_reopen_refuses_primary_or_retention_basis_drift() {
+        let (_temp, repo) = repository();
+        let mut autopilot_source = source(&repo, "source-cross-entrypoint-drift");
+        autopilot_source.outer_entrypoint = GeneratedFollowUpQueueEntrypoint::AutopilotRun;
+        autopilot_source.outer_command_run_id = "autopilot-outer-drift".to_string();
+        let created = GeneratedFollowUpQueue::create_or_open(
+            authenticator(&repo),
+            autopilot_source.clone(),
+            bounds(1),
+        )
+        .expect("create queue before cross-entrypoint drift");
+        drop(created);
+
+        let mut primary_drift = autopilot_source.clone();
+        primary_drift.outer_entrypoint = GeneratedFollowUpQueueEntrypoint::SuperviseRun;
+        primary_drift.outer_command_run_id = primary_drift.source_supervisor_run_id.clone();
+        primary_drift.whole_primary_baseline_sha256 = "5".repeat(64);
+        let primary_error =
+            GeneratedFollowUpQueue::create_or_open(authenticator(&repo), primary_drift, bounds(1))
+                .err()
+                .expect("whole-primary drift must not fork or reopen the queue");
+        assert!(format!("{primary_error:#}").contains("execution basis changed"));
+
+        let mut retention_drift = autopilot_source;
+        retention_drift.outer_entrypoint = GeneratedFollowUpQueueEntrypoint::SuperviseRun;
+        retention_drift.outer_command_run_id = retention_drift.source_supervisor_run_id.clone();
+        retention_drift.machine_global_retention.owner = "different-owner".to_string();
+        retention_drift.machine_global_retention.binding_sha256 = domain_separated_sha256(
+            b"MACO\0generated-follow-up-retention-binding\0v1\0",
+            &[
+                retention_drift
+                    .machine_global_retention
+                    .config_content_sha256
+                    .as_bytes(),
+                retention_drift.machine_global_retention.root_id.as_bytes(),
+                retention_drift.machine_global_retention.owner.as_bytes(),
+                retention_drift
+                    .machine_global_retention
+                    .correction_correlation_id
+                    .as_bytes(),
+                &retention_drift
+                    .machine_global_retention
+                    .config_file_identity
+                    .device
+                    .to_be_bytes(),
+                &retention_drift
+                    .machine_global_retention
+                    .config_file_identity
+                    .file
+                    .to_be_bytes(),
+            ],
+        )
+        .expect("recompute alternate valid retention binding");
+        let retention_error = GeneratedFollowUpQueue::create_or_open(
+            authenticator(&repo),
+            retention_drift,
+            bounds(1),
+        )
+        .err()
+        .expect("retention drift must not fork or reopen the queue");
+        assert!(format!("{retention_error:#}").contains("execution basis changed"));
     }
 
     #[test]
