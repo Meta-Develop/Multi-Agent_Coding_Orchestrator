@@ -37,11 +37,20 @@ item to `Enqueued`; an unreadable retention configuration instead uses the
 established typed `EnvironmentFailure` category `probe_failed`, journals that
 failure on the same release, and is equally retryable. An explicit invocation
 of the same run ID can retry after the operator corrects the refused condition.
-After dispatch starts, an authenticated finalized subordinate outcome,
-including a subordinate gate refusal, is observed and terminal-acknowledged
-without re-execution. A newly observed failure stops sibling admission for that
-invocation; a later explicit invocation of the same run ID may continue
-remaining pending items but never reruns the acknowledged item. A
+After dispatch starts, a finalized subordinate outcome is not enough by itself.
+The one observation-and-acknowledgement transition first authenticates the
+persisted final report, compares that report with the returned or reconciled
+report, and compares the complete authenticated persisted
+`LoadedSupervisorPlan` with the immutable queued generated plan. Only that
+structural plan/report match can record an observation, acknowledge the item, or
+contribute child-start evidence. A mismatched `DispatchStarted` item becomes
+`HeldAmbiguous` with the established typed permission-expansion refusal; an
+already unresolved mismatch remains nonterminal. Direct successful returns,
+immediate-error reconciliation, and later reconciliation share this transition,
+so none has an unverified acknowledgement bypass. A newly observed failure
+stops sibling admission for that invocation; a later explicit invocation of the
+same run ID may continue remaining pending items but never reruns the
+acknowledged item. A
 status-classified `Active` subordinate with its live bound run lock remains
 `DispatchStarted`. Only an authenticated `Interrupted` or `Uncertain`
 subordinate becomes `HeldAmbiguous` and requires reconciliation rather than
@@ -51,10 +60,16 @@ subordinate artifact's complete authenticated `LoadedSupervisorPlan` with the
 immutable queued generated plan, then observes and acknowledges it without
 dispatching it again. A same-ID subordinate with a different plan stays held
 and takes a typed permission-expansion refusal. If the outer Autopilot call
-fails after a durable start marker, it reports `true` only when the subordinate
-child-start checkpoint authenticates. Marker-only or unreadable evidence is
-`not_process_observable`, so Autopilot withholds a final report rather than
-finalizing a false execution claim.
+fails after a durable start marker, dispatch evidence reuses Issue #34's
+`RoleUsageObservation` vocabulary instead of defining a lookalike uncertainty
+enum. A structurally valid authenticated subordinate child-start checkpoint
+maps to `SupervisorAggregate`; marker-only, unreadable, or otherwise incomplete
+evidence maps to the canonical `NotProcessObservable`. Autopilot reports `true`
+only for `SupervisorAggregate`; every unknown or other observation fails closed
+rather than finalizing a false execution claim. Checkpoint MAC authentication
+alone is not semantic execution evidence: the ordinary supervise checkpoint
+analyzer must first accept the complete prepared binding, typed transitions,
+and lifecycle ordering before a `child_dispatch_started` phase can be counted.
 Direct `supervise run` can resume the same command and run ID from its
 authenticated finalized source artifacts, so it does not rerun the source
 round. It can also recover an Autopilot-origin queue by presenting that exact

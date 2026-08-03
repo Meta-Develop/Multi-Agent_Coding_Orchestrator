@@ -30,14 +30,14 @@ pub(super) enum FollowUpRuntimeCatalog {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GeneratedFollowUpDispatchEvidence {
     NoDurableDispatchStart,
-    AuthenticatedChildDispatchStarted,
-    NotProcessObservable,
+    DurableDispatchStart { observation: RoleUsageObservation },
 }
 
 enum FollowUpPreparation {
     Ready {
         plan_file: tempfile::NamedTempFile,
         loaded: Box<LoadedSupervisorPlan>,
+        queued_plan: Box<GeneratedFollowUpSupervisorPlan>,
     },
     Refused(GateDenial),
     EnvironmentFailed(EnvironmentFailure),
@@ -302,10 +302,15 @@ pub(super) fn run_generated_follow_up_cascade(
             Ok(FollowUpPreparation::Ready {
                 plan_file,
                 loaded: Box::new(reloaded),
+                queued_plan: Box::new(task.supervisor_plan),
             })
         })();
-        let (mut plan_file, reloaded) = match preparation {
-            Ok(FollowUpPreparation::Ready { plan_file, loaded }) => (plan_file, *loaded),
+        let (mut plan_file, reloaded, queued_plan) = match preparation {
+            Ok(FollowUpPreparation::Ready {
+                plan_file,
+                loaded,
+                queued_plan,
+            }) => (plan_file, *loaded, *queued_plan),
             Ok(FollowUpPreparation::Refused(denial)) => {
                 queue.release_before_dispatch(&item_id, Some(denial.clone()), Vec::new())?;
                 cascade_gate_denials.push(denial);
@@ -380,22 +385,27 @@ pub(super) fn run_generated_follow_up_cascade(
         plan_file.as_file_mut().flush()?;
         match result {
             Ok(report) => {
-                let child_started =
-                    authenticated_child_dispatch_started(repo, &subordinate_run_id)?;
+                let child_started = match observe_and_acknowledge(
+                    repo,
+                    &mut queue,
+                    &item_id,
+                    &subordinate_run_id,
+                    &queued_plan,
+                    &report,
+                )? {
+                    FinalizedTerminalTransition::Acknowledged { child_started } => child_started,
+                    FinalizedTerminalTransition::PlanMismatch(denial) => {
+                        cascade_gate_denials.push(denial);
+                        cascade_success = false;
+                        break;
+                    }
+                };
                 if child_started {
                     authenticated_child_dispatch_started_count =
                         authenticated_child_dispatch_started_count
                             .checked_add(1)
                             .context("generated follow-up dispatch evidence count overflowed")?;
                 }
-                let observation = GeneratedFollowUpDispatchObservation::new(
-                    subordinate_run_id.as_str(),
-                    report.gate_denials.first().cloned(),
-                    report.environment_failures.clone(),
-                    Some(ExternalSideEffectState::Completed),
-                )?;
-                queue.mark_dispatch_observed(&item_id, observation)?;
-                queue.acknowledge_terminal(&item_id)?;
                 #[cfg(test)]
                 record_queue_test_observation(
                     "acknowledged_terminal",
@@ -415,13 +425,23 @@ pub(super) fn run_generated_follow_up_cascade(
             }
             Err(_error) => match subordinate_reconciliation(repo, &subordinate_run_id)? {
                 SubordinateReconciliation::Finalized(report) => {
-                    let child_started = observe_and_acknowledge(
+                    let child_started = match observe_and_acknowledge(
                         repo,
                         &mut queue,
                         &item_id,
                         &subordinate_run_id,
+                        &queued_plan,
                         &report,
-                    )?;
+                    )? {
+                        FinalizedTerminalTransition::Acknowledged { child_started } => {
+                            child_started
+                        }
+                        FinalizedTerminalTransition::PlanMismatch(denial) => {
+                            cascade_gate_denials.push(denial);
+                            cascade_success = false;
+                            break;
+                        }
+                    };
                     if child_started {
                         authenticated_child_dispatch_started_count =
                             authenticated_child_dispatch_started_count
@@ -573,7 +593,9 @@ pub(crate) fn generated_follow_up_dispatch_evidence_after_cascade_error(
         return Ok(if source_lifecycle_observed {
             GeneratedFollowUpDispatchEvidence::NoDurableDispatchStart
         } else {
-            GeneratedFollowUpDispatchEvidence::NotProcessObservable
+            GeneratedFollowUpDispatchEvidence::DurableDispatchStart {
+                observation: RoleUsageObservation::NotProcessObservable,
+            }
         });
     };
     let source = queue.snapshot().source();
@@ -602,9 +624,13 @@ pub(crate) fn generated_follow_up_dispatch_evidence_after_cascade_error(
         }
     }
     if authenticated_start {
-        Ok(GeneratedFollowUpDispatchEvidence::AuthenticatedChildDispatchStarted)
+        Ok(GeneratedFollowUpDispatchEvidence::DurableDispatchStart {
+            observation: RoleUsageObservation::SupervisorAggregate,
+        })
     } else if started_but_not_process_observable {
-        Ok(GeneratedFollowUpDispatchEvidence::NotProcessObservable)
+        Ok(GeneratedFollowUpDispatchEvidence::DurableDispatchStart {
+            observation: RoleUsageObservation::NotProcessObservable,
+        })
     } else {
         Ok(GeneratedFollowUpDispatchEvidence::NoDurableDispatchStart)
     }
@@ -693,23 +719,23 @@ fn reconcile_started_items(
                 )?;
                 match subordinate_reconciliation(repo, &run_id)? {
                     SubordinateReconciliation::Finalized(report) => {
-                        if !authenticated_subordinate_plan_matches(
+                        let child_started = match observe_and_acknowledge(
                             repo,
+                            queue,
+                            &item_id,
                             &run_id,
                             &queued_task.supervisor_plan,
+                            &report,
                         )? {
-                            let denial = permission_expansion_denial(&item_id)?;
-                            queue.mark_held_ambiguous(
-                                &item_id,
-                                Some(denial.clone()),
-                                Vec::new(),
-                            )?;
-                            cascade_gate_denials.push(denial);
-                            *cascade_success = false;
-                            continue;
-                        }
-                        let child_started =
-                            observe_and_acknowledge(repo, queue, &item_id, &run_id, &report)?;
+                            FinalizedTerminalTransition::Acknowledged { child_started } => {
+                                child_started
+                            }
+                            FinalizedTerminalTransition::PlanMismatch(denial) => {
+                                cascade_gate_denials.push(denial);
+                                *cascade_success = false;
+                                continue;
+                            }
+                        };
                         if child_started {
                             *authenticated_dispatches =
                                 authenticated_dispatches.checked_add(1).context(
@@ -762,17 +788,24 @@ fn reconcile_started_items(
                         .context("observed generated follow-up has no subordinate run id")?,
                 )?;
                 if let Some(report) = conclusive_finalized_report(repo, &run_id)? {
-                    if !authenticated_subordinate_plan_matches(
+                    let child_started = match observe_and_acknowledge(
                         repo,
+                        queue,
+                        &item_id,
                         &run_id,
                         &queued_task.supervisor_plan,
+                        &report,
                     )? {
-                        cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
-                        *cascade_success = false;
-                        continue;
-                    }
-                    queue.acknowledge_terminal(&item_id)?;
-                    if authenticated_child_dispatch_started(repo, &run_id)? {
+                        FinalizedTerminalTransition::Acknowledged { child_started } => {
+                            child_started
+                        }
+                        FinalizedTerminalTransition::PlanMismatch(denial) => {
+                            cascade_gate_denials.push(denial);
+                            *cascade_success = false;
+                            continue;
+                        }
+                    };
+                    if child_started {
                         *authenticated_dispatches = authenticated_dispatches
                             .checked_add(1)
                             .context("generated follow-up dispatch evidence count overflowed")?;
@@ -808,17 +841,23 @@ fn reconcile_started_items(
                 )?;
                 match subordinate_reconciliation(repo, &run_id)? {
                     SubordinateReconciliation::Finalized(report) => {
-                        if !authenticated_subordinate_plan_matches(
+                        let child_started = match observe_and_acknowledge(
                             repo,
+                            queue,
+                            &item_id,
                             &run_id,
                             &queued_task.supervisor_plan,
+                            &report,
                         )? {
-                            cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
-                            *cascade_success = false;
-                            continue;
-                        }
-                        let child_started =
-                            observe_and_acknowledge(repo, queue, &item_id, &run_id, &report)?;
+                            FinalizedTerminalTransition::Acknowledged { child_started } => {
+                                child_started
+                            }
+                            FinalizedTerminalTransition::PlanMismatch(denial) => {
+                                cascade_gate_denials.push(denial);
+                                *cascade_success = false;
+                                continue;
+                            }
+                        };
                         if child_started {
                             *authenticated_dispatches =
                                 authenticated_dispatches.checked_add(1).context(
@@ -867,6 +906,7 @@ fn reconcile_started_items(
                         repo,
                         &run_id,
                         &queued_task.supervisor_plan,
+                        &report,
                     )? {
                         cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
                         *cascade_success = false;
@@ -893,6 +933,11 @@ fn reconcile_started_items(
         }
     }
     Ok(())
+}
+
+enum FinalizedTerminalTransition {
+    Acknowledged { child_started: bool },
+    PlanMismatch(GateDenial),
 }
 
 enum SubordinateReconciliation {
@@ -945,18 +990,38 @@ fn observe_and_acknowledge(
     queue: &mut GeneratedFollowUpQueue,
     item_id: &str,
     run_id: &RunId,
+    queued_plan: &GeneratedFollowUpSupervisorPlan,
     report: &SupervisorFinalReport,
-) -> Result<bool> {
+) -> Result<FinalizedTerminalTransition> {
+    let phase = queue
+        .snapshot()
+        .item(item_id)
+        .context("finalized generated follow-up item disappeared")?
+        .phase();
+    if !authenticated_subordinate_plan_matches(repo, run_id, queued_plan, report)? {
+        let denial = permission_expansion_denial(item_id)?;
+        if phase == GeneratedFollowUpQueuePhase::DispatchStarted {
+            queue.mark_held_ambiguous(item_id, Some(denial.clone()), Vec::new())?;
+        }
+        return Ok(FinalizedTerminalTransition::PlanMismatch(denial));
+    }
     let child_started = authenticated_child_dispatch_started(repo, run_id)?;
-    let observation = GeneratedFollowUpDispatchObservation::new(
-        run_id.as_str(),
-        report.gate_denials.first().cloned(),
-        report.environment_failures.clone(),
-        Some(ExternalSideEffectState::Completed),
-    )?;
-    queue.mark_dispatch_observed(item_id, observation)?;
+    if matches!(
+        phase,
+        GeneratedFollowUpQueuePhase::DispatchStarted | GeneratedFollowUpQueuePhase::HeldAmbiguous
+    ) {
+        let observation = GeneratedFollowUpDispatchObservation::new(
+            run_id.as_str(),
+            report.gate_denials.first().cloned(),
+            report.environment_failures.clone(),
+            Some(ExternalSideEffectState::Completed),
+        )?;
+        queue.mark_dispatch_observed(item_id, observation)?;
+    } else if phase != GeneratedFollowUpQueuePhase::DispatchObserved {
+        bail!("generated follow-up terminal transition began from a non-observable queue phase");
+    }
     queue.acknowledge_terminal(item_id)?;
-    Ok(child_started)
+    Ok(FinalizedTerminalTransition::Acknowledged { child_started })
 }
 
 fn verify_authenticated_source_basis(
@@ -1014,9 +1079,16 @@ fn authenticated_subordinate_plan_matches(
     repo: &Path,
     run_id: &RunId,
     queued: &GeneratedFollowUpSupervisorPlan,
+    report: &SupervisorFinalReport,
 ) -> Result<bool> {
     let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Supervise, run_id)
         .context("generated follow-up subordinate is not an authenticated finalized run")?;
+    let report_bytes = reader
+        .read(RunArtifactFamily::Supervise.final_report_relative_path())
+        .context("generated follow-up subordinate has no authenticated final report")?;
+    if report_bytes != encode_final_report(report)? {
+        bail!("generated follow-up subordinate report differs from its authenticated finalized report");
+    }
     let plan_bytes = reader
         .read("assignments/supervisor-plan.json")
         .context("generated follow-up subordinate has no authenticated normalized plan")?;

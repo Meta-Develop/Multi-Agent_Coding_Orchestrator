@@ -1758,6 +1758,209 @@ fn licensed_follow_up_enqueue_interruption_resumes_without_rerunning_source() {
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan() {
+    let (temp, repo) = injected_repository();
+    let source_assignment = licensed_assignment();
+    let follow_up_assignment = licensed_follow_up_assignment();
+    let plan = injected_plan(source_assignment.clone(), 0);
+    let source_run_id = RunId::new("licensed-immediate-error-plan-mismatch")
+        .expect("immediate mismatch source run id");
+    let source_plan_file = temp.path().join("immediate-error-plan-mismatch.json");
+    fs::write(
+        &source_plan_file,
+        serde_json::to_vec_pretty(&plan).expect("serialize immediate mismatch source plan"),
+    )
+    .expect("write immediate mismatch source plan");
+    let retention =
+        secure_machine_global_retention(temp.path(), "licensed-immediate-error-plan-mismatch");
+    let source_options = SupervisorRunOptions {
+        repo: repo.clone(),
+        plan_file: source_plan_file,
+        run_id: source_run_id.clone(),
+        codex_bin: PathBuf::from("unused-injected-codex"),
+        runtime: SupervisorRuntime::Codex,
+        allow_dirty_primary: false,
+        machine_global_retention: Some(retention.clone()),
+    };
+    let declaration_sha256 = licensed_breakage_declaration_sha256(
+        source_assignment
+            .licensed_breakage
+            .as_ref()
+            .expect("immediate mismatch source declaration"),
+    )
+    .expect("hash immediate mismatch source declaration");
+    let observations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = std::rc::Rc::clone(&observations);
+    set_generated_follow_up_queue_observer(move |observation| {
+        observed.borrow_mut().push(observation);
+    });
+    let primary_before = verified_whole_primary_snapshot_sha256(&repo)
+        .expect("capture immediate mismatch primary before");
+    let source_child_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let source_dispatches = std::sync::Arc::clone(&source_child_dispatches);
+    let mut source_runner = move |command: &ExternalAgentCommand| {
+        let output_path = command.output_last_message.to_string_lossy();
+        let is_follow_up = output_path.contains("child-a-licensed-update-01");
+        let is_auditor = output_path.contains("review-auditor");
+        assert!(!is_follow_up, "enqueue interruption dispatched a follow-up");
+        if is_auditor {
+            write_injected_json(
+                &command.output_last_message,
+                &licensed_auditor_report(&source_assignment, Some(&declaration_sha256)),
+            );
+        } else {
+            let count = source_dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(1);
+            assert_eq!(count, 1, "immediate mismatch source child reran");
+            fs::write(command.cwd.join("README.md"), "licensed breaking change\n")
+                .expect("write immediate mismatch source candidate");
+            write_injected_json(
+                &command.output_last_message,
+                &dependent_failure_child(&source_assignment, "src/client.rs"),
+            );
+        }
+        write_injected_usage(command, 0, 1);
+        injected_verified_run(command)
+    };
+
+    set_interrupt_after_follow_up_enqueue();
+    let error =
+        run_supervisor_plan_file_cascade_with_runner(source_options.clone(), &mut source_runner)
+            .expect_err("interrupt after immediate mismatch enqueue");
+    assert!(format!("{error:#}")
+        .contains("injected interruption after durable generated follow-up enqueue"));
+    let enqueued = observations
+        .borrow()
+        .iter()
+        .find(|observation| observation.label == "enqueued")
+        .cloned()
+        .expect("observe immediate mismatch enqueued state");
+    assert_eq!(enqueued.pending_count, 1);
+    assert_eq!(enqueued.dispatch_started_count, 0);
+    assert_eq!(enqueued.acknowledged_terminal_count, 0);
+    assert_eq!(enqueued.item_ids.len(), 1);
+
+    let source_report = supervisor_status(&repo, source_run_id)
+        .expect("read immediate mismatch finalized source")
+        .final_report
+        .expect("immediate mismatch source final report");
+    let queued_task = source_report
+        .generated_follow_up_tasks
+        .first()
+        .cloned()
+        .expect("immediate mismatch queued task");
+    let mut different_plan = queued_task.supervisor_plan;
+    different_plan
+        .task
+        .push_str(" with pre-existing unauthorized plan drift");
+    let subordinate_run_id = RunId::new(format!("follow-up-{}", enqueued.item_ids[0]))
+        .expect("deterministic immediate mismatch subordinate run id");
+    let subordinate_plan_file = temp.path().join("immediate-mismatch-subordinate.json");
+    fs::write(
+        &subordinate_plan_file,
+        serde_json::to_vec_pretty(&different_plan)
+            .expect("serialize immediate mismatch subordinate plan"),
+    )
+    .expect("write immediate mismatch subordinate plan");
+    let preexisting_child_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let preexisting_dispatches = std::sync::Arc::clone(&preexisting_child_dispatches);
+    let mut preexisting_runner = move |command: &ExternalAgentCommand| {
+        let is_auditor = command
+            .output_last_message
+            .to_string_lossy()
+            .contains("review-auditor");
+        if is_auditor {
+            let mut child = injected_child_report(&follow_up_assignment);
+            child.files_changed = vec![PathBuf::from("src/client.rs")];
+            write_injected_json(
+                &command.output_last_message,
+                &injected_auditor_report(&follow_up_assignment, &child),
+            );
+        } else {
+            let count = preexisting_dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(1);
+            assert_eq!(count, 1, "pre-existing mismatched subordinate retried");
+            fs::create_dir_all(command.cwd.join("src"))
+                .expect("create pre-existing mismatch source dir");
+            fs::write(
+                command.cwd.join("src/client.rs"),
+                "pub fn mismatched() {}\n",
+            )
+            .expect("write pre-existing mismatch candidate");
+            let mut child = injected_child_report(&follow_up_assignment);
+            child.files_changed = vec![PathBuf::from("src/client.rs")];
+            write_injected_json(&command.output_last_message, &child);
+        }
+        write_injected_usage(command, 0, 1);
+        injected_verified_run(command)
+    };
+    let preexisting = run_supervisor_plan_file_with_runner(
+        SupervisorRunOptions {
+            repo: repo.clone(),
+            plan_file: subordinate_plan_file,
+            run_id: subordinate_run_id,
+            codex_bin: PathBuf::from("unused-injected-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: false,
+            machine_global_retention: Some(retention),
+        },
+        &mut preexisting_runner,
+    )
+    .expect("finalize pre-existing mismatched subordinate");
+    assert!(preexisting.success, "{preexisting:#?}");
+
+    let unexpected_resume_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let unexpected = std::sync::Arc::clone(&unexpected_resume_dispatches);
+    let mut resume_runner = move |_command: &ExternalAgentCommand| {
+        unexpected.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        panic!("immediate mismatch reconciliation started a new external dispatch");
+    };
+    let outcome =
+        resume_supervisor_plan_file_cascade_with_runner(source_options, &mut resume_runner)
+            .expect("return typed immediate mismatch refusal");
+    clear_generated_follow_up_queue_observer();
+    let primary_after = verified_whole_primary_snapshot_sha256(&repo)
+        .expect("capture immediate mismatch primary after");
+
+    assert!(!outcome.follow_up_cascade_success);
+    assert!(!outcome.generated_follow_up_dispatch_performed());
+    assert!(outcome.follow_up_reports.is_empty());
+    assert!(outcome.follow_up_gate_denials.iter().any(|denial| {
+        matches!(
+            denial.reason,
+            GateDenialReason::ApprovalReview {
+                denial: crate::gate_denial::ApprovalReviewDenial::PermissionExpansion
+            }
+        )
+    }));
+    let queue = outcome
+        .follow_up_queue
+        .expect("immediate mismatch queue summary");
+    assert_eq!(queue.pending_count, 0);
+    assert_eq!(queue.dispatch_started_count, 0);
+    assert_eq!(queue.held_ambiguous_count, 1);
+    assert_eq!(queue.acknowledged_terminal_count, 0);
+    assert_eq!(queue.authenticated_child_dispatch_started_count, 0);
+    assert_eq!(
+        source_child_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        preexisting_child_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        unexpected_resume_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(primary_after, primary_before);
+    assert!(!repo.join("src/client.rs").exists());
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 enum HeldFinalizedSubordinateVariant {
     Exact,

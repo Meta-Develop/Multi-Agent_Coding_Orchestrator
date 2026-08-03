@@ -1281,11 +1281,22 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                     };
                 match evidence {
                     supervise::GeneratedFollowUpDispatchEvidence::NoDurableDispatchStart => false,
-                    supervise::GeneratedFollowUpDispatchEvidence::AuthenticatedChildDispatchStarted => true,
-                    supervise::GeneratedFollowUpDispatchEvidence::NotProcessObservable => {
+                    supervise::GeneratedFollowUpDispatchEvidence::DurableDispatchStart {
+                        observation: RoleUsageObservation::SupervisorAggregate,
+                    } => true,
+                    supervise::GeneratedFollowUpDispatchEvidence::DurableDispatchStart {
+                        observation: RoleUsageObservation::NotProcessObservable,
+                    } => {
                         return Err(error.context(
                             "generated follow-up dispatch is not_process_observable after a durable dispatch marker; refusing to finalize a false execution claim",
                         ));
+                    }
+                    supervise::GeneratedFollowUpDispatchEvidence::DurableDispatchStart {
+                        observation,
+                    } => {
+                        return Err(error.context(format!(
+                            "generated follow-up dispatch has {observation:?} evidence after a durable dispatch marker; refusing to finalize a false execution claim"
+                        )));
                     }
                 }
             };

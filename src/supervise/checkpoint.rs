@@ -677,10 +677,13 @@ pub(super) fn authenticated_child_dispatch_started(repo: &Path, run_id: &RunId) 
     let authenticator = repository_authenticator_key_only(repo)?;
     validate_repository_authenticated_state(repo, &authenticator)?;
     let journal = StateJournal::open_instance(authenticator, run_id.as_str())?;
-    // Opening authenticates the complete chain and repository/key epoch before
-    // the phase becomes execution evidence.
-    Ok(journal
-        .records()
+    let records = journal.records();
+    // Opening authenticates the complete chain and repository/key epoch. The
+    // supervise analyzer additionally proves that the authenticated records
+    // form a structurally valid checkpoint before a raw phase can become
+    // execution evidence.
+    analyze_checkpoint_records(records, run_id)?;
+    Ok(records
         .iter()
         .any(|record| record.phase == PHASE_CHILD_DISPATCH_STARTED))
 }
