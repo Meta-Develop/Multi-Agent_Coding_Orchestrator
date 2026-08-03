@@ -4011,8 +4011,11 @@ fn verify_after_autopilot_safety(bindings: &RepositoryPathBindings) -> Result<()
 }
 
 #[cfg(test)]
+type AutopilotProfileCallsiteHook = Box<dyn FnMut(&mut SupervisorPlan)>;
+
+#[cfg(test)]
 thread_local! {
-    static AUTOPILOT_PROFILE_CALLSITE_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&mut SupervisorPlan)>>> =
+    static AUTOPILOT_PROFILE_CALLSITE_HOOK: std::cell::RefCell<Option<AutopilotProfileCallsiteHook>> =
         std::cell::RefCell::new(None);
 }
 
@@ -5642,7 +5645,7 @@ mod tests {
         let reopened = observations
             .iter()
             .filter(|observation| observation.label == "created_or_opened")
-            .last()
+            .next_back()
             .expect("observe direct supervise queue reopen");
         let started = observations
             .iter()

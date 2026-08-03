@@ -1296,72 +1296,72 @@ fn run_generated_round_last_moment_mutation(
     let mut profile_callback_invocations = 0_usize;
     let repo_for_gate = repo.clone();
     let config_for_gate = machine_global_config.clone();
-    let mut before_dispatch = |_effective: &SupervisorPlan| {
-        profile_callback_invocations = profile_callback_invocations.saturating_add(1);
-        if profile_callback_invocations == 2 {
-            match mutation {
-                GeneratedRoundLastMomentMutation::Primary => {
-                    fs::write(
-                        repo_for_gate.join("README.md"),
-                        "primary changed after generated profile approval\n",
-                    )
-                    .expect("mutate primary after generated profile approval");
-                }
-                GeneratedRoundLastMomentMutation::MachineGlobalConfig => {
-                    let mut changed = fs::read(&config_for_gate)
-                        .expect("reread machine-global config before drift");
-                    changed.extend_from_slice(b"\n ");
-                    fs::write(&config_for_gate, changed)
-                        .expect("mutate machine-global config after profile approval");
-                }
-                GeneratedRoundLastMomentMutation::MachineGlobalConfigDeleted => {
-                    fs::remove_file(&config_for_gate)
-                        .expect("delete machine-global config after profile approval");
-                }
-            }
-        }
-        Ok(true)
-    };
     let mut source_child_dispatches = 0_usize;
     let mut generated_runner_dispatches = 0_usize;
-    let mut runner = |command: &ExternalAgentCommand| {
-        let output_path = command.output_last_message.to_string_lossy();
-        let is_follow_up = output_path.contains("child-a-licensed-update-01");
-        let is_auditor = output_path.contains("review-auditor");
-        if is_follow_up {
-            generated_runner_dispatches = generated_runner_dispatches.saturating_add(1);
-            panic!("last-moment generated-round refusal reached an external runner");
-        } else if is_auditor {
-            write_injected_json(
-                &command.output_last_message,
-                &licensed_auditor_report(&source_assignment, Some(&declaration_sha256)),
-            );
-        } else {
-            source_child_dispatches = source_child_dispatches.saturating_add(1);
-            assert_eq!(source_child_dispatches, 1, "source child reran");
-            fs::write(command.cwd.join("README.md"), "licensed breaking change\n")
-                .expect("write last-moment source candidate");
-            write_injected_json(
-                &command.output_last_message,
-                &dependent_failure_child(&source_assignment, "src/client.rs"),
-            );
-        }
-        write_injected_usage(command, 0, 1);
-        injected_verified_run(command)
-    };
     let outer_run_id =
         RunId::new(format!("{run_name}-outer")).expect("last-moment outer command run id");
-    let outcome = run_supervisor_plan_file_cascade_with_runner_and_gate(
-        options,
-        GeneratedFollowUpQueueEntrypoint::SuperviseRun,
-        &outer_run_id,
-        &mut before_dispatch,
-        &mut runner,
-    )
-    .expect("return typed last-moment generated-round refusal");
+    let outcome = {
+        let mut before_dispatch = |_effective: &SupervisorPlan| {
+            profile_callback_invocations = profile_callback_invocations.saturating_add(1);
+            if profile_callback_invocations == 2 {
+                match mutation {
+                    GeneratedRoundLastMomentMutation::Primary => {
+                        fs::write(
+                            repo_for_gate.join("README.md"),
+                            "primary changed after generated profile approval\n",
+                        )
+                        .expect("mutate primary after generated profile approval");
+                    }
+                    GeneratedRoundLastMomentMutation::MachineGlobalConfig => {
+                        let mut changed = fs::read(&config_for_gate)
+                            .expect("reread machine-global config before drift");
+                        changed.extend_from_slice(b"\n ");
+                        fs::write(&config_for_gate, changed)
+                            .expect("mutate machine-global config after profile approval");
+                    }
+                    GeneratedRoundLastMomentMutation::MachineGlobalConfigDeleted => {
+                        fs::remove_file(&config_for_gate)
+                            .expect("delete machine-global config after profile approval");
+                    }
+                }
+            }
+            Ok(true)
+        };
+        let mut runner = |command: &ExternalAgentCommand| {
+            let output_path = command.output_last_message.to_string_lossy();
+            let is_follow_up = output_path.contains("child-a-licensed-update-01");
+            let is_auditor = output_path.contains("review-auditor");
+            if is_follow_up {
+                generated_runner_dispatches = generated_runner_dispatches.saturating_add(1);
+                panic!("last-moment generated-round refusal reached an external runner");
+            } else if is_auditor {
+                write_injected_json(
+                    &command.output_last_message,
+                    &licensed_auditor_report(&source_assignment, Some(&declaration_sha256)),
+                );
+            } else {
+                source_child_dispatches = source_child_dispatches.saturating_add(1);
+                assert_eq!(source_child_dispatches, 1, "source child reran");
+                fs::write(command.cwd.join("README.md"), "licensed breaking change\n")
+                    .expect("write last-moment source candidate");
+                write_injected_json(
+                    &command.output_last_message,
+                    &dependent_failure_child(&source_assignment, "src/client.rs"),
+                );
+            }
+            write_injected_usage(command, 0, 1);
+            injected_verified_run(command)
+        };
+        run_supervisor_plan_file_cascade_with_runner_and_gate(
+            options,
+            GeneratedFollowUpQueueEntrypoint::SuperviseRun,
+            &outer_run_id,
+            &mut before_dispatch,
+            &mut runner,
+        )
+        .expect("return typed last-moment generated-round refusal")
+    };
     clear_generated_follow_up_queue_observer();
-    drop(before_dispatch);
-    drop(runner);
     let primary_after =
         verified_whole_primary_snapshot_sha256(&repo).expect("capture last-moment primary after");
     let machine_global_config_after = fs::read(&machine_global_config).ok();
@@ -1568,44 +1568,45 @@ fn generated_follow_up_initial_deleted_retention_is_typed_without_queue() {
     let primary_before = verified_whole_primary_snapshot_sha256(&repo)
         .expect("capture initial deleted-retention primary before");
     let mut source_child_dispatches = 0_usize;
-    let mut source_runner = |command: &ExternalAgentCommand| {
-        let is_auditor = command
-            .output_last_message
-            .to_string_lossy()
-            .contains("review-auditor");
-        if is_auditor {
-            write_injected_json(
-                &command.output_last_message,
-                &licensed_auditor_report(&source_assignment, Some(&declaration_sha256)),
-            );
-        } else {
-            source_child_dispatches = source_child_dispatches.saturating_add(1);
-            assert_eq!(source_child_dispatches, 1, "initial source child reran");
-            fs::write(command.cwd.join("README.md"), "licensed breaking change\n")
-                .expect("write initial deleted-retention source candidate");
-            write_injected_json(
-                &command.output_last_message,
-                &dependent_failure_child(&source_assignment, "src/client.rs"),
-            );
-        }
-        write_injected_usage(command, 0, 1);
-        injected_verified_run(command)
+    let source = {
+        let mut source_runner = |command: &ExternalAgentCommand| {
+            let is_auditor = command
+                .output_last_message
+                .to_string_lossy()
+                .contains("review-auditor");
+            if is_auditor {
+                write_injected_json(
+                    &command.output_last_message,
+                    &licensed_auditor_report(&source_assignment, Some(&declaration_sha256)),
+                );
+            } else {
+                source_child_dispatches = source_child_dispatches.saturating_add(1);
+                assert_eq!(source_child_dispatches, 1, "initial source child reran");
+                fs::write(command.cwd.join("README.md"), "licensed breaking change\n")
+                    .expect("write initial deleted-retention source candidate");
+                write_injected_json(
+                    &command.output_last_message,
+                    &dependent_failure_child(&source_assignment, "src/client.rs"),
+                );
+            }
+            write_injected_usage(command, 0, 1);
+            injected_verified_run(command)
+        };
+        run_supervisor_plan_file_with_runner(options.clone(), &mut source_runner)
+            .expect("finalize source before deleting initial retention config")
     };
-    let source = run_supervisor_plan_file_with_runner(options.clone(), &mut source_runner)
-        .expect("finalize source before deleting initial retention config");
-    drop(source_runner);
     assert!(source.success, "{source:#?}");
     assert_eq!(source.generated_follow_up_tasks.len(), 1);
     fs::remove_file(&config).expect("delete retention config before cascade initialization");
     let mut unexpected_generated_dispatches = 0_usize;
-    let mut no_generated_runner = |_command: &ExternalAgentCommand| {
-        unexpected_generated_dispatches = unexpected_generated_dispatches.saturating_add(1);
-        panic!("initial deleted retention reached generated runner");
-    };
-    let outcome =
+    let outcome = {
+        let mut no_generated_runner = |_command: &ExternalAgentCommand| {
+            unexpected_generated_dispatches = unexpected_generated_dispatches.saturating_add(1);
+            panic!("initial deleted retention reached generated runner");
+        };
         resume_supervisor_plan_file_cascade_with_runner(options, &mut no_generated_runner)
-            .expect("return typed initial retention probe failure");
-    drop(no_generated_runner);
+            .expect("return typed initial retention probe failure")
+    };
 
     assert!(!outcome.follow_up_cascade_success);
     assert!(!outcome.generated_follow_up_dispatch_performed());

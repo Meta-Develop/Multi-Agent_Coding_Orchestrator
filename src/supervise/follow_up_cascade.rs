@@ -1002,8 +1002,11 @@ fn loaded_generated_plan_matches(
 }
 
 #[cfg(test)]
+type BeforeGeneratedFollowUpPlanLoadHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
 thread_local! {
-    static BEFORE_GENERATED_FOLLOW_UP_PLAN_LOAD_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> =
+    static BEFORE_GENERATED_FOLLOW_UP_PLAN_LOAD_HOOK: std::cell::RefCell<Option<BeforeGeneratedFollowUpPlanLoadHook>> =
         std::cell::RefCell::new(None);
 }
 
@@ -1086,10 +1089,12 @@ fn run_before_generated_follow_up_plan_load_hook(path: &Path) {
 }
 
 #[cfg(test)]
+type GeneratedFollowUpQueueObserver = Box<dyn FnMut(GeneratedFollowUpQueueTestObservation)>;
+
+#[cfg(test)]
 thread_local! {
-    static GENERATED_FOLLOW_UP_QUEUE_OBSERVER: std::cell::RefCell<
-        Option<Box<dyn FnMut(GeneratedFollowUpQueueTestObservation)>>
-    > = std::cell::RefCell::new(None);
+    static GENERATED_FOLLOW_UP_QUEUE_OBSERVER: std::cell::RefCell<Option<GeneratedFollowUpQueueObserver>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]

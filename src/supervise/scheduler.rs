@@ -48,10 +48,12 @@ impl FromStr for SupervisorConcurrencyPolicy {
 }
 
 #[cfg(test)]
+type BeforeSupervisorFinalReportPersistHook = Box<dyn FnMut(&mut SupervisorFinalReport)>;
+
+#[cfg(test)]
 thread_local! {
-    static BEFORE_SUPERVISOR_FINAL_REPORT_PERSIST_HOOK: std::cell::RefCell<
-        Option<Box<dyn FnMut(&mut SupervisorFinalReport)>>,
-    > = std::cell::RefCell::new(None);
+    static BEFORE_SUPERVISOR_FINAL_REPORT_PERSIST_HOOK: std::cell::RefCell<Option<BeforeSupervisorFinalReportPersistHook>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
