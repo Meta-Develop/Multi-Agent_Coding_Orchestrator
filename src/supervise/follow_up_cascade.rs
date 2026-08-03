@@ -479,6 +479,16 @@ pub(crate) fn generated_follow_up_dispatch_evidence_after_cascade_error(
     let (source_plan_sha256, source_lifecycle_observed) =
         match supervisor_status(repo, source_supervisor_run_id.clone()) {
             Ok(status) if status.lifecycle == SupervisorRunLifecycle::Finalized => {
+                let finalized = status
+                    .final_report
+                    .context("finalized cascade source has no authenticated final report")?;
+                // Queue creation consumes only generated tasks from the finalized source.
+                // An authenticated empty set proves that this source could not have opened
+                // or started a generated follow-up queue, even when an earlier supervisor
+                // preflight failed before persisting the normalized plan artifact.
+                if finalized.generated_follow_up_tasks.is_empty() {
+                    return Ok(GeneratedFollowUpDispatchEvidence::NoDurableDispatchStart);
+                }
                 let reader = ArtifactRunReader::open(
                     repo,
                     RunArtifactFamily::Supervise,
@@ -917,6 +927,25 @@ fn verify_authenticated_source_basis(
         .context("generated follow-up source has no authenticated final report")?;
     let supplied_report_bytes = encode_final_report(source)?;
     let authenticated = read_supervisor_final_report(&reader)?;
+    // The finalized bytes are the authenticated execution basis. Comparing
+    // them with the same canonical encoder used by persistence covers every
+    // report field without depending on whether serde's decode defaults are
+    // structurally PartialEq-stable. The typed read above still rejects a
+    // malformed report before any queue state is opened.
+    if authenticated_report_bytes != supplied_report_bytes {
+        bail!("supplied generated follow-up source report differs from the authenticated canonical final-report bytes");
+    }
+    if authenticated.run_id != source.run_id
+        || authenticated.run_lifecycle != SupervisorRunLifecycle::Finalized
+    {
+        bail!("authenticated generated follow-up source report is not the expected finalized run");
+    }
+    // A finalized empty generated-task set is sufficient for the source-only
+    // outcome. Runtime-catalog preflight failures intentionally finalize before
+    // the normalized plan artifact exists, and there is no queue input to bind.
+    if authenticated.generated_follow_up_tasks.is_empty() {
+        return Ok(());
+    }
     let plan_bytes = reader
         .read("assignments/supervisor-plan.json")
         .context("generated follow-up source has no authenticated normalized plan")?;
@@ -931,19 +960,6 @@ fn verify_authenticated_source_basis(
     )?;
     if &authenticated_loaded != supplied || authenticated_sha256 != supplied_sha256 {
         bail!("supplied generated follow-up source plan differs from its authenticated finalized plan");
-    }
-    // The finalized bytes are the authenticated execution basis. Comparing
-    // them with the same canonical encoder used by persistence covers every
-    // report field without depending on whether serde's decode defaults are
-    // structurally PartialEq-stable. The typed read above still rejects a
-    // malformed report before any queue state is opened.
-    if authenticated_report_bytes != supplied_report_bytes {
-        bail!("supplied generated follow-up source report differs from the authenticated canonical final-report bytes");
-    }
-    if authenticated.run_id != source.run_id
-        || authenticated.run_lifecycle != SupervisorRunLifecycle::Finalized
-    {
-        bail!("authenticated generated follow-up source report is not the expected finalized run");
     }
     Ok(())
 }
