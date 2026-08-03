@@ -2,10 +2,9 @@ use super::*;
 use crate::{
     artifacts::repository_authenticator_key_only,
     follow_up_queue::{
-        GeneratedFollowUpDispatchObservation, GeneratedFollowUpQueue,
-        GeneratedFollowUpQueueBounds, GeneratedFollowUpQueueEntrypoint,
-        GeneratedFollowUpQueuePhase, GeneratedFollowUpQueueSource,
-        GeneratedFollowUpRetentionBinding,
+        GeneratedFollowUpDispatchObservation, GeneratedFollowUpQueue, GeneratedFollowUpQueueBounds,
+        GeneratedFollowUpQueueEntrypoint, GeneratedFollowUpQueuePhase,
+        GeneratedFollowUpQueueSource, GeneratedFollowUpRetentionBinding,
     },
 };
 use std::io::Write;
@@ -16,6 +15,22 @@ pub(super) struct FollowUpCascadeInvocation<'a> {
     pub(super) outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
     pub(super) outer_command_run_id: &'a RunId,
     pub(super) concurrency_policy: SupervisorConcurrencyPolicy,
+    pub(super) runtime_catalog: FollowUpRuntimeCatalog,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum FollowUpRuntimeCatalog {
+    Production,
+    #[cfg(test)]
+    Injected,
+}
+
+enum FollowUpPreparation {
+    Ready {
+        plan_file: tempfile::NamedTempFile,
+        loaded: LoadedSupervisorPlan,
+    },
+    Refused(GateDenial),
 }
 
 pub(super) fn source_only_cascade_outcome(
@@ -27,6 +42,7 @@ pub(super) fn source_only_cascade_outcome(
         source_report,
         follow_up_cascade_version: FOLLOW_UP_CASCADE_VERSION,
         follow_up_cascade_success,
+        follow_up_primary_worktree_untouched: None,
         follow_up_queue: None,
         follow_up_reports: Vec::new(),
         follow_up_gate_denials: Vec::new(),
@@ -40,32 +56,32 @@ pub(super) fn run_generated_follow_up_cascade(
     supervisor_template: &SupervisorRunOptions,
     invocation: FollowUpCascadeInvocation<'_>,
     before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<bool>,
+    external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorCascadeOutcome> {
-    if source_report.generated_follow_up_tasks.is_empty() {
-        return Ok(source_only_cascade_outcome(source_report));
-    }
-    if !source_report.success || !source_report.accepted || !source_report.publishable {
-        return Ok(source_only_cascade_outcome(source_report));
-    }
-
     let source_plan_sha256 = normalized_supervisor_plan_sha256(
         &source_loaded.plan,
         &source_loaded.consultant,
         &source_loaded.assignment_metadata,
         &source_loaded.plan_metadata,
     )?;
-    verify_authenticated_source_basis(
-        repo,
-        source_loaded,
-        &source_report,
-        &source_plan_sha256,
-    )?;
+    verify_authenticated_source_basis(repo, source_loaded, &source_report, &source_plan_sha256)?;
+    // Authentication precedes every early return. Resume is therefore bound
+    // to the immutable finalized source artifact even when that source has no
+    // generated work, failed, or was not publishable.
+    if source_report.generated_follow_up_tasks.is_empty() {
+        return Ok(source_only_cascade_outcome(source_report));
+    }
+    if !source_report.success || !source_report.accepted || !source_report.publishable {
+        return Ok(source_only_cascade_outcome(source_report));
+    }
     let primary_baseline =
         primary_worktree_snapshot_sha256(repo, SupervisorExecutionRuntime::Verified)?;
     let retention = supervisor_template
         .machine_global_retention
         .as_ref()
-        .context("generated follow-up cascade requires the inherited machine-global retention binding")?;
+        .context(
+            "generated follow-up cascade requires the inherited machine-global retention binding",
+        )?;
     let retained_binding = GeneratedFollowUpRetentionBinding::from_machine_global(retention)?;
     let authenticator = repository_authenticator_key_only(repo)?;
     let repository_id = authenticator.binding().repository_id.clone();
@@ -94,6 +110,8 @@ pub(super) fn run_generated_follow_up_cascade(
     } else {
         queue.enqueue_all_before_dispatch(&source_report.generated_follow_up_tasks)?;
     }
+    #[cfg(test)]
+    interrupt_after_follow_up_enqueue()?;
 
     queue.release_claimed_before_dispatch()?;
     let mut follow_up_reports = Vec::new();
@@ -110,66 +128,105 @@ pub(super) fn run_generated_follow_up_cascade(
         &mut cascade_gate_denials,
     )?;
 
-    let pending = queue
-        .snapshot()
-        .pending_item_ids()
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    // Never overtake an unresolved earlier effect. In particular an Active
+    // subordinate remains DispatchStarted and blocks every pending sibling
+    // until a later invocation can authenticate a terminal report.
+    let reconciled_summary = queue.summary();
+    let unresolved = reconciled_summary.claimed > 0
+        || reconciled_summary.dispatch_started > 0
+        || reconciled_summary.dispatch_observed > 0
+        || reconciled_summary.held_ambiguous > 0;
+    if unresolved {
+        cascade_success = false;
+    }
+    let pending = if unresolved {
+        Vec::new()
+    } else {
+        queue
+            .snapshot()
+            .pending_item_ids()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
     for item_id in pending {
         queue.claim(&item_id)?;
-        if primary_worktree_snapshot_sha256(repo, SupervisorExecutionRuntime::Verified)?
-            != primary_baseline
-        {
-            let denial = primary_integrity_denial(&item_id)?;
-            queue.release_before_dispatch(&item_id, Some(denial.clone()), Vec::new())?;
-            cascade_gate_denials.push(denial);
-            cascade_success = false;
-            break;
-        }
-        // Re-read the exact config bytes and inode immediately before every
-        // subordinate call. A changed binding refuses while the item is still
-        // safely releasable and has no dispatch-start marker.
-        let observed_retention = GeneratedFollowUpRetentionBinding::from_machine_global(retention)?;
-        if observed_retention.binding_sha256() != queue.snapshot().source().retention_binding_sha256()
-        {
-            let denial = permission_expansion_denial(&item_id)?;
-            queue.release_before_dispatch(&item_id, Some(denial.clone()), Vec::new())?;
-            cascade_gate_denials.push(denial);
-            cascade_success = false;
-            break;
-        }
+        let preparation = (|| -> Result<FollowUpPreparation> {
+            if primary_worktree_snapshot_sha256(repo, SupervisorExecutionRuntime::Verified)?
+                != primary_baseline
+            {
+                return Ok(FollowUpPreparation::Refused(primary_integrity_denial(
+                    &item_id,
+                )?));
+            }
+            if !retention_binding_matches(retention, &queue)? {
+                return Ok(FollowUpPreparation::Refused(permission_expansion_denial(
+                    &item_id,
+                )?));
+            }
 
-        let task = queue
-            .snapshot()
-            .item(&item_id)
-            .context("claimed generated follow-up item disappeared")?
-            .task()
-            .clone();
-        if task.cascade_depth != LICENSED_BREAKAGE_CASCADE_DEPTH {
-            let denial = permission_expansion_denial(&item_id)?;
-            queue.release_before_dispatch(&item_id, Some(denial.clone()), Vec::new())?;
-            cascade_gate_denials.push(denial);
-            cascade_success = false;
-            break;
-        }
-        let effective = validate_generated_follow_up_plan_document(&task.supervisor_plan)?;
-        let mut plan_file = generated_plan_file(repo, &task.supervisor_plan)?;
-        #[cfg(test)]
-        run_before_generated_follow_up_plan_load_hook(plan_file.path());
-        let reloaded = load_exact_generated_plan_file(plan_file.path(), &task.supervisor_plan)?;
-        if reloaded != effective {
-            bail!("generated follow-up ordinary plan file changed before dispatch");
-        }
-        // The caller-specific profile gate is intentionally last: it is built
-        // from the exact file the ordinary supervisor call will reload.
-        if !before_dispatch(&reloaded)? {
-            let denial = inconsistent_profile_denial(&item_id)?;
-            queue.release_before_dispatch(&item_id, Some(denial.clone()), Vec::new())?;
-            cascade_gate_denials.push(denial);
-            cascade_success = false;
-            break;
-        }
+            let task = queue
+                .snapshot()
+                .item(&item_id)
+                .context("claimed generated follow-up item disappeared")?
+                .task()
+                .clone();
+            if task.cascade_depth != LICENSED_BREAKAGE_CASCADE_DEPTH {
+                return Ok(FollowUpPreparation::Refused(permission_expansion_denial(
+                    &item_id,
+                )?));
+            }
+            let effective = validate_generated_follow_up_plan_document(&task.supervisor_plan)?;
+            let plan_file = generated_plan_file(repo, &task.supervisor_plan)?;
+            #[cfg(test)]
+            run_before_generated_follow_up_plan_load_hook(plan_file.path());
+            let reloaded = load_exact_generated_plan_file(plan_file.path(), &task.supervisor_plan)?;
+            if reloaded.plan != effective {
+                bail!("generated follow-up ordinary plan file changed before dispatch");
+            }
+            if !before_dispatch(&reloaded.plan)? {
+                return Ok(FollowUpPreparation::Refused(inconsistent_profile_denial(
+                    &item_id,
+                )?));
+            }
+
+            // These are the last effectful-path checks. They run after the
+            // full loader and caller-specific profile callback, immediately
+            // before the durable dispatch-start marker and subordinate call.
+            if primary_worktree_snapshot_sha256(repo, SupervisorExecutionRuntime::Verified)?
+                != primary_baseline
+            {
+                return Ok(FollowUpPreparation::Refused(primary_integrity_denial(
+                    &item_id,
+                )?));
+            }
+            if !retention_binding_matches(retention, &queue)? {
+                return Ok(FollowUpPreparation::Refused(permission_expansion_denial(
+                    &item_id,
+                )?));
+            }
+            Ok(FollowUpPreparation::Ready {
+                plan_file,
+                loaded: reloaded,
+            })
+        })();
+        let (mut plan_file, reloaded) = match preparation {
+            Ok(FollowUpPreparation::Ready { plan_file, loaded }) => (plan_file, loaded),
+            Ok(FollowUpPreparation::Refused(denial)) => {
+                queue.release_before_dispatch(&item_id, Some(denial.clone()), Vec::new())?;
+                cascade_gate_denials.push(denial);
+                cascade_success = false;
+                break;
+            }
+            Err(error) => {
+                // No dispatch marker exists yet, so an injected crash or
+                // validation/read error can be made explicitly retryable.
+                queue.release_before_dispatch(&item_id, None, Vec::new())?;
+                return Err(error.context(
+                    "generated follow-up preparation failed before durable dispatch start",
+                ));
+            }
+        };
         let started = queue.mark_dispatch_started(&item_id)?;
         let subordinate_run_id = RunId::new(
             started
@@ -186,19 +243,20 @@ pub(super) fn run_generated_follow_up_cascade(
             allow_dirty_primary: supervisor_template.allow_dirty_primary,
             machine_global_retention: Some(retention.clone()),
         };
-        let result = run_supervisor_plan_file_with_concurrency_policy(
+        let result = run_follow_up_supervisor_loaded_plan(
             subordinate_options,
+            reloaded,
             invocation.concurrency_policy,
+            invocation.runtime_catalog,
+            external_runner,
         );
         // The loader no longer needs the private file once the ordinary call
         // returns; keeping the handle alive across the call prevents path reuse.
         plan_file.as_file_mut().flush()?;
         match result {
             Ok(report) => {
-                let child_started = authenticated_child_dispatch_started(
-                    repo,
-                    &subordinate_run_id,
-                )?;
+                let child_started =
+                    authenticated_child_dispatch_started(repo, &subordinate_run_id)?;
                 if child_started {
                     authenticated_child_dispatch_started_count =
                         authenticated_child_dispatch_started_count
@@ -213,6 +271,7 @@ pub(super) fn run_generated_follow_up_cascade(
                 )?;
                 queue.mark_dispatch_observed(&item_id, observation)?;
                 queue.acknowledge_terminal(&item_id)?;
+                cascade_gate_denials.extend(report.gate_denials.iter().cloned());
                 if !report.generated_follow_up_tasks.is_empty() {
                     cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
                     cascade_success = false;
@@ -223,8 +282,8 @@ pub(super) fn run_generated_follow_up_cascade(
                     break;
                 }
             }
-            Err(_error) => {
-                if let Some(report) = conclusive_subordinate_report(repo, &subordinate_run_id)? {
+            Err(_error) => match subordinate_reconciliation(repo, &subordinate_run_id)? {
+                SubordinateReconciliation::Finalized(report) => {
                     let child_started = observe_and_acknowledge(
                         repo,
                         &mut queue,
@@ -236,27 +295,46 @@ pub(super) fn run_generated_follow_up_cascade(
                         authenticated_child_dispatch_started_count =
                             authenticated_child_dispatch_started_count
                                 .checked_add(1)
-                                .context("generated follow-up dispatch evidence count overflowed")?;
+                                .context(
+                                    "generated follow-up dispatch evidence count overflowed",
+                                )?;
                     }
-                    cascade_success &= report.success && report.generated_follow_up_tasks.is_empty();
+                    cascade_gate_denials.extend(report.gate_denials.iter().cloned());
+                    cascade_success &=
+                        report.success && report.generated_follow_up_tasks.is_empty();
                     if !report.generated_follow_up_tasks.is_empty() {
                         cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
                     }
                     follow_up_reports.push(report);
-                } else {
+                }
+                SubordinateReconciliation::Active
+                | SubordinateReconciliation::RetryableStatusRead => {
+                    cascade_gate_denials.push(ambiguous_dispatch_denial(&item_id)?);
+                    cascade_success = false;
+                    break;
+                }
+                SubordinateReconciliation::Ambiguous => {
                     let denial = ambiguous_dispatch_denial(&item_id)?;
                     queue.mark_held_ambiguous(&item_id, Some(denial.clone()), Vec::new())?;
                     cascade_gate_denials.push(denial);
                     cascade_success = false;
                     break;
                 }
-            }
+            },
+        }
+        if !cascade_success {
+            // A failed/refused generated subordinate never authorizes a later
+            // sibling effect. Remaining work stays durably Enqueued for an
+            // explicit later reconciliation decision.
+            break;
         }
     }
 
     let final_primary =
         primary_worktree_snapshot_sha256(repo, SupervisorExecutionRuntime::Verified)?;
-    if final_primary != primary_baseline {
+    let follow_up_primary_worktree_untouched = final_primary == primary_baseline;
+    if !follow_up_primary_worktree_untouched {
+        cascade_gate_denials.push(primary_integrity_denial(source_report.run_id.as_str())?);
         cascade_success = false;
     }
     let queue_summary = queue.summary();
@@ -270,6 +348,7 @@ pub(super) fn run_generated_follow_up_cascade(
         source_report,
         follow_up_cascade_version: FOLLOW_UP_CASCADE_VERSION,
         follow_up_cascade_success: cascade_success,
+        follow_up_primary_worktree_untouched: Some(follow_up_primary_worktree_untouched),
         follow_up_queue: Some(SupervisorFollowUpQueueSummary {
             queue_instance_id: queue_summary.queue_instance_id,
             source_supervisor_run_id: queue_summary.source_supervisor_run_id,
@@ -286,6 +365,47 @@ pub(super) fn run_generated_follow_up_cascade(
         follow_up_reports,
         follow_up_gate_denials: cascade_gate_denials,
     })
+}
+
+fn run_follow_up_supervisor_loaded_plan(
+    options: SupervisorRunOptions,
+    loaded: LoadedSupervisorPlan,
+    concurrency_policy: SupervisorConcurrencyPolicy,
+    runtime_catalog: FollowUpRuntimeCatalog,
+    external_runner: &CancellableExternalRunner<'_>,
+) -> Result<SupervisorFinalReport> {
+    let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
+    validate_max_concurrent_children(max_concurrent_children)?;
+    let repo = discover_repo_root(&options.repo)?;
+    let manager = WorktreeManager::new(&repo);
+    let cleanliness = manager.acquire_repository_cleanliness()?;
+    let runtime_model_catalog = match runtime_catalog {
+        FollowUpRuntimeCatalog::Production => RuntimeModelCatalog::for_supervisor(&options, &repo),
+        #[cfg(test)]
+        FollowUpRuntimeCatalog::Injected => {
+            Ok(test_runtime_model_catalog(&loaded.plan, options.runtime)?)
+        }
+    };
+    run_supervisor_plan_with_runner_and_creation(
+        loaded,
+        options,
+        max_concurrent_children,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::Bound(&cleanliness),
+        runtime_model_catalog,
+        external_runner,
+    )
+}
+
+fn retention_binding_matches(
+    retention: &MachineGlobalRetentionBinding,
+    queue: &GeneratedFollowUpQueue,
+) -> Result<bool> {
+    // Both exact config contents and stable file identity are represented in
+    // this digest. Reconstructing it from the inherited binding prevents a
+    // generated round from bypassing the machine-global retention boundary.
+    let observed = GeneratedFollowUpRetentionBinding::from_machine_global(retention)?;
+    Ok(observed.binding_sha256() == queue.snapshot().source().retention_binding_sha256())
 }
 
 fn reconcile_started_items(
@@ -316,45 +436,53 @@ fn reconcile_started_items(
                         .as_deref()
                         .context("started generated follow-up has no subordinate run id")?,
                 )?;
-                if let Some(report) = conclusive_subordinate_report(repo, &run_id)? {
-                    let child_started = observe_and_acknowledge(
-                        repo,
-                        queue,
-                        &item_id,
-                        &run_id,
-                        &report,
-                    )?;
-                    if child_started {
-                        *authenticated_dispatches = authenticated_dispatches
-                            .checked_add(1)
-                            .context("generated follow-up dispatch evidence count overflowed")?;
+                match subordinate_reconciliation(repo, &run_id)? {
+                    SubordinateReconciliation::Finalized(report) => {
+                        let child_started =
+                            observe_and_acknowledge(repo, queue, &item_id, &run_id, &report)?;
+                        if child_started {
+                            *authenticated_dispatches =
+                                authenticated_dispatches.checked_add(1).context(
+                                    "generated follow-up dispatch evidence count overflowed",
+                                )?;
+                        }
+                        cascade_gate_denials.extend(report.gate_denials.iter().cloned());
+                        if !report.generated_follow_up_tasks.is_empty() {
+                            cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
+                        }
+                        *cascade_success &=
+                            report.success && report.generated_follow_up_tasks.is_empty();
+                        reports.push(report);
                     }
-                    if !report.generated_follow_up_tasks.is_empty() {
-                        cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
+                    SubordinateReconciliation::Active
+                    | SubordinateReconciliation::RetryableStatusRead => {
+                        cascade_gate_denials.push(ambiguous_dispatch_denial(&item_id)?);
+                        *cascade_success = false;
                     }
-                    *cascade_success &= report.success && report.generated_follow_up_tasks.is_empty();
-                    reports.push(report);
-                } else {
-                    let denial = ambiguous_dispatch_denial(&item_id)?;
-                    queue.mark_held_ambiguous(&item_id, Some(denial.clone()), Vec::new())?;
-                    cascade_gate_denials.push(denial);
-                    *cascade_success = false;
+                    SubordinateReconciliation::Ambiguous => {
+                        let denial = ambiguous_dispatch_denial(&item_id)?;
+                        queue.mark_held_ambiguous(&item_id, Some(denial.clone()), Vec::new())?;
+                        cascade_gate_denials.push(denial);
+                        *cascade_success = false;
+                    }
                 }
             }
             GeneratedFollowUpQueuePhase::DispatchObserved => {
-                queue.acknowledge_terminal(&item_id)?;
                 let run_id = RunId::new(
                     subordinate_run_id
                         .as_deref()
                         .context("observed generated follow-up has no subordinate run id")?,
                 )?;
-                if let Some(report) = conclusive_subordinate_report(repo, &run_id)? {
+                if let Some(report) = conclusive_finalized_report(repo, &run_id)? {
+                    queue.acknowledge_terminal(&item_id)?;
                     if authenticated_child_dispatch_started(repo, &run_id)? {
                         *authenticated_dispatches = authenticated_dispatches
                             .checked_add(1)
                             .context("generated follow-up dispatch evidence count overflowed")?;
                     }
-                    *cascade_success &= report.success && report.generated_follow_up_tasks.is_empty();
+                    cascade_gate_denials.extend(report.gate_denials.iter().cloned());
+                    *cascade_success &=
+                        report.success && report.generated_follow_up_tasks.is_empty();
                     if !report.generated_follow_up_tasks.is_empty() {
                         cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
                     }
@@ -374,13 +502,15 @@ fn reconcile_started_items(
                         .as_deref()
                         .context("acknowledged generated follow-up has no subordinate run id")?,
                 )?;
-                if let Some(report) = conclusive_subordinate_report(repo, &run_id)? {
+                if let Some(report) = conclusive_finalized_report(repo, &run_id)? {
                     if authenticated_child_dispatch_started(repo, &run_id)? {
                         *authenticated_dispatches = authenticated_dispatches
                             .checked_add(1)
                             .context("generated follow-up dispatch evidence count overflowed")?;
                     }
-                    *cascade_success &= report.success && report.generated_follow_up_tasks.is_empty();
+                    cascade_gate_denials.extend(report.gate_denials.iter().cloned());
+                    *cascade_success &=
+                        report.success && report.generated_follow_up_tasks.is_empty();
                     if !report.generated_follow_up_tasks.is_empty() {
                         cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
                     }
@@ -390,28 +520,53 @@ fn reconcile_started_items(
                     *cascade_success = false;
                 }
             }
-            GeneratedFollowUpQueuePhase::Enqueued
-            | GeneratedFollowUpQueuePhase::Claimed => {}
+            GeneratedFollowUpQueuePhase::Enqueued | GeneratedFollowUpQueuePhase::Claimed => {}
         }
     }
     Ok(())
 }
 
-fn conclusive_subordinate_report(
+enum SubordinateReconciliation {
+    Finalized(SupervisorFinalReport),
+    Active,
+    Ambiguous,
+    RetryableStatusRead,
+}
+
+fn subordinate_reconciliation(repo: &Path, run_id: &RunId) -> Result<SubordinateReconciliation> {
+    let Ok(status) = supervisor_status(repo, run_id.clone()) else {
+        // Preserve DispatchStarted so a later invocation can retry the
+        // authenticated status read. A transient read failure is not evidence
+        // that the external effect is permanently ambiguous.
+        return Ok(SubordinateReconciliation::RetryableStatusRead);
+    };
+    match status.lifecycle {
+        SupervisorRunLifecycle::Finalized => status
+            .final_report
+            .map(SubordinateReconciliation::Finalized)
+            .context("finalized generated follow-up has no authenticated report"),
+        SupervisorRunLifecycle::Resumable => {
+            match resume_supervisor_run(repo, run_id.clone())?.final_report {
+                Some(report) => Ok(SubordinateReconciliation::Finalized(report)),
+                None => Ok(SubordinateReconciliation::Ambiguous),
+            }
+        }
+        SupervisorRunLifecycle::Active => Ok(SubordinateReconciliation::Active),
+        SupervisorRunLifecycle::Interrupted | SupervisorRunLifecycle::Uncertain => {
+            Ok(SubordinateReconciliation::Ambiguous)
+        }
+    }
+}
+
+fn conclusive_finalized_report(
     repo: &Path,
     run_id: &RunId,
 ) -> Result<Option<SupervisorFinalReport>> {
-    let Ok(status) = supervisor_status(repo, run_id.clone()) else {
-        return Ok(None);
-    };
-    match status.lifecycle {
-        SupervisorRunLifecycle::Finalized => Ok(status.final_report),
-        SupervisorRunLifecycle::Resumable => {
-            Ok(resume_supervisor_run(repo, run_id.clone())?.final_report)
-        }
-        SupervisorRunLifecycle::Active
-        | SupervisorRunLifecycle::Interrupted
-        | SupervisorRunLifecycle::Uncertain => Ok(None),
+    match subordinate_reconciliation(repo, run_id)? {
+        SubordinateReconciliation::Finalized(report) => Ok(Some(report)),
+        SubordinateReconciliation::Active
+        | SubordinateReconciliation::Ambiguous
+        | SubordinateReconciliation::RetryableStatusRead => Ok(None),
     }
 }
 
@@ -458,11 +613,8 @@ fn verify_authenticated_source_basis(
     if &authenticated_loaded != supplied || authenticated_sha256 != supplied_sha256 {
         bail!("supplied generated follow-up source plan differs from its authenticated finalized plan");
     }
-    if authenticated.accepted != source.accepted
-        || authenticated.publishable != source.publishable
-        || authenticated.generated_follow_up_tasks != source.generated_follow_up_tasks
-    {
-        bail!("generated follow-up source tasks differ from the authenticated finalized report");
+    if authenticated != *source {
+        bail!("supplied generated follow-up source report differs from the authenticated finalized report");
     }
     Ok(())
 }
@@ -485,7 +637,7 @@ fn generated_plan_file(
 fn load_exact_generated_plan_file(
     path: &Path,
     generated: &GeneratedFollowUpSupervisorPlan,
-) -> Result<SupervisorPlan> {
+) -> Result<LoadedSupervisorPlan> {
     let loaded = load_supervisor_plan_file_with_consultant(path)?;
     if loaded.plan != generated.ordinary_plan()
         || loaded.consultant != generated.consultant
@@ -494,9 +646,11 @@ fn load_exact_generated_plan_file(
         || loaded.plan_metadata.generated_follow_up != Some(generated.generated_follow_up.clone())
         || !loaded.plan_metadata.spec_fragment_ids.is_empty()
     {
-        bail!("persisted generated follow-up plan changed across the ordinary full-document loader");
+        bail!(
+            "persisted generated follow-up plan changed across the ordinary full-document loader"
+        );
     }
-    Ok(loaded.plan)
+    Ok(loaded)
 }
 
 #[cfg(test)]
@@ -506,11 +660,30 @@ thread_local! {
 }
 
 #[cfg(test)]
-pub(crate) fn set_before_generated_follow_up_plan_load_hook(
-    hook: impl FnMut(&Path) + 'static,
-) {
+pub(crate) fn set_before_generated_follow_up_plan_load_hook(hook: impl FnMut(&Path) + 'static) {
     BEFORE_GENERATED_FOLLOW_UP_PLAN_LOAD_HOOK
         .with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+thread_local! {
+    static INTERRUPT_AFTER_FOLLOW_UP_ENQUEUE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn set_interrupt_after_follow_up_enqueue() {
+    INTERRUPT_AFTER_FOLLOW_UP_ENQUEUE.with(|slot| slot.set(true));
+}
+
+#[cfg(test)]
+fn interrupt_after_follow_up_enqueue() -> Result<()> {
+    let interrupted = INTERRUPT_AFTER_FOLLOW_UP_ENQUEUE.with(|slot| slot.replace(false));
+    if interrupted {
+        bail!("injected interruption after durable generated follow-up enqueue");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

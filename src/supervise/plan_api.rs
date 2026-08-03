@@ -260,8 +260,8 @@ pub(super) fn parse_supervisor_plan_with_consultant(
 pub(crate) fn validate_generated_follow_up_plan_document(
     generated: &GeneratedFollowUpSupervisorPlan,
 ) -> Result<SupervisorPlan> {
-    let serialized = serde_json::to_string(generated)
-        .context("failed to serialize generated follow-up plan")?;
+    let serialized =
+        serde_json::to_string(generated).context("failed to serialize generated follow-up plan")?;
     let loaded = parse_supervisor_plan_with_consultant(&serialized)
         .context("generated follow-up plan failed the ordinary full-document loader")?;
     if loaded.plan != generated.ordinary_plan()
@@ -888,8 +888,10 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy(
             outer_entrypoint: GeneratedFollowUpQueueEntrypoint::SuperviseRun,
             outer_command_run_id: &outer_run_id,
             concurrency_policy,
+            runtime_catalog: FollowUpRuntimeCatalog::Production,
         },
         &mut permit,
+        &run_external_agent_cancellable_reviewed,
     )
 }
 
@@ -948,8 +950,10 @@ fn resume_generated_follow_up_cascade(
             outer_entrypoint: GeneratedFollowUpQueueEntrypoint::SuperviseRun,
             outer_command_run_id: &run_id,
             concurrency_policy,
+            runtime_catalog: FollowUpRuntimeCatalog::Production,
         },
         &mut permit,
+        &run_external_agent_cancellable_reviewed,
     )
 }
 
@@ -981,6 +985,9 @@ fn run_supervisor_plan_file_cascade_with_gate(
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    if !before_dispatch(&loaded.plan)? {
+        bail!("effective supervisor profile changed before exact loaded-plan dispatch");
+    }
     let source_loaded = loaded.clone();
     let template = options.clone();
     let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
@@ -1003,8 +1010,10 @@ fn run_supervisor_plan_file_cascade_with_gate(
             outer_entrypoint,
             outer_command_run_id,
             concurrency_policy,
+            runtime_catalog: FollowUpRuntimeCatalog::Production,
         },
         before_dispatch,
+        &run_external_agent_cancellable_reviewed,
     )
 }
 

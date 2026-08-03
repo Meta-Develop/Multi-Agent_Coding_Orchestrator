@@ -102,7 +102,9 @@ pub use plan_api::*;
 mod follow_up_cascade;
 use follow_up_cascade::*;
 #[cfg(test)]
-pub(crate) use follow_up_cascade::set_before_generated_follow_up_plan_load_hook;
+pub(crate) use follow_up_cascade::{
+    set_before_generated_follow_up_plan_load_hook, set_interrupt_after_follow_up_enqueue,
+};
 
 mod repository;
 use repository::*;
@@ -1152,6 +1154,11 @@ pub struct SupervisorCascadeOutcome {
     pub source_report: SupervisorFinalReport,
     pub follow_up_cascade_version: u32,
     pub follow_up_cascade_success: bool,
+    /// Observed whole-primary equality across an actual generated follow-up
+    /// cascade. `None` means that no follow-up round was dispatched or
+    /// reconciled, so there is no round-two execution fact to report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up_primary_worktree_untouched: Option<bool>,
     pub follow_up_queue: Option<SupervisorFollowUpQueueSummary>,
     #[serde(default)]
     pub follow_up_reports: Vec<SupervisorFinalReport>,
@@ -1177,9 +1184,9 @@ pub struct SupervisorFollowUpQueueSummary {
 
 impl SupervisorCascadeOutcome {
     pub fn generated_follow_up_dispatch_performed(&self) -> bool {
-        self.follow_up_queue.as_ref().is_some_and(|queue| {
-            queue.authenticated_child_dispatch_started_count > 0
-        })
+        self.follow_up_queue
+            .as_ref()
+            .is_some_and(|queue| queue.authenticated_child_dispatch_started_count > 0)
     }
 }
 
@@ -1631,6 +1638,105 @@ fn run_supervisor_plan_file_with_runner(
             Ok(mut runner) => runner(command),
             Err(poisoned) => poisoned.into_inner()(command),
         },
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn run_supervisor_plan_file_cascade_with_runner(
+    options: SupervisorRunOptions,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorCascadeOutcome> {
+    validate_max_concurrent_children(1)?;
+    if options.runtime == SupervisorRuntime::Fake {
+        bail!("publishable generated follow-up cascade tests require the verified runtime path");
+    }
+    let repo = discover_repo_root(&options.repo)?;
+    let manager = WorktreeManager::new(&repo);
+    let cleanliness = manager.acquire_repository_cleanliness()?;
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let source_loaded = loaded.clone();
+    let template = options.clone();
+    let outer_run_id = options.run_id.clone();
+    let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
+    let serialized_runner = Mutex::new(external_runner);
+    let cancellable =
+        |command: &ExternalAgentCommand, _cancellation, _review_runtime| match serialized_runner
+            .lock()
+        {
+            Ok(mut runner) => runner(command),
+            Err(poisoned) => poisoned.into_inner()(command),
+        };
+    let source_report = run_supervisor_plan_with_runner_and_creation(
+        loaded,
+        options,
+        1,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::Bound(&cleanliness),
+        Ok(runtime_model_catalog),
+        &cancellable,
+    )?;
+    drop(cleanliness);
+    let mut permit = |_plan: &SupervisorPlan| Ok(true);
+    run_generated_follow_up_cascade(
+        &repo,
+        &source_loaded,
+        source_report,
+        &template,
+        FollowUpCascadeInvocation {
+            outer_entrypoint: GeneratedFollowUpQueueEntrypoint::SuperviseRun,
+            outer_command_run_id: &outer_run_id,
+            concurrency_policy: SupervisorConcurrencyPolicy::Fixed(NonZeroUsize::MIN),
+            runtime_catalog: FollowUpRuntimeCatalog::Injected,
+        },
+        &mut permit,
+        &cancellable,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn resume_supervisor_plan_file_cascade_with_runner(
+    options: SupervisorRunOptions,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorCascadeOutcome> {
+    let repo = discover_repo_root(&options.repo)?;
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let run_id = options.run_id.clone();
+    let status = supervisor_status(&repo, run_id.clone())?;
+    let source_report = match status.lifecycle {
+        SupervisorRunLifecycle::Finalized => status
+            .final_report
+            .context("finalized injected cascade source report is missing")?,
+        SupervisorRunLifecycle::Resumable => resume_supervisor_run(&repo, run_id.clone())?
+            .final_report
+            .context("resumed injected cascade source report is missing")?,
+        SupervisorRunLifecycle::Active
+        | SupervisorRunLifecycle::Interrupted
+        | SupervisorRunLifecycle::Uncertain => {
+            bail!("injected cascade source is not safely finalized or finalization-resumable")
+        }
+    };
+    let serialized_runner = Mutex::new(external_runner);
+    let cancellable =
+        |command: &ExternalAgentCommand, _cancellation, _review_runtime| match serialized_runner
+            .lock()
+        {
+            Ok(mut runner) => runner(command),
+            Err(poisoned) => poisoned.into_inner()(command),
+        };
+    let mut permit = |_plan: &SupervisorPlan| Ok(true);
+    run_generated_follow_up_cascade(
+        &repo,
+        &loaded,
+        source_report,
+        &options,
+        FollowUpCascadeInvocation {
+            outer_entrypoint: GeneratedFollowUpQueueEntrypoint::SuperviseRun,
+            outer_command_run_id: &run_id,
+            concurrency_policy: SupervisorConcurrencyPolicy::Fixed(NonZeroUsize::MIN),
+            runtime_catalog: FollowUpRuntimeCatalog::Injected,
+        },
+        &mut permit,
+        &cancellable,
     )
 }
 

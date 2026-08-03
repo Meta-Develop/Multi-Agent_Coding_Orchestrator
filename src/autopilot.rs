@@ -989,6 +989,7 @@ fn run_autopilot_with_profile_and_retention(
             primary_worktree_untouched: false,
             next_action: "correct the typed preflight denial, then start a new autopilot run",
             auto_merge_requested: plan.auto_merge,
+            generated_follow_up_dispatch_performed: false,
         });
         write_private_json(&mut artifact_writer, "final-report.json", &report)?;
         artifact_writer.finalize("final-report.json", false)?;
@@ -1032,6 +1033,7 @@ fn run_autopilot_with_profile_and_retention(
             next_action:
                 "correct the typed denial observed immediately before dispatch, then start a new autopilot run",
             auto_merge_requested: plan.auto_merge,
+            generated_follow_up_dispatch_performed: false,
         });
         write_private_json(&mut artifact_writer, "final-report.json", &report)?;
         artifact_writer.finalize("final-report.json", false)?;
@@ -1058,8 +1060,6 @@ fn run_autopilot_with_profile_and_retention(
         &supervisor_plan,
     )?;
     let supervisor_plan_path = run_dir.join(&supervisor_plan_relative);
-    #[cfg(test)]
-    run_before_effective_supervisor_plan_load_hook(&supervisor_plan_path);
     let effective_supervisor_plan = supervise::load_supervisor_plan_file(&supervisor_plan_path)
         .context("failed to verify the effective autopilot supervisor profile")?;
     let follow_up_requested_profile = requested_profile.clone();
@@ -1102,6 +1102,7 @@ fn run_autopilot_with_profile_and_retention(
             primary_worktree_untouched: false,
             next_action: "correct the typed requested/effective profile mismatch; no supervisor dispatch, publication, merge, or follow-up dispatch was attempted",
             auto_merge_requested: plan.auto_merge,
+            generated_follow_up_dispatch_performed: false,
         });
         write_private_json(&mut artifact_writer, "final-report.json", &report)?;
         artifact_writer.finalize("final-report.json", false)?;
@@ -1161,6 +1162,8 @@ fn run_autopilot_with_profile_and_retention(
         }
         Ok(permitted)
     };
+    #[cfg(test)]
+    run_before_supervisor_cascade_load_hook(&supervisor_options.plan_file);
     let supervisor_result = supervise::run_supervisor_plan_file_cascade_for_autopilot(
         supervisor_options,
         cascade_concurrency_policy,
@@ -1168,9 +1171,13 @@ fn run_autopilot_with_profile_and_retention(
         &mut follow_up_profile_gate,
     );
     drop(follow_up_profile_gate);
+    if let Some(refusal) = follow_up_profile_refusal.take() {
+        profile_binding = refusal;
+    }
     let cascade = match supervisor_result {
         Ok(cascade) => cascade,
         Err(error) => {
+            let profile_refused_before_source_dispatch = !profile_binding.permits_dispatch();
             profile_binding.mark_execution_incomparable(
                 "not_process_observable: supervisor dispatch returned no final report, so its resolved model selections cannot be verified",
             );
@@ -1194,7 +1201,11 @@ fn run_autopilot_with_profile_and_retention(
             let report = final_report(FinalReportInput {
                 run_id: &options.run_id,
                 status: AutopilotRunStatus::Failed,
-                attempt_count: 1,
+                attempt_count: if profile_refused_before_source_dispatch {
+                    0
+                } else {
+                    1
+                },
                 max_repair_attempts: plan.max_repair_attempts,
                 artifacts,
                 plan: plan_summary(&plan),
@@ -1203,25 +1214,30 @@ fn run_autopilot_with_profile_and_retention(
                 validation: skipped_autopilot_validation(),
                 pr: None,
                 review: None,
-                attempts: vec![attempt],
+                attempts: if profile_refused_before_source_dispatch {
+                    Vec::new()
+                } else {
+                    vec![attempt]
+                },
                 supervisor: None,
                 gate_denials: Vec::new(),
                 primary_worktree_untouched: false,
-                next_action:
-                    "inspect the supervisor entry failure; no publication, merge, or follow-up dispatch was attempted",
+                next_action: if profile_refused_before_source_dispatch {
+                    "correct the requested/effective profile mismatch; no supervisor, publication, merge, or follow-up dispatch was attempted"
+                } else {
+                    "inspect the supervisor entry failure; no publication, merge, or follow-up dispatch was attempted"
+                },
                 auto_merge_requested: plan.auto_merge,
+                generated_follow_up_dispatch_performed: false,
             });
             write_private_json(&mut artifact_writer, "final-report.json", &report)?;
             artifact_writer.finalize("final-report.json", false)?;
             return Ok(report);
         }
     };
-    if let Some(refusal) = follow_up_profile_refusal {
-        profile_binding = refusal;
-    }
-    let generated_follow_up_dispatch_performed =
-        cascade.generated_follow_up_dispatch_performed();
+    let generated_follow_up_dispatch_performed = cascade.generated_follow_up_dispatch_performed();
     let follow_up_cascade_success = cascade.follow_up_cascade_success;
+    let follow_up_primary_worktree_untouched = cascade.follow_up_primary_worktree_untouched;
     let follow_up_gate_denials = cascade.follow_up_gate_denials.clone();
     write_private_json(
         &mut artifact_writer,
@@ -1245,17 +1261,17 @@ fn run_autopilot_with_profile_and_retention(
     )?;
     let execution_profile_mismatch =
         profile_binding.status == AutopilotProfileBindingStatus::Mismatch;
-    let status = if supervisor.success
-        && follow_up_cascade_success
-        && !execution_profile_mismatch
-    {
+    let status = if supervisor.success && follow_up_cascade_success && !execution_profile_mismatch {
         AutopilotRunStatus::Succeeded
     } else {
         AutopilotRunStatus::Failed
     };
     let mut gate_denials = supervisor.gate_denials.clone();
     gate_denials.extend(follow_up_gate_denials);
-    let primary_worktree_untouched = supervisor.success;
+    // This top-level execution fact is true only when the cascade observed an
+    // exact final whole-primary snapshot equal to its baseline. Source-only
+    // outcomes carry no round-two observation and therefore remain false.
+    let primary_worktree_untouched = follow_up_primary_worktree_untouched.unwrap_or(false);
     let next_action = if execution_profile_mismatch {
         "inspect the typed requested/observed profile mismatch; autopilot performed no publication, merge, or follow-up dispatch"
     } else if !follow_up_cascade_success {
@@ -1265,7 +1281,7 @@ fn run_autopilot_with_profile_and_retention(
     } else {
         "inspect the typed supervisor denials and environment failures; autopilot performed no publication, merge, or follow-up dispatch"
     };
-    let mut report = final_report(FinalReportInput {
+    let report = final_report(FinalReportInput {
         run_id: &options.run_id,
         status,
         attempt_count: 1,
@@ -1283,8 +1299,8 @@ fn run_autopilot_with_profile_and_retention(
         primary_worktree_untouched,
         next_action,
         auto_merge_requested: plan.auto_merge,
+        generated_follow_up_dispatch_performed,
     });
-    report.generated_follow_up_dispatch_performed = generated_follow_up_dispatch_performed;
     write_private_json(&mut artifact_writer, "final-report.json", &report)?;
     artifact_writer.finalize("final-report.json", false)?;
     Ok(report)
@@ -1355,6 +1371,7 @@ fn run_autopilot_plan_file_disabled_legacy(
             next_action:
                 "resolve the safety refusal, then rerun autopilot; a human reviews and merges manually",
             auto_merge_requested: plan.auto_merge,
+            generated_follow_up_dispatch_performed: false,
         });
         write_private_json(&mut artifact_writer, "final-report.json", &report)?;
         artifact_writer.finalize("final-report.json", false)?;
@@ -1664,6 +1681,7 @@ fn run_autopilot_plan_file_disabled_legacy(
         primary_worktree_untouched: false,
         next_action: &next_action,
         auto_merge_requested: plan.auto_merge,
+        generated_follow_up_dispatch_performed: false,
     });
     write_private_json(&mut artifact_writer, "final-report.json", &report)?;
     let publish_requested = publish_requested_for_audit(
@@ -3437,6 +3455,7 @@ struct FinalReportInput<'a> {
     primary_worktree_untouched: bool,
     next_action: &'a str,
     auto_merge_requested: bool,
+    generated_follow_up_dispatch_performed: bool,
 }
 
 fn final_report(input: FinalReportInput<'_>) -> AutopilotFinalReport {
@@ -3475,7 +3494,7 @@ fn final_report(input: FinalReportInput<'_>) -> AutopilotFinalReport {
         },
         auto_merge_requested: input.auto_merge_requested,
         auto_merge_performed: false,
-        generated_follow_up_dispatch_performed: false,
+        generated_follow_up_dispatch_performed: input.generated_follow_up_dispatch_performed,
         next_action: input.next_action.to_string(),
     }
 }
@@ -3882,21 +3901,18 @@ fn verify_after_autopilot_safety(bindings: &RepositoryPathBindings) -> Result<()
 
 #[cfg(test)]
 thread_local! {
-    static BEFORE_EFFECTIVE_SUPERVISOR_PLAN_LOAD_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> =
+    static BEFORE_SUPERVISOR_CASCADE_LOAD_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> =
         std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
-fn set_before_effective_supervisor_plan_load_hook(
-    hook: impl FnMut(&Path) + 'static,
-) {
-    BEFORE_EFFECTIVE_SUPERVISOR_PLAN_LOAD_HOOK
-        .with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+fn set_before_supervisor_cascade_load_hook(hook: impl FnMut(&Path) + 'static) {
+    BEFORE_SUPERVISOR_CASCADE_LOAD_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 #[cfg(test)]
-fn run_before_effective_supervisor_plan_load_hook(path: &Path) {
-    BEFORE_EFFECTIVE_SUPERVISOR_PLAN_LOAD_HOOK.with(|slot| {
+fn run_before_supervisor_cascade_load_hook(path: &Path) {
+    BEFORE_SUPERVISOR_CASCADE_LOAD_HOOK.with(|slot| {
         if let Some(mut hook) = slot.borrow_mut().take() {
             hook(path);
         }
@@ -4989,7 +5005,7 @@ mod tests {
             }"#,
         )
         .expect("write plan");
-        set_before_effective_supervisor_plan_load_hook(|path| {
+        set_before_supervisor_cascade_load_hook(|path| {
             let bytes = fs::read(path).expect("read persisted supervisor plan");
             let mut value: Value =
                 serde_json::from_slice(&bytes).expect("decode persisted supervisor plan");
