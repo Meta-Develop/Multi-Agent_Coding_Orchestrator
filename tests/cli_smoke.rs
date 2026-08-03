@@ -106,6 +106,50 @@ fn cli_orchestrate_failure_still_emits_json_summary() -> Result<()> {
 }
 
 #[test]
+fn cli_orchestrate_reports_committed_agent_change_and_patch() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let plan_path = temp.path().join("plan.json");
+    let patch_dir = temp.path().join("patches");
+    fs::write(
+        &plan_path,
+        r#"{
+          "agents": [
+            {
+              "id": "agent-a",
+              "paths": ["README.md"],
+              "command": "printf '# Smoke\n\ncommitted\n' > README.md && git add README.md && git -c user.name='maco test' -c user.email='maco-test@example.invalid' commit -m agent-change"
+            }
+          ]
+        }"#,
+    )
+    .context("write plan")?;
+
+    let summary = run_success_json([
+        "orchestrate",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--patch-dir",
+        patch_dir.to_str().context("patch dir utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(summary["success"], true);
+    assert_eq!(summary["agents"][0]["status"], "succeeded");
+    assert_eq!(summary["agents"][0]["changed_paths"][0], "README.md");
+    assert_eq!(
+        summary["agents"][0]["patch_path"],
+        patch_dir.join("agent-a.patch").to_string_lossy().as_ref()
+    );
+    let patch = fs::read_to_string(patch_dir.join("agent-a.patch")).context("read patch")?;
+    assert!(patch.contains("committed"));
+
+    Ok(())
+}
+
+#[test]
 fn cli_claim_conflict_still_emits_json_summary() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -234,6 +278,107 @@ fn cli_semantic_map_and_queries_emit_json() -> Result<()> {
 }
 
 #[test]
+fn cli_semantic_coord_preview_claim_conflict_status_and_release_json() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    fs::write(repo_path.join("src/lib.rs"), "pub struct Worker;\n")
+        .context("write semantic lib")?;
+
+    let preview = run_success_json([
+        "coord",
+        "preview",
+        "agent-a",
+        "--repo",
+        repo,
+        "--path",
+        "src/lib.rs",
+        "--symbol",
+        "Worker",
+        "--json",
+    ])?;
+    assert_eq!(preview["persisted"], false);
+    assert_eq!(preview["has_blocking_conflicts"], false);
+    assert_eq!(preview["intent"]["symbols"][0]["name"], "Worker");
+
+    let claim = run_success_json([
+        "coord",
+        "claim",
+        "agent-a",
+        "--repo",
+        repo,
+        "--path",
+        "src/lib.rs",
+        "--symbol",
+        "Worker",
+        "--json",
+    ])?;
+    assert_eq!(claim["persisted"], true);
+    let token = claim["intent"]["token"].as_u64().context("claim token")?;
+
+    let output = Command::new(BIN)
+        .args([
+            "coord", "claim", "agent-b", "--repo", repo, "--symbol", "Worker", "--json",
+        ])
+        .output()
+        .context("run conflicting claim")?;
+    assert!(!output.status.success());
+    let conflict: Value = serde_json::from_slice(&output.stdout).context("parse conflict json")?;
+    assert_eq!(conflict["persisted"], false);
+    assert_eq!(conflict["has_blocking_conflicts"], true);
+    assert!(conflict["conflicts"]
+        .as_array()
+        .context("conflicts array")?
+        .iter()
+        .any(|conflict| conflict["kind"] == "symbol_overlap"));
+
+    let status = run_success_json(["coord", "status", "--repo", repo, "--json"])?;
+    assert_eq!(status.as_array().context("status array")?.len(), 1);
+
+    let token_arg = token.to_string();
+    let released =
+        run_success_json_args(&["coord", "release", &token_arg, "--repo", repo, "--json"])?;
+    assert_eq!(released["agent_id"], "agent-a");
+    let status = run_success_json(["coord", "status", "--repo", repo, "--json"])?;
+    assert_eq!(status.as_array().context("status array")?.len(), 0);
+
+    Ok(())
+}
+
+#[test]
+fn cli_semantic_coord_release_agent_json() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    fs::write(
+        repo_path.join("src/lib.rs"),
+        "pub struct Alpha;\npub struct Beta;\n",
+    )
+    .context("write semantic lib")?;
+
+    run_success_json([
+        "coord", "claim", "agent-a", "--repo", repo, "--symbol", "Alpha", "--json",
+    ])?;
+    run_success_json([
+        "coord", "claim", "agent-a", "--repo", repo, "--symbol", "Beta", "--json",
+    ])?;
+
+    let released = run_success_json([
+        "coord",
+        "release-agent",
+        "agent-a",
+        "--repo",
+        repo,
+        "--json",
+    ])?;
+    assert_eq!(released.as_array().context("released array")?.len(), 2);
+    let status = run_success_json(["coord", "status", "--repo", repo, "--json"])?;
+    assert_eq!(status.as_array().context("status array")?.len(), 0);
+
+    Ok(())
+}
+
+#[test]
 fn cli_merge_preview_blocks_unclaimed_edits_json() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -311,6 +456,10 @@ fn cli_llm_providers_and_prompt_preview_are_network_free_json() -> Result<()> {
 }
 
 fn run_success_json<const N: usize>(args: [&str; N]) -> Result<Value> {
+    run_success_json_args(&args)
+}
+
+fn run_success_json_args(args: &[&str]) -> Result<Value> {
     let output = Command::new(BIN).args(args).output().context("run maco")?;
     if !output.status.success() {
         anyhow::bail!(

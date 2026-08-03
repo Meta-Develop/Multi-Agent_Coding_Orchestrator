@@ -195,6 +195,12 @@ fn is_ignored_path(path: &Path) -> bool {
         || path.starts_with(".agent/temp")
         || path == Path::new(".agent/storage")
         || path.starts_with(".agent/storage")
+        || path == Path::new(".agents/temp")
+        || path.starts_with(".agents/temp")
+        || path == Path::new(".agents/storage")
+        || path.starts_with(".agents/storage")
+        || path == Path::new(".agents/live")
+        || path.starts_with(".agents/live")
 }
 
 fn category_for(path: &Path, kind: RepoEntryKind) -> String {
@@ -202,7 +208,7 @@ fn category_for(path: &Path, kind: RepoEntryKind) -> String {
         return "directory".to_string();
     }
 
-    if path.starts_with(".agent") {
+    if path.starts_with(".agent") || path.starts_with(".agents") {
         return "agent_context".to_string();
     }
 
@@ -273,11 +279,21 @@ mod tests {
         fs::create_dir_all(repo_path.join(".agent/docs")).expect("create agent docs");
         fs::create_dir_all(repo_path.join(".agent/temp")).expect("create agent temp");
         fs::create_dir_all(repo_path.join(".agent/storage")).expect("create agent storage");
+        fs::create_dir_all(repo_path.join(".agents/docs")).expect("create agents docs");
+        fs::create_dir_all(repo_path.join(".agents/temp")).expect("create agents temp");
+        fs::create_dir_all(repo_path.join(".agents/storage")).expect("create agents storage");
+        fs::create_dir_all(repo_path.join(".agents/live/claims")).expect("create live claims");
         fs::create_dir_all(repo_path.join(".maco/state")).expect("create state");
         fs::create_dir_all(repo_path.join("target/debug")).expect("create target");
         fs::write(repo_path.join(".agent/docs/rules.md"), "# Rules\n").expect("write rules");
         fs::write(repo_path.join(".agent/temp/scratch"), "tmp\n").expect("write temp");
         fs::write(repo_path.join(".agent/storage/cache"), "cache\n").expect("write cache");
+        fs::write(repo_path.join(".agents/docs/rules.md"), "# Rules\n")
+            .expect("write agents rules");
+        fs::write(repo_path.join(".agents/temp/scratch"), "tmp\n").expect("write agents temp");
+        fs::write(repo_path.join(".agents/storage/cache"), "cache\n").expect("write agents cache");
+        fs::write(repo_path.join(".agents/live/claims/worker.md"), "# Claim\n")
+            .expect("write live claim");
         fs::write(repo_path.join(".maco/state/claims.json"), "{}\n").expect("write state");
         fs::write(repo_path.join("target/debug/output"), "generated\n").expect("write target");
 
@@ -290,10 +306,15 @@ mod tests {
 
         assert!(paths.contains(&PathBuf::from(".agent")));
         assert!(paths.contains(&PathBuf::from(".agent/docs/rules.md")));
+        assert!(paths.contains(&PathBuf::from(".agents")));
+        assert!(paths.contains(&PathBuf::from(".agents/docs/rules.md")));
         assert!(!paths.iter().any(|path| path.starts_with(".git")));
         assert!(!paths.iter().any(|path| path.starts_with(".maco")));
         assert!(!paths.iter().any(|path| path.starts_with("target")));
         assert!(!paths.iter().any(|path| path.starts_with(".agent/temp")));
         assert!(!paths.iter().any(|path| path.starts_with(".agent/storage")));
+        assert!(!paths.iter().any(|path| path.starts_with(".agents/temp")));
+        assert!(!paths.iter().any(|path| path.starts_with(".agents/storage")));
+        assert!(!paths.iter().any(|path| path.starts_with(".agents/live")));
     }
 }

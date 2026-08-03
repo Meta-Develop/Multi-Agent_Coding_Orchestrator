@@ -217,6 +217,173 @@ fn cli_agent_run_disables_provider_commands_by_default_json() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn cli_agent_run_failed_json_keep_claims_leaves_claim_active() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let task_path = temp.path().join("task.md");
+    let proposal_path = temp.path().join("proposal.json");
+    fs::write(&task_path, "Try to run a disabled shell command.\n").context("write task")?;
+    fs::write(
+        &proposal_path,
+        r#"{
+          "summary": "attempt command",
+          "commands": [
+            {
+              "command": "printf '# Smoke\n\nblocked command\n' > README.md",
+              "working_directory": null,
+              "purpose": "implement"
+            }
+          ],
+          "patches": [],
+          "notes": []
+        }"#,
+    )
+    .context("write proposal")?;
+
+    let output = Command::new(BIN)
+        .args([
+            "agent",
+            "run",
+            task_path.to_str().context("task path utf8")?,
+            "--agent-id",
+            "agent-a",
+            "--path",
+            "README.md",
+            "--fake-proposal",
+            proposal_path.to_str().context("proposal path utf8")?,
+            "--keep-claims",
+            "--repo",
+            repo,
+            "--json",
+        ])
+        .output()
+        .context("run maco")?;
+
+    assert!(!output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).context("parse agent json")?;
+    assert_eq!(report["success"], false);
+    assert!(report["error"]
+        .as_str()
+        .context("error string")?
+        .contains("disabled"));
+    assert_eq!(
+        report["released_claims"]
+            .as_array()
+            .context("released claims array")?
+            .len(),
+        0
+    );
+    assert_eq!(
+        report["release_errors"]
+            .as_array()
+            .context("release errors array")?
+            .len(),
+        0
+    );
+
+    let status = run_success_json(["sync", "status", "--repo", repo, "--json"])?;
+    let claims = status.as_array().context("status array")?;
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0]["agent_id"], "agent-a");
+    assert_eq!(claims[0]["paths"][0], "README.md");
+
+    Ok(())
+}
+
+#[test]
+fn cli_agent_run_allows_provider_command_to_edit_claimed_path() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let task_path = temp.path().join("task.md");
+    let proposal_path = temp.path().join("proposal.json");
+    fs::write(&task_path, "Run an implementation shell command.\n").context("write task")?;
+    fs::write(
+        &proposal_path,
+        r#"{
+          "summary": "edit README with command",
+          "commands": [
+            {
+              "command": "printf '# Smoke\n\ncommand edit\n' > README.md",
+              "working_directory": null,
+              "purpose": "implement"
+            }
+          ],
+          "patches": [],
+          "notes": []
+        }"#,
+    )
+    .context("write proposal")?;
+
+    let report = run_success_json([
+        "agent",
+        "run",
+        task_path.to_str().context("task path utf8")?,
+        "--agent-id",
+        "agent-a",
+        "--path",
+        "README.md",
+        "--fake-proposal",
+        proposal_path.to_str().context("proposal path utf8")?,
+        "--allow-provider-commands",
+        "--repo",
+        repo,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], true);
+    assert_eq!(report["provider_id"], "fake");
+    assert_eq!(report["provider_command_policy"], "allow_unsafe_shell");
+    assert_eq!(report["command_results"][0]["success"], true);
+    assert_eq!(report["command_results"][0]["purpose"], "implement");
+    assert_eq!(report["command_results"][0]["exit_code"], 0);
+    assert_eq!(report["command_results"][0]["error"], Value::Null);
+    assert_eq!(report["candidate"]["changed_paths"][0], "README.md");
+    assert_eq!(
+        report["candidate"]["unclaimed_changed_paths"]
+            .as_array()
+            .context("unclaimed array")?
+            .len(),
+        0
+    );
+    assert_eq!(
+        report["released_claims"]
+            .as_array()
+            .context("released claims array")?
+            .len(),
+        1
+    );
+    assert_eq!(
+        report["release_errors"]
+            .as_array()
+            .context("release errors array")?
+            .len(),
+        0
+    );
+
+    let worktree_path = Path::new(
+        report["worktree"]["path"]
+            .as_str()
+            .context("worktree path")?,
+    );
+    assert_ne!(worktree_path, repo_path.as_path());
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md"))?,
+        "# Smoke\n"
+    );
+    assert_eq!(
+        fs::read_to_string(worktree_path.join("README.md"))?,
+        "# Smoke\n\ncommand edit\n"
+    );
+
+    let status = run_success_json(["sync", "status", "--repo", repo, "--json"])?;
+    assert_eq!(status.as_array().context("status array")?.len(), 0);
+
+    Ok(())
+}
+
 fn run_success_json<const N: usize>(args: [&str; N]) -> Result<Value> {
     let output = Command::new(BIN).args(args).output().context("run maco")?;
     if !output.status.success() {
