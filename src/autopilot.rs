@@ -2,7 +2,7 @@ use crate::{
     artifacts::{ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, RunArtifactFamily},
     gate_denial::{ApprovalReviewDenial, GateCheckSource, GateDenial},
     live_claim::{self, LiveClock},
-    llm::Redactor,
+    llm::{provider::ModelPricing, Redactor},
     machine_global::MachineGlobalRetentionBinding,
     merge::{
         ApplyBlocker, ApplyReadinessStatus, BoundValidationEvidenceBundle,
@@ -20,7 +20,8 @@ use crate::{
         PrPublicationStatus,
     },
     review::{
-        self, ReviewPrOptions, ReviewReport, ReviewReportStatus, ReviewerConfig, ReviewerMode,
+        self, ReviewAggregationPolicy, ReviewLensBackendConfig, ReviewLensConfig, ReviewPrOptions,
+        ReviewReport, ReviewReportStatus, ReviewerConfig, ReviewerMode,
     },
     safe_state::{
         BoundedRegularReader, BoundedTreeEntry, BoundedTreeEntryKind, BoundedTreeWalkAction,
@@ -28,9 +29,10 @@ use crate::{
     },
     semantic_coord::SemanticIntentStore,
     supervise::{
-        self, AgentRole, FindingSeverity, OrchestratorAssignment, ReviewStatus,
-        SupervisorFinalReport, SupervisorPlan, SupervisorRunOptions, SupervisorRuntime,
-        ValidationResult, WorkerAssignment,
+        self, AgentRole, CommandRunRecord, FindingSeverity, OrchestratorAssignment,
+        ReviewLensUsageReport, ReviewStatus, RoleModelSelection, RoleUsageObservation,
+        RoleUsageReport, SupervisorFinalReport, SupervisorPlan, SupervisorRunOptions,
+        SupervisorRuntime, ValidationResult, WorkerAssignment,
     },
     sync::normalize_repo_relative_path,
     sync_store::SyncStore,
@@ -48,6 +50,8 @@ use std::{
 };
 
 const AUTOPILOT_SCHEMA_VERSION: u32 = 1;
+pub const AUTOPILOT_PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const AUTOPILOT_PROFILE_BINDING_SCHEMA_VERSION: u32 = 3;
 const REVIEW_REPORT_SCHEMA_VERSION: u32 = 1;
 const REVIEW_REQUEST_BINDING_HEX_LEN: usize = 64;
 const EXTERNAL_REVIEWER_ID_PREFIX: &str = "external-program-";
@@ -91,6 +95,36 @@ pub struct AutopilotRunOptions {
     pub codex_bin: Option<PathBuf>,
     pub reviewer_command: Option<String>,
     pub allow_dirty_primary: bool,
+}
+
+/// Versioned execution configuration passed through unchanged to the live supervisor plan.
+///
+/// The fields deliberately reuse the supervisor's public configuration types. This manifest is a
+/// binding envelope for the public autopilot entry, not a second role/model or review language.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutopilotProfile {
+    pub version: u32,
+    #[serde(default)]
+    pub role_models: BTreeMap<AgentRole, RoleModelSelection>,
+    #[serde(default)]
+    pub model_pricing: BTreeMap<String, ModelPricing>,
+    #[serde(default = "crate::supervise::default_supervisor_review_lenses")]
+    pub review_lenses: Vec<ReviewLensConfig>,
+    #[serde(default)]
+    pub review_aggregation_policy: ReviewAggregationPolicy,
+}
+
+impl Default for AutopilotProfile {
+    fn default() -> Self {
+        Self {
+            version: AUTOPILOT_PROFILE_SCHEMA_VERSION,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: crate::supervise::default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -208,6 +242,7 @@ pub struct AutopilotFinalReport {
     pub artifacts: AutopilotArtifactPaths,
     pub reports_created: AutopilotReportsCreated,
     pub plan: AutopilotPlanSummary,
+    pub profile_binding: AutopilotProfileBindingReport,
     pub safety: AutopilotSafetyReport,
     #[serde(default)]
     pub gate_denials: Vec<GateDenial>,
@@ -226,6 +261,110 @@ pub struct AutopilotFinalReport {
     pub auto_merge_performed: bool,
     pub generated_follow_up_dispatch_performed: bool,
     pub next_action: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutopilotProfileBindingStatus {
+    NotDispatched,
+    Matched,
+    Mismatch,
+    Incomparable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutopilotProfileBindingField {
+    RoleModels,
+    ModelPricing,
+    ReviewLenses,
+    ReviewAggregationPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutopilotProfileBindingFailureKind {
+    RequestedEffectiveMismatch,
+    RequestedObservedSelectionMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AutopilotProfileBindingFailure {
+    pub kind: AutopilotProfileBindingFailureKind,
+    pub mismatched_fields: Vec<AutopilotProfileBindingField>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mismatched_roles: Vec<AgentRole>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mismatched_review_lens_ids: Vec<String>,
+}
+
+/// Dispatch-observed model evidence for one explicitly configured role override.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AutopilotRoleModelExecutionBinding {
+    pub role: AgentRole,
+    pub requested: RoleModelSelection,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_models: Vec<String>,
+    pub observation: RoleUsageObservation,
+    pub status: AutopilotProfileBindingStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+/// Dispatch-observed model evidence for one configured review lens.
+///
+/// A `Mismatch` status is a defensive invariant-violation signal. Normal autopilot execution
+/// first requires requested/effective lens equality, then derives the dispatched selection from
+/// that effective lens. Fake or incomplete observations are `Incomparable`; a review-lens
+/// mismatch means that the upstream binding or dispatch-construction invariant was bypassed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AutopilotReviewLensExecutionBinding {
+    pub lens_id: String,
+    pub requested_backend_id: String,
+    pub requested_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_backend_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_reasoning_effort: Option<String>,
+    pub dispatch_count: usize,
+    pub observation: RoleUsageObservation,
+    pub status: AutopilotProfileBindingStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+/// Post-resolution evidence from selections that reached observable supervisor dispatches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AutopilotProfileExecutionBindingReport {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub role_models: Vec<AutopilotRoleModelExecutionBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_lenses: Vec<AutopilotReviewLensExecutionBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+/// Configuration and execution evidence for the requested autopilot profile.
+///
+/// `effective` and `configuration_status` bind the reloaded supervisor plan. `status` is reserved
+/// for post-resolution execution evidence and can be `matched` only when every requested model
+/// selection was process-observed at dispatch.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AutopilotProfileBindingReport {
+    pub version: u32,
+    pub status: AutopilotProfileBindingStatus,
+    pub configuration_status: AutopilotProfileBindingStatus,
+    pub requested: AutopilotProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective: Option<AutopilotProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<AutopilotProfileExecutionBindingReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<AutopilotProfileBindingFailure>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -599,11 +738,75 @@ fn apply_autopilot_input_shape_gate(
 }
 
 pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<AutopilotFinalReport> {
-    run_autopilot_plan_file_with_retention(options, None)
+    run_autopilot_plan_file_with_profile_and_retention(options, None, None)
 }
 
 pub fn run_autopilot_plan_file_with_retention(
     options: AutopilotRunOptions,
+    machine_global_retention: Option<MachineGlobalRetentionBinding>,
+) -> Result<AutopilotFinalReport> {
+    run_autopilot_plan_file_with_profile_and_retention(options, None, machine_global_retention)
+}
+
+pub fn autopilot_profile_from_file(profile_file: impl AsRef<Path>) -> Result<AutopilotProfile> {
+    let profile_file = profile_file.as_ref();
+    let contents =
+        BoundedRegularReader::read_tree_no_follow_utf8(profile_file, AUTOPILOT_PLAN_MAX_BYTES)
+            .with_context(|| {
+                format!(
+                    "failed to read bounded autopilot profile {}",
+                    profile_file.display()
+                )
+            })?;
+    let profile = serde_json::from_str::<AutopilotProfile>(&contents).with_context(|| {
+        format!(
+            "failed to parse autopilot profile {}",
+            profile_file.display()
+        )
+    })?;
+    validate_autopilot_profile(&profile)?;
+    Ok(profile)
+}
+
+fn validate_autopilot_profile(profile: &AutopilotProfile) -> Result<()> {
+    if profile.version != AUTOPILOT_PROFILE_SCHEMA_VERSION {
+        bail!("unsupported autopilot profile version {}", profile.version);
+    }
+    review::validate_review_lens_set(&profile.review_lenses)
+        .context("autopilot profile review_lenses are invalid")?;
+    if profile
+        .review_lenses
+        .iter()
+        .any(|lens| matches!(lens.backend, ReviewLensBackendConfig::Precomputed { .. }))
+    {
+        bail!("autopilot profile review_lenses must be executable model-backed lenses");
+    }
+    if let ReviewAggregationPolicy::ValidatedQuorum { minimum_accepts } =
+        profile.review_aggregation_policy
+    {
+        if minimum_accepts == 0 || minimum_accepts > profile.review_lenses.len() {
+            bail!(
+                "autopilot profile review_lenses validated quorum must be between 1 and the configured lens count"
+            );
+        }
+    }
+    for (model, pricing) in &profile.model_pricing {
+        if model.trim().is_empty() {
+            bail!("autopilot profile model_pricing model key cannot be empty");
+        }
+        if !pricing.is_valid() {
+            bail!(
+                "autopilot profile model_pricing for '{}' must contain finite, non-negative input and output prices",
+                model.trim()
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn run_autopilot_plan_file_with_profile_and_retention(
+    options: AutopilotRunOptions,
+    profile: Option<AutopilotProfile>,
     machine_global_retention: Option<MachineGlobalRetentionBinding>,
 ) -> Result<AutopilotFinalReport> {
     let machine_global_retention = machine_global_retention.context(
@@ -615,6 +818,8 @@ pub fn run_autopilot_plan_file_with_retention(
             "--reviewer-command belongs to the disabled legacy publication loop and cannot be used by the supervise-backed autopilot spine"
         );
     }
+    let requested_profile = profile.unwrap_or_default();
+    validate_autopilot_profile(&requested_profile)?;
 
     let repo = discover_repo_root(&options.repo)?;
     let LoadedAutopilotPlan { plan, input_shape } =
@@ -658,6 +863,9 @@ pub fn run_autopilot_plan_file_with_retention(
             max_repair_attempts: plan.max_repair_attempts,
             artifacts,
             plan: plan_summary(&plan),
+            profile_binding: AutopilotProfileBindingReport::not_dispatched(
+                requested_profile.clone(),
+            ),
             safety,
             validation: skipped_autopilot_validation(),
             pr: None,
@@ -697,6 +905,9 @@ pub fn run_autopilot_plan_file_with_retention(
             max_repair_attempts: plan.max_repair_attempts,
             artifacts,
             plan: plan_summary(&plan),
+            profile_binding: AutopilotProfileBindingReport::not_dispatched(
+                requested_profile.clone(),
+            ),
             safety: pre_dispatch_safety,
             validation: skipped_autopilot_validation(),
             pr: None,
@@ -716,7 +927,7 @@ pub fn run_autopilot_plan_file_with_retention(
 
     let agent_id = attempt_agent_id(&options.run_id, 1)?;
     let supervisor_run_id = RunId::new(format!("{}-supervise", options.run_id.as_str()))?;
-    let supervisor_plan = supervisor_plan_for_attempt(&plan, &agent_id, 1, &[]);
+    let supervisor_plan = supervisor_plan_for_attempt(&plan, &requested_profile, &agent_id, 1, &[]);
     let supervisor_plan_relative = PathBuf::from("supervisor-plan.json");
     write_private_json(
         &mut artifact_writer,
@@ -724,6 +935,52 @@ pub fn run_autopilot_plan_file_with_retention(
         &supervisor_plan,
     )?;
     let supervisor_plan_path = run_dir.join(&supervisor_plan_relative);
+    let effective_supervisor_plan = supervise::load_supervisor_plan_file(&supervisor_plan_path)
+        .context("failed to verify the effective autopilot supervisor profile")?;
+    let mut profile_binding = AutopilotProfileBindingReport::from_effective(
+        requested_profile,
+        &effective_supervisor_plan,
+    );
+    if !profile_binding.permits_dispatch() {
+        write_failed_report(
+            &mut artifact_writer,
+            "supervisor-report.json",
+            "profile_binding_mismatch",
+            "the effective supervisor profile did not match the requested autopilot profile",
+        )?;
+        write_skipped_report(
+            &mut artifact_writer,
+            "pr-report.json",
+            "profile_binding_mismatch",
+        )?;
+        write_skipped_report(
+            &mut artifact_writer,
+            "review-report.json",
+            "profile_binding_mismatch",
+        )?;
+        let report = final_report(FinalReportInput {
+            run_id: &options.run_id,
+            status: AutopilotRunStatus::Failed,
+            attempt_count: 0,
+            max_repair_attempts: plan.max_repair_attempts,
+            artifacts,
+            plan: plan_summary(&plan),
+            profile_binding,
+            safety: pre_dispatch_safety,
+            validation: skipped_autopilot_validation(),
+            pr: None,
+            review: None,
+            attempts: Vec::new(),
+            supervisor: None,
+            gate_denials: Vec::new(),
+            primary_worktree_untouched: false,
+            next_action: "correct the typed requested/effective profile mismatch; no supervisor dispatch, publication, merge, or follow-up dispatch was attempted",
+            auto_merge_requested: plan.auto_merge,
+        });
+        write_private_json(&mut artifact_writer, "final-report.json", &report)?;
+        artifact_writer.finalize("final-report.json", false)?;
+        return Ok(report);
+    }
     let (codex_bin, runtime) = match options.codex_bin {
         Some(codex_bin) => (codex_bin, SupervisorRuntime::Codex),
         None => (PathBuf::from("codex-not-executed"), SupervisorRuntime::Fake),
@@ -758,6 +1015,9 @@ pub fn run_autopilot_plan_file_with_retention(
     }) {
         Ok(supervisor) => supervisor,
         Err(error) => {
+            profile_binding.mark_execution_incomparable(
+                "not_process_observable: supervisor dispatch returned no final report, so its resolved model selections cannot be verified",
+            );
             attempt.supervisor_status = "failed".to_string();
             write_failed_report(
                 &mut artifact_writer,
@@ -782,6 +1042,7 @@ pub fn run_autopilot_plan_file_with_retention(
                 max_repair_attempts: plan.max_repair_attempts,
                 artifacts,
                 plan: plan_summary(&plan),
+                profile_binding: profile_binding.clone(),
                 safety: pre_dispatch_safety,
                 validation: skipped_autopilot_validation(),
                 pr: None,
@@ -800,6 +1061,7 @@ pub fn run_autopilot_plan_file_with_retention(
         }
     };
 
+    profile_binding.observe_execution(&supervisor);
     attempt.supervisor_status = review_status_label(supervisor.status).to_string();
     write_private_json(&mut artifact_writer, "supervisor-report.json", &supervisor)?;
     write_skipped_report(
@@ -812,14 +1074,18 @@ pub fn run_autopilot_plan_file_with_retention(
         "review-report.json",
         "manual_integration_only",
     )?;
-    let status = if supervisor.success {
+    let execution_profile_mismatch =
+        profile_binding.status == AutopilotProfileBindingStatus::Mismatch;
+    let status = if supervisor.success && !execution_profile_mismatch {
         AutopilotRunStatus::Succeeded
     } else {
         AutopilotRunStatus::Failed
     };
     let gate_denials = supervisor.gate_denials.clone();
     let primary_worktree_untouched = supervisor.success;
-    let next_action = if supervisor.success {
+    let next_action = if execution_profile_mismatch {
+        "inspect the typed requested/observed profile mismatch; autopilot performed no publication, merge, or follow-up dispatch"
+    } else if supervisor.success {
         "inspect the isolated supervise result and use explicit human-approved arbitration or merge preview/apply; autopilot performed no publication, merge, or follow-up dispatch"
     } else {
         "inspect the typed supervisor denials and environment failures; autopilot performed no publication, merge, or follow-up dispatch"
@@ -831,6 +1097,7 @@ pub fn run_autopilot_plan_file_with_retention(
         max_repair_attempts: plan.max_repair_attempts,
         artifacts,
         plan: plan_summary(&plan),
+        profile_binding,
         safety: pre_dispatch_safety,
         validation: skipped_autopilot_validation(),
         pr: None,
@@ -898,6 +1165,9 @@ fn run_autopilot_plan_file_disabled_legacy(
             max_repair_attempts: plan.max_repair_attempts,
             artifacts,
             plan: plan_summary(&plan),
+            profile_binding: AutopilotProfileBindingReport::not_dispatched(
+                AutopilotProfile::default(),
+            ),
             safety,
             validation,
             pr: None,
@@ -933,8 +1203,13 @@ fn run_autopilot_plan_file_disabled_legacy(
         let agent_id = attempt_agent_id(&options.run_id, attempt)?;
         let supervisor_run_id =
             RunId::new(format!("{}-attempt-{}", options.run_id.as_str(), attempt))?;
-        let supervisor_plan =
-            supervisor_plan_for_attempt(&plan, &agent_id, attempt, &repair_contexts);
+        let supervisor_plan = supervisor_plan_for_attempt(
+            &plan,
+            &AutopilotProfile::default(),
+            &agent_id,
+            attempt,
+            &repair_contexts,
+        );
         let supervisor_plan_relative =
             PathBuf::from(format!("supervisor-plan-attempt-{attempt}.json"));
         write_private_json(
@@ -1202,6 +1477,7 @@ fn run_autopilot_plan_file_disabled_legacy(
         max_repair_attempts: plan.max_repair_attempts,
         artifacts,
         plan: plan_summary(&plan),
+        profile_binding: AutopilotProfileBindingReport::not_dispatched(AutopilotProfile::default()),
         safety,
         validation: last_validation,
         pr: last_pr,
@@ -1520,6 +1796,7 @@ fn sorted_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 fn supervisor_plan_for_attempt(
     plan: &AutopilotPlan,
+    profile: &AutopilotProfile,
     agent_id: &str,
     attempt: usize,
     repair_contexts: &[RepairPromptContext],
@@ -1535,10 +1812,10 @@ fn supervisor_plan_for_attempt(
         max_gate_corrections: 0,
         child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
         semantic_coordination: SemanticCoordinationMode::Off,
-        role_models: BTreeMap::new(),
-        model_pricing: BTreeMap::new(),
-        review_lenses: crate::supervise::default_supervisor_review_lenses(),
-        review_aggregation_policy: crate::review::ReviewAggregationPolicy::AllMustAccept,
+        role_models: profile.role_models.clone(),
+        model_pricing: profile.model_pricing.clone(),
+        review_lenses: profile.review_lenses.clone(),
+        review_aggregation_policy: profile.review_aggregation_policy,
         assignments: vec![OrchestratorAssignment {
             id: agent_id.to_string(),
             role: AgentRole::ChildOrchestrator,
@@ -2484,6 +2761,488 @@ fn summarize_validation_output(output: &CapturedBytes) -> String {
     output.summarize_chars(VALIDATION_OUTPUT_LIMIT).text
 }
 
+impl AutopilotProfileBindingReport {
+    fn not_dispatched(requested: AutopilotProfile) -> Self {
+        Self {
+            version: AUTOPILOT_PROFILE_BINDING_SCHEMA_VERSION,
+            status: AutopilotProfileBindingStatus::NotDispatched,
+            configuration_status: AutopilotProfileBindingStatus::NotDispatched,
+            requested,
+            effective: None,
+            execution: None,
+            failure: None,
+        }
+    }
+
+    fn from_effective(requested: AutopilotProfile, plan: &SupervisorPlan) -> Self {
+        let effective = AutopilotProfile {
+            version: AUTOPILOT_PROFILE_SCHEMA_VERSION,
+            role_models: plan.role_models.clone(),
+            model_pricing: plan.model_pricing.clone(),
+            review_lenses: plan.review_lenses.clone(),
+            review_aggregation_policy: plan.review_aggregation_policy,
+        };
+        let mut mismatched_fields = Vec::new();
+        if requested.role_models != effective.role_models {
+            mismatched_fields.push(AutopilotProfileBindingField::RoleModels);
+        }
+        if requested.model_pricing != effective.model_pricing {
+            mismatched_fields.push(AutopilotProfileBindingField::ModelPricing);
+        }
+        if requested.review_lenses != effective.review_lenses {
+            mismatched_fields.push(AutopilotProfileBindingField::ReviewLenses);
+        }
+        if requested.review_aggregation_policy != effective.review_aggregation_policy {
+            mismatched_fields.push(AutopilotProfileBindingField::ReviewAggregationPolicy);
+        }
+        let configuration_status = if mismatched_fields.is_empty() {
+            AutopilotProfileBindingStatus::Matched
+        } else {
+            AutopilotProfileBindingStatus::Mismatch
+        };
+        let failure = (!mismatched_fields.is_empty()).then_some(AutopilotProfileBindingFailure {
+            kind: AutopilotProfileBindingFailureKind::RequestedEffectiveMismatch,
+            mismatched_fields,
+            mismatched_roles: Vec::new(),
+            mismatched_review_lens_ids: Vec::new(),
+        });
+        Self {
+            version: AUTOPILOT_PROFILE_BINDING_SCHEMA_VERSION,
+            status: if failure.is_some() {
+                AutopilotProfileBindingStatus::Mismatch
+            } else {
+                AutopilotProfileBindingStatus::NotDispatched
+            },
+            configuration_status,
+            requested,
+            effective: Some(effective),
+            execution: None,
+            failure,
+        }
+    }
+
+    fn permits_dispatch(&self) -> bool {
+        self.configuration_status == AutopilotProfileBindingStatus::Matched
+            && self.failure.is_none()
+    }
+
+    fn observe_execution(&mut self, supervisor: &SupervisorFinalReport) {
+        self.observe_execution_reports(
+            &supervisor.role_usage,
+            &supervisor.review_lens_usage,
+            &review_lens_dispatch_evidence(supervisor, self.requested.review_lenses.len()),
+        );
+    }
+
+    fn observe_execution_reports(
+        &mut self,
+        role_usage: &BTreeMap<AgentRole, RoleUsageReport>,
+        review_lens_usage: &[ReviewLensUsageReport],
+        review_lens_dispatches: &[ReviewLensDispatchEvidence],
+    ) {
+        if !self.permits_dispatch() {
+            return;
+        }
+        let execution = AutopilotProfileExecutionBindingReport::from_supervisor(
+            &self.requested,
+            role_usage,
+            review_lens_usage,
+            review_lens_dispatches,
+        );
+        let mismatched_roles = execution
+            .role_models
+            .iter()
+            .filter(|binding| binding.status == AutopilotProfileBindingStatus::Mismatch)
+            .map(|binding| binding.role)
+            .collect::<Vec<_>>();
+        let mismatched_review_lens_ids = execution
+            .review_lenses
+            .iter()
+            .filter(|binding| binding.status == AutopilotProfileBindingStatus::Mismatch)
+            .map(|binding| binding.lens_id.clone())
+            .collect::<Vec<_>>();
+        let mut mismatched_fields = Vec::new();
+        if !mismatched_roles.is_empty() {
+            mismatched_fields.push(AutopilotProfileBindingField::RoleModels);
+        }
+        if !mismatched_review_lens_ids.is_empty() {
+            mismatched_fields.push(AutopilotProfileBindingField::ReviewLenses);
+        }
+        let has_mismatch = !mismatched_fields.is_empty();
+        let has_incomparable = execution
+            .role_models
+            .iter()
+            .any(|binding| binding.status == AutopilotProfileBindingStatus::Incomparable)
+            || execution
+                .review_lenses
+                .iter()
+                .any(|binding| binding.status == AutopilotProfileBindingStatus::Incomparable)
+            || execution.unavailable_reason.is_some();
+        self.status = if has_mismatch {
+            AutopilotProfileBindingStatus::Mismatch
+        } else if has_incomparable {
+            AutopilotProfileBindingStatus::Incomparable
+        } else {
+            AutopilotProfileBindingStatus::Matched
+        };
+        self.failure = has_mismatch.then_some(AutopilotProfileBindingFailure {
+            kind: AutopilotProfileBindingFailureKind::RequestedObservedSelectionMismatch,
+            mismatched_fields,
+            mismatched_roles,
+            mismatched_review_lens_ids,
+        });
+        self.execution = Some(execution);
+    }
+
+    fn mark_execution_incomparable(&mut self, reason: impl Into<String>) {
+        if !self.permits_dispatch() {
+            return;
+        }
+        self.status = AutopilotProfileBindingStatus::Incomparable;
+        self.execution = Some(AutopilotProfileExecutionBindingReport {
+            role_models: Vec::new(),
+            review_lenses: Vec::new(),
+            unavailable_reason: Some(reason.into()),
+        });
+    }
+}
+
+impl AutopilotProfileExecutionBindingReport {
+    fn from_supervisor(
+        requested: &AutopilotProfile,
+        role_usage: &BTreeMap<AgentRole, RoleUsageReport>,
+        review_lens_usage: &[ReviewLensUsageReport],
+        review_lens_dispatches: &[ReviewLensDispatchEvidence],
+    ) -> Self {
+        let role_models = requested
+            .role_models
+            .iter()
+            .map(|(&role, selection)| {
+                role_model_execution_binding(role, selection, role_usage.get(&role))
+            })
+            .collect::<Vec<_>>();
+        let review_lenses = requested
+            .review_lenses
+            .iter()
+            .enumerate()
+            .map(|(lens_index, lens)| {
+                review_lens_execution_binding(
+                    lens,
+                    review_lens_usage
+                        .iter()
+                        .find(|usage| usage.lens_id == lens.id),
+                    review_lens_dispatches.get(lens_index),
+                )
+            })
+            .collect::<Vec<_>>();
+        let unavailable_reason = (role_models.is_empty() && review_lenses.is_empty()).then(|| {
+            "not_process_observable: the requested profile contained no executable model selection"
+                .to_string()
+        });
+        Self {
+            role_models,
+            review_lenses,
+            unavailable_reason,
+        }
+    }
+}
+
+fn role_model_execution_binding(
+    role: AgentRole,
+    requested: &RoleModelSelection,
+    usage: Option<&RoleUsageReport>,
+) -> AutopilotRoleModelExecutionBinding {
+    let observation = usage
+        .map(|usage| usage.observation)
+        .unwrap_or(RoleUsageObservation::NotProcessObservable);
+    let observed_models = usage
+        .filter(|usage| {
+            usage.observation == RoleUsageObservation::ProcessObserved && usage.usage.is_some()
+        })
+        .map(|usage| usage.models.clone())
+        .unwrap_or_default();
+    let process_observed = observation == RoleUsageObservation::ProcessObserved
+        && usage.is_some_and(|usage| usage.usage.is_some());
+    let status = if !process_observed {
+        AutopilotProfileBindingStatus::Incomparable
+    } else if let Some(requested_model) = requested.model.as_deref() {
+        if observed_models.is_empty() {
+            AutopilotProfileBindingStatus::Incomparable
+        } else if observed_models.len() == 1
+            && observed_models.first().map(String::as_str) == Some(requested_model)
+        {
+            if requested.reasoning_effort.is_some() {
+                AutopilotProfileBindingStatus::Incomparable
+            } else {
+                AutopilotProfileBindingStatus::Matched
+            }
+        } else {
+            AutopilotProfileBindingStatus::Mismatch
+        }
+    } else {
+        AutopilotProfileBindingStatus::Incomparable
+    };
+    let unavailable_reason = match status {
+        AutopilotProfileBindingStatus::Incomparable => usage
+            .and_then(|usage| usage.unavailable_reason.clone())
+            .or_else(|| {
+                requested.model.is_none().then(|| {
+                    "not_process_observable: runtime_default dispatch omitted an explicit model, so the selected provider model is unknown"
+                        .to_string()
+                })
+            })
+            .or_else(|| {
+                requested.reasoning_effort.is_some().then(|| {
+                    "not_process_observable: process usage reports the dispatched model but not the resolved reasoning effort"
+                        .to_string()
+                })
+            })
+            .or_else(|| {
+                Some(
+                    "not_process_observable: no reliable dispatch-attributed model selection was reported for this role"
+                        .to_string(),
+                )
+            }),
+        _ => None,
+    };
+    AutopilotRoleModelExecutionBinding {
+        role,
+        requested: requested.clone(),
+        observed_models,
+        observation: if status == AutopilotProfileBindingStatus::Incomparable {
+            RoleUsageObservation::NotProcessObservable
+        } else {
+            observation
+        },
+        status,
+        unavailable_reason,
+    }
+}
+
+fn review_lens_execution_binding(
+    requested: &ReviewLensConfig,
+    usage: Option<&ReviewLensUsageReport>,
+    dispatch: Option<&ReviewLensDispatchEvidence>,
+) -> AutopilotReviewLensExecutionBinding {
+    let requested_backend_id = requested.backend.backend_id().to_string();
+    let requested_model = requested.backend.model().to_string();
+    let requested_reasoning_effort = requested.backend.reasoning_effort().map(str::to_string);
+    let usage_is_process_observed = usage.is_some_and(|usage| {
+        usage.observation == RoleUsageObservation::ProcessObserved && usage.usage.is_some()
+    });
+    let dispatches = dispatch
+        .map(|dispatch| dispatch.selections.as_slice())
+        .unwrap_or_default();
+    let observed_backend_id =
+        unique_dispatch_value(dispatches, |selection| selection.backend_id.as_deref());
+    let observed_model = unique_dispatch_value(dispatches, |selection| selection.model.as_deref());
+    let observed_reasoning_effort = unique_dispatch_value(dispatches, |selection| {
+        selection.reasoning_effort.as_deref()
+    });
+    let selection_is_complete = !dispatches.is_empty()
+        && dispatches.iter().all(|selection| {
+            selection.backend_id.is_some()
+                && selection.model.is_some()
+                && (requested_reasoning_effort.is_none() || selection.reasoning_effort.is_some())
+                && selection.unavailable_reason.is_none()
+        });
+    let status = if !usage_is_process_observed || !selection_is_complete {
+        AutopilotProfileBindingStatus::Incomparable
+    } else if dispatches.iter().any(|selection| {
+        selection.backend_id.as_deref() != Some(requested_backend_id.as_str())
+            || selection.model.as_deref() != Some(requested_model.as_str())
+            || selection.reasoning_effort.as_deref() != requested_reasoning_effort.as_deref()
+    }) {
+        // Defensive only: requested/effective lens equality is checked before dispatch, and the
+        // production command is built from that equality-gated effective lens.
+        AutopilotProfileBindingStatus::Mismatch
+    } else {
+        AutopilotProfileBindingStatus::Matched
+    };
+    AutopilotReviewLensExecutionBinding {
+        lens_id: requested.id.clone(),
+        requested_backend_id,
+        requested_model,
+        requested_reasoning_effort,
+        observed_backend_id,
+        observed_model,
+        observed_reasoning_effort,
+        dispatch_count: dispatches.len(),
+        observation: if status == AutopilotProfileBindingStatus::Incomparable {
+            RoleUsageObservation::NotProcessObservable
+        } else {
+            RoleUsageObservation::ProcessObserved
+        },
+        status,
+        unavailable_reason: (status == AutopilotProfileBindingStatus::Incomparable).then(|| {
+            (!usage_is_process_observed)
+                .then(|| {
+                    usage
+                        .and_then(|usage| usage.unavailable_reason.clone())
+                        .unwrap_or_else(|| {
+                            "not_process_observable: no reliable process-observable usage sample was attributed to this review lens"
+                                .to_string()
+                        })
+                })
+                .or_else(|| dispatch.and_then(|dispatch| dispatch.unavailable_reason.clone()))
+                .or_else(|| {
+                    dispatches
+                        .iter()
+                        .find_map(|selection| selection.unavailable_reason.clone())
+                })
+                .unwrap_or_else(|| {
+                    "not_process_observable: the dispatched review-lens backend, model, or reasoning effort was unknown"
+                        .to_string()
+                })
+        }),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewLensDispatchSelection {
+    backend_id: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ReviewLensDispatchEvidence {
+    selections: Vec<ReviewLensDispatchSelection>,
+    unavailable_reason: Option<String>,
+}
+
+fn review_lens_dispatch_evidence(
+    supervisor: &SupervisorFinalReport,
+    lens_count: usize,
+) -> Vec<ReviewLensDispatchEvidence> {
+    review_lens_dispatch_evidence_from_records(
+        supervisor
+            .orchestrator_reports
+            .iter()
+            .flat_map(|report| report.audit_reports.iter())
+            // Supervisor collection appends its own sanitized command record after parsing the
+            // runtime-authored report, so the last entry is parent evidence rather than a lens
+            // claim about how it was launched.
+            .map(|auditor| (auditor.id.as_str(), auditor.commands_run.last())),
+        lens_count,
+    )
+}
+
+fn review_lens_dispatch_evidence_from_records<'a>(
+    auditors: impl IntoIterator<Item = (&'a str, Option<&'a CommandRunRecord>)>,
+    lens_count: usize,
+) -> Vec<ReviewLensDispatchEvidence> {
+    let mut evidence = vec![ReviewLensDispatchEvidence::default(); lens_count];
+    for (auditor_id, parent_recorded_command) in auditors {
+        let Some(lens_index) = review_lens_auditor_index(auditor_id) else {
+            continue;
+        };
+        let Some(lens_evidence) = evidence.get_mut(lens_index) else {
+            continue;
+        };
+        let Some(parent_recorded_command) = parent_recorded_command else {
+            lens_evidence.unavailable_reason = Some(
+                "not_process_observable: the parent review-auditor report contained no dispatched command record"
+                    .to_string(),
+            );
+            continue;
+        };
+        lens_evidence
+            .selections
+            .push(review_lens_selection_from_command(parent_recorded_command));
+    }
+    for lens_evidence in &mut evidence {
+        if lens_evidence.selections.is_empty() && lens_evidence.unavailable_reason.is_none() {
+            lens_evidence.unavailable_reason = Some(
+                "not_process_observable: no parent-recorded review-lens dispatch was reported"
+                    .to_string(),
+            );
+        }
+    }
+    evidence
+}
+
+fn review_lens_auditor_index(auditor_id: &str) -> Option<usize> {
+    auditor_id
+        .rsplit_once("-review-auditor-lens-")
+        .and_then(|(_, index)| index.parse::<usize>().ok())
+}
+
+fn review_lens_selection_from_command(record: &CommandRunRecord) -> ReviewLensDispatchSelection {
+    let model = unique_command_argument(&record.command, "-m");
+    let backend_id = unique_codex_config_string(&record.command, "model_provider");
+    let reasoning_effort = unique_codex_config_string(&record.command, "model_reasoning_effort");
+    let unavailable_reason = model
+        .as_ref()
+        .err()
+        .or_else(|| backend_id.as_ref().err())
+        .or_else(|| reasoning_effort.as_ref().err())
+        .cloned();
+    ReviewLensDispatchSelection {
+        backend_id: backend_id.unwrap_or_default(),
+        model: model.unwrap_or_default(),
+        reasoning_effort: reasoning_effort.unwrap_or_default(),
+        unavailable_reason,
+    }
+}
+
+fn unique_command_argument(
+    command: &[String],
+    flag: &str,
+) -> std::result::Result<Option<String>, String> {
+    let values = command
+        .windows(2)
+        .filter(|arguments| arguments[0] == flag)
+        .map(|arguments| arguments[1].clone())
+        .collect::<Vec<_>>();
+    match values.as_slice() {
+        [] => Ok(None),
+        [value] => Ok(Some(value.clone())),
+        _ => Err(format!(
+            "not_process_observable: dispatched review-lens command contained multiple {flag} selections"
+        )),
+    }
+}
+
+fn unique_codex_config_string(
+    command: &[String],
+    key: &str,
+) -> std::result::Result<Option<String>, String> {
+    let prefix = format!("{key}=");
+    let encoded = command
+        .windows(2)
+        .filter(|arguments| arguments[0] == "-c")
+        .filter_map(|arguments| arguments[1].strip_prefix(&prefix))
+        .collect::<Vec<_>>();
+    let value = match encoded.as_slice() {
+        [] => return Ok(None),
+        [value] => *value,
+        _ => {
+            return Err(format!(
+                "not_process_observable: dispatched review-lens command contained multiple {key} selections"
+            ));
+        }
+    };
+    serde_json::from_str::<String>(value).map(Some).map_err(|_| {
+        format!(
+            "not_process_observable: dispatched review-lens command contained an invalid {key} string"
+        )
+    })
+}
+
+fn unique_dispatch_value(
+    dispatches: &[ReviewLensDispatchSelection],
+    value: impl Fn(&ReviewLensDispatchSelection) -> Option<&str>,
+) -> Option<String> {
+    let values = dispatches.iter().filter_map(value).collect::<BTreeSet<_>>();
+    if values.len() == 1 {
+        values.into_iter().next().map(str::to_string)
+    } else {
+        None
+    }
+}
+
 struct FinalReportInput<'a> {
     run_id: &'a RunId,
     status: AutopilotRunStatus,
@@ -2491,6 +3250,7 @@ struct FinalReportInput<'a> {
     max_repair_attempts: usize,
     artifacts: AutopilotArtifactPaths,
     plan: AutopilotPlanSummary,
+    profile_binding: AutopilotProfileBindingReport,
     safety: AutopilotSafetyReport,
     validation: AutopilotValidationSummary,
     pr: Option<SanitizedPrReport>,
@@ -2521,6 +3281,7 @@ fn final_report(input: FinalReportInput<'_>) -> AutopilotFinalReport {
         },
         artifacts: input.artifacts,
         plan: input.plan,
+        profile_binding: input.profile_binding,
         safety: input.safety,
         gate_denials: input.gate_denials,
         supervisor: input.supervisor,
@@ -3245,6 +4006,621 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn supervisor_profile_test_plan() -> AutopilotPlan {
+        AutopilotPlan {
+            version: AUTOPILOT_SCHEMA_VERSION,
+            task: AutopilotTask {
+                title: "Profile plumbing".to_string(),
+                body: "Keep the supervisor profile bound to this attempt.".to_string(),
+            },
+            assigned_paths: vec![PathBuf::from("README.md")],
+            path_proposal: planning::TaskPathProposalDiagnostics::default(),
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            validation_commands: Vec::new(),
+            max_repair_attempts: 1,
+            forge_mode: AutopilotForgeMode::Fake,
+            reviewer: ReviewerConfig::default(),
+            publish_mode: AutopilotPublishMode::DraftOnly,
+            auto_merge: false,
+            external_source: None,
+        }
+    }
+
+    fn nondefault_test_profile() -> AutopilotProfile {
+        AutopilotProfile {
+            version: AUTOPILOT_PROFILE_SCHEMA_VERSION,
+            role_models: BTreeMap::from([(
+                AgentRole::Worker,
+                RoleModelSelection {
+                    model: Some("profile-worker".to_string()),
+                    reasoning_effort: Some("medium".to_string()),
+                    unavailable_model_fallback:
+                        crate::supervise::UnavailableModelFallback::LocalDeterministicFake,
+                },
+            )]),
+            model_pricing: BTreeMap::from([(
+                "profile-worker".to_string(),
+                ModelPricing {
+                    input_usd_per_million_tokens: 1.25,
+                    output_usd_per_million_tokens: 5.5,
+                },
+            )]),
+            review_lenses: vec![ReviewLensConfig {
+                id: "profile-review".to_string(),
+                backend: ReviewLensBackendConfig::Model {
+                    backend_id: "profile-provider".to_string(),
+                    model: "profile-review-model".to_string(),
+                    reasoning_effort: Some("high".to_string()),
+                },
+                information_scope: crate::review::ReviewInformationScope::DiffOnly,
+            }],
+            review_aggregation_policy: ReviewAggregationPolicy::ValidatedQuorum {
+                minimum_accepts: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn omitted_profile_preserves_legacy_supervisor_plan_bytes() {
+        let plan = supervisor_profile_test_plan();
+        let profile = AutopilotProfile::default();
+        let actual = supervisor_plan_for_attempt(&plan, &profile, "agent-a", 1, &[]);
+        let task = supervisor_task(&plan, 1, &[]);
+        let legacy = SupervisorPlan {
+            version: 1,
+            task: task.clone(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: crate::supervise::default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![OrchestratorAssignment {
+                id: "agent-a".to_string(),
+                role: AgentRole::ChildOrchestrator,
+                assigned_paths: plan.assigned_paths.clone(),
+                semantic_symbols: plan.semantic_symbols.clone(),
+                semantic_modules: plan.semantic_modules.clone(),
+                task: None,
+                worker_assignments: vec![WorkerAssignment {
+                    id: "agent-a-worker".to_string(),
+                    role: AgentRole::Worker,
+                    assigned_paths: plan.assigned_paths.clone(),
+                    semantic_symbols: plan.semantic_symbols.clone(),
+                    semantic_modules: plan.semantic_modules.clone(),
+                    task: Some(task),
+                    environment_requirements: Vec::new(),
+                    report_path: None,
+                }],
+                environment_requirements: Vec::new(),
+                licensed_breakage: None,
+                notes: Some("autopilot attempt 1".to_string()),
+            }],
+        };
+
+        assert_eq!(
+            serde_json::to_vec(&actual).expect("serialize actual supervisor plan"),
+            serde_json::to_vec(&legacy).expect("serialize legacy supervisor plan")
+        );
+    }
+
+    #[test]
+    fn requested_effective_profile_mismatch_is_typed_and_blocks_dispatch() {
+        let plan = supervisor_profile_test_plan();
+        let requested = nondefault_test_profile();
+        let mut effective = supervisor_plan_for_attempt(&plan, &requested, "agent-a", 1, &[]);
+        effective.role_models.clear();
+        effective.model_pricing.clear();
+        effective.review_lenses = crate::supervise::default_supervisor_review_lenses();
+        effective.review_aggregation_policy = ReviewAggregationPolicy::AllMustAccept;
+
+        let binding = AutopilotProfileBindingReport::from_effective(requested, &effective);
+
+        assert_eq!(binding.status, AutopilotProfileBindingStatus::Mismatch);
+        assert_eq!(
+            binding.configuration_status,
+            AutopilotProfileBindingStatus::Mismatch
+        );
+        assert_eq!(
+            binding.failure,
+            Some(AutopilotProfileBindingFailure {
+                kind: AutopilotProfileBindingFailureKind::RequestedEffectiveMismatch,
+                mismatched_fields: vec![
+                    AutopilotProfileBindingField::RoleModels,
+                    AutopilotProfileBindingField::ModelPricing,
+                    AutopilotProfileBindingField::ReviewLenses,
+                    AutopilotProfileBindingField::ReviewAggregationPolicy,
+                ],
+                mismatched_roles: Vec::new(),
+                mismatched_review_lens_ids: Vec::new(),
+            })
+        );
+        assert!(!binding.permits_dispatch());
+    }
+
+    #[test]
+    fn requested_effective_lens_mismatch_blocks_before_dispatch() {
+        let plan = supervisor_profile_test_plan();
+        let requested = nondefault_test_profile();
+        let mut effective = supervisor_plan_for_attempt(&plan, &requested, "agent-a", 1, &[]);
+        let ReviewLensBackendConfig::Model { backend_id, .. } =
+            &mut effective.review_lenses[0].backend
+        else {
+            panic!("test profile lens must be model-backed");
+        };
+        *backend_id = "different-effective-provider".to_string();
+
+        let binding = AutopilotProfileBindingReport::from_effective(requested, &effective);
+
+        assert_eq!(binding.status, AutopilotProfileBindingStatus::Mismatch);
+        assert_eq!(
+            binding.configuration_status,
+            AutopilotProfileBindingStatus::Mismatch
+        );
+        assert_eq!(
+            binding.failure,
+            Some(AutopilotProfileBindingFailure {
+                kind: AutopilotProfileBindingFailureKind::RequestedEffectiveMismatch,
+                mismatched_fields: vec![AutopilotProfileBindingField::ReviewLenses],
+                mismatched_roles: Vec::new(),
+                mismatched_review_lens_ids: Vec::new(),
+            })
+        );
+        assert!(!binding.permits_dispatch());
+    }
+
+    fn process_observed_role_usage(models: Vec<&str>) -> RoleUsageReport {
+        RoleUsageReport {
+            models: models.into_iter().map(str::to_string).collect(),
+            usage: Some(crate::llm::provider::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+            }),
+            cost_usd: None,
+            observation: RoleUsageObservation::ProcessObserved,
+            unavailable_reason: None,
+        }
+    }
+
+    fn process_observed_lens_usage(lens: &ReviewLensConfig, model: &str) -> ReviewLensUsageReport {
+        ReviewLensUsageReport {
+            lens_id: lens.id.clone(),
+            backend_id: lens.backend.backend_id().to_string(),
+            model: model.to_string(),
+            usage: Some(crate::llm::provider::Usage {
+                input_tokens: 8,
+                output_tokens: 4,
+                total_tokens: 12,
+            }),
+            cost_usd: None,
+            observation: RoleUsageObservation::ProcessObserved,
+            unavailable_reason: None,
+        }
+    }
+
+    fn synthetic_lens_dispatch_evidence(
+        backend_id: Option<&str>,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) -> Vec<ReviewLensDispatchEvidence> {
+        let command = crate::external_agent::ExternalAgentCommand::codex(
+            "codex",
+            ".",
+            "prompt.md",
+            "capture.jsonl",
+            "report.json",
+            Duration::from_secs(30),
+        )
+        .with_model_provider(backend_id.map(str::to_string))
+        .with_model_selection(
+            model.map(str::to_string),
+            reasoning_effort.map(str::to_string),
+        );
+        let command = CommandRunRecord {
+            command: crate::external_agent::command_argv(&command)
+                .into_iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect(),
+            cwd: PathBuf::from("<child-worktree>"),
+            exit_code: Some(0),
+            status: ReviewStatus::Succeeded,
+            timeout_seconds: 30,
+            duration_ms: 1,
+            timed_out: false,
+            stdout: String::new(),
+            stderr: String::new(),
+            sandbox_denials: Vec::new(),
+            environment_preflight_results: Vec::new(),
+            environment_failures: Vec::new(),
+            error: None,
+        };
+        review_lens_dispatch_evidence_from_records(
+            [("agent-a-review-auditor-lens-0", Some(&command))],
+            1,
+        )
+    }
+
+    #[test]
+    fn observed_requested_execution_profile_is_matched() {
+        let plan = supervisor_profile_test_plan();
+        let mut requested = nondefault_test_profile();
+        requested.role_models = BTreeMap::from([(
+            AgentRole::ChildOrchestrator,
+            RoleModelSelection {
+                model: Some("profile-child".to_string()),
+                reasoning_effort: None,
+                unavailable_model_fallback: crate::supervise::UnavailableModelFallback::FailClosed,
+            },
+        )]);
+        let ReviewLensBackendConfig::Model {
+            reasoning_effort, ..
+        } = &mut requested.review_lenses[0].backend
+        else {
+            panic!("test profile lens must be model-backed");
+        };
+        *reasoning_effort = None;
+        let effective = supervisor_plan_for_attempt(&plan, &requested, "agent-a", 1, &[]);
+        let mut binding =
+            AutopilotProfileBindingReport::from_effective(requested.clone(), &effective);
+        let role_usage = BTreeMap::from([(
+            AgentRole::ChildOrchestrator,
+            process_observed_role_usage(vec!["profile-child"]),
+        )]);
+        let lens_usage = vec![process_observed_lens_usage(
+            &requested.review_lenses[0],
+            "profile-review-model",
+        )];
+
+        let lens_dispatch = synthetic_lens_dispatch_evidence(
+            Some("profile-provider"),
+            Some("profile-review-model"),
+            None,
+        );
+        binding.observe_execution_reports(&role_usage, &lens_usage, &lens_dispatch);
+
+        assert_eq!(binding.status, AutopilotProfileBindingStatus::Matched);
+        assert_eq!(
+            binding.configuration_status,
+            AutopilotProfileBindingStatus::Matched
+        );
+        assert!(binding.failure.is_none());
+        let execution = binding.execution.expect("execution binding");
+        assert_eq!(
+            execution.role_models[0].observed_models,
+            vec!["profile-child"]
+        );
+        assert_eq!(
+            execution.review_lenses[0].observed_model.as_deref(),
+            Some("profile-review-model")
+        );
+    }
+
+    #[test]
+    fn observed_different_execution_profile_is_typed_mismatch() {
+        let plan = supervisor_profile_test_plan();
+        let mut requested = nondefault_test_profile();
+        requested.role_models = BTreeMap::from([(
+            AgentRole::ChildOrchestrator,
+            RoleModelSelection {
+                model: Some("profile-child".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                unavailable_model_fallback: crate::supervise::UnavailableModelFallback::FailClosed,
+            },
+        )]);
+        let effective = supervisor_plan_for_attempt(&plan, &requested, "agent-a", 1, &[]);
+        let mut binding =
+            AutopilotProfileBindingReport::from_effective(requested.clone(), &effective);
+        let role_usage = BTreeMap::from([(
+            AgentRole::ChildOrchestrator,
+            process_observed_role_usage(vec!["different-child"]),
+        )]);
+        let lens_usage = vec![process_observed_lens_usage(
+            &requested.review_lenses[0],
+            "profile-review-model",
+        )];
+
+        let lens_dispatch = synthetic_lens_dispatch_evidence(
+            Some("profile-provider"),
+            Some("profile-review-model"),
+            Some("high"),
+        );
+        binding.observe_execution_reports(&role_usage, &lens_usage, &lens_dispatch);
+
+        assert_eq!(binding.status, AutopilotProfileBindingStatus::Mismatch);
+        assert_eq!(
+            binding.configuration_status,
+            AutopilotProfileBindingStatus::Matched
+        );
+        assert_eq!(
+            binding.failure,
+            Some(AutopilotProfileBindingFailure {
+                kind: AutopilotProfileBindingFailureKind::RequestedObservedSelectionMismatch,
+                mismatched_fields: vec![AutopilotProfileBindingField::RoleModels],
+                mismatched_roles: vec![AgentRole::ChildOrchestrator],
+                mismatched_review_lens_ids: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn synthetic_complete_lens_dispatch_mismatch_is_a_defensive_signal() {
+        let plan = supervisor_profile_test_plan();
+        let mut requested = nondefault_test_profile();
+        requested.role_models.clear();
+        let effective = supervisor_plan_for_attempt(&plan, &requested, "agent-a", 1, &[]);
+        let mut binding =
+            AutopilotProfileBindingReport::from_effective(requested.clone(), &effective);
+        let lens_usage = vec![process_observed_lens_usage(
+            &requested.review_lenses[0],
+            "profile-review-model",
+        )];
+        let lens_dispatch = synthetic_lens_dispatch_evidence(
+            Some("different-synthetic-provider"),
+            Some("profile-review-model"),
+            Some("high"),
+        );
+
+        binding.observe_execution_reports(&BTreeMap::new(), &lens_usage, &lens_dispatch);
+
+        assert_eq!(binding.status, AutopilotProfileBindingStatus::Mismatch);
+        assert_eq!(
+            binding.failure,
+            Some(AutopilotProfileBindingFailure {
+                kind: AutopilotProfileBindingFailureKind::RequestedObservedSelectionMismatch,
+                mismatched_fields: vec![AutopilotProfileBindingField::ReviewLenses],
+                mismatched_roles: Vec::new(),
+                mismatched_review_lens_ids: vec!["profile-review".to_string()],
+            })
+        );
+        let observed = &binding.execution.as_ref().expect("execution").review_lenses[0];
+        assert_eq!(
+            observed.observed_backend_id.as_deref(),
+            Some("different-synthetic-provider")
+        );
+        assert_eq!(
+            observed.observed_model.as_deref(),
+            Some("profile-review-model")
+        );
+        assert_eq!(observed.observed_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(observed.dispatch_count, 1);
+    }
+
+    #[test]
+    fn incomplete_lens_dispatch_with_different_backend_is_incomparable() {
+        let plan = supervisor_profile_test_plan();
+        let mut requested = nondefault_test_profile();
+        requested.role_models.clear();
+        let effective = supervisor_plan_for_attempt(&plan, &requested, "agent-a", 1, &[]);
+        let mut binding =
+            AutopilotProfileBindingReport::from_effective(requested.clone(), &effective);
+        let lens_usage = vec![process_observed_lens_usage(
+            &requested.review_lenses[0],
+            "profile-review-model",
+        )];
+        let lens_dispatch = synthetic_lens_dispatch_evidence(
+            Some("different-synthetic-provider"),
+            None,
+            Some("high"),
+        );
+
+        binding.observe_execution_reports(&BTreeMap::new(), &lens_usage, &lens_dispatch);
+
+        assert_eq!(binding.status, AutopilotProfileBindingStatus::Incomparable);
+        assert!(binding.failure.is_none());
+        let observed = &binding.execution.as_ref().expect("execution").review_lenses[0];
+        assert_eq!(observed.status, AutopilotProfileBindingStatus::Incomparable);
+        assert_eq!(
+            observed.observed_backend_id.as_deref(),
+            Some("different-synthetic-provider")
+        );
+        assert!(observed.observed_model.is_none());
+        assert_eq!(
+            observed.observation,
+            RoleUsageObservation::NotProcessObservable
+        );
+    }
+
+    #[test]
+    fn complete_lens_dispatch_without_usage_is_incomparable() {
+        let plan = supervisor_profile_test_plan();
+        let mut requested = nondefault_test_profile();
+        requested.role_models.clear();
+        let effective = supervisor_plan_for_attempt(&plan, &requested, "agent-a", 1, &[]);
+        let mut binding =
+            AutopilotProfileBindingReport::from_effective(requested.clone(), &effective);
+        let lens_dispatch = synthetic_lens_dispatch_evidence(
+            Some("profile-provider"),
+            Some("profile-review-model"),
+            Some("high"),
+        );
+
+        binding.observe_execution_reports(&BTreeMap::new(), &[], &lens_dispatch);
+
+        assert_eq!(binding.status, AutopilotProfileBindingStatus::Incomparable);
+        assert!(binding.failure.is_none());
+        let observed = &binding.execution.as_ref().expect("execution").review_lenses[0];
+        assert_eq!(observed.status, AutopilotProfileBindingStatus::Incomparable);
+        assert_eq!(observed.dispatch_count, 1);
+        assert_eq!(
+            observed.observation,
+            RoleUsageObservation::NotProcessObservable
+        );
+        assert!(observed
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("not_process_observable")));
+    }
+
+    #[test]
+    fn plan_echoed_lens_usage_without_dispatched_selection_is_incomparable() {
+        let plan = supervisor_profile_test_plan();
+        let mut requested = nondefault_test_profile();
+        requested.role_models.clear();
+        let effective = supervisor_plan_for_attempt(&plan, &requested, "agent-a", 1, &[]);
+        let mut binding =
+            AutopilotProfileBindingReport::from_effective(requested.clone(), &effective);
+        let lens_usage = vec![process_observed_lens_usage(
+            &requested.review_lenses[0],
+            "profile-review-model",
+        )];
+        let lens_dispatch = synthetic_lens_dispatch_evidence(None, None, None);
+
+        binding.observe_execution_reports(&BTreeMap::new(), &lens_usage, &lens_dispatch);
+
+        assert_eq!(binding.status, AutopilotProfileBindingStatus::Incomparable);
+        assert!(binding.failure.is_none());
+        let observed = &binding.execution.as_ref().expect("execution").review_lenses[0];
+        assert_eq!(observed.status, AutopilotProfileBindingStatus::Incomparable);
+        assert!(observed.observed_backend_id.is_none());
+        assert!(observed.observed_model.is_none());
+        assert_eq!(observed.dispatch_count, 1);
+        assert!(observed
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("not_process_observable")));
+    }
+
+    #[test]
+    fn fake_worker_selection_is_incomparable_not_matched() {
+        let plan = supervisor_profile_test_plan();
+        let requested = nondefault_test_profile();
+        let effective = supervisor_plan_for_attempt(&plan, &requested, "agent-a", 1, &[]);
+        let mut binding =
+            AutopilotProfileBindingReport::from_effective(requested.clone(), &effective);
+        let role_usage = BTreeMap::from([(
+            AgentRole::Worker,
+            RoleUsageReport {
+                models: Vec::new(),
+                usage: None,
+                cost_usd: None,
+                observation: RoleUsageObservation::NotProcessObservable,
+                unavailable_reason: Some(
+                    "nested fake worker usage is not process observable".to_string(),
+                ),
+            },
+        )]);
+        let lens_usage = vec![ReviewLensUsageReport {
+            lens_id: requested.review_lenses[0].id.clone(),
+            backend_id: requested.review_lenses[0].backend.backend_id().to_string(),
+            model: requested.review_lenses[0].backend.model().to_string(),
+            usage: None,
+            cost_usd: None,
+            observation: RoleUsageObservation::NotProcessObservable,
+            unavailable_reason: Some("fake lens usage is not process observable".to_string()),
+        }];
+
+        let lens_dispatch = synthetic_lens_dispatch_evidence(None, None, None);
+        binding.observe_execution_reports(&role_usage, &lens_usage, &lens_dispatch);
+
+        assert_eq!(binding.status, AutopilotProfileBindingStatus::Incomparable);
+        assert_eq!(
+            binding.configuration_status,
+            AutopilotProfileBindingStatus::Matched
+        );
+        assert!(binding.failure.is_none());
+        let worker = &binding.execution.as_ref().expect("execution").role_models[0];
+        assert_eq!(
+            worker.observation,
+            RoleUsageObservation::NotProcessObservable
+        );
+        assert_ne!(worker.status, AutopilotProfileBindingStatus::Matched);
+    }
+
+    #[test]
+    fn runtime_default_without_explicit_model_is_incomparable() {
+        let plan = supervisor_profile_test_plan();
+        let mut requested = nondefault_test_profile();
+        requested.role_models = BTreeMap::from([(
+            AgentRole::ChildOrchestrator,
+            RoleModelSelection {
+                model: None,
+                reasoning_effort: Some("high".to_string()),
+                unavailable_model_fallback:
+                    crate::supervise::UnavailableModelFallback::RuntimeDefault,
+            },
+        )]);
+        let effective = supervisor_plan_for_attempt(&plan, &requested, "agent-a", 1, &[]);
+        let mut binding =
+            AutopilotProfileBindingReport::from_effective(requested.clone(), &effective);
+        let role_usage = BTreeMap::from([(
+            AgentRole::ChildOrchestrator,
+            process_observed_role_usage(Vec::new()),
+        )]);
+        let lens_usage = vec![process_observed_lens_usage(
+            &requested.review_lenses[0],
+            "profile-review-model",
+        )];
+
+        let lens_dispatch = synthetic_lens_dispatch_evidence(
+            Some("profile-provider"),
+            Some("profile-review-model"),
+            Some("high"),
+        );
+        binding.observe_execution_reports(&role_usage, &lens_usage, &lens_dispatch);
+
+        assert_eq!(binding.status, AutopilotProfileBindingStatus::Incomparable);
+        let role = &binding.execution.as_ref().expect("execution").role_models[0];
+        assert_eq!(role.observation, RoleUsageObservation::NotProcessObservable);
+        assert!(role
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("runtime_default")));
+    }
+
+    #[test]
+    fn unobserved_reasoning_effort_keeps_matching_model_incomparable() {
+        let plan = supervisor_profile_test_plan();
+        let mut requested = nondefault_test_profile();
+        requested.role_models = BTreeMap::from([(
+            AgentRole::ChildOrchestrator,
+            RoleModelSelection {
+                model: Some("profile-child".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                unavailable_model_fallback: crate::supervise::UnavailableModelFallback::FailClosed,
+            },
+        )]);
+        let ReviewLensBackendConfig::Model {
+            reasoning_effort, ..
+        } = &mut requested.review_lenses[0].backend
+        else {
+            panic!("test profile lens must be model-backed");
+        };
+        *reasoning_effort = None;
+        let effective = supervisor_plan_for_attempt(&plan, &requested, "agent-a", 1, &[]);
+        let mut binding =
+            AutopilotProfileBindingReport::from_effective(requested.clone(), &effective);
+        let role_usage = BTreeMap::from([(
+            AgentRole::ChildOrchestrator,
+            process_observed_role_usage(vec!["profile-child"]),
+        )]);
+        let lens_usage = vec![process_observed_lens_usage(
+            &requested.review_lenses[0],
+            "profile-review-model",
+        )];
+
+        let lens_dispatch = synthetic_lens_dispatch_evidence(
+            Some("profile-provider"),
+            Some("profile-review-model"),
+            None,
+        );
+        binding.observe_execution_reports(&role_usage, &lens_usage, &lens_dispatch);
+
+        assert_eq!(binding.status, AutopilotProfileBindingStatus::Incomparable);
+        let role = &binding.execution.as_ref().expect("execution").role_models[0];
+        assert_eq!(role.observation, RoleUsageObservation::NotProcessObservable);
+        assert!(role
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("reasoning effort")));
     }
 
     fn create_committed_autopilot_repo(root: &Path) -> PathBuf {
