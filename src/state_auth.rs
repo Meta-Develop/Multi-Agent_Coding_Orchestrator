@@ -5,6 +5,7 @@
 
 use crate::{
     field_guide::FIELD_GUIDE_STATE_NAMESPACE,
+    follow_up_queue::GENERATED_FOLLOW_UP_QUEUE_ROOT_NAME,
     safe_state::{
         identity_for_path, AtomicStateWriter, BoundedRegularReader, ExistingExclusiveLock,
         FileIdentity, KernelStateLock, SafeRoot,
@@ -63,6 +64,10 @@ const AUTHENTICATED_STATE_CONSUMERS: &[(&str, &str)] = &[
     (
         "state-migration-manifests-v1",
         "authenticated state migration manifests",
+    ),
+    (
+        GENERATED_FOLLOW_UP_QUEUE_ROOT_NAME,
+        "authenticated generated follow-up queues",
     ),
 ];
 
