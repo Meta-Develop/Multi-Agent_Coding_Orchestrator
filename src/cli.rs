@@ -86,6 +86,8 @@ const MAX_PROMPT_EXCERPT_BYTES: u64 = 32 * 1024;
 const MAX_PROMPT_EXCERPT_TOTAL_BYTES: usize = 48 * 1024;
 const MAX_PROMPT_PATHS: usize = 64;
 const MAX_SUPERVISE_GOAL_FILE_BYTES: u64 = 256 * 1024;
+const MAX_EVALUATION_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_EVALUATION_PLAN_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "maco")]
@@ -123,6 +125,7 @@ impl Cli {
             Command::Agent(command) => command.run(),
             Command::Agents(command) => command.run(),
             Command::Llm(command) => command.run(),
+            Command::Evaluation(command) => command.run(),
         }
     }
 }
@@ -171,6 +174,8 @@ enum Command {
     Agents(AgentsCommand),
     /// Inspect local LLM adapter boundaries without network calls.
     Llm(LlmCommand),
+    /// Generate deterministic model-mix fixture results from a versioned manifest.
+    Evaluation(EvaluationCommand),
 }
 
 #[derive(Debug, Args)]
@@ -2807,6 +2812,99 @@ struct LlmPromptPreviewArgs {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct EvaluationCommand {
+    #[command(subcommand)]
+    command: EvaluationSubcommand,
+}
+
+impl EvaluationCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            EvaluationSubcommand::Run(args) => run_evaluation_command(args),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum EvaluationSubcommand {
+    /// Generate deterministic fixture output for every manifest profile and repetition.
+    Run(RunEvaluationArgs),
+}
+
+#[derive(Debug, Args)]
+struct RunEvaluationArgs {
+    /// Versioned evaluation manifest JSON.
+    manifest: PathBuf,
+    /// Hand-authored plan whose exact bytes are bound by the manifest.
+    #[arg(long)]
+    plan_file: PathBuf,
+    /// Reserved source-repository path; unused by the current synthetic fixture runner.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Requested mode; the current runner supports deterministic-fake and refuses real-provider.
+    #[arg(
+        long,
+        default_value = "deterministic-fake",
+        value_parser = parse_evaluation_execution
+    )]
+    execution: crate::evaluation::EvaluationExecution,
+    /// Acknowledge future real-provider execution; the current runner still refuses it.
+    #[arg(long)]
+    allow_real_provider: bool,
+    /// Stable seed for deterministic fake evaluation fixtures.
+    #[arg(
+        long,
+        default_value_t = crate::evaluation::COMMITTED_FIXTURE_FAKE_SEED
+    )]
+    fake_seed: u64,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+fn run_evaluation_command(args: RunEvaluationArgs) -> Result<()> {
+    let manifest_bytes =
+        BoundedRegularReader::read_tree_no_follow(&args.manifest, MAX_EVALUATION_MANIFEST_BYTES)
+            .with_context(|| {
+                format!(
+                    "failed to read evaluation manifest {}",
+                    args.manifest.display()
+                )
+            })?;
+    let manifest = serde_json::from_slice::<crate::evaluation::EvaluationManifest>(&manifest_bytes)
+        .with_context(|| {
+            format!(
+                "failed to parse evaluation manifest {}",
+                args.manifest.display()
+            )
+        })?;
+    let plan_bytes =
+        BoundedRegularReader::read_tree_no_follow(&args.plan_file, MAX_EVALUATION_PLAN_BYTES)
+            .with_context(|| {
+                format!(
+                    "failed to read hand-authored evaluation plan {}",
+                    args.plan_file.display()
+                )
+            })?;
+
+    // This legacy Phase-A runner generates synthetic fixtures only: it does not inspect the
+    // repository or execute a provider, supervisor, held-out command, or isolated workflow.
+    // Keep the reserved repository binding explicit so a future isolated runner can replace this
+    // single call without silently changing the command contract.
+    let _repo = args.repo;
+    let results = crate::evaluation::run_evaluation(
+        &manifest,
+        &plan_bytes,
+        crate::evaluation::EvaluationRunRequest {
+            execution: args.execution,
+            allow_real_provider: args.allow_real_provider,
+            fake_seed: args.fake_seed,
+        },
+    )?;
+    print_query_report(&results, args.json)
+}
+
 #[derive(Debug, Subcommand)]
 enum WorktreeSubcommand {
     /// Create a linked worktree for an agent.
@@ -4111,6 +4209,16 @@ fn parse_forge_kind(value: &str) -> std::result::Result<ForgeKind, String> {
 
 fn parse_inbox_permission_mode(value: &str) -> std::result::Result<InboxPermissionMode, String> {
     InboxPermissionMode::parse(value)
+}
+
+fn parse_evaluation_execution(
+    value: &str,
+) -> std::result::Result<crate::evaluation::EvaluationExecution, String> {
+    match value {
+        "deterministic-fake" => Ok(crate::evaluation::EvaluationExecution::DeterministicFake),
+        "real-provider" => Ok(crate::evaluation::EvaluationExecution::RealProvider),
+        _ => Err("expected one of: deterministic-fake, real-provider".to_string()),
+    }
 }
 
 fn live_clock(value: Option<&str>) -> Result<LiveClock> {
