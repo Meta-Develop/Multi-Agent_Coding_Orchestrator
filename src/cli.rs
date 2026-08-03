@@ -800,16 +800,38 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     "supervise run requires exactly one positional SUPERVISOR_PLAN or --from-goal <FILE>"
                 ),
             };
-            let resolved = resolve_run_id_for_run(
-                &args.repo,
-                RunArtifactFamily::Supervise,
-                args.run_id.as_deref(),
-                args.json,
-            )?;
+            let existing = if let Some(explicit) = args.run_id.as_deref() {
+                let repo = artifacts::discover_repo_root(&args.repo)?;
+                let run_id = RunId::new(explicit)?;
+                let run_dir = repo
+                    .join(RunArtifactFamily::Supervise.run_root())
+                    .join(run_id.as_str());
+                match std::fs::symlink_metadata(&run_dir) {
+                    Ok(_) => Some((repo, run_id)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error).with_context(|| {
+                        format!("failed to inspect supervise run {}", run_dir.display())
+                    }),
+                }
+            } else {
+                None
+            };
+            let (resolved_repo, resolved_run_id, resume_existing) = match existing {
+                Some((repo, run_id)) => (repo, run_id, true),
+                None => {
+                    let resolved = resolve_run_id_for_run(
+                        &args.repo,
+                        RunArtifactFamily::Supervise,
+                        args.run_id.as_deref(),
+                        args.json,
+                    )?;
+                    (resolved.repo, resolved.run_id, false)
+                }
+            };
             let options = SupervisorRunOptions {
-                repo: resolved.repo,
+                repo: resolved_repo,
                 plan_file,
-                run_id: resolved.run_id.clone(),
+                run_id: resolved_run_id.clone(),
                 codex_bin: args.codex_bin,
                 runtime: args.runtime,
                 allow_dirty_primary: args.allow_dirty_primary,
@@ -817,23 +839,41 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     config: args.machine_global_config,
                     root_id: args.machine_global_runtime_root_id,
                     owner: "maco-supervise".to_string(),
-                    correction_correlation_id: resolved.run_id.as_str().to_string(),
+                    correction_correlation_id: resolved_run_id.as_str().to_string(),
                 }),
             };
-            let report = match goal_spec {
-                Some(goal_spec) => supervise::run_supervisor_goal_spec_with_concurrency_policy(
-                    options,
-                    "",
-                    &goal_spec,
-                    args.max_concurrent_children,
-                )?,
-                None => supervise::run_supervisor_plan_file_with_concurrency_policy(
-                    options,
-                    args.max_concurrent_children,
-                )?,
+            let report = match (goal_spec, resume_existing) {
+                (Some(goal_spec), true) => {
+                    supervise::resume_supervisor_goal_spec_cascade_with_concurrency_policy(
+                        options,
+                        "",
+                        &goal_spec,
+                        args.max_concurrent_children,
+                    )?
+                }
+                (Some(goal_spec), false) => {
+                    supervise::run_supervisor_goal_spec_cascade_with_concurrency_policy(
+                        options,
+                        "",
+                        &goal_spec,
+                        args.max_concurrent_children,
+                    )?
+                }
+                (None, true) => {
+                    supervise::resume_supervisor_plan_file_cascade_with_concurrency_policy(
+                        options,
+                        args.max_concurrent_children,
+                    )?
+                }
+                (None, false) => {
+                    supervise::run_supervisor_plan_file_cascade_with_concurrency_policy(
+                        options,
+                        args.max_concurrent_children,
+                    )?
+                }
             };
             print_query_report(&report, args.json)?;
-            if !report.success {
+            if !report.follow_up_cascade_success {
                 bail!("supervise run failed");
             }
             Ok(())

@@ -99,6 +99,11 @@ use std::{
 mod plan_api;
 pub use plan_api::*;
 
+mod follow_up_cascade;
+use follow_up_cascade::*;
+#[cfg(test)]
+pub(crate) use follow_up_cascade::set_before_generated_follow_up_plan_load_hook;
+
 mod repository;
 use repository::*;
 
@@ -1136,6 +1141,46 @@ pub struct SupervisorFinalReport {
     pub semantic_release_errors: Vec<String>,
     pub remaining_risk: String,
     pub next_safe_action: String,
+}
+
+/// A command-level view over the immutable source report and the separately
+/// authenticated generated-follow-up cascade. Flattening preserves every
+/// existing top-level source field while making round-two state explicit.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct SupervisorCascadeOutcome {
+    #[serde(flatten)]
+    pub source_report: SupervisorFinalReport,
+    pub follow_up_cascade_version: u32,
+    pub follow_up_cascade_success: bool,
+    pub follow_up_queue: Option<SupervisorFollowUpQueueSummary>,
+    #[serde(default)]
+    pub follow_up_reports: Vec<SupervisorFinalReport>,
+    #[serde(default)]
+    pub follow_up_gate_denials: Vec<GateDenial>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorFollowUpQueueSummary {
+    pub queue_instance_id: String,
+    pub source_supervisor_run_id: String,
+    pub enqueue_committed: bool,
+    pub item_count: usize,
+    pub pending_count: usize,
+    pub claimed_count: usize,
+    pub dispatch_started_count: usize,
+    pub dispatch_observed_count: usize,
+    pub acknowledged_terminal_count: usize,
+    pub held_ambiguous_count: usize,
+    pub authenticated_child_dispatch_started_count: usize,
+}
+
+impl SupervisorCascadeOutcome {
+    pub fn generated_follow_up_dispatch_performed(&self) -> bool {
+        self.follow_up_queue.as_ref().is_some_and(|queue| {
+            queue.authenticated_child_dispatch_started_count > 0
+        })
+    }
 }
 
 /// Content-addressed evidence-only operation embedded in a normalized plan.

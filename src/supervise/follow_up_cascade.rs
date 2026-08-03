@@ -1,0 +1,577 @@
+use super::*;
+use crate::{
+    artifacts::repository_authenticator_key_only,
+    follow_up_queue::{
+        GeneratedFollowUpDispatchObservation, GeneratedFollowUpQueue,
+        GeneratedFollowUpQueueBounds, GeneratedFollowUpQueueEntrypoint,
+        GeneratedFollowUpQueuePhase, GeneratedFollowUpQueueSource,
+        GeneratedFollowUpRetentionBinding,
+    },
+};
+use std::io::Write;
+
+const FOLLOW_UP_CASCADE_VERSION: u32 = 1;
+
+pub(super) struct FollowUpCascadeInvocation<'a> {
+    pub(super) outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
+    pub(super) outer_command_run_id: &'a RunId,
+    pub(super) concurrency_policy: SupervisorConcurrencyPolicy,
+}
+
+pub(super) fn source_only_cascade_outcome(
+    source_report: SupervisorFinalReport,
+) -> SupervisorCascadeOutcome {
+    let follow_up_cascade_success =
+        source_report.success && source_report.generated_follow_up_tasks.is_empty();
+    SupervisorCascadeOutcome {
+        source_report,
+        follow_up_cascade_version: FOLLOW_UP_CASCADE_VERSION,
+        follow_up_cascade_success,
+        follow_up_queue: None,
+        follow_up_reports: Vec::new(),
+        follow_up_gate_denials: Vec::new(),
+    }
+}
+
+pub(super) fn run_generated_follow_up_cascade(
+    repo: &Path,
+    source_loaded: &LoadedSupervisorPlan,
+    source_report: SupervisorFinalReport,
+    supervisor_template: &SupervisorRunOptions,
+    invocation: FollowUpCascadeInvocation<'_>,
+    before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<bool>,
+) -> Result<SupervisorCascadeOutcome> {
+    if source_report.generated_follow_up_tasks.is_empty() {
+        return Ok(source_only_cascade_outcome(source_report));
+    }
+    if !source_report.success || !source_report.accepted || !source_report.publishable {
+        return Ok(source_only_cascade_outcome(source_report));
+    }
+
+    let source_plan_sha256 = normalized_supervisor_plan_sha256(
+        &source_loaded.plan,
+        &source_loaded.consultant,
+        &source_loaded.assignment_metadata,
+        &source_loaded.plan_metadata,
+    )?;
+    verify_authenticated_source_basis(
+        repo,
+        source_loaded,
+        &source_report,
+        &source_plan_sha256,
+    )?;
+    let primary_baseline =
+        primary_worktree_snapshot_sha256(repo, SupervisorExecutionRuntime::Verified)?;
+    let retention = supervisor_template
+        .machine_global_retention
+        .as_ref()
+        .context("generated follow-up cascade requires the inherited machine-global retention binding")?;
+    let retained_binding = GeneratedFollowUpRetentionBinding::from_machine_global(retention)?;
+    let authenticator = repository_authenticator_key_only(repo)?;
+    let repository_id = authenticator.binding().repository_id.clone();
+    let source = GeneratedFollowUpQueueSource::root(
+        source_report.run_id.as_str(),
+        source_plan_sha256,
+        source_report.accepted,
+        source_report.publishable,
+        invocation.outer_entrypoint,
+        invocation.outer_command_run_id.as_str(),
+        repository_id,
+        primary_baseline.clone(),
+        retained_binding,
+    )?;
+    let bounds = GeneratedFollowUpQueueBounds::from_validated_source_plan_and_tasks(
+        &source_loaded.plan,
+        &source_report.generated_follow_up_tasks,
+    )?;
+    let mut queue = GeneratedFollowUpQueue::create_or_open(authenticator, source, bounds)?;
+    if !queue.snapshot().enqueue_committed() {
+        if queue.snapshot().staged_count() == 0 {
+            queue.enqueue_all_before_dispatch(&source_report.generated_follow_up_tasks)?;
+        } else {
+            queue.complete_staged_batch(&source_report.generated_follow_up_tasks)?;
+        }
+    } else {
+        queue.enqueue_all_before_dispatch(&source_report.generated_follow_up_tasks)?;
+    }
+
+    queue.release_claimed_before_dispatch()?;
+    let mut follow_up_reports = Vec::new();
+    let mut authenticated_child_dispatch_started_count = 0_usize;
+    let mut cascade_success = true;
+    let mut cascade_gate_denials = Vec::new();
+
+    reconcile_started_items(
+        repo,
+        &mut queue,
+        &mut follow_up_reports,
+        &mut authenticated_child_dispatch_started_count,
+        &mut cascade_success,
+        &mut cascade_gate_denials,
+    )?;
+
+    let pending = queue
+        .snapshot()
+        .pending_item_ids()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for item_id in pending {
+        queue.claim(&item_id)?;
+        if primary_worktree_snapshot_sha256(repo, SupervisorExecutionRuntime::Verified)?
+            != primary_baseline
+        {
+            let denial = primary_integrity_denial(&item_id)?;
+            queue.release_before_dispatch(&item_id, Some(denial.clone()), Vec::new())?;
+            cascade_gate_denials.push(denial);
+            cascade_success = false;
+            break;
+        }
+        // Re-read the exact config bytes and inode immediately before every
+        // subordinate call. A changed binding refuses while the item is still
+        // safely releasable and has no dispatch-start marker.
+        let observed_retention = GeneratedFollowUpRetentionBinding::from_machine_global(retention)?;
+        if observed_retention.binding_sha256() != queue.snapshot().source().retention_binding_sha256()
+        {
+            let denial = permission_expansion_denial(&item_id)?;
+            queue.release_before_dispatch(&item_id, Some(denial.clone()), Vec::new())?;
+            cascade_gate_denials.push(denial);
+            cascade_success = false;
+            break;
+        }
+
+        let task = queue
+            .snapshot()
+            .item(&item_id)
+            .context("claimed generated follow-up item disappeared")?
+            .task()
+            .clone();
+        if task.cascade_depth != LICENSED_BREAKAGE_CASCADE_DEPTH {
+            let denial = permission_expansion_denial(&item_id)?;
+            queue.release_before_dispatch(&item_id, Some(denial.clone()), Vec::new())?;
+            cascade_gate_denials.push(denial);
+            cascade_success = false;
+            break;
+        }
+        let effective = validate_generated_follow_up_plan_document(&task.supervisor_plan)?;
+        let mut plan_file = generated_plan_file(repo, &task.supervisor_plan)?;
+        #[cfg(test)]
+        run_before_generated_follow_up_plan_load_hook(plan_file.path());
+        let reloaded = load_exact_generated_plan_file(plan_file.path(), &task.supervisor_plan)?;
+        if reloaded != effective {
+            bail!("generated follow-up ordinary plan file changed before dispatch");
+        }
+        // The caller-specific profile gate is intentionally last: it is built
+        // from the exact file the ordinary supervisor call will reload.
+        if !before_dispatch(&reloaded)? {
+            let denial = inconsistent_profile_denial(&item_id)?;
+            queue.release_before_dispatch(&item_id, Some(denial.clone()), Vec::new())?;
+            cascade_gate_denials.push(denial);
+            cascade_success = false;
+            break;
+        }
+        let started = queue.mark_dispatch_started(&item_id)?;
+        let subordinate_run_id = RunId::new(
+            started
+                .subordinate_run_id
+                .as_deref()
+                .context("durable generated follow-up dispatch has no subordinate run id")?,
+        )?;
+        let subordinate_options = SupervisorRunOptions {
+            repo: repo.to_path_buf(),
+            plan_file: plan_file.path().to_path_buf(),
+            run_id: subordinate_run_id.clone(),
+            codex_bin: supervisor_template.codex_bin.clone(),
+            runtime: supervisor_template.runtime,
+            allow_dirty_primary: supervisor_template.allow_dirty_primary,
+            machine_global_retention: Some(retention.clone()),
+        };
+        let result = run_supervisor_plan_file_with_concurrency_policy(
+            subordinate_options,
+            invocation.concurrency_policy,
+        );
+        // The loader no longer needs the private file once the ordinary call
+        // returns; keeping the handle alive across the call prevents path reuse.
+        plan_file.as_file_mut().flush()?;
+        match result {
+            Ok(report) => {
+                let child_started = authenticated_child_dispatch_started(
+                    repo,
+                    &subordinate_run_id,
+                )?;
+                if child_started {
+                    authenticated_child_dispatch_started_count =
+                        authenticated_child_dispatch_started_count
+                            .checked_add(1)
+                            .context("generated follow-up dispatch evidence count overflowed")?;
+                }
+                let observation = GeneratedFollowUpDispatchObservation::new(
+                    subordinate_run_id.as_str(),
+                    report.gate_denials.first().cloned(),
+                    report.environment_failures.clone(),
+                    Some(ExternalSideEffectState::Completed),
+                )?;
+                queue.mark_dispatch_observed(&item_id, observation)?;
+                queue.acknowledge_terminal(&item_id)?;
+                if !report.generated_follow_up_tasks.is_empty() {
+                    cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
+                    cascade_success = false;
+                }
+                cascade_success &= report.success;
+                follow_up_reports.push(report);
+                if !cascade_gate_denials.is_empty() {
+                    break;
+                }
+            }
+            Err(_error) => {
+                if let Some(report) = conclusive_subordinate_report(repo, &subordinate_run_id)? {
+                    let child_started = observe_and_acknowledge(
+                        repo,
+                        &mut queue,
+                        &item_id,
+                        &subordinate_run_id,
+                        &report,
+                    )?;
+                    if child_started {
+                        authenticated_child_dispatch_started_count =
+                            authenticated_child_dispatch_started_count
+                                .checked_add(1)
+                                .context("generated follow-up dispatch evidence count overflowed")?;
+                    }
+                    cascade_success &= report.success && report.generated_follow_up_tasks.is_empty();
+                    if !report.generated_follow_up_tasks.is_empty() {
+                        cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
+                    }
+                    follow_up_reports.push(report);
+                } else {
+                    let denial = ambiguous_dispatch_denial(&item_id)?;
+                    queue.mark_held_ambiguous(&item_id, Some(denial.clone()), Vec::new())?;
+                    cascade_gate_denials.push(denial);
+                    cascade_success = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    let final_primary =
+        primary_worktree_snapshot_sha256(repo, SupervisorExecutionRuntime::Verified)?;
+    if final_primary != primary_baseline {
+        cascade_success = false;
+    }
+    let queue_summary = queue.summary();
+    cascade_success &= queue_summary.acknowledged_terminal == queue_summary.capacity
+        && queue_summary.enqueued == 0
+        && queue_summary.claimed == 0
+        && queue_summary.dispatch_started == 0
+        && queue_summary.dispatch_observed == 0
+        && queue_summary.held_ambiguous == 0;
+    Ok(SupervisorCascadeOutcome {
+        source_report,
+        follow_up_cascade_version: FOLLOW_UP_CASCADE_VERSION,
+        follow_up_cascade_success: cascade_success,
+        follow_up_queue: Some(SupervisorFollowUpQueueSummary {
+            queue_instance_id: queue_summary.queue_instance_id,
+            source_supervisor_run_id: queue_summary.source_supervisor_run_id,
+            enqueue_committed: queue.snapshot().enqueue_committed(),
+            item_count: queue_summary.capacity,
+            pending_count: queue_summary.enqueued,
+            claimed_count: queue_summary.claimed,
+            dispatch_started_count: queue_summary.dispatch_started,
+            dispatch_observed_count: queue_summary.dispatch_observed,
+            acknowledged_terminal_count: queue_summary.acknowledged_terminal,
+            held_ambiguous_count: queue_summary.held_ambiguous,
+            authenticated_child_dispatch_started_count,
+        }),
+        follow_up_reports,
+        follow_up_gate_denials: cascade_gate_denials,
+    })
+}
+
+fn reconcile_started_items(
+    repo: &Path,
+    queue: &mut GeneratedFollowUpQueue,
+    reports: &mut Vec<SupervisorFinalReport>,
+    authenticated_dispatches: &mut usize,
+    cascade_success: &mut bool,
+    cascade_gate_denials: &mut Vec<GateDenial>,
+) -> Result<()> {
+    let items = queue
+        .snapshot()
+        .items()
+        .values()
+        .map(|item| {
+            (
+                item.item_id().to_string(),
+                item.phase(),
+                item.subordinate_run_id().map(str::to_string),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (item_id, phase, subordinate_run_id) in items {
+        match phase {
+            GeneratedFollowUpQueuePhase::DispatchStarted => {
+                let run_id = RunId::new(
+                    subordinate_run_id
+                        .as_deref()
+                        .context("started generated follow-up has no subordinate run id")?,
+                )?;
+                if let Some(report) = conclusive_subordinate_report(repo, &run_id)? {
+                    let child_started = observe_and_acknowledge(
+                        repo,
+                        queue,
+                        &item_id,
+                        &run_id,
+                        &report,
+                    )?;
+                    if child_started {
+                        *authenticated_dispatches = authenticated_dispatches
+                            .checked_add(1)
+                            .context("generated follow-up dispatch evidence count overflowed")?;
+                    }
+                    if !report.generated_follow_up_tasks.is_empty() {
+                        cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
+                    }
+                    *cascade_success &= report.success && report.generated_follow_up_tasks.is_empty();
+                    reports.push(report);
+                } else {
+                    let denial = ambiguous_dispatch_denial(&item_id)?;
+                    queue.mark_held_ambiguous(&item_id, Some(denial.clone()), Vec::new())?;
+                    cascade_gate_denials.push(denial);
+                    *cascade_success = false;
+                }
+            }
+            GeneratedFollowUpQueuePhase::DispatchObserved => {
+                queue.acknowledge_terminal(&item_id)?;
+                let run_id = RunId::new(
+                    subordinate_run_id
+                        .as_deref()
+                        .context("observed generated follow-up has no subordinate run id")?,
+                )?;
+                if let Some(report) = conclusive_subordinate_report(repo, &run_id)? {
+                    if authenticated_child_dispatch_started(repo, &run_id)? {
+                        *authenticated_dispatches = authenticated_dispatches
+                            .checked_add(1)
+                            .context("generated follow-up dispatch evidence count overflowed")?;
+                    }
+                    *cascade_success &= report.success && report.generated_follow_up_tasks.is_empty();
+                    if !report.generated_follow_up_tasks.is_empty() {
+                        cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
+                    }
+                    reports.push(report);
+                } else {
+                    cascade_gate_denials.push(ambiguous_dispatch_denial(&item_id)?);
+                    *cascade_success = false;
+                }
+            }
+            GeneratedFollowUpQueuePhase::HeldAmbiguous => {
+                cascade_gate_denials.push(ambiguous_dispatch_denial(&item_id)?);
+                *cascade_success = false;
+            }
+            GeneratedFollowUpQueuePhase::AcknowledgedTerminal => {
+                let run_id = RunId::new(
+                    subordinate_run_id
+                        .as_deref()
+                        .context("acknowledged generated follow-up has no subordinate run id")?,
+                )?;
+                if let Some(report) = conclusive_subordinate_report(repo, &run_id)? {
+                    if authenticated_child_dispatch_started(repo, &run_id)? {
+                        *authenticated_dispatches = authenticated_dispatches
+                            .checked_add(1)
+                            .context("generated follow-up dispatch evidence count overflowed")?;
+                    }
+                    *cascade_success &= report.success && report.generated_follow_up_tasks.is_empty();
+                    if !report.generated_follow_up_tasks.is_empty() {
+                        cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
+                    }
+                    reports.push(report);
+                } else {
+                    cascade_gate_denials.push(ambiguous_dispatch_denial(&item_id)?);
+                    *cascade_success = false;
+                }
+            }
+            GeneratedFollowUpQueuePhase::Enqueued
+            | GeneratedFollowUpQueuePhase::Claimed => {}
+        }
+    }
+    Ok(())
+}
+
+fn conclusive_subordinate_report(
+    repo: &Path,
+    run_id: &RunId,
+) -> Result<Option<SupervisorFinalReport>> {
+    let Ok(status) = supervisor_status(repo, run_id.clone()) else {
+        return Ok(None);
+    };
+    match status.lifecycle {
+        SupervisorRunLifecycle::Finalized => Ok(status.final_report),
+        SupervisorRunLifecycle::Resumable => {
+            Ok(resume_supervisor_run(repo, run_id.clone())?.final_report)
+        }
+        SupervisorRunLifecycle::Active
+        | SupervisorRunLifecycle::Interrupted
+        | SupervisorRunLifecycle::Uncertain => Ok(None),
+    }
+}
+
+fn observe_and_acknowledge(
+    repo: &Path,
+    queue: &mut GeneratedFollowUpQueue,
+    item_id: &str,
+    run_id: &RunId,
+    report: &SupervisorFinalReport,
+) -> Result<bool> {
+    let child_started = authenticated_child_dispatch_started(repo, run_id)?;
+    let observation = GeneratedFollowUpDispatchObservation::new(
+        run_id.as_str(),
+        report.gate_denials.first().cloned(),
+        report.environment_failures.clone(),
+        Some(ExternalSideEffectState::Completed),
+    )?;
+    queue.mark_dispatch_observed(item_id, observation)?;
+    queue.acknowledge_terminal(item_id)?;
+    Ok(child_started)
+}
+
+fn verify_authenticated_source_basis(
+    repo: &Path,
+    supplied: &LoadedSupervisorPlan,
+    source: &SupervisorFinalReport,
+    supplied_sha256: &str,
+) -> Result<()> {
+    let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Supervise, &source.run_id)
+        .context("generated follow-up source is not an authenticated finalized run")?;
+    let authenticated = read_supervisor_final_report(&reader)?;
+    let plan_bytes = reader
+        .read("assignments/supervisor-plan.json")
+        .context("generated follow-up source has no authenticated normalized plan")?;
+    let plan_text = String::from_utf8(plan_bytes)
+        .context("authenticated generated follow-up source plan is not UTF-8")?;
+    let authenticated_loaded = parse_supervisor_plan_with_consultant(&plan_text)?;
+    let authenticated_sha256 = normalized_supervisor_plan_sha256(
+        &authenticated_loaded.plan,
+        &authenticated_loaded.consultant,
+        &authenticated_loaded.assignment_metadata,
+        &authenticated_loaded.plan_metadata,
+    )?;
+    if &authenticated_loaded != supplied || authenticated_sha256 != supplied_sha256 {
+        bail!("supplied generated follow-up source plan differs from its authenticated finalized plan");
+    }
+    if authenticated.accepted != source.accepted
+        || authenticated.publishable != source.publishable
+        || authenticated.generated_follow_up_tasks != source.generated_follow_up_tasks
+    {
+        bail!("generated follow-up source tasks differ from the authenticated finalized report");
+    }
+    Ok(())
+}
+
+fn generated_plan_file(
+    repo: &Path,
+    plan: &GeneratedFollowUpSupervisorPlan,
+) -> Result<tempfile::NamedTempFile> {
+    let repository = Repository::open(repo)?;
+    let mut file = tempfile::Builder::new()
+        .prefix("maco-generated-follow-up-")
+        .suffix(".json")
+        .tempfile_in(repository.path())?;
+    serde_json::to_writer(file.as_file_mut(), plan)?;
+    file.as_file_mut().flush()?;
+    file.as_file().sync_all()?;
+    Ok(file)
+}
+
+fn load_exact_generated_plan_file(
+    path: &Path,
+    generated: &GeneratedFollowUpSupervisorPlan,
+) -> Result<SupervisorPlan> {
+    let loaded = load_supervisor_plan_file_with_consultant(path)?;
+    if loaded.plan != generated.ordinary_plan()
+        || loaded.consultant != generated.consultant
+        || loaded.plan_metadata.assignment_schedule != generated.assignment_schedule
+        || loaded.plan_metadata.run_budget != generated.run_budget
+        || loaded.plan_metadata.generated_follow_up != Some(generated.generated_follow_up.clone())
+        || !loaded.plan_metadata.spec_fragment_ids.is_empty()
+    {
+        bail!("persisted generated follow-up plan changed across the ordinary full-document loader");
+    }
+    Ok(loaded.plan)
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_GENERATED_FOLLOW_UP_PLAN_LOAD_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_generated_follow_up_plan_load_hook(
+    hook: impl FnMut(&Path) + 'static,
+) {
+    BEFORE_GENERATED_FOLLOW_UP_PLAN_LOAD_HOOK
+        .with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_before_generated_follow_up_plan_load_hook(path: &Path) {
+    BEFORE_GENERATED_FOLLOW_UP_PLAN_LOAD_HOOK.with(|slot| {
+        if let Some(mut hook) = slot.borrow_mut().take() {
+            hook(path);
+        }
+    });
+}
+
+fn primary_integrity_denial(correlation_id: &str) -> Result<GateDenial> {
+    GateDenial::new(
+        correlation_id,
+        GateDenialReason::PrimaryIntegrityFailure,
+        VerifiedGateContext::new(
+            correlation_id,
+            GateCheckSource::PrimaryIntegrity,
+            std::iter::empty::<&Path>(),
+        )?,
+    )
+}
+
+fn ambiguous_dispatch_denial(correlation_id: &str) -> Result<GateDenial> {
+    GateDenial::new(
+        correlation_id,
+        GateDenialReason::ExternalSideEffect {
+            state: ExternalSideEffectState::Ambiguous,
+        },
+        VerifiedGateContext::new(
+            correlation_id,
+            GateCheckSource::ExternalSideEffect,
+            std::iter::empty::<&Path>(),
+        )?,
+    )
+}
+
+fn permission_expansion_denial(correlation_id: &str) -> Result<GateDenial> {
+    GateDenial::new(
+        correlation_id,
+        GateDenialReason::ApprovalReview {
+            denial: crate::gate_denial::ApprovalReviewDenial::PermissionExpansion,
+        },
+        VerifiedGateContext::new(
+            correlation_id,
+            GateCheckSource::FutureApprovalReview,
+            std::iter::empty::<&Path>(),
+        )?,
+    )
+}
+
+fn inconsistent_profile_denial(correlation_id: &str) -> Result<GateDenial> {
+    GateDenial::new(
+        correlation_id,
+        GateDenialReason::ApprovalReview {
+            denial: crate::gate_denial::ApprovalReviewDenial::InconsistentRequest,
+        },
+        VerifiedGateContext::new(
+            correlation_id,
+            GateCheckSource::FutureApprovalReview,
+            std::iter::empty::<&Path>(),
+        )?,
+    )
+}
