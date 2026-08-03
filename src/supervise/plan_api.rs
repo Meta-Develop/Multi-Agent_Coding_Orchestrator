@@ -923,13 +923,19 @@ fn resume_generated_follow_up_cascade(
 ) -> Result<SupervisorCascadeOutcome> {
     let run_id = options.run_id.clone();
     let status = supervisor_status(&repo, run_id.clone())?;
-    let source_report = match status.lifecycle {
-        SupervisorRunLifecycle::Finalized => status
-            .final_report
-            .context("finalized supervise cascade source report is missing")?,
-        SupervisorRunLifecycle::Resumable => resume_supervisor_run(&repo, run_id.clone())?
-            .final_report
-            .context("resumed supervise cascade source report is missing")?,
+    let (source_report, source_was_finalized) = match status.lifecycle {
+        SupervisorRunLifecycle::Finalized => (
+            status
+                .final_report
+                .context("finalized supervise cascade source report is missing")?,
+            true,
+        ),
+        SupervisorRunLifecycle::Resumable => (
+            resume_supervisor_run(&repo, run_id.clone())?
+                .final_report
+                .context("resumed supervise cascade source report is missing")?,
+            false,
+        ),
         SupervisorRunLifecycle::Active => {
             bail!("cannot resume generated follow-up cascade while its source run is active")
         }
@@ -940,6 +946,9 @@ fn resume_generated_follow_up_cascade(
             bail!("cannot resume generated follow-up cascade from an interrupted source run")
         }
     };
+    if source_was_finalized {
+        ensure_generated_follow_up_cascade_needs_resume(&repo, &loaded, &source_report)?;
+    }
     let mut permit = |_plan: &SupervisorPlan| Ok(true);
     run_generated_follow_up_cascade(
         &repo,

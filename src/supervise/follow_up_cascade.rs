@@ -60,6 +60,52 @@ pub(super) fn source_only_cascade_outcome(
     }
 }
 
+pub(super) fn ensure_generated_follow_up_cascade_needs_resume(
+    repo: &Path,
+    source_loaded: &LoadedSupervisorPlan,
+    source_report: &SupervisorFinalReport,
+) -> Result<()> {
+    let source_plan_sha256 = normalized_supervisor_plan_sha256(
+        &source_loaded.plan,
+        &source_loaded.consultant,
+        &source_loaded.assignment_metadata,
+        &source_loaded.plan_metadata,
+    )?;
+    verify_authenticated_source_basis(repo, source_loaded, source_report, &source_plan_sha256)?;
+    if source_report.generated_follow_up_tasks.is_empty() {
+        bail!(
+            "supervise run '{}' already exists and has no generated follow-up queue to resume",
+            source_report.run_id.as_str()
+        );
+    }
+    let authenticator = repository_authenticator_key_only(repo)?;
+    let Some(queue) = GeneratedFollowUpQueue::open_existing_for_source_execution(
+        authenticator,
+        source_report.run_id.as_str(),
+        &source_plan_sha256,
+    )?
+    else {
+        // A crash after source finalization but before queue creation is safe to
+        // resume: the authenticated source report is the immutable enqueue basis.
+        return Ok(());
+    };
+    let summary = queue.summary();
+    let complete = summary.acknowledged_terminal == summary.capacity
+        && summary.staged == 0
+        && summary.enqueued == 0
+        && summary.claimed == 0
+        && summary.dispatch_started == 0
+        && summary.dispatch_observed == 0
+        && summary.held_ambiguous == 0;
+    if complete {
+        bail!(
+            "supervise run '{}' already exists and its generated follow-up queue is complete",
+            source_report.run_id.as_str()
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn run_generated_follow_up_cascade(
     repo: &Path,
     source_loaded: &LoadedSupervisorPlan,
