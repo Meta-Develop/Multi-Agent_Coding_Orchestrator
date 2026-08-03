@@ -1683,13 +1683,6 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner(
     let outer_run_id = options.run_id.clone();
     let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
     let serialized_runner = Mutex::new(external_runner);
-    let cancellable =
-        |command: &ExternalAgentCommand, _cancellation, _review_runtime| match serialized_runner
-            .lock()
-        {
-            Ok(mut runner) => runner(command),
-            Err(poisoned) => poisoned.into_inner()(command),
-        };
     let source_report = run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
@@ -1697,7 +1690,10 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner(
         SupervisorExecutionRuntime::Verified,
         SupervisorWorktreeCreation::Bound(&cleanliness),
         Ok(runtime_model_catalog),
-        &cancellable,
+        &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+            Ok(mut runner) => runner(command),
+            Err(poisoned) => poisoned.into_inner()(command),
+        },
     )?;
     drop(cleanliness);
     let mut permit = |_plan: &SupervisorPlan| Ok(true);
@@ -1713,7 +1709,10 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner(
             runtime_catalog: FollowUpRuntimeCatalog::Injected,
         },
         &mut permit,
-        &cancellable,
+        &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+            Ok(mut runner) => runner(command),
+            Err(poisoned) => poisoned.into_inner()(command),
+        },
     )
 }
 
@@ -1740,13 +1739,6 @@ pub(crate) fn resume_supervisor_plan_file_cascade_with_runner(
         }
     };
     let serialized_runner = Mutex::new(external_runner);
-    let cancellable =
-        |command: &ExternalAgentCommand, _cancellation, _review_runtime| match serialized_runner
-            .lock()
-        {
-            Ok(mut runner) => runner(command),
-            Err(poisoned) => poisoned.into_inner()(command),
-        };
     let mut permit = |_plan: &SupervisorPlan| Ok(true);
     run_generated_follow_up_cascade(
         &repo,
@@ -1760,7 +1752,10 @@ pub(crate) fn resume_supervisor_plan_file_cascade_with_runner(
             runtime_catalog: FollowUpRuntimeCatalog::Injected,
         },
         &mut permit,
-        &cancellable,
+        &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+            Ok(mut runner) => runner(command),
+            Err(poisoned) => poisoned.into_inner()(command),
+        },
     )
 }
 
