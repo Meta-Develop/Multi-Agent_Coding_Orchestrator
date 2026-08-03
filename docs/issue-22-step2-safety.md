@@ -38,14 +38,20 @@ authenticated finalized subordinate outcome, including a subordinate gate
 refusal, is observed and terminal-acknowledged without re-execution. A newly
 observed failure stops sibling admission for that invocation; a later explicit
 invocation of the same run ID may continue remaining pending items but never
-reruns the acknowledged item. An authenticated `Active` subordinate remains
-`DispatchStarted`. Only an authenticated `Interrupted` or `Uncertain`
-subordinate becomes `HeldAmbiguous` and requires human reconciliation rather
-than silently returning to pending. Direct `supervise run` can resume the same
-command and run ID from its authenticated finalized source artifacts, so it
-does not rerun the source round. Autopilot outer-artifact interruption has no
-safe same-command resume because there is no authenticated outer resume
-binding, and this design does not claim one.
+reruns the acknowledged item. A status-classified `Active` subordinate with
+its live bound run lock remains `DispatchStarted`. Only an authenticated
+`Interrupted` or `Uncertain` subordinate becomes `HeldAmbiguous` and requires
+reconciliation rather than silently returning to pending. Once that exact
+subordinate later has an authenticated finalized report, a subsequent
+invocation observes and acknowledges it without dispatching it again. Direct
+`supervise run` can resume the same command and run ID from its authenticated
+finalized source artifacts, so it does not rerun the source round. It can also
+recover an Autopilot-origin queue by presenting that exact authenticated source
+run, normalized plan, primary baseline, and retention binding: the queue slot
+is derived from those execution-basis fields, while the original Autopilot
+entrypoint and outer run ID remain immutable provenance. Autopilot
+outer-artifact interruption still has no safe same-command outer-artifact
+resume binding, and this design does not claim one.
 
 ## 4. What stops a follow-up task from regenerating itself indefinitely?
 
