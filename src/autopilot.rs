@@ -4206,6 +4206,7 @@ fn finding_severity_label(severity: FindingSeverity) -> &'static str {
 mod tests {
     use super::*;
     use crate::worktree::WorktreeCreateOptions;
+    use serde_json::json;
     use std::{
         cell::{Cell, RefCell},
         fs::File,

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
 pub use crate::supervise_budget::{
     BudgetAction, BudgetAmount, BudgetReason, BudgetRemaining, RoleBudgetReport, RunBudgetLimits,
     RunBudgetReport,
@@ -103,8 +105,8 @@ mod follow_up_cascade;
 use follow_up_cascade::*;
 #[cfg(test)]
 pub(crate) use follow_up_cascade::{
-    clear_generated_follow_up_queue_observer, set_before_generated_follow_up_plan_load_hook,
-    set_generated_follow_up_queue_observer, set_interrupt_after_follow_up_enqueue,
+    clear_generated_follow_up_queue_observer, set_generated_follow_up_queue_observer,
+    set_interrupt_after_follow_up_enqueue,
 };
 
 mod repository;

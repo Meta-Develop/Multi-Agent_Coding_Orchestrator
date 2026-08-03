@@ -6,6 +6,7 @@ use crate::{
         GeneratedFollowUpQueueEntrypoint, GeneratedFollowUpQueuePhase,
         GeneratedFollowUpQueueSource, GeneratedFollowUpRetentionBinding,
     },
+    machine_global::MachineGlobalRetentionBinding,
 };
 use std::io::Write;
 
@@ -773,7 +774,7 @@ fn record_queue_test_observation(
 }
 
 fn primary_integrity_denial(correlation_id: &str) -> Result<GateDenial> {
-    GateDenial::new(
+    Ok(GateDenial::new(
         correlation_id,
         GateDenialReason::PrimaryIntegrityFailure,
         VerifiedGateContext::new(
@@ -781,11 +782,11 @@ fn primary_integrity_denial(correlation_id: &str) -> Result<GateDenial> {
             GateCheckSource::PrimaryIntegrity,
             std::iter::empty::<&Path>(),
         )?,
-    )
+    )?)
 }
 
 fn ambiguous_dispatch_denial(correlation_id: &str) -> Result<GateDenial> {
-    GateDenial::new(
+    Ok(GateDenial::new(
         correlation_id,
         GateDenialReason::ExternalSideEffect {
             state: ExternalSideEffectState::Ambiguous,
@@ -795,11 +796,11 @@ fn ambiguous_dispatch_denial(correlation_id: &str) -> Result<GateDenial> {
             GateCheckSource::ExternalSideEffect,
             std::iter::empty::<&Path>(),
         )?,
-    )
+    )?)
 }
 
 fn permission_expansion_denial(correlation_id: &str) -> Result<GateDenial> {
-    GateDenial::new(
+    Ok(GateDenial::new(
         correlation_id,
         GateDenialReason::ApprovalReview {
             denial: crate::gate_denial::ApprovalReviewDenial::PermissionExpansion,
@@ -809,11 +810,11 @@ fn permission_expansion_denial(correlation_id: &str) -> Result<GateDenial> {
             GateCheckSource::FutureApprovalReview,
             std::iter::empty::<&Path>(),
         )?,
-    )
+    )?)
 }
 
 fn inconsistent_profile_denial(correlation_id: &str) -> Result<GateDenial> {
-    GateDenial::new(
+    Ok(GateDenial::new(
         correlation_id,
         GateDenialReason::ApprovalReview {
             denial: crate::gate_denial::ApprovalReviewDenial::InconsistentRequest,
@@ -823,5 +824,5 @@ fn inconsistent_profile_denial(correlation_id: &str) -> Result<GateDenial> {
             GateCheckSource::FutureApprovalReview,
             std::iter::empty::<&Path>(),
         )?,
-    )
+    )?)
 }
