@@ -172,8 +172,10 @@ Command:
 CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo test --lib autopilot::tests::autopilot_reloads_effective_profile_at_call_site_before_starting_supervisor -- --exact --nocapture
 
 Raw failing output:
-thread 'autopilot::tests::autopilot_reloads_effective_profile_at_call_site_before_starting_supervisor' panicked at src/autopilot.rs:5849:10:
-finalize requested/effective call-site refusal: artifact file digest/length does not match its manifest: supervisor-plan.json
+thread 'autopilot::tests::autopilot_reloads_effective_profile_at_call_site_before_starting_supervisor' panicked at src/autopilot.rs:5849:9:
+assertion `left == right` failed
+  left: Succeeded
+ right: Failed
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 test autopilot::tests::autopilot_reloads_effective_profile_at_call_site_before_starting_supervisor ... FAILED
 
@@ -182,9 +184,14 @@ failures:
 failures:
     autopilot::tests::autopilot_reloads_effective_profile_at_call_site_before_starting_supervisor
 
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1279 filtered out; finished in 24.66s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1279 filtered out; finished in 26.25s
 
 error: test failed, to rerun pass `--lib`
+
+Raw restored output:
+test autopilot::tests::autopilot_reloads_effective_profile_at_call_site_before_starting_supervisor ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1279 filtered out; finished in 5.13s
 
 
 7. Retention probe failures remain typed and retryable

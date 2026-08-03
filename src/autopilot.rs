@@ -1214,6 +1214,10 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     };
     let mut follow_up_profile_refusal = None;
     let mut follow_up_profile_gate = |effective: &SupervisorPlan| {
+        #[cfg(test)]
+        let effective_override = run_autopilot_profile_callsite_hook(effective);
+        #[cfg(test)]
+        let effective = effective_override.as_ref().unwrap_or(effective);
         let binding = AutopilotProfileBindingReport::from_effective(
             follow_up_requested_profile.clone(),
             effective,
@@ -1224,8 +1228,6 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         }
         Ok(permitted)
     };
-    #[cfg(test)]
-    run_before_supervisor_cascade_load_hook(&supervisor_options.plan_file);
     let error_evidence_source_plan_sha256 =
         supervise::normalized_supervisor_plan_file_sha256(&supervisor_options.plan_file)?;
     let command_primary_baseline = supervise::verified_whole_primary_snapshot_sha256(&repo)?;
@@ -4009,22 +4011,26 @@ fn verify_after_autopilot_safety(bindings: &RepositoryPathBindings) -> Result<()
 
 #[cfg(test)]
 thread_local! {
-    static BEFORE_SUPERVISOR_CASCADE_LOAD_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> =
+    static AUTOPILOT_PROFILE_CALLSITE_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&mut SupervisorPlan)>>> =
         std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
-fn set_before_supervisor_cascade_load_hook(hook: impl FnMut(&Path) + 'static) {
-    BEFORE_SUPERVISOR_CASCADE_LOAD_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+fn set_autopilot_profile_callsite_hook(hook: impl FnMut(&mut SupervisorPlan) + 'static) {
+    AUTOPILOT_PROFILE_CALLSITE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 #[cfg(test)]
-fn run_before_supervisor_cascade_load_hook(path: &Path) {
-    BEFORE_SUPERVISOR_CASCADE_LOAD_HOOK.with(|slot| {
+fn run_autopilot_profile_callsite_hook(effective: &SupervisorPlan) -> Option<SupervisorPlan> {
+    AUTOPILOT_PROFILE_CALLSITE_HOOK.with(|slot| {
         if let Some(mut hook) = slot.borrow_mut().take() {
-            hook(path);
+            let mut overridden = effective.clone();
+            hook(&mut overridden);
+            Some(overridden)
+        } else {
+            None
         }
-    });
+    })
 }
 
 #[cfg(test)]
@@ -5817,16 +5823,8 @@ mod tests {
             }"#,
         )
         .expect("write plan");
-        set_before_supervisor_cascade_load_hook(|path| {
-            let bytes = fs::read(path).expect("read persisted supervisor plan");
-            let mut value: Value =
-                serde_json::from_slice(&bytes).expect("decode persisted supervisor plan");
-            value["role_models"] = json!({});
-            fs::write(
-                path,
-                serde_json::to_vec_pretty(&value).expect("encode mutated supervisor plan"),
-            )
-            .expect("mutate persisted supervisor plan");
+        set_autopilot_profile_callsite_hook(|effective| {
+            effective.role_models.clear();
         });
 
         let report = run_autopilot_plan_file_with_profile_and_retention(
