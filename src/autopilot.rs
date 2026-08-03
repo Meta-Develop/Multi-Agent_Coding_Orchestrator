@@ -1213,47 +1213,48 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         SupervisorConcurrencyPolicy::default()
     };
     let mut follow_up_profile_refusal = None;
-    let mut follow_up_profile_gate = |effective: &SupervisorPlan| {
-        #[cfg(test)]
-        let effective_override = run_autopilot_profile_callsite_hook(effective);
-        #[cfg(test)]
-        let effective = effective_override.as_ref().unwrap_or(effective);
-        let binding = AutopilotProfileBindingReport::from_effective(
-            follow_up_requested_profile.clone(),
-            effective,
-        );
-        let permitted = binding.permits_dispatch();
-        if !permitted {
-            follow_up_profile_refusal = Some(binding);
-        }
-        Ok(permitted)
-    };
     let error_evidence_source_plan_sha256 =
         supervise::normalized_supervisor_plan_file_sha256(&supervisor_options.plan_file)?;
     let command_primary_baseline = supervise::verified_whole_primary_snapshot_sha256(&repo)?;
     let error_evidence_source_run_id = supervisor_options.run_id.clone();
-    let supervisor_result = match &mut cascade_dispatch {
-        AutopilotCascadeDispatch::Production(_) => {
-            supervise::run_supervisor_plan_file_cascade_for_autopilot(
+    let supervisor_result = {
+        let mut follow_up_profile_gate = |effective: &SupervisorPlan| {
+            #[cfg(test)]
+            let effective_override = run_autopilot_profile_callsite_hook(effective);
+            #[cfg(test)]
+            let effective = effective_override.as_ref().unwrap_or(effective);
+            let binding = AutopilotProfileBindingReport::from_effective(
+                follow_up_requested_profile.clone(),
+                effective,
+            );
+            let permitted = binding.permits_dispatch();
+            if !permitted {
+                follow_up_profile_refusal = Some(binding);
+            }
+            Ok(permitted)
+        };
+        match &mut cascade_dispatch {
+            AutopilotCascadeDispatch::Production(_) => {
+                supervise::run_supervisor_plan_file_cascade_for_autopilot(
+                    supervisor_options,
+                    cascade_concurrency_policy,
+                    &options.run_id,
+                    &mut follow_up_profile_gate,
+                )
+            }
+            #[cfg(test)]
+            AutopilotCascadeDispatch::Injected {
+                external_runner, ..
+            } => supervise::run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilot(
                 supervisor_options,
-                cascade_concurrency_policy,
                 &options.run_id,
                 &mut follow_up_profile_gate,
-            )
+                *external_runner,
+            ),
         }
-        #[cfg(test)]
-        AutopilotCascadeDispatch::Injected {
-            external_runner, ..
-        } => supervise::run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilot(
-            supervisor_options,
-            &options.run_id,
-            &mut follow_up_profile_gate,
-            *external_runner,
-        ),
     };
     let command_primary_final = supervise::verified_whole_primary_snapshot_sha256(&repo)?;
     let command_primary_worktree_untouched = command_primary_final == command_primary_baseline;
-    drop(follow_up_profile_gate);
     if let Some(refusal) = follow_up_profile_refusal.take() {
         profile_binding = refusal;
     }

@@ -4,7 +4,8 @@ use crate::{
     follow_up_queue::{
         GeneratedFollowUpDispatchObservation, GeneratedFollowUpQueue, GeneratedFollowUpQueueBounds,
         GeneratedFollowUpQueueEntrypoint, GeneratedFollowUpQueuePhase,
-        GeneratedFollowUpQueueSource, GeneratedFollowUpRetentionBinding,
+        GeneratedFollowUpQueueRootInput, GeneratedFollowUpQueueSource,
+        GeneratedFollowUpRetentionBinding,
     },
     machine_global::MachineGlobalRetentionBinding,
 };
@@ -36,7 +37,7 @@ pub(crate) enum GeneratedFollowUpDispatchEvidence {
 enum FollowUpPreparation {
     Ready {
         plan_file: tempfile::NamedTempFile,
-        loaded: LoadedSupervisorPlan,
+        loaded: Box<LoadedSupervisorPlan>,
     },
     Refused(GateDenial),
     EnvironmentFailed(EnvironmentFailure),
@@ -105,17 +106,17 @@ pub(super) fn run_generated_follow_up_cascade(
     };
     let authenticator = repository_authenticator_key_only(repo)?;
     let repository_id = authenticator.binding().repository_id.clone();
-    let source = GeneratedFollowUpQueueSource::root(
-        source_report.run_id.as_str(),
-        source_plan_sha256,
-        source_report.accepted,
-        source_report.publishable,
-        invocation.outer_entrypoint,
-        invocation.outer_command_run_id.as_str(),
+    let source = GeneratedFollowUpQueueSource::root(GeneratedFollowUpQueueRootInput {
+        source_supervisor_run_id: source_report.run_id.as_str().to_string(),
+        source_normalized_plan_sha256: source_plan_sha256,
+        source_report_accepted: source_report.accepted,
+        source_report_publishable: source_report.publishable,
+        outer_entrypoint: invocation.outer_entrypoint,
+        outer_command_run_id: invocation.outer_command_run_id.as_str().to_string(),
         repository_id,
-        primary_baseline.clone(),
-        retained_binding,
-    )?;
+        whole_primary_baseline_sha256: primary_baseline.clone(),
+        machine_global_retention: retained_binding,
+    })?;
     let bounds = GeneratedFollowUpQueueBounds::from_validated_source_plan_and_tasks(
         &source_loaded.plan,
         &source_report.generated_follow_up_tasks,
@@ -254,11 +255,11 @@ pub(super) fn run_generated_follow_up_cascade(
             }
             Ok(FollowUpPreparation::Ready {
                 plan_file,
-                loaded: reloaded,
+                loaded: Box::new(reloaded),
             })
         })();
         let (mut plan_file, reloaded) = match preparation {
-            Ok(FollowUpPreparation::Ready { plan_file, loaded }) => (plan_file, loaded),
+            Ok(FollowUpPreparation::Ready { plan_file, loaded }) => (plan_file, *loaded),
             Ok(FollowUpPreparation::Refused(denial)) => {
                 queue.release_before_dispatch(&item_id, Some(denial.clone()), Vec::new())?;
                 cascade_gate_denials.push(denial);
@@ -395,7 +396,7 @@ pub(super) fn run_generated_follow_up_cascade(
                     if !report.generated_follow_up_tasks.is_empty() {
                         cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
                     }
-                    follow_up_reports.push(report);
+                    follow_up_reports.push(*report);
                 }
                 SubordinateReconciliation::Active
                 | SubordinateReconciliation::RetryableStatusRead => {
@@ -671,7 +672,7 @@ fn reconcile_started_items(
                         }
                         *cascade_success &=
                             report.success && report.generated_follow_up_tasks.is_empty();
-                        reports.push(report);
+                        reports.push(*report);
                     }
                     SubordinateReconciliation::Active
                     | SubordinateReconciliation::RetryableStatusRead => {
@@ -780,7 +781,7 @@ fn reconcile_started_items(
                         }
                         *cascade_success &=
                             report.success && report.generated_follow_up_tasks.is_empty();
-                        reports.push(report);
+                        reports.push(*report);
                     }
                     SubordinateReconciliation::Active
                     | SubordinateReconciliation::Ambiguous
@@ -839,7 +840,7 @@ fn reconcile_started_items(
 }
 
 enum SubordinateReconciliation {
-    Finalized(SupervisorFinalReport),
+    Finalized(Box<SupervisorFinalReport>),
     Active,
     Ambiguous,
     RetryableStatusRead,
@@ -855,11 +856,12 @@ fn subordinate_reconciliation(repo: &Path, run_id: &RunId) -> Result<Subordinate
     match status.lifecycle {
         SupervisorRunLifecycle::Finalized => status
             .final_report
+            .map(Box::new)
             .map(SubordinateReconciliation::Finalized)
             .context("finalized generated follow-up has no authenticated report"),
         SupervisorRunLifecycle::Resumable => {
             match resume_supervisor_run(repo, run_id.clone())?.final_report {
-                Some(report) => Ok(SubordinateReconciliation::Finalized(report)),
+                Some(report) => Ok(SubordinateReconciliation::Finalized(Box::new(report))),
                 None => Ok(SubordinateReconciliation::Ambiguous),
             }
         }
@@ -875,7 +877,7 @@ fn conclusive_finalized_report(
     run_id: &RunId,
 ) -> Result<Option<SupervisorFinalReport>> {
     match subordinate_reconciliation(repo, run_id)? {
-        SubordinateReconciliation::Finalized(report) => Ok(Some(report)),
+        SubordinateReconciliation::Finalized(report) => Ok(Some(*report)),
         SubordinateReconciliation::Active
         | SubordinateReconciliation::Ambiguous
         | SubordinateReconciliation::RetryableStatusRead => Ok(None),

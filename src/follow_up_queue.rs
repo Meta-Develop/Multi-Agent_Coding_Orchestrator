@@ -180,28 +180,30 @@ pub(crate) struct GeneratedFollowUpQueueSource {
     cascade_depth: u8,
 }
 
+pub(crate) struct GeneratedFollowUpQueueRootInput {
+    pub(crate) source_supervisor_run_id: String,
+    pub(crate) source_normalized_plan_sha256: String,
+    pub(crate) source_report_accepted: bool,
+    pub(crate) source_report_publishable: bool,
+    pub(crate) outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
+    pub(crate) outer_command_run_id: String,
+    pub(crate) repository_id: String,
+    pub(crate) whole_primary_baseline_sha256: String,
+    pub(crate) machine_global_retention: GeneratedFollowUpRetentionBinding,
+}
+
 impl GeneratedFollowUpQueueSource {
-    pub(crate) fn root(
-        source_supervisor_run_id: impl Into<String>,
-        source_normalized_plan_sha256: impl Into<String>,
-        source_report_accepted: bool,
-        source_report_publishable: bool,
-        outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
-        outer_command_run_id: impl Into<String>,
-        repository_id: impl Into<String>,
-        whole_primary_baseline_sha256: impl Into<String>,
-        machine_global_retention: GeneratedFollowUpRetentionBinding,
-    ) -> Result<Self> {
+    pub(crate) fn root(input: GeneratedFollowUpQueueRootInput) -> Result<Self> {
         let source = Self {
-            source_supervisor_run_id: source_supervisor_run_id.into(),
-            source_normalized_plan_sha256: source_normalized_plan_sha256.into(),
-            source_report_accepted,
-            source_report_publishable,
-            outer_entrypoint,
-            outer_command_run_id: outer_command_run_id.into(),
-            repository_id: repository_id.into(),
-            whole_primary_baseline_sha256: whole_primary_baseline_sha256.into(),
-            machine_global_retention,
+            source_supervisor_run_id: input.source_supervisor_run_id,
+            source_normalized_plan_sha256: input.source_normalized_plan_sha256,
+            source_report_accepted: input.source_report_accepted,
+            source_report_publishable: input.source_report_publishable,
+            outer_entrypoint: input.outer_entrypoint,
+            outer_command_run_id: input.outer_command_run_id,
+            repository_id: input.repository_id,
+            whole_primary_baseline_sha256: input.whole_primary_baseline_sha256,
+            machine_global_retention: input.machine_global_retention,
             cascade_depth: SOURCE_CASCADE_DEPTH,
         };
         source.validate()?;
@@ -578,7 +580,7 @@ enum QueueJournalEvent {
         bounds: GeneratedFollowUpQueueBounds,
     },
     EnqueueStaged {
-        item: ImmutableEnqueueRecord,
+        item: Box<ImmutableEnqueueRecord>,
     },
     Enqueued {
         item_ids: Vec<String>,
@@ -965,8 +967,9 @@ impl GeneratedFollowUpQueue {
             if self.snapshot.staged.contains_key(item_id) {
                 continue;
             }
-            events
-                .push(self.append_event(QueueJournalEvent::EnqueueStaged { item: item.clone() })?);
+            events.push(self.append_event(QueueJournalEvent::EnqueueStaged {
+                item: Box::new(item.clone()),
+            })?);
         }
         let item_ids = prepared.keys().cloned().collect::<Vec<_>>();
         let batch_sha256 = batch_sha256(&item_ids)?;
@@ -1166,7 +1169,7 @@ fn apply_queue_event(
                 bail!("generated follow-up item id does not match its immutable task record");
             }
             if let Some(existing) = snapshot.staged.get(&item.item_id) {
-                if existing == item {
+                if existing == item.as_ref() {
                     bail!("generated follow-up enqueue transition repeated");
                 }
                 bail!("generated follow-up item id conflicts with another immutable record");
@@ -1174,7 +1177,9 @@ fn apply_queue_event(
             if snapshot.staged.len() >= snapshot.bounds.capacity {
                 bail!("generated follow-up queue exceeds its validated item capacity");
             }
-            snapshot.staged.insert(item.item_id.clone(), item.clone());
+            snapshot
+                .staged
+                .insert(item.item_id.clone(), item.as_ref().clone());
         }
         QueueJournalEvent::Enqueued {
             item_ids,
@@ -1758,17 +1763,17 @@ mod tests {
 
     fn source(repo: &Path, run_id: &str) -> GeneratedFollowUpQueueSource {
         let repository_id = authenticator(repo).binding().repository_id.clone();
-        GeneratedFollowUpQueueSource::root(
-            run_id,
-            "1".repeat(64),
-            true,
-            true,
-            GeneratedFollowUpQueueEntrypoint::SuperviseRun,
-            format!("outer-{run_id}"),
+        GeneratedFollowUpQueueSource::root(GeneratedFollowUpQueueRootInput {
+            source_supervisor_run_id: run_id.to_string(),
+            source_normalized_plan_sha256: "1".repeat(64),
+            source_report_accepted: true,
+            source_report_publishable: true,
+            outer_entrypoint: GeneratedFollowUpQueueEntrypoint::SuperviseRun,
+            outer_command_run_id: format!("outer-{run_id}"),
             repository_id,
-            "3".repeat(64),
-            retained_machine_global(),
-        )
+            whole_primary_baseline_sha256: "3".repeat(64),
+            machine_global_retention: retained_machine_global(),
+        })
         .expect("valid queue source")
     }
 
@@ -2220,7 +2225,9 @@ mod tests {
         let prepared = prepare_enqueue_records(&source, &tasks).expect("prepare batch");
         let first = prepared.values().next().expect("first staged item").clone();
         queue
-            .append_event(QueueJournalEvent::EnqueueStaged { item: first })
+            .append_event(QueueJournalEvent::EnqueueStaged {
+                item: Box::new(first),
+            })
             .expect("stage one item");
         drop(queue);
 
@@ -2260,20 +2267,20 @@ mod tests {
         let first_task = generated_task("01");
         let item_id = generated_follow_up_item_id(&source, &first_task).expect("item id");
         let first = QueueJournalEvent::EnqueueStaged {
-            item: ImmutableEnqueueRecord {
+            item: Box::new(ImmutableEnqueueRecord {
                 item_id: item_id.clone(),
                 task: first_task,
-            },
+            }),
         };
         queue
             .journal
             .append(first.phase(), first.subject(), &first)
             .expect("append first staged record");
         let conflicting = QueueJournalEvent::EnqueueStaged {
-            item: ImmutableEnqueueRecord {
+            item: Box::new(ImmutableEnqueueRecord {
                 item_id,
                 task: generated_task("02"),
-            },
+            }),
         };
         queue
             .journal
