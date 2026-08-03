@@ -1114,6 +1114,120 @@ fn licensed_follow_up_cascade_dispatches_one_authenticated_round_and_keeps_prima
 
 #[cfg(target_os = "linux")]
 #[test]
+fn generated_follow_up_exact_loaded_plan_drift_refuses_before_child_dispatch() {
+    let (temp, repo) = injected_repository();
+    let source_assignment = licensed_assignment();
+    let plan = injected_plan(source_assignment.clone(), 0);
+    let run_id = RunId::new("licensed-cascade-exact-plan-refusal")
+        .expect("exact-plan refusal source run id");
+    let plan_file = temp.path().join("licensed-cascade-exact-plan-refusal.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&plan).expect("serialize exact-plan refusal source"),
+    )
+    .expect("write exact-plan refusal source");
+    let options = SupervisorRunOptions {
+        repo: repo.clone(),
+        plan_file,
+        run_id,
+        codex_bin: PathBuf::from("unused-injected-codex"),
+        runtime: SupervisorRuntime::Codex,
+        allow_dirty_primary: false,
+        machine_global_retention: Some(secure_machine_global_retention(
+            temp.path(),
+            "licensed-cascade-exact-plan-refusal",
+        )),
+    };
+    let declaration_sha256 = licensed_breakage_declaration_sha256(
+        source_assignment
+            .licensed_breakage
+            .as_ref()
+            .expect("exact-plan refusal declaration"),
+    )
+    .expect("hash exact-plan refusal declaration");
+    let primary_before = verified_whole_primary_snapshot_sha256(&repo)
+        .expect("capture exact-plan refusal primary baseline");
+    let observations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = std::rc::Rc::clone(&observations);
+    set_generated_follow_up_queue_observer(move |observation| {
+        observed.borrow_mut().push(observation);
+    });
+    set_before_generated_follow_up_plan_load_hook(|path| {
+        let bytes = fs::read(path).expect("read persisted generated follow-up plan");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("decode generated follow-up plan");
+        value["assignments"][0]["assigned_paths"] =
+            serde_json::json!(["src/client.rs", "src/expanded.rs"]);
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&value).expect("encode drifted generated follow-up plan"),
+        )
+        .expect("mutate persisted generated follow-up scope");
+    });
+    let mut source_child_dispatches = 0_usize;
+    let mut generated_child_dispatches = 0_usize;
+    let mut runner = |command: &ExternalAgentCommand| {
+        let output_path = command.output_last_message.to_string_lossy();
+        let is_follow_up = output_path.contains("child-a-licensed-update-01");
+        let is_auditor = output_path.contains("review-auditor");
+        if is_follow_up {
+            generated_child_dispatches += 1;
+            panic!("drifted generated plan reached a child or auditor dispatch");
+        } else if is_auditor {
+            write_injected_json(
+                &command.output_last_message,
+                &licensed_auditor_report(&source_assignment, Some(&declaration_sha256)),
+            );
+        } else {
+            source_child_dispatches += 1;
+            assert_eq!(source_child_dispatches, 1, "source child reran");
+            fs::write(command.cwd.join("README.md"), "licensed breaking change\n")
+                .expect("write exact-plan refusal source candidate");
+            write_injected_json(
+                &command.output_last_message,
+                &dependent_failure_child(&source_assignment, "src/client.rs"),
+            );
+        }
+        write_injected_usage(command, 0, 1);
+        injected_verified_run(command)
+    };
+
+    let outcome = run_supervisor_plan_file_cascade_with_runner(options, &mut runner)
+        .expect("return typed exact generated-plan refusal");
+    clear_generated_follow_up_queue_observer();
+    let primary_after = verified_whole_primary_snapshot_sha256(&repo)
+        .expect("capture exact-plan refusal primary final");
+
+    assert!(outcome.source_report.success, "{outcome:#?}");
+    assert!(!outcome.follow_up_cascade_success);
+    assert!(!outcome.generated_follow_up_dispatch_performed());
+    assert_eq!(outcome.follow_up_primary_worktree_untouched, Some(true));
+    assert!(outcome.follow_up_reports.is_empty());
+    assert!(outcome.follow_up_gate_denials.iter().any(|denial| {
+        matches!(
+            denial.reason,
+            GateDenialReason::ApprovalReview {
+                denial: crate::gate_denial::ApprovalReviewDenial::PermissionExpansion
+            }
+        )
+    }));
+    let queue = outcome.follow_up_queue.expect("refused queue summary");
+    assert_eq!(queue.pending_count, 1);
+    assert_eq!(queue.dispatch_started_count, 0);
+    assert_eq!(queue.acknowledged_terminal_count, 0);
+    assert_eq!(queue.authenticated_child_dispatch_started_count, 0);
+    assert_eq!(source_child_dispatches, 1);
+    assert_eq!(generated_child_dispatches, 0);
+    assert_eq!(primary_after, primary_before);
+    assert!(!repo.join("src/client.rs").exists());
+    assert!(observations
+        .borrow()
+        .iter()
+        .all(|observation| observation.label != "dispatch_started"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn licensed_follow_up_enqueue_interruption_resumes_without_rerunning_source() {
     let (temp, repo) = injected_repository();
     let source_assignment = licensed_assignment();

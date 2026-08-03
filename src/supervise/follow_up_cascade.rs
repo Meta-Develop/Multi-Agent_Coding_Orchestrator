@@ -185,7 +185,13 @@ pub(super) fn run_generated_follow_up_cascade(
             let plan_file = generated_plan_file(repo, &task.supervisor_plan)?;
             #[cfg(test)]
             run_before_generated_follow_up_plan_load_hook(plan_file.path());
-            let reloaded = load_exact_generated_plan_file(plan_file.path(), &task.supervisor_plan)?;
+            let Some(reloaded) =
+                load_exact_generated_plan_file(plan_file.path(), &task.supervisor_plan)?
+            else {
+                return Ok(FollowUpPreparation::Refused(permission_expansion_denial(
+                    &item_id,
+                )?));
+            };
             if reloaded.plan != effective {
                 bail!("generated follow-up ordinary plan file changed before dispatch");
             }
@@ -687,7 +693,7 @@ fn generated_plan_file(
 fn load_exact_generated_plan_file(
     path: &Path,
     generated: &GeneratedFollowUpSupervisorPlan,
-) -> Result<LoadedSupervisorPlan> {
+) -> Result<Option<LoadedSupervisorPlan>> {
     let loaded = load_supervisor_plan_file_with_consultant(path)?;
     if loaded.plan != generated.ordinary_plan()
         || loaded.consultant != generated.consultant
@@ -696,11 +702,9 @@ fn load_exact_generated_plan_file(
         || loaded.plan_metadata.generated_follow_up != Some(generated.generated_follow_up.clone())
         || !loaded.plan_metadata.spec_fragment_ids.is_empty()
     {
-        bail!(
-            "persisted generated follow-up plan changed across the ordinary full-document loader"
-        );
+        return Ok(None);
     }
-    Ok(loaded)
+    Ok(Some(loaded))
 }
 
 #[cfg(test)]
