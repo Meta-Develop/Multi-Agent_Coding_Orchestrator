@@ -403,7 +403,9 @@ fn declared_scoped_breakage_passes_and_journals_dispatchable_follow_up_plan() {
         collected.generated_follow_up_tasks,
         scenario.report.generated_follow_up_tasks
     );
-    assert!(collected.remaining_risk.contains("automatic dispatch"));
+    assert!(collected
+        .remaining_risk
+        .contains("separate cascade outcome determines whether dispatch occurred"));
     assert!(supervisor_final_report_schema_value()["properties"]
         .get("generated_follow_up_tasks")
         .is_some());
