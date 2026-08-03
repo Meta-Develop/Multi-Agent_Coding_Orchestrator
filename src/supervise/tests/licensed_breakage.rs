@@ -144,6 +144,60 @@ fn licensed_auditor_report(
     }
 }
 
+fn licensed_follow_up_assignment() -> OrchestratorAssignment {
+    OrchestratorAssignment {
+        id: "child-a-licensed-update-01".to_string(),
+        role: AgentRole::ChildOrchestrator,
+        assigned_paths: vec![PathBuf::from("src/client.rs")],
+        semantic_symbols: vec![LICENSED_INTERFACE.to_string()],
+        semantic_modules: Vec::new(),
+        task: Some("apply the generated licensed dependent update".to_string()),
+        worker_assignments: Vec::new(),
+        environment_requirements: Vec::new(),
+        licensed_breakage: None,
+        notes: None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn secure_machine_global_retention(
+    root: &Path,
+    correlation_id: &str,
+) -> crate::machine_global::MachineGlobalRetentionBinding {
+    use std::os::unix::fs::PermissionsExt;
+
+    let runtime_root = crate::process_runner::trusted_linux_runtime_root()
+        .expect("resolve trusted runtime root for generated follow-up cleanup");
+    let state_root = root.join(format!("{correlation_id}-machine-global-state"));
+    fs::create_dir(&state_root).expect("create generated follow-up machine-global state");
+    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
+        .expect("secure generated follow-up machine-global state");
+    let config = root.join(format!("{correlation_id}-machine-global.json"));
+    fs::write(
+        &config,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "state_root": state_root,
+            "roots": [{
+                "id": "runtime",
+                "path": runtime_root,
+                "protected_paths": [],
+                "quarantine_grace_seconds": 60
+            }]
+        }))
+        .expect("serialize generated follow-up machine-global config"),
+    )
+    .expect("write generated follow-up machine-global config");
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600))
+        .expect("secure generated follow-up machine-global config");
+    crate::machine_global::MachineGlobalRetentionBinding {
+        config,
+        root_id: "runtime".to_string(),
+        owner: "maco-supervise-test".to_string(),
+        correction_correlation_id: correlation_id.to_string(),
+    }
+}
+
 fn run_licensed_scenario(
     assignment: OrchestratorAssignment,
     mut child: OrchestratorReviewReport,
@@ -908,4 +962,274 @@ fn licensed_follow_up_survives_authenticated_final_report_resume_without_redispa
         final_report.generated_follow_up_tasks,
         final_report.orchestrator_reports[0].generated_follow_up_tasks
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn licensed_follow_up_cascade_dispatches_one_authenticated_round_and_keeps_primary_untouched() {
+    let (temp, repo) = injected_repository();
+    let source_assignment = licensed_assignment();
+    let follow_up_assignment = licensed_follow_up_assignment();
+    let plan = injected_plan(source_assignment.clone(), 0);
+    let run_id = RunId::new("licensed-cascade-depth-two").expect("cascade source run id");
+    let plan_file = temp.path().join("licensed-cascade-depth-two.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&plan).expect("serialize licensed cascade source plan"),
+    )
+    .expect("write licensed cascade source plan");
+    let options = SupervisorRunOptions {
+        repo: repo.clone(),
+        plan_file,
+        run_id,
+        codex_bin: PathBuf::from("unused-injected-codex"),
+        runtime: SupervisorRuntime::Codex,
+        allow_dirty_primary: false,
+        machine_global_retention: Some(secure_machine_global_retention(
+            temp.path(),
+            "licensed-cascade-depth-two",
+        )),
+    };
+    let declaration_sha256 = licensed_breakage_declaration_sha256(
+        source_assignment
+            .licensed_breakage
+            .as_ref()
+            .expect("licensed cascade declaration"),
+    )
+    .expect("hash licensed cascade declaration");
+    let queue_root = repo
+        .join(".git/maco/state")
+        .join(crate::follow_up_queue::GENERATED_FOLLOW_UP_QUEUE_ROOT_NAME);
+    assert!(
+        !queue_root.exists(),
+        "queue must not predate the source run"
+    );
+    let observations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = std::rc::Rc::clone(&observations);
+    set_generated_follow_up_queue_observer(move |observation| {
+        observed.borrow_mut().push(observation);
+    });
+    let primary_before =
+        verified_whole_primary_snapshot_sha256(&repo).expect("capture whole-primary baseline");
+    let mut source_child_dispatches = 0_usize;
+    let mut follow_up_child_dispatches = 0_usize;
+    let mut runner = |command: &ExternalAgentCommand| {
+        let output_path = command.output_last_message.to_string_lossy();
+        let is_follow_up = output_path.contains("child-a-licensed-update-01");
+        let is_auditor = output_path.contains("review-auditor");
+        if is_auditor && is_follow_up {
+            let child = injected_child_report(&follow_up_assignment);
+            write_injected_json(
+                &command.output_last_message,
+                &injected_auditor_report(&follow_up_assignment, &child),
+            );
+        } else if is_auditor {
+            write_injected_json(
+                &command.output_last_message,
+                &licensed_auditor_report(&source_assignment, Some(&declaration_sha256)),
+            );
+        } else if is_follow_up {
+            follow_up_child_dispatches += 1;
+            assert_eq!(follow_up_child_dispatches, 1, "follow-up child reran");
+            fs::create_dir_all(command.cwd.join("src")).expect("create dependent source dir");
+            fs::write(
+                command.cwd.join("src/client.rs"),
+                "pub fn migrated_client() {}\n",
+            )
+            .expect("write generated dependent update");
+            let mut child = injected_child_report(&follow_up_assignment);
+            child.files_changed = vec![PathBuf::from("src/client.rs")];
+            write_injected_json(&command.output_last_message, &child);
+        } else {
+            source_child_dispatches += 1;
+            assert_eq!(source_child_dispatches, 1, "source child reran");
+            fs::write(command.cwd.join("README.md"), "licensed breaking change\n")
+                .expect("write licensed source candidate");
+            write_injected_json(
+                &command.output_last_message,
+                &dependent_failure_child(&source_assignment, "src/client.rs"),
+            );
+        }
+        injected_verified_run(command)
+    };
+
+    let outcome = run_supervisor_plan_file_cascade_with_runner(options, &mut runner)
+        .expect("dispatch authenticated bounded licensed cascade");
+    clear_generated_follow_up_queue_observer();
+    let primary_after = verified_whole_primary_snapshot_sha256(&repo)
+        .expect("capture whole-primary final observation");
+
+    assert!(outcome.source_report.success, "{outcome:#?}");
+    assert!(outcome.source_report.publishable, "{outcome:#?}");
+    assert!(outcome.follow_up_cascade_success, "{outcome:#?}");
+    assert_eq!(outcome.follow_up_primary_worktree_untouched, Some(true));
+    assert!(outcome.generated_follow_up_dispatch_performed());
+    let queue = outcome
+        .follow_up_queue
+        .expect("authenticated queue summary");
+    assert!(queue.enqueue_committed);
+    assert_eq!(queue.item_count, 1);
+    assert_eq!(queue.pending_count, 0);
+    assert_eq!(queue.dispatch_started_count, 0);
+    assert_eq!(queue.acknowledged_terminal_count, 1);
+    assert_eq!(queue.authenticated_child_dispatch_started_count, 1);
+    assert_eq!(outcome.follow_up_reports.len(), 1);
+    assert!(outcome.follow_up_reports[0].success);
+    assert!(outcome.follow_up_reports[0]
+        .generated_follow_up_tasks
+        .is_empty());
+    assert_eq!(source_child_dispatches, 1);
+    assert_eq!(follow_up_child_dispatches, 1);
+    assert_eq!(primary_after, primary_before);
+    assert!(!repo.join("src/client.rs").exists());
+    let observations = observations.borrow();
+    let created = observations
+        .iter()
+        .find(|observation| observation.label == "created_or_opened")
+        .expect("queue Created observation");
+    assert_eq!(created.pending_count, 0);
+    assert_eq!(created.dispatch_started_count, 0);
+    let enqueued = observations
+        .iter()
+        .find(|observation| observation.label == "enqueued")
+        .expect("durable Enqueued observation");
+    assert_eq!(enqueued.pending_count, 1);
+    assert_eq!(enqueued.dispatch_started_count, 0);
+    let started = observations
+        .iter()
+        .find(|observation| observation.label == "dispatch_started")
+        .expect("durable DispatchStarted observation");
+    assert_eq!(started.pending_count, 0);
+    assert_eq!(started.dispatch_started_count, 1);
+    assert_eq!(started.authenticated_child_dispatch_started_count, 0);
+    let acknowledged = observations
+        .iter()
+        .find(|observation| observation.label == "acknowledged_terminal")
+        .expect("durable Acknowledged observation");
+    assert_eq!(acknowledged.acknowledged_terminal_count, 1);
+    assert_eq!(acknowledged.authenticated_child_dispatch_started_count, 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn licensed_follow_up_enqueue_interruption_resumes_without_rerunning_source() {
+    let (temp, repo) = injected_repository();
+    let source_assignment = licensed_assignment();
+    let follow_up_assignment = licensed_follow_up_assignment();
+    let plan = injected_plan(source_assignment.clone(), 0);
+    let run_id = RunId::new("licensed-cascade-enqueue-resume").expect("cascade resume run id");
+    let plan_file = temp.path().join("licensed-cascade-enqueue-resume.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&plan).expect("serialize resumable licensed source plan"),
+    )
+    .expect("write resumable licensed source plan");
+    let options = SupervisorRunOptions {
+        repo: repo.clone(),
+        plan_file,
+        run_id,
+        codex_bin: PathBuf::from("unused-injected-codex"),
+        runtime: SupervisorRuntime::Codex,
+        allow_dirty_primary: false,
+        machine_global_retention: Some(secure_machine_global_retention(
+            temp.path(),
+            "licensed-cascade-enqueue-resume",
+        )),
+    };
+    let declaration_sha256 = licensed_breakage_declaration_sha256(
+        source_assignment
+            .licensed_breakage
+            .as_ref()
+            .expect("resumable licensed declaration"),
+    )
+    .expect("hash resumable licensed declaration");
+    let observations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = std::rc::Rc::clone(&observations);
+    set_generated_follow_up_queue_observer(move |observation| {
+        observed.borrow_mut().push(observation);
+    });
+    let source_child_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let follow_up_child_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut runner = |command: &ExternalAgentCommand| {
+        let output_path = command.output_last_message.to_string_lossy();
+        let is_follow_up = output_path.contains("child-a-licensed-update-01");
+        let is_auditor = output_path.contains("review-auditor");
+        if is_auditor && is_follow_up {
+            let child = injected_child_report(&follow_up_assignment);
+            write_injected_json(
+                &command.output_last_message,
+                &injected_auditor_report(&follow_up_assignment, &child),
+            );
+        } else if is_auditor {
+            write_injected_json(
+                &command.output_last_message,
+                &licensed_auditor_report(&source_assignment, Some(&declaration_sha256)),
+            );
+        } else if is_follow_up {
+            let count = follow_up_child_dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(1);
+            assert_eq!(count, 1, "resumed follow-up reran");
+            fs::create_dir_all(command.cwd.join("src")).expect("create resumed dependent dir");
+            fs::write(command.cwd.join("src/client.rs"), "pub fn migrated() {}\n")
+                .expect("write resumed dependent update");
+            let mut child = injected_child_report(&follow_up_assignment);
+            child.files_changed = vec![PathBuf::from("src/client.rs")];
+            write_injected_json(&command.output_last_message, &child);
+        } else {
+            let count = source_child_dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(1);
+            assert_eq!(count, 1, "source reran across resume");
+            fs::write(command.cwd.join("README.md"), "licensed breaking change\n")
+                .expect("write resumable licensed source candidate");
+            write_injected_json(
+                &command.output_last_message,
+                &dependent_failure_child(&source_assignment, "src/client.rs"),
+            );
+        }
+        injected_verified_run(command)
+    };
+
+    set_interrupt_after_follow_up_enqueue();
+    let error = run_supervisor_plan_file_cascade_with_runner(options.clone(), &mut runner)
+        .expect_err("interrupt after durable follow-up enqueue");
+    assert!(format!("{error:#}")
+        .contains("injected interruption after durable generated follow-up enqueue"));
+    assert_eq!(
+        source_child_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        follow_up_child_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    {
+        let observations = observations.borrow();
+        let interrupted = observations.last().expect("interrupted queue observation");
+        assert_eq!(interrupted.label, "enqueued");
+        assert_eq!(interrupted.pending_count, 1);
+        assert_eq!(interrupted.dispatch_started_count, 0);
+        assert_eq!(interrupted.acknowledged_terminal_count, 0);
+    }
+
+    let outcome = resume_supervisor_plan_file_cascade_with_runner(options, &mut runner)
+        .expect("resume exact finalized source and drain durable queue");
+    clear_generated_follow_up_queue_observer();
+    assert!(outcome.follow_up_cascade_success, "{outcome:#?}");
+    assert!(outcome.generated_follow_up_dispatch_performed());
+    assert_eq!(
+        source_child_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        follow_up_child_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    let queue = outcome.follow_up_queue.expect("resumed queue summary");
+    assert_eq!(queue.pending_count, 0);
+    assert_eq!(queue.dispatch_started_count, 0);
+    assert_eq!(queue.acknowledged_terminal_count, 1);
+    assert_eq!(queue.authenticated_child_dispatch_started_count, 1);
+    assert!(!repo.join("src/client.rs").exists());
 }

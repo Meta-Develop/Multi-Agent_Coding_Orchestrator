@@ -101,6 +101,8 @@ pub(super) fn run_generated_follow_up_cascade(
         &source_report.generated_follow_up_tasks,
     )?;
     let mut queue = GeneratedFollowUpQueue::create_or_open(authenticator, source, bounds)?;
+    #[cfg(test)]
+    record_queue_test_observation("created_or_opened", &queue, 0);
     if !queue.snapshot().enqueue_committed() {
         if queue.snapshot().staged_count() == 0 {
             queue.enqueue_all_before_dispatch(&source_report.generated_follow_up_tasks)?;
@@ -110,6 +112,8 @@ pub(super) fn run_generated_follow_up_cascade(
     } else {
         queue.enqueue_all_before_dispatch(&source_report.generated_follow_up_tasks)?;
     }
+    #[cfg(test)]
+    record_queue_test_observation("enqueued", &queue, 0);
     #[cfg(test)]
     interrupt_after_follow_up_enqueue()?;
 
@@ -228,6 +232,12 @@ pub(super) fn run_generated_follow_up_cascade(
             }
         };
         let started = queue.mark_dispatch_started(&item_id)?;
+        #[cfg(test)]
+        record_queue_test_observation(
+            "dispatch_started",
+            &queue,
+            authenticated_child_dispatch_started_count,
+        );
         let subordinate_run_id = RunId::new(
             started
                 .subordinate_run_id
@@ -271,6 +281,12 @@ pub(super) fn run_generated_follow_up_cascade(
                 )?;
                 queue.mark_dispatch_observed(&item_id, observation)?;
                 queue.acknowledge_terminal(&item_id)?;
+                #[cfg(test)]
+                record_queue_test_observation(
+                    "acknowledged_terminal",
+                    &queue,
+                    authenticated_child_dispatch_started_count,
+                );
                 cascade_gate_denials.extend(report.gate_denials.iter().cloned());
                 if !report.generated_follow_up_tasks.is_empty() {
                     cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
@@ -299,6 +315,12 @@ pub(super) fn run_generated_follow_up_cascade(
                                     "generated follow-up dispatch evidence count overflowed",
                                 )?;
                     }
+                    #[cfg(test)]
+                    record_queue_test_observation(
+                        "acknowledged_terminal",
+                        &queue,
+                        authenticated_child_dispatch_started_count,
+                    );
                     cascade_gate_denials.extend(report.gate_denials.iter().cloned());
                     cascade_success &=
                         report.success && report.generated_follow_up_tasks.is_empty();
@@ -446,6 +468,12 @@ fn reconcile_started_items(
                                     "generated follow-up dispatch evidence count overflowed",
                                 )?;
                         }
+                        #[cfg(test)]
+                        record_queue_test_observation(
+                            "acknowledged_terminal",
+                            queue,
+                            *authenticated_dispatches,
+                        );
                         cascade_gate_denials.extend(report.gate_denials.iter().cloned());
                         if !report.generated_follow_up_tasks.is_empty() {
                             cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
@@ -480,6 +508,12 @@ fn reconcile_started_items(
                             .checked_add(1)
                             .context("generated follow-up dispatch evidence count overflowed")?;
                     }
+                    #[cfg(test)]
+                    record_queue_test_observation(
+                        "acknowledged_terminal",
+                        queue,
+                        *authenticated_dispatches,
+                    );
                     cascade_gate_denials.extend(report.gate_denials.iter().cloned());
                     *cascade_success &=
                         report.success && report.generated_follow_up_tasks.is_empty();
@@ -691,6 +725,49 @@ fn run_before_generated_follow_up_plan_load_hook(path: &Path) {
     BEFORE_GENERATED_FOLLOW_UP_PLAN_LOAD_HOOK.with(|slot| {
         if let Some(mut hook) = slot.borrow_mut().take() {
             hook(path);
+        }
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    static GENERATED_FOLLOW_UP_QUEUE_OBSERVER: std::cell::RefCell<
+        Option<Box<dyn FnMut(GeneratedFollowUpQueueTestObservation)>>
+    > = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_generated_follow_up_queue_observer(
+    observer: impl FnMut(GeneratedFollowUpQueueTestObservation) + 'static,
+) {
+    GENERATED_FOLLOW_UP_QUEUE_OBSERVER.with(|slot| *slot.borrow_mut() = Some(Box::new(observer)));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_generated_follow_up_queue_observer() {
+    GENERATED_FOLLOW_UP_QUEUE_OBSERVER.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[cfg(test)]
+fn record_queue_test_observation(
+    label: &'static str,
+    queue: &GeneratedFollowUpQueue,
+    authenticated_child_dispatch_started_count: usize,
+) {
+    let summary = queue.summary();
+    let observation = GeneratedFollowUpQueueTestObservation {
+        label,
+        pending_count: summary.enqueued,
+        claimed_count: summary.claimed,
+        dispatch_started_count: summary.dispatch_started,
+        dispatch_observed_count: summary.dispatch_observed,
+        acknowledged_terminal_count: summary.acknowledged_terminal,
+        held_ambiguous_count: summary.held_ambiguous,
+        authenticated_child_dispatch_started_count,
+    };
+    GENERATED_FOLLOW_UP_QUEUE_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow_mut().as_mut() {
+            observer(observation);
         }
     });
 }

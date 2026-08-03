@@ -103,7 +103,8 @@ mod follow_up_cascade;
 use follow_up_cascade::*;
 #[cfg(test)]
 pub(crate) use follow_up_cascade::{
-    set_before_generated_follow_up_plan_load_hook, set_interrupt_after_follow_up_enqueue,
+    clear_generated_follow_up_queue_observer, set_before_generated_follow_up_plan_load_hook,
+    set_generated_follow_up_queue_observer, set_interrupt_after_follow_up_enqueue,
 };
 
 mod repository;
@@ -1181,6 +1182,19 @@ pub struct SupervisorFollowUpQueueSummary {
     pub source_supervisor_run_id: String,
     pub enqueue_committed: bool,
     pub item_count: usize,
+    pub pending_count: usize,
+    pub claimed_count: usize,
+    pub dispatch_started_count: usize,
+    pub dispatch_observed_count: usize,
+    pub acknowledged_terminal_count: usize,
+    pub held_ambiguous_count: usize,
+    pub authenticated_child_dispatch_started_count: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeneratedFollowUpQueueTestObservation {
+    pub label: &'static str,
     pub pending_count: usize,
     pub claimed_count: usize,
     pub dispatch_started_count: usize,
