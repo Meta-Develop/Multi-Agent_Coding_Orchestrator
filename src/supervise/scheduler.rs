@@ -47,6 +47,30 @@ impl FromStr for SupervisorConcurrencyPolicy {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_SUPERVISOR_FINAL_REPORT_PERSIST_HOOK: std::cell::RefCell<
+        Option<Box<dyn FnMut(&mut SupervisorFinalReport)>>,
+    > = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_supervisor_final_report_persist_hook(
+    hook: impl FnMut(&mut SupervisorFinalReport) + 'static,
+) {
+    BEFORE_SUPERVISOR_FINAL_REPORT_PERSIST_HOOK
+        .with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_before_supervisor_final_report_persist_hook(report: &mut SupervisorFinalReport) {
+    BEFORE_SUPERVISOR_FINAL_REPORT_PERSIST_HOOK.with(|slot| {
+        if let Some(mut hook) = slot.borrow_mut().take() {
+            hook(report);
+        }
+    });
+}
+
 fn assignments_overlap(left: &OrchestratorAssignment, right: &OrchestratorAssignment) -> bool {
     left.assigned_paths.iter().any(|left_path| {
         right
@@ -1161,6 +1185,8 @@ fn persist_supervisor_final_report(
             trip.autonomy_kpis = final_report.autonomy_kpis.clone();
         }
     }
+    #[cfg(test)]
+    run_before_supervisor_final_report_persist_hook(&mut final_report);
     let report_bytes = encode_final_report(&final_report)?;
     let mut checkpoint_writer = checkpoint_writer;
     if let Some(checkpoint) = checkpoint_writer.as_deref_mut() {

@@ -1585,3 +1585,338 @@ fn licensed_follow_up_enqueue_interruption_resumes_without_rerunning_source() {
     assert_eq!(queue.authenticated_child_dispatch_started_count, 1);
     assert!(!repo.join("src/client.rs").exists());
 }
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum HeldFinalizedSubordinateVariant {
+    Exact,
+    PlanDrift,
+    GeneratesThirdRound,
+}
+
+#[cfg(target_os = "linux")]
+struct HeldFinalizedSubordinateScenario {
+    _temp: tempfile::TempDir,
+    repo: PathBuf,
+    held_observation: GeneratedFollowUpQueueTestObservation,
+    finalized_subordinate: SupervisorFinalReport,
+    outcome: SupervisorCascadeOutcome,
+    source_child_dispatches: usize,
+    subordinate_child_dispatches: usize,
+    unexpected_reconciliation_dispatches: usize,
+    primary_before: String,
+    primary_after: String,
+}
+
+#[cfg(target_os = "linux")]
+fn run_held_finalized_subordinate_scenario(
+    run_name: &str,
+    variant: HeldFinalizedSubordinateVariant,
+) -> HeldFinalizedSubordinateScenario {
+    let (temp, repo) = injected_repository();
+    let source_assignment = licensed_assignment();
+    let follow_up_assignment = licensed_follow_up_assignment();
+    let plan = injected_plan(source_assignment.clone(), 0);
+    let source_run_id = RunId::new(run_name).expect("held source run id");
+    let source_plan_file = temp.path().join(format!("{run_name}.json"));
+    fs::write(
+        &source_plan_file,
+        serde_json::to_vec_pretty(&plan).expect("serialize held source plan"),
+    )
+    .expect("write held source plan");
+    let retention = secure_machine_global_retention(temp.path(), run_name);
+    let source_options = SupervisorRunOptions {
+        repo: repo.clone(),
+        plan_file: source_plan_file,
+        run_id: source_run_id.clone(),
+        codex_bin: PathBuf::from("unused-injected-codex"),
+        runtime: SupervisorRuntime::Codex,
+        allow_dirty_primary: false,
+        machine_global_retention: Some(retention.clone()),
+    };
+    let declaration_sha256 = licensed_breakage_declaration_sha256(
+        source_assignment
+            .licensed_breakage
+            .as_ref()
+            .expect("held source declaration"),
+    )
+    .expect("hash held source declaration");
+    let observations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = std::rc::Rc::clone(&observations);
+    set_generated_follow_up_queue_observer(move |observation| {
+        observed.borrow_mut().push(observation);
+    });
+    let primary_before =
+        verified_whole_primary_snapshot_sha256(&repo).expect("capture held primary before");
+    let source_child_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let source_follow_up_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut source_runner = |command: &ExternalAgentCommand| {
+        let output_path = command.output_last_message.to_string_lossy();
+        let is_follow_up = output_path.contains("child-a-licensed-update-01");
+        let is_auditor = output_path.contains("review-auditor");
+        if is_follow_up {
+            source_follow_up_dispatches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("ambiguous-hold seam reached a subordinate external runner");
+        } else if is_auditor {
+            write_injected_json(
+                &command.output_last_message,
+                &licensed_auditor_report(&source_assignment, Some(&declaration_sha256)),
+            );
+        } else {
+            let count = source_child_dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(1);
+            assert_eq!(count, 1, "held source child reran");
+            fs::write(command.cwd.join("README.md"), "licensed breaking change\n")
+                .expect("write held source candidate");
+            write_injected_json(
+                &command.output_last_message,
+                &dependent_failure_child(&source_assignment, "src/client.rs"),
+            );
+        }
+        write_injected_usage(command, 0, 1);
+        injected_verified_run(command)
+    };
+
+    set_interrupt_after_follow_up_dispatch_started();
+    let error =
+        run_supervisor_plan_file_cascade_with_runner(source_options.clone(), &mut source_runner)
+            .expect_err("interrupt after authenticated ambiguous hold");
+    assert!(format!("{error:#}")
+        .contains("injected interruption after durable generated follow-up ambiguous hold"));
+    assert_eq!(
+        source_follow_up_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    let held_observation = observations
+        .borrow()
+        .iter()
+        .find(|observation| observation.label == "held_ambiguous")
+        .cloned()
+        .expect("observe authenticated HeldAmbiguous state");
+    assert_eq!(held_observation.held_ambiguous_count, 1);
+    assert_eq!(
+        held_observation.authenticated_child_dispatch_started_count,
+        0
+    );
+    assert_eq!(held_observation.subordinate_run_ids.len(), 1);
+    let subordinate_run_id =
+        RunId::new(&held_observation.subordinate_run_ids[0]).expect("held subordinate run id");
+    let source_report = supervisor_status(&repo, source_run_id)
+        .expect("read finalized held source")
+        .final_report
+        .expect("held source final report");
+    let queued_task = source_report
+        .generated_follow_up_tasks
+        .first()
+        .cloned()
+        .expect("held source queued task");
+    let mut finalized_plan = queued_task.supervisor_plan.clone();
+    if matches!(variant, HeldFinalizedSubordinateVariant::PlanDrift) {
+        finalized_plan
+            .task
+            .push_str(" with unauthorized plan drift");
+    }
+    let subordinate_plan_file = temp.path().join(format!("{run_name}-subordinate.json"));
+    fs::write(
+        &subordinate_plan_file,
+        serde_json::to_vec_pretty(&finalized_plan).expect("serialize held subordinate plan"),
+    )
+    .expect("write held subordinate plan");
+    if matches!(
+        variant,
+        HeldFinalizedSubordinateVariant::GeneratesThirdRound
+    ) {
+        set_before_supervisor_final_report_persist_hook(move |report| {
+            report.generated_follow_up_tasks = vec![queued_task.clone()];
+        });
+    }
+    let subordinate_child_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut subordinate_runner = |command: &ExternalAgentCommand| {
+        let output_path = command.output_last_message.to_string_lossy();
+        let is_auditor = output_path.contains("review-auditor");
+        if is_auditor {
+            let mut child = injected_child_report(&follow_up_assignment);
+            child.files_changed = vec![PathBuf::from("src/client.rs")];
+            write_injected_json(
+                &command.output_last_message,
+                &injected_auditor_report(&follow_up_assignment, &child),
+            );
+        } else {
+            let count = subordinate_child_dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(1);
+            assert_eq!(count, 1, "held subordinate child reran");
+            fs::create_dir_all(command.cwd.join("src"))
+                .expect("create held subordinate source dir");
+            fs::write(command.cwd.join("src/client.rs"), "pub fn migrated() {}\n")
+                .expect("write held subordinate candidate");
+            let mut child = injected_child_report(&follow_up_assignment);
+            child.files_changed = vec![PathBuf::from("src/client.rs")];
+            write_injected_json(&command.output_last_message, &child);
+        }
+        write_injected_usage(command, 0, 1);
+        injected_verified_run(command)
+    };
+    let finalized_subordinate = run_supervisor_plan_file_with_runner(
+        SupervisorRunOptions {
+            repo: repo.clone(),
+            plan_file: subordinate_plan_file,
+            run_id: subordinate_run_id,
+            codex_bin: PathBuf::from("unused-injected-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: false,
+            machine_global_retention: Some(retention),
+        },
+        &mut subordinate_runner,
+    )
+    .expect("finalize deterministic held subordinate through ordinary supervisor");
+    assert!(finalized_subordinate.success, "{finalized_subordinate:#?}");
+
+    let unexpected_reconciliation_dispatches =
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let unexpected = std::sync::Arc::clone(&unexpected_reconciliation_dispatches);
+    let mut reconciliation_runner = move |_command: &ExternalAgentCommand| {
+        unexpected.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        panic!("HeldAmbiguous reconciliation attempted a new external dispatch");
+    };
+    let outcome =
+        resume_supervisor_plan_file_cascade_with_runner(source_options, &mut reconciliation_runner)
+            .expect("reconcile newly finalized HeldAmbiguous subordinate");
+    clear_generated_follow_up_queue_observer();
+    let primary_after =
+        verified_whole_primary_snapshot_sha256(&repo).expect("capture held primary after");
+
+    HeldFinalizedSubordinateScenario {
+        _temp: temp,
+        repo,
+        held_observation,
+        finalized_subordinate,
+        outcome,
+        source_child_dispatches: source_child_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        subordinate_child_dispatches: subordinate_child_dispatches
+            .load(std::sync::atomic::Ordering::SeqCst),
+        unexpected_reconciliation_dispatches: unexpected_reconciliation_dispatches
+            .load(std::sync::atomic::Ordering::SeqCst),
+        primary_before,
+        primary_after,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn held_ambiguous_reconciles_newly_finalized_exact_subordinate() {
+    let scenario = run_held_finalized_subordinate_scenario(
+        "licensed-held-finalized-exact",
+        HeldFinalizedSubordinateVariant::Exact,
+    );
+
+    assert!(
+        scenario.outcome.follow_up_cascade_success,
+        "{:#?}",
+        scenario.outcome
+    );
+    assert!(scenario.outcome.generated_follow_up_dispatch_performed());
+    assert!(scenario.outcome.follow_up_gate_denials.is_empty());
+    assert_eq!(scenario.outcome.follow_up_reports.len(), 1);
+    let queue = scenario
+        .outcome
+        .follow_up_queue
+        .expect("reconciled HeldAmbiguous queue");
+    assert_eq!(
+        queue.queue_instance_id,
+        scenario.held_observation.queue_instance_id
+    );
+    assert_eq!(queue.pending_count, 0);
+    assert_eq!(queue.dispatch_started_count, 0);
+    assert_eq!(queue.held_ambiguous_count, 0);
+    assert_eq!(queue.acknowledged_terminal_count, 1);
+    assert_eq!(queue.authenticated_child_dispatch_started_count, 1);
+    assert_eq!(scenario.source_child_dispatches, 1);
+    assert_eq!(scenario.subordinate_child_dispatches, 1);
+    assert_eq!(scenario.unexpected_reconciliation_dispatches, 0);
+    assert_eq!(scenario.primary_after, scenario.primary_before);
+    assert!(!scenario.repo.join("src/client.rs").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn held_ambiguous_refuses_finalized_subordinate_plan_drift_without_counting() {
+    let scenario = run_held_finalized_subordinate_scenario(
+        "licensed-held-finalized-plan-drift",
+        HeldFinalizedSubordinateVariant::PlanDrift,
+    );
+
+    assert!(scenario.finalized_subordinate.success);
+    assert!(!scenario.outcome.follow_up_cascade_success);
+    assert!(!scenario.outcome.generated_follow_up_dispatch_performed());
+    assert!(scenario.outcome.follow_up_reports.is_empty());
+    assert!(scenario
+        .outcome
+        .follow_up_gate_denials
+        .iter()
+        .any(|denial| {
+            matches!(
+                denial.reason,
+                GateDenialReason::ApprovalReview {
+                    denial: crate::gate_denial::ApprovalReviewDenial::PermissionExpansion
+                }
+            )
+        }));
+    let queue = scenario
+        .outcome
+        .follow_up_queue
+        .expect("plan-drift HeldAmbiguous queue");
+    assert_eq!(queue.held_ambiguous_count, 1);
+    assert_eq!(queue.acknowledged_terminal_count, 0);
+    assert_eq!(queue.authenticated_child_dispatch_started_count, 0);
+    assert_eq!(scenario.source_child_dispatches, 1);
+    assert_eq!(scenario.subordinate_child_dispatches, 1);
+    assert_eq!(scenario.unexpected_reconciliation_dispatches, 0);
+    assert_eq!(scenario.primary_after, scenario.primary_before);
+    assert!(!scenario.repo.join("src/client.rs").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn held_ambiguous_finalized_round_two_tasks_refuse_maximum_round() {
+    let scenario = run_held_finalized_subordinate_scenario(
+        "licensed-held-finalized-maximum-round",
+        HeldFinalizedSubordinateVariant::GeneratesThirdRound,
+    );
+
+    assert_eq!(
+        scenario
+            .finalized_subordinate
+            .generated_follow_up_tasks
+            .len(),
+        1
+    );
+    assert!(!scenario.outcome.follow_up_cascade_success);
+    assert!(scenario.outcome.generated_follow_up_dispatch_performed());
+    assert_eq!(scenario.outcome.follow_up_reports.len(), 1);
+    assert!(scenario
+        .outcome
+        .follow_up_gate_denials
+        .iter()
+        .any(|denial| {
+            matches!(
+                denial.reason,
+                GateDenialReason::ApprovalReview {
+                    denial: crate::gate_denial::ApprovalReviewDenial::PermissionExpansion
+                }
+            )
+        }));
+    let queue = scenario
+        .outcome
+        .follow_up_queue
+        .expect("maximum-round HeldAmbiguous queue");
+    assert_eq!(queue.held_ambiguous_count, 0);
+    assert_eq!(queue.acknowledged_terminal_count, 1);
+    assert_eq!(queue.authenticated_child_dispatch_started_count, 1);
+    assert_eq!(scenario.source_child_dispatches, 1);
+    assert_eq!(scenario.subordinate_child_dispatches, 1);
+    assert_eq!(scenario.unexpected_reconciliation_dispatches, 0);
+    assert_eq!(scenario.primary_after, scenario.primary_before);
+    assert!(!scenario.repo.join("src/client.rs").exists());
+}

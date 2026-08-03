@@ -245,6 +245,17 @@ pub(super) fn run_generated_follow_up_cascade(
             &queue,
             authenticated_child_dispatch_started_count,
         );
+        #[cfg(test)]
+        if take_interrupt_after_follow_up_dispatch_started() {
+            let denial = ambiguous_dispatch_denial(&item_id)?;
+            queue.mark_held_ambiguous(&item_id, Some(denial), Vec::new())?;
+            record_queue_test_observation(
+                "held_ambiguous",
+                &queue,
+                authenticated_child_dispatch_started_count,
+            );
+            bail!("injected interruption after durable generated follow-up ambiguous hold");
+        }
         let subordinate_run_id = RunId::new(
             started
                 .subordinate_run_id
@@ -454,10 +465,12 @@ fn reconcile_started_items(
                 item.item_id().to_string(),
                 item.phase(),
                 item.subordinate_run_id().map(str::to_string),
+                item.last_gate_denial().cloned(),
+                item.task().clone(),
             )
         })
         .collect::<Vec<_>>();
-    for (item_id, phase, subordinate_run_id) in items {
+    for (item_id, phase, subordinate_run_id, prior_gate_denial, queued_task) in items {
         match phase {
             GeneratedFollowUpQueuePhase::DispatchStarted => {
                 let run_id = RunId::new(
@@ -467,6 +480,21 @@ fn reconcile_started_items(
                 )?;
                 match subordinate_reconciliation(repo, &run_id)? {
                     SubordinateReconciliation::Finalized(report) => {
+                        if !authenticated_subordinate_plan_matches(
+                            repo,
+                            &run_id,
+                            &queued_task.supervisor_plan,
+                        )? {
+                            let denial = permission_expansion_denial(&item_id)?;
+                            queue.mark_held_ambiguous(
+                                &item_id,
+                                Some(denial.clone()),
+                                Vec::new(),
+                            )?;
+                            cascade_gate_denials.push(denial);
+                            *cascade_success = false;
+                            continue;
+                        }
                         let child_started =
                             observe_and_acknowledge(repo, queue, &item_id, &run_id, &report)?;
                         if child_started {
@@ -491,10 +519,22 @@ fn reconcile_started_items(
                     }
                     SubordinateReconciliation::Active
                     | SubordinateReconciliation::RetryableStatusRead => {
+                        if authenticated_child_dispatch_started(repo, &run_id)? {
+                            *authenticated_dispatches =
+                                authenticated_dispatches.checked_add(1).context(
+                                    "generated follow-up dispatch evidence count overflowed",
+                                )?;
+                        }
                         cascade_gate_denials.push(ambiguous_dispatch_denial(&item_id)?);
                         *cascade_success = false;
                     }
                     SubordinateReconciliation::Ambiguous => {
+                        if authenticated_child_dispatch_started(repo, &run_id)? {
+                            *authenticated_dispatches =
+                                authenticated_dispatches.checked_add(1).context(
+                                    "generated follow-up dispatch evidence count overflowed",
+                                )?;
+                        }
                         let denial = ambiguous_dispatch_denial(&item_id)?;
                         queue.mark_held_ambiguous(&item_id, Some(denial.clone()), Vec::new())?;
                         cascade_gate_denials.push(denial);
@@ -509,6 +549,15 @@ fn reconcile_started_items(
                         .context("observed generated follow-up has no subordinate run id")?,
                 )?;
                 if let Some(report) = conclusive_finalized_report(repo, &run_id)? {
+                    if !authenticated_subordinate_plan_matches(
+                        repo,
+                        &run_id,
+                        &queued_task.supervisor_plan,
+                    )? {
+                        cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
+                        *cascade_success = false;
+                        continue;
+                    }
                     queue.acknowledge_terminal(&item_id)?;
                     if authenticated_child_dispatch_started(repo, &run_id)? {
                         *authenticated_dispatches = authenticated_dispatches
@@ -529,13 +578,70 @@ fn reconcile_started_items(
                     }
                     reports.push(report);
                 } else {
+                    if authenticated_child_dispatch_started(repo, &run_id)? {
+                        *authenticated_dispatches = authenticated_dispatches
+                            .checked_add(1)
+                            .context("generated follow-up dispatch evidence count overflowed")?;
+                    }
                     cascade_gate_denials.push(ambiguous_dispatch_denial(&item_id)?);
                     *cascade_success = false;
                 }
             }
             GeneratedFollowUpQueuePhase::HeldAmbiguous => {
-                cascade_gate_denials.push(ambiguous_dispatch_denial(&item_id)?);
-                *cascade_success = false;
+                let run_id = RunId::new(
+                    subordinate_run_id
+                        .as_deref()
+                        .context("held generated follow-up has no subordinate run id")?,
+                )?;
+                match subordinate_reconciliation(repo, &run_id)? {
+                    SubordinateReconciliation::Finalized(report) => {
+                        if !authenticated_subordinate_plan_matches(
+                            repo,
+                            &run_id,
+                            &queued_task.supervisor_plan,
+                        )? {
+                            cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
+                            *cascade_success = false;
+                            continue;
+                        }
+                        let child_started =
+                            observe_and_acknowledge(repo, queue, &item_id, &run_id, &report)?;
+                        if child_started {
+                            *authenticated_dispatches =
+                                authenticated_dispatches.checked_add(1).context(
+                                    "generated follow-up dispatch evidence count overflowed",
+                                )?;
+                        }
+                        #[cfg(test)]
+                        record_queue_test_observation(
+                            "acknowledged_terminal",
+                            queue,
+                            *authenticated_dispatches,
+                        );
+                        cascade_gate_denials.extend(report.gate_denials.iter().cloned());
+                        if !report.generated_follow_up_tasks.is_empty() {
+                            cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
+                        }
+                        *cascade_success &=
+                            report.success && report.generated_follow_up_tasks.is_empty();
+                        reports.push(report);
+                    }
+                    SubordinateReconciliation::Active
+                    | SubordinateReconciliation::Ambiguous
+                    | SubordinateReconciliation::RetryableStatusRead => {
+                        if authenticated_child_dispatch_started(repo, &run_id)? {
+                            *authenticated_dispatches =
+                                authenticated_dispatches.checked_add(1).context(
+                                    "generated follow-up dispatch evidence count overflowed",
+                                )?;
+                        }
+                        cascade_gate_denials.push(match prior_gate_denial {
+                            Some(denial) => denial,
+                            None => ambiguous_dispatch_denial(&item_id)?,
+                        });
+                        *cascade_success = false;
+                    }
+                }
             }
             GeneratedFollowUpQueuePhase::AcknowledgedTerminal => {
                 let run_id = RunId::new(
@@ -544,6 +650,15 @@ fn reconcile_started_items(
                         .context("acknowledged generated follow-up has no subordinate run id")?,
                 )?;
                 if let Some(report) = conclusive_finalized_report(repo, &run_id)? {
+                    if !authenticated_subordinate_plan_matches(
+                        repo,
+                        &run_id,
+                        &queued_task.supervisor_plan,
+                    )? {
+                        cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
+                        *cascade_success = false;
+                        continue;
+                    }
                     if authenticated_child_dispatch_started(repo, &run_id)? {
                         *authenticated_dispatches = authenticated_dispatches
                             .checked_add(1)
@@ -675,6 +790,22 @@ fn verify_authenticated_source_basis(
     Ok(())
 }
 
+fn authenticated_subordinate_plan_matches(
+    repo: &Path,
+    run_id: &RunId,
+    queued: &GeneratedFollowUpSupervisorPlan,
+) -> Result<bool> {
+    let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Supervise, run_id)
+        .context("generated follow-up subordinate is not an authenticated finalized run")?;
+    let plan_bytes = reader
+        .read("assignments/supervisor-plan.json")
+        .context("generated follow-up subordinate has no authenticated normalized plan")?;
+    let plan_text = String::from_utf8(plan_bytes)
+        .context("authenticated generated follow-up subordinate plan is not UTF-8")?;
+    let loaded = parse_supervisor_plan_with_consultant(&plan_text)?;
+    loaded_generated_plan_matches(&loaded, queued)
+}
+
 fn generated_plan_file(
     repo: &Path,
     plan: &GeneratedFollowUpSupervisorPlan,
@@ -695,16 +826,21 @@ fn load_exact_generated_plan_file(
     generated: &GeneratedFollowUpSupervisorPlan,
 ) -> Result<Option<LoadedSupervisorPlan>> {
     let loaded = load_supervisor_plan_file_with_consultant(path)?;
-    if loaded.plan != generated.ordinary_plan()
-        || loaded.consultant != generated.consultant
-        || loaded.plan_metadata.assignment_schedule != generated.assignment_schedule
-        || loaded.plan_metadata.run_budget != generated.run_budget
-        || loaded.plan_metadata.generated_follow_up != Some(generated.generated_follow_up.clone())
-        || !loaded.plan_metadata.spec_fragment_ids.is_empty()
-    {
+    if !loaded_generated_plan_matches(&loaded, generated)? {
         return Ok(None);
     }
     Ok(Some(loaded))
+}
+
+fn loaded_generated_plan_matches(
+    loaded: &LoadedSupervisorPlan,
+    generated: &GeneratedFollowUpSupervisorPlan,
+) -> Result<bool> {
+    let encoded = serde_json::to_string(generated)
+        .context("failed to encode the immutable queued generated follow-up plan")?;
+    let expected = parse_supervisor_plan_with_consultant(&encoded)
+        .context("immutable queued generated follow-up plan no longer parses")?;
+    Ok(loaded == &expected)
 }
 
 #[cfg(test)]
@@ -738,6 +874,23 @@ fn interrupt_after_follow_up_enqueue() -> Result<()> {
         bail!("injected interruption after durable generated follow-up enqueue");
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static INTERRUPT_AFTER_FOLLOW_UP_DISPATCH_STARTED: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn set_interrupt_after_follow_up_dispatch_started() {
+    INTERRUPT_AFTER_FOLLOW_UP_DISPATCH_STARTED.with(|slot| slot.set(true));
+}
+
+#[cfg(test)]
+fn take_interrupt_after_follow_up_dispatch_started() -> bool {
+    INTERRUPT_AFTER_FOLLOW_UP_DISPATCH_STARTED.with(|slot| slot.replace(false))
 }
 
 #[cfg(test)]
