@@ -262,6 +262,14 @@ pub struct SupervisorRunOptions {
     pub machine_global_retention: Option<crate::machine_global::MachineGlobalRetentionBinding>,
 }
 
+/// Captures the exact Verified-runtime whole-primary integrity digest used by
+/// supervisor dispatch gates. Callers may compare two observations; the digest
+/// itself is not a configured execution claim.
+pub(crate) fn verified_whole_primary_snapshot_sha256(repo: &Path) -> Result<String> {
+    let repo = discover_repo_root(repo)?;
+    primary_worktree_snapshot_sha256(&repo, SupervisorExecutionRuntime::Verified)
+}
+
 #[derive(Debug, Clone)]
 pub struct SupervisorEvidenceOnlyReauditOptions {
     pub repo: PathBuf,

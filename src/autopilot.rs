@@ -1164,12 +1164,15 @@ fn run_autopilot_with_profile_and_retention(
     };
     #[cfg(test)]
     run_before_supervisor_cascade_load_hook(&supervisor_options.plan_file);
+    let command_primary_baseline = supervise::verified_whole_primary_snapshot_sha256(&repo)?;
     let supervisor_result = supervise::run_supervisor_plan_file_cascade_for_autopilot(
         supervisor_options,
         cascade_concurrency_policy,
         &options.run_id,
         &mut follow_up_profile_gate,
     );
+    let command_primary_final = supervise::verified_whole_primary_snapshot_sha256(&repo)?;
+    let command_primary_worktree_untouched = command_primary_final == command_primary_baseline;
     drop(follow_up_profile_gate);
     if let Some(refusal) = follow_up_profile_refusal.take() {
         profile_binding = refusal;
@@ -1221,7 +1224,7 @@ fn run_autopilot_with_profile_and_retention(
                 },
                 supervisor: None,
                 gate_denials: Vec::new(),
-                primary_worktree_untouched: false,
+                primary_worktree_untouched: command_primary_worktree_untouched,
                 next_action: if profile_refused_before_source_dispatch {
                     "correct the requested/effective profile mismatch; no supervisor, publication, merge, or follow-up dispatch was attempted"
                 } else {
@@ -1237,7 +1240,6 @@ fn run_autopilot_with_profile_and_retention(
     };
     let generated_follow_up_dispatch_performed = cascade.generated_follow_up_dispatch_performed();
     let follow_up_cascade_success = cascade.follow_up_cascade_success;
-    let follow_up_primary_worktree_untouched = cascade.follow_up_primary_worktree_untouched;
     let follow_up_gate_denials = cascade.follow_up_gate_denials.clone();
     write_private_json(
         &mut artifact_writer,
@@ -1268,10 +1270,9 @@ fn run_autopilot_with_profile_and_retention(
     };
     let mut gate_denials = supervisor.gate_denials.clone();
     gate_denials.extend(follow_up_gate_denials);
-    // This top-level execution fact is true only when the cascade observed an
-    // exact final whole-primary snapshot equal to its baseline. Source-only
-    // outcomes carry no round-two observation and therefore remain false.
-    let primary_worktree_untouched = follow_up_primary_worktree_untouched.unwrap_or(false);
+    // This is the observed whole-command interval: immediately before the
+    // exact source-plan dispatch through completion of the bounded cascade.
+    let primary_worktree_untouched = command_primary_worktree_untouched;
     let next_action = if execution_profile_mismatch {
         "inspect the typed requested/observed profile mismatch; autopilot performed no publication, merge, or follow-up dispatch"
     } else if !follow_up_cascade_success {
