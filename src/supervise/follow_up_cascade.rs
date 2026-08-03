@@ -33,11 +33,27 @@ pub(crate) enum GeneratedFollowUpDispatchEvidence {
     DurableDispatchStart { observation: RoleUsageObservation },
 }
 
+/// Opaque proof that a finalized subordinate report was authenticated and its
+/// normalized plan exactly matched one immutable queued follow-up item.
+///
+/// Only this module can construct the proof. The queue consumes it while
+/// applying the private observation and acknowledgement reducers.
+pub(crate) struct AuthenticatedGeneratedFollowUpTerminal {
+    queue_instance_id: String,
+    item_id: String,
+    observation: GeneratedFollowUpDispatchObservation,
+}
+
+impl AuthenticatedGeneratedFollowUpTerminal {
+    pub(crate) fn into_parts(self) -> (String, String, GeneratedFollowUpDispatchObservation) {
+        (self.queue_instance_id, self.item_id, self.observation)
+    }
+}
+
 enum FollowUpPreparation {
     Ready {
         plan_file: tempfile::NamedTempFile,
         loaded: Box<LoadedSupervisorPlan>,
-        queued_plan: Box<GeneratedFollowUpSupervisorPlan>,
     },
     Refused(GateDenial),
     EnvironmentFailed(EnvironmentFailure),
@@ -302,15 +318,10 @@ pub(super) fn run_generated_follow_up_cascade(
             Ok(FollowUpPreparation::Ready {
                 plan_file,
                 loaded: Box::new(reloaded),
-                queued_plan: Box::new(task.supervisor_plan),
             })
         })();
-        let (mut plan_file, reloaded, queued_plan) = match preparation {
-            Ok(FollowUpPreparation::Ready {
-                plan_file,
-                loaded,
-                queued_plan,
-            }) => (plan_file, *loaded, *queued_plan),
+        let (mut plan_file, reloaded) = match preparation {
+            Ok(FollowUpPreparation::Ready { plan_file, loaded }) => (plan_file, *loaded),
             Ok(FollowUpPreparation::Refused(denial)) => {
                 queue.release_before_dispatch(&item_id, Some(denial.clone()), Vec::new())?;
                 cascade_gate_denials.push(denial);
@@ -390,7 +401,6 @@ pub(super) fn run_generated_follow_up_cascade(
                     &mut queue,
                     &item_id,
                     &subordinate_run_id,
-                    &queued_plan,
                     &report,
                 )? {
                     FinalizedTerminalTransition::Acknowledged { child_started } => child_started,
@@ -430,7 +440,6 @@ pub(super) fn run_generated_follow_up_cascade(
                         &mut queue,
                         &item_id,
                         &subordinate_run_id,
-                        &queued_plan,
                         &report,
                     )? {
                         FinalizedTerminalTransition::Acknowledged { child_started } => {
@@ -705,11 +714,10 @@ fn reconcile_started_items(
                 item.phase(),
                 item.subordinate_run_id().map(str::to_string),
                 item.last_gate_denial().cloned(),
-                item.task().clone(),
             )
         })
         .collect::<Vec<_>>();
-    for (item_id, phase, subordinate_run_id, prior_gate_denial, queued_task) in items {
+    for (item_id, phase, subordinate_run_id, prior_gate_denial) in items {
         match phase {
             GeneratedFollowUpQueuePhase::DispatchStarted => {
                 let run_id = RunId::new(
@@ -719,23 +727,18 @@ fn reconcile_started_items(
                 )?;
                 match subordinate_reconciliation(repo, &run_id)? {
                     SubordinateReconciliation::Finalized(report) => {
-                        let child_started = match observe_and_acknowledge(
-                            repo,
-                            queue,
-                            &item_id,
-                            &run_id,
-                            &queued_task.supervisor_plan,
-                            &report,
-                        )? {
-                            FinalizedTerminalTransition::Acknowledged { child_started } => {
-                                child_started
-                            }
-                            FinalizedTerminalTransition::PlanMismatch(denial) => {
-                                cascade_gate_denials.push(denial);
-                                *cascade_success = false;
-                                continue;
-                            }
-                        };
+                        let child_started =
+                            match observe_and_acknowledge(repo, queue, &item_id, &run_id, &report)?
+                            {
+                                FinalizedTerminalTransition::Acknowledged { child_started } => {
+                                    child_started
+                                }
+                                FinalizedTerminalTransition::PlanMismatch(denial) => {
+                                    cascade_gate_denials.push(denial);
+                                    *cascade_success = false;
+                                    continue;
+                                }
+                            };
                         if child_started {
                             *authenticated_dispatches =
                                 authenticated_dispatches.checked_add(1).context(
@@ -788,23 +791,17 @@ fn reconcile_started_items(
                         .context("observed generated follow-up has no subordinate run id")?,
                 )?;
                 if let Some(report) = conclusive_finalized_report(repo, &run_id)? {
-                    let child_started = match observe_and_acknowledge(
-                        repo,
-                        queue,
-                        &item_id,
-                        &run_id,
-                        &queued_task.supervisor_plan,
-                        &report,
-                    )? {
-                        FinalizedTerminalTransition::Acknowledged { child_started } => {
-                            child_started
-                        }
-                        FinalizedTerminalTransition::PlanMismatch(denial) => {
-                            cascade_gate_denials.push(denial);
-                            *cascade_success = false;
-                            continue;
-                        }
-                    };
+                    let child_started =
+                        match observe_and_acknowledge(repo, queue, &item_id, &run_id, &report)? {
+                            FinalizedTerminalTransition::Acknowledged { child_started } => {
+                                child_started
+                            }
+                            FinalizedTerminalTransition::PlanMismatch(denial) => {
+                                cascade_gate_denials.push(denial);
+                                *cascade_success = false;
+                                continue;
+                            }
+                        };
                     if child_started {
                         *authenticated_dispatches = authenticated_dispatches
                             .checked_add(1)
@@ -841,23 +838,18 @@ fn reconcile_started_items(
                 )?;
                 match subordinate_reconciliation(repo, &run_id)? {
                     SubordinateReconciliation::Finalized(report) => {
-                        let child_started = match observe_and_acknowledge(
-                            repo,
-                            queue,
-                            &item_id,
-                            &run_id,
-                            &queued_task.supervisor_plan,
-                            &report,
-                        )? {
-                            FinalizedTerminalTransition::Acknowledged { child_started } => {
-                                child_started
-                            }
-                            FinalizedTerminalTransition::PlanMismatch(denial) => {
-                                cascade_gate_denials.push(denial);
-                                *cascade_success = false;
-                                continue;
-                            }
-                        };
+                        let child_started =
+                            match observe_and_acknowledge(repo, queue, &item_id, &run_id, &report)?
+                            {
+                                FinalizedTerminalTransition::Acknowledged { child_started } => {
+                                    child_started
+                                }
+                                FinalizedTerminalTransition::PlanMismatch(denial) => {
+                                    cascade_gate_denials.push(denial);
+                                    *cascade_success = false;
+                                    continue;
+                                }
+                            };
                         if child_started {
                             *authenticated_dispatches =
                                 authenticated_dispatches.checked_add(1).context(
@@ -902,12 +894,14 @@ fn reconcile_started_items(
                         .context("acknowledged generated follow-up has no subordinate run id")?,
                 )?;
                 if let Some(report) = conclusive_finalized_report(repo, &run_id)? {
-                    if !authenticated_subordinate_plan_matches(
-                        repo,
-                        &run_id,
-                        &queued_task.supervisor_plan,
-                        &report,
-                    )? {
+                    let queued_plan = &queue
+                        .snapshot()
+                        .item(&item_id)
+                        .context("acknowledged generated follow-up item disappeared")?
+                        .task()
+                        .supervisor_plan;
+                    if !authenticated_subordinate_plan_matches(repo, &run_id, queued_plan, &report)?
+                    {
                         cascade_gate_denials.push(permission_expansion_denial(&item_id)?);
                         *cascade_success = false;
                         continue;
@@ -990,15 +984,15 @@ fn observe_and_acknowledge(
     queue: &mut GeneratedFollowUpQueue,
     item_id: &str,
     run_id: &RunId,
-    queued_plan: &GeneratedFollowUpSupervisorPlan,
     report: &SupervisorFinalReport,
 ) -> Result<FinalizedTerminalTransition> {
-    let phase = queue
+    let item = queue
         .snapshot()
         .item(item_id)
-        .context("finalized generated follow-up item disappeared")?
-        .phase();
-    if !authenticated_subordinate_plan_matches(repo, run_id, queued_plan, report)? {
+        .context("finalized generated follow-up item disappeared")?;
+    let phase = item.phase();
+    if !authenticated_subordinate_plan_matches(repo, run_id, &item.task().supervisor_plan, report)?
+    {
         let denial = permission_expansion_denial(item_id)?;
         if phase == GeneratedFollowUpQueuePhase::DispatchStarted {
             queue.mark_held_ambiguous(item_id, Some(denial.clone()), Vec::new())?;
@@ -1006,21 +1000,18 @@ fn observe_and_acknowledge(
         return Ok(FinalizedTerminalTransition::PlanMismatch(denial));
     }
     let child_started = authenticated_child_dispatch_started(repo, run_id)?;
-    if matches!(
-        phase,
-        GeneratedFollowUpQueuePhase::DispatchStarted | GeneratedFollowUpQueuePhase::HeldAmbiguous
-    ) {
-        let observation = GeneratedFollowUpDispatchObservation::new(
-            run_id.as_str(),
-            report.gate_denials.first().cloned(),
-            report.environment_failures.clone(),
-            Some(ExternalSideEffectState::Completed),
-        )?;
-        queue.mark_dispatch_observed(item_id, observation)?;
-    } else if phase != GeneratedFollowUpQueuePhase::DispatchObserved {
-        bail!("generated follow-up terminal transition began from a non-observable queue phase");
-    }
-    queue.acknowledge_terminal(item_id)?;
+    let observation = GeneratedFollowUpDispatchObservation::new(
+        run_id.as_str(),
+        report.gate_denials.first().cloned(),
+        report.environment_failures.clone(),
+        Some(ExternalSideEffectState::Completed),
+    )?;
+    let authenticated = AuthenticatedGeneratedFollowUpTerminal {
+        queue_instance_id: queue.snapshot().queue_instance_id().to_string(),
+        item_id: item_id.to_string(),
+        observation,
+    };
+    queue.apply_authenticated_terminal(authenticated)?;
     Ok(FinalizedTerminalTransition::Acknowledged { child_started })
 }
 

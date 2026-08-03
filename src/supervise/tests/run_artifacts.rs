@@ -828,6 +828,50 @@ fn authenticated_child_dispatch_evidence_accepts_structurally_valid_checkpoint()
 }
 
 #[test]
+fn authenticated_child_dispatch_evidence_refuses_dispatch_after_assignment_completion() {
+    let (_temp, repo) = injected_repository();
+    let run_id = RunId::new("authenticated-dispatch-evidence-after-completion")
+        .expect("completed assignment dispatch evidence run id");
+    let (writer, mut checkpoint, assignment, ledger) =
+        prepared_dispatch_evidence_checkpoint(&repo, &run_id);
+    checkpoint
+        .assignment_started(
+            &assignment,
+            0,
+            Some(
+                writer
+                    .resume_binding()
+                    .expect("completed assignment start binding"),
+            ),
+            ledger.report().expect("completed assignment start budget"),
+        )
+        .expect("record completed assignment start");
+    checkpoint
+        .assignment_completed(
+            &assignment,
+            0,
+            Some(
+                writer
+                    .resume_binding()
+                    .expect("completed assignment binding"),
+            ),
+            ledger.report().expect("completed assignment budget"),
+            None,
+            Vec::new(),
+        )
+        .expect("record assignment completion");
+    checkpoint
+        .dispatch_started(false, &assignment.id, 1)
+        .expect("record late child dispatch start");
+    drop(checkpoint);
+    drop(writer);
+
+    let error = authenticated_child_dispatch_started(&repo, &run_id)
+        .expect_err("child dispatch after assignment completion must be refused");
+    assert!(format!("{error:#}").contains("after assignment completion"));
+}
+
+#[test]
 fn authenticated_child_dispatch_evidence_refuses_structurally_invalid_checkpoint() {
     let (_temp, repo) = injected_repository();
     let run_id = RunId::new("authenticated-dispatch-evidence-invalid")
@@ -852,6 +896,58 @@ fn authenticated_child_dispatch_evidence_refuses_structurally_invalid_checkpoint
     let error = authenticated_child_dispatch_started(&repo, &run_id)
         .expect_err("authenticated malformed checkpoint must not become dispatch evidence");
     assert!(format!("{error:#}").contains("transition has no subject"));
+}
+
+#[test]
+fn authenticated_child_dispatch_evidence_rejects_unknown_assignment_without_start() {
+    let (_temp, repo) = injected_repository();
+    let run_id = RunId::new("authenticated-dispatch-evidence-unknown-assignment")
+        .expect("unknown assignment dispatch evidence run id");
+    let (writer, checkpoint, _assignment, _ledger) =
+        prepared_dispatch_evidence_checkpoint(&repo, &run_id);
+    drop(checkpoint);
+    let authenticator = repository_authenticator_key_only(&repo).expect("repository authenticator");
+    let mut journal =
+        crate::state_journal::StateJournal::open_instance(authenticator, run_id.as_str())
+            .expect("open dispatch evidence journal");
+    journal
+        .append(
+            "child_dispatch_started",
+            Some("unknown-assignment"),
+            &serde_json::json!({"version": 1, "attempt": 1}),
+        )
+        .expect("append authenticated child dispatch without assignment start");
+    drop(journal);
+    drop(writer);
+
+    assert!(!authenticated_child_dispatch_started(&repo, &run_id)
+        .expect("unknown assignment must not become child dispatch evidence"));
+}
+
+#[test]
+fn authenticated_child_dispatch_evidence_rejects_pending_assignment_without_start() {
+    let (_temp, repo) = injected_repository();
+    let run_id = RunId::new("authenticated-dispatch-evidence-pending-assignment")
+        .expect("pending assignment dispatch evidence run id");
+    let (writer, checkpoint, assignment, _ledger) =
+        prepared_dispatch_evidence_checkpoint(&repo, &run_id);
+    drop(checkpoint);
+    let authenticator = repository_authenticator_key_only(&repo).expect("repository authenticator");
+    let mut journal =
+        crate::state_journal::StateJournal::open_instance(authenticator, run_id.as_str())
+            .expect("open dispatch evidence journal");
+    journal
+        .append(
+            "child_dispatch_started",
+            Some(&assignment.id),
+            &serde_json::json!({"version": 1, "attempt": 1}),
+        )
+        .expect("append authenticated child dispatch for pending assignment");
+    drop(journal);
+    drop(writer);
+
+    assert!(!authenticated_child_dispatch_started(&repo, &run_id)
+        .expect("pending assignment must not become child dispatch evidence"));
 }
 
 #[cfg(target_os = "linux")]

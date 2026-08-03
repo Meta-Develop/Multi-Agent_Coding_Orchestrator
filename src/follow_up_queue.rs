@@ -16,9 +16,9 @@ use crate::{
     safe_state::FileIdentity,
     state_journal::{AuthenticatedStateJournal, JournalRecord, JournalSpec},
     supervise::{
-        validate_generated_follow_up_plan_document, GeneratedFollowUpDispatchStatus,
-        GeneratedFollowUpTaskRecord, SupervisorPlan, LICENSED_BREAKAGE_CASCADE_DEPTH,
-        MAX_LICENSED_BREAKAGE_DEPENDENTS,
+        validate_generated_follow_up_plan_document, AuthenticatedGeneratedFollowUpTerminal,
+        GeneratedFollowUpDispatchStatus, GeneratedFollowUpTaskRecord, SupervisorPlan,
+        LICENSED_BREAKAGE_CASCADE_DEPTH, MAX_LICENSED_BREAKAGE_DEPENDENTS,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -1043,7 +1043,7 @@ impl GeneratedFollowUpQueue {
         })
     }
 
-    pub(crate) fn mark_dispatch_observed(
+    fn mark_dispatch_observed(
         &mut self,
         item_id: &str,
         observation: GeneratedFollowUpDispatchObservation,
@@ -1062,10 +1062,7 @@ impl GeneratedFollowUpQueue {
         })
     }
 
-    pub(crate) fn acknowledge_terminal(
-        &mut self,
-        item_id: &str,
-    ) -> Result<GeneratedFollowUpQueueEventData> {
+    fn acknowledge_terminal(&mut self, item_id: &str) -> Result<GeneratedFollowUpQueueEventData> {
         let subordinate_run_id = self
             .snapshot
             .item(item_id)
@@ -1076,6 +1073,49 @@ impl GeneratedFollowUpQueue {
             item_id: item_id.to_string(),
             subordinate_run_id,
         })
+    }
+
+    /// Applies the observation and acknowledgement reducers only when the
+    /// cascade has authenticated the finalized report and matched its exact
+    /// normalized plan to this immutable queued item. The capability is
+    /// non-cloneable, consumed here, and bound to both the queue instance and
+    /// item so it cannot authorize a sibling transition.
+    pub(crate) fn apply_authenticated_terminal(
+        &mut self,
+        authenticated: AuthenticatedGeneratedFollowUpTerminal,
+    ) -> Result<Vec<GeneratedFollowUpQueueEventData>> {
+        let (queue_instance_id, item_id, observation) = authenticated.into_parts();
+        if queue_instance_id != self.snapshot.queue_instance_id {
+            bail!("authenticated generated follow-up terminal belongs to a different queue");
+        }
+        let phase = self
+            .snapshot
+            .item(&item_id)
+            .context("authenticated generated follow-up item disappeared")?
+            .phase();
+        let mut events = Vec::with_capacity(2);
+        if matches!(
+            phase,
+            GeneratedFollowUpQueuePhase::DispatchStarted
+                | GeneratedFollowUpQueuePhase::HeldAmbiguous
+        ) {
+            events.push(self.mark_dispatch_observed(&item_id, observation)?);
+        } else if phase == GeneratedFollowUpQueuePhase::DispatchObserved {
+            let existing = self
+                .snapshot
+                .item(&item_id)
+                .and_then(GeneratedFollowUpQueueItemSnapshot::observation)
+                .context("observed generated follow-up has no durable observation")?;
+            if existing != &observation {
+                bail!("authenticated generated follow-up terminal differs from its durable observation");
+            }
+        } else {
+            bail!(
+                "generated follow-up authenticated terminal transition began from a non-observable queue phase"
+            );
+        }
+        events.push(self.acknowledge_terminal(&item_id)?);
+        Ok(events)
     }
 
     pub(crate) fn mark_held_ambiguous(

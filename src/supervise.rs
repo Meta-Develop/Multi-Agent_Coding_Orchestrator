@@ -112,7 +112,8 @@ pub(crate) use follow_up_cascade::{
 };
 pub(crate) use follow_up_cascade::{
     generated_follow_up_dispatch_evidence_after_cascade_error,
-    normalized_supervisor_plan_file_sha256, GeneratedFollowUpDispatchEvidence,
+    normalized_supervisor_plan_file_sha256, AuthenticatedGeneratedFollowUpTerminal,
+    GeneratedFollowUpDispatchEvidence,
 };
 
 mod repository;
