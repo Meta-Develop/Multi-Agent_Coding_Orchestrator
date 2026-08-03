@@ -369,7 +369,7 @@ fn fake_autopilot_run_reports_configured_but_execution_incomparable_profile() ->
     ])?;
 
     assert_eq!(report["status"], "succeeded");
-    assert_eq!(report["profile_binding"]["version"], 2);
+    assert_eq!(report["profile_binding"]["version"], 3);
     assert_eq!(report["profile_binding"]["status"], "incomparable");
     assert_eq!(report["profile_binding"]["configuration_status"], "matched");
     assert!(report["profile_binding"].get("failure").is_none());
@@ -411,6 +411,16 @@ fn fake_autopilot_run_reports_configured_but_execution_incomparable_profile() ->
         "not_process_observable"
     );
     assert_eq!(
+        report["profile_binding"]["execution"]["review_lenses"][0]["dispatch_count"],
+        1
+    );
+    assert!(report["profile_binding"]["execution"]["review_lenses"][0]
+        .get("observed_backend_id")
+        .is_none());
+    assert!(report["profile_binding"]["execution"]["review_lenses"][0]
+        .get("observed_model")
+        .is_none());
+    assert_eq!(
         report["supervisor"]["role_economics_profile"]["overridden_roles"],
         serde_json::json!(["worker"])
     );
@@ -442,6 +452,32 @@ fn fake_autopilot_run_reports_configured_but_execution_incomparable_profile() ->
         supervisor_plan["review_aggregation_policy"],
         report["profile_binding"]["requested"]["review_aggregation_policy"]
     );
+
+    let alternate_profile = fs::read_to_string(&profile_path)?
+        .replace("profile-provider", "alternate-profile-provider");
+    write_file(&profile_path, &alternate_profile)?;
+    let alternate = run_success_json(&[
+        "autopilot",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--profile",
+        path_str(&profile_path)?,
+        "--run-id",
+        "alternate-profile-bound",
+        "--json",
+    ])?;
+    assert_ne!(
+        report["profile_binding"]["requested"]["review_lenses"][0]["backend"]["backend_id"],
+        alternate["profile_binding"]["requested"]["review_lenses"][0]["backend"]["backend_id"]
+    );
+    for profile_report in [&report, &alternate] {
+        let lens = &profile_report["profile_binding"]["execution"]["review_lenses"][0];
+        assert_eq!(lens["status"], "incomparable");
+        assert_ne!(lens["status"], "matched");
+        assert!(lens.get("observed_backend_id").is_none());
+    }
 
     Ok(())
 }
