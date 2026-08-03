@@ -312,6 +312,11 @@ pub struct AutopilotRoleModelExecutionBinding {
 }
 
 /// Dispatch-observed model evidence for one configured review lens.
+///
+/// A `Mismatch` status is a defensive invariant-violation signal. Normal autopilot execution
+/// first requires requested/effective lens equality, then derives the dispatched selection from
+/// that effective lens. Fake or incomplete observations are `Incomparable`; a review-lens
+/// mismatch means that the upstream binding or dispatch-construction invariant was bypassed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AutopilotReviewLensExecutionBinding {
     pub lens_id: String,
@@ -3034,18 +3039,6 @@ fn review_lens_execution_binding(
     let observed_reasoning_effort = unique_dispatch_value(dispatches, |selection| {
         selection.reasoning_effort.as_deref()
     });
-    let observed_mismatch = dispatches.iter().any(|selection| {
-        selection
-            .backend_id
-            .as_deref()
-            .is_some_and(|backend_id| backend_id != requested_backend_id)
-            || selection
-                .model
-                .as_deref()
-                .is_some_and(|model| model != requested_model)
-            || selection.reasoning_effort.as_deref() != requested_reasoning_effort.as_deref()
-                && selection.reasoning_effort.is_some()
-    });
     let selection_is_complete = !dispatches.is_empty()
         && dispatches.iter().all(|selection| {
             selection.backend_id.is_some()
@@ -3053,14 +3046,18 @@ fn review_lens_execution_binding(
                 && (requested_reasoning_effort.is_none() || selection.reasoning_effort.is_some())
                 && selection.unavailable_reason.is_none()
         });
-    let status = if !usage_is_process_observed {
+    let status = if !usage_is_process_observed || !selection_is_complete {
         AutopilotProfileBindingStatus::Incomparable
-    } else if observed_mismatch {
+    } else if dispatches.iter().any(|selection| {
+        selection.backend_id.as_deref() != Some(requested_backend_id.as_str())
+            || selection.model.as_deref() != Some(requested_model.as_str())
+            || selection.reasoning_effort.as_deref() != requested_reasoning_effort.as_deref()
+    }) {
+        // Defensive only: requested/effective lens equality is checked before dispatch, and the
+        // production command is built from that equality-gated effective lens.
         AutopilotProfileBindingStatus::Mismatch
-    } else if selection_is_complete {
-        AutopilotProfileBindingStatus::Matched
     } else {
-        AutopilotProfileBindingStatus::Incomparable
+        AutopilotProfileBindingStatus::Matched
     };
     AutopilotReviewLensExecutionBinding {
         lens_id: requested.id.clone(),
@@ -4149,6 +4146,37 @@ mod tests {
         assert!(!binding.permits_dispatch());
     }
 
+    #[test]
+    fn requested_effective_lens_mismatch_blocks_before_dispatch() {
+        let plan = supervisor_profile_test_plan();
+        let requested = nondefault_test_profile();
+        let mut effective = supervisor_plan_for_attempt(&plan, &requested, "agent-a", 1, &[]);
+        let ReviewLensBackendConfig::Model { backend_id, .. } =
+            &mut effective.review_lenses[0].backend
+        else {
+            panic!("test profile lens must be model-backed");
+        };
+        *backend_id = "different-effective-provider".to_string();
+
+        let binding = AutopilotProfileBindingReport::from_effective(requested, &effective);
+
+        assert_eq!(binding.status, AutopilotProfileBindingStatus::Mismatch);
+        assert_eq!(
+            binding.configuration_status,
+            AutopilotProfileBindingStatus::Mismatch
+        );
+        assert_eq!(
+            binding.failure,
+            Some(AutopilotProfileBindingFailure {
+                kind: AutopilotProfileBindingFailureKind::RequestedEffectiveMismatch,
+                mismatched_fields: vec![AutopilotProfileBindingField::ReviewLenses],
+                mismatched_roles: Vec::new(),
+                mismatched_review_lens_ids: Vec::new(),
+            })
+        );
+        assert!(!binding.permits_dispatch());
+    }
+
     fn process_observed_role_usage(models: Vec<&str>) -> RoleUsageReport {
         RoleUsageReport {
             models: models.into_iter().map(str::to_string).collect(),
@@ -4179,7 +4207,7 @@ mod tests {
         }
     }
 
-    fn process_observed_lens_dispatch(
+    fn synthetic_lens_dispatch_evidence(
         backend_id: Option<&str>,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
@@ -4252,7 +4280,7 @@ mod tests {
             "profile-review-model",
         )];
 
-        let lens_dispatch = process_observed_lens_dispatch(
+        let lens_dispatch = synthetic_lens_dispatch_evidence(
             Some("profile-provider"),
             Some("profile-review-model"),
             None,
@@ -4300,7 +4328,7 @@ mod tests {
             "profile-review-model",
         )];
 
-        let lens_dispatch = process_observed_lens_dispatch(
+        let lens_dispatch = synthetic_lens_dispatch_evidence(
             Some("profile-provider"),
             Some("profile-review-model"),
             Some("high"),
@@ -4324,7 +4352,7 @@ mod tests {
     }
 
     #[test]
-    fn production_dispatch_argv_with_different_lens_backend_is_typed_mismatch() {
+    fn synthetic_complete_lens_dispatch_mismatch_is_a_defensive_signal() {
         let plan = supervisor_profile_test_plan();
         let mut requested = nondefault_test_profile();
         requested.role_models.clear();
@@ -4335,8 +4363,8 @@ mod tests {
             &requested.review_lenses[0],
             "profile-review-model",
         )];
-        let lens_dispatch = process_observed_lens_dispatch(
-            Some("different-production-provider"),
+        let lens_dispatch = synthetic_lens_dispatch_evidence(
+            Some("different-synthetic-provider"),
             Some("profile-review-model"),
             Some("high"),
         );
@@ -4356,7 +4384,7 @@ mod tests {
         let observed = &binding.execution.as_ref().expect("execution").review_lenses[0];
         assert_eq!(
             observed.observed_backend_id.as_deref(),
-            Some("different-production-provider")
+            Some("different-synthetic-provider")
         );
         assert_eq!(
             observed.observed_model.as_deref(),
@@ -4364,6 +4392,72 @@ mod tests {
         );
         assert_eq!(observed.observed_reasoning_effort.as_deref(), Some("high"));
         assert_eq!(observed.dispatch_count, 1);
+    }
+
+    #[test]
+    fn incomplete_lens_dispatch_with_different_backend_is_incomparable() {
+        let plan = supervisor_profile_test_plan();
+        let mut requested = nondefault_test_profile();
+        requested.role_models.clear();
+        let effective = supervisor_plan_for_attempt(&plan, &requested, "agent-a", 1, &[]);
+        let mut binding =
+            AutopilotProfileBindingReport::from_effective(requested.clone(), &effective);
+        let lens_usage = vec![process_observed_lens_usage(
+            &requested.review_lenses[0],
+            "profile-review-model",
+        )];
+        let lens_dispatch = synthetic_lens_dispatch_evidence(
+            Some("different-synthetic-provider"),
+            None,
+            Some("high"),
+        );
+
+        binding.observe_execution_reports(&BTreeMap::new(), &lens_usage, &lens_dispatch);
+
+        assert_eq!(binding.status, AutopilotProfileBindingStatus::Incomparable);
+        assert!(binding.failure.is_none());
+        let observed = &binding.execution.as_ref().expect("execution").review_lenses[0];
+        assert_eq!(observed.status, AutopilotProfileBindingStatus::Incomparable);
+        assert_eq!(
+            observed.observed_backend_id.as_deref(),
+            Some("different-synthetic-provider")
+        );
+        assert!(observed.observed_model.is_none());
+        assert_eq!(
+            observed.observation,
+            RoleUsageObservation::NotProcessObservable
+        );
+    }
+
+    #[test]
+    fn complete_lens_dispatch_without_usage_is_incomparable() {
+        let plan = supervisor_profile_test_plan();
+        let mut requested = nondefault_test_profile();
+        requested.role_models.clear();
+        let effective = supervisor_plan_for_attempt(&plan, &requested, "agent-a", 1, &[]);
+        let mut binding =
+            AutopilotProfileBindingReport::from_effective(requested.clone(), &effective);
+        let lens_dispatch = synthetic_lens_dispatch_evidence(
+            Some("profile-provider"),
+            Some("profile-review-model"),
+            Some("high"),
+        );
+
+        binding.observe_execution_reports(&BTreeMap::new(), &[], &lens_dispatch);
+
+        assert_eq!(binding.status, AutopilotProfileBindingStatus::Incomparable);
+        assert!(binding.failure.is_none());
+        let observed = &binding.execution.as_ref().expect("execution").review_lenses[0];
+        assert_eq!(observed.status, AutopilotProfileBindingStatus::Incomparable);
+        assert_eq!(observed.dispatch_count, 1);
+        assert_eq!(
+            observed.observation,
+            RoleUsageObservation::NotProcessObservable
+        );
+        assert!(observed
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("not_process_observable")));
     }
 
     #[test]
@@ -4378,7 +4472,7 @@ mod tests {
             &requested.review_lenses[0],
             "profile-review-model",
         )];
-        let lens_dispatch = process_observed_lens_dispatch(None, None, None);
+        let lens_dispatch = synthetic_lens_dispatch_evidence(None, None, None);
 
         binding.observe_execution_reports(&BTreeMap::new(), &lens_usage, &lens_dispatch);
 
@@ -4424,7 +4518,7 @@ mod tests {
             unavailable_reason: Some("fake lens usage is not process observable".to_string()),
         }];
 
-        let lens_dispatch = process_observed_lens_dispatch(None, None, None);
+        let lens_dispatch = synthetic_lens_dispatch_evidence(None, None, None);
         binding.observe_execution_reports(&role_usage, &lens_usage, &lens_dispatch);
 
         assert_eq!(binding.status, AutopilotProfileBindingStatus::Incomparable);
@@ -4466,7 +4560,7 @@ mod tests {
             "profile-review-model",
         )];
 
-        let lens_dispatch = process_observed_lens_dispatch(
+        let lens_dispatch = synthetic_lens_dispatch_evidence(
             Some("profile-provider"),
             Some("profile-review-model"),
             Some("high"),
@@ -4513,7 +4607,7 @@ mod tests {
             "profile-review-model",
         )];
 
-        let lens_dispatch = process_observed_lens_dispatch(
+        let lens_dispatch = synthetic_lens_dispatch_evidence(
             Some("profile-provider"),
             Some("profile-review-model"),
             None,
