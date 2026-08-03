@@ -221,3 +221,66 @@ Raw restored output:
 test supervise::tests::licensed_breakage::generated_follow_up_deleted_retention_is_journaled_probe_failed_and_retryable ... ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1279 filtered out; finished in 25.75s
+
+
+8. Finalized subordinate exact-plan transition guard
+-----------------------------------------------------
+Neuter: make the exact authenticated queued-plan comparison unreachable inside
+observe_and_acknowledge, allowing a pre-existing finalized same-ID subordinate
+with a different plan to be observed and terminal-acknowledged.
+
+Command:
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_TARGET_DIR=$PWD/.target-track-22-step2-r2 cargo test --lib immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan -- --nocapture
+
+Failing exit status: 101
+
+Raw failing output:
+thread 'supervise::tests::licensed_breakage::immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan' panicked at src/supervise/tests/licensed_breakage.rs:1928:5:
+assertion failed: !outcome.follow_up_cascade_success
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test supervise::tests::licensed_breakage::immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan ... FAILED
+
+failures:
+
+failures:
+    supervise::tests::licensed_breakage::immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1282 filtered out; finished in 51.59s
+
+error: test failed, to rerun pass `--lib`
+
+Raw restored output:
+test supervise::tests::licensed_breakage::immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1282 filtered out; finished in 50.29s
+
+
+9. Authenticated checkpoint semantic analyzer
+----------------------------------------------
+Neuter: remove analyze_checkpoint_records(records, run_id) before deriving
+child_dispatch_started evidence from the authenticated journal.
+
+Command:
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_TARGET_DIR=$PWD/.target-track-22-step2-r2 cargo test --lib authenticated_child_dispatch_evidence_refuses_structurally_invalid_checkpoint -- --nocapture
+
+Failing exit status: 101
+
+Raw failing output:
+thread 'supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_refuses_structurally_invalid_checkpoint' panicked at src/supervise/tests/run_artifacts.rs:853:10:
+authenticated malformed checkpoint must not become dispatch evidence: true
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_refuses_structurally_invalid_checkpoint ... FAILED
+
+failures:
+
+failures:
+    supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_refuses_structurally_invalid_checkpoint
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1282 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `--lib`
+
+Raw restored output:
+test supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_refuses_structurally_invalid_checkpoint ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1282 filtered out; finished in 0.05s
