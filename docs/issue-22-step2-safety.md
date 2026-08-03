@@ -12,9 +12,10 @@ or masquerade as source-journal evidence.
 The command permits exactly the source round plus one generated follow-up
 batch. Every generated plan carries the fixed cascade depth, and evidence that
 the generated batch produced another licensed follow-up is retained but cannot
-start a third round: it produces the established typed
-`approval_review`/`permission_expansion` refusal. The refusal is terminal queue
-evidence, not an invitation to dispatch outside the command.
+start a third round. The cascade outcome carries the established typed
+`approval_review`/`permission_expansion` refusal, while the subordinate queue
+item is terminal. The typed refusal is not misrepresented as a queue event or
+an invitation to dispatch outside the command.
 
 ## 2. What bounds the work per round when a round can generate more follow-ups than it consumes?
 
@@ -29,15 +30,22 @@ material only and is not an execution-budget concept.
 
 The durable lifecycle distinguishes a fully staged batch, a claimed item that
 has not started, a dispatch-start checkpoint, and a finalized subordinate run.
-A staged batch is completed idempotently; a pre-start claim can be released;
-and a finalized subordinate is authenticated and acknowledged without
-re-execution. An active or ambiguous started subordinate is held rather than
-silently returned to pending, while a typed gate refusal is recorded as a
-terminal outcome. Direct `supervise run` can resume the same command and run ID
-from its authenticated finalized source artifacts, so it does not rerun the
-source round. Autopilot outer-artifact interruption has no safe same-command
-resume because there is no authenticated outer resume binding, and this design
-does not claim one.
+A staged batch is completed idempotently. A pre-dispatch profile, primary, or
+retention refusal records its typed denial and releases the claimed item to
+`Enqueued`; an explicit invocation of the same run ID can retry it after the
+operator corrects the refused condition. After dispatch starts, an
+authenticated finalized subordinate outcome, including a subordinate gate
+refusal, is observed and terminal-acknowledged without re-execution. A newly
+observed failure stops sibling admission for that invocation; a later explicit
+invocation of the same run ID may continue remaining pending items but never
+reruns the acknowledged item. An authenticated `Active` subordinate remains
+`DispatchStarted`. Only an authenticated `Interrupted` or `Uncertain`
+subordinate becomes `HeldAmbiguous` and requires human reconciliation rather
+than silently returning to pending. Direct `supervise run` can resume the same
+command and run ID from its authenticated finalized source artifacts, so it
+does not rerun the source round. Autopilot outer-artifact interruption has no
+safe same-command resume because there is no authenticated outer resume
+binding, and this design does not claim one.
 
 ## 4. What stops a follow-up task from regenerating itself indefinitely?
 
