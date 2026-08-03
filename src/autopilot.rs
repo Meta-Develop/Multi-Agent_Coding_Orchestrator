@@ -4294,7 +4294,10 @@ mod tests {
         cell::{Cell, RefCell},
         fs::File,
         rc::Rc,
-        sync::{Mutex, MutexGuard, OnceLock},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex, MutexGuard, OnceLock,
+        },
     };
 
     // These fixtures each perform several bounded, strict-containment Git snapshots. Running them
@@ -5149,31 +5152,12 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn run_injected_licensed_autopilot_cascade(
-        temp_root: &Path,
-        repo: &Path,
-        run_name: &str,
-    ) -> (AutopilotFinalReport, usize) {
-        let outer_plan = temp_root.join(format!("{run_name}-autopilot.json"));
-        fs::write(
-            &outer_plan,
-            serde_json::to_vec_pretty(&json!({
-                "version": 1,
-                "task": {
-                    "title": "Licensed cascade",
-                    "body": "Dispatch one bounded generated dependent update."
-                },
-                "assigned_paths": ["README.md"],
-                "auto_merge": false
-            }))
-            .expect("serialize injected Autopilot outer plan"),
-        )
-        .expect("write injected Autopilot outer plan");
-        let (supervisor_plan, _declaration, declaration_sha256) =
-            licensed_autopilot_supervisor_plan();
-        let mut source_child_dispatches = 0_usize;
-        let mut follow_up_child_dispatches = 0_usize;
-        let mut runner = |command: &ExternalAgentCommand| {
+    fn injected_licensed_autopilot_runner(
+        declaration_sha256: String,
+        source_child_dispatches: Arc<AtomicUsize>,
+        follow_up_child_dispatches: Arc<AtomicUsize>,
+    ) -> impl FnMut(&ExternalAgentCommand) -> crate::external_agent::ExternalAgentRun + Send {
+        move |command: &ExternalAgentCommand| {
             let output_path = command.output_last_message.to_string_lossy();
             let is_follow_up = output_path.contains("child-a-licensed-update-01");
             let is_auditor = output_path.contains("review-auditor");
@@ -5196,8 +5180,10 @@ mod tests {
                     ),
                 );
             } else if is_follow_up {
-                follow_up_child_dispatches += 1;
-                assert_eq!(follow_up_child_dispatches, 1, "generated child reran");
+                let count = follow_up_child_dispatches
+                    .fetch_add(1, Ordering::SeqCst)
+                    .saturating_add(1);
+                assert_eq!(count, 1, "generated child reran");
                 fs::create_dir_all(command.cwd.join("src"))
                     .expect("create injected Autopilot dependent dir");
                 fs::write(
@@ -5216,8 +5202,10 @@ mod tests {
                     ),
                 );
             } else {
-                source_child_dispatches += 1;
-                assert_eq!(source_child_dispatches, 1, "Autopilot source child reran");
+                let count = source_child_dispatches
+                    .fetch_add(1, Ordering::SeqCst)
+                    .saturating_add(1);
+                assert_eq!(count, 1, "Autopilot source child reran");
                 fs::write(command.cwd.join("README.md"), "licensed source change\n")
                     .expect("write injected Autopilot source candidate");
                 supervise::write_injected_json(
@@ -5233,7 +5221,39 @@ mod tests {
             }
             supervise::write_injected_usage(command, 0, 1);
             supervise::injected_verified_run(command)
-        };
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_injected_licensed_autopilot_cascade(
+        temp_root: &Path,
+        repo: &Path,
+        run_name: &str,
+    ) -> (AutopilotFinalReport, usize) {
+        let outer_plan = temp_root.join(format!("{run_name}-autopilot.json"));
+        fs::write(
+            &outer_plan,
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "task": {
+                    "title": "Licensed cascade",
+                    "body": "Dispatch one bounded generated dependent update."
+                },
+                "assigned_paths": ["README.md"],
+                "auto_merge": false
+            }))
+            .expect("serialize injected Autopilot outer plan"),
+        )
+        .expect("write injected Autopilot outer plan");
+        let (supervisor_plan, _declaration, declaration_sha256) =
+            licensed_autopilot_supervisor_plan();
+        let source_child_dispatches = Arc::new(AtomicUsize::new(0));
+        let follow_up_child_dispatches = Arc::new(AtomicUsize::new(0));
+        let mut runner = injected_licensed_autopilot_runner(
+            declaration_sha256,
+            Arc::clone(&source_child_dispatches),
+            Arc::clone(&follow_up_child_dispatches),
+        );
         let report = run_autopilot_plan_file_with_injected_supervisor_and_runner(
             AutopilotRunOptions {
                 repo: repo.to_path_buf(),
@@ -5249,8 +5269,8 @@ mod tests {
             &mut runner,
         )
         .expect("run injected licensed Autopilot cascade");
-        assert_eq!(source_child_dispatches, 1);
-        (report, follow_up_child_dispatches)
+        assert_eq!(source_child_dispatches.load(Ordering::SeqCst), 1);
+        (report, follow_up_child_dispatches.load(Ordering::SeqCst))
     }
 
     #[cfg(target_os = "linux")]
@@ -5358,6 +5378,171 @@ mod tests {
         assert_eq!(queue.dispatch_started_count, 0);
         assert_eq!(queue.acknowledged_terminal_count, 0);
         assert_eq!(queue.authenticated_child_dispatch_started_count, 0);
+        assert!(!repo.join("src/client.rs").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interrupted_autopilot_queue_resumes_through_supervise_without_duplicate_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = create_committed_autopilot_repo(temp.path());
+        let run_name = "autopilot-cross-entrypoint-resume";
+        let outer_run_id = RunId::new(run_name).expect("cross-entrypoint Autopilot run id");
+        let supervisor_run_id =
+            RunId::new(format!("{run_name}-supervise")).expect("source supervisor run id");
+        let outer_plan = temp.path().join(format!("{run_name}-autopilot.json"));
+        fs::write(
+            &outer_plan,
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "task": {
+                    "title": "Cross-entrypoint licensed cascade",
+                    "body": "Resume the durable generated dependent through supervise run."
+                },
+                "assigned_paths": ["README.md"],
+                "auto_merge": false
+            }))
+            .expect("serialize cross-entrypoint Autopilot plan"),
+        )
+        .expect("write cross-entrypoint Autopilot plan");
+        let (supervisor_plan, _declaration, declaration_sha256) =
+            licensed_autopilot_supervisor_plan();
+        let retention = secure_autopilot_machine_global_retention(temp.path(), run_name);
+        let source_child_dispatches = Arc::new(AtomicUsize::new(0));
+        let follow_up_child_dispatches = Arc::new(AtomicUsize::new(0));
+        let mut runner = injected_licensed_autopilot_runner(
+            declaration_sha256,
+            Arc::clone(&source_child_dispatches),
+            Arc::clone(&follow_up_child_dispatches),
+        );
+        let observations = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&observations);
+        supervise::set_generated_follow_up_queue_observer(move |observation| {
+            observed.borrow_mut().push(observation);
+        });
+        let head_before = Repository::open(&repo)
+            .expect("open cross-entrypoint repository")
+            .head()
+            .expect("read cross-entrypoint HEAD")
+            .target()
+            .expect("cross-entrypoint HEAD oid");
+        let primary_before = supervise::verified_whole_primary_snapshot_sha256(&repo)
+            .expect("capture cross-entrypoint primary baseline");
+
+        supervise::set_interrupt_after_follow_up_enqueue();
+        let interrupted = run_autopilot_plan_file_with_injected_supervisor_and_runner(
+            AutopilotRunOptions {
+                repo: repo.clone(),
+                plan_file: outer_plan,
+                run_id: outer_run_id.clone(),
+                codex_bin: Some(PathBuf::from("unused-injected-codex")),
+                reviewer_command: None,
+                allow_dirty_primary: false,
+            },
+            None,
+            retention.clone(),
+            supervisor_plan,
+            &mut runner,
+        )
+        .expect("return failed Autopilot report after injected enqueue interruption");
+        assert_eq!(interrupted.status, AutopilotRunStatus::Failed);
+        assert!(!interrupted.generated_follow_up_dispatch_performed);
+        assert!(interrupted.primary_worktree_untouched);
+        assert!(!interrupted.auto_merge_performed);
+        assert_eq!(source_child_dispatches.load(Ordering::SeqCst), 1);
+        assert_eq!(follow_up_child_dispatches.load(Ordering::SeqCst), 0);
+        let interrupted_queue = observations
+            .borrow()
+            .iter()
+            .find(|observation| observation.label == "enqueued")
+            .cloned()
+            .expect("observe durable Autopilot-origin enqueue");
+        assert_eq!(interrupted_queue.outer_entrypoint, "autopilot_run");
+        assert_eq!(interrupted_queue.outer_command_run_id, run_name);
+        assert_eq!(interrupted_queue.item_ids.len(), 1);
+        assert!(interrupted_queue.subordinate_run_ids.is_empty());
+        assert_eq!(interrupted_queue.pending_count, 1);
+        assert_eq!(interrupted_queue.dispatch_started_count, 0);
+
+        let supervisor_plan_file = repo
+            .join(".maco/autopilot/runs")
+            .join(run_name)
+            .join("supervisor-plan.json");
+        let resumed = supervise::resume_supervisor_plan_file_cascade_with_runner(
+            SupervisorRunOptions {
+                repo: repo.clone(),
+                plan_file: supervisor_plan_file,
+                run_id: supervisor_run_id.clone(),
+                codex_bin: PathBuf::from("unused-injected-codex"),
+                runtime: SupervisorRuntime::Codex,
+                allow_dirty_primary: true,
+                machine_global_retention: Some(retention),
+            },
+            &mut runner,
+        )
+        .expect("resume Autopilot-origin queue through direct supervise");
+        supervise::clear_generated_follow_up_queue_observer();
+
+        assert_eq!(resumed.source_report.run_id, supervisor_run_id);
+        assert!(resumed.source_report.success, "{resumed:#?}");
+        assert!(resumed.follow_up_cascade_success, "{resumed:#?}");
+        assert!(resumed.generated_follow_up_dispatch_performed());
+        assert_eq!(resumed.follow_up_primary_worktree_untouched, Some(true));
+        assert_eq!(source_child_dispatches.load(Ordering::SeqCst), 1);
+        assert_eq!(follow_up_child_dispatches.load(Ordering::SeqCst), 1);
+        let final_queue = resumed
+            .follow_up_queue
+            .expect("cross-entrypoint final queue summary");
+        assert_eq!(
+            final_queue.queue_instance_id,
+            interrupted_queue.queue_instance_id
+        );
+        assert_eq!(final_queue.pending_count, 0);
+        assert_eq!(final_queue.dispatch_started_count, 0);
+        assert_eq!(final_queue.acknowledged_terminal_count, 1);
+        assert_eq!(final_queue.authenticated_child_dispatch_started_count, 1);
+        let observations = observations.borrow();
+        let reopened = observations
+            .iter()
+            .filter(|observation| observation.label == "created_or_opened")
+            .last()
+            .expect("observe direct supervise queue reopen");
+        let started = observations
+            .iter()
+            .find(|observation| observation.label == "dispatch_started")
+            .expect("observe resumed subordinate dispatch start");
+        let acknowledged = observations
+            .iter()
+            .find(|observation| observation.label == "acknowledged_terminal")
+            .expect("observe resumed subordinate acknowledgement");
+        for observation in [reopened, started, acknowledged] {
+            assert_eq!(
+                observation.queue_instance_id,
+                interrupted_queue.queue_instance_id
+            );
+            assert_eq!(observation.outer_entrypoint, "autopilot_run");
+            assert_eq!(observation.outer_command_run_id, run_name);
+            assert_eq!(observation.item_ids, interrupted_queue.item_ids);
+        }
+        assert_eq!(started.subordinate_run_ids.len(), 1);
+        assert_eq!(
+            acknowledged.subordinate_run_ids,
+            started.subordinate_run_ids
+        );
+        assert_eq!(
+            supervise::verified_whole_primary_snapshot_sha256(&repo)
+                .expect("capture cross-entrypoint final primary"),
+            primary_before
+        );
+        assert_eq!(
+            Repository::open(&repo)
+                .expect("reopen cross-entrypoint repository")
+                .head()
+                .expect("reread cross-entrypoint HEAD")
+                .target()
+                .expect("reread cross-entrypoint HEAD oid"),
+            head_before
+        );
         assert!(!repo.join("src/client.rs").exists());
     }
 

@@ -1197,6 +1197,11 @@ pub struct SupervisorFollowUpQueueSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GeneratedFollowUpQueueTestObservation {
     pub label: &'static str,
+    pub queue_instance_id: String,
+    pub outer_entrypoint: String,
+    pub outer_command_run_id: String,
+    pub item_ids: Vec<String>,
+    pub subordinate_run_ids: Vec<String>,
     pub pending_count: usize,
     pub claimed_count: usize,
     pub dispatch_started_count: usize,

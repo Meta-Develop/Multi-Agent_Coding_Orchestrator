@@ -775,8 +775,20 @@ fn record_queue_test_observation(
     authenticated_child_dispatch_started_count: usize,
 ) {
     let summary = queue.summary();
+    let item_ids = queue.snapshot().items().keys().cloned().collect();
+    let subordinate_run_ids = queue
+        .snapshot()
+        .items()
+        .values()
+        .filter_map(|item| item.subordinate_run_id().map(str::to_string))
+        .collect();
     let observation = GeneratedFollowUpQueueTestObservation {
         label,
+        queue_instance_id: summary.queue_instance_id.clone(),
+        outer_entrypoint: summary.outer_entrypoint.as_str().to_string(),
+        outer_command_run_id: summary.outer_command_run_id.clone(),
+        item_ids,
+        subordinate_run_ids,
         pending_count: summary.enqueued,
         claimed_count: summary.claimed,
         dispatch_started_count: summary.dispatch_started,

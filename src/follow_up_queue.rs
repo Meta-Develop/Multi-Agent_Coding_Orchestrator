@@ -73,7 +73,7 @@ pub(crate) enum GeneratedFollowUpQueueEntrypoint {
 }
 
 impl GeneratedFollowUpQueueEntrypoint {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::SuperviseRun => "supervise_run",
             Self::AutopilotRun => "autopilot_run",
@@ -725,6 +725,8 @@ pub(crate) struct GeneratedFollowUpQueueSummary {
     pub version: u32,
     pub queue_instance_id: String,
     pub source_supervisor_run_id: String,
+    pub outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
+    pub outer_command_run_id: String,
     pub cascade_depth: u8,
     pub capacity: usize,
     pub staged: usize,
@@ -778,6 +780,8 @@ impl GeneratedFollowUpQueueSnapshot {
             version: QUEUE_FORMAT_VERSION,
             queue_instance_id: self.queue_instance_id.clone(),
             source_supervisor_run_id: self.source.source_supervisor_run_id.clone(),
+            outer_entrypoint: self.source.outer_entrypoint,
+            outer_command_run_id: self.source.outer_command_run_id.clone(),
             cascade_depth: self.source.cascade_depth,
             capacity: self.bounds.capacity,
             staged: self.staged.len(),
