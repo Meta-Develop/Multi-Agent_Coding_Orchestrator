@@ -12,29 +12,36 @@ use crate::{
     artifacts::state_auth::{sha256_hex, AuthenticationDomain, RepositoryAuthenticator},
     external_agent::EnvironmentFailure,
     gate_denial::{ExternalSideEffectState, GateDenial},
+    machine_global::{
+        machine_global_config_content_binding, MachineGlobalRetentionBinding,
+    },
+    safe_state::FileIdentity,
     state_journal::{AuthenticatedStateJournal, JournalRecord, JournalSpec},
     supervise::{
-        load_supervisor_plan_file, GeneratedFollowUpDispatchStatus, GeneratedFollowUpTaskRecord,
-        SupervisorPlan,
+        validate_generated_follow_up_plan_document, GeneratedFollowUpDispatchStatus,
+        GeneratedFollowUpTaskRecord, SupervisorPlan, LICENSED_BREAKAGE_CASCADE_DEPTH,
+        MAX_LICENSED_BREAKAGE_DEPENDENTS,
     },
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, io::Write};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const GENERATED_FOLLOW_UP_QUEUE_ROOT_NAME: &str =
     "authenticated-generated-follow-up-queues-v1";
 
 const QUEUE_FORMAT_VERSION: u32 = 1;
-const GENERATED_CASCADE_DEPTH: u8 = 1;
 const SOURCE_CASCADE_DEPTH: u8 = 0;
-const MAX_QUEUE_ITEMS: usize = 64;
-const MAX_SOURCE_GROUPS: usize = 64;
+// This is an authenticated-state storage ceiling, not an execution budget.
+// Per-assignment work remains bounded by the licensed-breakage constants and
+// each generated plan's derived run budget.
+const MAX_STORED_QUEUE_ITEMS: usize = 64;
 const MAX_SOURCE_RUN_ID_BYTES: usize = 128;
 const MAX_CANONICAL_TASK_BYTES: usize = 7 * 1024 * 1024;
 const MAX_ENQUEUED_TASK_BYTES: usize = 64 * 1024 * 1024;
 const ITEM_ID_DOMAIN: &[u8] = b"MACO\0generated-follow-up-queue-item\0v1\0";
 const QUEUE_ID_DOMAIN: &[u8] = b"MACO\0generated-follow-up-queue-instance\0v1\0";
+const QUEUE_SLOT_ID_DOMAIN: &[u8] = b"MACO\0generated-follow-up-queue-slot\0v1\0";
 const BATCH_ID_DOMAIN: &[u8] = b"MACO\0generated-follow-up-queue-batch\0v1\0";
 
 enum GeneratedFollowUpQueueJournalSpec {}
@@ -60,31 +67,145 @@ impl JournalSpec for GeneratedFollowUpQueueJournalSpec {
 
 type QueueJournal = AuthenticatedStateJournal<GeneratedFollowUpQueueJournalSpec>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GeneratedFollowUpQueueEntrypoint {
+    SuperviseRun,
+    AutopilotRun,
+}
+
+impl GeneratedFollowUpQueueEntrypoint {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SuperviseRun => "supervise_run",
+            Self::AutopilotRun => "autopilot_run",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GeneratedFollowUpRetentionBinding {
+    config_content_sha256: String,
+    config_file_identity: FileIdentity,
+    root_id: String,
+    owner: String,
+    correction_correlation_id: String,
+    binding_sha256: String,
+}
+
+impl GeneratedFollowUpRetentionBinding {
+    pub(crate) fn from_machine_global(binding: &MachineGlobalRetentionBinding) -> Result<Self> {
+        let (config_content_sha256, config_file_identity) =
+            machine_global_config_content_binding(&binding.config)?;
+        let binding_sha256 = domain_separated_sha256(
+            b"MACO\0generated-follow-up-retention-binding\0v1\0",
+            &[
+                config_content_sha256.as_bytes(),
+                binding.root_id.as_bytes(),
+                binding.owner.as_bytes(),
+                binding.correction_correlation_id.as_bytes(),
+                &config_file_identity.device.to_be_bytes(),
+                &config_file_identity.file.to_be_bytes(),
+            ],
+        )?;
+        let retained = Self {
+            config_content_sha256,
+            config_file_identity,
+            root_id: binding.root_id.clone(),
+            owner: binding.owner.clone(),
+            correction_correlation_id: binding.correction_correlation_id.clone(),
+            binding_sha256,
+        };
+        retained.validate()?;
+        Ok(retained)
+    }
+
+    pub(crate) fn binding_sha256(&self) -> &str {
+        &self.binding_sha256
+    }
+
+    pub(crate) fn root_id(&self) -> &str {
+        &self.root_id
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_sha256_id(&self.config_content_sha256, "machine-global config content digest")?;
+        validate_sha256_id(&self.binding_sha256, "machine-global retention binding digest")?;
+        if self.config_file_identity.device == 0 || self.config_file_identity.file == 0 {
+            bail!("machine-global config file identity is incomplete");
+        }
+        validate_source_run_id(&self.root_id)
+            .context("machine-global runtime root identity is invalid")?;
+        validate_bounded_text(&self.owner, "machine-global retention owner", 256)?;
+        validate_bounded_text(
+            &self.correction_correlation_id,
+            "machine-global correction correlation id",
+            256,
+        )?;
+        let expected = domain_separated_sha256(
+            b"MACO\0generated-follow-up-retention-binding\0v1\0",
+            &[
+                self.config_content_sha256.as_bytes(),
+                self.root_id.as_bytes(),
+                self.owner.as_bytes(),
+                self.correction_correlation_id.as_bytes(),
+                &self.config_file_identity.device.to_be_bytes(),
+                &self.config_file_identity.file.to_be_bytes(),
+            ],
+        )?;
+        if self.binding_sha256 != expected {
+            bail!("machine-global retention binding digest does not match its exact fields");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GeneratedFollowUpQueueSource {
     source_supervisor_run_id: String,
+    source_normalized_plan_sha256: String,
+    source_report_accepted: bool,
+    source_report_publishable: bool,
+    outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
+    outer_command_run_id: String,
+    repository_id: String,
+    whole_primary_baseline_sha256: String,
+    machine_global_retention: GeneratedFollowUpRetentionBinding,
     cascade_depth: u8,
 }
 
 impl GeneratedFollowUpQueueSource {
-    pub(crate) fn root(source_supervisor_run_id: impl Into<String>) -> Result<Self> {
+    pub(crate) fn root(
+        source_supervisor_run_id: impl Into<String>,
+        source_normalized_plan_sha256: impl Into<String>,
+        source_report_accepted: bool,
+        source_report_publishable: bool,
+        outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
+        outer_command_run_id: impl Into<String>,
+        repository_id: impl Into<String>,
+        whole_primary_baseline_sha256: impl Into<String>,
+        machine_global_retention: GeneratedFollowUpRetentionBinding,
+    ) -> Result<Self> {
         let source = Self {
             source_supervisor_run_id: source_supervisor_run_id.into(),
+            source_normalized_plan_sha256: source_normalized_plan_sha256.into(),
+            source_report_accepted,
+            source_report_publishable,
+            outer_entrypoint,
+            outer_command_run_id: outer_command_run_id.into(),
+            repository_id: repository_id.into(),
+            whole_primary_baseline_sha256: whole_primary_baseline_sha256.into(),
+            machine_global_retention,
             cascade_depth: SOURCE_CASCADE_DEPTH,
         };
         source.validate()?;
         Ok(source)
     }
 
-    pub(crate) fn generated(
-        source_supervisor_run_id: impl Into<String>,
-        cascade_depth: u8,
-    ) -> Result<Self> {
-        let source = Self {
-            source_supervisor_run_id: source_supervisor_run_id.into(),
-            cascade_depth,
-        };
+    pub(crate) fn generated(mut source: Self, cascade_depth: u8) -> Result<Self> {
+        source.cascade_depth = cascade_depth;
         source.validate()?;
         Ok(source)
     }
@@ -97,8 +218,61 @@ impl GeneratedFollowUpQueueSource {
         self.cascade_depth
     }
 
+    pub(crate) fn source_normalized_plan_sha256(&self) -> &str {
+        &self.source_normalized_plan_sha256
+    }
+
+    pub(crate) fn source_report_accepted(&self) -> bool {
+        self.source_report_accepted
+    }
+
+    pub(crate) fn source_report_publishable(&self) -> bool {
+        self.source_report_publishable
+    }
+
+    pub(crate) fn outer_entrypoint(&self) -> GeneratedFollowUpQueueEntrypoint {
+        self.outer_entrypoint
+    }
+
+    pub(crate) fn outer_command_run_id(&self) -> &str {
+        &self.outer_command_run_id
+    }
+
+    pub(crate) fn repository_id(&self) -> &str {
+        &self.repository_id
+    }
+
+    pub(crate) fn whole_primary_baseline_sha256(&self) -> &str {
+        &self.whole_primary_baseline_sha256
+    }
+
+    pub(crate) fn retention_binding_sha256(&self) -> &str {
+        self.machine_global_retention.binding_sha256()
+    }
+
+    pub(crate) fn machine_global_runtime_root_id(&self) -> &str {
+        self.machine_global_retention.root_id()
+    }
+
     fn validate(&self) -> Result<()> {
         validate_source_run_id(&self.source_supervisor_run_id)?;
+        validate_source_run_id(&self.outer_command_run_id)
+            .context("generated follow-up outer command run identity is invalid")?;
+        validate_sha256_id(
+            &self.source_normalized_plan_sha256,
+            "source normalized supervisor plan digest",
+        )?;
+        if !self.source_report_accepted || !self.source_report_publishable {
+            bail!(
+                "generated follow-up queue source must be observed accepted and publishable"
+            );
+        }
+        validate_sha256_id(&self.repository_id, "repository authentication identity")?;
+        validate_sha256_id(
+            &self.whole_primary_baseline_sha256,
+            "whole-primary baseline binding",
+        )?;
+        self.machine_global_retention.validate()?;
         if self.cascade_depth != SOURCE_CASCADE_DEPTH {
             bail!(
                 "generated follow-up queue refuses second-generation work at cascade depth {}",
@@ -118,19 +292,115 @@ pub(crate) struct GeneratedFollowUpQueueBounds {
 }
 
 impl GeneratedFollowUpQueueBounds {
+    /// Derives the queue's storage capacity from the accepted source plan and
+    /// the complete set of generated records that plan actually produced.
+    /// The source declarations retain the established per-assignment bound;
+    /// this queue adds only a fixed authenticated-storage ceiling.
+    pub(crate) fn from_validated_source_plan_and_tasks(
+        source_plan: &SupervisorPlan,
+        tasks: &[GeneratedFollowUpTaskRecord],
+    ) -> Result<Self> {
+        if tasks.is_empty() {
+            bail!("generated follow-up queue requires at least one validated task");
+        }
+        let mut declared_by_assignment = BTreeMap::new();
+        for assignment in &source_plan.assignments {
+            let Some(declaration) = assignment.licensed_breakage.as_ref() else {
+                continue;
+            };
+            if declaration.dependents.is_empty()
+                || declaration.dependents.len() > MAX_LICENSED_BREAKAGE_DEPENDENTS
+            {
+                bail!(
+                    "generated follow-up source assignment '{}' exceeds the established licensed-dependent bound",
+                    assignment.id
+                );
+            }
+            if declared_by_assignment
+                .insert(assignment.id.clone(), declaration.dependents.clone())
+                .is_some()
+            {
+                bail!("generated follow-up source plan repeats an assignment id");
+            }
+        }
+        if declared_by_assignment.is_empty() {
+            bail!("generated follow-up source plan has no licensed-breakage declarations");
+        }
+
+        let mut validated_by_assignment = BTreeMap::<String, usize>::new();
+        let mut represented_dependents = BTreeSet::<(String, String)>::new();
+        for task in tasks {
+            canonical_validated_task_bytes(task)?;
+            let Some(dependents) = declared_by_assignment.get(&task.breaking_assignment_id) else {
+                bail!(
+                    "generated follow-up task names a breaking assignment absent from the validated source plan"
+                );
+            };
+            let assignment = task
+                .supervisor_plan
+                .assignments
+                .first()
+                .filter(|_| task.supervisor_plan.assignments.len() == 1)
+                .context("generated follow-up task must contain one dependent assignment")?;
+            let matched = dependents
+                .iter()
+                .enumerate()
+                .find(|(index, dependent)| {
+                    let ordinal = index.saturating_add(1);
+                    assignment.id
+                        == format!(
+                            "{}-licensed-update-{ordinal:02}",
+                            task.breaking_assignment_id
+                        )
+                        && assignment.assigned_paths == dependent.paths
+                        && assignment.semantic_symbols == dependent.interfaces
+                })
+                .map(|(_, dependent)| dependent)
+                .context(
+                    "generated follow-up assignment does not exactly match one declared dependent scope",
+                )?;
+            if !represented_dependents.insert((
+                task.breaking_assignment_id.clone(),
+                matched.dependent_id.clone(),
+            )) {
+                bail!("generated follow-up task set represents one declared dependent twice");
+            }
+            let count = validated_by_assignment
+                .entry(task.breaking_assignment_id.clone())
+                .or_default();
+            *count = count
+                .checked_add(1)
+                .context("generated follow-up validated-dependent count overflowed")?;
+        }
+
+        let mut declared_counts = Vec::with_capacity(declared_by_assignment.len());
+        let mut validated_counts = Vec::with_capacity(declared_by_assignment.len());
+        for (assignment_id, dependents) in declared_by_assignment {
+            let validated = validated_by_assignment
+                .remove(&assignment_id)
+                .unwrap_or_default();
+            declared_counts.push(dependents.len());
+            validated_counts.push(validated);
+        }
+        if !validated_by_assignment.is_empty() {
+            bail!("generated follow-up validated tasks escaped their source declarations");
+        }
+        Self::from_validated_counts(&declared_counts, &validated_counts)
+    }
+
     /// Computes one round's exact item capacity from per-source-assignment
     /// declared and validated dependent counts. Both totals use checked
     /// arithmetic; validated failures may be a subset of declarations.
-    pub(crate) fn from_source_dependents(
+    fn from_validated_counts(
         declared_per_assignment: &[usize],
         validated_per_assignment: &[usize],
     ) -> Result<Self> {
         if declared_per_assignment.is_empty()
             || declared_per_assignment.len() != validated_per_assignment.len()
-            || declared_per_assignment.len() > MAX_SOURCE_GROUPS
+            || declared_per_assignment.len() > MAX_STORED_QUEUE_ITEMS
         {
             bail!(
-                "generated follow-up queue source counts must contain 1..={MAX_SOURCE_GROUPS} aligned assignment groups"
+                "generated follow-up queue source counts must contain 1..={MAX_STORED_QUEUE_ITEMS} aligned assignment groups"
             );
         }
         let mut declared_dependents = 0_usize;
@@ -140,6 +410,11 @@ impl GeneratedFollowUpQueueBounds {
             .copied()
             .zip(validated_per_assignment.iter().copied())
         {
+            if declared > MAX_LICENSED_BREAKAGE_DEPENDENTS {
+                bail!(
+                    "generated follow-up source assignment exceeds the established licensed-dependent bound of {MAX_LICENSED_BREAKAGE_DEPENDENTS}"
+                );
+            }
             declared_dependents = declared_dependents
                 .checked_add(declared)
                 .context("generated follow-up declared-dependent count overflowed")?;
@@ -150,8 +425,10 @@ impl GeneratedFollowUpQueueBounds {
                 bail!("generated follow-up validated dependents exceed the source declaration");
             }
         }
-        if validated_dependents == 0 || validated_dependents > MAX_QUEUE_ITEMS {
-            bail!("generated follow-up queue capacity must be between 1 and {MAX_QUEUE_ITEMS}");
+        if validated_dependents == 0 || validated_dependents > MAX_STORED_QUEUE_ITEMS {
+            bail!(
+                "generated follow-up queue storage capacity must be between 1 and {MAX_STORED_QUEUE_ITEMS}"
+            );
         }
         let bounds = Self {
             declared_dependents,
@@ -160,6 +437,14 @@ impl GeneratedFollowUpQueueBounds {
         };
         bounds.validate()?;
         Ok(bounds)
+    }
+
+    #[cfg(test)]
+    fn from_source_dependents(
+        declared_per_assignment: &[usize],
+        validated_per_assignment: &[usize],
+    ) -> Result<Self> {
+        Self::from_validated_counts(declared_per_assignment, validated_per_assignment)
     }
 
     pub(crate) fn declared_dependents(&self) -> usize {
@@ -177,7 +462,7 @@ impl GeneratedFollowUpQueueBounds {
     fn validate(&self) -> Result<()> {
         if self.declared_dependents < self.validated_dependents
             || self.validated_dependents == 0
-            || self.validated_dependents > MAX_QUEUE_ITEMS
+            || self.validated_dependents > MAX_STORED_QUEUE_ITEMS
             || self.capacity != self.validated_dependents
         {
             bail!("generated follow-up queue bounds are malformed or unsupported");
@@ -412,6 +697,22 @@ pub(crate) struct GeneratedFollowUpQueueSnapshot {
     items: BTreeMap<String, GeneratedFollowUpQueueItemSnapshot>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct GeneratedFollowUpQueueSummary {
+    pub version: u32,
+    pub queue_instance_id: String,
+    pub source_supervisor_run_id: String,
+    pub cascade_depth: u8,
+    pub capacity: usize,
+    pub staged: usize,
+    pub enqueued: usize,
+    pub claimed: usize,
+    pub dispatch_started: usize,
+    pub dispatch_observed: usize,
+    pub acknowledged_terminal: usize,
+    pub held_ambiguous: usize,
+}
+
 impl GeneratedFollowUpQueueSnapshot {
     pub(crate) fn queue_instance_id(&self) -> &str {
         &self.queue_instance_id
@@ -448,6 +749,36 @@ impl GeneratedFollowUpQueueSnapshot {
             .map(GeneratedFollowUpQueueItemSnapshot::item_id)
             .collect()
     }
+
+    pub(crate) fn summary(&self) -> GeneratedFollowUpQueueSummary {
+        let mut summary = GeneratedFollowUpQueueSummary {
+            version: QUEUE_FORMAT_VERSION,
+            queue_instance_id: self.queue_instance_id.clone(),
+            source_supervisor_run_id: self.source.source_supervisor_run_id.clone(),
+            cascade_depth: self.source.cascade_depth,
+            capacity: self.bounds.capacity,
+            staged: self.staged.len(),
+            enqueued: 0,
+            claimed: 0,
+            dispatch_started: 0,
+            dispatch_observed: 0,
+            acknowledged_terminal: 0,
+            held_ambiguous: 0,
+        };
+        for item in self.items.values() {
+            match item.phase {
+                GeneratedFollowUpQueuePhase::Enqueued => summary.enqueued += 1,
+                GeneratedFollowUpQueuePhase::Claimed => summary.claimed += 1,
+                GeneratedFollowUpQueuePhase::DispatchStarted => summary.dispatch_started += 1,
+                GeneratedFollowUpQueuePhase::DispatchObserved => summary.dispatch_observed += 1,
+                GeneratedFollowUpQueuePhase::AcknowledgedTerminal => {
+                    summary.acknowledged_terminal += 1;
+                }
+                GeneratedFollowUpQueuePhase::HeldAmbiguous => summary.held_ambiguous += 1,
+            }
+        }
+        summary
+    }
 }
 
 pub(crate) struct GeneratedFollowUpQueue {
@@ -461,16 +792,30 @@ impl GeneratedFollowUpQueue {
         source: GeneratedFollowUpQueueSource,
         bounds: GeneratedFollowUpQueueBounds,
     ) -> Result<Self> {
+        Self::create_or_open(authenticator, source, bounds)
+    }
+
+    pub(crate) fn create_or_open(
+        authenticator: RepositoryAuthenticator,
+        source: GeneratedFollowUpQueueSource,
+        bounds: GeneratedFollowUpQueueBounds,
+    ) -> Result<Self> {
         source.validate()?;
         bounds.validate()?;
-        let instance_id = queue_instance_id(&source)?;
-        let mut journal = QueueJournal::create(authenticator, &instance_id)?;
-        let created = QueueJournalEvent::Created {
-            source: source.clone(),
-            bounds: bounds.clone(),
-        };
-        journal.append(created.phase(), None, &created)?;
-        let snapshot = replay_queue_records(&instance_id, journal.records())?;
+        verify_source_repository_binding(&authenticator, &source)?;
+        let journal_slot_id = queue_journal_slot_id(&source)?;
+        let mut journal = QueueJournal::open_or_initialize(authenticator, &journal_slot_id)?;
+        if journal.records().is_empty() {
+            let created = QueueJournalEvent::Created {
+                source: source.clone(),
+                bounds: bounds.clone(),
+            };
+            journal.append(created.phase(), None, &created)?;
+        }
+        let snapshot = replay_queue_records(&journal_slot_id, journal.records())?;
+        if snapshot.source != source || snapshot.bounds != bounds {
+            bail!("generated follow-up queue execution basis changed across create-or-open");
+        }
         Ok(Self { journal, snapshot })
     }
 
@@ -479,9 +824,10 @@ impl GeneratedFollowUpQueue {
         source: &GeneratedFollowUpQueueSource,
     ) -> Result<Self> {
         source.validate()?;
-        let instance_id = queue_instance_id(source)?;
-        let journal = QueueJournal::open_instance(authenticator, &instance_id)?;
-        let snapshot = replay_queue_records(&instance_id, journal.records())?;
+        verify_source_repository_binding(&authenticator, source)?;
+        let journal_slot_id = queue_journal_slot_id(source)?;
+        let journal = QueueJournal::open_instance(authenticator, &journal_slot_id)?;
+        let snapshot = replay_queue_records(&journal_slot_id, journal.records())?;
         if &snapshot.source != source {
             bail!("generated follow-up queue source identity changed across reopen");
         }
@@ -494,6 +840,10 @@ impl GeneratedFollowUpQueue {
 
     pub(crate) fn replay_snapshot(&self) -> Result<GeneratedFollowUpQueueSnapshot> {
         replay_queue_records(self.journal.instance_id(), self.journal.records())
+    }
+
+    pub(crate) fn summary(&self) -> GeneratedFollowUpQueueSummary {
+        self.snapshot.summary()
     }
 
     /// Stages every immutable task before committing the complete batch. An
@@ -554,6 +904,19 @@ impl GeneratedFollowUpQueue {
         Ok(events)
     }
 
+    /// Completes an interrupted staged batch only when the caller presents the
+    /// exact immutable task set. Existing staged records are checked before
+    /// the missing suffix and single commit record are appended.
+    pub(crate) fn complete_staged_batch(
+        &mut self,
+        tasks: &[GeneratedFollowUpTaskRecord],
+    ) -> Result<Vec<GeneratedFollowUpQueueEventData>> {
+        if self.snapshot.enqueue_committed || self.snapshot.staged.is_empty() {
+            bail!("generated follow-up queue has no incomplete staged batch to recover");
+        }
+        self.enqueue_all_before_dispatch(tasks)
+    }
+
     pub(crate) fn claim(&mut self, item_id: &str) -> Result<GeneratedFollowUpQueueEventData> {
         self.append_event(QueueJournalEvent::Claimed {
             item_id: item_id.to_string(),
@@ -571,6 +934,26 @@ impl GeneratedFollowUpQueue {
             gate_denial,
             environment_failures,
         })
+    }
+
+    /// Releases every crash-surviving claim that has no durable dispatch
+    /// marker. DispatchStarted items are excluded by phase and remain
+    /// ambiguous until the caller supplies stronger subordinate-run evidence.
+    pub(crate) fn release_claimed_before_dispatch(
+        &mut self,
+    ) -> Result<Vec<GeneratedFollowUpQueueEventData>> {
+        let claimed = self
+            .snapshot
+            .items
+            .values()
+            .filter(|item| item.phase == GeneratedFollowUpQueuePhase::Claimed)
+            .map(|item| item.item_id().to_string())
+            .collect::<Vec<_>>();
+        let mut events = Vec::with_capacity(claimed.len());
+        for item_id in claimed {
+            events.push(self.release_before_dispatch(&item_id, None, Vec::new())?);
+        }
+        Ok(events)
     }
 
     pub(crate) fn mark_dispatch_started(
@@ -654,7 +1037,7 @@ impl GeneratedFollowUpQueue {
 }
 
 fn replay_queue_records(
-    instance_id: &str,
+    journal_slot_id: &str,
     records: &[JournalRecord],
 ) -> Result<GeneratedFollowUpQueueSnapshot> {
     let first = records
@@ -670,11 +1053,12 @@ fn replay_queue_records(
     };
     source.validate()?;
     bounds.validate()?;
-    if queue_instance_id(&source)? != instance_id {
-        bail!("generated follow-up queue instance id is not bound to its source run");
+    if queue_journal_slot_id(&source)? != journal_slot_id {
+        bail!("generated follow-up queue journal slot is not bound to its source run");
     }
+    let instance_id = queue_instance_id(&source)?;
     let mut snapshot = GeneratedFollowUpQueueSnapshot {
-        queue_instance_id: instance_id.to_string(),
+        queue_instance_id: instance_id,
         source,
         bounds,
         enqueue_committed: false,
@@ -914,10 +1298,11 @@ fn generated_follow_up_item_id(
 ) -> Result<String> {
     source.validate()?;
     let canonical_task = canonical_validated_task_bytes(task)?;
+    let queue_instance_id = queue_instance_id(source)?;
     domain_separated_sha256(
         ITEM_ID_DOMAIN,
         &[
-            source.source_supervisor_run_id.as_bytes(),
+            queue_instance_id.as_bytes(),
             canonical_task.as_slice(),
         ],
     )
@@ -959,7 +1344,7 @@ fn validate_generated_follow_up_task(task: &GeneratedFollowUpTaskRecord) -> Resu
         || task.cascade_depth != context.cascade_depth
         || task.dispatch_status != context.dispatch_status
         || task.handoff != context.handoff
-        || task.cascade_depth != GENERATED_CASCADE_DEPTH
+        || task.cascade_depth != LICENSED_BREAKAGE_CASCADE_DEPTH
         || task.dispatch_status != GeneratedFollowUpDispatchStatus::DeferredForPlannedRun
         || task.breaking_assignment_id != task.breaking_change.agent_id
         || task.handoff.trim().is_empty()
@@ -968,19 +1353,7 @@ fn validate_generated_follow_up_task(task: &GeneratedFollowUpTaskRecord) -> Resu
         bail!("generated follow-up task provenance or cascade binding is invalid");
     }
 
-    let mut plan_file = tempfile::Builder::new()
-        .prefix("maco-generated-follow-up-plan-")
-        .suffix(".json")
-        .tempfile()
-        .context("failed to create a private generated-plan validation file")?;
-    serde_json::to_writer(plan_file.as_file_mut(), plan)
-        .context("failed to write generated plan for ordinary loader validation")?;
-    plan_file
-        .as_file_mut()
-        .flush()
-        .context("failed to flush generated plan before validation")?;
-    let loaded = load_supervisor_plan_file(plan_file.path())
-        .context("generated follow-up task failed the ordinary supervisor plan loader")?;
+    let loaded = validate_generated_follow_up_plan_document(plan)?;
     if loaded != ordinary_plan_from_generated(plan) {
         bail!("ordinary supervisor plan loader changed the generated follow-up task");
     }
@@ -1012,9 +1385,46 @@ fn queue_instance_id(source: &GeneratedFollowUpQueueSource) -> Result<String> {
     source.validate()?;
     let digest = domain_separated_sha256(
         QUEUE_ID_DOMAIN,
-        &[source.source_supervisor_run_id.as_bytes()],
+        &[
+            source.source_supervisor_run_id.as_bytes(),
+            source.source_normalized_plan_sha256.as_bytes(),
+            b"accepted",
+            b"publishable",
+            source.outer_entrypoint.as_str().as_bytes(),
+            source.outer_command_run_id.as_bytes(),
+            source.repository_id.as_bytes(),
+            source.whole_primary_baseline_sha256.as_bytes(),
+            source.machine_global_retention.binding_sha256.as_bytes(),
+            source.machine_global_retention.root_id.as_bytes(),
+            &[source.cascade_depth],
+        ],
     )?;
     Ok(format!("follow-up-{digest}"))
+}
+
+fn queue_journal_slot_id(source: &GeneratedFollowUpQueueSource) -> Result<String> {
+    source.validate()?;
+    let digest = domain_separated_sha256(
+        QUEUE_SLOT_ID_DOMAIN,
+        &[
+            source.outer_entrypoint.as_str().as_bytes(),
+            source.outer_command_run_id.as_bytes(),
+            source.source_supervisor_run_id.as_bytes(),
+            source.repository_id.as_bytes(),
+        ],
+    )?;
+    Ok(format!("follow-up-{digest}"))
+}
+
+fn verify_source_repository_binding(
+    authenticator: &RepositoryAuthenticator,
+    source: &GeneratedFollowUpQueueSource,
+) -> Result<()> {
+    authenticator.verify_epoch()?;
+    if authenticator.binding().repository_id != source.repository_id {
+        bail!("generated follow-up source repository identity does not match the authenticator");
+    }
+    Ok(())
 }
 
 fn subordinate_run_id(item_id: &str) -> Result<String> {
@@ -1023,7 +1433,7 @@ fn subordinate_run_id(item_id: &str) -> Result<String> {
 }
 
 fn batch_sha256(item_ids: &[String]) -> Result<String> {
-    if item_ids.is_empty() || item_ids.len() > MAX_QUEUE_ITEMS {
+    if item_ids.is_empty() || item_ids.len() > MAX_STORED_QUEUE_ITEMS {
         bail!("generated follow-up enqueue batch id list is out of bounds");
     }
     let mut previous = None;
@@ -1067,6 +1477,17 @@ fn validate_source_run_id(run_id: &str) -> Result<()> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
         bail!("generated follow-up source run id is not a bounded canonical identifier");
+    }
+    Ok(())
+}
+
+fn validate_bounded_text(value: &str, label: &str, max_bytes: usize) -> Result<()> {
+    if value.is_empty()
+        || value.trim() != value
+        || value.len() > max_bytes
+        || value.chars().any(char::is_control)
+    {
+        bail!("{label} is not bounded canonical text");
     }
     Ok(())
 }
@@ -1194,7 +1615,8 @@ mod tests {
         },
         supervise::{
             AgentRole, AssignmentScheduleEntry, GeneratedFollowUpOperatorDefault,
-            GeneratedFollowUpPlanContext, GeneratedFollowUpSupervisorPlan, OrchestratorAssignment,
+            GeneratedFollowUpPlanContext, GeneratedFollowUpSupervisorPlan,
+            LicensedBreakageDeclaration, LicensedBreakageDependentScope, OrchestratorAssignment,
             RunBudgetLimits, SupervisorBudgetConfig, SupervisorConsultantPlan,
         },
     };
@@ -1216,8 +1638,48 @@ mod tests {
             .expect("repository authenticator")
     }
 
-    fn source(run_id: &str) -> GeneratedFollowUpQueueSource {
-        GeneratedFollowUpQueueSource::root(run_id).expect("valid queue source")
+    fn retained_machine_global() -> GeneratedFollowUpRetentionBinding {
+        let config_file_identity = FileIdentity { device: 11, file: 22 };
+        let config_content_sha256 = "4".repeat(64);
+        let root_id = "runtime-root".to_string();
+        let owner = "supervise-run".to_string();
+        let correction_correlation_id = "correction-01".to_string();
+        let binding_sha256 = domain_separated_sha256(
+            b"MACO\0generated-follow-up-retention-binding\0v1\0",
+            &[
+                config_content_sha256.as_bytes(),
+                root_id.as_bytes(),
+                owner.as_bytes(),
+                correction_correlation_id.as_bytes(),
+                &config_file_identity.device.to_be_bytes(),
+                &config_file_identity.file.to_be_bytes(),
+            ],
+        )
+        .expect("retention digest");
+        GeneratedFollowUpRetentionBinding {
+            config_content_sha256,
+            config_file_identity,
+            root_id,
+            owner,
+            correction_correlation_id,
+            binding_sha256,
+        }
+    }
+
+    fn source(repo: &Path, run_id: &str) -> GeneratedFollowUpQueueSource {
+        let repository_id = authenticator(repo).binding().repository_id.clone();
+        GeneratedFollowUpQueueSource::root(
+            run_id,
+            "1".repeat(64),
+            true,
+            true,
+            GeneratedFollowUpQueueEntrypoint::SuperviseRun,
+            format!("outer-{run_id}"),
+            repository_id,
+            "3".repeat(64),
+            retained_machine_global(),
+        )
+        .expect("valid queue source")
     }
 
     fn bounds(count: usize) -> GeneratedFollowUpQueueBounds {
@@ -1257,7 +1719,7 @@ mod tests {
             declaration_sha256: "a".repeat(64),
             failure_signature: failure_signature.clone(),
             migration_rationale: "update the declared dependent".to_string(),
-            cascade_depth: GENERATED_CASCADE_DEPTH,
+            cascade_depth: LICENSED_BREAKAGE_CASCADE_DEPTH,
             dispatch_status: GeneratedFollowUpDispatchStatus::DeferredForPlannedRun,
             handoff: handoff.clone(),
             operator_defaults,
@@ -1328,16 +1790,59 @@ mod tests {
             declaration_sha256: "a".repeat(64),
             failure_signature,
             migration_rationale: "update the declared dependent".to_string(),
-            cascade_depth: GENERATED_CASCADE_DEPTH,
+            cascade_depth: LICENSED_BREAKAGE_CASCADE_DEPTH,
             dispatch_status: GeneratedFollowUpDispatchStatus::DeferredForPlannedRun,
             handoff,
+        }
+    }
+
+    fn licensed_source_plan(dependent_count: usize) -> SupervisorPlan {
+        let template = generated_task("01").supervisor_plan;
+        let dependents = (1..=dependent_count)
+            .map(|ordinal| LicensedBreakageDependentScope {
+                dependent_id: format!("dependent-{ordinal:02}"),
+                paths: vec![std::path::PathBuf::from(format!(
+                    "src/{ordinal:02}.rs"
+                ))],
+                interfaces: Vec::new(),
+            })
+            .collect();
+        SupervisorPlan {
+            version: template.version,
+            task: "licensed breaking source".to_string(),
+            task_file: None,
+            max_depth: template.max_depth,
+            max_child_assignments: 1,
+            max_child_retries: template.max_child_retries,
+            max_gate_corrections: template.max_gate_corrections,
+            child_timeout_seconds: template.child_timeout_seconds,
+            semantic_coordination: template.semantic_coordination,
+            role_models: template.role_models,
+            model_pricing: template.model_pricing,
+            review_lenses: template.review_lenses,
+            review_aggregation_policy: template.review_aggregation_policy,
+            assignments: vec![OrchestratorAssignment {
+                id: "child-a".to_string(),
+                role: AgentRole::ChildOrchestrator,
+                assigned_paths: vec![std::path::PathBuf::from("src/breaking.rs")],
+                semantic_symbols: Vec::new(),
+                semantic_modules: Vec::new(),
+                task: Some("make licensed breaking change".to_string()),
+                worker_assignments: Vec::new(),
+                environment_requirements: Vec::new(),
+                licensed_breakage: Some(LicensedBreakageDeclaration {
+                    migration_rationale: "migrate declared dependents".to_string(),
+                    dependents,
+                }),
+                notes: None,
+            }],
         }
     }
 
     #[test]
     fn legal_lifecycle_exposes_queue_state_before_during_and_after_dispatch() {
         let (_temp, repo) = repository();
-        let source = source("source-legal");
+        let source = source(&repo, "source-legal");
         let mut queue = GeneratedFollowUpQueue::create(authenticator(&repo), source, bounds(1))
             .expect("create queue");
         assert!(!queue.snapshot().enqueue_committed());
@@ -1389,7 +1894,7 @@ mod tests {
     #[test]
     fn exact_duplicate_enqueue_is_idempotent_after_commit() {
         let (_temp, repo) = repository();
-        let source = source("source-idempotent");
+        let source = source(&repo, "source-idempotent");
         let task = generated_task("01");
         let mut queue = GeneratedFollowUpQueue::create(authenticator(&repo), source, bounds(1))
             .expect("create queue");
@@ -1405,9 +1910,124 @@ mod tests {
     }
 
     #[test]
+    fn source_plan_bounds_bind_each_generated_task_to_one_declared_dependent() {
+        let plan = licensed_source_plan(2);
+        let first = generated_task("01");
+        let second = generated_task("02");
+        let bounds = GeneratedFollowUpQueueBounds::from_validated_source_plan_and_tasks(
+            &plan,
+            &[first.clone(), second],
+        )
+        .expect("derive exact bounds");
+        assert_eq!(bounds.declared_dependents(), 2);
+        assert_eq!(bounds.validated_dependents(), 2);
+
+        let mut duplicate = first;
+        duplicate.failure_signature = "different failure signature".to_string();
+        duplicate.supervisor_plan.generated_follow_up.failure_signature =
+            duplicate.failure_signature.clone();
+        let error = GeneratedFollowUpQueueBounds::from_validated_source_plan_and_tasks(
+            &plan,
+            &[generated_task("01"), duplicate],
+        )
+        .expect_err("one dependent cannot be represented twice");
+        assert!(format!("{error:#}").contains("represents one declared dependent twice"));
+    }
+
+    #[test]
+    fn altered_generated_budget_and_metadata_refuse_before_enqueue_record() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-noncanonical");
+        let mut queue = GeneratedFollowUpQueue::create(authenticator(&repo), source, bounds(1))
+            .expect("create queue");
+        let mut altered_budget = generated_task("01");
+        altered_budget.supervisor_plan.run_budget.limits.soft_tokens = Some(3);
+        altered_budget.supervisor_plan.run_budget.limits.hard_tokens = Some(3);
+        assert!(queue
+            .enqueue_all_before_dispatch(&[altered_budget])
+            .is_err());
+
+        let mut altered_metadata = generated_task("01");
+        altered_metadata
+            .supervisor_plan
+            .generated_follow_up
+            .operator_defaults
+            .reverse();
+        assert!(queue
+            .enqueue_all_before_dispatch(&[altered_metadata])
+            .is_err());
+        assert_eq!(queue.journal.records().len(), 1);
+    }
+
+    #[test]
+    fn create_or_open_recovers_empty_reservation_and_initializes_once() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-create-gap");
+        let slot = queue_journal_slot_id(&source).expect("queue slot");
+        let empty = QueueJournal::open_or_initialize(authenticator(&repo), &slot)
+            .expect("reserve empty deterministic journal");
+        assert!(empty.records().is_empty());
+        drop(empty);
+
+        let queue = GeneratedFollowUpQueue::create_or_open(
+            authenticator(&repo),
+            source.clone(),
+            bounds(1),
+        )
+        .expect("recover and initialize queue");
+        assert_eq!(queue.journal.records().len(), 1);
+        drop(queue);
+        let reopened = GeneratedFollowUpQueue::create_or_open(
+            authenticator(&repo),
+            source,
+            bounds(1),
+        )
+        .expect("open existing initialized queue");
+        assert_eq!(reopened.journal.records().len(), 1);
+    }
+
+    #[test]
+    fn incomplete_staging_and_claimed_items_have_explicit_recovery() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-recovery");
+        let tasks = vec![generated_task("01"), generated_task("02")];
+        let mut queue = GeneratedFollowUpQueue::create(
+            authenticator(&repo),
+            source.clone(),
+            bounds(2),
+        )
+        .expect("create queue");
+        let prepared = prepare_enqueue_records(&source, &tasks).expect("prepare batch");
+        let first = prepared.values().next().expect("first staged item").clone();
+        queue
+            .append_event(QueueJournalEvent::EnqueueStaged { item: first })
+            .expect("stage one item");
+        drop(queue);
+
+        let mut reopened = GeneratedFollowUpQueue::open(authenticator(&repo), &source)
+            .expect("reopen staged queue");
+        assert_eq!(reopened.snapshot().staged_count(), 1);
+        reopened
+            .complete_staged_batch(&tasks)
+            .expect("complete exact staged batch");
+        let first_id = reopened.snapshot().pending_item_ids()[0].to_string();
+        reopened.claim(&first_id).expect("claim item");
+        drop(reopened);
+
+        let mut recovered = GeneratedFollowUpQueue::open(authenticator(&repo), &source)
+            .expect("reopen claimed queue");
+        assert_eq!(recovered.release_claimed_before_dispatch().expect("release").len(), 1);
+        assert_eq!(
+            recovered.snapshot().item(&first_id).expect("item").phase(),
+            GeneratedFollowUpQueuePhase::Enqueued
+        );
+        recovered.claim(&first_id).expect("reclaim released item");
+    }
+
+    #[test]
     fn conflicting_duplicate_item_id_is_refused_during_replay() {
         let (_temp, repo) = repository();
-        let source = source("source-conflict");
+        let source = source(&repo, "source-conflict");
         let mut queue =
             GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
                 .expect("create queue");
@@ -1442,7 +2062,7 @@ mod tests {
     #[test]
     fn skipped_and_repeated_transitions_are_refused() {
         let (_temp, repo) = repository();
-        let skip_source = source("source-transition-skip");
+        let skip_source = source(&repo, "source-transition-skip");
         let mut queue =
             GeneratedFollowUpQueue::create(authenticator(&repo), skip_source, bounds(1))
                 .expect("create queue");
@@ -1461,7 +2081,7 @@ mod tests {
         assert!(queue.replay_snapshot().is_err());
 
         let (_temp, repo) = repository();
-        let repeat_source = source("source-transition-repeat");
+        let repeat_source = source(&repo, "source-transition-repeat");
         let mut queue =
             GeneratedFollowUpQueue::create(authenticator(&repo), repeat_source, bounds(1))
                 .expect("create queue");
@@ -1481,11 +2101,14 @@ mod tests {
     #[test]
     fn cascade_and_second_generation_refuse_before_any_dispatch_marker() {
         let (_temp, repo) = repository();
-        let generated_source = GeneratedFollowUpQueueSource::generated("source-second", 1)
-            .expect_err("second generation must be refused");
+        let generated_source = GeneratedFollowUpQueueSource::generated(
+            source(&repo, "source-second"),
+            1,
+        )
+        .expect_err("second generation must be refused");
         assert!(format!("{generated_source:#}").contains("second-generation"));
 
-        let source = source("source-cascade");
+        let source = source(&repo, "source-cascade");
         let mut queue = GeneratedFollowUpQueue::create(authenticator(&repo), source, bounds(1))
             .expect("create queue");
         let mut task = generated_task("01");
@@ -1507,13 +2130,13 @@ mod tests {
                 .expect_err("declared total overflow must fail");
         assert!(format!("{overflow:#}").contains("overflowed"));
         assert!(GeneratedFollowUpQueueBounds::from_source_dependents(
-            &[MAX_QUEUE_ITEMS + 1],
-            &[MAX_QUEUE_ITEMS + 1],
+            &[MAX_STORED_QUEUE_ITEMS + 1],
+            &[MAX_STORED_QUEUE_ITEMS + 1],
         )
         .is_err());
 
         let (_temp, repo) = repository();
-        let source = source("source-capacity");
+        let source = source(&repo, "source-capacity");
         let mut queue = GeneratedFollowUpQueue::create(authenticator(&repo), source, bounds(2))
             .expect("create queue");
         assert!(queue
@@ -1529,7 +2152,7 @@ mod tests {
     #[test]
     fn authenticated_reopen_replays_committed_queue() {
         let (_temp, repo) = repository();
-        let source = source("source-reopen");
+        let source = source(&repo, "source-reopen");
         let mut queue =
             GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
                 .expect("create queue");
@@ -1551,7 +2174,7 @@ mod tests {
     #[test]
     fn authenticated_record_tampering_is_refused() {
         let (_temp, repo) = repository();
-        let source = source("source-tamper");
+        let source = source(&repo, "source-tamper");
         let queue = GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
             .expect("create queue");
         let first_record = queue
@@ -1574,7 +2197,7 @@ mod tests {
     #[test]
     fn pending_and_claimed_items_survive_crash_replay_without_loss() {
         let (_temp, repo) = repository();
-        let source = source("source-claimed-replay");
+        let source = source(&repo, "source-claimed-replay");
         let mut queue =
             GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(2))
                 .expect("create queue");
@@ -1600,7 +2223,7 @@ mod tests {
     #[test]
     fn dispatch_started_replay_remains_ambiguous_and_never_pending() {
         let (_temp, repo) = repository();
-        let source = source("source-started-replay");
+        let source = source(&repo, "source-started-replay");
         let mut queue =
             GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
                 .expect("create queue");

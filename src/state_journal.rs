@@ -190,6 +190,104 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
         Ok(journal)
     }
 
+    /// Opens an existing deterministic instance or initializes its reserved
+    /// directory when no durable journal effect exists yet.
+    ///
+    /// This closes the crash window between reserving an instance directory
+    /// and publishing its first record. Recovery never removes or replaces a
+    /// directory: an existing instance is initialized only while both locks
+    /// are held and its bounded inventory proves that it has no record, head,
+    /// or temporary publication residue.
+    pub(crate) fn open_or_initialize(
+        authenticator: RepositoryAuthenticator,
+        run_id: &str,
+    ) -> Result<Self> {
+        validate_spec::<S>()?;
+        validate_instance_id::<S>(run_id)?;
+        authenticator.verify_epoch()?;
+        let journal_root = open_or_create_journal_root::<S>(&authenticator)?;
+        let root_lock = BoundStateLock::acquire(&journal_root, S::ROOT_LOCK_NAME)?;
+        root_lock.verify(&journal_root)?;
+        let existed = journal_root.direct_child_exists(run_id)?;
+        let reserved = if existed {
+            journal_root
+                .bind_existing_direct_child_directory(run_id)
+                .with_context(|| format!("{} instance is missing or unsafe", S::NAMESPACE))?
+        } else {
+            journal_root
+                .reserve_direct_child_directory(run_id)
+                .with_context(|| format!("failed to reserve {} instance", S::NAMESPACE))?
+        };
+        reserved.verify(&journal_root)?;
+        let run_root = SafeRoot::open_existing(reserved.path())?;
+        let run_lock = BoundStateLock::try_acquire_exclusive(&run_root, S::INSTANCE_LOCK_NAME)
+            .with_context(|| format!("{} instance is active elsewhere", S::NAMESPACE))?;
+        let inventory = inventory_run_directory::<S>(&run_root)?;
+        let had_records = !inventory.records.is_empty();
+
+        let mut journal = if !had_records {
+            if inventory.head_exists
+                || !inventory.record_temps.is_empty()
+                || !inventory.head_temps.is_empty()
+            {
+                bail!(
+                    "{} empty instance has publication residue and cannot be initialized",
+                    S::NAMESPACE
+                );
+            }
+            let identity = JournalIdentity {
+                version: S::FORMAT_VERSION,
+                repository: authenticator.binding().clone(),
+                run_id: run_id.to_string(),
+                journal_id: random_identifier()?,
+                run_directory_identity: run_root.identity().clone(),
+            };
+            Self {
+                authenticator,
+                journal_root,
+                run_root,
+                run_lock,
+                identity,
+                records: Vec::new(),
+                record_bytes: 0,
+                spec: PhantomData,
+            }
+        } else {
+            let first_name = inventory
+                .records
+                .get(&1)
+                .context("authenticated journal has records but no first record")?;
+            let bytes =
+                BoundedRegularReader::read_direct(&run_root, first_name, S::MAX_RECORD_BYTES)?;
+            let locator: JournalRecord = serde_json::from_slice(&bytes)
+                .with_context(|| format!("{} first record locator is malformed", S::NAMESPACE))?;
+            validate_identity::<S>(&locator.identity)?;
+            authenticator.verify_repository_binding(&locator.identity.repository)?;
+            if locator.sequence != 1
+                || locator.identity.run_id != run_id
+                || locator.identity.run_directory_identity != *run_root.identity()
+            {
+                bail!("{} first record locator has the wrong instance binding", S::NAMESPACE);
+            }
+            Self {
+                authenticator,
+                journal_root,
+                run_root,
+                run_lock,
+                identity: locator.identity,
+                records: Vec::new(),
+                record_bytes: 0,
+                spec: PhantomData,
+            }
+        };
+        if had_records {
+            journal.load_and_recover()?;
+        }
+        root_lock.verify(&journal.journal_root)?;
+        journal.verify_boundaries()?;
+        Ok(journal)
+    }
+
     pub(crate) fn open(
         authenticator: RepositoryAuthenticator,
         expected: &JournalIdentity,

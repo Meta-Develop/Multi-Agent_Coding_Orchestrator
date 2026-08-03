@@ -256,6 +256,25 @@ pub(super) fn parse_supervisor_plan_with_consultant(
     })
 }
 
+pub(crate) fn validate_generated_follow_up_plan_document(
+    generated: &GeneratedFollowUpSupervisorPlan,
+) -> Result<SupervisorPlan> {
+    let serialized = serde_json::to_string(generated)
+        .context("failed to serialize generated follow-up plan")?;
+    let loaded = parse_supervisor_plan_with_consultant(&serialized)
+        .context("generated follow-up plan failed the ordinary full-document loader")?;
+    if loaded.plan != generated.ordinary_plan()
+        || loaded.consultant != generated.consultant
+        || loaded.plan_metadata.assignment_schedule != generated.assignment_schedule
+        || loaded.plan_metadata.run_budget != generated.run_budget
+        || loaded.plan_metadata.generated_follow_up != Some(generated.generated_follow_up.clone())
+        || !loaded.plan_metadata.spec_fragment_ids.is_empty()
+    {
+        bail!("ordinary full-document loader changed generated follow-up authority");
+    }
+    Ok(loaded.plan)
+}
+
 fn assignments_from_plan_value(value: &Value) -> Result<Vec<OrchestratorAssignment>> {
     let raw_assignments = value
         .get("assignments")
