@@ -10,12 +10,13 @@ or masquerade as source-journal evidence.
 ## 1. What bounds the number of rounds, and what happens at the bound?
 
 The command permits exactly the source round plus one generated follow-up
-batch. Every generated plan carries the fixed cascade depth, and evidence that
-the generated batch produced another licensed follow-up is retained but cannot
-start a third round. The cascade outcome carries the established typed
-`approval_review`/`permission_expansion` refusal, while the subordinate queue
-item is terminal. The typed refusal is not misrepresented as a queue event or
-an invitation to dispatch outside the command.
+batch. Every generated plan carries the fixed cascade depth. If an
+authenticated terminal report from that generated batch contains further
+follow-up tasks, those tasks are retained as report evidence but are never
+admitted to this queue or another queue. The cascade outcome carries the
+established typed `approval_review`/`permission_expansion` refusal, while the
+subordinate queue item is terminal. The typed refusal is not misrepresented as
+a queue event or an invitation to dispatch outside the command.
 
 ## 2. What bounds the work per round when a round can generate more follow-ups than it consumes?
 
@@ -43,15 +44,18 @@ its live bound run lock remains `DispatchStarted`. Only an authenticated
 `Interrupted` or `Uncertain` subordinate becomes `HeldAmbiguous` and requires
 reconciliation rather than silently returning to pending. Once that exact
 subordinate later has an authenticated finalized report, a subsequent
-invocation observes and acknowledges it without dispatching it again. Direct
-`supervise run` can resume the same command and run ID from its authenticated
-finalized source artifacts, so it does not rerun the source round. It can also
-recover an Autopilot-origin queue by presenting that exact authenticated source
-run, normalized plan, primary baseline, and retention binding: the queue slot
-is derived from those execution-basis fields, while the original Autopilot
-entrypoint and outer run ID remain immutable provenance. Autopilot
-outer-artifact interruption still has no safe same-command outer-artifact
-resume binding, and this design does not claim one.
+invocation first compares the subordinate artifact's complete authenticated
+`LoadedSupervisorPlan` with the immutable queued generated plan, then observes
+and acknowledges it without dispatching it again. A same-ID subordinate with a
+different plan stays held and takes a typed permission-expansion refusal.
+Direct `supervise run` can resume the same command and run ID from its
+authenticated finalized source artifacts, so it does not rerun the source
+round. It can also recover an Autopilot-origin queue by presenting that exact
+authenticated source run, normalized plan, primary baseline, and retention
+binding: the queue slot is derived from those execution-basis fields, while the
+original Autopilot entrypoint and outer run ID remain immutable provenance.
+Autopilot outer-artifact interruption still has no safe same-command
+outer-artifact resume binding, and this design does not claim one.
 
 ## 4. What stops a follow-up task from regenerating itself indefinitely?
 
