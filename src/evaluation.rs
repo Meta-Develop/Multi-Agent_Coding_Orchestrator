@@ -24,6 +24,7 @@ use thiserror::Error;
 
 pub const EVALUATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const EVALUATION_RESULTS_SCHEMA_VERSION: u32 = 2;
+pub const MAX_EVALUATION_HELD_OUT_VALIDATIONS: usize = 32;
 pub const MAX_EVALUATION_PROFILES: usize = 32;
 pub const MAX_EVALUATION_REPETITIONS: u32 = 100;
 pub const MAX_EXECUTION_ERROR_EVIDENCE_BYTES: usize = 256;
@@ -148,6 +149,15 @@ impl EvaluationManifest {
                 format!(
                     "must contain at most {MAX_EVALUATION_PROFILES} profiles, got {}",
                     self.profiles.len()
+                ),
+            ));
+        }
+        if self.held_out_validation.len() > MAX_EVALUATION_HELD_OUT_VALIDATIONS {
+            return Err(invalid_manifest(
+                "held_out_validation",
+                format!(
+                    "must contain at most {MAX_EVALUATION_HELD_OUT_VALIDATIONS} validations, got {}",
+                    self.held_out_validation.len()
                 ),
             ));
         }
@@ -1934,6 +1944,7 @@ fn calculate_quality(
     })
 }
 
+#[cfg(test)]
 fn summarize_profiles(
     manifest: &EvaluationManifest,
     runs: &[EvaluationRepetitionResult],
@@ -2814,6 +2825,35 @@ mod tests {
         assert!(error
             .to_string()
             .contains(&format!("at most {MAX_EVALUATION_PROFILES}")));
+    }
+
+    #[test]
+    fn manifest_held_out_count_accepts_boundary_and_refuses_excess() {
+        let mut manifest = manifest();
+        manifest.held_out_validation = (0..MAX_EVALUATION_HELD_OUT_VALIDATIONS)
+            .map(|index| HeldOutValidation {
+                id: format!("held-out-{index}"),
+                command: vec!["true".to_string()],
+            })
+            .collect();
+        manifest
+            .validate()
+            .expect("maximum held-out validation count remains accepted");
+
+        manifest.held_out_validation.push(HeldOutValidation {
+            id: "held-out-over-limit".to_string(),
+            command: vec!["true".to_string()],
+        });
+        let error = manifest
+            .validate()
+            .expect_err("held-out count above the conservative bound must fail closed");
+        assert!(matches!(
+            error,
+            EvaluationError::InvalidManifest { ref field, .. } if field == "held_out_validation"
+        ));
+        assert!(error
+            .to_string()
+            .contains(&format!("at most {MAX_EVALUATION_HELD_OUT_VALIDATIONS}")));
     }
 
     #[test]
