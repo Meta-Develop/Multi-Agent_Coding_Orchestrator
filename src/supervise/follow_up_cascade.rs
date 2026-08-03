@@ -632,6 +632,11 @@ fn verify_authenticated_source_basis(
 ) -> Result<()> {
     let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Supervise, &source.run_id)
         .context("generated follow-up source is not an authenticated finalized run")?;
+    let final_report_relative = RunArtifactFamily::Supervise.final_report_relative_path();
+    let authenticated_report_bytes = reader
+        .read(&final_report_relative)
+        .context("generated follow-up source has no authenticated final report")?;
+    let supplied_report_bytes = encode_final_report(source)?;
     let authenticated = read_supervisor_final_report(&reader)?;
     let plan_bytes = reader
         .read("assignments/supervisor-plan.json")
@@ -648,8 +653,18 @@ fn verify_authenticated_source_basis(
     if &authenticated_loaded != supplied || authenticated_sha256 != supplied_sha256 {
         bail!("supplied generated follow-up source plan differs from its authenticated finalized plan");
     }
-    if authenticated != *source {
-        bail!("supplied generated follow-up source report differs from the authenticated finalized report");
+    // The finalized bytes are the authenticated execution basis. Comparing
+    // them with the same canonical encoder used by persistence covers every
+    // report field without depending on whether serde's decode defaults are
+    // structurally PartialEq-stable. The typed read above still rejects a
+    // malformed report before any queue state is opened.
+    if authenticated_report_bytes != supplied_report_bytes {
+        bail!("supplied generated follow-up source report differs from the authenticated canonical final-report bytes");
+    }
+    if authenticated.run_id != source.run_id
+        || authenticated.run_lifecycle != SupervisorRunLifecycle::Finalized
+    {
+        bail!("authenticated generated follow-up source report is not the expected finalized run");
     }
     Ok(())
 }
