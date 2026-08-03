@@ -412,17 +412,23 @@ impl GeneratedFollowUpQueueBounds {
             .copied()
             .zip(validated_per_assignment.iter().copied())
         {
-            if declared > MAX_LICENSED_BREAKAGE_DEPENDENTS {
-                bail!(
-                    "generated follow-up source assignment exceeds the established licensed-dependent bound of {MAX_LICENSED_BREAKAGE_DEPENDENTS}"
-                );
-            }
             declared_dependents = declared_dependents
                 .checked_add(declared)
                 .context("generated follow-up declared-dependent count overflowed")?;
             validated_dependents = validated_dependents
                 .checked_add(validated)
                 .context("generated follow-up validated-dependent count overflowed")?;
+        }
+        for (declared, validated) in declared_per_assignment
+            .iter()
+            .copied()
+            .zip(validated_per_assignment.iter().copied())
+        {
+            if declared > MAX_LICENSED_BREAKAGE_DEPENDENTS {
+                bail!(
+                    "generated follow-up source assignment exceeds the established licensed-dependent bound of {MAX_LICENSED_BREAKAGE_DEPENDENTS}"
+                );
+            }
             if validated > declared {
                 bail!("generated follow-up validated dependents exceed the source declaration");
             }
