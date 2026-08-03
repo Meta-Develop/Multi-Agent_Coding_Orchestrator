@@ -304,7 +304,7 @@ fn fake_autopilot_depth_two_e2e_is_gated_durable_and_primary_untouched() -> Resu
 }
 
 #[test]
-fn autopilot_run_reports_matching_effective_nondefault_profile() -> Result<()> {
+fn fake_autopilot_run_reports_configured_but_execution_incomparable_profile() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("profiled-plan.json");
@@ -369,8 +369,9 @@ fn autopilot_run_reports_matching_effective_nondefault_profile() -> Result<()> {
     ])?;
 
     assert_eq!(report["status"], "succeeded");
-    assert_eq!(report["profile_binding"]["version"], 1);
-    assert_eq!(report["profile_binding"]["status"], "matched");
+    assert_eq!(report["profile_binding"]["version"], 2);
+    assert_eq!(report["profile_binding"]["status"], "incomparable");
+    assert_eq!(report["profile_binding"]["configuration_status"], "matched");
     assert!(report["profile_binding"].get("failure").is_none());
     assert_eq!(
         report["profile_binding"]["requested"],
@@ -388,6 +389,26 @@ fn autopilot_run_reports_matching_effective_nondefault_profile() -> Result<()> {
     assert_eq!(
         report["profile_binding"]["effective"]["review_lenses"][0]["id"],
         "profile-diff-review"
+    );
+    assert_eq!(
+        report["profile_binding"]["execution"]["role_models"][0]["role"],
+        "worker"
+    );
+    assert_eq!(
+        report["profile_binding"]["execution"]["role_models"][0]["status"],
+        "incomparable"
+    );
+    assert_eq!(
+        report["profile_binding"]["execution"]["role_models"][0]["observation"],
+        "not_process_observable"
+    );
+    assert_eq!(
+        report["profile_binding"]["execution"]["review_lenses"][0]["status"],
+        "incomparable"
+    );
+    assert_eq!(
+        report["profile_binding"]["execution"]["review_lenses"][0]["observation"],
+        "not_process_observable"
     );
     assert_eq!(
         report["supervisor"]["role_economics_profile"]["overridden_roles"],
