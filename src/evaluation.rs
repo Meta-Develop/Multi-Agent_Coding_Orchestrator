@@ -23,7 +23,7 @@ use std::{
 use thiserror::Error;
 
 pub const EVALUATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const EVALUATION_RESULTS_SCHEMA_VERSION: u32 = 1;
+pub const EVALUATION_RESULTS_SCHEMA_VERSION: u32 = 2;
 pub const MAX_EVALUATION_PROFILES: usize = 32;
 pub const MAX_EVALUATION_REPETITIONS: u32 = 100;
 pub const MAX_EXECUTION_ERROR_EVIDENCE_BYTES: usize = 256;
@@ -414,7 +414,7 @@ pub struct DispatchComparison {
 pub enum ParetoConclusionStatus {
     Available,
     RefusedIncomparableDispatchEvidence,
-    RefusedMissingCostEvidence,
+    RefusedNoDispatchDifference,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -901,7 +901,7 @@ fn run_deterministic_fake(
     }
 
     let dispatch_comparisons = compare_same_repetition_dispatches(manifest, &runs)?;
-    let pareto_conclusion = pareto_conclusion(&dispatch_comparisons, &runs);
+    let pareto_conclusion = pareto_conclusion(&dispatch_comparisons);
     let pareto_allowed = pareto_conclusion.status == ParetoConclusionStatus::Available;
     let (profile_summaries, pareto_frontier) =
         summarize_profiles_with_pareto(manifest, &runs, pareto_allowed)?;
@@ -1071,22 +1071,16 @@ fn compare_same_repetition_dispatches(
     Ok(comparisons)
 }
 
-fn pareto_conclusion(
-    comparisons: &[DispatchComparison],
-    runs: &[EvaluationRepetitionResult],
-) -> ParetoConclusion {
+fn pareto_conclusion(comparisons: &[DispatchComparison]) -> ParetoConclusion {
     let status = if comparisons.is_empty()
         || comparisons.iter().any(|comparison| {
             comparison.comparability == RequirementFourComparability::Incomparable
         }) {
         ParetoConclusionStatus::RefusedIncomparableDispatchEvidence
-    } else if runs.iter().any(|run| {
-        run.metrics
-            .role_usage
-            .values()
-            .any(|report| report.cost_usd.is_none())
+    } else if !comparisons.iter().any(|comparison| {
+        comparison.comparability == RequirementFourComparability::DispatchGroundedSelectionsDiffer
     }) {
-        ParetoConclusionStatus::RefusedMissingCostEvidence
+        ParetoConclusionStatus::RefusedNoDispatchDifference
     } else {
         ParetoConclusionStatus::Available
     };
@@ -1251,7 +1245,7 @@ pub fn validate_results_against_manifest(
             "comparisons do not match same-repetition observed dispatch records",
         ));
     }
-    let expected_conclusion = pareto_conclusion(&expected_comparisons, &results.runs);
+    let expected_conclusion = pareto_conclusion(&expected_comparisons);
     if results.pareto_conclusion != expected_conclusion {
         return Err(invalid_results(
             "pareto_conclusion",
@@ -1287,12 +1281,30 @@ fn validate_observed_dispatch_record(
             "must contain at least one observed role or review-lens selection",
         ));
     }
+    if !is_strictly_sorted(&record.roles) {
+        return Err(invalid_results(
+            &field,
+            "role observations must be in canonical sorted order without duplicates",
+        ));
+    }
+    if !is_strictly_sorted(&record.review_lenses) {
+        return Err(invalid_results(
+            &field,
+            "review-lens observations must be in canonical sorted order without duplicates",
+        ));
+    }
     let mut roles = BTreeSet::new();
     for role in &record.roles {
         if !roles.insert(role.role) || role.models.is_empty() {
             return Err(invalid_results(
                 &field,
                 "role observations must be unique and contain at least one model",
+            ));
+        }
+        if !is_strictly_sorted(&role.models) {
+            return Err(invalid_results(
+                &field,
+                "observed role models must be in canonical sorted order without duplicates",
             ));
         }
         for model in &role.models {
@@ -1315,6 +1327,10 @@ fn validate_observed_dispatch_record(
         require_result_nonempty(&format!("{field}.review_lenses.model"), &lens.model)?;
     }
     Ok(())
+}
+
+fn is_strictly_sorted<T: Ord>(values: &[T]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 fn validate_execution(
@@ -2617,6 +2633,58 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_dispatches_refuse_a_pareto_conclusion() {
+        let comparisons = vec![DispatchComparison {
+            left_profile_id: "left".to_string(),
+            right_profile_id: "right".to_string(),
+            repetition: 0,
+            comparability: RequirementFourComparability::DispatchGroundedSelectionsEquivalent,
+            unavailable_reason: None,
+        }];
+
+        assert_eq!(
+            pareto_conclusion(&comparisons).status,
+            ParetoConclusionStatus::RefusedNoDispatchDifference
+        );
+    }
+
+    #[test]
+    fn observed_dispatch_validation_requires_canonical_ordering() {
+        let record = observed_dispatch_record_from_profile_binding(&complete_observed_binding(
+            "observed-worker",
+            "observed-review",
+        ))
+        .expect("complete dispatch record");
+
+        let mut unsorted_models = record.clone();
+        unsorted_models.roles[0].models = vec!["z-model".to_string(), "a-model".to_string()];
+        let error = validate_observed_dispatch_record(&unsorted_models, 0)
+            .expect_err("model reordering must not fabricate a dispatch difference");
+        assert!(error.to_string().contains("canonical sorted order"));
+
+        let mut unsorted_roles = record.clone();
+        unsorted_roles.roles.push(ObservedRoleDispatch {
+            role: AgentRole::ChildOrchestrator,
+            models: vec!["observed-orchestrator".to_string()],
+        });
+        unsorted_roles.roles.sort();
+        unsorted_roles.roles.reverse();
+        let error = validate_observed_dispatch_record(&unsorted_roles, 0)
+            .expect_err("role reordering must not fabricate a dispatch difference");
+        assert!(error.to_string().contains("canonical sorted order"));
+
+        let mut unsorted_lenses = record;
+        let mut second_lens = unsorted_lenses.review_lenses[0].clone();
+        second_lens.lens_id = "another-lens".to_string();
+        unsorted_lenses.review_lenses.push(second_lens);
+        unsorted_lenses.review_lenses.sort();
+        unsorted_lenses.review_lenses.reverse();
+        let error = validate_observed_dispatch_record(&unsorted_lenses, 0)
+            .expect_err("review-lens reordering must not fabricate a dispatch difference");
+        assert!(error.to_string().contains("canonical sorted order"));
+    }
+
+    #[test]
     fn configured_difference_without_observed_selection_is_incomparable() {
         let mut absent = complete_observed_binding("observed-worker", "observed-review");
         absent.status = AutopilotProfileBindingStatus::Incomparable;
@@ -2661,7 +2729,7 @@ mod tests {
         assert!(comparisons.iter().any(|comparison| {
             comparison.comparability == RequirementFourComparability::Incomparable
         }));
-        let conclusion = pareto_conclusion(&comparisons, &results.runs);
+        let conclusion = pareto_conclusion(&comparisons);
         assert_eq!(
             conclusion.status,
             ParetoConclusionStatus::RefusedIncomparableDispatchEvidence
@@ -2693,7 +2761,7 @@ mod tests {
 
         results.dispatch_comparisons =
             compare_same_repetition_dispatches(&manifest, &results.runs).expect("comparisons");
-        results.pareto_conclusion = pareto_conclusion(&results.dispatch_comparisons, &results.runs);
+        results.pareto_conclusion = pareto_conclusion(&results.dispatch_comparisons);
         let pareto_allowed = results.pareto_conclusion.status == ParetoConclusionStatus::Available;
         (results.profile_summaries, results.pareto_frontier) =
             summarize_profiles_with_pareto(&manifest, &results.runs, pareto_allowed)
