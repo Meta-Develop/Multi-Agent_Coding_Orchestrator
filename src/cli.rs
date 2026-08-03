@@ -174,7 +174,7 @@ enum Command {
     Agents(AgentsCommand),
     /// Inspect local LLM adapter boundaries without network calls.
     Llm(LlmCommand),
-    /// Run reproducible model-mix evaluations from a versioned manifest.
+    /// Generate deterministic model-mix fixture results from a versioned manifest.
     Evaluation(EvaluationCommand),
 }
 
@@ -2828,7 +2828,7 @@ impl EvaluationCommand {
 
 #[derive(Debug, Subcommand)]
 enum EvaluationSubcommand {
-    /// Run every manifest profile and repetition with the selected execution mode.
+    /// Generate deterministic fixture output for every manifest profile and repetition.
     Run(RunEvaluationArgs),
 }
 
@@ -2839,17 +2839,17 @@ struct RunEvaluationArgs {
     /// Hand-authored plan whose exact bytes are bound by the manifest.
     #[arg(long)]
     plan_file: PathBuf,
-    /// Source repository used by isolated real-provider execution.
+    /// Reserved source-repository path; unused by the current synthetic fixture runner.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// Evaluation execution mode.
+    /// Requested mode; the current runner supports deterministic-fake and refuses real-provider.
     #[arg(
         long,
         default_value = "deterministic-fake",
         value_parser = parse_evaluation_execution
     )]
     execution: crate::evaluation::EvaluationExecution,
-    /// Explicitly permit the selected real-provider execution path.
+    /// Acknowledge future real-provider execution; the current runner still refuses it.
     #[arg(long)]
     allow_real_provider: bool,
     /// Stable seed for deterministic fake evaluation fixtures.
@@ -2888,8 +2888,10 @@ fn run_evaluation_command(args: RunEvaluationArgs) -> Result<()> {
                 )
             })?;
 
-    // The legacy runner is repository-independent. Keep this binding explicit so the isolated
-    // Phase-B runner can replace this single call without changing the command contract.
+    // This legacy Phase-A runner generates synthetic fixtures only: it does not inspect the
+    // repository or execute a provider, supervisor, held-out command, or isolated workflow.
+    // Keep the reserved repository binding explicit so a future isolated runner can replace this
+    // single call without silently changing the command contract.
     let _repo = args.repo;
     let results = crate::evaluation::run_evaluation(
         &manifest,

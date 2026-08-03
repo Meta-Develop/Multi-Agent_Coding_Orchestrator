@@ -123,14 +123,23 @@ fn evaluation_cli_refuses_real_provider_without_opt_in_before_state_artifacts() 
 
 #[test]
 fn evaluation_help_exposes_execution_and_real_provider_gate() -> Result<()> {
+    let top_level_help = Command::new(BIN)
+        .arg("--help")
+        .output()
+        .context("run top-level help")?;
+    assert!(top_level_help.status.success());
+    assert!(String::from_utf8(top_level_help.stdout)
+        .context("decode top-level help")?
+        .contains("Generate deterministic model-mix fixture results"));
+
     let family_help = Command::new(BIN)
         .args(["evaluation", "--help"])
         .output()
         .context("run evaluation help")?;
     assert!(family_help.status.success());
-    assert!(String::from_utf8(family_help.stdout)
-        .context("decode evaluation help")?
-        .contains("run"));
+    let family_help = String::from_utf8(family_help.stdout).context("decode evaluation help")?;
+    assert!(family_help.contains("run"));
+    assert!(family_help.contains("Generate deterministic fixture output"));
 
     let run_help = Command::new(BIN)
         .args(["evaluation", "run", "--help"])
@@ -149,6 +158,16 @@ fn evaluation_help_exposes_execution_and_real_provider_gate() -> Result<()> {
         assert!(
             help.contains(obligation),
             "help omitted {obligation}: {help}"
+        );
+    }
+    for boundary in [
+        "unused",
+        "synthetic fixture runner",
+        "refuses real-provider",
+    ] {
+        assert!(
+            help.contains(boundary),
+            "help omitted boundary '{boundary}': {help}"
         );
     }
     Ok(())
