@@ -6,6 +6,7 @@
 
 use crate::{
     artifacts::state_auth::sha256_hex,
+    autopilot::{AutopilotProfileBindingReport, AutopilotProfileBindingStatus},
     llm::provider::Usage,
     supervise::{
         AgentRole, Finding, FindingSeverity, RoleModelSelection, RoleUsageObservation,
@@ -30,6 +31,8 @@ pub const PROVISIONAL_FAKE_EVIDENCE_NOTICE: &str = "provisional deterministic fa
      a hand-authored plan; no isolated repository state was observed, so Issue #26 requirement-4 \
      comparability is not established and is deferred to Phase B; ineligible for production or \
      default decisions";
+pub const DISPATCH_COMPARABILITY_NOTICE: &str = "comparison is scoped to MACO-dispatched model \
+     selections; it does not establish that the provider executed profiles differently";
 
 const BASIS_POINTS: u32 = 10_000;
 const HELD_OUT_WEIGHT_PERCENT: u32 = 50;
@@ -244,6 +247,45 @@ pub enum EvaluationPlanBasis {
 #[serde(rename_all = "snake_case")]
 pub enum RequirementFourComparability {
     NotEstablishedDeferredToPhaseB,
+    DispatchGroundedSelectionsDiffer,
+    DispatchGroundedSelectionsEquivalent,
+    Incomparable,
+}
+
+/// The strongest claim supported by the landed profile-observation channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationComparabilityScope {
+    Dispatch,
+}
+
+/// Mandatory claim boundary carried by every result and summary document.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DispatchComparabilityClaim {
+    pub scope: EvaluationComparabilityScope,
+    pub provider_execution_difference_established: bool,
+    pub notice: String,
+}
+
+impl DispatchComparabilityClaim {
+    fn dispatch_only() -> Self {
+        Self {
+            scope: EvaluationComparabilityScope::Dispatch,
+            provider_execution_difference_established: false,
+            notice: DISPATCH_COMPARABILITY_NOTICE.to_string(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), EvaluationError> {
+        if self != &Self::dispatch_only() {
+            return Err(invalid_results(
+                "dispatch_comparability_claim",
+                "must state the exact dispatch-only claim and must not claim provider-execution differentiation",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -312,6 +354,64 @@ pub struct SyntheticRunIdentity {
     /// Unique deterministic fixture identity. Reusing one identity across repetitions fails
     /// validation.
     pub fake_run_id: String,
+}
+
+/// A dispatch-observed role selection copied from the A4 execution binding.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedRoleDispatch {
+    pub role: AgentRole,
+    pub models: Vec<String>,
+}
+
+/// A dispatch-observed review-lens selection copied from parent-recorded argv evidence.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedReviewLensDispatch {
+    pub lens_id: String,
+    pub backend_id: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    pub dispatch_count: usize,
+}
+
+/// Normalized observed dispatch record for one profile repetition.
+///
+/// No requested, effective, or manifest selection is copied into this record.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedDispatchRecord {
+    pub roles: Vec<ObservedRoleDispatch>,
+    pub review_lenses: Vec<ObservedReviewLensDispatch>,
+}
+
+/// Same-repetition comparison between two profile runs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DispatchComparison {
+    pub left_profile_id: String,
+    pub right_profile_id: String,
+    pub repetition: u32,
+    pub comparability: RequirementFourComparability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+/// Whether a cost-versus-quality Pareto conclusion is licensed by the evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParetoConclusionStatus {
+    Available,
+    RefusedIncomparableDispatchEvidence,
+    RefusedMissingCostEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParetoConclusion {
+    pub status: ParetoConclusionStatus,
+    pub claim: DispatchComparabilityClaim,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -445,6 +545,8 @@ pub struct EvaluationRepetitionResult {
     pub synthetic_run_identity: SyntheticRunIdentity,
     pub execution: RepetitionExecution,
     pub metrics: EvaluationMetrics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_dispatch: Option<ObservedDispatchRecord>,
 }
 
 /// Per-profile aggregate. Role usage and cost are totals; other numeric fields are arithmetic
@@ -494,8 +596,11 @@ pub struct EvaluationResults {
     pub evidence: EvaluationEvidence,
     pub declared_inputs: DeclaredInputsBinding,
     pub declared_inputs_digest: String,
+    pub dispatch_comparability_claim: DispatchComparabilityClaim,
     pub runs: Vec<EvaluationRepetitionResult>,
+    pub dispatch_comparisons: Vec<DispatchComparison>,
     pub profile_summaries: Vec<ProfileSummary>,
+    pub pareto_conclusion: ParetoConclusion,
     pub pareto_frontier: Vec<ParetoPoint>,
 }
 
@@ -515,7 +620,10 @@ impl EvaluationResults {
             fake_seed: self.fake_seed,
             evidence: self.evidence.clone(),
             declared_inputs_digest: self.declared_inputs_digest.clone(),
+            dispatch_comparability_claim: self.dispatch_comparability_claim.clone(),
+            dispatch_comparisons: self.dispatch_comparisons.clone(),
             profile_summaries: self.profile_summaries.clone(),
+            pareto_conclusion: self.pareto_conclusion.clone(),
             pareto_frontier: self.pareto_frontier.clone(),
         }
     }
@@ -531,7 +639,10 @@ pub struct EvaluationSummary {
     pub fake_seed: u64,
     pub evidence: EvaluationEvidence,
     pub declared_inputs_digest: String,
+    pub dispatch_comparability_claim: DispatchComparabilityClaim,
+    pub dispatch_comparisons: Vec<DispatchComparison>,
     pub profile_summaries: Vec<ProfileSummary>,
+    pub pareto_conclusion: ParetoConclusion,
     pub pareto_frontier: Vec<ParetoPoint>,
 }
 
@@ -774,11 +885,16 @@ fn run_deterministic_fake(
                 },
                 execution,
                 metrics,
+                observed_dispatch: None,
             });
         }
     }
 
-    let (profile_summaries, pareto_frontier) = summarize_profiles(manifest, &runs)?;
+    let dispatch_comparisons = compare_same_repetition_dispatches(manifest, &runs)?;
+    let pareto_conclusion = pareto_conclusion(&dispatch_comparisons, &runs);
+    let pareto_allowed = pareto_conclusion.status == ParetoConclusionStatus::Available;
+    let (profile_summaries, pareto_frontier) =
+        summarize_profiles_with_pareto(manifest, &runs, pareto_allowed)?;
     let results = EvaluationResults {
         version: EVALUATION_RESULTS_SCHEMA_VERSION,
         manifest_version: manifest.version,
@@ -787,12 +903,187 @@ fn run_deterministic_fake(
         evidence: EvaluationEvidence::provisional_fake_only(),
         declared_inputs,
         declared_inputs_digest,
+        dispatch_comparability_claim: DispatchComparabilityClaim::dispatch_only(),
         runs,
+        dispatch_comparisons,
         profile_summaries,
+        pareto_conclusion,
         pareto_frontier,
     };
     validate_results_against_manifest(manifest, &results)?;
     Ok(results)
+}
+
+/// Normalize the A4 dispatch-observation channel without reading requested/effective profile data.
+pub fn observed_dispatch_record_from_profile_binding(
+    binding: &AutopilotProfileBindingReport,
+) -> Result<ObservedDispatchRecord, String> {
+    if binding.configuration_status != AutopilotProfileBindingStatus::Matched
+        || binding.status != AutopilotProfileBindingStatus::Matched
+        || binding.failure.is_some()
+    {
+        return Err(
+            "not_process_observable: profile execution binding is not fully matched".to_string(),
+        );
+    }
+    let execution = binding
+        .execution
+        .as_ref()
+        .ok_or_else(|| "not_process_observable: profile execution binding is absent".to_string())?;
+    if execution.unavailable_reason.is_some() {
+        return Err(
+            "not_process_observable: profile execution binding reports unavailable evidence"
+                .to_string(),
+        );
+    }
+
+    let mut roles = Vec::with_capacity(execution.role_models.len());
+    for observed in &execution.role_models {
+        if observed.status != AutopilotProfileBindingStatus::Matched
+            || observed.observation != RoleUsageObservation::ProcessObserved
+            || observed.observed_models.is_empty()
+            || observed
+                .observed_models
+                .iter()
+                .any(|model| model.trim().is_empty())
+        {
+            return Err(format!(
+                "not_process_observable: role '{}' lacks a complete process-observed dispatch selection",
+                role_name(observed.role)
+            ));
+        }
+        let mut models = observed.observed_models.clone();
+        models.sort();
+        roles.push(ObservedRoleDispatch {
+            role: observed.role,
+            models,
+        });
+    }
+    roles.sort();
+
+    let mut review_lenses = Vec::with_capacity(execution.review_lenses.len());
+    for observed in &execution.review_lenses {
+        let backend_id = observed.observed_backend_id.as_deref().ok_or_else(|| {
+            format!(
+                "not_process_observable: review lens '{}' lacks an observed backend",
+                observed.lens_id
+            )
+        })?;
+        let model = observed.observed_model.as_deref().ok_or_else(|| {
+            format!(
+                "not_process_observable: review lens '{}' lacks an observed model",
+                observed.lens_id
+            )
+        })?;
+        if observed.status != AutopilotProfileBindingStatus::Matched
+            || observed.observation != RoleUsageObservation::ProcessObserved
+            || observed.dispatch_count == 0
+            || observed.lens_id.trim().is_empty()
+            || backend_id.trim().is_empty()
+            || model.trim().is_empty()
+        {
+            return Err(format!(
+                "not_process_observable: review lens '{}' lacks a complete process-observed dispatch selection",
+                observed.lens_id
+            ));
+        }
+        review_lenses.push(ObservedReviewLensDispatch {
+            lens_id: observed.lens_id.clone(),
+            backend_id: backend_id.to_string(),
+            model: model.to_string(),
+            reasoning_effort: observed.observed_reasoning_effort.clone(),
+            dispatch_count: observed.dispatch_count,
+        });
+    }
+    review_lenses.sort();
+    if roles.is_empty() && review_lenses.is_empty() {
+        return Err(
+            "not_process_observable: profile contained no observed dispatch selection".to_string(),
+        );
+    }
+    Ok(ObservedDispatchRecord {
+        roles,
+        review_lenses,
+    })
+}
+
+/// Comparator seam used by Phase-B fail-capability tests and source-neuter checks.
+pub fn compare_observed_dispatch_records(
+    left: Option<&ObservedDispatchRecord>,
+    right: Option<&ObservedDispatchRecord>,
+) -> RequirementFourComparability {
+    match (left, right) {
+        (Some(left), Some(right)) if left != right => {
+            RequirementFourComparability::DispatchGroundedSelectionsDiffer
+        }
+        (Some(_), Some(_)) => RequirementFourComparability::DispatchGroundedSelectionsEquivalent,
+        _ => RequirementFourComparability::Incomparable,
+    }
+}
+
+fn compare_same_repetition_dispatches(
+    manifest: &EvaluationManifest,
+    runs: &[EvaluationRepetitionResult],
+) -> Result<Vec<DispatchComparison>, EvaluationError> {
+    let mut comparisons = Vec::new();
+    for repetition in 0..manifest.repetitions {
+        for left_index in 0..manifest.profiles.len() {
+            for right_index in (left_index + 1)..manifest.profiles.len() {
+                let left_profile = &manifest.profiles[left_index];
+                let right_profile = &manifest.profiles[right_index];
+                let left = runs
+                    .iter()
+                    .find(|run| run.profile_id == left_profile.id && run.repetition == repetition)
+                    .ok_or_else(|| invalid_results("runs", "missing left comparison run"))?;
+                let right = runs
+                    .iter()
+                    .find(|run| run.profile_id == right_profile.id && run.repetition == repetition)
+                    .ok_or_else(|| invalid_results("runs", "missing right comparison run"))?;
+                let comparability = compare_observed_dispatch_records(
+                    left.observed_dispatch.as_ref(),
+                    right.observed_dispatch.as_ref(),
+                );
+                comparisons.push(DispatchComparison {
+                    left_profile_id: left_profile.id.clone(),
+                    right_profile_id: right_profile.id.clone(),
+                    repetition,
+                    comparability,
+                    unavailable_reason: (comparability
+                        == RequirementFourComparability::Incomparable)
+                        .then(|| {
+                            "not_process_observable: one or both runs lack a complete observed dispatch record"
+                                .to_string()
+                        }),
+                });
+            }
+        }
+    }
+    Ok(comparisons)
+}
+
+fn pareto_conclusion(
+    comparisons: &[DispatchComparison],
+    runs: &[EvaluationRepetitionResult],
+) -> ParetoConclusion {
+    let status = if comparisons.is_empty()
+        || comparisons.iter().any(|comparison| {
+            comparison.comparability == RequirementFourComparability::Incomparable
+        }) {
+        ParetoConclusionStatus::RefusedIncomparableDispatchEvidence
+    } else if runs.iter().any(|run| {
+        run.metrics
+            .role_usage
+            .values()
+            .any(|report| report.cost_usd.is_none())
+    }) {
+        ParetoConclusionStatus::RefusedMissingCostEvidence
+    } else {
+        ParetoConclusionStatus::Available
+    };
+    ParetoConclusion {
+        status,
+        claim: DispatchComparabilityClaim::dispatch_only(),
+    }
 }
 
 /// Check that every synthetic result is internally consistent with the manifest's declared target,
@@ -830,6 +1121,7 @@ pub fn validate_results_against_manifest(
         ));
     }
     results.evidence.validate()?;
+    results.dispatch_comparability_claim.validate()?;
 
     let expected_binding = manifest.declared_inputs_binding();
     if results.declared_inputs != expected_binding {
@@ -925,9 +1217,28 @@ pub fn validate_results_against_manifest(
             run_index,
         )?;
         validate_metrics(manifest, profile, &run.metrics, run_index)?;
+        if let Some(observed_dispatch) = &run.observed_dispatch {
+            validate_observed_dispatch_record(observed_dispatch, run_index)?;
+        }
     }
 
-    let (expected_summaries, expected_frontier) = summarize_profiles(manifest, &results.runs)?;
+    let expected_comparisons = compare_same_repetition_dispatches(manifest, &results.runs)?;
+    if results.dispatch_comparisons != expected_comparisons {
+        return Err(invalid_results(
+            "dispatch_comparisons",
+            "comparisons do not match same-repetition observed dispatch records",
+        ));
+    }
+    let expected_conclusion = pareto_conclusion(&expected_comparisons, &results.runs);
+    if results.pareto_conclusion != expected_conclusion {
+        return Err(invalid_results(
+            "pareto_conclusion",
+            "does not match dispatch comparability and cost evidence",
+        ));
+    }
+    let pareto_allowed = expected_conclusion.status == ParetoConclusionStatus::Available;
+    let (expected_summaries, expected_frontier) =
+        summarize_profiles_with_pareto(manifest, &results.runs, pareto_allowed)?;
     if !profile_summaries_equivalent(&results.profile_summaries, &expected_summaries) {
         return Err(invalid_results(
             "profile_summaries",
@@ -939,6 +1250,47 @@ pub fn validate_results_against_manifest(
             "pareto_frontier",
             "frontier does not match cost-versus-quality dominance over profile summaries",
         ));
+    }
+    Ok(())
+}
+
+fn validate_observed_dispatch_record(
+    record: &ObservedDispatchRecord,
+    run_index: usize,
+) -> Result<(), EvaluationError> {
+    let field = format!("runs[{run_index}].observed_dispatch");
+    if record.roles.is_empty() && record.review_lenses.is_empty() {
+        return Err(invalid_results(
+            field,
+            "must contain at least one observed role or review-lens selection",
+        ));
+    }
+    let mut roles = BTreeSet::new();
+    for role in &record.roles {
+        if !roles.insert(role.role) || role.models.is_empty() {
+            return Err(invalid_results(
+                &field,
+                "role observations must be unique and contain at least one model",
+            ));
+        }
+        for model in &role.models {
+            require_result_nonempty(&format!("{field}.roles.models"), model)?;
+        }
+    }
+    let mut lens_ids = BTreeSet::new();
+    for lens in &record.review_lenses {
+        if !lens_ids.insert(lens.lens_id.as_str()) || lens.dispatch_count == 0 {
+            return Err(invalid_results(
+                &field,
+                "review-lens observations must be unique and have a nonzero dispatch count",
+            ));
+        }
+        require_result_nonempty(&format!("{field}.review_lenses.lens_id"), &lens.lens_id)?;
+        require_result_nonempty(
+            &format!("{field}.review_lenses.backend_id"),
+            &lens.backend_id,
+        )?;
+        require_result_nonempty(&format!("{field}.review_lenses.model"), &lens.model)?;
     }
     Ok(())
 }
@@ -1548,6 +1900,14 @@ fn summarize_profiles(
     manifest: &EvaluationManifest,
     runs: &[EvaluationRepetitionResult],
 ) -> Result<(Vec<ProfileSummary>, Vec<ParetoPoint>), EvaluationError> {
+    summarize_profiles_with_pareto(manifest, runs, true)
+}
+
+fn summarize_profiles_with_pareto(
+    manifest: &EvaluationManifest,
+    runs: &[EvaluationRepetitionResult],
+    pareto_allowed: bool,
+) -> Result<(Vec<ProfileSummary>, Vec<ParetoPoint>), EvaluationError> {
     let mut summaries = Vec::with_capacity(manifest.profiles.len());
     for profile in &manifest.profiles {
         let profile_runs = runs
@@ -1695,11 +2055,13 @@ fn summarize_profiles(
         });
     }
 
-    for index in 0..summaries.len() {
-        let dominated = summaries.iter().enumerate().any(|(other_index, other)| {
-            other_index != index && dominates(other, &summaries[index])
-        });
-        summaries[index].pareto_optimal = !dominated;
+    if pareto_allowed {
+        for index in 0..summaries.len() {
+            let dominated = summaries.iter().enumerate().any(|(other_index, other)| {
+                other_index != index && dominates(other, &summaries[index])
+            });
+            summaries[index].pareto_optimal = !dominated;
+        }
     }
     let mut frontier = summaries
         .iter()
@@ -1767,7 +2129,10 @@ fn evaluation_summaries_equivalent(left: &EvaluationSummary, right: &EvaluationS
         && left.fake_seed == right.fake_seed
         && left.evidence == right.evidence
         && left.declared_inputs_digest == right.declared_inputs_digest
+        && left.dispatch_comparability_claim == right.dispatch_comparability_claim
+        && left.dispatch_comparisons == right.dispatch_comparisons
         && profile_summaries_equivalent(&left.profile_summaries, &right.profile_summaries)
+        && left.pareto_conclusion == right.pareto_conclusion
         && pareto_frontiers_equivalent(&left.pareto_frontier, &right.pareto_frontier)
 }
 
@@ -2031,6 +2396,10 @@ impl fmt::Display for EvaluationEvidenceKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::autopilot::{
+        AutopilotProfile, AutopilotProfileExecutionBindingReport,
+        AutopilotReviewLensExecutionBinding, AutopilotRoleModelExecutionBinding,
+    };
     use serde_json::json;
 
     const FIXTURE_PLAN: &[u8] =
@@ -2164,6 +2533,123 @@ mod tests {
         }
     }
 
+    fn complete_observed_binding(
+        role_model: &str,
+        lens_model: &str,
+    ) -> AutopilotProfileBindingReport {
+        AutopilotProfileBindingReport {
+            version: 3,
+            status: AutopilotProfileBindingStatus::Matched,
+            configuration_status: AutopilotProfileBindingStatus::Matched,
+            requested: AutopilotProfile::default(),
+            effective: None,
+            execution: Some(AutopilotProfileExecutionBindingReport {
+                role_models: vec![AutopilotRoleModelExecutionBinding {
+                    role: AgentRole::Worker,
+                    requested: model("requested-plan-value-must-not-be-observed", ""),
+                    observed_models: vec![role_model.to_string()],
+                    observation: RoleUsageObservation::ProcessObserved,
+                    status: AutopilotProfileBindingStatus::Matched,
+                    unavailable_reason: None,
+                }],
+                review_lenses: vec![AutopilotReviewLensExecutionBinding {
+                    lens_id: "quality-lens".to_string(),
+                    requested_backend_id: "requested-provider-must-not-be-observed".to_string(),
+                    requested_model: "requested-model-must-not-be-observed".to_string(),
+                    requested_reasoning_effort: Some("requested-effort".to_string()),
+                    observed_backend_id: Some("observed-provider".to_string()),
+                    observed_model: Some(lens_model.to_string()),
+                    observed_reasoning_effort: Some("xhigh".to_string()),
+                    dispatch_count: 1,
+                    observation: RoleUsageObservation::ProcessObserved,
+                    status: AutopilotProfileBindingStatus::Matched,
+                    unavailable_reason: None,
+                }],
+                unavailable_reason: None,
+            }),
+            failure: None,
+        }
+    }
+
+    #[test]
+    fn different_complete_a4_observations_ground_only_a_dispatch_difference() {
+        let left = observed_dispatch_record_from_profile_binding(&complete_observed_binding(
+            "observed-worker-a",
+            "observed-review-a",
+        ))
+        .expect("complete left dispatch evidence");
+        let right = observed_dispatch_record_from_profile_binding(&complete_observed_binding(
+            "observed-worker-b",
+            "observed-review-b",
+        ))
+        .expect("complete right dispatch evidence");
+
+        assert_eq!(
+            compare_observed_dispatch_records(Some(&left), Some(&right)),
+            RequirementFourComparability::DispatchGroundedSelectionsDiffer
+        );
+        let claim = DispatchComparabilityClaim::dispatch_only();
+        assert_eq!(claim.scope, EvaluationComparabilityScope::Dispatch);
+        assert!(!claim.provider_execution_difference_established);
+        assert!(claim.notice.contains("does not establish"));
+    }
+
+    #[test]
+    fn configured_difference_without_observed_selection_is_incomparable() {
+        let mut absent = complete_observed_binding("observed-worker", "observed-review");
+        absent.status = AutopilotProfileBindingStatus::Incomparable;
+        absent.execution = None;
+        absent.requested.role_models.insert(
+            AgentRole::Worker,
+            model("configured-only-difference", "high"),
+        );
+
+        assert!(observed_dispatch_record_from_profile_binding(&absent).is_err());
+        assert_eq!(
+            compare_observed_dispatch_records(None, None),
+            RequirementFourComparability::Incomparable
+        );
+    }
+
+    #[test]
+    fn one_incomparable_run_refuses_pareto_among_otherwise_grounded_comparisons() {
+        let manifest = manifest();
+        let mut results = run_fake(&manifest, 71).expect("fake result shell");
+        for run in &mut results.runs {
+            let model = if run.profile_id == manifest.profiles[0].id {
+                "observed-a"
+            } else {
+                "observed-b"
+            };
+            run.observed_dispatch = Some(
+                observed_dispatch_record_from_profile_binding(&complete_observed_binding(
+                    model, model,
+                ))
+                .expect("complete observed dispatch"),
+            );
+        }
+        results.runs[0].observed_dispatch = None;
+
+        let comparisons =
+            compare_same_repetition_dispatches(&manifest, &results.runs).expect("comparisons");
+        assert!(comparisons.iter().any(|comparison| {
+            comparison.comparability
+                == RequirementFourComparability::DispatchGroundedSelectionsDiffer
+        }));
+        assert!(comparisons.iter().any(|comparison| {
+            comparison.comparability == RequirementFourComparability::Incomparable
+        }));
+        let conclusion = pareto_conclusion(&comparisons, &results.runs);
+        assert_eq!(
+            conclusion.status,
+            ParetoConclusionStatus::RefusedIncomparableDispatchEvidence
+        );
+        let (summaries, frontier) = summarize_profiles_with_pareto(&manifest, &results.runs, false)
+            .expect("descriptive summaries without Pareto");
+        assert!(frontier.is_empty());
+        assert!(summaries.iter().all(|summary| !summary.pareto_optimal));
+    }
+
     #[test]
     fn committed_fixtures_match_the_deterministic_harness() {
         let manifest = committed_manifest();
@@ -2280,19 +2766,21 @@ mod tests {
             assert!(run.metrics.quality.anti_shortcut_basis_points <= BASIS_POINTS);
         }
 
-        assert!(!results.pareto_frontier.is_empty());
+        assert!(results.pareto_frontier.is_empty());
+        assert_eq!(
+            results.pareto_conclusion.status,
+            ParetoConclusionStatus::RefusedIncomparableDispatchEvidence
+        );
         assert!(results.profile_summaries.iter().all(|summary| {
             summary
                 .aggregate_role_usage
                 .values()
                 .all(|report| report.observation == RoleUsageObservation::SyntheticFake)
         }));
-        assert!(results.pareto_frontier.iter().all(|point| {
-            point.quality_basis_points.total > 0
-                && point.held_out_basis_points.total > 0
-                && point.breadth_basis_points.total > 0
-                && point.anti_shortcut_basis_points.total > 0
-        }));
+        assert!(results
+            .profile_summaries
+            .iter()
+            .all(|summary| !summary.pareto_optimal));
         let frontier_profiles = results
             .pareto_frontier
             .iter()
@@ -2404,7 +2892,11 @@ mod tests {
         assert!(!first.evidence.eligible_to_justify_named_default);
         assert_eq!(first.runs.len(), 6);
         assert_eq!(first.profile_summaries.len(), 2);
-        assert!(!first.pareto_frontier.is_empty());
+        assert!(first.pareto_frontier.is_empty());
+        assert_eq!(
+            first.pareto_conclusion.status,
+            ParetoConclusionStatus::RefusedIncomparableDispatchEvidence
+        );
 
         let fake_run_ids = first
             .runs
@@ -2971,5 +3463,59 @@ mod tests {
         shortcut.mean_cost_usd = 0.5;
         assert!(!dominates(&high_quality, &shortcut));
         assert!(!dominates(&shortcut, &high_quality));
+    }
+
+    #[test]
+    fn loc_or_held_out_pass_inflation_alone_cannot_win_quality() {
+        let perfect_held_out = vec![HeldOutValidationResult {
+            id: "held-out".to_string(),
+            assertions_run: 100,
+            assertions_passed: 100,
+            passed: true,
+        }];
+        let shortcut_only = ReviewQuality {
+            breadth: ReviewDimension {
+                checks_run: 10,
+                checks_passed: 0,
+            },
+            anti_shortcut: ReviewDimension {
+                checks_run: 10,
+                checks_passed: 0,
+            },
+            findings: Vec::new(),
+        };
+        let broad_review = ReviewQuality {
+            breadth: ReviewDimension {
+                checks_run: 10,
+                checks_passed: 10,
+            },
+            anti_shortcut: ReviewDimension {
+                checks_run: 10,
+                checks_passed: 10,
+            },
+            findings: Vec::new(),
+        };
+        let shortcut_quality =
+            calculate_quality(&perfect_held_out, &shortcut_only).expect("shortcut quality");
+        let broad_quality =
+            calculate_quality(&perfect_held_out, &broad_review).expect("broad quality");
+        assert_eq!(shortcut_quality.held_out_basis_points, BASIS_POINTS);
+        assert!(shortcut_quality.overall_basis_points < broad_quality.overall_basis_points);
+
+        let results = run_fake(&manifest(), 73).expect("fake summary shells");
+        let mut inflated = results.profile_summaries[0].clone();
+        inflated.mean_cost_usd = 1.0;
+        inflated.mean_loc_added = PreciseMean {
+            total: u64::MAX,
+            count: 1,
+        };
+        inflated.mean_quality = precise_quality(shortcut_quality);
+        let mut broad = results.profile_summaries[1].clone();
+        broad.mean_cost_usd = 1.0;
+        broad.mean_loc_added = PreciseMean { total: 1, count: 1 };
+        broad.mean_quality = precise_quality(broad_quality);
+
+        assert!(dominates(&broad, &inflated));
+        assert!(!dominates(&inflated, &broad));
     }
 }
