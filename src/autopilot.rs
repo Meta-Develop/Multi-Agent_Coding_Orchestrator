@@ -31,8 +31,8 @@ use crate::{
     supervise::{
         self, AgentRole, CommandRunRecord, FindingSeverity, OrchestratorAssignment,
         ReviewLensUsageReport, ReviewStatus, RoleModelSelection, RoleUsageObservation,
-        RoleUsageReport, SupervisorFinalReport, SupervisorPlan, SupervisorRunOptions,
-        SupervisorRuntime, ValidationResult, WorkerAssignment,
+        RoleUsageReport, SupervisorConcurrencyPolicy, SupervisorFinalReport, SupervisorPlan,
+        SupervisorRunOptions, SupervisorRuntime, ValidationResult, WorkerAssignment,
     },
     sync::normalize_repo_relative_path,
     sync_store::SyncStore,
@@ -45,6 +45,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -915,6 +916,7 @@ fn run_autopilot_with_profile_and_retention(
     validate_autopilot_profile(&requested_profile)?;
 
     let repo = discover_repo_root(&options.repo)?;
+    let goal_derived_supervisor_plan = matches!(&source, AutopilotRunSource::GoalSpec { .. });
     let LoadedAutopilotPlan {
         plan,
         input_shape,
@@ -1123,7 +1125,7 @@ fn run_autopilot_with_profile_and_retention(
         prepublication_stage: "not_dispatched_manual_integration".to_string(),
         repair_reason: None,
     };
-    let supervisor = match supervise::run_supervisor_plan_file(SupervisorRunOptions {
+    let supervisor_options = SupervisorRunOptions {
         repo: repo.clone(),
         plan_file: supervisor_plan_path,
         run_id: supervisor_run_id,
@@ -1133,7 +1135,21 @@ fn run_autopilot_with_profile_and_retention(
         // outer typed dirty-primary gate already handled operator worktree state.
         allow_dirty_primary: true,
         machine_global_retention: Some(machine_global_retention),
-    }) {
+    };
+    // Goal decomposition can admit multiple independent planning roots. Capability-bound
+    // worktree creation revalidates one shared repository-cleanliness capability before and after
+    // each create, so overlapping creates can invalidate a peer's held Git-directory generation.
+    // Keep only this trusted multi-root source serial until creation itself has a serialized
+    // capability boundary; authored one-assignment Autopilot behavior remains unchanged.
+    let supervisor_result = if goal_derived_supervisor_plan {
+        supervise::run_supervisor_plan_file_with_concurrency_policy(
+            supervisor_options,
+            SupervisorConcurrencyPolicy::Fixed(NonZeroUsize::MIN),
+        )
+    } else {
+        supervise::run_supervisor_plan_file(supervisor_options)
+    };
+    let supervisor = match supervisor_result {
         Ok(supervisor) => supervisor,
         Err(error) => {
             profile_binding.mark_execution_incomparable(
