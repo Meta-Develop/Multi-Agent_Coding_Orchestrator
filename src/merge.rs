@@ -3,14 +3,18 @@ use crate::{
     worktree::{normalize_agent_id, WorktreeManager, WorktreeRecord},
 };
 use anyhow::{bail, Context, Result};
-use git2::{ErrorCode, Oid, Repository, Status, StatusOptions};
+use git2::{Delta, DiffOptions, ErrorCode, Oid, Repository, Status, StatusOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env,
+    ffi::OsStr,
+    fs,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 pub const DEFAULT_DIFF_SUMMARY_CHAR_LIMIT: usize = 32 * 1024;
@@ -29,11 +33,18 @@ pub struct MergeCollectOptions {
 pub struct MergePreviewOptions {
     pub collect: MergeCollectOptions,
     pub forces: MergeForceOptions,
+    pub require_validation: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeApplyOptions {
     pub preview: MergePreviewOptions,
+    pub candidate_validation_commands: Vec<CandidateValidationCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateValidationCommand {
+    pub command: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -130,6 +141,9 @@ pub struct MergeApplySafety {
     pub apply_check: SafetyCheck,
     pub unclaimed_edits: SafetyCheck,
     pub validation: SafetyCheck,
+    pub validation_required: bool,
+    pub candidate_validation_commands: Vec<String>,
+    pub force_options: MergeForceOptions,
     pub apply_mode: ApplyMode,
     pub readiness: ApplyReadiness,
 }
@@ -182,6 +196,9 @@ pub enum ApplyBlocker {
     StaleBase,
     ApplyCheckFailed,
     UnclaimedEdits,
+    ValidationMissing,
+    ValidationNotRun,
+    ValidationSkipped,
     ValidationFailed,
 }
 
@@ -192,6 +209,9 @@ pub struct ApplyBlockerDetail {
     pub check_status: SafetyCheckStatus,
     pub paths: Vec<PathBuf>,
     pub message: Option<String>,
+    pub validation_reports: Vec<ValidationReport>,
+    pub validation_commands: Vec<String>,
+    pub next_safe_operation: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -248,13 +268,14 @@ pub fn collect_agent_result(options: MergeCollectOptions) -> Result<MergeCandida
 
     let metadata = collect_metadata(&primary_repo, &agent_repo, &record, repo_root)?;
     let claimed_paths = normalize_claim_paths(options.claimed_paths)?;
-    let changes = collect_changed_paths(&agent_repo)?;
+    let diff_base = collection_base_oid(&metadata)?;
+    let changes = collect_changed_paths(&agent_repo, diff_base)?;
     let changed_paths = changes
         .iter()
         .map(|change| change.path.clone())
         .collect::<Vec<_>>();
     let unclaimed_changed_paths = unclaimed_paths(&changed_paths, &claimed_paths);
-    let full_diff = collect_full_diff(&record.path)?;
+    let full_diff = collect_full_diff(&record.path, diff_base)?;
     let diff = DiffOutput {
         summary: summarize_text(&full_diff, options.diff_summary_char_limit),
         full: options.include_full_diff.then_some(full_diff),
@@ -276,11 +297,12 @@ pub fn preview_merge_apply(options: MergePreviewOptions) -> Result<MergeApplyPre
     collect.include_full_diff = true;
     let candidate = collect_agent_result(collect)?;
     let patch = candidate.diff.full.as_deref().unwrap_or_default();
+    let candidate_validation_commands = Vec::new();
 
     let dirty_primary = dirty_primary_check(&candidate.metadata.primary_repo_root)?;
     let stale_base = stale_base_check(&candidate.metadata);
     let unclaimed_edits = unclaimed_edits_check(&candidate.unclaimed_changed_paths);
-    let validation = validation_check(&candidate.validations);
+    let validation = validation_check(&candidate.validations, options.require_validation);
     let (apply_check, apply_mode) = apply_check(
         &candidate.metadata.primary_repo_root,
         patch,
@@ -292,6 +314,10 @@ pub fn preview_merge_apply(options: MergePreviewOptions) -> Result<MergeApplyPre
         apply_check: &apply_check,
         unclaimed_edits: &unclaimed_edits,
         validation: &validation,
+        validations: &candidate.validations,
+        require_validation: options.require_validation,
+        validation_commands: &candidate_validation_commands,
+        validation_related_paths: &candidate.changed_paths,
     };
     let readiness = classify_apply_safety(checks, &options.forces);
 
@@ -303,6 +329,9 @@ pub fn preview_merge_apply(options: MergePreviewOptions) -> Result<MergeApplyPre
             apply_check,
             unclaimed_edits,
             validation,
+            validation_required: options.require_validation,
+            candidate_validation_commands,
+            force_options: options.forces,
             apply_mode,
             readiness,
         },
@@ -310,15 +339,33 @@ pub fn preview_merge_apply(options: MergePreviewOptions) -> Result<MergeApplyPre
 }
 
 pub fn apply_merge_result(options: MergeApplyOptions) -> Result<MergeApplyReport> {
-    let preview = preview_merge_apply(options.preview)?;
-    if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
+    let report = merge_apply_report(options)?;
+    if report.status == MergeApplyReportStatus::Blocked {
         bail!(
             "merge apply refused: {}",
-            format_blockers(&preview.safety.readiness.blockers)
+            format_blockers(&report.preview.safety.readiness.blockers)
         );
     }
 
-    apply_prechecked_merge(preview)
+    Ok(report)
+}
+
+pub fn merge_apply_report(options: MergeApplyOptions) -> Result<MergeApplyReport> {
+    let mut preview_options = options.preview;
+    let require_validation_after_candidate = preview_options.require_validation;
+    if !options.candidate_validation_commands.is_empty() {
+        preview_options.require_validation = false;
+    }
+    let preview = preview_merge_apply(preview_options)?;
+    if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
+        return Ok(blocked_merge_apply_report(preview));
+    }
+
+    apply_prechecked_merge_with_candidate_validation(
+        preview,
+        options.candidate_validation_commands,
+        require_validation_after_candidate,
+    )
 }
 
 pub fn blocked_merge_apply_report(preview: MergeApplyPreview) -> MergeApplyReport {
@@ -342,6 +389,14 @@ pub fn blocked_merge_apply_report(preview: MergeApplyPreview) -> MergeApplyRepor
 }
 
 pub fn apply_prechecked_merge(preview: MergeApplyPreview) -> Result<MergeApplyReport> {
+    apply_prechecked_merge_with_candidate_validation(preview, Vec::new(), false)
+}
+
+pub fn apply_prechecked_merge_with_candidate_validation(
+    mut preview: MergeApplyPreview,
+    candidate_validation_commands: Vec<CandidateValidationCommand>,
+    require_validation_after_candidate: bool,
+) -> Result<MergeApplyReport> {
     if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
         bail!(
             "merge apply refused: {}",
@@ -363,6 +418,51 @@ pub fn apply_prechecked_merge(preview: MergeApplyPreview) -> Result<MergeApplyRe
 
     if preview.safety.apply_check.status != SafetyCheckStatus::Passed {
         bail!("merge apply refused: git apply check did not pass");
+    }
+
+    if !candidate_validation_commands.is_empty() {
+        let command_labels = candidate_validation_commands
+            .iter()
+            .map(|command| command.command.clone())
+            .collect::<Vec<_>>();
+        let reports = run_candidate_validation_commands(&preview, &candidate_validation_commands)?;
+        preview.candidate.validations.extend(reports);
+        preview.safety.candidate_validation_commands = command_labels;
+        preview.safety.validation_required = true;
+        preview.safety.validation = validation_check(&preview.candidate.validations, true);
+        let checks = SafetyChecks {
+            dirty_primary: &preview.safety.dirty_primary,
+            stale_base: &preview.safety.stale_base,
+            apply_check: &preview.safety.apply_check,
+            unclaimed_edits: &preview.safety.unclaimed_edits,
+            validation: &preview.safety.validation,
+            validations: &preview.candidate.validations,
+            require_validation: true,
+            validation_commands: &preview.safety.candidate_validation_commands,
+            validation_related_paths: &preview.candidate.changed_paths,
+        };
+        preview.safety.readiness = classify_apply_safety(checks, &preview.safety.force_options);
+        if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
+            return Ok(blocked_merge_apply_report(preview));
+        }
+    } else if require_validation_after_candidate {
+        preview.safety.validation_required = true;
+        preview.safety.validation = validation_check(&preview.candidate.validations, true);
+        let checks = SafetyChecks {
+            dirty_primary: &preview.safety.dirty_primary,
+            stale_base: &preview.safety.stale_base,
+            apply_check: &preview.safety.apply_check,
+            unclaimed_edits: &preview.safety.unclaimed_edits,
+            validation: &preview.safety.validation,
+            validations: &preview.candidate.validations,
+            require_validation: true,
+            validation_commands: &preview.safety.candidate_validation_commands,
+            validation_related_paths: &preview.candidate.changed_paths,
+        };
+        preview.safety.readiness = classify_apply_safety(checks, &preview.safety.force_options);
+        if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
+            return Ok(blocked_merge_apply_report(preview));
+        }
     }
 
     let args = match preview.safety.apply_mode {
@@ -501,7 +601,20 @@ fn collect_metadata(
     })
 }
 
-fn collect_changed_paths(repo: &Repository) -> Result<Vec<ChangedPath>> {
+fn collection_base_oid(metadata: &WorktreeMergeMetadata) -> Result<Option<Oid>> {
+    metadata
+        .merge_base
+        .as_deref()
+        .or(metadata.primary_head.as_deref())
+        .map(|oid| Oid::from_str(oid).context("failed to parse collection base oid"))
+        .transpose()
+}
+
+fn collect_changed_paths(repo: &Repository, base_oid: Option<Oid>) -> Result<Vec<ChangedPath>> {
+    if let Some(base_oid) = base_oid {
+        return collect_changed_paths_since_base(repo, base_oid);
+    }
+
     let mut options = StatusOptions::new();
     options
         .include_untracked(true)
@@ -524,14 +637,81 @@ fn collect_changed_paths(repo: &Repository) -> Result<Vec<ChangedPath>> {
         .collect())
 }
 
-fn collect_full_diff(worktree_path: &Path) -> Result<String> {
-    let tracked =
-        run_git_capture(worktree_path, &["diff", "--binary", "HEAD"]).with_context(|| {
-            format!(
-                "failed to collect tracked diff in {}",
-                worktree_path.display()
-            )
-        })?;
+fn collect_changed_paths_since_base(repo: &Repository, base_oid: Oid) -> Result<Vec<ChangedPath>> {
+    let base_commit = repo
+        .find_commit(base_oid)
+        .with_context(|| format!("failed to find base commit {base_oid}"))?;
+    let base_tree = base_commit
+        .tree()
+        .with_context(|| format!("failed to read tree for base commit {base_oid}"))?;
+    let mut options = DiffOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_typechange(true);
+    let diff = repo
+        .diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut options))
+        .context("failed to diff worktree against base commit")?;
+    let mut changes = BTreeMap::<PathBuf, ChangeKind>::new();
+    diff.foreach(
+        &mut |delta, _| {
+            collect_delta_changes(delta, &mut changes);
+            true
+        },
+        None,
+        None,
+        None,
+    )
+    .context("failed to inspect changed paths")?;
+
+    Ok(changes
+        .into_iter()
+        .map(|(path, kind)| ChangedPath { path, kind })
+        .collect())
+}
+
+fn collect_delta_changes(delta: git2::DiffDelta<'_>, changes: &mut BTreeMap<PathBuf, ChangeKind>) {
+    let kind = classify_delta(delta.status());
+    match delta.status() {
+        Delta::Deleted => {
+            insert_delta_change(delta.old_file().path(), kind, changes);
+        }
+        Delta::Renamed | Delta::Copied => {
+            insert_delta_change(delta.old_file().path(), kind, changes);
+            insert_delta_change(delta.new_file().path(), kind, changes);
+        }
+        _ => {
+            insert_delta_change(delta.new_file().path(), kind, changes);
+        }
+    }
+}
+
+fn insert_delta_change(
+    path: Option<&Path>,
+    kind: ChangeKind,
+    changes: &mut BTreeMap<PathBuf, ChangeKind>,
+) {
+    if let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) {
+        changes.insert(path.to_path_buf(), kind);
+    }
+}
+
+fn collect_full_diff(worktree_path: &Path, base_oid: Option<Oid>) -> Result<String> {
+    let mut args = vec!["diff", "--binary"];
+    let base_arg;
+    if let Some(base_oid) = base_oid {
+        base_arg = base_oid.to_string();
+        args.push(base_arg.as_str());
+    } else {
+        args.push("HEAD");
+    }
+
+    let tracked = run_git_capture(worktree_path, &args).with_context(|| {
+        format!(
+            "failed to collect tracked diff in {}",
+            worktree_path.display()
+        )
+    })?;
     if !tracked.success {
         bail!(
             "git diff failed: {}",
@@ -594,9 +774,10 @@ fn collect_untracked_paths(worktree_path: &Path) -> Result<Vec<PathBuf>> {
 fn dirty_primary_check(repo_root: &Path) -> Result<SafetyCheck> {
     let repo = Repository::open(repo_root)
         .with_context(|| format!("failed to open primary repository {}", repo_root.display()))?;
-    let paths = collect_changed_paths(&repo)?
+    let paths = collect_changed_paths(&repo, None)?
         .into_iter()
         .map(|change| change.path)
+        .filter(|path| !is_local_runtime_path(path))
         .collect::<Vec<_>>();
 
     if paths.is_empty() {
@@ -612,6 +793,14 @@ fn dirty_primary_check(repo_root: &Path) -> Result<SafetyCheck> {
             paths,
         })
     }
+}
+
+fn is_local_runtime_path(path: &Path) -> bool {
+    matches!(
+        path.components().next(),
+        Some(std::path::Component::Normal(name))
+            if name == OsStr::new(".maco") || name == OsStr::new(".maco-cache")
+    )
 }
 
 fn stale_base_check(metadata: &WorktreeMergeMetadata) -> SafetyCheck {
@@ -650,7 +839,7 @@ fn unclaimed_edits_check(paths: &[PathBuf]) -> SafetyCheck {
     }
 }
 
-fn validation_check(validations: &[ValidationReport]) -> SafetyCheck {
+fn validation_check(validations: &[ValidationReport], require_validation: bool) -> SafetyCheck {
     let failed = failed_validation_paths(validations);
 
     if !failed.is_empty() {
@@ -659,6 +848,38 @@ fn validation_check(validations: &[ValidationReport]) -> SafetyCheck {
             message: Some("one or more validation checks failed".to_string()),
             paths: failed,
         };
+    }
+    if require_validation {
+        if validations.is_empty() {
+            return SafetyCheck {
+                status: SafetyCheckStatus::Failed,
+                message: Some("required validation evidence was not supplied".to_string()),
+                paths: Vec::new(),
+            };
+        }
+        if validations
+            .iter()
+            .all(|validation| validation.status != ValidationStatus::Passed)
+        {
+            let message = if validations
+                .iter()
+                .any(|validation| validation.status == ValidationStatus::NotRun)
+            {
+                "required validation evidence has not run"
+            } else if validations
+                .iter()
+                .any(|validation| validation.status == ValidationStatus::Skipped)
+            {
+                "required validation evidence was skipped"
+            } else {
+                "required validation evidence has no passing checks"
+            };
+            return SafetyCheck {
+                status: SafetyCheckStatus::Failed,
+                message: Some(message.to_string()),
+                paths: failed_validation_paths(validations),
+            };
+        }
     }
     if validations
         .iter()
@@ -782,12 +1003,178 @@ fn apply_check(
     ))
 }
 
+fn run_candidate_validation_commands(
+    preview: &MergeApplyPreview,
+    commands: &[CandidateValidationCommand],
+) -> Result<Vec<ValidationReport>> {
+    let sandbox = CandidateValidationSandbox::create(preview)?;
+    let mut reports = Vec::new();
+    for (index, command) in commands.iter().enumerate() {
+        reports.push(run_candidate_validation_command(
+            sandbox.path(),
+            command,
+            index,
+            &preview.candidate.changed_paths,
+        ));
+    }
+    Ok(reports)
+}
+
+struct CandidateValidationSandbox {
+    primary_repo_root: PathBuf,
+    path: PathBuf,
+}
+
+impl CandidateValidationSandbox {
+    fn create(preview: &MergeApplyPreview) -> Result<Self> {
+        let primary_repo_root = preview.candidate.metadata.primary_repo_root.clone();
+        let path = candidate_validation_sandbox_path(&primary_repo_root)?;
+        let add_output = Command::new("git")
+            .arg("-C")
+            .arg(&primary_repo_root)
+            .args(["worktree", "add", "--detach", "--force"])
+            .arg(&path)
+            .arg("HEAD")
+            .output()
+            .with_context(|| {
+                format!(
+                    "failed to create candidate validation worktree {}",
+                    path.display()
+                )
+            })?;
+        if !add_output.status.success() {
+            bail!(
+                "failed to create candidate validation worktree: {}",
+                String::from_utf8_lossy(&add_output.stderr).trim()
+            );
+        }
+        let sandbox = Self {
+            primary_repo_root,
+            path,
+        };
+
+        let patch = preview.candidate.diff.full.as_deref().unwrap_or_default();
+        let args = match preview.safety.apply_mode {
+            ApplyMode::Direct => vec!["apply", "--binary"],
+            ApplyMode::ThreeWay => vec!["apply", "--3way", "--binary"],
+            ApplyMode::None => Vec::new(),
+        };
+        if !args.is_empty() {
+            let apply_output = run_git_with_input(&sandbox.path, &args, patch)
+                .context("failed to apply candidate patch to validation worktree")?;
+            if !apply_output.success {
+                bail!(
+                    "failed to apply candidate patch to validation worktree: {}",
+                    String::from_utf8_lossy(&apply_output.stderr).trim()
+                );
+            }
+        }
+
+        Ok(sandbox)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for CandidateValidationSandbox {
+    fn drop(&mut self) {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&self.primary_repo_root)
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.path)
+            .output();
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn candidate_validation_sandbox_path(primary_repo_root: &Path) -> Result<PathBuf> {
+    let repo_name = primary_repo_root
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("repo");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time before UNIX epoch")?
+        .as_nanos();
+    Ok(env::temp_dir().join(format!(
+        "maco-candidate-validation-{repo_name}-{}-{nanos}",
+        std::process::id()
+    )))
+}
+
+fn run_candidate_validation_command(
+    worktree_path: &Path,
+    validation: &CandidateValidationCommand,
+    index: usize,
+    changed_paths: &[PathBuf],
+) -> ValidationReport {
+    let output = shell_command(&validation.command)
+        .current_dir(worktree_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+
+    match output {
+        Ok(output) => {
+            let passed = output.status.success();
+            ValidationReport {
+                name: format!("candidate validation {}", index + 1),
+                status: if passed {
+                    ValidationStatus::Passed
+                } else {
+                    ValidationStatus::Failed
+                },
+                message: candidate_validation_message(&output),
+                paths: if passed {
+                    Vec::new()
+                } else {
+                    changed_paths.to_vec()
+                },
+            }
+        }
+        Err(error) => ValidationReport {
+            name: format!("candidate validation {}", index + 1),
+            status: ValidationStatus::Failed,
+            message: Some(format!("failed to run validation command: {error}")),
+            paths: changed_paths.to_vec(),
+        },
+    }
+}
+
+fn candidate_validation_message(output: &std::process::Output) -> Option<String> {
+    if output.status.success() {
+        return None;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let text = if !stderr.trim().is_empty() {
+        stderr.trim()
+    } else if !stdout.trim().is_empty() {
+        stdout.trim()
+    } else {
+        "candidate validation command failed"
+    };
+    let exit = output
+        .status
+        .code()
+        .map(|code| format!("exited with status {code}"))
+        .unwrap_or_else(|| "terminated without an exit code".to_string());
+    Some(format!("{exit}: {}", summarize_text(text, 1024).text))
+}
+
 struct SafetyChecks<'a> {
     dirty_primary: &'a SafetyCheck,
     stale_base: &'a SafetyCheck,
     apply_check: &'a SafetyCheck,
     unclaimed_edits: &'a SafetyCheck,
     validation: &'a SafetyCheck,
+    validations: &'a [ValidationReport],
+    require_validation: bool,
+    validation_commands: &'a [String],
+    validation_related_paths: &'a [PathBuf],
 }
 
 fn classify_apply_safety(checks: SafetyChecks<'_>, forces: &MergeForceOptions) -> ApplyReadiness {
@@ -807,11 +1194,6 @@ fn classify_apply_safety(checks: SafetyChecks<'_>, forces: &MergeForceOptions) -
             checks.unclaimed_edits,
             ApplyBlocker::UnclaimedEdits,
             forces.allow_unclaimed_edits,
-        ),
-        (
-            checks.validation,
-            ApplyBlocker::ValidationFailed,
-            forces.allow_validation_failures,
         ),
     ];
     let mut blockers = Vec::new();
@@ -835,7 +1217,18 @@ fn classify_apply_safety(checks: SafetyChecks<'_>, forces: &MergeForceOptions) -
             check_status: check.status,
             paths: check.paths.clone(),
             message: check.message.clone(),
+            validation_reports: Vec::new(),
+            validation_commands: Vec::new(),
+            next_safe_operation: None,
         });
+    }
+
+    for detail in validation_blocker_details(&checks, forces) {
+        match detail.disposition {
+            ApplyBlockerDisposition::Blocked => blockers.push(detail.kind),
+            ApplyBlockerDisposition::Forced => forced.push(detail.kind),
+        }
+        details.push(detail);
     }
 
     let status = if !blockers.is_empty() {
@@ -852,6 +1245,127 @@ fn classify_apply_safety(checks: SafetyChecks<'_>, forces: &MergeForceOptions) -
         forced,
         details,
     }
+}
+
+fn validation_blocker_details(
+    checks: &SafetyChecks<'_>,
+    forces: &MergeForceOptions,
+) -> Vec<ApplyBlockerDetail> {
+    if checks.validation.status != SafetyCheckStatus::Failed {
+        return Vec::new();
+    }
+
+    let mut details = Vec::new();
+    let failed = reports_with_status(checks.validations, ValidationStatus::Failed);
+    if !failed.is_empty() {
+        details.push(validation_blocker_detail(
+            ApplyBlocker::ValidationFailed,
+            checks,
+            failed,
+            !checks.require_validation && forces.allow_validation_failures,
+            "run the failing validation command again after fixing the reported paths",
+        ));
+    }
+
+    if checks.require_validation {
+        if checks.validations.is_empty() {
+            details.push(validation_blocker_detail(
+                ApplyBlocker::ValidationMissing,
+                checks,
+                Vec::new(),
+                false,
+                "supply --validation-report with at least one passed check or run merge apply --validation-command <command>",
+            ));
+            return details;
+        }
+
+        if !checks
+            .validations
+            .iter()
+            .any(|validation| validation.status == ValidationStatus::Passed)
+        {
+            let not_run = reports_with_status(checks.validations, ValidationStatus::NotRun);
+            if !not_run.is_empty() {
+                details.push(validation_blocker_detail(
+                    ApplyBlocker::ValidationNotRun,
+                    checks,
+                    not_run,
+                    false,
+                    "run the pending validation command and provide a passed validation report",
+                ));
+            }
+            let skipped = reports_with_status(checks.validations, ValidationStatus::Skipped);
+            if !skipped.is_empty() {
+                details.push(validation_blocker_detail(
+                    ApplyBlocker::ValidationSkipped,
+                    checks,
+                    skipped,
+                    false,
+                    "run the skipped validation command and provide a passed validation report",
+                ));
+            }
+            if details.is_empty() {
+                details.push(validation_blocker_detail(
+                    ApplyBlocker::ValidationMissing,
+                    checks,
+                    checks.validations.to_vec(),
+                    false,
+                    "provide at least one passed validation report",
+                ));
+            }
+        }
+    }
+
+    details
+}
+
+fn validation_blocker_detail(
+    kind: ApplyBlocker,
+    checks: &SafetyChecks<'_>,
+    reports: Vec<ValidationReport>,
+    force_allowed: bool,
+    next_safe_operation: &str,
+) -> ApplyBlockerDetail {
+    let paths = validation_detail_paths(&reports, checks.validation_related_paths);
+    ApplyBlockerDetail {
+        kind,
+        disposition: if force_allowed {
+            ApplyBlockerDisposition::Forced
+        } else {
+            ApplyBlockerDisposition::Blocked
+        },
+        check_status: checks.validation.status,
+        paths,
+        message: checks.validation.message.clone(),
+        validation_reports: reports,
+        validation_commands: checks.validation_commands.to_vec(),
+        next_safe_operation: Some(next_safe_operation.to_string()),
+    }
+}
+
+fn validation_detail_paths(
+    reports: &[ValidationReport],
+    validation_related_paths: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut paths = reports
+        .iter()
+        .flat_map(|report| report.paths.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if paths.is_empty() {
+        paths.extend(validation_related_paths.iter().cloned());
+    }
+    paths.into_iter().collect()
+}
+
+fn reports_with_status(
+    validations: &[ValidationReport],
+    status: ValidationStatus,
+) -> Vec<ValidationReport> {
+    validations
+        .iter()
+        .filter(|validation| validation.status == status)
+        .cloned()
+        .collect()
 }
 
 fn unclaimed_paths(changed_paths: &[PathBuf], claimed_paths: &[PathBuf]) -> Vec<PathBuf> {
@@ -908,6 +1422,19 @@ fn classify_status(status: Status) -> ChangeKind {
         ChangeKind::Modified
     } else {
         ChangeKind::Unknown
+    }
+}
+
+fn classify_delta(delta: Delta) -> ChangeKind {
+    match delta {
+        Delta::Added => ChangeKind::Added,
+        Delta::Modified => ChangeKind::Modified,
+        Delta::Deleted => ChangeKind::Deleted,
+        Delta::Renamed | Delta::Copied => ChangeKind::Renamed,
+        Delta::Typechange => ChangeKind::Typechange,
+        Delta::Untracked => ChangeKind::Untracked,
+        Delta::Conflicted => ChangeKind::Conflicted,
+        _ => ChangeKind::Unknown,
     }
 }
 
@@ -1002,6 +1529,21 @@ fn git_command(repo_root: &Path, args: &[&str]) -> Command {
     command
 }
 
+fn shell_command(command_text: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("cmd");
+        command.arg("/C").arg(command_text);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(command_text);
+        command
+    }
+}
+
 fn is_diff_exit(output: &GitCommandOutput) -> bool {
     !output.stdout.is_empty()
 }
@@ -1020,6 +1562,9 @@ fn blocker_label(blocker: ApplyBlocker) -> &'static str {
         ApplyBlocker::StaleBase => "stale_base",
         ApplyBlocker::ApplyCheckFailed => "apply_check_failed",
         ApplyBlocker::UnclaimedEdits => "unclaimed_edits",
+        ApplyBlocker::ValidationMissing => "validation_missing",
+        ApplyBlocker::ValidationNotRun => "validation_not_run",
+        ApplyBlocker::ValidationSkipped => "validation_skipped",
         ApplyBlocker::ValidationFailed => "validation_failed",
     }
 }
@@ -1171,6 +1716,7 @@ fn sort_validation_reports(reports: &mut [ValidationReport]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git2::Signature;
 
     #[test]
     fn classifies_unclaimed_paths_by_repo_relative_claim_coverage() {
@@ -1222,6 +1768,10 @@ mod tests {
             apply_check: &passed,
             unclaimed_edits: &failed,
             validation: &passed,
+            validations: &[],
+            require_validation: false,
+            validation_commands: &[],
+            validation_related_paths: &[],
         };
 
         let readiness = classify_apply_safety(checks, &MergeForceOptions::default());
@@ -1260,6 +1810,10 @@ mod tests {
             apply_check: &passed,
             unclaimed_edits: &passed,
             validation: &passed,
+            validations: &[],
+            require_validation: false,
+            validation_commands: &[],
+            validation_related_paths: &[],
         };
 
         let readiness = classify_apply_safety(
@@ -1301,6 +1855,10 @@ mod tests {
             apply_check: &failed,
             unclaimed_edits: &passed,
             validation: &passed,
+            validations: &[],
+            require_validation: false,
+            validation_commands: &[],
+            validation_related_paths: &[],
         };
 
         let readiness = classify_apply_safety(
@@ -1313,6 +1871,99 @@ mod tests {
 
         assert_eq!(readiness.status, ApplyReadinessStatus::Blocked);
         assert_eq!(readiness.blockers, vec![ApplyBlocker::ApplyCheckFailed]);
+    }
+
+    #[test]
+    fn candidate_validation_sandbox_is_removed_when_patch_apply_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir(&repo_path).expect("create repo dir");
+        let repo = Repository::init(&repo_path).expect("init repo");
+        fs::write(repo_path.join("README.md"), "# Smoke\n").expect("write readme");
+        let mut index = repo.index().expect("open index");
+        index.add_path(Path::new("README.md")).expect("add readme");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").expect("create signature");
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "initial commit",
+            &tree,
+            &[],
+        )
+        .expect("commit");
+
+        let passed = SafetyCheck {
+            status: SafetyCheckStatus::Passed,
+            message: None,
+            paths: Vec::new(),
+        };
+        let preview = MergeApplyPreview {
+            candidate: MergeCandidate {
+                metadata: WorktreeMergeMetadata {
+                    agent_id: "agent-a".to_string(),
+                    worktree_path: repo_path.clone(),
+                    branch: "maco/agent-a".to_string(),
+                    primary_repo_root: repo_path.clone(),
+                    primary_head: None,
+                    agent_head: None,
+                    merge_base: None,
+                    base_matches_primary: Some(true),
+                },
+                claimed_paths: vec![PathBuf::from("README.md")],
+                changed_paths: vec![PathBuf::from("README.md")],
+                changes: vec![ChangedPath {
+                    path: PathBuf::from("README.md"),
+                    kind: ChangeKind::Modified,
+                }],
+                unclaimed_changed_paths: Vec::new(),
+                diff: DiffOutput {
+                    summary: OutputSummary {
+                        text: "invalid patch".to_string(),
+                        truncated: false,
+                    },
+                    full: Some("this is not a patch\n".to_string()),
+                },
+                validations: Vec::new(),
+            },
+            safety: MergeApplySafety {
+                dirty_primary: passed.clone(),
+                stale_base: passed.clone(),
+                apply_check: passed.clone(),
+                unclaimed_edits: passed.clone(),
+                validation: passed,
+                validation_required: false,
+                candidate_validation_commands: Vec::new(),
+                force_options: MergeForceOptions::default(),
+                apply_mode: ApplyMode::Direct,
+                readiness: ApplyReadiness {
+                    status: ApplyReadinessStatus::Safe,
+                    blockers: Vec::new(),
+                    forced: Vec::new(),
+                    details: Vec::new(),
+                },
+            },
+        };
+
+        let result = CandidateValidationSandbox::create(&preview);
+
+        assert!(result.is_err());
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .expect("list worktrees");
+        assert!(output.status.success());
+        let worktrees = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !worktrees.contains("maco-candidate-validation-"),
+            "{worktrees}"
+        );
     }
 
     #[test]
@@ -1396,12 +2047,15 @@ error: src/lib.rs: does not match index
 
     #[test]
     fn validation_check_uses_explicit_paths_for_failures() {
-        let validation = validation_check(&[ValidationReport {
-            name: "unit".to_string(),
-            status: ValidationStatus::Failed,
-            message: Some("failed".to_string()),
-            paths: vec![PathBuf::from("src/lib.rs")],
-        }]);
+        let validation = validation_check(
+            &[ValidationReport {
+                name: "unit".to_string(),
+                status: ValidationStatus::Failed,
+                message: Some("failed".to_string()),
+                paths: vec![PathBuf::from("src/lib.rs")],
+            }],
+            false,
+        );
 
         assert_eq!(validation.status, SafetyCheckStatus::Failed);
         assert_eq!(validation.paths, vec![PathBuf::from("src/lib.rs")]);
