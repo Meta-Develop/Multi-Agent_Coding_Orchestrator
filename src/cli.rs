@@ -809,9 +809,11 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 match std::fs::symlink_metadata(&run_dir) {
                     Ok(_) => Some((repo, run_id)),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(error) => return Err(error).with_context(|| {
-                        format!("failed to inspect supervise run {}", run_dir.display())
-                    }),
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to inspect supervise run {}", run_dir.display())
+                        })
+                    }
                 }
             } else {
                 None

@@ -267,7 +267,10 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
                 || locator.identity.run_id != run_id
                 || locator.identity.run_directory_identity != *run_root.identity()
             {
-                bail!("{} first record locator has the wrong instance binding", S::NAMESPACE);
+                bail!(
+                    "{} first record locator has the wrong instance binding",
+                    S::NAMESPACE
+                );
             }
             Self {
                 authenticator,

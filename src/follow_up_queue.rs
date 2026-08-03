@@ -12,9 +12,7 @@ use crate::{
     artifacts::state_auth::{sha256_hex, AuthenticationDomain, RepositoryAuthenticator},
     external_agent::EnvironmentFailure,
     gate_denial::{ExternalSideEffectState, GateDenial},
-    machine_global::{
-        machine_global_config_content_binding, MachineGlobalRetentionBinding,
-    },
+    machine_global::{machine_global_config_content_binding, MachineGlobalRetentionBinding},
     safe_state::FileIdentity,
     state_journal::{AuthenticatedStateJournal, JournalRecord, JournalSpec},
     supervise::{
@@ -130,8 +128,14 @@ impl GeneratedFollowUpRetentionBinding {
     }
 
     fn validate(&self) -> Result<()> {
-        validate_sha256_id(&self.config_content_sha256, "machine-global config content digest")?;
-        validate_sha256_id(&self.binding_sha256, "machine-global retention binding digest")?;
+        validate_sha256_id(
+            &self.config_content_sha256,
+            "machine-global config content digest",
+        )?;
+        validate_sha256_id(
+            &self.binding_sha256,
+            "machine-global retention binding digest",
+        )?;
         if self.config_file_identity.device == 0 || self.config_file_identity.file == 0 {
             bail!("machine-global config file identity is incomplete");
         }
@@ -263,9 +267,7 @@ impl GeneratedFollowUpQueueSource {
             "source normalized supervisor plan digest",
         )?;
         if !self.source_report_accepted || !self.source_report_publishable {
-            bail!(
-                "generated follow-up queue source must be observed accepted and publishable"
-            );
+            bail!("generated follow-up queue source must be observed accepted and publishable");
         }
         validate_sha256_id(&self.repository_id, "repository authentication identity")?;
         validate_sha256_id(
@@ -1301,10 +1303,7 @@ fn generated_follow_up_item_id(
     let queue_instance_id = queue_instance_id(source)?;
     domain_separated_sha256(
         ITEM_ID_DOMAIN,
-        &[
-            queue_instance_id.as_bytes(),
-            canonical_task.as_slice(),
-        ],
+        &[queue_instance_id.as_bytes(), canonical_task.as_slice()],
     )
 }
 
@@ -1639,7 +1638,10 @@ mod tests {
     }
 
     fn retained_machine_global() -> GeneratedFollowUpRetentionBinding {
-        let config_file_identity = FileIdentity { device: 11, file: 22 };
+        let config_file_identity = FileIdentity {
+            device: 11,
+            file: 22,
+        };
         let config_content_sha256 = "4".repeat(64);
         let root_id = "runtime-root".to_string();
         let owner = "supervise-run".to_string();
@@ -1801,9 +1803,7 @@ mod tests {
         let dependents = (1..=dependent_count)
             .map(|ordinal| LicensedBreakageDependentScope {
                 dependent_id: format!("dependent-{ordinal:02}"),
-                paths: vec![std::path::PathBuf::from(format!(
-                    "src/{ordinal:02}.rs"
-                ))],
+                paths: vec![std::path::PathBuf::from(format!("src/{ordinal:02}.rs"))],
                 interfaces: Vec::new(),
             })
             .collect();
@@ -1924,8 +1924,10 @@ mod tests {
 
         let mut duplicate = first;
         duplicate.failure_signature = "different failure signature".to_string();
-        duplicate.supervisor_plan.generated_follow_up.failure_signature =
-            duplicate.failure_signature.clone();
+        duplicate
+            .supervisor_plan
+            .generated_follow_up
+            .failure_signature = duplicate.failure_signature.clone();
         let error = GeneratedFollowUpQueueBounds::from_validated_source_plan_and_tasks(
             &plan,
             &[generated_task("01"), duplicate],
@@ -1969,20 +1971,14 @@ mod tests {
         assert!(empty.records().is_empty());
         drop(empty);
 
-        let queue = GeneratedFollowUpQueue::create_or_open(
-            authenticator(&repo),
-            source.clone(),
-            bounds(1),
-        )
-        .expect("recover and initialize queue");
+        let queue =
+            GeneratedFollowUpQueue::create_or_open(authenticator(&repo), source.clone(), bounds(1))
+                .expect("recover and initialize queue");
         assert_eq!(queue.journal.records().len(), 1);
         drop(queue);
-        let reopened = GeneratedFollowUpQueue::create_or_open(
-            authenticator(&repo),
-            source,
-            bounds(1),
-        )
-        .expect("open existing initialized queue");
+        let reopened =
+            GeneratedFollowUpQueue::create_or_open(authenticator(&repo), source, bounds(1))
+                .expect("open existing initialized queue");
         assert_eq!(reopened.journal.records().len(), 1);
     }
 
@@ -1991,12 +1987,9 @@ mod tests {
         let (_temp, repo) = repository();
         let source = source(&repo, "source-recovery");
         let tasks = vec![generated_task("01"), generated_task("02")];
-        let mut queue = GeneratedFollowUpQueue::create(
-            authenticator(&repo),
-            source.clone(),
-            bounds(2),
-        )
-        .expect("create queue");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(2))
+                .expect("create queue");
         let prepared = prepare_enqueue_records(&source, &tasks).expect("prepare batch");
         let first = prepared.values().next().expect("first staged item").clone();
         queue
@@ -2016,7 +2009,13 @@ mod tests {
 
         let mut recovered = GeneratedFollowUpQueue::open(authenticator(&repo), &source)
             .expect("reopen claimed queue");
-        assert_eq!(recovered.release_claimed_before_dispatch().expect("release").len(), 1);
+        assert_eq!(
+            recovered
+                .release_claimed_before_dispatch()
+                .expect("release")
+                .len(),
+            1
+        );
         assert_eq!(
             recovered.snapshot().item(&first_id).expect("item").phase(),
             GeneratedFollowUpQueuePhase::Enqueued
@@ -2101,11 +2100,9 @@ mod tests {
     #[test]
     fn cascade_and_second_generation_refuse_before_any_dispatch_marker() {
         let (_temp, repo) = repository();
-        let generated_source = GeneratedFollowUpQueueSource::generated(
-            source(&repo, "source-second"),
-            1,
-        )
-        .expect_err("second generation must be refused");
+        let generated_source =
+            GeneratedFollowUpQueueSource::generated(source(&repo, "source-second"), 1)
+                .expect_err("second generation must be refused");
         assert!(format!("{generated_source:#}").contains("second-generation"));
 
         let source = source(&repo, "source-cascade");

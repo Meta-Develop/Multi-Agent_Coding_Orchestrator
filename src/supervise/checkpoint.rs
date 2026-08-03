@@ -673,10 +673,7 @@ pub(super) fn open_supervisor_checkpoint(
     ))
 }
 
-pub(super) fn authenticated_child_dispatch_started(
-    repo: &Path,
-    run_id: &RunId,
-) -> Result<bool> {
+pub(super) fn authenticated_child_dispatch_started(repo: &Path, run_id: &RunId) -> Result<bool> {
     let authenticator = repository_authenticator_key_only(repo)?;
     validate_repository_authenticated_state(repo, &authenticator)?;
     let journal = StateJournal::open_instance(authenticator, run_id.as_str())?;

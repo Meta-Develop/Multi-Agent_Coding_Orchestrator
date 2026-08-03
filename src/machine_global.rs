@@ -76,9 +76,7 @@ pub struct MachineGlobalRetentionBinding {
 
 /// Returns the exact no-follow content and inode binding used to retain a
 /// machine-global configuration across a generated follow-up round.
-pub(crate) fn machine_global_config_content_binding(
-    path: &Path,
-) -> Result<(String, FileIdentity)> {
+pub(crate) fn machine_global_config_content_binding(path: &Path) -> Result<(String, FileIdentity)> {
     let config_path = require_exact_canonical_regular_file(path)
         .context("machine-global config path is not exact and canonical")?;
     let before = identity_for_path(&config_path)?;
