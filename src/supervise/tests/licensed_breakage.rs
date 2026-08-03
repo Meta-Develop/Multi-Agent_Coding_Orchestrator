@@ -1018,7 +1018,8 @@ fn licensed_follow_up_cascade_dispatches_one_authenticated_round_and_keeps_prima
         let is_follow_up = output_path.contains("child-a-licensed-update-01");
         let is_auditor = output_path.contains("review-auditor");
         if is_auditor && is_follow_up {
-            let child = injected_child_report(&follow_up_assignment);
+            let mut child = injected_child_report(&follow_up_assignment);
+            child.files_changed = vec![PathBuf::from("src/client.rs")];
             write_injected_json(
                 &command.output_last_message,
                 &injected_auditor_report(&follow_up_assignment, &child),
@@ -1156,7 +1157,8 @@ fn licensed_follow_up_enqueue_interruption_resumes_without_rerunning_source() {
         let is_follow_up = output_path.contains("child-a-licensed-update-01");
         let is_auditor = output_path.contains("review-auditor");
         if is_auditor && is_follow_up {
-            let child = injected_child_report(&follow_up_assignment);
+            let mut child = injected_child_report(&follow_up_assignment);
+            child.files_changed = vec![PathBuf::from("src/client.rs")];
             write_injected_json(
                 &command.output_last_message,
                 &injected_auditor_report(&follow_up_assignment, &child),
