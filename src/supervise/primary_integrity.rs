@@ -8,6 +8,17 @@ pub(super) fn primary_worktree_snapshot(
     primary_worktree_snapshot_at_depth(repo_path, 0, &mut visited_gitdirs, runtime)
 }
 
+/// Stable within this supervisor schema version and deliberately covers the
+/// complete snapshot rather than only HEAD or configured dirty-path policy.
+pub(super) fn primary_worktree_snapshot_sha256(
+    repo_path: &Path,
+    runtime: SupervisorExecutionRuntime,
+) -> Result<String> {
+    let snapshot = primary_worktree_snapshot(repo_path, runtime)?;
+    let framed = format!("maco-primary-worktree-snapshot-v1\n{snapshot:?}");
+    Ok(crate::artifacts::state_auth::sha256_hex(framed.as_bytes()))
+}
+
 fn primary_worktree_snapshot_at_depth(
     repo_path: &Path,
     depth: usize,

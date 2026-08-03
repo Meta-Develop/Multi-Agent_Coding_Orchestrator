@@ -530,6 +530,10 @@ pub struct EnvironmentFailure {
 }
 
 impl EnvironmentFailure {
+    pub(crate) fn probe_failed(summary: String) -> Self {
+        environment_failure(EnvironmentFailureCategory::ProbeFailed, None, summary)
+    }
+
     pub(crate) fn runtime_model_catalog(summary: String) -> Self {
         environment_failure(
             EnvironmentFailureCategory::RuntimeModelCatalogUnavailable,

@@ -137,6 +137,17 @@ enum AssignmentResumeState {
     Completed,
 }
 
+#[derive(Debug)]
+struct ChildDispatchWithoutAssignmentStart;
+
+impl std::fmt::Display for ChildDispatchWithoutAssignmentStart {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("checkpoint child dispatch has no preceding assignment start")
+    }
+}
+
+impl std::error::Error for ChildDispatchWithoutAssignmentStart {}
+
 #[derive(Debug, Clone)]
 pub(super) struct FinalReportResumePlan {
     pub(super) report: SupervisorFinalReport,
@@ -673,6 +684,26 @@ pub(super) fn open_supervisor_checkpoint(
     ))
 }
 
+pub(super) fn authenticated_child_dispatch_started(repo: &Path, run_id: &RunId) -> Result<bool> {
+    let authenticator = repository_authenticator_key_only(repo)?;
+    validate_repository_authenticated_state(repo, &authenticator)?;
+    let journal = StateJournal::open_instance(authenticator, run_id.as_str())?;
+    let records = journal.records();
+    // Opening authenticates the complete chain and repository/key epoch. The
+    // supervise analyzer additionally proves that the authenticated records
+    // form a structurally valid checkpoint before a raw phase can become
+    // execution evidence.
+    if let Err(error) = analyze_checkpoint_records(records, run_id) {
+        if error.is::<ChildDispatchWithoutAssignmentStart>() {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    Ok(records
+        .iter()
+        .any(|record| record.phase == PHASE_CHILD_DISPATCH_STARTED))
+}
+
 fn analyze_checkpoint_records(
     records: &[JournalRecord],
     run_id: &RunId,
@@ -777,6 +808,17 @@ fn analyze_checkpoint_records(
                 let payload: DispatchCheckpoint = decode_payload(record)?;
                 validate_version(payload.version)?;
                 let auditor = record.phase == PHASE_AUDITOR_DISPATCH_STARTED;
+                if !auditor {
+                    match assignments.get(subject) {
+                        Some(AssignmentResumeState::Started) => {}
+                        Some(AssignmentResumeState::Completed) => {
+                            bail!("checkpoint child dispatch started after assignment completion")
+                        }
+                        Some(AssignmentResumeState::Pending) | None => {
+                            return Err(ChildDispatchWithoutAssignmentStart.into());
+                        }
+                    }
+                }
                 if !dispatches.insert((auditor, subject.to_string(), payload.attempt)) {
                     bail!("checkpoint contains a duplicate dispatch start");
                 }

@@ -1,0 +1,319 @@
+Issue 22 step 2 fail-capability neuter evidence
+================================================
+
+Each section records a temporary one-line production guard break. The break was
+applied only for the named exact test, the raw failing output below was
+captured, and the inverse patch was applied immediately afterward. None of the
+neuters is present in the committed source.
+
+1. Goal-to-live execution
+-------------------------
+Neuter: replace the Autopilot GoalSpec loader branch with an unconditional
+"NEUTER: goal execution disabled" error.
+
+Command:
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo test --test autopilot_cli fake_autopilot_goal_run_dispatches_exact_derived_tree_and_preserves_primary -- --exact --nocapture
+
+Raw failing output:
+    Finished `test` profile [unoptimized] target(s) in 1m 22s
+     Running tests/autopilot_cli.rs (target/debug/deps/autopilot_cli-e10f6ca01d2efcf8)
+
+running 1 test
+Error: maco command failed: stdout= stderr=Error: NEUTER: goal execution disabled
+
+test fake_autopilot_goal_run_dispatches_exact_derived_tree_and_preserves_primary ... FAILED
+
+failures:
+
+failures:
+    fake_autopilot_goal_run_dispatches_exact_derived_tree_and_preserves_primary
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 26 filtered out; finished in 1.93s
+
+error: test failed, to rerun pass `--test autopilot_cli`
+
+Raw restored output:
+test fake_autopilot_goal_run_dispatches_exact_derived_tree_and_preserves_primary has been running for over 60 seconds
+test fake_autopilot_goal_run_dispatches_exact_derived_tree_and_preserves_primary ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 77.25s
+
+
+2. Cross-entrypoint queue identity
+----------------------------------
+Neuter: treat outer_entrypoint as execution identity in
+GeneratedFollowUpQueueSource::has_same_execution_basis.
+
+Command:
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo test --lib autopilot::tests::interrupted_autopilot_queue_resumes_through_supervise_without_duplicate_identity -- --exact --nocapture
+
+Raw failing output:
+thread 'autopilot::tests::interrupted_autopilot_queue_resumes_through_supervise_without_duplicate_identity' panicked at src/autopilot.rs:5613:10:
+resume Autopilot-origin queue through direct supervise: generated follow-up queue execution basis changed across create-or-open
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test autopilot::tests::interrupted_autopilot_queue_resumes_through_supervise_without_duplicate_identity ... FAILED
+
+failures:
+
+failures:
+    autopilot::tests::interrupted_autopilot_queue_resumes_through_supervise_without_duplicate_identity
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1279 filtered out; finished in 27.07s
+
+error: test failed, to rerun pass `--lib`
+
+Raw restored output:
+test autopilot::tests::interrupted_autopilot_queue_resumes_through_supervise_without_duplicate_identity ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1279 filtered out; finished in 52.30s
+
+
+3. Maximum-round refusal
+------------------------
+Neuter: suppress the PermissionExpansion denial when an authenticated round-two
+terminal report contains generated_follow_up_tasks.
+
+Command:
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo test --lib supervise::tests::licensed_breakage::held_ambiguous_finalized_round_two_tasks_refuse_maximum_round -- --exact --nocapture
+
+Raw failing output:
+thread 'supervise::tests::licensed_breakage::held_ambiguous_finalized_round_two_tasks_refuse_maximum_round' panicked at src/supervise/tests/licensed_breakage.rs:2066:5:
+assertion failed: scenario.outcome.follow_up_gate_denials.iter().any(|denial|
+        {
+            matches!(denial.reason, GateDenialReason::ApprovalReview
+                {
+                    denial:
+                    crate::gate_denial::ApprovalReviewDenial::PermissionExpansion
+                })
+        })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test supervise::tests::licensed_breakage::held_ambiguous_finalized_round_two_tasks_refuse_maximum_round ... FAILED
+
+failures:
+
+failures:
+    supervise::tests::licensed_breakage::held_ambiguous_finalized_round_two_tasks_refuse_maximum_round
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1279 filtered out; finished in 47.89s
+
+error: test failed, to rerun pass `--lib`
+
+Raw restored output:
+test supervise::tests::licensed_breakage::held_ambiguous_finalized_round_two_tasks_refuse_maximum_round ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1279 filtered out; finished in 47.17s
+
+
+4. Last-moment whole-primary gate
+---------------------------------
+Neuter: replace the post-profile, immediately-pre-dispatch whole-primary check
+with false.
+
+Command:
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo test --lib supervise::tests::licensed_breakage::generated_follow_up_rechecks_primary_after_profile_before_dispatch -- --exact --nocapture
+
+Raw failing output:
+thread 'supervise::tests::licensed_breakage::generated_follow_up_rechecks_primary_after_profile_before_dispatch' panicked at src/supervise/tests/licensed_breakage.rs:1411:5:
+assertion `left == right` failed
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test supervise::tests::licensed_breakage::generated_follow_up_rechecks_primary_after_profile_before_dispatch ... FAILED
+
+failures:
+
+failures:
+    supervise::tests::licensed_breakage::generated_follow_up_rechecks_primary_after_profile_before_dispatch
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1279 filtered out; finished in 25.94s
+
+error: test failed, to rerun pass `--lib`
+
+Raw restored output:
+test supervise::tests::licensed_breakage::generated_follow_up_rechecks_primary_after_profile_before_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1279 filtered out; finished in 25.82s
+
+
+5. Unknown dispatch evidence must not become false
+--------------------------------------------------
+Neuter: ignore Ok(false) and authenticated evidence read errors for a durable
+started item, incorrectly classifying marker-only state as no dispatch.
+
+Command:
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo test --lib autopilot::tests::autopilot_marker_without_child_checkpoint_refuses_a_false_final_report -- --exact --nocapture
+
+Raw failing output (verbatim relevant excerpt):
+generated_follow_up_dispatch_performed: false, next_action: "inspect the supervisor entry failure; no publication, merge, or follow-up dispatch was attempted"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test autopilot::tests::autopilot_marker_without_child_checkpoint_refuses_a_false_final_report ... FAILED
+
+failures:
+
+failures:
+    autopilot::tests::autopilot_marker_without_child_checkpoint_refuses_a_false_final_report
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1279 filtered out; finished in 29.84s
+
+error: test failed, to rerun pass `--lib`
+
+Raw restored output:
+test autopilot::tests::autopilot_marker_without_child_checkpoint_refuses_a_false_final_report ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1279 filtered out; finished in 28.39s
+
+
+6. Requested/effective profile call-site gate
+------------------------------------------------
+Neuter: replace binding.permits_dispatch() with true in the exact loaded-plan
+call-site callback.
+
+Command:
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo test --lib autopilot::tests::autopilot_reloads_effective_profile_at_call_site_before_starting_supervisor -- --exact --nocapture
+
+Raw failing output:
+thread 'autopilot::tests::autopilot_reloads_effective_profile_at_call_site_before_starting_supervisor' panicked at src/autopilot.rs:5849:9:
+assertion `left == right` failed
+  left: Succeeded
+ right: Failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test autopilot::tests::autopilot_reloads_effective_profile_at_call_site_before_starting_supervisor ... FAILED
+
+failures:
+
+failures:
+    autopilot::tests::autopilot_reloads_effective_profile_at_call_site_before_starting_supervisor
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1279 filtered out; finished in 26.25s
+
+error: test failed, to rerun pass `--lib`
+
+Raw restored output:
+test autopilot::tests::autopilot_reloads_effective_profile_at_call_site_before_starting_supervisor ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1279 filtered out; finished in 5.13s
+
+
+7. Retention probe failures remain typed and retryable
+------------------------------------------------------
+Neuter: map the post-profile retention read error to PermissionExpansion
+instead of EnvironmentFailureCategory::ProbeFailed.
+
+Command:
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo test --lib supervise::tests::licensed_breakage::generated_follow_up_deleted_retention_is_journaled_probe_failed_and_retryable -- --exact --nocapture
+
+Raw failing output:
+thread 'supervise::tests::licensed_breakage::generated_follow_up_deleted_retention_is_journaled_probe_failed_and_retryable' panicked at src/supervise/tests/licensed_breakage.rs:1498:5:
+assertion failed: scenario.outcome.follow_up_gate_denials.is_empty()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test supervise::tests::licensed_breakage::generated_follow_up_deleted_retention_is_journaled_probe_failed_and_retryable ... FAILED
+
+failures:
+
+failures:
+    supervise::tests::licensed_breakage::generated_follow_up_deleted_retention_is_journaled_probe_failed_and_retryable
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1279 filtered out; finished in 28.37s
+
+error: test failed, to rerun pass `--lib`
+
+Raw restored output:
+test supervise::tests::licensed_breakage::generated_follow_up_deleted_retention_is_journaled_probe_failed_and_retryable ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1279 filtered out; finished in 25.75s
+
+
+8. Finalized subordinate exact-plan transition guard
+-----------------------------------------------------
+Neuter: make the exact authenticated queued-plan comparison unreachable inside
+observe_and_acknowledge, allowing a pre-existing finalized same-ID subordinate
+with a different plan to be observed and terminal-acknowledged.
+
+Command:
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_TARGET_DIR=$PWD/.target-track-22-step2-r2 cargo test --lib immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan -- --nocapture
+
+Failing exit status: 101
+
+Raw failing output:
+thread 'supervise::tests::licensed_breakage::immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan' panicked at src/supervise/tests/licensed_breakage.rs:1928:5:
+assertion failed: !outcome.follow_up_cascade_success
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test supervise::tests::licensed_breakage::immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan ... FAILED
+
+failures:
+
+failures:
+    supervise::tests::licensed_breakage::immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1282 filtered out; finished in 51.59s
+
+error: test failed, to rerun pass `--lib`
+
+Raw restored output:
+test supervise::tests::licensed_breakage::immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1282 filtered out; finished in 50.29s
+
+
+9. Authenticated checkpoint semantic analyzer
+----------------------------------------------
+Neuter: remove analyze_checkpoint_records(records, run_id) before deriving
+child_dispatch_started evidence from the authenticated journal.
+
+Command:
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_TARGET_DIR=$PWD/.target-track-22-step2-r2 cargo test --lib authenticated_child_dispatch_evidence_refuses_structurally_invalid_checkpoint -- --nocapture
+
+Failing exit status: 101
+
+Raw failing output:
+thread 'supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_refuses_structurally_invalid_checkpoint' panicked at src/supervise/tests/run_artifacts.rs:853:10:
+authenticated malformed checkpoint must not become dispatch evidence: true
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_refuses_structurally_invalid_checkpoint ... FAILED
+
+failures:
+
+failures:
+    supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_refuses_structurally_invalid_checkpoint
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1282 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `--lib`
+
+Raw restored output:
+test supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_refuses_structurally_invalid_checkpoint ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1282 filtered out; finished in 0.05s
+
+
+10. Subject-specific assignment-start checkpoint guard
+-------------------------------------------------------
+Neuter: replace the child-dispatch `if !auditor` assignment-state guard with
+`if false && !auditor`, bypassing only the new requirement that the exact child
+assignment have a preceding `assignment_started` transition.
+
+Command:
+CARGO_TARGET_DIR=target/round3-queue CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo test --lib supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_rejects_unknown_assignment_without_start -- --exact --nocapture
+
+Failing exit status: 101
+
+Raw failing output:
+thread 'supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_rejects_unknown_assignment_without_start' panicked at src/supervise/tests/run_artifacts.rs:923:5:
+assertion failed: !authenticated_child_dispatch_started(&repo,
+            &run_id).expect("unknown assignment must not become child dispatch evidence")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_rejects_unknown_assignment_without_start ... FAILED
+
+failures:
+
+failures:
+    supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_rejects_unknown_assignment_without_start
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1285 filtered out; finished in 0.05s
+
+error: test failed, to rerun pass `--lib`
+
+Raw restored output:
+test supervise::tests::run_artifacts::authenticated_child_dispatch_evidence_rejects_unknown_assignment_without_start ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1285 filtered out; finished in 0.05s

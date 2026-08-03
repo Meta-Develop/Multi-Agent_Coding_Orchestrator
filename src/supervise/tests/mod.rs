@@ -461,7 +461,11 @@ fn inject_priced_process_roles(plan: &mut SupervisorPlan, model: &str, rate: f64
     );
 }
 
-fn write_injected_usage(command: &ExternalAgentCommand, input_tokens: usize, output_tokens: usize) {
+pub(crate) fn write_injected_usage(
+    command: &ExternalAgentCommand,
+    input_tokens: usize,
+    output_tokens: usize,
+) {
     fs::write(
             &command.json_log,
             format!(
@@ -783,7 +787,7 @@ fn injected_target_attempted(run: ExternalAgentRun) -> ExternalAgentRun {
     launched
 }
 
-fn injected_verified_run(command: &ExternalAgentCommand) -> ExternalAgentRun {
+pub(crate) fn injected_verified_run(command: &ExternalAgentCommand) -> ExternalAgentRun {
     write_injected_worker_journals_from_report(command);
     injected_verified_run_without_journals(command)
 }
@@ -899,7 +903,7 @@ fn injected_command_record() -> CommandRunRecord {
     }
 }
 
-fn write_injected_json(path: &Path, value: &impl Serialize) {
+pub(crate) fn write_injected_json(path: &Path, value: &impl Serialize) {
     fs::write(
         path,
         serde_json::to_vec(value).expect("serialize injected report"),

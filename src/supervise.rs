@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
 pub use crate::supervise_budget::{
     BudgetAction, BudgetAmount, BudgetReason, BudgetRemaining, RoleBudgetReport, RunBudgetLimits,
     RunBudgetReport,
@@ -99,6 +101,21 @@ use std::{
 mod plan_api;
 pub use plan_api::*;
 
+mod follow_up_cascade;
+use follow_up_cascade::*;
+#[cfg(test)]
+pub(crate) use follow_up_cascade::{
+    clear_generated_follow_up_queue_observer, set_before_generated_follow_up_plan_load_hook,
+    set_generated_follow_up_queue_observer,
+    set_interrupt_after_authenticated_follow_up_child_start,
+    set_interrupt_after_follow_up_dispatch_started, set_interrupt_after_follow_up_enqueue,
+};
+pub(crate) use follow_up_cascade::{
+    generated_follow_up_dispatch_evidence_after_cascade_error,
+    normalized_supervisor_plan_file_sha256, AuthenticatedGeneratedFollowUpTerminal,
+    GeneratedFollowUpDispatchEvidence,
+};
+
 mod repository;
 use repository::*;
 
@@ -151,12 +168,12 @@ const MAX_CHILD_RETRIES_LIMIT: u8 = 2;
 const DEFAULT_MAX_GATE_CORRECTIONS: u8 = 0;
 const MAX_GATE_CORRECTIONS_LIMIT: u8 = 4;
 const MAX_EVIDENCE_ONLY_REAUDITS: u8 = 2;
-const MAX_LICENSED_BREAKAGE_DEPENDENTS: usize = 16;
+pub(crate) const MAX_LICENSED_BREAKAGE_DEPENDENTS: usize = 16;
 const MAX_LICENSED_BREAKAGE_PATHS_PER_DEPENDENT: usize = 16;
 const MAX_LICENSED_BREAKAGE_INTERFACES_PER_DEPENDENT: usize = 16;
 const MAX_LICENSED_BREAKAGE_RATIONALE_BYTES: usize = 8 * 1024;
 const MAX_LICENSED_BREAKAGE_FAILURE_SIGNATURE_BYTES: usize = 16 * 1024;
-const LICENSED_BREAKAGE_CASCADE_DEPTH: u8 = 1;
+pub(crate) const LICENSED_BREAKAGE_CASCADE_DEPTH: u8 = 1;
 const LICENSED_BREAKAGE_AUDIT_VALIDATION_NAME: &str = "licensed_breakage_declaration";
 const MIN_SUPERVISOR_DEPTH: u8 = 2;
 const MAX_SUPERVISOR_DEPTH: u8 = 32;
@@ -253,6 +270,14 @@ pub struct SupervisorRunOptions {
     /// config/root pair and so simulation-only tests can exercise preparation
     /// without claiming that they performed a host cleanup.
     pub machine_global_retention: Option<crate::machine_global::MachineGlobalRetentionBinding>,
+}
+
+/// Captures the exact Verified-runtime whole-primary integrity digest used by
+/// supervisor dispatch gates. Callers may compare two observations; the digest
+/// itself is not a configured execution claim.
+pub(crate) fn verified_whole_primary_snapshot_sha256(repo: &Path) -> Result<String> {
+    let repo = discover_repo_root(repo)?;
+    primary_worktree_snapshot_sha256(&repo, SupervisorExecutionRuntime::Verified)
 }
 
 #[derive(Debug, Clone)]
@@ -1138,6 +1163,72 @@ pub struct SupervisorFinalReport {
     pub next_safe_action: String,
 }
 
+/// A command-level view over the immutable source report and the separately
+/// authenticated generated-follow-up cascade. Flattening preserves every
+/// existing top-level source field while making round-two state explicit.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct SupervisorCascadeOutcome {
+    #[serde(flatten)]
+    pub source_report: SupervisorFinalReport,
+    pub follow_up_cascade_version: u32,
+    pub follow_up_cascade_success: bool,
+    /// Observed whole-primary equality across an actual generated follow-up
+    /// cascade. `None` means that no follow-up round was dispatched or
+    /// reconciled, so there is no round-two execution fact to report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up_primary_worktree_untouched: Option<bool>,
+    pub follow_up_queue: Option<SupervisorFollowUpQueueSummary>,
+    #[serde(default)]
+    pub follow_up_reports: Vec<SupervisorFinalReport>,
+    #[serde(default)]
+    pub follow_up_gate_denials: Vec<GateDenial>,
+    #[serde(default)]
+    pub follow_up_environment_failures: Vec<EnvironmentFailure>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorFollowUpQueueSummary {
+    pub queue_instance_id: String,
+    pub source_supervisor_run_id: String,
+    pub enqueue_committed: bool,
+    pub item_count: usize,
+    pub pending_count: usize,
+    pub claimed_count: usize,
+    pub dispatch_started_count: usize,
+    pub dispatch_observed_count: usize,
+    pub acknowledged_terminal_count: usize,
+    pub held_ambiguous_count: usize,
+    pub authenticated_child_dispatch_started_count: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeneratedFollowUpQueueTestObservation {
+    pub label: &'static str,
+    pub queue_instance_id: String,
+    pub outer_entrypoint: String,
+    pub outer_command_run_id: String,
+    pub item_ids: Vec<String>,
+    pub subordinate_run_ids: Vec<String>,
+    pub environment_failures: Vec<EnvironmentFailure>,
+    pub pending_count: usize,
+    pub claimed_count: usize,
+    pub dispatch_started_count: usize,
+    pub dispatch_observed_count: usize,
+    pub acknowledged_terminal_count: usize,
+    pub held_ambiguous_count: usize,
+    pub authenticated_child_dispatch_started_count: usize,
+}
+
+impl SupervisorCascadeOutcome {
+    pub fn generated_follow_up_dispatch_performed(&self) -> bool {
+        self.follow_up_queue
+            .as_ref()
+            .is_some_and(|queue| queue.authenticated_child_dispatch_started_count > 0)
+    }
+}
+
 /// Content-addressed evidence-only operation embedded in a normalized plan.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1582,6 +1673,136 @@ fn run_supervisor_plan_file_with_runner(
         SupervisorExecutionRuntime::Verified,
         SupervisorWorktreeCreation::Bound(&cleanliness),
         Ok(runtime_model_catalog),
+        &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+            Ok(mut runner) => runner(command),
+            Err(poisoned) => poisoned.into_inner()(command),
+        },
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn run_supervisor_plan_file_cascade_with_runner(
+    options: SupervisorRunOptions,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorCascadeOutcome> {
+    let mut permit = |_plan: &SupervisorPlan| Ok(true);
+    let outer_run_id = options.run_id.clone();
+    run_supervisor_plan_file_cascade_with_runner_and_gate(
+        options,
+        GeneratedFollowUpQueueEntrypoint::SuperviseRun,
+        &outer_run_id,
+        &mut permit,
+        external_runner,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilot(
+    options: SupervisorRunOptions,
+    outer_command_run_id: &RunId,
+    before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<bool>,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorCascadeOutcome> {
+    run_supervisor_plan_file_cascade_with_runner_and_gate(
+        options,
+        GeneratedFollowUpQueueEntrypoint::AutopilotRun,
+        outer_command_run_id,
+        before_dispatch,
+        external_runner,
+    )
+}
+
+#[cfg(test)]
+fn run_supervisor_plan_file_cascade_with_runner_and_gate(
+    options: SupervisorRunOptions,
+    outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
+    outer_command_run_id: &RunId,
+    before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<bool>,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorCascadeOutcome> {
+    validate_max_concurrent_children(1)?;
+    if options.runtime == SupervisorRuntime::Fake {
+        bail!("publishable generated follow-up cascade tests require the verified runtime path");
+    }
+    let repo = discover_repo_root(&options.repo)?;
+    let manager = WorktreeManager::new(&repo);
+    let cleanliness = manager.acquire_repository_cleanliness()?;
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    if !before_dispatch(&loaded.plan)? {
+        bail!("effective injected supervisor profile changed before exact loaded-plan dispatch");
+    }
+    let source_loaded = loaded.clone();
+    let template = options.clone();
+    let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
+    let serialized_runner = Mutex::new(external_runner);
+    let source_report = run_supervisor_plan_with_runner_and_creation(
+        loaded,
+        options,
+        1,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::Bound(&cleanliness),
+        Ok(runtime_model_catalog),
+        &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+            Ok(mut runner) => runner(command),
+            Err(poisoned) => poisoned.into_inner()(command),
+        },
+    )?;
+    drop(cleanliness);
+    run_generated_follow_up_cascade(
+        &repo,
+        &source_loaded,
+        source_report,
+        &template,
+        FollowUpCascadeInvocation {
+            outer_entrypoint,
+            outer_command_run_id,
+            concurrency_policy: SupervisorConcurrencyPolicy::Fixed(NonZeroUsize::MIN),
+            runtime_catalog: FollowUpRuntimeCatalog::Injected,
+        },
+        before_dispatch,
+        &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+            Ok(mut runner) => runner(command),
+            Err(poisoned) => poisoned.into_inner()(command),
+        },
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn resume_supervisor_plan_file_cascade_with_runner(
+    options: SupervisorRunOptions,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorCascadeOutcome> {
+    let repo = discover_repo_root(&options.repo)?;
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let run_id = options.run_id.clone();
+    let status = supervisor_status(&repo, run_id.clone())?;
+    let source_report = match status.lifecycle {
+        SupervisorRunLifecycle::Finalized => status
+            .final_report
+            .context("finalized injected cascade source report is missing")?,
+        SupervisorRunLifecycle::Resumable => resume_supervisor_run(&repo, run_id.clone())?
+            .final_report
+            .context("resumed injected cascade source report is missing")?,
+        SupervisorRunLifecycle::Active
+        | SupervisorRunLifecycle::Interrupted
+        | SupervisorRunLifecycle::Uncertain => {
+            bail!("injected cascade source is not safely finalized or finalization-resumable")
+        }
+    };
+    let serialized_runner = Mutex::new(external_runner);
+    let mut permit = |_plan: &SupervisorPlan| Ok(true);
+    run_generated_follow_up_cascade(
+        &repo,
+        &loaded,
+        source_report,
+        &options,
+        FollowUpCascadeInvocation {
+            outer_entrypoint: GeneratedFollowUpQueueEntrypoint::SuperviseRun,
+            outer_command_run_id: &run_id,
+            concurrency_policy: SupervisorConcurrencyPolicy::Fixed(NonZeroUsize::MIN),
+            runtime_catalog: FollowUpRuntimeCatalog::Injected,
+        },
+        &mut permit,
         &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),
             Err(poisoned) => poisoned.into_inner()(command),
@@ -3220,3 +3441,5 @@ struct PathOwner {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::{injected_verified_run, write_injected_json, write_injected_usage};

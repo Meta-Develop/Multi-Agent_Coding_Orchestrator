@@ -443,7 +443,7 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 environment_requirements: Vec::new(),
                 licensed_breakage: None,
                 notes: Some(
-                    "Generated licensed-breakage follow-up in a complete ordinary supervisor plan; automatic dispatch is deferred"
+                    "Generated licensed-breakage follow-up in a complete ordinary supervisor plan; authenticated queue admission requires an accepted publishable source run"
                         .to_string(),
                 ),
             };
@@ -456,7 +456,7 @@ pub(super) fn generated_licensed_follow_up_tasks(
             let ordinary_plan = SupervisorPlan {
                 version: SUPERVISOR_SCHEMA_VERSION,
                 task: format!(
-                    "Dispatch generated dependent update '{}' for licensed breaking assignment '{}'. The generated_follow_up section documents candidate provenance, automatic-dispatch deferral, and every operator-owned default.",
+                    "Dispatch generated dependent update '{}' for licensed breaking assignment '{}'. The generated_follow_up section documents candidate provenance, authenticated queue eligibility, and every operator-owned default.",
                     failure.dependent_id, assignment.id
                 ),
                 task_file: None,
@@ -473,7 +473,7 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 assignments: vec![follow_up_assignment],
             };
             let run_budget = derived_generated_follow_up_budget(&ordinary_plan, source_budget)?;
-            let handoff = "write supervisor_plan directly to a plan file and load it through maco supervise run; automatic dispatch from the breaking run remains deferred"
+            let handoff = "an accepted publishable source command may admit this exact supervisor_plan to the authenticated durable bounded follow-up queue; fake and non-publishable sources remain deferred"
                 .to_string();
             let generated_context = GeneratedFollowUpPlanContext {
                 breaking_assignment_id: assignment.id.clone(),

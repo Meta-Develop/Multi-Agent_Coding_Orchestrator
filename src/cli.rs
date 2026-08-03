@@ -785,13 +785,7 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     supervise::supervisor_plan_document_from_task_file(repo, task_file)?
                 }
                 (None, Some(goal_file)) => {
-                    let goal_spec = BoundedRegularReader::read_tree_no_follow_utf8(
-                        &goal_file,
-                        MAX_SUPERVISE_GOAL_FILE_BYTES,
-                    )
-                    .with_context(|| {
-                        format!("failed to read goal/spec file {}", goal_file.display())
-                    })?;
+                    let goal_spec = read_supervise_goal_file(&goal_file)?;
                     supervise::supervisor_plan_document_from_goal_spec(repo, "", &goal_spec)?
                 }
                 _ => bail!(
@@ -801,31 +795,92 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             print_query_report(&plan, json)
         }
         SuperviseSubcommand::Run(args) => {
-            let resolved = resolve_run_id_for_run(
-                &args.repo,
-                RunArtifactFamily::Supervise,
-                args.run_id.as_deref(),
-                args.json,
-            )?;
-            let report = supervise::run_supervisor_plan_file_with_concurrency_policy(
-                SupervisorRunOptions {
-                    repo: resolved.repo,
-                    plan_file: args.supervisor_plan,
-                    run_id: resolved.run_id.clone(),
-                    codex_bin: args.codex_bin,
-                    runtime: args.runtime,
-                    allow_dirty_primary: args.allow_dirty_primary,
-                    machine_global_retention: Some(MachineGlobalRetentionBinding {
-                        config: args.machine_global_config,
-                        root_id: args.machine_global_runtime_root_id,
-                        owner: "maco-supervise".to_string(),
-                        correction_correlation_id: resolved.run_id.as_str().to_string(),
-                    }),
-                },
-                args.max_concurrent_children,
-            )?;
+            let (plan_file, goal_spec) = match (args.supervisor_plan, args.from_goal) {
+                (Some(plan_file), None) => (plan_file, None),
+                (None, Some(goal_file)) => {
+                    let goal_spec = read_supervise_goal_file(&goal_file)?;
+                    (goal_file, Some(goal_spec))
+                }
+                _ => bail!(
+                    "supervise run requires exactly one positional SUPERVISOR_PLAN or --from-goal <FILE>"
+                ),
+            };
+            let existing = if let Some(explicit) = args.run_id.as_deref() {
+                let repo = artifacts::discover_repo_root(&args.repo)?;
+                let run_id = RunId::new(explicit)?;
+                let run_dir = repo
+                    .join(RunArtifactFamily::Supervise.run_root())
+                    .join(run_id.as_str());
+                match std::fs::symlink_metadata(&run_dir) {
+                    Ok(_) => Some((repo, run_id)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to inspect supervise run {}", run_dir.display())
+                        })
+                    }
+                }
+            } else {
+                None
+            };
+            let (resolved_repo, resolved_run_id, resume_existing) = match existing {
+                Some((repo, run_id)) => (repo, run_id, true),
+                None => {
+                    let resolved = resolve_run_id_for_run(
+                        &args.repo,
+                        RunArtifactFamily::Supervise,
+                        args.run_id.as_deref(),
+                        args.json,
+                    )?;
+                    (resolved.repo, resolved.run_id, false)
+                }
+            };
+            let options = SupervisorRunOptions {
+                repo: resolved_repo,
+                plan_file,
+                run_id: resolved_run_id.clone(),
+                codex_bin: args.codex_bin,
+                runtime: args.runtime,
+                allow_dirty_primary: args.allow_dirty_primary,
+                machine_global_retention: Some(MachineGlobalRetentionBinding {
+                    config: args.machine_global_config,
+                    root_id: args.machine_global_runtime_root_id,
+                    owner: "maco-supervise".to_string(),
+                    correction_correlation_id: resolved_run_id.as_str().to_string(),
+                }),
+            };
+            let report = match (goal_spec, resume_existing) {
+                (Some(goal_spec), true) => {
+                    supervise::resume_supervisor_goal_spec_cascade_with_concurrency_policy(
+                        options,
+                        "",
+                        &goal_spec,
+                        args.max_concurrent_children,
+                    )?
+                }
+                (Some(goal_spec), false) => {
+                    supervise::run_supervisor_goal_spec_cascade_with_concurrency_policy(
+                        options,
+                        "",
+                        &goal_spec,
+                        args.max_concurrent_children,
+                    )?
+                }
+                (None, true) => {
+                    supervise::resume_supervisor_plan_file_cascade_with_concurrency_policy(
+                        options,
+                        args.max_concurrent_children,
+                    )?
+                }
+                (None, false) => {
+                    supervise::run_supervisor_plan_file_cascade_with_concurrency_policy(
+                        options,
+                        args.max_concurrent_children,
+                    )?
+                }
+            };
             print_query_report(&report, args.json)?;
-            if !report.success {
+            if !report.follow_up_cascade_success {
                 bail!("supervise run failed");
             }
             Ok(())
@@ -884,6 +939,11 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
     }
 }
 
+fn read_supervise_goal_file(goal_file: &Path) -> Result<String> {
+    BoundedRegularReader::read_tree_no_follow_utf8(goal_file, MAX_SUPERVISE_GOAL_FILE_BYTES)
+        .with_context(|| format!("failed to read goal/spec file {}", goal_file.display()))
+}
+
 #[derive(Debug, Subcommand)]
 enum SuperviseSubcommand {
     /// Build a validated plan from a goal/spec, task file, or JSON supervisor plan.
@@ -926,7 +986,15 @@ struct PlanSuperviseArgs {
 #[derive(Debug, Args)]
 struct RunSuperviseArgs {
     /// JSON supervisor plan file to run.
-    supervisor_plan: PathBuf,
+    #[arg(
+        value_name = "SUPERVISOR_PLAN",
+        required_unless_present = "from_goal",
+        conflicts_with = "from_goal"
+    )]
+    supervisor_plan: Option<PathBuf>,
+    /// High-level goal/spec file to decompose and run through the supervisor gates.
+    #[arg(long, value_name = "FILE", conflicts_with = "supervisor_plan")]
+    from_goal: Option<PathBuf>,
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
@@ -1420,6 +1488,16 @@ impl AutopilotCommand {
                 print_query_report(&plan, args.json)
             }
             AutopilotSubcommand::Run(args) => {
+                let (plan_file, goal_spec) = match (args.task_file, args.from_goal) {
+                    (Some(plan_file), None) => (plan_file, None),
+                    (None, Some(goal_file)) => {
+                        let goal_spec = read_supervise_goal_file(&goal_file)?;
+                        (goal_file, Some(goal_spec))
+                    }
+                    _ => bail!(
+                        "autopilot run requires exactly one positional TASK_FILE or --from-goal <FILE>"
+                    ),
+                };
                 let profile = args
                     .profile
                     .as_ref()
@@ -1431,23 +1509,30 @@ impl AutopilotCommand {
                     args.run_id.as_deref(),
                     args.json,
                 )?;
-                let report = autopilot::run_autopilot_plan_file_with_profile_and_retention(
-                    AutopilotRunOptions {
-                        repo: resolved.repo,
-                        plan_file: args.task_file,
-                        run_id: resolved.run_id.clone(),
-                        codex_bin: args.codex_bin,
-                        reviewer_command: args.reviewer_command,
-                        allow_dirty_primary: args.allow_dirty_primary,
-                    },
-                    profile,
-                    Some(MachineGlobalRetentionBinding {
-                        config: args.machine_global_config,
-                        root_id: args.machine_global_runtime_root_id,
-                        owner: "maco-autopilot".to_string(),
-                        correction_correlation_id: resolved.run_id.as_str().to_string(),
-                    }),
-                )?;
+                let options = AutopilotRunOptions {
+                    repo: resolved.repo,
+                    plan_file,
+                    run_id: resolved.run_id.clone(),
+                    codex_bin: args.codex_bin,
+                    reviewer_command: args.reviewer_command,
+                    allow_dirty_primary: args.allow_dirty_primary,
+                };
+                let retention = Some(MachineGlobalRetentionBinding {
+                    config: args.machine_global_config,
+                    root_id: args.machine_global_runtime_root_id,
+                    owner: "maco-autopilot".to_string(),
+                    correction_correlation_id: resolved.run_id.as_str().to_string(),
+                });
+                let report = match goal_spec {
+                    Some(goal_spec) => {
+                        autopilot::run_autopilot_goal_spec_with_profile_and_retention(
+                            options, "", &goal_spec, profile, retention,
+                        )?
+                    }
+                    None => autopilot::run_autopilot_plan_file_with_profile_and_retention(
+                        options, profile, retention,
+                    )?,
+                };
                 print_query_report(&report, args.json)?;
                 if !report.success {
                     bail!("autopilot run failed");
@@ -1505,7 +1590,15 @@ struct PlanAutopilotArgs {
 #[derive(Debug, Args)]
 struct RunAutopilotArgs {
     /// Task file or JSON autopilot plan file.
-    task_file: PathBuf,
+    #[arg(
+        value_name = "TASK_FILE",
+        required_unless_present = "from_goal",
+        conflicts_with = "from_goal"
+    )]
+    task_file: Option<PathBuf>,
+    /// High-level goal/spec file to decompose and run through the autopilot gates.
+    #[arg(long, value_name = "FILE", conflicts_with = "task_file")]
+    from_goal: Option<PathBuf>,
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
@@ -5268,6 +5361,71 @@ mod tests {
             "goal.md",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn live_goal_entrypoints_require_exactly_one_plan_or_goal_source() {
+        let retention = [
+            "--machine-global-config",
+            "/tmp/maco-machine-global.json",
+            "--machine-global-runtime-root-id",
+            "runtime",
+        ];
+        for command in ["supervise", "autopilot"] {
+            let mut positional = vec!["maco", command, "run", "plan.json"];
+            positional.extend(retention);
+            let positional = Cli::try_parse_from(positional)
+                .unwrap_or_else(|error| panic!("{command} positional source must parse: {error}"));
+            match positional.command {
+                Command::Supervise(SuperviseCommand {
+                    command: SuperviseSubcommand::Run(args),
+                }) => {
+                    assert_eq!(args.supervisor_plan, Some(PathBuf::from("plan.json")));
+                    assert_eq!(args.from_goal, None);
+                }
+                Command::Autopilot(AutopilotCommand {
+                    command: AutopilotSubcommand::Run(args),
+                }) => {
+                    assert_eq!(args.task_file, Some(PathBuf::from("plan.json")));
+                    assert_eq!(args.from_goal, None);
+                }
+                _ => panic!("expected a live run command"),
+            }
+
+            let mut from_goal = vec!["maco", command, "run", "--from-goal", "goal.md"];
+            from_goal.extend(retention);
+            let from_goal = Cli::try_parse_from(from_goal)
+                .unwrap_or_else(|error| panic!("{command} goal source must parse: {error}"));
+            match from_goal.command {
+                Command::Supervise(SuperviseCommand {
+                    command: SuperviseSubcommand::Run(args),
+                }) => {
+                    assert_eq!(args.supervisor_plan, None);
+                    assert_eq!(args.from_goal, Some(PathBuf::from("goal.md")));
+                }
+                Command::Autopilot(AutopilotCommand {
+                    command: AutopilotSubcommand::Run(args),
+                }) => {
+                    assert_eq!(args.task_file, None);
+                    assert_eq!(args.from_goal, Some(PathBuf::from("goal.md")));
+                }
+                _ => panic!("expected a live run command"),
+            }
+
+            let mut missing = vec!["maco", command, "run"];
+            missing.extend(retention);
+            assert!(Cli::try_parse_from(missing).is_err());
+            let mut conflicting = vec![
+                "maco",
+                command,
+                "run",
+                "plan.json",
+                "--from-goal",
+                "goal.md",
+            ];
+            conflicting.extend(retention);
+            assert!(Cli::try_parse_from(conflicting).is_err());
+        }
     }
 
     #[test]

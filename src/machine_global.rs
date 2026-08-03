@@ -4,7 +4,7 @@
 //! Persisted claims, operation reports, and gate denials use [`DeclaredPathCoordinate`] instead.
 
 use crate::{
-    artifacts::state_auth::random_identifier,
+    artifacts::state_auth::{random_identifier, sha256_hex},
     gate_denial::{CorrectionCorrelationId, GateDenial},
     protected_path::{DeclaredPathCoordinate, ProtectedPathSpec, SandboxDenialRetryability},
     safe_state::{
@@ -72,6 +72,24 @@ pub struct MachineGlobalRetentionBinding {
     pub root_id: String,
     pub owner: String,
     pub correction_correlation_id: String,
+}
+
+/// Returns the exact no-follow content and inode binding used to retain a
+/// machine-global configuration across a generated follow-up round.
+pub(crate) fn machine_global_config_content_binding(path: &Path) -> Result<(String, FileIdentity)> {
+    let config_path = require_exact_canonical_regular_file(path)
+        .context("machine-global config path is not exact and canonical")?;
+    let before = identity_for_path(&config_path)?;
+    let bytes = BoundedRegularReader::read_tree_no_follow_validated(
+        &config_path,
+        CONFIG_MAX_BYTES,
+        validate_machine_global_config_metadata,
+    )?;
+    let after = identity_for_path(&config_path)?;
+    if before != after {
+        bail!("machine-global config identity changed while binding its contents");
+    }
+    Ok((sha256_hex(&bytes), after))
 }
 
 /// A gate operation either completed or was refused through the typed Issue 29 envelope.

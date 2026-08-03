@@ -47,6 +47,32 @@ impl FromStr for SupervisorConcurrencyPolicy {
     }
 }
 
+#[cfg(test)]
+type BeforeSupervisorFinalReportPersistHook = Box<dyn FnMut(&mut SupervisorFinalReport)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_SUPERVISOR_FINAL_REPORT_PERSIST_HOOK: std::cell::RefCell<Option<BeforeSupervisorFinalReportPersistHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_supervisor_final_report_persist_hook(
+    hook: impl FnMut(&mut SupervisorFinalReport) + 'static,
+) {
+    BEFORE_SUPERVISOR_FINAL_REPORT_PERSIST_HOOK
+        .with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_before_supervisor_final_report_persist_hook(report: &mut SupervisorFinalReport) {
+    BEFORE_SUPERVISOR_FINAL_REPORT_PERSIST_HOOK.with(|slot| {
+        if let Some(mut hook) = slot.borrow_mut().take() {
+            hook(report);
+        }
+    });
+}
+
 fn assignments_overlap(left: &OrchestratorAssignment, right: &OrchestratorAssignment) -> bool {
     left.assigned_paths.iter().any(|left_path| {
         right
@@ -913,7 +939,7 @@ fn build_supervisor_final_report(
             )
         } else if success && generated_follow_up_task_count > 0 {
             format!(
-                "the breaking assignments completed under accepted narrow licenses, but automatic dispatch of {generated_follow_up_task_count} complete generated dependent update plan(s) remains deferred to separate runs"
+                "the breaking assignments completed under accepted narrow licenses; {generated_follow_up_task_count} complete generated dependent update plan(s) are eligible for the authenticated command-level queue, whose separate cascade outcome determines whether dispatch occurred"
             )
         } else if success && !publishable {
             "fake supervisor simulation succeeded but is not publishable or acceptable as real model evidence"
@@ -950,7 +976,7 @@ fn build_supervisor_final_report(
             "rerun with the trusted system Codex runtime before treating the generated follow-up records as dispatchable evidence"
                 .to_string()
         } else if success && generated_follow_up_task_count > 0 {
-            "write each generated_follow_up_tasks supervisor_plan directly to a plan file and invoke a new supervise run; ordinary claims, budget admission, checkpoints, child gates, and review lenses are already configured"
+            "inspect the authenticated follow-up queue and cascade outcome; any admitted generated plan still passes ordinary claims, budget admission, checkpoints, child gates, and review lenses"
                 .to_string()
         } else if success && !publishable {
             "rerun with the trusted system Codex runtime before any real acceptance, merge, or publication"
@@ -1161,6 +1187,8 @@ fn persist_supervisor_final_report(
             trip.autonomy_kpis = final_report.autonomy_kpis.clone();
         }
     }
+    #[cfg(test)]
+    run_before_supervisor_final_report_persist_hook(&mut final_report);
     let report_bytes = encode_final_report(&final_report)?;
     let mut checkpoint_writer = checkpoint_writer;
     if let Some(checkpoint) = checkpoint_writer.as_deref_mut() {

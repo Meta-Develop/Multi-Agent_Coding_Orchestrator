@@ -1,4 +1,5 @@
 use super::*;
+use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
 
 pub fn supervisor_plan_from_task_file(
     repo: impl AsRef<Path>,
@@ -21,14 +22,23 @@ pub fn supervisor_plan_document_from_goal_spec(
     goal: &str,
     spec: &str,
 ) -> Result<Value> {
+    Ok(supervisor_plan_and_document_from_goal_spec(repo, goal, spec)?.1)
+}
+
+pub(crate) fn supervisor_plan_and_document_from_goal_spec(
+    repo: impl AsRef<Path>,
+    goal: &str,
+    spec: &str,
+) -> Result<(SupervisorPlan, Value)> {
     let repo = discover_repo_root(repo.as_ref())?;
     let loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
-    supervisor_plan_value(
+    let document = supervisor_plan_value(
         &loaded.plan,
         &loaded.consultant,
         &loaded.assignment_metadata,
         &loaded.plan_metadata,
-    )
+    )?;
+    Ok((loaded.plan, document))
 }
 
 pub fn supervisor_plan_document_from_task_file(
@@ -245,6 +255,25 @@ pub(super) fn parse_supervisor_plan_with_consultant(
         assignment_metadata,
         plan_metadata,
     })
+}
+
+pub(crate) fn validate_generated_follow_up_plan_document(
+    generated: &GeneratedFollowUpSupervisorPlan,
+) -> Result<SupervisorPlan> {
+    let serialized =
+        serde_json::to_string(generated).context("failed to serialize generated follow-up plan")?;
+    let loaded = parse_supervisor_plan_with_consultant(&serialized)
+        .context("generated follow-up plan failed the ordinary full-document loader")?;
+    if loaded.plan != generated.ordinary_plan()
+        || loaded.consultant != generated.consultant
+        || loaded.plan_metadata.assignment_schedule != generated.assignment_schedule
+        || loaded.plan_metadata.run_budget != generated.run_budget
+        || loaded.plan_metadata.generated_follow_up != Some(generated.generated_follow_up.clone())
+        || !loaded.plan_metadata.spec_fragment_ids.is_empty()
+    {
+        bail!("ordinary full-document loader changed generated follow-up authority");
+    }
+    Ok(loaded.plan)
 }
 
 fn assignments_from_plan_value(value: &Value) -> Result<Vec<OrchestratorAssignment>> {
@@ -791,6 +820,233 @@ pub fn run_supervisor_plan_file_with_concurrency_policy(
 ) -> Result<SupervisorFinalReport> {
     let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
     run_supervisor_plan_file_with_max_concurrent_children(options, max_concurrent_children)
+}
+
+pub fn run_supervisor_goal_spec_with_concurrency_policy(
+    options: SupervisorRunOptions,
+    goal: &str,
+    spec: &str,
+    concurrency_policy: SupervisorConcurrencyPolicy,
+) -> Result<SupervisorFinalReport> {
+    let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
+    run_supervisor_goal_spec_with_max_concurrent_children(
+        options,
+        goal,
+        spec,
+        max_concurrent_children,
+    )
+}
+
+pub fn run_supervisor_plan_file_cascade_with_concurrency_policy(
+    options: SupervisorRunOptions,
+    concurrency_policy: SupervisorConcurrencyPolicy,
+) -> Result<SupervisorCascadeOutcome> {
+    let outer_run_id = options.run_id.clone();
+    let mut permit = |_plan: &SupervisorPlan| Ok(true);
+    run_supervisor_plan_file_cascade_with_gate(
+        options,
+        concurrency_policy,
+        GeneratedFollowUpQueueEntrypoint::SuperviseRun,
+        &outer_run_id,
+        &mut permit,
+    )
+}
+
+pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy(
+    options: SupervisorRunOptions,
+    goal: &str,
+    spec: &str,
+    concurrency_policy: SupervisorConcurrencyPolicy,
+) -> Result<SupervisorCascadeOutcome> {
+    let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
+    validate_max_concurrent_children(max_concurrent_children)?;
+    let outer_run_id = options.run_id.clone();
+    let repo = discover_repo_root(&options.repo)?;
+    let manager = WorktreeManager::new(&repo);
+    let cleanliness = manager.acquire_repository_cleanliness()?;
+    let loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
+    let source_loaded = loaded.clone();
+    let template = options.clone();
+    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
+    let source_report = run_supervisor_plan_with_runner_and_creation(
+        loaded,
+        options,
+        max_concurrent_children,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::Bound(&cleanliness),
+        runtime_model_catalog,
+        &run_external_agent_cancellable_reviewed,
+    )?;
+    drop(cleanliness);
+    let mut permit = |_plan: &SupervisorPlan| Ok(true);
+    run_generated_follow_up_cascade(
+        &repo,
+        &source_loaded,
+        source_report,
+        &template,
+        FollowUpCascadeInvocation {
+            outer_entrypoint: GeneratedFollowUpQueueEntrypoint::SuperviseRun,
+            outer_command_run_id: &outer_run_id,
+            concurrency_policy,
+            runtime_catalog: FollowUpRuntimeCatalog::Production,
+        },
+        &mut permit,
+        &run_external_agent_cancellable_reviewed,
+    )
+}
+
+pub fn resume_supervisor_plan_file_cascade_with_concurrency_policy(
+    options: SupervisorRunOptions,
+    concurrency_policy: SupervisorConcurrencyPolicy,
+) -> Result<SupervisorCascadeOutcome> {
+    let repo = discover_repo_root(&options.repo)?;
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    resume_generated_follow_up_cascade(repo, loaded, options, concurrency_policy)
+}
+
+pub fn resume_supervisor_goal_spec_cascade_with_concurrency_policy(
+    options: SupervisorRunOptions,
+    goal: &str,
+    spec: &str,
+    concurrency_policy: SupervisorConcurrencyPolicy,
+) -> Result<SupervisorCascadeOutcome> {
+    let repo = discover_repo_root(&options.repo)?;
+    let loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
+    resume_generated_follow_up_cascade(repo, loaded, options, concurrency_policy)
+}
+
+fn resume_generated_follow_up_cascade(
+    repo: PathBuf,
+    loaded: LoadedSupervisorPlan,
+    options: SupervisorRunOptions,
+    concurrency_policy: SupervisorConcurrencyPolicy,
+) -> Result<SupervisorCascadeOutcome> {
+    let run_id = options.run_id.clone();
+    let status = supervisor_status(&repo, run_id.clone())?;
+    let (source_report, source_was_finalized) = match status.lifecycle {
+        SupervisorRunLifecycle::Finalized => (
+            status
+                .final_report
+                .context("finalized supervise cascade source report is missing")?,
+            true,
+        ),
+        SupervisorRunLifecycle::Resumable => (
+            resume_supervisor_run(&repo, run_id.clone())?
+                .final_report
+                .context("resumed supervise cascade source report is missing")?,
+            false,
+        ),
+        SupervisorRunLifecycle::Active => {
+            bail!("cannot resume generated follow-up cascade while its source run is active")
+        }
+        SupervisorRunLifecycle::Uncertain => {
+            bail!("cannot resume generated follow-up cascade from an uncertain source run")
+        }
+        SupervisorRunLifecycle::Interrupted => {
+            bail!("cannot resume generated follow-up cascade from an interrupted source run")
+        }
+    };
+    if source_was_finalized {
+        ensure_generated_follow_up_cascade_needs_resume(&repo, &loaded, &source_report)?;
+    }
+    let mut permit = |_plan: &SupervisorPlan| Ok(true);
+    run_generated_follow_up_cascade(
+        &repo,
+        &loaded,
+        source_report,
+        &options,
+        FollowUpCascadeInvocation {
+            outer_entrypoint: GeneratedFollowUpQueueEntrypoint::SuperviseRun,
+            outer_command_run_id: &run_id,
+            concurrency_policy,
+            runtime_catalog: FollowUpRuntimeCatalog::Production,
+        },
+        &mut permit,
+        &run_external_agent_cancellable_reviewed,
+    )
+}
+
+pub(crate) fn run_supervisor_plan_file_cascade_for_autopilot(
+    options: SupervisorRunOptions,
+    concurrency_policy: SupervisorConcurrencyPolicy,
+    outer_command_run_id: &RunId,
+    before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<bool>,
+) -> Result<SupervisorCascadeOutcome> {
+    run_supervisor_plan_file_cascade_with_gate(
+        options,
+        concurrency_policy,
+        GeneratedFollowUpQueueEntrypoint::AutopilotRun,
+        outer_command_run_id,
+        before_dispatch,
+    )
+}
+
+fn run_supervisor_plan_file_cascade_with_gate(
+    options: SupervisorRunOptions,
+    concurrency_policy: SupervisorConcurrencyPolicy,
+    outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
+    outer_command_run_id: &RunId,
+    before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<bool>,
+) -> Result<SupervisorCascadeOutcome> {
+    let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
+    validate_max_concurrent_children(max_concurrent_children)?;
+    let repo = discover_repo_root(&options.repo)?;
+    let manager = WorktreeManager::new(&repo);
+    let cleanliness = manager.acquire_repository_cleanliness()?;
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    if !before_dispatch(&loaded.plan)? {
+        bail!("effective supervisor profile changed before exact loaded-plan dispatch");
+    }
+    let source_loaded = loaded.clone();
+    let template = options.clone();
+    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
+    let source_report = run_supervisor_plan_with_runner_and_creation(
+        loaded,
+        options,
+        max_concurrent_children,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::Bound(&cleanliness),
+        runtime_model_catalog,
+        &run_external_agent_cancellable_reviewed,
+    )?;
+    drop(cleanliness);
+    run_generated_follow_up_cascade(
+        &repo,
+        &source_loaded,
+        source_report,
+        &template,
+        FollowUpCascadeInvocation {
+            outer_entrypoint,
+            outer_command_run_id,
+            concurrency_policy,
+            runtime_catalog: FollowUpRuntimeCatalog::Production,
+        },
+        before_dispatch,
+        &run_external_agent_cancellable_reviewed,
+    )
+}
+
+fn run_supervisor_goal_spec_with_max_concurrent_children(
+    options: SupervisorRunOptions,
+    goal: &str,
+    spec: &str,
+    max_concurrent_children: usize,
+) -> Result<SupervisorFinalReport> {
+    validate_max_concurrent_children(max_concurrent_children)?;
+    let repo = discover_repo_root(&options.repo)?;
+    let manager = WorktreeManager::new(&repo);
+    let cleanliness = manager.acquire_repository_cleanliness()?;
+    let loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
+    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
+    run_supervisor_plan_with_runner_and_creation(
+        loaded,
+        options,
+        max_concurrent_children,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::Bound(&cleanliness),
+        runtime_model_catalog,
+        &run_external_agent_cancellable_reviewed,
+    )
 }
 
 pub fn run_supervisor_plan_file_with_max_concurrent_children(
