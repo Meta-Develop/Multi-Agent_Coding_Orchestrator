@@ -1227,6 +1227,240 @@ fn generated_follow_up_exact_loaded_plan_drift_refuses_before_child_dispatch() {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum GeneratedRoundLastMomentMutation {
+    Primary,
+    MachineGlobalConfig,
+}
+
+#[cfg(target_os = "linux")]
+struct GeneratedRoundLastMomentScenario {
+    _temp: tempfile::TempDir,
+    repo: PathBuf,
+    outcome: SupervisorCascadeOutcome,
+    primary_before: String,
+    primary_after: String,
+    machine_global_config_before: Vec<u8>,
+    machine_global_config_after: Vec<u8>,
+    profile_callback_invocations: usize,
+    source_child_dispatches: usize,
+    generated_runner_dispatches: usize,
+}
+
+#[cfg(target_os = "linux")]
+fn run_generated_round_last_moment_mutation(
+    run_name: &str,
+    mutation: GeneratedRoundLastMomentMutation,
+) -> GeneratedRoundLastMomentScenario {
+    let (temp, repo) = injected_repository();
+    let source_assignment = licensed_assignment();
+    let plan = injected_plan(source_assignment.clone(), 0);
+    let run_id = RunId::new(run_name).expect("last-moment gate source run id");
+    let plan_file = temp.path().join(format!("{run_name}.json"));
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&plan).expect("serialize last-moment gate source plan"),
+    )
+    .expect("write last-moment gate source plan");
+    let retention = secure_machine_global_retention(temp.path(), run_name);
+    let machine_global_config = retention.config.clone();
+    let machine_global_config_before =
+        fs::read(&machine_global_config).expect("read original machine-global config");
+    let options = SupervisorRunOptions {
+        repo: repo.clone(),
+        plan_file,
+        run_id,
+        codex_bin: PathBuf::from("unused-injected-codex"),
+        runtime: SupervisorRuntime::Codex,
+        allow_dirty_primary: false,
+        machine_global_retention: Some(retention),
+    };
+    let declaration_sha256 = licensed_breakage_declaration_sha256(
+        source_assignment
+            .licensed_breakage
+            .as_ref()
+            .expect("last-moment gate licensed declaration"),
+    )
+    .expect("hash last-moment gate declaration");
+    let primary_before =
+        verified_whole_primary_snapshot_sha256(&repo).expect("capture last-moment primary before");
+    let mut profile_callback_invocations = 0_usize;
+    let repo_for_gate = repo.clone();
+    let config_for_gate = machine_global_config.clone();
+    let mut before_dispatch = |_effective: &SupervisorPlan| {
+        profile_callback_invocations = profile_callback_invocations.saturating_add(1);
+        if profile_callback_invocations == 2 {
+            match mutation {
+                GeneratedRoundLastMomentMutation::Primary => {
+                    fs::write(
+                        repo_for_gate.join("README.md"),
+                        "primary changed after generated profile approval\n",
+                    )
+                    .expect("mutate primary after generated profile approval");
+                }
+                GeneratedRoundLastMomentMutation::MachineGlobalConfig => {
+                    let mut changed = fs::read(&config_for_gate)
+                        .expect("reread machine-global config before drift");
+                    changed.extend_from_slice(b"\n ");
+                    fs::write(&config_for_gate, changed)
+                        .expect("mutate machine-global config after profile approval");
+                }
+            }
+        }
+        Ok(true)
+    };
+    let mut source_child_dispatches = 0_usize;
+    let mut generated_runner_dispatches = 0_usize;
+    let mut runner = |command: &ExternalAgentCommand| {
+        let output_path = command.output_last_message.to_string_lossy();
+        let is_follow_up = output_path.contains("child-a-licensed-update-01");
+        let is_auditor = output_path.contains("review-auditor");
+        if is_follow_up {
+            generated_runner_dispatches = generated_runner_dispatches.saturating_add(1);
+            panic!("last-moment generated-round refusal reached an external runner");
+        } else if is_auditor {
+            write_injected_json(
+                &command.output_last_message,
+                &licensed_auditor_report(&source_assignment, Some(&declaration_sha256)),
+            );
+        } else {
+            source_child_dispatches = source_child_dispatches.saturating_add(1);
+            assert_eq!(source_child_dispatches, 1, "source child reran");
+            fs::write(command.cwd.join("README.md"), "licensed breaking change\n")
+                .expect("write last-moment source candidate");
+            write_injected_json(
+                &command.output_last_message,
+                &dependent_failure_child(&source_assignment, "src/client.rs"),
+            );
+        }
+        write_injected_usage(command, 0, 1);
+        injected_verified_run(command)
+    };
+    let outer_run_id =
+        RunId::new(format!("{run_name}-outer")).expect("last-moment outer command run id");
+    let outcome = run_supervisor_plan_file_cascade_with_runner_and_gate(
+        options,
+        GeneratedFollowUpQueueEntrypoint::SuperviseRun,
+        &outer_run_id,
+        &mut before_dispatch,
+        &mut runner,
+    )
+    .expect("return typed last-moment generated-round refusal");
+    drop(before_dispatch);
+    drop(runner);
+    let primary_after =
+        verified_whole_primary_snapshot_sha256(&repo).expect("capture last-moment primary after");
+    let machine_global_config_after =
+        fs::read(&machine_global_config).expect("read final machine-global config");
+
+    GeneratedRoundLastMomentScenario {
+        _temp: temp,
+        repo,
+        outcome,
+        primary_before,
+        primary_after,
+        machine_global_config_before,
+        machine_global_config_after,
+        profile_callback_invocations,
+        source_child_dispatches,
+        generated_runner_dispatches,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn generated_follow_up_rechecks_primary_after_profile_before_dispatch() {
+    let scenario = run_generated_round_last_moment_mutation(
+        "licensed-cascade-last-moment-primary",
+        GeneratedRoundLastMomentMutation::Primary,
+    );
+
+    assert!(
+        scenario.outcome.source_report.success,
+        "{:#?}",
+        scenario.outcome
+    );
+    assert!(!scenario.outcome.follow_up_cascade_success);
+    assert!(!scenario.outcome.generated_follow_up_dispatch_performed());
+    assert_eq!(
+        scenario.outcome.follow_up_primary_worktree_untouched,
+        Some(false)
+    );
+    assert!(scenario
+        .outcome
+        .follow_up_gate_denials
+        .iter()
+        .any(|denial| { matches!(denial.reason, GateDenialReason::PrimaryIntegrityFailure) }));
+    let queue = scenario
+        .outcome
+        .follow_up_queue
+        .expect("last-moment primary queue summary");
+    assert_eq!(queue.pending_count, 1);
+    assert_eq!(queue.dispatch_started_count, 0);
+    assert_eq!(queue.acknowledged_terminal_count, 0);
+    assert_eq!(queue.authenticated_child_dispatch_started_count, 0);
+    assert_eq!(scenario.profile_callback_invocations, 2);
+    assert_eq!(scenario.source_child_dispatches, 1);
+    assert_eq!(scenario.generated_runner_dispatches, 0);
+    assert_ne!(scenario.primary_after, scenario.primary_before);
+    assert_eq!(
+        scenario.machine_global_config_after,
+        scenario.machine_global_config_before
+    );
+    assert!(!scenario.repo.join("src/client.rs").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn generated_follow_up_rechecks_machine_global_after_profile_before_dispatch() {
+    let scenario = run_generated_round_last_moment_mutation(
+        "licensed-cascade-last-moment-retention",
+        GeneratedRoundLastMomentMutation::MachineGlobalConfig,
+    );
+
+    assert!(
+        scenario.outcome.source_report.success,
+        "{:#?}",
+        scenario.outcome
+    );
+    assert!(!scenario.outcome.follow_up_cascade_success);
+    assert!(!scenario.outcome.generated_follow_up_dispatch_performed());
+    assert_eq!(
+        scenario.outcome.follow_up_primary_worktree_untouched,
+        Some(true)
+    );
+    assert!(scenario
+        .outcome
+        .follow_up_gate_denials
+        .iter()
+        .any(|denial| {
+            matches!(
+                denial.reason,
+                GateDenialReason::ApprovalReview {
+                    denial: crate::gate_denial::ApprovalReviewDenial::PermissionExpansion
+                }
+            )
+        }));
+    let queue = scenario
+        .outcome
+        .follow_up_queue
+        .expect("last-moment retention queue summary");
+    assert_eq!(queue.pending_count, 1);
+    assert_eq!(queue.dispatch_started_count, 0);
+    assert_eq!(queue.acknowledged_terminal_count, 0);
+    assert_eq!(queue.authenticated_child_dispatch_started_count, 0);
+    assert_eq!(scenario.profile_callback_invocations, 2);
+    assert_eq!(scenario.source_child_dispatches, 1);
+    assert_eq!(scenario.generated_runner_dispatches, 0);
+    assert_eq!(scenario.primary_after, scenario.primary_before);
+    assert_ne!(
+        scenario.machine_global_config_after,
+        scenario.machine_global_config_before
+    );
+    assert!(!scenario.repo.join("src/client.rs").exists());
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn licensed_follow_up_enqueue_interruption_resumes_without_rerunning_source() {
     let (temp, repo) = injected_repository();
