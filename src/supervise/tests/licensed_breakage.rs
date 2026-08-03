@@ -1050,6 +1050,7 @@ fn licensed_follow_up_cascade_dispatches_one_authenticated_round_and_keeps_prima
                 &dependent_failure_child(&source_assignment, "src/client.rs"),
             );
         }
+        write_injected_usage(command, 0, 1);
         injected_verified_run(command)
     };
 
@@ -1188,6 +1189,7 @@ fn licensed_follow_up_enqueue_interruption_resumes_without_rerunning_source() {
                 &dependent_failure_child(&source_assignment, "src/client.rs"),
             );
         }
+        write_injected_usage(command, 0, 1);
         injected_verified_run(command)
     };
 
