@@ -14,8 +14,8 @@ use crate::{
     gate_denial::{ExternalSideEffectState, GateDenial},
     state_journal::{AuthenticatedStateJournal, JournalRecord, JournalSpec},
     supervise::{
-        load_supervisor_plan_file, GeneratedFollowUpDispatchStatus,
-        GeneratedFollowUpTaskRecord, SupervisorPlan,
+        load_supervisor_plan_file, GeneratedFollowUpDispatchStatus, GeneratedFollowUpTaskRecord,
+        SupervisorPlan,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -147,15 +147,11 @@ impl GeneratedFollowUpQueueBounds {
                 .checked_add(validated)
                 .context("generated follow-up validated-dependent count overflowed")?;
             if validated > declared {
-                bail!(
-                    "generated follow-up validated dependents exceed the source declaration"
-                );
+                bail!("generated follow-up validated dependents exceed the source declaration");
             }
         }
         if validated_dependents == 0 || validated_dependents > MAX_QUEUE_ITEMS {
-            bail!(
-                "generated follow-up queue capacity must be between 1 and {MAX_QUEUE_ITEMS}"
-            );
+            bail!("generated follow-up queue capacity must be between 1 and {MAX_QUEUE_ITEMS}");
         }
         let bounds = Self {
             declared_dependents,
@@ -253,9 +249,7 @@ impl GeneratedFollowUpDispatchObservation {
             bail!("dispatch observation names a different subordinate run");
         }
         if self.external_side_effect_state == Some(ExternalSideEffectState::Ambiguous) {
-            bail!(
-                "ambiguous dispatch evidence must use the held_ambiguous queue transition"
-            );
+            bail!("ambiguous dispatch evidence must use the held_ambiguous queue transition");
         }
         Ok(())
     }
@@ -548,9 +542,8 @@ impl GeneratedFollowUpQueue {
             if self.snapshot.staged.contains_key(item_id) {
                 continue;
             }
-            events.push(self.append_event(QueueJournalEvent::EnqueueStaged {
-                item: item.clone(),
-            })?);
+            events
+                .push(self.append_event(QueueJournalEvent::EnqueueStaged { item: item.clone() })?);
         }
         let item_ids = prepared.keys().cloned().collect::<Vec<_>>();
         let batch_sha256 = batch_sha256(&item_ids)?;
@@ -561,10 +554,7 @@ impl GeneratedFollowUpQueue {
         Ok(events)
     }
 
-    pub(crate) fn claim(
-        &mut self,
-        item_id: &str,
-    ) -> Result<GeneratedFollowUpQueueEventData> {
+    pub(crate) fn claim(&mut self, item_id: &str) -> Result<GeneratedFollowUpQueueEventData> {
         self.append_event(QueueJournalEvent::Claimed {
             item_id: item_id.to_string(),
         })
@@ -795,11 +785,7 @@ fn apply_queue_event(
                 bail!("generated follow-up dispatch marker has a non-deterministic run id");
             }
             let item = queue_item_mut(&mut snapshot, item_id)?;
-            require_phase(
-                item,
-                GeneratedFollowUpQueuePhase::Claimed,
-                "dispatch start",
-            )?;
+            require_phase(item, GeneratedFollowUpQueuePhase::Claimed, "dispatch start")?;
             item.phase = GeneratedFollowUpQueuePhase::DispatchStarted;
             item.subordinate_run_id = Some(expected_run_id);
             item.external_side_effect_state = Some(ExternalSideEffectState::Ambiguous);
@@ -1202,12 +1188,14 @@ mod tests {
         artifacts::repository_auth_writer,
         merge::CandidateValidationBinding,
         orchestrator::SemanticCoordinationMode,
-        review::{ReviewAggregationPolicy, ReviewInformationScope, ReviewLensBackendConfig, ReviewLensConfig},
+        review::{
+            ReviewAggregationPolicy, ReviewInformationScope, ReviewLensBackendConfig,
+            ReviewLensConfig,
+        },
         supervise::{
             AgentRole, AssignmentScheduleEntry, GeneratedFollowUpOperatorDefault,
-            GeneratedFollowUpPlanContext, GeneratedFollowUpSupervisorPlan,
-            OrchestratorAssignment, RunBudgetLimits, SupervisorBudgetConfig,
-            SupervisorConsultantPlan,
+            GeneratedFollowUpPlanContext, GeneratedFollowUpSupervisorPlan, OrchestratorAssignment,
+            RunBudgetLimits, SupervisorBudgetConfig, SupervisorConsultantPlan,
         },
     };
     use git2::Repository;
@@ -1420,8 +1408,9 @@ mod tests {
     fn conflicting_duplicate_item_id_is_refused_during_replay() {
         let (_temp, repo) = repository();
         let source = source("source-conflict");
-        let mut queue = GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
-            .expect("create queue");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
         let first_task = generated_task("01");
         let item_id = generated_follow_up_item_id(&source, &first_task).expect("item id");
         let first = QueueJournalEvent::EnqueueStaged {
@@ -1511,11 +1500,9 @@ mod tests {
 
     #[test]
     fn capacity_and_checked_overflow_refuse_before_dispatch() {
-        let overflow = GeneratedFollowUpQueueBounds::from_source_dependents(
-            &[usize::MAX, 1],
-            &[0, 0],
-        )
-        .expect_err("declared total overflow must fail");
+        let overflow =
+            GeneratedFollowUpQueueBounds::from_source_dependents(&[usize::MAX, 1], &[0, 0])
+                .expect_err("declared total overflow must fail");
         assert!(format!("{overflow:#}").contains("overflowed"));
         assert!(GeneratedFollowUpQueueBounds::from_source_dependents(
             &[MAX_QUEUE_ITEMS + 1],
@@ -1541,12 +1528,9 @@ mod tests {
     fn authenticated_reopen_replays_committed_queue() {
         let (_temp, repo) = repository();
         let source = source("source-reopen");
-        let mut queue = GeneratedFollowUpQueue::create(
-            authenticator(&repo),
-            source.clone(),
-            bounds(1),
-        )
-        .expect("create queue");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
         queue
             .enqueue_all_before_dispatch(&[generated_task("01")])
             .expect("enqueue");
@@ -1566,12 +1550,8 @@ mod tests {
     fn authenticated_record_tampering_is_refused() {
         let (_temp, repo) = repository();
         let source = source("source-tamper");
-        let queue = GeneratedFollowUpQueue::create(
-            authenticator(&repo),
-            source.clone(),
-            bounds(1),
-        )
-        .expect("create queue");
+        let queue = GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+            .expect("create queue");
         let first_record = queue
             .journal
             .root()
@@ -1593,21 +1573,13 @@ mod tests {
     fn pending_and_claimed_items_survive_crash_replay_without_loss() {
         let (_temp, repo) = repository();
         let source = source("source-claimed-replay");
-        let mut queue = GeneratedFollowUpQueue::create(
-            authenticator(&repo),
-            source.clone(),
-            bounds(2),
-        )
-        .expect("create queue");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(2))
+                .expect("create queue");
         queue
             .enqueue_all_before_dispatch(&[generated_task("01"), generated_task("02")])
             .expect("enqueue");
-        let ids = queue
-            .snapshot()
-            .items()
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
+        let ids = queue.snapshot().items().keys().cloned().collect::<Vec<_>>();
         queue.claim(&ids[0]).expect("claim first item");
         drop(queue);
 
@@ -1627,12 +1599,9 @@ mod tests {
     fn dispatch_started_replay_remains_ambiguous_and_never_pending() {
         let (_temp, repo) = repository();
         let source = source("source-started-replay");
-        let mut queue = GeneratedFollowUpQueue::create(
-            authenticator(&repo),
-            source.clone(),
-            bounds(1),
-        )
-        .expect("create queue");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
         queue
             .enqueue_all_before_dispatch(&[generated_task("01")])
             .expect("enqueue");
@@ -1653,7 +1622,9 @@ mod tests {
         );
         assert!(reopened.snapshot().pending_item_ids().is_empty());
         assert!(reopened.claim(&item_id).is_err());
-        assert!(reopened.release_before_dispatch(&item_id, None, Vec::new()).is_err());
+        assert!(reopened
+            .release_before_dispatch(&item_id, None, Vec::new())
+            .is_err());
         reopened
             .mark_held_ambiguous(&item_id, None, Vec::new())
             .expect("hold ambiguous dispatch");
