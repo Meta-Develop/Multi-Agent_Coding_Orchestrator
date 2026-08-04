@@ -21,6 +21,9 @@ SYNTHETIC_DEVICE = 33_333_333
 SYNTHETIC_COMMON_DIR_FILE = 33_000_001
 SYNTHETIC_KEY_FILE = 33_000_002
 SYNTHETIC_RUN_DIRECTORY_FILE = 33_000_003
+FIXTURE_NAMESPACE_DIRECTORY = "state"
+FIXTURE_JOURNAL_DIRECTORY = "j"
+LEGACY_FIXTURE_NAMESPACE_DIRECTORY = "authenticated-claims-state-v1"
 
 
 def digest_label(label: str) -> str:
@@ -246,12 +249,14 @@ def logical_anchor() -> bytes:
 def write_fixture(output_root: Path, anchor_synthetic_identity: bool) -> None:
     files = generated_files()
     verify_generated_files(files)
-    namespace = output_root / "authenticated-claims-state-v1"
-    if namespace.is_symlink():
-        namespace.unlink()
-    elif namespace.exists():
-        shutil.rmtree(namespace)
-    journal = namespace / RUN_ID
+    namespace = output_root / FIXTURE_NAMESPACE_DIRECTORY
+    legacy_namespace = output_root / LEGACY_FIXTURE_NAMESPACE_DIRECTORY
+    for existing_namespace in (namespace, legacy_namespace):
+        if existing_namespace.is_symlink():
+            existing_namespace.unlink()
+        elif existing_namespace.exists():
+            shutil.rmtree(existing_namespace)
+    journal = namespace / FIXTURE_JOURNAL_DIRECTORY
     journal.mkdir(parents=True)
     if anchor_synthetic_identity:
         (namespace / LOGICAL_ANCHOR_NAME).write_bytes(logical_anchor())
@@ -259,7 +264,9 @@ def write_fixture(output_root: Path, anchor_synthetic_identity: bool) -> None:
     manifest_lines = []
     for name, contents in sorted(files.items()):
         (journal / name).write_bytes(contents)
-        relative = Path("authenticated-claims-state-v1") / RUN_ID / name
+        relative = (
+            Path(FIXTURE_NAMESPACE_DIRECTORY) / FIXTURE_JOURNAL_DIRECTORY / name
+        )
         manifest_lines.append(f"{hashlib.sha256(contents).hexdigest()}  {relative.as_posix()}\n")
     (output_root / "authenticated-claims-state-v1.sha256").write_text(
         "".join(manifest_lines), encoding="ascii"
