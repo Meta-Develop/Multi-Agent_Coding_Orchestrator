@@ -8,7 +8,8 @@ use crate::{
         StdinMode, StrictOfflineWorkspaceProfile,
     },
     safe_state::{
-        remove_direct_child_tree, BoundedRegularReader, FileIdentity, SafeRoot, TreeLinkPolicy,
+        remove_direct_child_tree, unsigned_to_u32, unsigned_to_u64, BoundedRegularReader,
+        FileIdentity, SafeRoot, TreeLinkPolicy,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -3267,7 +3268,7 @@ fn materialized_reviewer_file(path: &Path) -> Result<MaterializedReviewerFile> {
             bail!("materialized reviewer file changed during verification");
         }
         Ok(MaterializedReviewerFile {
-            mode: before.st_mode,
+            mode: unsigned_to_u32(before.st_mode),
             length,
             sha256: sha256_bytes(&contents),
             identity: file_identity_from_stat(&before),
@@ -3412,7 +3413,7 @@ fn read_absolute_reviewer_program(path: &Path) -> Result<BoundReviewerProgramFil
             bail!("absolute reviewer program changed during bounded read");
         }
         Ok(BoundReviewerProgramFile {
-            mode: before.st_mode,
+            mode: unsigned_to_u32(before.st_mode),
             length,
             sha256: sha256_bytes(&contents),
             identity: file_identity_from_stat(&before),
@@ -4005,7 +4006,7 @@ impl ReviewTreeReader {
                 bail!("review directory changed during binding");
             }
             Ok(BoundReviewDirectory {
-                mode: opened.st_mode,
+                mode: unsigned_to_u32(opened.st_mode),
                 identity: file_identity_from_stat(&opened),
                 modified_seconds: opened.st_mtime,
                 modified_nanoseconds: stat_modified_nanoseconds(&opened),
@@ -4061,7 +4062,7 @@ impl ReviewTreeReader {
             };
             validate_snapshot_entry_owner_and_links(&before)?;
             let file_type = before.st_mode & libc::S_IFMT;
-            let mode = before.st_mode;
+            let mode = unsigned_to_u32(before.st_mode);
             if file_type == libc::S_IFREG {
                 let length = u64::try_from(before.st_size)
                     .context("review worktree file has a negative length")?;
@@ -4183,7 +4184,7 @@ impl ReviewTreeReader {
             if file_type == libc::S_IFDIR {
                 return Ok(GitBacklinkSnapshot {
                     kind: "directory".to_string(),
-                    mode: before.st_mode,
+                    mode: unsigned_to_u32(before.st_mode),
                     identity,
                     modified_seconds: before.st_mtime,
                     modified_nanoseconds: stat_modified_nanoseconds(&before),
@@ -4232,7 +4233,7 @@ impl ReviewTreeReader {
             }
             Ok(GitBacklinkSnapshot {
                 kind: "file".to_string(),
-                mode: before.st_mode,
+                mode: unsigned_to_u32(before.st_mode),
                 identity,
                 modified_seconds: before.st_mtime,
                 modified_nanoseconds: stat_modified_nanoseconds(&before),
@@ -4574,8 +4575,8 @@ fn fstat_file(file: &File) -> Result<libc::stat> {
 #[cfg(unix)]
 fn file_identity_from_stat(stat: &libc::stat) -> FileIdentity {
     FileIdentity {
-        device: stat.st_dev,
-        file: stat.st_ino,
+        device: unsigned_to_u64(stat.st_dev),
+        file: unsigned_to_u64(stat.st_ino),
     }
 }
 
@@ -7175,7 +7176,7 @@ mod tests {
     #[test]
     fn sanitized_view_rejects_special_modes_and_collapses_hidden_ancestors() {
         let entry = SnapshotTreeEntry::Regular {
-            mode: libc::S_IFREG | 0o4755,
+            mode: unsigned_to_u32(libc::S_IFREG) | 0o4755,
             length: 1,
             sha256: [0; 32],
             identity: FileIdentity { device: 1, file: 1 },
