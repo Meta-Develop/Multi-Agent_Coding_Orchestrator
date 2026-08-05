@@ -2,26 +2,39 @@
 
 ## Development Setup
 
-Use the Nix development shell when you want the repository-pinned native tools:
+The authoritative local environment for CI parity is the repository's Nix
+development shell:
 
 ```bash
-nix develop .
+nix develop path:$PWD
 ```
 
-Inside the shell, run Cargo normally. If Rust is already available on your
-system, you can run the same Cargo commands without Nix.
+It provides the Rust toolchain selected by `rust-toolchain.toml` and the Python
+interpreter used by the repository-portability gate. An ambient system
+toolchain is not evidence of CI parity.
 
 ## Verification
 
-Run these gates before sending changes for review:
+Run these one-shot gates before sending changes for review:
 
 ```bash
-cargo fmt -- --check
-cargo test
-cargo clippy --all-targets -- -D warnings
+nix develop path:$PWD -c rustc --version --verbose
+nix develop path:$PWD -c cargo --version --verbose
+nix develop path:$PWD -c cargo clippy --version
+nix develop path:$PWD -c python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+nix develop path:$PWD -c python3 scripts/check_repository_portability.py
+nix develop path:$PWD -c cargo fmt --all -- --check
+nix develop path:$PWD -c cargo check --locked --all-targets
+nix develop path:$PWD -c cargo clippy --locked --all-targets -- -D warnings
+nix develop path:$PWD -c cargo test --locked --all-targets
 ```
 
-Use `--locked` when checking release or CI parity against `Cargo.lock`.
+These commands reproduce the Linux CI toolchain and tracked-path portability
+gate. They cannot compile or link target-specific code on actual macOS or
+Windows runners. Before treating a branch as fully CI-green, push it or open a
+draft pull request and wait for both the `macos-latest` and `windows-latest`
+`portable-build` jobs; a draft pull request is the cheapest honest way to close
+that residual gap.
 
 ## Tests
 

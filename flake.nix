@@ -33,6 +33,7 @@
           default = pkgs.mkShell {
             packages = [
               rustToolchain
+              pkgs.python3
               pkgs.cargo-audit
               pkgs.cargo-deny
             ];
