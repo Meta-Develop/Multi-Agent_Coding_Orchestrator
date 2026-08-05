@@ -17,6 +17,22 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  repository-portability:
+    name: Repository portability
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Run repository portability unit tests
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+      - name: Check tracked path portability
+        run: python3 scripts/check_repository_portability.py
+
   linux:
     name: Linux fmt, check, clippy, and test
     runs-on: ubuntu-latest
@@ -48,6 +64,7 @@ jobs:
 
   portable-build:
     name: ${{ matrix.os }} compile and test build
+    needs: repository-portability
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
