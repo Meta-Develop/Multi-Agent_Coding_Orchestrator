@@ -1736,29 +1736,27 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilo
     outer_command_run_id: &RunId,
     caller_cancellation: Option<&ProcessCancellation>,
     before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
-    external_runner: &mut (dyn FnMut(
-        &ExternalAgentCommand,
-        &ProcessCancellation,
-    ) -> ExternalAgentRun
-                  + Send),
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand, &ProcessCancellation) -> ExternalAgentRun
+              + Send),
 ) -> Result<SupervisorCascadeOutcome> {
     let serialized_runner = Mutex::new(external_runner);
-    let cancellable_runner = |command: &ExternalAgentCommand,
-                              scheduler_cancellation: &ProcessCancellation,
-                              _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
-        let run = || match serialized_runner.lock() {
-            Ok(mut runner) => runner(command, scheduler_cancellation),
-            Err(poisoned) => poisoned.into_inner()(command, scheduler_cancellation),
+    let cancellable_runner =
+        |command: &ExternalAgentCommand,
+         scheduler_cancellation: &ProcessCancellation,
+         _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+            let run = || match serialized_runner.lock() {
+                Ok(mut runner) => runner(command, scheduler_cancellation),
+                Err(poisoned) => poisoned.into_inner()(command, scheduler_cancellation),
+            };
+            match caller_cancellation {
+                Some(caller_cancellation) => run_with_caller_process_cancellation(
+                    caller_cancellation,
+                    scheduler_cancellation,
+                    run,
+                ),
+                None => run(),
+            }
         };
-        match caller_cancellation {
-            Some(caller_cancellation) => run_with_caller_process_cancellation(
-                caller_cancellation,
-                scheduler_cancellation,
-                run,
-            ),
-            None => run(),
-        }
-    };
     run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
         options,
         GeneratedFollowUpQueueEntrypoint::AutopilotRun,

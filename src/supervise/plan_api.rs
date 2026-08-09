@@ -979,21 +979,22 @@ pub(crate) fn run_supervisor_plan_file_cascade_for_autopilot(
 ) -> Result<SupervisorCascadeOutcome> {
     match caller_cancellation {
         Some(caller_cancellation) => {
-            let external_runner = |command: &ExternalAgentCommand,
-                                   scheduler_cancellation: &ProcessCancellation,
-                                   review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
-                run_with_caller_process_cancellation(
-                    caller_cancellation,
-                    scheduler_cancellation,
-                    || {
-                        run_external_agent_cancellable_reviewed(
-                            command,
-                            scheduler_cancellation,
-                            review_runtime,
-                        )
-                    },
-                )
-            };
+            let external_runner =
+                |command: &ExternalAgentCommand,
+                 scheduler_cancellation: &ProcessCancellation,
+                 review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+                    run_with_caller_process_cancellation(
+                        caller_cancellation,
+                        scheduler_cancellation,
+                        || {
+                            run_external_agent_cancellable_reviewed(
+                                command,
+                                scheduler_cancellation,
+                                review_runtime,
+                            )
+                        },
+                    )
+                };
             run_supervisor_plan_file_cascade_with_gate(
                 options,
                 concurrency_policy,

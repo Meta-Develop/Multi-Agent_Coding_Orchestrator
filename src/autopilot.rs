@@ -1,8 +1,8 @@
 use crate::{
     artifacts::{ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, RunArtifactFamily},
     gate_denial::{
-        ApprovalReviewDenial, BudgetAdmissionDenial, GateCheckSource, GateDenial,
-        GateDenialReason, VerifiedGateContext,
+        ApprovalReviewDenial, BudgetAdmissionDenial, GateCheckSource, GateDenial, GateDenialReason,
+        VerifiedGateContext,
     },
     live_claim::{self, LiveClock},
     llm::{provider::ModelPricing, Redactor},
@@ -936,6 +936,53 @@ fn run_autopilot_with_profile_and_retention(
     )
 }
 
+fn supervisor_terminal_cleanup_completed(report: &SupervisorFinalReport) -> bool {
+    let released_claim_tokens = report
+        .released_claims
+        .iter()
+        .map(|claim| claim.token.get())
+        .collect::<BTreeSet<_>>();
+    let released_semantic_tokens = report
+        .released_semantic_intents
+        .iter()
+        .map(|intent| intent.token.get())
+        .collect::<BTreeSet<_>>();
+    report.release_errors.is_empty()
+        && report.semantic_release_errors.is_empty()
+        && report.claim_tokens.iter().copied().collect::<BTreeSet<_>>() == released_claim_tokens
+        && report
+            .semantic_intent_tokens
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            == released_semantic_tokens
+}
+
+fn cancelled_cascade_cleanup_completed(
+    cascade: &supervise::SupervisorCascadeOutcome,
+    primary_worktree_untouched: bool,
+) -> bool {
+    let queue_cleanup_completed = cascade.follow_up_queue.as_ref().is_none_or(|queue| {
+        queue.enqueue_committed
+            && queue.claimed_count == 0
+            && queue.dispatch_started_count == 0
+            && queue.dispatch_observed_count == 0
+            && queue.held_ambiguous_count == 0
+            && queue
+                .pending_count
+                .checked_add(queue.acknowledged_terminal_count)
+                == Some(queue.item_count)
+    });
+    primary_worktree_untouched
+        && cascade.follow_up_primary_worktree_untouched != Some(false)
+        && supervisor_terminal_cleanup_completed(&cascade.source_report)
+        && cascade
+            .follow_up_reports
+            .iter()
+            .all(supervisor_terminal_cleanup_completed)
+        && queue_cleanup_completed
+}
+
 #[cfg(test)]
 fn run_autopilot_plan_file_with_injected_supervisor_and_runner(
     options: AutopilotRunOptions,
@@ -1261,9 +1308,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 before_dispatch_denial = Some(denial.clone());
                 return Ok(Some(denial));
             }
-            if max_child_dispatches
-                .is_some_and(|maximum| admitted_child_dispatches >= maximum)
-            {
+            if max_child_dispatches.is_some_and(|maximum| admitted_child_dispatches >= maximum) {
                 let denial = GateDenial::new(
                     options.run_id.as_str(),
                     GateDenialReason::BudgetAdmission {
@@ -1431,6 +1476,11 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     let generated_follow_up_dispatch_performed = cascade.generated_follow_up_dispatch_performed();
     let follow_up_cascade_success = cascade.follow_up_cascade_success;
     let follow_up_gate_denials = cascade.follow_up_gate_denials.clone();
+    let caller_cancelled = caller_cancellation
+        .as_ref()
+        .is_some_and(ProcessCancellation::is_cancelled);
+    let cancellation_cleanup_completed = caller_cancelled
+        && cancelled_cascade_cleanup_completed(&cascade, command_primary_worktree_untouched);
     write_private_json(
         &mut artifact_writer,
         "follow-up-cascade-report.json",
@@ -1453,14 +1503,13 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     )?;
     let execution_profile_mismatch =
         profile_binding.status == AutopilotProfileBindingStatus::Mismatch;
-    let caller_cancelled = caller_cancellation
-        .as_ref()
-        .is_some_and(ProcessCancellation::is_cancelled);
     let child_dispatch_admission_refused = before_dispatch_denial
         .as_ref()
         .is_some_and(|denial| matches!(denial.reason, GateDenialReason::BudgetAdmission { .. }));
-    let status = if caller_cancelled {
+    let status = if cancellation_cleanup_completed {
         AutopilotRunStatus::Cancelled
+    } else if caller_cancelled {
+        AutopilotRunStatus::Failed
     } else if child_dispatch_admission_refused {
         AutopilotRunStatus::Refused
     } else if supervisor.success && follow_up_cascade_success && !execution_profile_mismatch {
@@ -1473,8 +1522,10 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     // This is the observed whole-command interval: immediately before the
     // exact source-plan dispatch through completion of the bounded cascade.
     let primary_worktree_untouched = command_primary_worktree_untouched;
-    let next_action = if caller_cancelled {
+    let next_action = if cancellation_cleanup_completed {
         "caller cancellation was observed and the supervised cleanup path completed; inspect the durable supervisor and queue evidence before starting a new run"
+    } else if caller_cancelled {
+        "caller cancellation was observed but terminal cleanup evidence is incomplete; reconcile supervisor claims, semantic intents, worktrees, and the authenticated follow-up queue before retrying"
     } else if child_dispatch_admission_refused {
         "review the configured child-dispatch maximum and start a new run with an adequate bound; the refused generated follow-up was not dispatched"
     } else if execution_profile_mismatch {
@@ -4431,7 +4482,7 @@ mod tests {
         fs::File,
         rc::Rc,
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex, MutexGuard, OnceLock,
         },
     };
@@ -5365,6 +5416,47 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn injected_cancelling_licensed_autopilot_runner(
+        declaration_sha256: String,
+        caller_cancellation: ProcessCancellation,
+        source_scheduler_cancellation_observed: Arc<AtomicBool>,
+        source_child_dispatches: Arc<AtomicUsize>,
+        follow_up_child_dispatches: Arc<AtomicUsize>,
+    ) -> impl FnMut(
+        &ExternalAgentCommand,
+        &ProcessCancellation,
+    ) -> crate::external_agent::ExternalAgentRun
+           + Send {
+        let mut injected_runner = injected_licensed_autopilot_runner(
+            declaration_sha256,
+            source_child_dispatches,
+            follow_up_child_dispatches,
+        );
+        move |command: &ExternalAgentCommand, scheduler_cancellation: &ProcessCancellation| {
+            let output_path = command.output_last_message.to_string_lossy();
+            let is_follow_up = output_path.contains("child-a-licensed-update-01");
+            let is_auditor = output_path.contains("review-auditor");
+            if !is_follow_up && !is_auditor {
+                assert!(
+                    !scheduler_cancellation.is_cancelled(),
+                    "source scheduler token was cancelled before the caller requested cancellation"
+                );
+                caller_cancellation.cancel();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !scheduler_cancellation.is_cancelled() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "caller cancellation did not propagate to the in-flight source scheduler token"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                source_scheduler_cancellation_observed.store(true, Ordering::SeqCst);
+            }
+            injected_runner(command, scheduler_cancellation)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn run_injected_licensed_autopilot_cascade_result(
         temp_root: &Path,
         repo: &Path,
@@ -5521,6 +5613,165 @@ mod tests {
             queue.authenticated_child_dispatch_started_count, 0,
             "{queue:#?}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn autopilot_source_child_cancellation_propagates_and_cleanly_unwinds() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = create_committed_autopilot_repo(temp.path());
+        let run_name = "autopilot-source-child-cancelled";
+        let run_id = RunId::new(run_name).expect("cancelled Autopilot run id");
+        let source_run_id =
+            RunId::new(format!("{run_name}-supervise")).expect("cancelled source run id");
+        let outer_plan = temp.path().join(format!("{run_name}-autopilot.json"));
+        fs::write(
+            &outer_plan,
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "task": {
+                    "title": "Cancelled licensed cascade",
+                    "body": "Cancel while the source child is in flight."
+                },
+                "assigned_paths": ["README.md"],
+                "auto_merge": false
+            }))
+            .expect("serialize cancelling Autopilot outer plan"),
+        )
+        .expect("write cancelling Autopilot outer plan");
+        let (supervisor_plan, _declaration, declaration_sha256) =
+            licensed_autopilot_supervisor_plan();
+        let caller_cancellation = ProcessCancellation::new();
+        let source_scheduler_cancellation_observed = Arc::new(AtomicBool::new(false));
+        let source_child_dispatches = Arc::new(AtomicUsize::new(0));
+        let follow_up_child_dispatches = Arc::new(AtomicUsize::new(0));
+        let mut runner = injected_cancelling_licensed_autopilot_runner(
+            declaration_sha256,
+            caller_cancellation.clone(),
+            Arc::clone(&source_scheduler_cancellation_observed),
+            Arc::clone(&source_child_dispatches),
+            Arc::clone(&follow_up_child_dispatches),
+        );
+        let primary_before = supervise::verified_whole_primary_snapshot_sha256(&repo)
+            .expect("capture cancelling Autopilot primary baseline");
+        let primary_readme_before =
+            fs::read(repo.join("README.md")).expect("read cancelling Autopilot primary bytes");
+        let observations = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&observations);
+        supervise::set_generated_follow_up_queue_observer(move |observation| {
+            observed.borrow_mut().push(observation);
+        });
+
+        let report = run_autopilot_plan_file_with_injected_supervisor_and_runner(
+            AutopilotRunOptions {
+                repo: repo.clone(),
+                plan_file: outer_plan,
+                run_id,
+                codex_bin: Some(PathBuf::from("unused-injected-codex")),
+                reviewer_command: None,
+                allow_dirty_primary: false,
+                max_child_dispatches: None,
+                cancellation: Some(caller_cancellation.clone()),
+            },
+            None,
+            secure_autopilot_machine_global_retention(temp.path(), run_name),
+            supervisor_plan,
+            &mut runner,
+        )
+        .expect("cancelled source child must unwind to a finalized Autopilot report");
+        supervise::clear_generated_follow_up_queue_observer();
+
+        assert!(caller_cancellation.is_cancelled());
+        assert!(source_scheduler_cancellation_observed.load(Ordering::SeqCst));
+        assert_eq!(source_child_dispatches.load(Ordering::SeqCst), 1);
+        assert_eq!(follow_up_child_dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(report.status, AutopilotRunStatus::Cancelled, "{report:#?}");
+        assert!(!report.success, "{report:#?}");
+        assert_eq!(report.attempt_count, 1, "{report:#?}");
+        assert!(!report.generated_follow_up_dispatch_performed);
+        assert!(report.primary_worktree_untouched);
+        assert!(report.gate_denials.is_empty(), "{report:#?}");
+        let source = report
+            .supervisor
+            .as_ref()
+            .expect("cancelled Autopilot retains finalized source report");
+        assert!(source.success, "{source:#?}");
+        assert_eq!(source.generated_follow_up_tasks.len(), 1, "{source:#?}");
+
+        let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &report.run_id)
+            .expect("open finalized cancelled Autopilot artifacts");
+        let cascade = serde_json::from_slice::<supervise::SupervisorCascadeOutcome>(
+            &reader
+                .read(Path::new("follow-up-cascade-report.json"))
+                .expect("read cancelled Autopilot cascade report"),
+        )
+        .expect("decode cancelled Autopilot cascade report");
+        assert!(!cascade.follow_up_cascade_success, "{cascade:#?}");
+        assert!(cascade.follow_up_reports.is_empty(), "{cascade:#?}");
+        assert!(cascade.follow_up_gate_denials.is_empty(), "{cascade:#?}");
+        assert!(
+            cascade.follow_up_environment_failures.is_empty(),
+            "{cascade:#?}"
+        );
+        assert!(cancelled_cascade_cleanup_completed(&cascade, true));
+        assert!(!cancelled_cascade_cleanup_completed(&cascade, false));
+        let mut release_failed = cascade.clone();
+        release_failed
+            .source_report
+            .release_errors
+            .push("injected unreleased claim".to_string());
+        assert!(!cancelled_cascade_cleanup_completed(&release_failed, true));
+        let mut queue_ambiguous = cascade.clone();
+        queue_ambiguous
+            .follow_up_queue
+            .as_mut()
+            .expect("cancelled queue summary for cleanup classification")
+            .held_ambiguous_count = 1;
+        assert!(!cancelled_cascade_cleanup_completed(&queue_ambiguous, true));
+        assert_undispatched_generated_follow_up_queue(
+            cascade
+                .follow_up_queue
+                .as_ref()
+                .expect("cancelled Autopilot queue summary"),
+        );
+        let observations = observations.borrow();
+        let enqueued = observations
+            .iter()
+            .find(|observation| observation.label == "enqueued")
+            .expect("observe generated follow-up before cancellation release");
+        assert!(enqueued.subordinate_run_ids.is_empty(), "{enqueued:#?}");
+        assert_eq!(enqueued.pending_count, 1, "{enqueued:#?}");
+        assert_eq!(enqueued.claimed_count, 0, "{enqueued:#?}");
+        assert_eq!(enqueued.dispatch_started_count, 0, "{enqueued:#?}");
+        assert_eq!(enqueued.dispatch_observed_count, 0, "{enqueued:#?}");
+        assert_eq!(
+            enqueued.authenticated_child_dispatch_started_count, 0,
+            "{enqueued:#?}"
+        );
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.label != "dispatch_started"),
+            "cancellation must release before any generated follow-up dispatch marker: {observations:#?}"
+        );
+        drop(observations);
+
+        assert_finalized_autopilot_source_cleanup(&repo, &report, &source_run_id);
+        assert_eq!(
+            collect_autopilot_run(&repo, report.run_id.clone())
+                .expect("collect cancelled Autopilot run")["status"],
+            Value::String("cancelled".to_string())
+        );
+        assert_eq!(
+            supervise::verified_whole_primary_snapshot_sha256(&repo)
+                .expect("capture cancelling Autopilot final primary"),
+            primary_before
+        );
+        assert_eq!(
+            fs::read(repo.join("README.md")).expect("reread cancelling Autopilot primary bytes"),
+            primary_readme_before
+        );
+        assert!(!repo.join("src/client.rs").exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -5899,9 +6150,8 @@ mod tests {
             .join(run_name)
             .join("supervisor-plan.json");
         let resume_cancellation = ProcessCancellation::new();
-        let mut resume_runner = |command: &ExternalAgentCommand| {
-            runner(command, &resume_cancellation)
-        };
+        let mut resume_runner =
+            |command: &ExternalAgentCommand| runner(command, &resume_cancellation);
         let resumed = supervise::resume_supervisor_plan_file_cascade_with_runner(
             SupervisorRunOptions {
                 repo: repo.clone(),
