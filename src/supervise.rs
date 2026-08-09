@@ -254,6 +254,35 @@ type CancellableExternalRunner<'a> = dyn for<'review> Fn(
     + Sync
     + 'a;
 
+fn run_with_caller_process_cancellation<T>(
+    caller_cancellation: &ProcessCancellation,
+    scheduler_cancellation: &ProcessCancellation,
+    run: impl FnOnce() -> T,
+) -> T {
+    if caller_cancellation.is_cancelled() {
+        scheduler_cancellation.cancel();
+        return run();
+    }
+
+    thread::scope(|scope| {
+        let (finished_sender, finished_receiver) = mpsc::channel::<()>();
+        scope.spawn(move || loop {
+            match finished_receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if caller_cancellation.is_cancelled() {
+                        scheduler_cancellation.cancel();
+                        break;
+                    }
+                }
+            }
+        });
+        let result = run();
+        let _ = finished_sender.send(());
+        result
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct SupervisorRunOptions {
     pub repo: PathBuf,

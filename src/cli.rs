@@ -1516,6 +1516,8 @@ impl AutopilotCommand {
                     codex_bin: args.codex_bin,
                     reviewer_command: args.reviewer_command,
                     allow_dirty_primary: args.allow_dirty_primary,
+                    max_child_dispatches: args.max_child_dispatches,
+                    cancellation: None,
                 };
                 let retention = Some(MachineGlobalRetentionBinding {
                     config: args.machine_global_config,
@@ -1617,6 +1619,9 @@ struct RunAutopilotArgs {
     /// Allow autopilot to run when the primary worktree is dirty.
     #[arg(long)]
     allow_dirty_primary: bool,
+    /// Maximum source plus generated follow-up supervisor-plan dispatches admitted by this run.
+    #[arg(long, value_name = "COUNT")]
+    max_child_dispatches: Option<usize>,
     /// Exact reviewed config used to gate private runtime output-staging cleanup.
     #[arg(long, required = true)]
     machine_global_config: PathBuf,

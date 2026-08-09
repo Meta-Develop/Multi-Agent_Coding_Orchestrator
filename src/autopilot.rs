@@ -1,6 +1,9 @@
 use crate::{
     artifacts::{ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, RunArtifactFamily},
-    gate_denial::{ApprovalReviewDenial, GateCheckSource, GateDenial},
+    gate_denial::{
+        ApprovalReviewDenial, BudgetAdmissionDenial, GateCheckSource, GateDenial,
+        GateDenialReason, VerifiedGateContext,
+    },
     live_claim::{self, LiveClock},
     llm::{provider::ModelPricing, Redactor},
     machine_global::MachineGlobalRetentionBinding,
@@ -12,8 +15,9 @@ use crate::{
     orchestrator::{RunId, SemanticCoordinationMode},
     planning,
     process_runner::{
-        run_process, CapturedBytes, EnvironmentMode, ProcessOutput, ProcessRunError, ProcessSpec,
-        Shell, SideEffectConfinementProfile, StrictOfflineWorkspaceProfile,
+        run_process, CapturedBytes, EnvironmentMode, ProcessCancellation, ProcessOutput,
+        ProcessRunError, ProcessSpec, Shell, SideEffectConfinementProfile,
+        StrictOfflineWorkspaceProfile,
     },
     publication::{
         self, ExternalSourceGuard, ForgeKind, PrPublicationOptions, PrPublicationReport,
@@ -96,6 +100,12 @@ pub struct AutopilotRunOptions {
     pub codex_bin: Option<PathBuf>,
     pub reviewer_command: Option<String>,
     pub allow_dirty_primary: bool,
+    /// Maximum supervisor-plan child dispatches admitted across the source plan and generated
+    /// follow-up plans. `None` preserves the unbounded behavior of existing callers.
+    pub max_child_dispatches: Option<usize>,
+    /// Optional caller-owned whole-run cancellation signal. The caller keeps a clone and may
+    /// request cooperative cancellation while this synchronous call is running.
+    pub cancellation: Option<ProcessCancellation>,
 }
 
 /// Versioned execution configuration passed through unchanged to the live supervisor plan.
@@ -374,6 +384,7 @@ pub enum AutopilotRunStatus {
     Succeeded,
     Failed,
     Refused,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -965,6 +976,8 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     }
     let requested_profile = profile.unwrap_or_default();
     validate_autopilot_profile(&requested_profile)?;
+    let caller_cancellation = options.cancellation.clone();
+    let max_child_dispatches = options.max_child_dispatches;
 
     let repo = discover_repo_root(&options.repo)?;
     let source_is_goal_derived = matches!(&source, AutopilotRunSource::GoalSpec { .. });
@@ -1213,6 +1226,8 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         SupervisorConcurrencyPolicy::default()
     };
     let mut follow_up_profile_refusal = None;
+    let mut before_dispatch_denial = None;
+    let mut admitted_child_dispatches = 0_usize;
     let error_evidence_source_plan_sha256 =
         supervise::normalized_supervisor_plan_file_sha256(&supervisor_options.plan_file)?;
     let command_primary_baseline = supervise::verified_whole_primary_snapshot_sha256(&repo)?;
@@ -1223,6 +1238,11 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             let effective_override = run_autopilot_profile_callsite_hook(effective);
             #[cfg(test)]
             let effective = effective_override.as_ref().unwrap_or(effective);
+            let effective_paths = effective
+                .assignments
+                .iter()
+                .flat_map(|assignment| assignment.assigned_paths.iter().cloned())
+                .collect::<Vec<_>>();
             let binding = AutopilotProfileBindingReport::from_effective(
                 follow_up_requested_profile.clone(),
                 effective,
@@ -1230,8 +1250,36 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             let permitted = binding.permits_dispatch();
             if !permitted {
                 follow_up_profile_refusal = Some(binding);
+                let denial = GateDenial::from_approval_review(
+                    options.run_id.as_str(),
+                    "maco-autopilot",
+                    ApprovalReviewDenial::InconsistentRequest,
+                    effective_paths,
+                )?;
+                before_dispatch_denial = Some(denial.clone());
+                return Ok(Some(denial));
             }
-            Ok(permitted)
+            if max_child_dispatches
+                .is_some_and(|maximum| admitted_child_dispatches >= maximum)
+            {
+                let denial = GateDenial::new(
+                    options.run_id.as_str(),
+                    GateDenialReason::BudgetAdmission {
+                        denial: BudgetAdmissionDenial::NewDispatchStopped,
+                    },
+                    VerifiedGateContext::new(
+                        "maco-autopilot",
+                        GateCheckSource::BudgetAdmission,
+                        effective_paths,
+                    )?,
+                )?;
+                before_dispatch_denial = Some(denial.clone());
+                return Ok(Some(denial));
+            }
+            admitted_child_dispatches = admitted_child_dispatches
+                .checked_add(1)
+                .context("autopilot admitted child dispatch count overflowed")?;
+            Ok(None)
         };
         match &mut cascade_dispatch {
             AutopilotCascadeDispatch::Production(_) => {
@@ -1239,6 +1287,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                     supervisor_options,
                     cascade_concurrency_policy,
                     &options.run_id,
+                    caller_cancellation.as_ref(),
                     &mut follow_up_profile_gate,
                 )
             }
@@ -1248,6 +1297,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             } => supervise::run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilot(
                 supervisor_options,
                 &options.run_id,
+                caller_cancellation.as_ref(),
                 &mut follow_up_profile_gate,
                 *external_runner,
             ),
@@ -1261,8 +1311,17 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     let cascade = match supervisor_result {
         Ok(cascade) => cascade,
         Err(error) => {
-            let profile_refused_before_source_dispatch = !profile_binding.permits_dispatch();
-            let generated_follow_up_dispatch_performed = if profile_refused_before_source_dispatch {
+            let caller_cancelled = caller_cancellation
+                .as_ref()
+                .is_some_and(ProcessCancellation::is_cancelled);
+            let source_dispatch_admitted = admitted_child_dispatches > 0;
+            let profile_refused_before_source_dispatch =
+                !source_dispatch_admitted && !profile_binding.permits_dispatch();
+            let admission_refused_before_source_dispatch = !source_dispatch_admitted
+                && before_dispatch_denial.as_ref().is_some_and(|denial| {
+                    matches!(denial.reason, GateDenialReason::BudgetAdmission { .. })
+                });
+            let generated_follow_up_dispatch_performed = if !source_dispatch_admitted {
                 false
             } else {
                 let evidence =
@@ -1322,12 +1381,14 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             )?;
             let report = final_report(FinalReportInput {
                 run_id: &options.run_id,
-                status: AutopilotRunStatus::Failed,
-                attempt_count: if profile_refused_before_source_dispatch {
-                    0
+                status: if caller_cancelled {
+                    AutopilotRunStatus::Cancelled
+                } else if admission_refused_before_source_dispatch {
+                    AutopilotRunStatus::Refused
                 } else {
-                    1
+                    AutopilotRunStatus::Failed
                 },
+                attempt_count: usize::from(source_dispatch_admitted),
                 max_repair_attempts: plan.max_repair_attempts,
                 artifacts,
                 plan: plan_summary(&plan),
@@ -1336,15 +1397,21 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 validation: skipped_autopilot_validation(),
                 pr: None,
                 review: None,
-                attempts: if profile_refused_before_source_dispatch {
-                    Vec::new()
-                } else {
+                attempts: if source_dispatch_admitted {
                     vec![attempt]
+                } else {
+                    Vec::new()
                 },
                 supervisor: None,
-                gate_denials: Vec::new(),
+                gate_denials: before_dispatch_denial.clone().into_iter().collect(),
                 primary_worktree_untouched: command_primary_worktree_untouched,
-                next_action: if profile_refused_before_source_dispatch {
+                next_action: if caller_cancelled && source_dispatch_admitted {
+                    "caller cancellation was observed during supervisor execution; inspect the finalized supervisor evidence and start a new run only if the remaining work is still required"
+                } else if caller_cancelled {
+                    "caller cancellation was observed before supervisor dispatch; start a new run only if the work is still required"
+                } else if admission_refused_before_source_dispatch {
+                    "review the configured child-dispatch maximum and start a new run with an adequate bound; no supervisor dispatch was attempted"
+                } else if profile_refused_before_source_dispatch {
                     "correct the requested/effective profile mismatch; no supervisor, publication, merge, or follow-up dispatch was attempted"
                 } else if generated_follow_up_dispatch_performed {
                     "inspect the authenticated generated follow-up queue and subordinate checkpoint: a generated child dispatch started before the cascade failure; no publication or merge was performed"
@@ -1384,7 +1451,12 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     )?;
     let execution_profile_mismatch =
         profile_binding.status == AutopilotProfileBindingStatus::Mismatch;
-    let status = if supervisor.success && follow_up_cascade_success && !execution_profile_mismatch {
+    let caller_cancelled = caller_cancellation
+        .as_ref()
+        .is_some_and(ProcessCancellation::is_cancelled);
+    let status = if caller_cancelled {
+        AutopilotRunStatus::Cancelled
+    } else if supervisor.success && follow_up_cascade_success && !execution_profile_mismatch {
         AutopilotRunStatus::Succeeded
     } else {
         AutopilotRunStatus::Failed
@@ -1394,7 +1466,9 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     // This is the observed whole-command interval: immediately before the
     // exact source-plan dispatch through completion of the bounded cascade.
     let primary_worktree_untouched = command_primary_worktree_untouched;
-    let next_action = if execution_profile_mismatch {
+    let next_action = if caller_cancelled {
+        "caller cancellation was observed and the supervised cleanup path completed; inspect the durable supervisor and queue evidence before starting a new run"
+    } else if execution_profile_mismatch {
         "inspect the typed requested/observed profile mismatch; autopilot performed no publication, merge, or follow-up dispatch"
     } else if !follow_up_cascade_success {
         "inspect the generated follow-up cascade report, authenticated queue if present, typed denials or environment failures, and subordinate reports; no publication or merge was performed"

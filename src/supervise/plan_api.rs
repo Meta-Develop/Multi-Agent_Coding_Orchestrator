@@ -842,13 +842,15 @@ pub fn run_supervisor_plan_file_cascade_with_concurrency_policy(
     concurrency_policy: SupervisorConcurrencyPolicy,
 ) -> Result<SupervisorCascadeOutcome> {
     let outer_run_id = options.run_id.clone();
-    let mut permit = |_plan: &SupervisorPlan| Ok(true);
+    let mut permit = |_plan: &SupervisorPlan| Ok(None);
     run_supervisor_plan_file_cascade_with_gate(
         options,
         concurrency_policy,
         GeneratedFollowUpQueueEntrypoint::SuperviseRun,
         &outer_run_id,
+        None,
         &mut permit,
+        &run_external_agent_cancellable_reviewed,
     )
 }
 
@@ -878,7 +880,7 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy(
         &run_external_agent_cancellable_reviewed,
     )?;
     drop(cleanliness);
-    let mut permit = |_plan: &SupervisorPlan| Ok(true);
+    let mut permit = |_plan: &SupervisorPlan| Ok(None);
     run_generated_follow_up_cascade(
         &repo,
         &source_loaded,
@@ -890,6 +892,7 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy(
             concurrency_policy,
             runtime_catalog: FollowUpRuntimeCatalog::Production,
         },
+        None,
         &mut permit,
         &run_external_agent_cancellable_reviewed,
     )
@@ -949,7 +952,7 @@ fn resume_generated_follow_up_cascade(
     if source_was_finalized {
         ensure_generated_follow_up_cascade_needs_resume(&repo, &loaded, &source_report)?;
     }
-    let mut permit = |_plan: &SupervisorPlan| Ok(true);
+    let mut permit = |_plan: &SupervisorPlan| Ok(None);
     run_generated_follow_up_cascade(
         &repo,
         &loaded,
@@ -961,6 +964,7 @@ fn resume_generated_follow_up_cascade(
             concurrency_policy,
             runtime_catalog: FollowUpRuntimeCatalog::Production,
         },
+        None,
         &mut permit,
         &run_external_agent_cancellable_reviewed,
     )
@@ -970,15 +974,46 @@ pub(crate) fn run_supervisor_plan_file_cascade_for_autopilot(
     options: SupervisorRunOptions,
     concurrency_policy: SupervisorConcurrencyPolicy,
     outer_command_run_id: &RunId,
-    before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<bool>,
+    caller_cancellation: Option<&ProcessCancellation>,
+    before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
 ) -> Result<SupervisorCascadeOutcome> {
-    run_supervisor_plan_file_cascade_with_gate(
-        options,
-        concurrency_policy,
-        GeneratedFollowUpQueueEntrypoint::AutopilotRun,
-        outer_command_run_id,
-        before_dispatch,
-    )
+    match caller_cancellation {
+        Some(caller_cancellation) => {
+            let external_runner = |command: &ExternalAgentCommand,
+                                   scheduler_cancellation: &ProcessCancellation,
+                                   review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+                run_with_caller_process_cancellation(
+                    caller_cancellation,
+                    scheduler_cancellation,
+                    || {
+                        run_external_agent_cancellable_reviewed(
+                            command,
+                            scheduler_cancellation,
+                            review_runtime,
+                        )
+                    },
+                )
+            };
+            run_supervisor_plan_file_cascade_with_gate(
+                options,
+                concurrency_policy,
+                GeneratedFollowUpQueueEntrypoint::AutopilotRun,
+                outer_command_run_id,
+                Some(caller_cancellation),
+                before_dispatch,
+                &external_runner,
+            )
+        }
+        None => run_supervisor_plan_file_cascade_with_gate(
+            options,
+            concurrency_policy,
+            GeneratedFollowUpQueueEntrypoint::AutopilotRun,
+            outer_command_run_id,
+            None,
+            before_dispatch,
+            &run_external_agent_cancellable_reviewed,
+        ),
+    }
 }
 
 fn run_supervisor_plan_file_cascade_with_gate(
@@ -986,7 +1021,9 @@ fn run_supervisor_plan_file_cascade_with_gate(
     concurrency_policy: SupervisorConcurrencyPolicy,
     outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
     outer_command_run_id: &RunId,
-    before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<bool>,
+    caller_cancellation: Option<&ProcessCancellation>,
+    before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
+    external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorCascadeOutcome> {
     let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
     validate_max_concurrent_children(max_concurrent_children)?;
@@ -994,8 +1031,14 @@ fn run_supervisor_plan_file_cascade_with_gate(
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
-    if !before_dispatch(&loaded.plan)? {
-        bail!("effective supervisor profile changed before exact loaded-plan dispatch");
+    if caller_cancellation.is_some_and(ProcessCancellation::is_cancelled) {
+        bail!("autopilot caller cancelled before exact loaded-plan dispatch");
+    }
+    if let Some(denial) = before_dispatch(&loaded.plan)? {
+        bail!(
+            "effective supervisor plan was refused before exact loaded-plan dispatch by denial '{}'",
+            denial.denial_id.as_str()
+        );
     }
     let source_loaded = loaded.clone();
     let template = options.clone();
@@ -1007,7 +1050,7 @@ fn run_supervisor_plan_file_cascade_with_gate(
         SupervisorExecutionRuntime::Verified,
         SupervisorWorktreeCreation::Bound(&cleanliness),
         runtime_model_catalog,
-        &run_external_agent_cancellable_reviewed,
+        external_runner,
     )?;
     drop(cleanliness);
     run_generated_follow_up_cascade(
@@ -1021,8 +1064,9 @@ fn run_supervisor_plan_file_cascade_with_gate(
             concurrency_policy,
             runtime_catalog: FollowUpRuntimeCatalog::Production,
         },
+        caller_cancellation,
         before_dispatch,
-        &run_external_agent_cancellable_reviewed,
+        external_runner,
     )
 }
 
