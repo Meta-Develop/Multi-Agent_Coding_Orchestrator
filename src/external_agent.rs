@@ -530,6 +530,14 @@ pub struct EnvironmentFailure {
 }
 
 impl EnvironmentFailure {
+    pub(crate) fn sandbox_unavailable(summary: String) -> Self {
+        environment_failure(
+            EnvironmentFailureCategory::SandboxUnavailable,
+            None,
+            summary,
+        )
+    }
+
     pub(crate) fn probe_failed(summary: String) -> Self {
         environment_failure(EnvironmentFailureCategory::ProbeFailed, None, summary)
     }
@@ -540,6 +548,12 @@ impl EnvironmentFailure {
             None,
             summary,
         )
+    }
+}
+
+impl std::fmt::Display for EnvironmentFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.summary)
     }
 }
 
@@ -2954,8 +2968,22 @@ impl EnvironmentPreflightProcessEvidence {
                 ),
                 false,
             ),
+            ProcessRunError::EnvironmentFailure {
+                target_process_started: true,
+                ..
+            } => self.record(
+                ProcessTreeEvidence::Unverified(ContainmentBackend::SystemdUserService),
+                SideEffectConfinementEvidence::Unverified(
+                    SideEffectConfinementProfileKind::ExternalCodex,
+                ),
+                false,
+            ),
             ProcessRunError::Cancelled { evidence: None, .. }
             | ProcessRunError::ContainmentUnavailable { .. }
+            | ProcessRunError::EnvironmentFailure {
+                target_process_started: false,
+                ..
+            }
             | ProcessRunError::StdinTooLarge { .. } => {}
         }
     }
@@ -2985,6 +3013,10 @@ fn process_run_error_definitely_before_process_start(error: &ProcessRunError) ->
         error,
         ProcessRunError::Cancelled { evidence: None, .. }
             | ProcessRunError::ContainmentUnavailable { .. }
+            | ProcessRunError::EnvironmentFailure {
+                target_process_started: false,
+                ..
+            }
             | ProcessRunError::StdinTooLarge { .. }
     )
 }
@@ -2999,6 +3031,12 @@ fn target_process_environment_failure(
             Some(EnvironmentRequirement::sandbox(
                 EnvironmentSandboxCapability::VerifiedExternalCodex,
             )),
+        )),
+        ProcessRunError::EnvironmentFailure { failure, .. } => Some((
+            failure.category,
+            (failure.category == EnvironmentFailureCategory::SandboxUnavailable).then(|| {
+                EnvironmentRequirement::sandbox(EnvironmentSandboxCapability::VerifiedExternalCodex)
+            }),
         )),
         ProcessRunError::Cancelled { .. }
         | ProcessRunError::OpenTee { .. }
@@ -3621,9 +3659,13 @@ fn run_fixed_version_probe(
         Err(error) => {
             process_evidence.record_error(&error);
             let sandbox_unavailable = matches!(
-                error,
+                &error,
                 ProcessRunError::ContainmentUnavailable { .. }
                     | ProcessRunError::ProcessOwnership { .. }
+            ) || matches!(
+                &error,
+                ProcessRunError::EnvironmentFailure { failure, .. }
+                    if failure.category == EnvironmentFailureCategory::SandboxUnavailable
             );
             return Err(EnvironmentProbeFailure {
                 category: if sandbox_unavailable {
@@ -3634,8 +3676,8 @@ fn run_fixed_version_probe(
                 timed_out: matches!(error, ProcessRunError::SetupTimeout { .. }),
                 summary: if sandbox_unavailable {
                     format!(
-                        "{} version preflight could not establish the fixed child sandbox",
-                        executable.program_name()
+                        "{} version preflight could not establish the fixed child sandbox: {error}",
+                        executable.program_name(),
                     )
                 } else {
                     format!(
@@ -9357,6 +9399,18 @@ printf '{"type":"done"}\n'
             ),
         };
         assert_eq!(sandbox_denial_from_process_error(&prose_only), None);
+        let environment = ProcessRunError::EnvironmentFailure {
+            label: "external agent".to_string(),
+            command: "/tmp/maco-target/debug/probe".to_string(),
+            failure: Box::new(EnvironmentFailure::sandbox_unavailable(
+                "PrivateTmp hides /tmp/maco-target/debug/probe".to_string(),
+            )),
+            target_process_started: false,
+        };
+        assert_eq!(sandbox_denial_from_process_error(&environment), None);
+        assert!(!crate::process_runner::is_verified_backend_unavailable(
+            &environment
+        ));
     }
 
     #[test]

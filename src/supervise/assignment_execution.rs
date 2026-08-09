@@ -2910,18 +2910,7 @@ mod decomposition_tests {
             .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile)),
         ) {
             Ok(output) => output,
-            Err(error)
-                if matches!(
-                    error,
-                    crate::process_runner::ProcessRunError::ProcessOwnership { .. }
-                ) && [
-                    "inaccessible path remained",
-                    "inaccessible path placeholder",
-                    "could not inspect inaccessible-path",
-                ]
-                .iter()
-                .any(|diagnostic| error.to_string().contains(diagnostic)) =>
-            {
+            Err(error) if crate::process_runner::is_verified_backend_unavailable(&error) => {
                 eprintln!("strict sandbox unavailable; hostile lens boundary probe did not launch");
                 return Ok(());
             }
