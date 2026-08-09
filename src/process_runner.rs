@@ -2831,6 +2831,7 @@ fn environment_failure_from_source(source: &std::io::Error) -> Option<(Environme
     }
 }
 
+#[cfg(test)]
 pub(crate) fn is_verified_backend_unavailable(error: &ProcessRunError) -> bool {
     match error {
         ProcessRunError::ProcessOwnership { .. } => {
@@ -10242,6 +10243,42 @@ mod tests {
             program,
         )
         .is_none());
+
+        let typed = process_ownership_error(
+            "sandbox probe".to_string(),
+            program.display().to_string(),
+            systemd_launcher_exit_error(
+                ExitStatus::from_raw(226 << 8),
+                "Failed at step NAMESPACE spawning child",
+                Some(program),
+                "before target PID publication",
+            ),
+        );
+        assert!(matches!(
+            &typed,
+            ProcessRunError::EnvironmentFailure {
+                failure,
+                target_process_started: false,
+                ..
+            } if failure.category
+                == crate::external_agent::EnvironmentFailureCategory::SandboxUnavailable
+        ));
+        assert!(typed.to_string().contains(&program.display().to_string()));
+
+        let unrelated = process_ownership_error(
+            "sandbox probe".to_string(),
+            program.display().to_string(),
+            systemd_launcher_exit_error(
+                ExitStatus::from_raw(17 << 8),
+                "NAMESPACE",
+                Some(program),
+                "before target PID publication",
+            ),
+        );
+        assert!(matches!(
+            unrelated,
+            ProcessRunError::ProcessOwnership { .. }
+        ));
     }
 
     #[cfg(target_os = "linux")]

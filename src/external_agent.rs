@@ -7162,6 +7162,14 @@ else:
             command: "codex exec".to_string(),
             source: std::io::Error::other("injected containment refusal"),
         };
+        let environment = ProcessRunError::EnvironmentFailure {
+            label: "external agent".to_string(),
+            command: "/tmp/maco-target/debug/probe".to_string(),
+            failure: Box::new(EnvironmentFailure::sandbox_unavailable(
+                "PrivateTmp hides /tmp/maco-target/debug/probe".to_string(),
+            )),
+            target_process_started: false,
+        };
 
         assert_eq!(target_process_environment_failure(&setup_timeout), None);
         assert_eq!(target_process_environment_failure(&cancellation), None);
@@ -7174,6 +7182,18 @@ else:
                 )),
             ))
         );
+        assert_eq!(
+            target_process_environment_failure(&environment),
+            Some((
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(EnvironmentRequirement::sandbox(
+                    EnvironmentSandboxCapability::VerifiedExternalCodex,
+                )),
+            ))
+        );
+        assert!(process_run_error_definitely_before_process_start(
+            &environment
+        ));
     }
 
     #[test]
