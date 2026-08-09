@@ -10168,8 +10168,16 @@ mod tests {
             .prefix("maco-private-tmp-link-")
             .tempdir_in("/tmp")
             .expect("private tmp symlink directory");
+        let visible_target_root = tempfile::Builder::new()
+            .prefix("maco-visible-target-")
+            .tempdir_in("/dev/shm")
+            .expect("visible target directory");
+        let visible_target = visible_target_root.path().join("probe");
+        fs::write(&visible_target, b"#!/bin/sh\nexit 0\n").expect("visible target");
+        fs::set_permissions(&visible_target, fs::Permissions::from_mode(0o755))
+            .expect("visible target permissions");
         let hidden_invocation = private_tmp.path().join("probe");
-        symlink("/usr/bin/true", &hidden_invocation).expect("symlink hidden invocation");
+        symlink(&visible_target, &hidden_invocation).expect("symlink hidden invocation");
         let spec = ProcessSpec::direct(
             "hidden invocation",
             &hidden_invocation,
@@ -10180,6 +10188,7 @@ mod tests {
         let paths = resolved_direct_program_paths(&spec, Path::new("/"))
             .expect("resolve hidden invocation and target");
         assert_eq!(paths.first(), Some(&hidden_invocation));
+        assert_eq!(paths.get(1), Some(&visible_target));
         assert!(validate_systemd_program_visibility(&paths[0], &[]).is_err());
         assert!(validate_systemd_program_visibility(&paths[1], &[]).is_ok());
 
