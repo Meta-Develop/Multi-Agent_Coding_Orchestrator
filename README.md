@@ -950,44 +950,51 @@ from repository maps, semantic maps, and task-path proposal helpers.
 
 ## Development
 
-If Rust is available globally:
+The authoritative local environment for CI parity is the repository's Nix
+development shell:
 
 ```bash
-cargo fmt -- --check
-cargo test
-cargo clippy --all-targets -- -D warnings
+nix develop path:$PWD
 ```
 
-If Rust is not available globally, use Nix:
+It provides the Rust toolchain selected by `rust-toolchain.toml`, including
+Clippy and rustfmt, plus the Python interpreter used by the
+repository-portability gate. An ambient system toolchain is not evidence of CI
+parity.
+
+Run the CI-equivalent Linux and repository-portability gates with:
 
 ```bash
-nix develop .
+nix develop path:$PWD -c rustc --version --verbose
+nix develop path:$PWD -c cargo --version --verbose
+nix develop path:$PWD -c cargo clippy --version
+nix develop path:$PWD -c python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+nix develop path:$PWD -c python3 scripts/check_repository_portability.py
+nix develop path:$PWD -c cargo fmt --all -- --check
+nix develop path:$PWD -c cargo check --locked --all-targets
+nix develop path:$PWD -c cargo clippy --locked --all-targets -- -D warnings
+nix develop path:$PWD -c cargo test --locked --all-targets
 ```
 
-Inside that shell, run the same Cargo commands.
-
-For one-shot checks:
-
-```bash
-nix develop . -c cargo fmt -- --check
-nix develop . -c cargo test
-nix develop . -c cargo clippy --all-targets -- -D warnings
-```
+This reproduces the Linux CI toolchain and tracked-path portability gate. It
+cannot compile or link target-specific code on actual macOS or Windows runners.
+Before treating a branch as fully CI-green, push it or open a draft pull request
+and wait for both the `macos-latest` and `windows-latest` `portable-build` jobs;
+a draft pull request is the cheapest honest way to close that residual gap.
 
 The Nix development shell also pins the supply-chain tools through
 `flake.lock`. Audit the exact Cargo lockfile and enforce the repository policy
 with:
 
 ```bash
-nix develop . -c cargo audit --deny warnings
-nix develop . -c cargo deny --locked check -D warnings advisories bans licenses sources
+nix develop path:$PWD -c cargo audit --deny warnings
+nix develop path:$PWD -c cargo deny --locked check -D warnings advisories bans licenses sources
 ```
 
-The `.` flake reference uses Nix's Git-filtered source for this repository, so
-ignored local coordination files are not copied into the Nix store. The flake
-exports development shells only; release contents are selected independently
-by Cargo, whose package manifest excludes `.agents`, `.github`, `.maco`, and
-`AGENTS.md`.
+The `path:$PWD` flake reference addresses the current worktree explicitly. The
+flake exports development shells only; release contents are selected
+independently by Cargo, whose package manifest excludes `.agents`, `.github`,
+`.maco`, and `AGENTS.md`.
 
 `cargo fetch --locked` is the explicit online boundary for Rust dependencies in
 a fresh checkout. Once that checksum-verified closure is present in the Cargo

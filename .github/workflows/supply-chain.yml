@@ -16,8 +16,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Match the flake.lock development shell used for local verification.
-  RUSTUP_TOOLCHAIN: "1.94.1"
 
 jobs:
   audit:
@@ -30,11 +28,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Select stable Rust
+      - name: Install repository Rust toolchain
         run: |
-          rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+          rustup toolchain install
           rustc --version --verbose
           cargo --version --verbose
+          cargo clippy --version
 
       - name: Verify Cargo.lock is current
         run: cargo metadata --locked --format-version 1 > /dev/null
