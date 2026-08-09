@@ -2262,10 +2262,10 @@ fn ensure_claim_has_no_errors(claim: &ParsedClaim, context: &str) -> Result<()> 
     Ok(())
 }
 
-fn first_duplicate_claim_pair<'a, F>(
-    claims: &'a [ParsedClaim],
+fn first_duplicate_claim_pair<F>(
+    claims: &[ParsedClaim],
     mut blocks: F,
-) -> Option<(&'a ParsedClaim, &'a ParsedClaim)>
+) -> Option<(&ParsedClaim, &ParsedClaim)>
 where
     F: FnMut(&ParsedClaim, &ParsedClaim) -> bool,
 {
