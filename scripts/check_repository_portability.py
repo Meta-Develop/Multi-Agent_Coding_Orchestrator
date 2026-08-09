@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -211,13 +212,60 @@ def collect_violations(raw_paths: Iterable[bytes]) -> list[Violation]:
 def git_tracked_paths(repository: Path) -> list[bytes]:
     """Read tracked paths as raw bytes using Git's NUL-delimited output."""
 
+    command = ["git", "ls-files", "-z"]
+    git_directory = _wsl_worktree_git_directory(repository)
+    if git_directory is not None:
+        command = [
+            "git",
+            "--git-dir",
+            str(git_directory),
+            "--work-tree",
+            str(repository.resolve()),
+            "ls-files",
+            "-z",
+        ]
+
     result = subprocess.run(
-        ["git", "ls-files", "-z"],
+        command,
         cwd=repository,
         check=True,
         stdout=subprocess.PIPE,
     )
     return [path for path in result.stdout.split(b"\0") if path]
+
+
+def _wsl_worktree_git_directory(repository: Path) -> str | None:
+    """Translate a Windows-created worktree's Git pointer when running in WSL."""
+
+    if sys.platform != "linux":
+        return None
+
+    try:
+        lines = (repository / ".git").read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None
+    if len(lines) != 1 or not lines[0].startswith("gitdir: "):
+        return None
+
+    git_directory = lines[0].removeprefix("gitdir: ")
+    if re.fullmatch(r"[A-Za-z]:[\\/].+", git_directory) is None:
+        return None
+
+    try:
+        translated = subprocess.run(
+            ["wslpath", "-u", git_directory],
+            cwd=repository,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError, UnicodeError):
+        return None
+
+    if not translated.startswith("/"):
+        return None
+    return translated
 
 
 def render_violations(violations: Sequence[Violation]) -> str:

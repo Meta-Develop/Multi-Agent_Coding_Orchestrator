@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -140,6 +141,69 @@ class RawGitPathTests(unittest.TestCase):
             cwd=Path("repository"),
             check=True,
             stdout=subprocess.PIPE,
+        )
+
+    @mock.patch.object(portability.sys, "platform", "linux")
+    @mock.patch("scripts.check_repository_portability.subprocess.run")
+    def test_windows_worktree_pointer_is_translated_in_wsl(
+        self, run: mock.Mock
+    ) -> None:
+        run.side_effect = [
+            subprocess.CompletedProcess(
+                ["wslpath", "-u", "D:/source/.git/worktrees/task"],
+                0,
+                stdout="/mnt/d/source/.git/worktrees/task\n",
+            ),
+            subprocess.CompletedProcess(
+                [
+                    "git",
+                    "--git-dir",
+                    "/mnt/d/source/.git/worktrees/task",
+                    "--work-tree",
+                    "unused",
+                    "ls-files",
+                    "-z",
+                ],
+                0,
+                stdout=b"one\0two\0",
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            (repository / ".git").write_text(
+                "gitdir: D:/source/.git/worktrees/task\n", encoding="utf-8"
+            )
+
+            paths = portability.git_tracked_paths(repository)
+
+        self.assertEqual(paths, [b"one", b"two"])
+        self.assertEqual(run.call_count, 2)
+        run.assert_has_calls(
+            [
+                mock.call(
+                    ["wslpath", "-u", "D:/source/.git/worktrees/task"],
+                    cwd=repository,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                ),
+                mock.call(
+                    [
+                        "git",
+                        "--git-dir",
+                        "/mnt/d/source/.git/worktrees/task",
+                        "--work-tree",
+                        str(repository.resolve()),
+                        "ls-files",
+                        "-z",
+                    ],
+                    cwd=repository,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                ),
+            ]
         )
 
 
