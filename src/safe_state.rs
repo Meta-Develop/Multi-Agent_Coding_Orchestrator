@@ -41,17 +41,17 @@ const MAX_TREE_DEPTH: usize = 128;
 const MAX_TREE_ENTRIES: usize = 1_000_000;
 #[cfg(target_os = "linux")]
 const ENTRY_QUARANTINE_PREFIX: &str = ".maco-entry-quarantine-";
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const TEMP_QUARANTINE_PREFIX: &str = ".maco-temp-quarantine-";
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const TEMP_QUARANTINE_V2_PREFIX: &str = ".maco-temp-quarantine-v2-";
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const TEMP_QUARANTINE_V2_DOMAIN: &[u8] = b"MACO\0temp-quarantine\0v2\0";
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const DELETION_QUARANTINE_PREFIX: &str = ".maco-delete-";
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const DELETION_QUARANTINE_V2_PREFIX: &str = ".maco-delete-v2-";
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const DELETION_QUARANTINE_V2_DOMAIN: &[u8] = b"MACO\0deletion-quarantine\0v2\0";
 const LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
@@ -128,7 +128,7 @@ impl DirectChildBinding {
                     )
                 })?;
             let after = fstat(self.file.as_raw_fd())?;
-            if after.st_mode & 0o777 != mode & 0o777 {
+            if unsigned_to_u32(after.st_mode & 0o777) != mode & 0o777 {
                 bail!("bound direct child permissions did not reach the requested mode");
             }
             self.verify(root)
@@ -603,7 +603,7 @@ impl SafeRoot {
             self.verify()?;
             let after = fstat(self.directory.as_raw_fd())?;
             validate_owned_direct_child_stat(&after, &self.identity, DirectChildType::Directory)?;
-            if after.st_mode & 0o777 != mode & 0o777 {
+            if unsigned_to_u32(after.st_mode & 0o777) != mode & 0o777 {
                 bail!("bound directory permissions did not reach the requested mode");
             }
             Ok(())
@@ -1327,12 +1327,19 @@ impl BoundedRegularReader {
 pub struct AtomicStateWriter;
 
 impl AtomicStateWriter {
-    #[cfg(target_os = "linux")]
     pub(crate) fn canonical_direct_temp_target(name: &OsStr) -> Result<Option<OsString>> {
-        if let Some(target) = canonical_random_temp_target(name) {
-            return Ok(Some(target));
+        #[cfg(unix)]
+        {
+            if let Some(target) = canonical_random_temp_target(name) {
+                return Ok(Some(target));
+            }
+            Ok(canonical_temp_quarantine_binding(name)?.map(|binding| binding.target))
         }
-        Ok(canonical_temp_quarantine_binding(name)?.map(|binding| binding.target))
+        #[cfg(not(unix))]
+        {
+            let _ = name;
+            Ok(None)
+        }
     }
 
     pub fn write(path: impl AsRef<Path>, contents: &[u8]) -> Result<()> {
@@ -1529,7 +1536,7 @@ impl AtomicStateWriter {
     }
 }
 
-#[cfg(all(target_os = "linux", test))]
+#[cfg(test)]
 thread_local! {
     static TEMP_SCAVENGE_AFTER_QUARANTINE_FAULT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
@@ -2094,7 +2101,15 @@ pub fn quarantined_direct_child_cleanup_name(
 ) -> Result<OsString> {
     let quarantine_name = quarantine_name.as_ref();
     validate_single_component(quarantine_name)?;
-    Ok(deletion_quarantine_name(quarantine_name, expected))
+    #[cfg(unix)]
+    {
+        Ok(deletion_quarantine_name(quarantine_name, expected))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = expected;
+        bail!("secure quarantine cleanup names are unsupported on this platform")
+    }
 }
 
 /// Atomically replaces an empty reserved final directory with a verified
@@ -2344,7 +2359,7 @@ fn secure_create_directory(path: &Path, policy: RootPolicy) -> Result<File> {
             path.display()
         );
     }
-    let observed_mode = stat.st_mode & 0o777;
+    let observed_mode = unsigned_to_u32(stat.st_mode & 0o777);
     if final_created {
         if unsafe { libc::fchmod(current.as_raw_fd(), 0o700) } != 0 {
             return Err(std::io::Error::last_os_error())
@@ -3449,12 +3464,12 @@ fn validate_private_regular_quarantine(stat: &libc::stat, expected: &FileIdentit
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn component_checksum(name: &OsStr) -> String {
     stable_checksum(name.as_bytes())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn deletion_quarantine_name(name: &OsStr, identity: &FileIdentity) -> OsString {
     let source = base64url_encode(name.as_bytes());
     let tag = deletion_quarantine_tag(name, identity);
@@ -3464,7 +3479,7 @@ fn deletion_quarantine_name(name: &OsStr, identity: &FileIdentity) -> OsString {
     ))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn deletion_quarantine_tag(name: &OsStr, identity: &FileIdentity) -> String {
     let mut payload = Vec::with_capacity(
         DELETION_QUARANTINE_V2_DOMAIN
@@ -3487,7 +3502,7 @@ fn deletion_quarantine_tag(name: &OsStr, identity: &FileIdentity) -> String {
     checksum[8..40].to_string()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn base64url_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut encoded = String::with_capacity(bytes.len().saturating_add(2) / 3 * 4);
@@ -3507,7 +3522,7 @@ fn base64url_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn base64url_decode(encoded: &[u8]) -> Result<Vec<u8>> {
     if encoded.is_empty() || encoded.len() % 4 == 1 {
         bail!("private residue quarantine source encoding is malformed");
@@ -3844,7 +3859,7 @@ fn deletion_quarantine_binding(name: &OsStr) -> Result<Option<DeletionQuarantine
     Ok(Some(DeletionQuarantineBinding { source, identity }))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn parse_fixed_lower_hex_u64(bytes: &[u8]) -> Result<u64> {
     if bytes.len() != 16
         || !bytes
@@ -3966,12 +3981,12 @@ fn temp_quarantine_name(file_name: &OsStr, source: &OsStr, identity: &FileIdenti
     ))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn component_checksum_tag(name: &OsStr) -> String {
     component_checksum(name)[8..40].to_string()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn temp_quarantine_binding_tag(
     file_name: &OsStr,
     source_checksum: &str,
@@ -3998,7 +4013,7 @@ fn temp_quarantine_binding_tag(
     stable_checksum(&payload)[8..40].to_string()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn canonical_random_temp_target(name: &OsStr) -> Option<OsString> {
     let bytes = name.as_bytes();
     let body = bytes.strip_prefix(b".")?.strip_suffix(b".tmp")?;
@@ -4020,7 +4035,7 @@ fn canonical_random_temp_target(name: &OsStr) -> Option<OsString> {
     Some(OsString::from_vec(target.to_vec()))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn is_canonical_decimal_u64(value: &str) -> bool {
     value
         .parse::<u64>()
@@ -4028,13 +4043,13 @@ fn is_canonical_decimal_u64(value: &str) -> bool {
         .is_some_and(|parsed| parsed.to_string() == value)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 struct TempQuarantineBinding {
     target: OsString,
     identity: FileIdentity,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn canonical_temp_quarantine_binding(name: &OsStr) -> Result<Option<TempQuarantineBinding>> {
     let bytes = name.as_bytes();
     if !bytes.starts_with(TEMP_QUARANTINE_PREFIX.as_bytes()) {
@@ -4085,7 +4100,7 @@ fn canonical_temp_quarantine_binding(name: &OsStr) -> Result<Option<TempQuaranti
     Ok(Some(TempQuarantineBinding { target, identity }))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn is_lower_hex_bytes_width(value: &[u8], width: usize) -> bool {
     value.len() == width
         && value
@@ -4562,16 +4577,14 @@ struct InventoryWalkState<'a, F> {
     entries: &'a mut Vec<BoundedTreeEntry>,
 }
 
-#[cfg(unix)]
-fn unsigned_to_u64<T>(value: T) -> u64
+pub(crate) fn unsigned_to_u64<T>(value: T) -> u64
 where
     T: TryInto<u64>,
 {
     value.try_into().unwrap_or(u64::MAX)
 }
 
-#[cfg(unix)]
-fn unsigned_to_u32<T>(value: T) -> u32
+pub(crate) fn unsigned_to_u32<T>(value: T) -> u32
 where
     T: TryInto<u32>,
 {
@@ -5251,8 +5264,8 @@ fn fstatat_optional_no_follow(fd: RawFd, name: &std::ffi::CStr) -> Result<Option
 #[cfg(unix)]
 fn identity_from_stat(stat: &libc::stat) -> FileIdentity {
     FileIdentity {
-        device: stat.st_dev,
-        file: stat.st_ino,
+        device: unsigned_to_u64(stat.st_dev),
+        file: unsigned_to_u64(stat.st_ino),
     }
 }
 

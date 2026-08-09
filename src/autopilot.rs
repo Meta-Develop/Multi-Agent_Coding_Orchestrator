@@ -5655,8 +5655,7 @@ mod tests {
         let observations = observations.borrow();
         let reopened = observations
             .iter()
-            .filter(|observation| observation.label == "created_or_opened")
-            .next_back()
+            .rfind(|observation| observation.label == "created_or_opened")
             .expect("observe direct supervise queue reopen");
         let started = observations
             .iter()

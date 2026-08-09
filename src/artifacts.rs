@@ -7,9 +7,9 @@ use self::state_auth::{
 use crate::{
     orchestrator::RunId,
     safe_state::{
-        identity_for_path, remove_direct_child_tree, stable_checksum, AtomicStateWriter,
-        BoundedRegularReader, FileIdentity, KernelStateLock, ReservedDirectory, SafeRoot,
-        TreeLinkPolicy,
+        identity_for_path, remove_direct_child_tree, stable_checksum, unsigned_to_u64,
+        AtomicStateWriter, BoundedRegularReader, FileIdentity, KernelStateLock, ReservedDirectory,
+        SafeRoot, TreeLinkPolicy,
     },
 };
 
@@ -3121,8 +3121,8 @@ fn fstatat_no_follow(fd: i32, name: &CStr) -> Result<libc::stat> {
 #[cfg(unix)]
 fn identity_from_stat(stat: &libc::stat) -> FileIdentity {
     FileIdentity {
-        device: stat.st_dev,
-        file: stat.st_ino,
+        device: unsigned_to_u64(stat.st_dev),
+        file: unsigned_to_u64(stat.st_ino),
     }
 }
 
