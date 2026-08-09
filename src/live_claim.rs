@@ -2205,15 +2205,15 @@ fn ensure_claim_board_valid(claims: &[ParsedClaim]) -> Result<()> {
 
 fn ensure_claim_board_allows_apply(claims: &[ParsedClaim]) -> Result<()> {
     for claim in claims {
-        if let Some(issue) = claim
+        let stored_status_error = claim
             .issues
             .iter()
-            .find(|issue| issue.severity == "error" && issue.field == "status")
-        {
+            .any(|issue| issue.severity == "error" && issue.field == "status");
+        if stored_status_error || (claim.status.is_some() && !claim.status_is_trustworthy) {
             bail!(
                 "claim apply board entry `{}` has an invalid `{}` field",
                 claim.file.display(),
-                issue.field
+                "status"
             );
         }
         if !claim_is_provably_non_conflicting(claim) {
@@ -2244,10 +2244,11 @@ fn claim_can_conflict(claim: &ParsedClaim) -> bool {
 }
 
 fn claim_is_provably_non_conflicting(claim: &ParsedClaim) -> bool {
-    matches!(
-        claim.status.as_deref(),
-        Some("ready-for-review" | "handoff" | "done")
-    )
+    claim.status_is_trustworthy
+        && matches!(
+            claim.status.as_deref(),
+            Some("ready-for-review" | "handoff" | "done")
+        )
 }
 
 fn ensure_claim_has_no_errors(claim: &ParsedClaim, context: &str) -> Result<()> {
@@ -2348,6 +2349,7 @@ struct ParsedClaim {
     claim_id: Option<String>,
     owner: Option<String>,
     status: Option<String>,
+    status_is_trustworthy: bool,
     created: Option<String>,
     updated: Option<String>,
     heartbeat: Option<String>,
@@ -2410,6 +2412,7 @@ fn parse_claim_file(file: PathBuf, content: &str) -> ParsedClaim {
         claim_id: None,
         owner: None,
         status: None,
+        status_is_trustworthy: false,
         created: None,
         updated: None,
         heartbeat: None,
@@ -2422,6 +2425,7 @@ fn parse_claim_file(file: PathBuf, content: &str) -> ParsedClaim {
         push_parse_issue(&mut claim, "file", "claim file exceeds its bounded size");
         return claim;
     }
+    claim.status_is_trustworthy = has_single_valid_status_field(content);
 
     let mut header_values = Vec::new();
     let mut fields = BTreeMap::<String, Vec<String>>::new();
@@ -2682,6 +2686,20 @@ fn push_parse_issue(claim: &mut ParsedClaim, field: &str, message: &str) {
         field: field.to_string(),
         message: message.to_string(),
     });
+}
+
+fn has_single_valid_status_field(content: &str) -> bool {
+    let mut statuses = content.lines().filter_map(|line| {
+        if !line.starts_with("- ") {
+            return None;
+        }
+        let (key, value) = field_from_line(line.trim())?;
+        (key == "status").then_some(value)
+    });
+    let Some(status) = statuses.next() else {
+        return false;
+    };
+    VALID_STATUSES.contains(&status.as_str()) && statuses.next().is_none()
 }
 
 fn field_from_line(line: &str) -> Option<(String, String)> {
@@ -4211,6 +4229,98 @@ mod tests {
     }
 
     #[test]
+    fn apply_does_not_trust_a_duplicate_terminal_status_when_diagnostics_are_full() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = claims_dir(temp.path());
+        std::fs::create_dir_all(&directory)?;
+        let mut malformed = "\u{1}\n".repeat(MAX_CLAIM_ISSUES);
+        malformed.push_str(&claim_text(
+            "ambiguous-terminal",
+            "terminal-owner",
+            "done",
+            "2026-05-20T00:00:00Z",
+            "src/terminal.rs",
+        ));
+        malformed = malformed.replace("- Status: done", "- Status: done\n- Status: active");
+        let malformed_file = PathBuf::from(CLAIMS_DIR).join("ambiguous-terminal.md");
+        let parsed = parse_claim_file(malformed_file.clone(), &malformed);
+        assert_eq!(parsed.issues.len(), MAX_CLAIM_ISSUES);
+        assert!(parsed.issues.iter().all(|issue| issue.field == "line"));
+        assert_eq!(parsed.status.as_deref(), Some("done"));
+        assert!(!parsed.status_is_trustworthy);
+        std::fs::write(directory.join("ambiguous-terminal.md"), malformed)?;
+
+        let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
+        let draft = temp.path().join("claim-draft.md");
+        std::fs::write(
+            &draft,
+            initial_draft_text(
+                "blocked-by-ambiguous-terminal",
+                "new-owner",
+                "active",
+                now.raw(),
+                "src/new_scope.rs",
+            ),
+        )?;
+        let error = apply_with_clock(temp.path(), &draft, "new-owner", &now)
+            .expect_err("a structurally ambiguous status must block apply admission");
+        let message = error.to_string();
+        assert!(message.contains("ambiguous-terminal.md"));
+        assert!(message.contains("`status`"));
+        assert!(!message.contains("done"));
+        assert!(!message.contains("active"));
+        assert!(!directory.join("blocked-by-ambiguous-terminal.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn apply_does_not_trust_a_duplicate_terminal_status_after_the_line_limit() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = claims_dir(temp.path());
+        std::fs::create_dir_all(&directory)?;
+        let mut malformed = claim_text(
+            "line-limited-terminal",
+            "terminal-owner",
+            "done",
+            "2026-05-20T00:00:00Z",
+            "src/terminal.rs",
+        );
+        malformed.push_str(&"\n".repeat(MAX_CLAIM_LINES));
+        malformed.push_str("- Status: active\n");
+        let malformed_file = PathBuf::from(CLAIMS_DIR).join("line-limited-terminal.md");
+        let parsed = parse_claim_file(malformed_file, &malformed);
+        assert_eq!(parsed.status.as_deref(), Some("done"));
+        assert!(!parsed.status_is_trustworthy);
+        assert!(parsed.issues.iter().any(|issue| issue.field == "lines"));
+        assert!(!parsed.issues.iter().any(|issue| issue.field == "status"));
+        std::fs::write(directory.join("line-limited-terminal.md"), malformed)?;
+
+        let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
+        let draft = temp.path().join("claim-draft.md");
+        std::fs::write(
+            &draft,
+            initial_draft_text(
+                "blocked-by-line-limited-terminal",
+                "new-owner",
+                "active",
+                now.raw(),
+                "src/new_scope.rs",
+            ),
+        )?;
+        let error = apply_with_clock(temp.path(), &draft, "new-owner", &now)
+            .expect_err("a status hidden after the parser line limit must block admission");
+        let message = error.to_string();
+        assert!(message.contains("line-limited-terminal.md"));
+        assert!(message.contains("`status`"));
+        assert!(!message.contains("done"));
+        assert!(!message.contains("active"));
+        assert!(!directory
+            .join("blocked-by-line-limited-terminal.md")
+            .exists());
+        Ok(())
+    }
+
+    #[test]
     fn apply_rejects_a_malformed_draft_with_file_and_field_only() -> Result<()> {
         let temp = tempfile::tempdir()?;
         std::fs::create_dir_all(claims_dir(temp.path()))?;
@@ -4607,12 +4717,24 @@ mod tests {
                 "src/live_claim.rs",
             ),
         )?;
-        let error = status(temp.path(), &now)
-            .expect_err("an unsupported status must remain fail-closed outside apply admission");
+        let draft = temp.path().join("claim-draft.md");
+        std::fs::write(
+            &draft,
+            initial_draft_text(
+                "new-real-board-claim",
+                "new-owner",
+                "active",
+                now.raw(),
+                "src/new_scope.rs",
+            ),
+        )?;
+        let error = apply_with_clock(temp.path(), &draft, "new-owner", &now)
+            .expect_err("an unsupported status cannot be classified as non-conflicting");
         let message = error.to_string();
         assert!(message.contains("legacy-status.md"));
         assert!(message.contains("`status`"));
         assert!(!message.contains("completed"));
+        assert!(!directory.join("new-real-board-claim.md").exists());
         let validation = validate(temp.path(), &now)?;
         assert!(!validation.valid);
         let legacy = validation
