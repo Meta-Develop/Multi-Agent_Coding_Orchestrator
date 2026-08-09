@@ -37,7 +37,7 @@ pub(super) fn direct_worktree_control_identity(
     // SAFETY: `fstatat` succeeded and initialized `stat`.
     let stat = unsafe { stat.assume_init() };
     Ok(WorktreeControlIdentity {
-        device: crate::safe_state::unsigned_to_u64(stat.st_dev),
+        device: crate::safe_state::device_id_to_u64(stat.st_dev),
         inode: crate::safe_state::unsigned_to_u64(stat.st_ino),
         file_type: crate::safe_state::unsigned_to_u32(stat.st_mode & libc::S_IFMT),
     })

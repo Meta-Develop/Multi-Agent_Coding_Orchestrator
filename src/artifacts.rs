@@ -4,6 +4,8 @@ pub(crate) mod state_auth;
 use self::state_auth::{
     sha256_hex, AuthenticationTag, RepositoryAuthWriter, RepositoryAuthenticator,
 };
+#[cfg(unix)]
+use crate::safe_state::device_id_to_u64;
 use crate::{
     orchestrator::RunId,
     safe_state::{
@@ -3121,7 +3123,7 @@ fn fstatat_no_follow(fd: i32, name: &CStr) -> Result<libc::stat> {
 #[cfg(unix)]
 fn identity_from_stat(stat: &libc::stat) -> FileIdentity {
     FileIdentity {
-        device: unsigned_to_u64(stat.st_dev),
+        device: device_id_to_u64(stat.st_dev),
         file: unsigned_to_u64(stat.st_ino),
     }
 }

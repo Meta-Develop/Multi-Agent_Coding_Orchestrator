@@ -4584,6 +4584,30 @@ where
     value.try_into().unwrap_or(u64::MAX)
 }
 
+#[cfg(any(test, target_os = "macos"))]
+const fn signed_device_id_to_u64(value: i32) -> u64 {
+    value as u64
+}
+
+/// Converts `stat::st_dev` to the representation returned by
+/// `std::os::unix::fs::MetadataExt::dev`.
+///
+/// Darwin defines `dev_t` as a signed 32-bit integer. Rust's widening cast
+/// preserves each negative device identifier modulo 2^64; a checked unsigned
+/// conversion would instead reject every negative value and collapse them to
+/// one fallback identity.
+#[cfg(unix)]
+pub(crate) const fn device_id_to_u64(value: libc::dev_t) -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        signed_device_id_to_u64(value)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        value as u64
+    }
+}
+
 pub(crate) fn unsigned_to_u32<T>(value: T) -> u32
 where
     T: TryInto<u32>,
@@ -5264,7 +5288,7 @@ fn fstatat_optional_no_follow(fd: RawFd, name: &std::ffi::CStr) -> Result<Option
 #[cfg(unix)]
 fn identity_from_stat(stat: &libc::stat) -> FileIdentity {
     FileIdentity {
-        device: unsigned_to_u64(stat.st_dev),
+        device: device_id_to_u64(stat.st_dev),
         file: unsigned_to_u64(stat.st_ino),
     }
 }
@@ -5273,6 +5297,31 @@ fn identity_from_stat(stat: &libc::stat) -> FileIdentity {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn darwin_signed_device_ids_remain_distinct() {
+        let negative_one = signed_device_id_to_u64(-1);
+        let negative_two = signed_device_id_to_u64(-2);
+
+        assert_eq!(negative_one, u64::MAX);
+        assert_eq!(negative_two, u64::MAX - 1);
+        assert_ne!(negative_one, negative_two);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stat_device_conversion_matches_metadata_ext() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("device-identity");
+        fs::write(&path, b"identity").expect("write fixture");
+        let file = File::open(&path).expect("open fixture");
+        let stat = fstat(file.as_raw_fd()).expect("fstat fixture");
+
+        assert_eq!(
+            device_id_to_u64(stat.st_dev),
+            file.metadata().expect("metadata").dev()
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

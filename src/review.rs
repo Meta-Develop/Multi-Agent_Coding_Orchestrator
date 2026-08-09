@@ -1,5 +1,7 @@
 #[cfg(target_os = "linux")]
 use crate::process_runner::trusted_linux_runtime_root;
+#[cfg(unix)]
+use crate::safe_state::device_id_to_u64;
 use crate::{
     llm::Redactor,
     pinned_exec::PinnedDirectExecutable,
@@ -4575,7 +4577,7 @@ fn fstat_file(file: &File) -> Result<libc::stat> {
 #[cfg(unix)]
 fn file_identity_from_stat(stat: &libc::stat) -> FileIdentity {
     FileIdentity {
-        device: unsigned_to_u64(stat.st_dev),
+        device: device_id_to_u64(stat.st_dev),
         file: unsigned_to_u64(stat.st_ino),
     }
 }
