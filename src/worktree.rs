@@ -2074,11 +2074,11 @@ pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<Worktr
     require_plain_directory(&workspace, "workspace")?;
     let metadata_root = workspace.join(".maco");
     let worktrees_root = metadata_root.join("worktrees");
-    let group_names = match fs::symlink_metadata(&metadata_root) {
+    let group_entries = match fs::symlink_metadata(&metadata_root) {
         Ok(_) => {
             require_plain_directory(&metadata_root, "workspace metadata root")?;
             match fs::symlink_metadata(&worktrees_root) {
-                Ok(_) => bounded_plain_direct_child_names(
+                Ok(_) => bounded_workspace_sweep_group_entries(
                     &worktrees_root,
                     MAX_WORKSPACE_SWEEP_GROUPS,
                     "workspace worktree root",
@@ -2105,14 +2105,15 @@ pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<Worktr
         }
     };
     let mut groups = Vec::new();
-    for group_name in group_names {
-        let group = group_name
+    for group_entry in group_entries {
+        let group = group_entry
+            .name
             .to_str()
             .context("workspace worktree group name is not valid UTF-8")?;
         if group.is_empty() || group.len() > MAX_WORKSPACE_SWEEP_GROUP_NAME_BYTES {
             bail!("workspace worktree group name is invalid or out of bounds");
         }
-        groups.push(group.to_string());
+        groups.push((group.to_string(), group_entry.plain_directory));
     }
 
     let dry_run = !options.apply;
@@ -2137,29 +2138,27 @@ pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<Worktr
         repositories: Vec::with_capacity(groups.len()),
     };
 
-    for group in groups {
+    for (group, plain_directory) in groups {
         let group_root = worktrees_root.join(&group);
+        if !plain_directory {
+            add_sweep_pre_gc_failure(
+                &mut report,
+                group,
+                group_root.clone(),
+                WorktreeSweepFailure {
+                    kind: WorktreeSweepFailureKind::RepositoryAssociation,
+                    message: format!(
+                        "workspace worktree group is not a plain directory: {}",
+                        group_root.display()
+                    ),
+                },
+            )?;
+            continue;
+        }
         let repository = match resolve_sweep_repository(&workspace, &group_root, &group) {
             Ok(repository) => repository,
             Err(failure) => {
-                report.repository_pre_gc_skipped_count = report
-                    .repository_pre_gc_skipped_count
-                    .checked_add(1)
-                    .context("workspace sweep skipped repository count overflowed")?;
-                report.repository_failure_count = report
-                    .repository_failure_count
-                    .checked_add(1)
-                    .context("workspace sweep repository failure count overflowed")?;
-                report.repositories.push(WorktreeSweepRepositoryReport {
-                    group,
-                    worktree_root: group_root,
-                    repository: None,
-                    status: WorktreeSweepRepositoryStatus::Skipped,
-                    gc_attempted: false,
-                    effects_may_have_occurred: false,
-                    failure: Some(failure),
-                    gc_report: None,
-                });
+                add_sweep_pre_gc_failure(&mut report, group, group_root, failure)?;
                 continue;
             }
         };
@@ -2216,6 +2215,33 @@ pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<Worktr
     }
 
     Ok(report)
+}
+
+fn add_sweep_pre_gc_failure(
+    report: &mut WorktreeSweepReport,
+    group: String,
+    worktree_root: PathBuf,
+    failure: WorktreeSweepFailure,
+) -> Result<()> {
+    report.repository_pre_gc_skipped_count = report
+        .repository_pre_gc_skipped_count
+        .checked_add(1)
+        .context("workspace sweep skipped repository count overflowed")?;
+    report.repository_failure_count = report
+        .repository_failure_count
+        .checked_add(1)
+        .context("workspace sweep repository failure count overflowed")?;
+    report.repositories.push(WorktreeSweepRepositoryReport {
+        group,
+        worktree_root,
+        repository: None,
+        status: WorktreeSweepRepositoryStatus::Skipped,
+        gc_attempted: false,
+        effects_may_have_occurred: false,
+        failure: Some(failure),
+        gc_report: None,
+    });
+    Ok(())
 }
 
 fn add_sweep_gc_counts(sweep: &mut WorktreeSweepReport, gc: &WorktreeGcReport) -> Result<()> {
@@ -2555,6 +2581,37 @@ fn require_plain_directory(path: &Path, label: &str) -> Result<()> {
         bail!("{label} is not a plain directory: {}", path.display());
     }
     Ok(())
+}
+
+struct WorkspaceSweepGroupEntry {
+    name: OsString,
+    plain_directory: bool,
+}
+
+fn bounded_workspace_sweep_group_entries(
+    root: &Path,
+    limit: usize,
+    label: &str,
+) -> Result<Vec<WorkspaceSweepGroupEntry>> {
+    require_plain_directory(root, label)?;
+    let mut entries = Vec::new();
+    for entry in
+        fs::read_dir(root).with_context(|| format!("failed to read {label} {}", root.display()))?
+    {
+        if entries.len() >= limit {
+            bail!("{label} exceeds the {limit} entry limit");
+        }
+        let entry = entry.with_context(|| format!("failed to read an entry in {label}"))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect an entry in {label}"))?;
+        entries.push(WorkspaceSweepGroupEntry {
+            name: entry.file_name(),
+            plain_directory: file_type.is_dir() && !file_type.is_symlink(),
+        });
+    }
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(entries)
 }
 
 fn bounded_plain_direct_child_names(
@@ -8122,6 +8179,74 @@ mod tests {
             .to_string()
             .contains("workspace metadata root is not a plain directory"));
         assert!(created.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_sweep_reports_symlinked_group_and_continues_valid_group() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let linked_repo_path = workspace.join("a-linked");
+        WorktreeManager::init_repository(&linked_repo_path, "main").expect("init linked repo");
+        let linked_repo = Repository::open(&linked_repo_path).expect("open linked repo");
+        commit_readme(&linked_repo).expect("initial linked commit");
+        let outside_group = temp.path().join("outside-group");
+        let outside_lane = create_gc_worktree(
+            &WorktreeManager::new(&linked_repo_path),
+            "outside-lane",
+            &outside_group,
+        );
+
+        let valid_repo_path = workspace.join("z-valid");
+        WorktreeManager::init_repository(&valid_repo_path, "main").expect("init valid repo");
+        let valid_repo = Repository::open(&valid_repo_path).expect("open valid repo");
+        commit_readme(&valid_repo).expect("initial valid commit");
+        let worktrees_root = workspace.join(".maco/worktrees");
+        let valid_group = worktrees_root.join("z-valid");
+        let valid_lane = create_gc_worktree(
+            &WorktreeManager::new(&valid_repo_path),
+            "valid-lane",
+            &valid_group,
+        );
+        symlink(&outside_group, worktrees_root.join("a-linked")).expect("link group");
+
+        let report = sweep_workspace_worktrees(workspace_sweep_options(&workspace, true))
+            .expect("sweep with symlinked group");
+        assert_eq!(report.repository_discovered_count, 2);
+        assert_eq!(report.repository_inspected_count, 1);
+        assert_eq!(report.repository_pre_gc_skipped_count, 1);
+        assert_eq!(report.repository_gc_failed_count, 0);
+        assert_eq!(report.repository_failure_count, 1);
+        assert_eq!(
+            report
+                .repositories
+                .iter()
+                .map(|entry| entry.group.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-linked", "z-valid"]
+        );
+        let linked = &report.repositories[0];
+        assert_eq!(linked.status, WorktreeSweepRepositoryStatus::Skipped);
+        assert!(!linked.gc_attempted);
+        assert!(!linked.effects_may_have_occurred);
+        assert_eq!(
+            linked.failure.as_ref().expect("typed group failure").kind,
+            WorktreeSweepFailureKind::RepositoryAssociation
+        );
+        assert!(linked
+            .failure
+            .as_ref()
+            .expect("group failure")
+            .message
+            .contains("not a plain directory"));
+        assert_eq!(
+            report.repositories[1].status,
+            WorktreeSweepRepositoryStatus::Inspected
+        );
+        assert!(outside_lane.path.exists());
+        assert!(!valid_lane.path.exists());
     }
 
     #[cfg(target_os = "linux")]
