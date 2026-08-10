@@ -56,6 +56,7 @@ enum FollowUpPreparation {
         loaded: Box<LoadedSupervisorPlan>,
     },
     Refused(GateDenial),
+    Cancelled,
     EnvironmentFailed(EnvironmentFailure),
 }
 
@@ -128,7 +129,9 @@ pub(super) fn run_generated_follow_up_cascade(
     source_report: SupervisorFinalReport,
     supervisor_template: &SupervisorRunOptions,
     invocation: FollowUpCascadeInvocation<'_>,
-    before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<bool>,
+    caller_cancellation: Option<&ProcessCancellation>,
+    cancellation_observed: &AtomicBool,
+    before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorCascadeOutcome> {
     let source_plan_sha256 = normalized_supervisor_plan_sha256(
@@ -138,6 +141,7 @@ pub(super) fn run_generated_follow_up_cascade(
         &source_loaded.plan_metadata,
     )?;
     verify_authenticated_source_basis(repo, source_loaded, &source_report, &source_plan_sha256)?;
+    observe_caller_cancellation(caller_cancellation, cancellation_observed);
     // Authentication precedes every early return. Resume is therefore bound
     // to the immutable finalized source artifact even when that source has no
     // generated work, failed, or was not publishable.
@@ -286,10 +290,11 @@ pub(super) fn run_generated_follow_up_cascade(
             if reloaded.plan != effective {
                 bail!("generated follow-up ordinary plan file changed before dispatch");
             }
-            if !before_dispatch(&reloaded.plan)? {
-                return Ok(FollowUpPreparation::Refused(inconsistent_profile_denial(
-                    &item_id,
-                )?));
+            if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
+                return Ok(FollowUpPreparation::Cancelled);
+            }
+            if let Some(denial) = before_dispatch(&reloaded.plan)? {
+                return Ok(FollowUpPreparation::Refused(denial));
             }
 
             // These are the last effectful-path checks. They run after the
@@ -315,6 +320,9 @@ pub(super) fn run_generated_follow_up_cascade(
                     ));
                 }
             }
+            if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
+                return Ok(FollowUpPreparation::Cancelled);
+            }
             Ok(FollowUpPreparation::Ready {
                 plan_file,
                 loaded: Box::new(reloaded),
@@ -325,6 +333,11 @@ pub(super) fn run_generated_follow_up_cascade(
             Ok(FollowUpPreparation::Refused(denial)) => {
                 queue.release_before_dispatch(&item_id, Some(denial.clone()), Vec::new())?;
                 cascade_gate_denials.push(denial);
+                cascade_success = false;
+                break;
+            }
+            Ok(FollowUpPreparation::Cancelled) => {
+                queue.release_before_dispatch(&item_id, None, Vec::new())?;
                 cascade_success = false;
                 break;
             }
@@ -1308,20 +1321,6 @@ fn permission_expansion_denial(correlation_id: &str) -> Result<GateDenial> {
         correlation_id,
         GateDenialReason::ApprovalReview {
             denial: crate::gate_denial::ApprovalReviewDenial::PermissionExpansion,
-        },
-        VerifiedGateContext::new(
-            correlation_id,
-            GateCheckSource::FutureApprovalReview,
-            std::iter::empty::<&Path>(),
-        )?,
-    )?)
-}
-
-fn inconsistent_profile_denial(correlation_id: &str) -> Result<GateDenial> {
-    Ok(GateDenial::new(
-        correlation_id,
-        GateDenialReason::ApprovalReview {
-            denial: crate::gate_denial::ApprovalReviewDenial::InconsistentRequest,
         },
         VerifiedGateContext::new(
             correlation_id,
