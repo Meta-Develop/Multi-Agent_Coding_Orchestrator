@@ -20,6 +20,7 @@ use thiserror::Error;
 
 use crate::{
     agent_lifecycle::{AgentLaunchMetadata, AgentRegistry, MACO_RUN_ID_ENV, MACO_TASK_ID_ENV},
+    external_agent::EnvironmentFailure,
     pinned_exec::{
         self, PinnedDirectExecutable, HIDDEN_PINNED_EXEC_ARGUMENT, PINNED_EXEC_DESCRIPTOR_NAME,
     },
@@ -1536,6 +1537,13 @@ pub enum ProcessRunError {
         #[source]
         source: std::io::Error,
     },
+    #[error("sandbox environment is unavailable for {label} ({command}): {failure}")]
+    EnvironmentFailure {
+        label: String,
+        command: String,
+        failure: Box<EnvironmentFailure>,
+        target_process_started: bool,
+    },
     #[error("failed to prepare cancellable child I/O for {label} ({command}): {source}")]
     IoSetup {
         label: String,
@@ -1686,10 +1694,8 @@ fn run_process_cancellable_with_interaction(
     )?;
     let mut command = prepared_process_tree
         .build_command(&spec)
-        .map_err(|source| ProcessRunError::ContainmentUnavailable {
-            label: spec.label.clone(),
-            command: command_display.clone(),
-            source,
+        .map_err(|source| {
+            containment_setup_error(spec.label.clone(), command_display.clone(), source)
         })?;
     ensure_setup_budget(
         operation_deadline,
@@ -1843,14 +1849,8 @@ fn run_process_cancellable_with_interaction(
                         "agent lifecycle PID capture rollback",
                     ),
                 );
-                let source = append_error(Some(source.to_string()), cleanup_error)
-                    .map(std::io::Error::other)
-                    .unwrap_or(source);
-                return Err(ProcessRunError::ProcessOwnership {
-                    label: spec.label.clone(),
-                    command: command_display,
-                    source,
-                });
+                let error = process_ownership_error(spec.label.clone(), command_display, source);
+                return Err(append_process_run_error_cleanup(error, cleanup_error));
             }
         };
         let registration = AgentRegistry::open(metadata.repo())
@@ -2733,6 +2733,20 @@ fn append_process_run_error_cleanup(
             command,
             source: std::io::Error::other(format!("{source}; cleanup failed: {cleanup}")),
         },
+        ProcessRunError::EnvironmentFailure {
+            label,
+            command,
+            mut failure,
+            target_process_started,
+        } => {
+            failure.summary = format!("{}; cleanup failed: {cleanup}", failure.summary);
+            ProcessRunError::EnvironmentFailure {
+                label,
+                command,
+                failure,
+                target_process_started,
+            }
+        }
         ProcessRunError::SetupTimeout {
             label,
             command,
@@ -2759,6 +2773,78 @@ fn setup_timeout_error(
         command: command.to_string(),
         phase,
         source: std::io::Error::new(std::io::ErrorKind::TimedOut, detail.into()),
+    }
+}
+
+fn containment_setup_error(
+    label: String,
+    command: String,
+    source: std::io::Error,
+) -> ProcessRunError {
+    if let Some((failure, target_process_started)) = environment_failure_from_source(&source) {
+        return ProcessRunError::EnvironmentFailure {
+            label,
+            command,
+            failure: Box::new(failure),
+            target_process_started,
+        };
+    }
+    ProcessRunError::ContainmentUnavailable {
+        label,
+        command,
+        source,
+    }
+}
+
+fn process_ownership_error(
+    label: String,
+    command: String,
+    source: std::io::Error,
+) -> ProcessRunError {
+    if let Some((failure, target_process_started)) = environment_failure_from_source(&source) {
+        return ProcessRunError::EnvironmentFailure {
+            label,
+            command,
+            failure: Box::new(failure),
+            target_process_started,
+        };
+    }
+    ProcessRunError::ProcessOwnership {
+        label,
+        command,
+        source,
+    }
+}
+
+fn environment_failure_from_source(source: &std::io::Error) -> Option<(EnvironmentFailure, bool)> {
+    #[cfg(target_os = "linux")]
+    {
+        return source
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<EnvironmentFailureSource>())
+            .map(|source| (source.failure.clone(), source.target_process_started));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = source;
+        None
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn is_verified_backend_unavailable(error: &ProcessRunError) -> bool {
+    match error {
+        ProcessRunError::ProcessOwnership { .. } => {
+            let message = error.to_string();
+            [
+                "inaccessible path remained",
+                "inaccessible path placeholder",
+                "could not inspect inaccessible-path",
+            ]
+            .iter()
+            .any(|diagnostic| message.contains(diagnostic))
+        }
+        _ => false,
     }
 }
 
@@ -4138,6 +4224,12 @@ impl PreparedProcessTree {
                                 stdin_error: None,
                             })),
                         })
+                    } else if environment_failure_from_source(&source).is_some() {
+                        Err(process_ownership_error(
+                            label.to_string(),
+                            command.to_string(),
+                            source,
+                        ))
                     } else if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline)
                     {
                         Err(setup_timeout_error(
@@ -4147,11 +4239,11 @@ impl PreparedProcessTree {
                             source.to_string(),
                         ))
                     } else {
-                        Err(ProcessRunError::ProcessOwnership {
-                            label: label.to_string(),
-                            command: command.to_string(),
+                        Err(process_ownership_error(
+                            label.to_string(),
+                            command.to_string(),
                             source,
-                        })
+                        ))
                     };
                 }
                 let side_effects = unit.side_effect_evidence();
@@ -4287,6 +4379,12 @@ impl AttachedProcessTree {
                                 stdin_error: None,
                             })),
                         })
+                    } else if environment_failure_from_source(&source).is_some() {
+                        Err(process_ownership_error(
+                            label.to_string(),
+                            command.to_string(),
+                            source,
+                        ))
                     } else if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline)
                     {
                         Err(setup_timeout_error(
@@ -4296,11 +4394,11 @@ impl AttachedProcessTree {
                             source.to_string(),
                         ))
                     } else {
-                        Err(ProcessRunError::ProcessOwnership {
-                            label: label.to_string(),
-                            command: command.to_string(),
+                        Err(process_ownership_error(
+                            label.to_string(),
+                            command.to_string(),
                             source,
-                        })
+                        ))
                     };
                 }
             }
@@ -4454,6 +4552,34 @@ struct ResolvedSystemdSandbox {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct EnvironmentFailureSource {
+    failure: EnvironmentFailure,
+    target_process_started: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Display for EnvironmentFailureSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.failure, formatter)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for EnvironmentFailureSource {}
+
+#[cfg(target_os = "linux")]
+fn environment_failure_io(
+    failure: EnvironmentFailure,
+    target_process_started: bool,
+) -> std::io::Error {
+    std::io::Error::other(EnvironmentFailureSource {
+        failure,
+        target_process_started,
+    })
+}
+
+#[cfg(target_os = "linux")]
 struct SandboxPathIdentity {
     path: PathBuf,
     device: u64,
@@ -4501,6 +4627,53 @@ struct SandboxMountRegion {
 
 #[cfg(target_os = "linux")]
 impl ResolvedSystemdSandbox {
+    fn explicitly_binds_program(&self, program: &Path) -> bool {
+        std::iter::once(&self.workspace_root)
+            .chain(self.visible_read_only_roots.iter())
+            .chain(self.visible_read_write_roots.iter())
+            .chain(self.writable_artifact_roots.iter())
+            .any(|root| program.starts_with(root))
+            || self
+                .visible_read_only_files
+                .iter()
+                .chain(self.visible_read_write_files.iter())
+                .any(|file| program == file)
+    }
+
+    fn validate_program_visibility(&self, program: &Path) -> std::io::Result<()> {
+        if let Some(hidden_root) = self
+            .hidden_roots
+            .iter()
+            .find(|root| program.starts_with(root))
+        {
+            return Err(environment_failure_io(
+                EnvironmentFailure::sandbox_unavailable(format!(
+                    "the sandbox cannot start program {} because sandbox.hidden_roots makes that root inaccessible inside the transient unit: {}; place the executable outside the hidden root before retrying",
+                    program.display(),
+                    hidden_root.display(),
+                )),
+                false,
+            ));
+        }
+        let Some(private_tmp_root) = [Path::new("/tmp"), Path::new("/var/tmp")]
+            .into_iter()
+            .find(|root| program.starts_with(root))
+        else {
+            return Ok(());
+        };
+        if self.explicitly_binds_program(program) {
+            return Ok(());
+        }
+        Err(environment_failure_io(
+            EnvironmentFailure::sandbox_unavailable(format!(
+                "the sandbox cannot start program {} because PrivateTmp=yes replaces that root inside the transient unit: {}; place the executable outside the hidden root before retrying",
+                program.display(),
+                private_tmp_root.display(),
+            )),
+            false,
+        ))
+    }
+
     fn add_isolated_runtime_file(&mut self, file: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -5390,6 +5563,61 @@ fn sandbox_mount_regions_conflict(left: &SandboxMountRegion, right: &SandboxMoun
 }
 
 #[cfg(target_os = "linux")]
+fn normalized_absolute_program_invocation(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if normalized != Path::new("/") {
+                    normalized.pop();
+                }
+            }
+            std::path::Component::Normal(component) => normalized.push(component),
+            std::path::Component::Prefix(_) => {}
+        }
+    }
+    normalized
+}
+
+#[cfg(target_os = "linux")]
+fn resolved_direct_program_paths(
+    spec: &ProcessSpec,
+    current_dir: &Path,
+) -> std::io::Result<Vec<PathBuf>> {
+    let ProcessCommand::Direct { program, .. } = &spec.command else {
+        return Ok(Vec::new());
+    };
+    let candidate = if program.is_absolute() {
+        program.clone()
+    } else if program.components().count() > 1 {
+        current_dir.join(program)
+    } else {
+        // The guardian's eventual exec applies the target environment's PATH semantics. Avoid a
+        // partial local reimplementation here; status 226 remains typed defense in depth for a
+        // bare name whose selected executable cannot be established before launch.
+        return Ok(Vec::new());
+    };
+    let invocation = normalized_absolute_program_invocation(&candidate);
+    let mut paths = vec![invocation];
+    match fs::canonicalize(&candidate) {
+        Ok(canonical) if !paths.contains(&canonical) => paths.push(canonical),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to resolve sandbox program path {}: {error}",
+                    candidate.display()
+                ),
+            ));
+        }
+    }
+    Ok(paths)
+}
+
+#[cfg(target_os = "linux")]
 fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<ResolvedSystemdSandbox>> {
     let Some(config) = spec.side_effects.workspace_config() else {
         return Ok(None);
@@ -5591,6 +5819,9 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         path_identities,
         mount_checks,
     };
+    for program in resolved_direct_program_paths(spec, &sandbox.current_dir)? {
+        sandbox.validate_program_visibility(&program)?;
+    }
     sandbox.verify_no_special_entries()?;
     Ok(Some(sandbox))
 }
@@ -6803,6 +7034,7 @@ struct SystemdUnit {
     pending_environment: Option<EnvironmentMode>,
     pending_runtime_files: Vec<PrivateRuntimeFile>,
     runtime_file_paths: Vec<PathBuf>,
+    target_program_path: Option<PathBuf>,
     sandbox: Option<ResolvedSystemdSandbox>,
     sandbox_verified: bool,
     environment_published: bool,
@@ -7089,6 +7321,7 @@ impl SystemdUnit {
             pending_environment: None,
             pending_runtime_files: Vec::new(),
             runtime_file_paths: Vec::new(),
+            target_program_path: None,
             sandbox: None,
             sandbox_verified: false,
             environment_published: false,
@@ -7143,7 +7376,28 @@ impl SystemdUnit {
             target_environment
         });
         let mut sandbox = resolve_systemd_sandbox(spec)?;
+        let target_current_dir = sandbox
+            .as_ref()
+            .map_or(spec.current_dir.as_path(), |sandbox| {
+                sandbox.current_dir.as_path()
+            });
+        let target_program_path = match &pinned_launch {
+            Some((helper, _)) => helper.clone(),
+            None => match &spec.command {
+                ProcessCommand::Shell { .. } => self.shell.clone(),
+                ProcessCommand::Direct { program, .. } if program.is_absolute() => {
+                    normalized_absolute_program_invocation(program)
+                }
+                ProcessCommand::Direct { program, .. } if program.components().count() > 1 => {
+                    normalized_absolute_program_invocation(&target_current_dir.join(program))
+                }
+                ProcessCommand::Direct { program, .. } => program.clone(),
+            },
+        };
         if let Some(sandbox) = sandbox.as_mut() {
+            if pinned_launch.is_some() || matches!(&spec.command, ProcessCommand::Shell { .. }) {
+                sandbox.validate_program_visibility(&target_program_path)?;
+            }
             for helper in [
                 &self.env_program,
                 &self.shell,
@@ -7158,6 +7412,7 @@ impl SystemdUnit {
             }
             sandbox.add_private_runtime_root(&self.runtime_dir)?;
         }
+        self.target_program_path = Some(target_program_path);
         let working_directory = sandbox
             .as_ref()
             .map(|sandbox| sandbox.current_dir.clone())
@@ -7387,9 +7642,12 @@ impl SystemdUnit {
             if let Some(status) = child.try_wait()? {
                 self.launcher_completed = true;
                 let startup_output = collect_exited_child_startup_output(child);
-                return Err(std::io::Error::other(format!(
-                    "systemd-run exited with {status} before transient-unit ownership was observed{startup_output}"
-                )));
+                return Err(systemd_launcher_exit_error(
+                    status,
+                    &startup_output,
+                    self.target_program_path.as_deref(),
+                    "before transient-unit ownership was observed",
+                ));
             }
             thread::sleep(IO_CANCEL_POLL_INTERVAL);
         }
@@ -7458,9 +7716,12 @@ impl SystemdUnit {
             if let Some(status) = child.try_wait()? {
                 self.launcher_completed = true;
                 let startup_output = collect_exited_child_startup_output(child);
-                return Err(std::io::Error::other(format!(
-                    "systemd-run exited with {status} before the execution gate was released{startup_output}"
-                )));
+                return Err(systemd_launcher_exit_error(
+                    status,
+                    &startup_output,
+                    self.target_program_path.as_deref(),
+                    "before the execution gate was released",
+                ));
             }
             if Instant::now() >= deadline {
                 return Err(std::io::Error::new(
@@ -7500,9 +7761,13 @@ impl SystemdUnit {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     if let Some(status) = child.try_wait()? {
                         self.launcher_completed = true;
-                        return Err(std::io::Error::other(format!(
-                            "systemd-run exited with {status} before target PID publication"
-                        )));
+                        let startup_output = collect_exited_child_startup_output(child);
+                        return Err(systemd_launcher_exit_error(
+                            status,
+                            &startup_output,
+                            self.target_program_path.as_deref(),
+                            "before target PID publication",
+                        ));
                     }
                     if Instant::now() >= deadline {
                         return Err(std::io::Error::new(
@@ -7888,6 +8153,43 @@ fn run_control_command_bounded<'a>(
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_systemd_namespace_failure(
+    status: ExitStatus,
+    startup_output: &str,
+    program: &Path,
+) -> Option<EnvironmentFailure> {
+    if status.code() != Some(226) {
+        return None;
+    }
+    let namespace_corroborated = startup_output.to_ascii_uppercase().contains("NAMESPACE");
+    let corroboration = if namespace_corroborated {
+        "startup output also reported NAMESPACE"
+    } else {
+        "startup output did not repeat NAMESPACE"
+    };
+    Some(EnvironmentFailure::sandbox_unavailable(format!(
+        "systemd reported exit status 226/NAMESPACE while preparing the sandbox for program {}; namespace setup failed before the program executed ({corroboration})",
+        program.display(),
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_launcher_exit_error(
+    status: ExitStatus,
+    startup_output: &str,
+    program: Option<&Path>,
+    phase: &str,
+) -> std::io::Error {
+    let program = program.unwrap_or_else(|| Path::new("<unknown sandbox program>"));
+    if let Some(failure) = classify_systemd_namespace_failure(status, startup_output, program) {
+        return environment_failure_io(failure, false);
+    }
+    std::io::Error::other(format!(
+        "systemd-run exited with {status} {phase}{startup_output}"
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -9834,6 +10136,266 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn program_visibility_sandbox(workspace_root: &Path) -> ResolvedSystemdSandbox {
+        ResolvedSystemdSandbox {
+            kind: SideEffectConfinementProfileKind::ExternalCodex,
+            workspace_root: workspace_root.to_path_buf(),
+            current_dir: workspace_root.to_path_buf(),
+            workspace_access: WorkspaceAccess::ReadWrite,
+            visible_read_only_roots: Vec::new(),
+            visible_read_only_files: Vec::new(),
+            visible_read_write_roots: Vec::new(),
+            visible_read_write_files: Vec::new(),
+            external_codex_writable_file_capabilities: Vec::new(),
+            writable_artifact_roots: Vec::new(),
+            hidden_roots: Vec::new(),
+            isolated_host_view: false,
+            resource_limits: ProcessResourceLimits::default(),
+            path_identities: Vec::new(),
+            mount_checks: Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_program_visibility_rejects_private_tmp_and_hidden_roots() {
+        let mut sandbox = program_visibility_sandbox(Path::new("/opt/maco/workspace"));
+        sandbox.hidden_roots = vec![PathBuf::from("/srv/private")];
+        for program in [
+            Path::new("/tmp/target/debug/probe"),
+            Path::new("/var/tmp/target/debug/probe"),
+            Path::new("/srv/private/bin/probe"),
+        ] {
+            let error = sandbox
+                .validate_program_visibility(program)
+                .expect_err("hidden program path must be rejected");
+            let (failure, target_process_started) =
+                environment_failure_from_source(&error).expect("typed environment failure");
+            assert_eq!(
+                failure.category,
+                crate::external_agent::EnvironmentFailureCategory::SandboxUnavailable
+            );
+            assert!(!target_process_started);
+            assert!(failure.summary.contains(&program.display().to_string()));
+        }
+
+        assert!(sandbox
+            .validate_program_visibility(Path::new("/opt/maco/bin/probe"))
+            .is_ok());
+        assert!(sandbox
+            .validate_program_visibility(Path::new("/tmp-adjacent/bin/probe"))
+            .is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_program_visibility_accepts_explicit_private_tmp_bindings() {
+        let workspace_program = Path::new("/tmp/workspace/bin/probe");
+        let mut sandbox = program_visibility_sandbox(Path::new("/tmp/workspace"));
+        assert!(sandbox
+            .validate_program_visibility(workspace_program)
+            .is_ok());
+
+        sandbox.workspace_root = PathBuf::from("/opt/maco/workspace");
+        sandbox.current_dir = sandbox.workspace_root.clone();
+        let read_only_root_program = Path::new("/tmp/read-only-tools/bin/probe");
+        sandbox
+            .visible_read_only_roots
+            .push(PathBuf::from("/tmp/read-only-tools"));
+        assert!(sandbox
+            .validate_program_visibility(read_only_root_program)
+            .is_ok());
+
+        let read_write_root_program = Path::new("/var/tmp/read-write-tools/bin/probe");
+        sandbox
+            .visible_read_write_roots
+            .push(PathBuf::from("/var/tmp/read-write-tools"));
+        assert!(sandbox
+            .validate_program_visibility(read_write_root_program)
+            .is_ok());
+
+        let artifact_program = Path::new("/tmp/artifacts/bin/probe");
+        sandbox
+            .writable_artifact_roots
+            .push(PathBuf::from("/tmp/artifacts"));
+        assert!(sandbox
+            .validate_program_visibility(artifact_program)
+            .is_ok());
+
+        let read_only_file = PathBuf::from("/var/tmp/exact-read-only-probe");
+        sandbox.visible_read_only_files.push(read_only_file.clone());
+        assert!(sandbox.validate_program_visibility(&read_only_file).is_ok());
+
+        let read_write_file = PathBuf::from("/tmp/exact-read-write-probe");
+        sandbox
+            .visible_read_write_files
+            .push(read_write_file.clone());
+        assert!(sandbox.validate_program_visibility(&read_write_file).is_ok());
+
+        let hidden_program = Path::new("/tmp/workspace/hidden/probe");
+        sandbox.workspace_root = PathBuf::from("/tmp/workspace");
+        sandbox
+            .hidden_roots
+            .push(PathBuf::from("/tmp/workspace/hidden"));
+        let hidden_error = sandbox
+            .validate_program_visibility(hidden_program)
+            .expect_err("hidden roots must override an overlapping workspace bind");
+        assert!(hidden_error.to_string().contains("sandbox.hidden_roots"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_program_visibility_checks_invocation_and_canonical_symlink_paths() {
+        use std::os::unix::{fs::symlink, fs::PermissionsExt};
+
+        let private_tmp = tempfile::Builder::new()
+            .prefix("maco-private-tmp-link-")
+            .tempdir_in("/tmp")
+            .expect("private tmp symlink directory");
+        let visible_target_root = tempfile::Builder::new()
+            .prefix("maco-visible-target-")
+            .tempdir_in("/dev/shm")
+            .expect("visible target directory");
+        let visible_target = visible_target_root.path().join("probe");
+        fs::write(&visible_target, b"#!/bin/sh\nexit 0\n").expect("visible target");
+        fs::set_permissions(&visible_target, fs::Permissions::from_mode(0o755))
+            .expect("visible target permissions");
+        let hidden_invocation = private_tmp.path().join("probe");
+        symlink(&visible_target, &hidden_invocation).expect("symlink hidden invocation");
+        let spec = ProcessSpec::direct(
+            "hidden invocation",
+            &hidden_invocation,
+            Vec::<OsString>::new(),
+            Path::new("/"),
+            128,
+        );
+        let paths = resolved_direct_program_paths(&spec, Path::new("/"))
+            .expect("resolve hidden invocation and target");
+        assert_eq!(paths.first(), Some(&hidden_invocation));
+        assert_eq!(paths.get(1), Some(&visible_target));
+        let sandbox = program_visibility_sandbox(Path::new("/opt/maco/workspace"));
+        assert!(sandbox.validate_program_visibility(&paths[0]).is_err());
+        assert!(sandbox.validate_program_visibility(&paths[1]).is_ok());
+
+        let hidden_target_root = tempfile::Builder::new()
+            .prefix("maco-hidden-target-")
+            .tempdir_in("/var/tmp")
+            .expect("hidden target directory");
+        let hidden_target = hidden_target_root.path().join("probe");
+        fs::write(&hidden_target, b"#!/bin/sh\nexit 0\n").expect("hidden target");
+        fs::set_permissions(&hidden_target, fs::Permissions::from_mode(0o755))
+            .expect("hidden target permissions");
+        let visible_invocation_root = tempfile::Builder::new()
+            .prefix("maco-visible-link-")
+            .tempdir_in("/dev/shm")
+            .expect("visible symlink directory");
+        let visible_invocation = visible_invocation_root.path().join("probe");
+        symlink(&hidden_target, &visible_invocation).expect("symlink to hidden target");
+        let spec = ProcessSpec::direct(
+            "hidden target",
+            &visible_invocation,
+            Vec::<OsString>::new(),
+            Path::new("/"),
+            128,
+        );
+        let paths = resolved_direct_program_paths(&spec, Path::new("/"))
+            .expect("resolve visible invocation and hidden target");
+        assert!(sandbox.validate_program_visibility(&paths[0]).is_ok());
+        assert_eq!(paths.get(1), Some(&hidden_target));
+        assert!(sandbox.validate_program_visibility(&paths[1]).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_namespace_exit_classifier_is_typed_and_corroboration_aware() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let program = Path::new("/tmp/maco-target/debug/probe");
+        let corroborated = classify_systemd_namespace_failure(
+            ExitStatus::from_raw(226 << 8),
+            "Failed at step NAMESPACE spawning child",
+            program,
+        )
+        .expect("226 with NAMESPACE must be typed");
+        assert_eq!(
+            corroborated.category,
+            crate::external_agent::EnvironmentFailureCategory::SandboxUnavailable
+        );
+        assert!(corroborated.summary.contains("226/NAMESPACE"));
+        assert!(corroborated.summary.contains("also reported NAMESPACE"));
+
+        let uncorroborated = classify_systemd_namespace_failure(
+            ExitStatus::from_raw(226 << 8),
+            "transient unit failed",
+            program,
+        )
+        .expect("226 without NAMESPACE output must still be typed");
+        assert!(uncorroborated.summary.contains("did not repeat NAMESPACE"));
+        assert!(classify_systemd_namespace_failure(
+            ExitStatus::from_raw(17 << 8),
+            "NAMESPACE",
+            program,
+        )
+        .is_none());
+
+        let typed = process_ownership_error(
+            "sandbox probe".to_string(),
+            program.display().to_string(),
+            systemd_launcher_exit_error(
+                ExitStatus::from_raw(226 << 8),
+                "Failed at step NAMESPACE spawning child",
+                Some(program),
+                "before target PID publication",
+            ),
+        );
+        assert!(matches!(
+            &typed,
+            ProcessRunError::EnvironmentFailure {
+                failure,
+                target_process_started: false,
+                ..
+            } if failure.category
+                == crate::external_agent::EnvironmentFailureCategory::SandboxUnavailable
+        ));
+        assert!(typed.to_string().contains(&program.display().to_string()));
+
+        let unrelated = process_ownership_error(
+            "sandbox probe".to_string(),
+            program.display().to_string(),
+            systemd_launcher_exit_error(
+                ExitStatus::from_raw(17 << 8),
+                "NAMESPACE",
+                Some(program),
+                "before target PID publication",
+            ),
+        );
+        assert!(matches!(
+            unrelated,
+            ProcessRunError::ProcessOwnership { .. }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_environment_failure_message_names_cause_and_program_path() {
+        let program = Path::new("/tmp/maco-target/debug/probe");
+        let sandbox = program_visibility_sandbox(Path::new("/opt/maco/workspace"));
+        let source = sandbox
+            .validate_program_visibility(program)
+            .expect_err("PrivateTmp-hidden program must fail preflight");
+        let error = containment_setup_error(
+            "hostile scope probe".to_string(),
+            program.display().to_string(),
+            source,
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("sandbox environment is unavailable"));
+        assert!(rendered.contains("PrivateTmp=yes"));
+        assert!(rendered.contains(&program.display().to_string()));
+        assert!(!is_verified_backend_unavailable(&error));
+    }
 
     #[cfg(unix)]
     fn assert_process_not_executable(pid: &str, context: &str) {
@@ -12812,21 +13374,6 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
     #[cfg(not(target_os = "linux"))]
     fn strict_backend_available_for_tests() -> bool {
         false
-    }
-
-    #[cfg(target_os = "linux")]
-    fn is_verified_backend_unavailable(error: &ProcessRunError) -> bool {
-        if !matches!(error, ProcessRunError::ProcessOwnership { .. }) {
-            return false;
-        }
-        let message = error.to_string();
-        [
-            "inaccessible path remained",
-            "inaccessible path placeholder",
-            "could not inspect inaccessible-path",
-        ]
-        .iter()
-        .any(|diagnostic| message.contains(diagnostic))
     }
 
     #[cfg(target_os = "linux")]
