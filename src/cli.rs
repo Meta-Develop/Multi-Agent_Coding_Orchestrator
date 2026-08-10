@@ -50,9 +50,10 @@ use crate::{
         ClaimStatusReport, ClaimTelemetryOutcome, MegafileClaimWarning, OwnerReport, SyncStore,
     },
     worktree::{
-        RepositoryInfo, WorktreeCreateOptions, WorktreeGcOptions, WorktreeGcReason,
-        WorktreeGcReport, WorktreeGcStatus, WorktreeManager, WorktreeRecord,
-        WorktreeRetentionPolicy,
+        sweep_workspace_worktrees, RepositoryInfo, WorktreeCreateOptions, WorktreeGcOptions,
+        WorktreeGcReason, WorktreeGcReport, WorktreeGcStatus, WorktreeManager, WorktreeRecord,
+        WorktreeRetentionPolicy, WorktreeSweepFailureKind, WorktreeSweepOptions,
+        WorktreeSweepReport, WorktreeSweepRepositoryStatus,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -2077,6 +2078,18 @@ impl WorktreeCommand {
                 })?;
                 print_worktree_gc_report(&report, args.json)
             }
+            WorktreeSubcommand::Sweep(args) => {
+                let report = sweep_workspace_worktrees(WorktreeSweepOptions {
+                    workspace: args.workspace,
+                    apply: args.apply,
+                    remove_targets: !args.keep_targets,
+                    retention: WorktreeRetentionPolicy {
+                        max_age: args.max_age_seconds.map(Duration::from_secs),
+                        max_count: args.max_count,
+                    },
+                })?;
+                print_worktree_sweep_report(&report, args.json)
+            }
             WorktreeSubcommand::Remove(args) => {
                 let manager = WorktreeManager::new(args.repo);
                 let record = manager.remove(&args.agent_id, args.force, args.delete_branch)?;
@@ -3011,6 +3024,8 @@ enum WorktreeSubcommand {
     Diff(DiffWorktreeArgs),
     /// Remove clean, inactive managed worktrees and unregistered leftover directories.
     Gc(GcWorktreeArgs),
+    /// Sweep managed worktrees across every repository group in a workspace.
+    Sweep(SweepWorktreeArgs),
     /// Remove a linked worktree for an agent.
     Remove(RemoveWorktreeArgs),
     /// List registered worktrees.
@@ -3075,6 +3090,28 @@ struct GcWorktreeArgs {
     /// Correction lifecycle identity used by typed machine-global gate denials.
     #[arg(long)]
     machine_global_correlation: Option<String>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct SweepWorktreeArgs {
+    /// Workspace containing .maco/worktrees/<repo>/<lane> directories.
+    #[arg(long)]
+    workspace: PathBuf,
+    /// Apply cleanup. Without this flag, the sweep is a dry-run.
+    #[arg(long)]
+    apply: bool,
+    /// Keep per-worktree target/ directories for retained worktrees.
+    #[arg(long)]
+    keep_targets: bool,
+    /// Remove only eligible clean worktrees older than this many seconds.
+    #[arg(long)]
+    max_age_seconds: Option<u64>,
+    /// Keep at most this many newest eligible clean worktrees per repository.
+    #[arg(long)]
+    max_count: Option<usize>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -4838,6 +4875,145 @@ fn print_worktree_gc_report(report: &WorktreeGcReport, json: bool) -> Result<()>
     Ok(())
 }
 
+fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+
+    let removal_label = if report.dry_run {
+        "Would remove"
+    } else {
+        "Removed"
+    };
+    let target_label = if report.dry_run {
+        "Targets would clean"
+    } else {
+        "Targets cleaned"
+    };
+    let target_action_count = if report.dry_run {
+        report
+            .repositories
+            .iter()
+            .filter_map(|repository| repository.gc_report.as_ref())
+            .map(worktree_gc_target_action_count)
+            .sum()
+    } else {
+        report.target_removed_count
+    };
+    let orphan_label = if report.dry_run {
+        "Orphans would prune"
+    } else {
+        "Orphans pruned"
+    };
+    println!(
+        "Workspace worktree sweep: {}",
+        if report.dry_run { "dry-run" } else { "applied" }
+    );
+    println!("Workspace: {}", report.workspace.display());
+    println!(
+        "Repositories: discovered={} inspected={} skipped-before-gc={} gc-failed={} total-failures={}",
+        report.repository_discovered_count,
+        report.repository_inspected_count,
+        report.repository_pre_gc_skipped_count,
+        report.repository_gc_failed_count,
+        report.repository_failure_count
+    );
+    println!("Considered: {}", report.considered_count);
+    println!("{removal_label}: {}", report.removed_count);
+    println!("Protected: {}", report.protected_count);
+    println!("Retained: {}", report.retained_count);
+    println!("{target_label}: {target_action_count}");
+    println!("{orphan_label}: {}", report.orphan_removed_count);
+
+    for repository in &report.repositories {
+        let resolved_repository = repository
+            .repository
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "Repository group={} status={} repository={} worktree-root={} gc-attempted={} effects-may-have-occurred={}",
+            repository.group,
+            worktree_sweep_repository_status_label(repository.status),
+            resolved_repository,
+            repository.worktree_root.display(),
+            repository.gc_attempted,
+            repository.effects_may_have_occurred
+        );
+        if let Some(failure) = &repository.failure {
+            println!(
+                "  Failure: kind={} message={}",
+                worktree_sweep_failure_kind_label(failure.kind),
+                failure.message
+            );
+        }
+        if let Some(gc_report) = &repository.gc_report {
+            let target_action_label = if gc_report.dry_run {
+                "targets-would-clean"
+            } else {
+                "targets-cleaned"
+            };
+            println!(
+                "  GC: considered={} {}={} protected={} retained={} {}={} orphans={}",
+                gc_report.considered_count,
+                if gc_report.dry_run {
+                    "would-remove"
+                } else {
+                    "removed"
+                },
+                gc_report.removed_count,
+                gc_report.protected_count,
+                gc_report.retained_count,
+                target_action_label,
+                worktree_gc_target_action_count(gc_report),
+                gc_report.orphan_removed_count
+            );
+            for entry in &gc_report.entries {
+                let branch = entry.branch.as_deref().unwrap_or("-");
+                println!(
+                    "    {}\t{}\t{}\t{}\t{}",
+                    worktree_gc_status_label(entry.status),
+                    worktree_gc_reason_label(entry.reason),
+                    entry.name,
+                    branch,
+                    entry.path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn worktree_gc_target_action_count(report: &WorktreeGcReport) -> usize {
+    if report.dry_run {
+        report
+            .entries
+            .iter()
+            .filter(|entry| entry.reason == WorktreeGcReason::TargetWouldRemove)
+            .count()
+    } else {
+        report.target_removed_count
+    }
+}
+
+fn worktree_sweep_repository_status_label(status: WorktreeSweepRepositoryStatus) -> &'static str {
+    match status {
+        WorktreeSweepRepositoryStatus::Inspected => "inspected",
+        WorktreeSweepRepositoryStatus::Skipped => "skipped",
+        WorktreeSweepRepositoryStatus::Failed => "failed",
+    }
+}
+
+fn worktree_sweep_failure_kind_label(kind: WorktreeSweepFailureKind) -> &'static str {
+    match kind {
+        WorktreeSweepFailureKind::RepositoryOpen => "repository_open",
+        WorktreeSweepFailureKind::RepositoryAssociation => "repository_association",
+        WorktreeSweepFailureKind::AmbiguousRepository => "ambiguous_repository",
+        WorktreeSweepFailureKind::GarbageCollection => "garbage_collection",
+    }
+}
+
 fn worktree_gc_status_label(status: WorktreeGcStatus) -> &'static str {
     match status {
         WorktreeGcStatus::Removed => "removed",
@@ -4969,6 +5145,108 @@ mod tests {
     use git2::Signature;
 
     use super::*;
+
+    #[test]
+    fn worktree_sweep_defaults_to_dry_run_and_requires_workspace() {
+        let parsed =
+            Cli::try_parse_from(["maco", "worktree", "sweep", "--workspace", "/srv/workspace"])
+                .expect("workspace sweep should parse");
+        let Command::Worktree(WorktreeCommand {
+            command: WorktreeSubcommand::Sweep(args),
+        }) = parsed.command
+        else {
+            panic!("expected worktree sweep command");
+        };
+        assert_eq!(args.workspace, PathBuf::from("/srv/workspace"));
+        assert!(!args.apply, "workspace sweep must default to dry-run");
+        assert!(!args.keep_targets);
+        assert_eq!(args.max_age_seconds, None);
+        assert_eq!(args.max_count, None);
+        assert!(!args.json);
+
+        let error = Cli::try_parse_from(["maco", "worktree", "sweep"])
+            .expect_err("workspace sweep must require --workspace");
+        assert!(error.to_string().contains("--workspace"));
+    }
+
+    #[test]
+    fn worktree_sweep_parses_apply_retention_target_and_json_flags() {
+        let parsed = Cli::try_parse_from([
+            "maco",
+            "worktree",
+            "sweep",
+            "--workspace",
+            "workspace",
+            "--apply",
+            "--max-age-seconds",
+            "86400",
+            "--max-count",
+            "12",
+            "--keep-targets",
+            "--json",
+        ])
+        .expect("fully configured workspace sweep should parse");
+        let Command::Worktree(WorktreeCommand {
+            command: WorktreeSubcommand::Sweep(args),
+        }) = parsed.command
+        else {
+            panic!("expected worktree sweep command");
+        };
+        assert_eq!(args.workspace, PathBuf::from("workspace"));
+        assert!(args.apply);
+        assert_eq!(args.max_age_seconds, Some(86_400));
+        assert_eq!(args.max_count, Some(12));
+        assert!(args.keep_targets);
+        assert!(args.json);
+    }
+
+    #[test]
+    fn existing_worktree_gc_keeps_apply_by_default_contract() {
+        let parsed = Cli::try_parse_from(["maco", "worktree", "gc", "--repo", "repo"])
+            .expect("existing worktree gc command should parse");
+        let Command::Worktree(WorktreeCommand {
+            command: WorktreeSubcommand::Gc(args),
+        }) = parsed.command
+        else {
+            panic!("expected worktree gc command");
+        };
+        assert_eq!(args.repo, PathBuf::from("repo"));
+        assert!(!args.dry_run, "worktree gc must remain apply-by-default");
+    }
+
+    #[test]
+    fn worktree_sweep_dry_run_target_summary_counts_would_remove_entries() {
+        let dry_run = WorktreeGcReport {
+            dry_run: true,
+            remove_targets: true,
+            max_age_seconds: None,
+            max_count: Some(1),
+            considered_count: 1,
+            removed_count: 0,
+            protected_count: 0,
+            retained_count: 1,
+            target_removed_count: 0,
+            orphan_removed_count: 0,
+            entries: vec![crate::worktree::WorktreeGcEntry {
+                name: "retained-lane".to_string(),
+                branch: Some("maco/retained-lane".to_string()),
+                path: PathBuf::from("/workspace/.maco/worktrees/repo/retained-lane"),
+                status: WorktreeGcStatus::Retained,
+                reason: WorktreeGcReason::TargetWouldRemove,
+                target_path: Some(PathBuf::from(
+                    "/workspace/.maco/worktrees/repo/retained-lane/target",
+                )),
+                gate_denial: None,
+                retention_operation_id: None,
+            }],
+        };
+        assert_eq!(worktree_gc_target_action_count(&dry_run), 1);
+
+        let mut applied = dry_run.clone();
+        applied.dry_run = false;
+        applied.target_removed_count = 2;
+        assert_eq!(worktree_gc_target_action_count(&applied), 2);
+    }
 
     #[test]
     fn supervise_run_requires_complete_machine_global_binding() {

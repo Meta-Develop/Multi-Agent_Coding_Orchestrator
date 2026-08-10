@@ -29,6 +29,7 @@ The current implementation covers a local-first command-line slice:
 - `maco worktree list` lists verified registered agent worktrees. `maco worktree pending` is a strict existing-only authenticated reader: absent state returns an empty list, while transitional or invalid state is refused without creating locks, migrating, scavenging, recovering, or writing.
 - `maco worktree remove <agent-id> --force` performs explicitly authorized cleanup of authenticated managed state; non-force removal is temporarily disabled.
 - `maco worktree gc` removes clean, inactive managed worktrees while retaining branch refs, protects dirty worktrees and active leases/claims, removes retained `target/` build artifacts by default, supports dry-run and max-age/max-count retention filters, and routes unregistered leftover directories through recoverable machine-global quarantine.
+- `maco worktree sweep --workspace <path>` enumerates every repository group under a workspace's `.maco/worktrees` root and aggregates the existing per-repository GC reports. It is dry-run by default; removal requires `--apply`, and an unresolved repository is reported as a typed per-repository failure without aborting the remaining groups.
 - `SyncCoordinator` provides an in-memory exclusive path-claim layer for local agent coordination.
 - `maco sync claim <agent-id> <path>...` records durable exclusive path claims.
 - `maco sync release <token>` releases one durable claim.
@@ -1292,6 +1293,27 @@ destructive second pass requires the three-part machine-global binding above, tr
 all discovered orphans as one preflight set, and uses recoverable quarantine rather
 than direct deletion. Dry-run discovery remains non-mutating and does not require the
 binding.
+
+Sweep every repository group beneath one workspace. The first command is a
+dry-run because workspace sweeps never remove anything unless `--apply` is
+explicitly supplied:
+
+```bash
+cargo run -- worktree sweep --workspace /exact/path/to/workspace --json
+cargo run -- worktree sweep --workspace /exact/path/to/workspace \
+  --apply --max-count 10 --max-age-seconds 604800 --json
+cargo run -- worktree sweep --workspace /exact/path/to/workspace \
+  --apply --keep-targets
+```
+
+The aggregate report distinguishes repository groups that were inspected from
+groups skipped before GC and groups whose GC attempt failed. Each group includes
+its resolved repository when available, a typed failure when resolution or GC
+fails, and its nested GC summary. A failure in one group does not stop later
+groups from being inspected. Retention flags and `--keep-targets` are passed to
+the existing per-repository GC engine, so dirty worktrees and lanes with active
+leases or claims remain protected. Existing machine-global quarantine gates also
+remain in force; the sweep does not weaken them.
 
 Perform explicitly authorized force cleanup and delete a MACO-owned branch:
 
