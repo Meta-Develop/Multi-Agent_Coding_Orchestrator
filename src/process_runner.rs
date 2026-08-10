@@ -10232,7 +10232,9 @@ mod tests {
         sandbox
             .visible_read_write_files
             .push(read_write_file.clone());
-        assert!(sandbox.validate_program_visibility(&read_write_file).is_ok());
+        assert!(sandbox
+            .validate_program_visibility(&read_write_file)
+            .is_ok());
 
         let hidden_program = Path::new("/tmp/workspace/hidden/probe");
         sandbox.workspace_root = PathBuf::from("/tmp/workspace");
