@@ -7996,6 +7996,249 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn workspace_sweep_defaults_to_dry_run_and_requires_apply_for_removal() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let repo_path = workspace.join("repo+name");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let worktree_root = workspace.join(".maco/worktrees/repo_name");
+        let created = create_gc_worktree(
+            &WorktreeManager::new(&repo_path),
+            "sweep-default",
+            &worktree_root,
+        );
+
+        let preview = sweep_workspace_worktrees(workspace_sweep_options(&workspace, false))
+            .expect("preview workspace sweep");
+        assert!(preview.dry_run);
+        assert!(!preview.apply);
+        assert_eq!(preview.repository_discovered_count, 1);
+        assert_eq!(preview.repository_inspected_count, 1);
+        assert_eq!(preview.repository_failure_count, 0);
+        assert_eq!(preview.removed_count, 1);
+        assert_eq!(
+            preview.repositories[0].status,
+            WorktreeSweepRepositoryStatus::Inspected
+        );
+        assert_eq!(
+            preview.repositories[0]
+                .gc_report
+                .as_ref()
+                .expect("preview GC report")
+                .entries[0]
+                .status,
+            WorktreeGcStatus::WouldRemove
+        );
+        assert!(created.path.exists());
+
+        let applied = sweep_workspace_worktrees(workspace_sweep_options(&workspace, true))
+            .expect("apply workspace sweep");
+        assert!(!applied.dry_run);
+        assert!(applied.apply);
+        assert_eq!(applied.removed_count, 1);
+        assert_eq!(
+            applied.repositories[0]
+                .gc_report
+                .as_ref()
+                .expect("applied GC report")
+                .entries[0]
+                .status,
+            WorktreeGcStatus::Removed
+        );
+        assert!(!created.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_sweep_continues_after_typed_repository_open_failure() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let repo_path = workspace.join("valid+repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let valid_root = workspace.join(".maco/worktrees/valid_repo");
+        let valid =
+            create_gc_worktree(&WorktreeManager::new(&repo_path), "valid-lane", &valid_root);
+        let broken_lane = workspace.join(".maco/worktrees/broken/lane");
+        fs::create_dir_all(&broken_lane).expect("broken lane");
+        fs::write(
+            broken_lane.join(".git"),
+            "gitdir: /definitely/missing/git-dir\n",
+        )
+        .expect("broken Git marker");
+
+        let first = sweep_workspace_worktrees(workspace_sweep_options(&workspace, false))
+            .expect("workspace sweep with broken group");
+        let second = sweep_workspace_worktrees(workspace_sweep_options(&workspace, false))
+            .expect("repeat deterministic workspace sweep");
+        assert_eq!(
+            serde_json::to_string(&first).expect("serialize first report"),
+            serde_json::to_string(&second).expect("serialize second report")
+        );
+        assert_eq!(first.repository_discovered_count, 2);
+        assert_eq!(first.repository_inspected_count, 1);
+        assert_eq!(first.repository_pre_gc_skipped_count, 1);
+        assert_eq!(first.repository_gc_failed_count, 0);
+        assert_eq!(first.repository_failure_count, 1);
+        assert_eq!(
+            first
+                .repositories
+                .iter()
+                .map(|entry| entry.group.as_str())
+                .collect::<Vec<_>>(),
+            vec!["broken", "valid_repo"]
+        );
+        let broken = &first.repositories[0];
+        assert_eq!(broken.status, WorktreeSweepRepositoryStatus::Skipped);
+        assert!(!broken.gc_attempted);
+        assert!(!broken.effects_may_have_occurred);
+        assert_eq!(
+            broken.failure.as_ref().expect("typed open failure").kind,
+            WorktreeSweepFailureKind::RepositoryOpen
+        );
+        assert_eq!(
+            serde_json::to_value(broken)
+                .expect("serialize broken entry")
+                .get("status"),
+            Some(&serde_json::json!("skipped"))
+        );
+        assert_eq!(
+            first.repositories[1].status,
+            WorktreeSweepRepositoryStatus::Inspected
+        );
+        assert!(valid.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_sweep_passes_retention_and_keep_target_options_to_gc() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let repo_path = workspace.join("retained+repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let worktree_root = workspace.join(".maco/worktrees/retained_repo");
+        let old = create_gc_worktree(
+            &WorktreeManager::new(&repo_path),
+            "retention-old",
+            &worktree_root,
+        );
+        let new = create_gc_worktree(
+            &WorktreeManager::new(&repo_path),
+            "retention-new",
+            &worktree_root,
+        );
+        fs::create_dir_all(old.path.join("target/debug")).expect("old target");
+        fs::create_dir_all(new.path.join("target/debug")).expect("new target");
+        let mut options = workspace_sweep_options(&workspace, false);
+        options.remove_targets = false;
+        options.retention = WorktreeRetentionPolicy {
+            max_age: Some(Duration::from_secs(3600)),
+            max_count: Some(1),
+        };
+
+        let report = sweep_workspace_worktrees(options).expect("retained workspace sweep");
+        assert_eq!(report.max_age_seconds, Some(3600));
+        assert_eq!(report.max_count, Some(1));
+        assert!(!report.remove_targets);
+        assert_eq!(report.removed_count, 1);
+        assert_eq!(report.retained_count, 1);
+        assert_eq!(report.target_removed_count, 0);
+        let gc = report.repositories[0]
+            .gc_report
+            .as_ref()
+            .expect("nested GC report");
+        assert_eq!(gc.max_age_seconds, Some(3600));
+        assert_eq!(gc.max_count, Some(1));
+        assert!(!gc.remove_targets);
+        assert!(gc.entries.iter().any(|entry| {
+            entry.status == WorktreeGcStatus::Retained
+                && entry.reason == WorktreeGcReason::RetentionKeep
+        }));
+        assert!(old.path.exists());
+        assert!(new.path.exists());
+        assert!(old.path.join("target").exists());
+        assert!(new.path.join("target").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_sweep_inherits_combined_active_claim_and_lease_protection() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let repo_path = workspace.join("protected+repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let worktree_root = workspace.join(".maco/worktrees/protected_repo");
+        let claimed = create_gc_worktree(&manager, "claimed-lane", &worktree_root);
+        let leased = create_gc_worktree(&manager, "leased-lane", &worktree_root);
+        SyncStore::open(&repo_path)
+            .expect("open claims")
+            .claim_paths("claimed-lane", [PathBuf::from("src")])
+            .expect("claim path");
+        let _lease = manager
+            .acquire_read_execution_lease("leased-lane")
+            .expect("active lease");
+
+        let report = sweep_workspace_worktrees(workspace_sweep_options(&workspace, true))
+            .expect("protected workspace sweep");
+        assert_eq!(report.repository_inspected_count, 1);
+        assert_eq!(report.protected_count, 2);
+        assert_eq!(report.removed_count, 0);
+        let reasons = report.repositories[0]
+            .gc_report
+            .as_ref()
+            .expect("nested GC report")
+            .entries
+            .iter()
+            .map(|entry| entry.reason)
+            .collect::<Vec<_>>();
+        assert_eq!(reasons.len(), 2);
+        assert!(reasons.contains(&WorktreeGcReason::ActiveClaim));
+        assert!(reasons.contains(&WorktreeGcReason::ActiveLease));
+        assert!(claimed.path.exists());
+        assert!(leased.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_sweep_marks_gc_error_as_effectful_failure_without_clean_report() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let repo_path = workspace.join("orphan+repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let orphan = workspace.join(".maco/worktrees/orphan_repo/plain-orphan");
+        fs::create_dir_all(&orphan).expect("orphan lane");
+
+        let report = sweep_workspace_worktrees(workspace_sweep_options(&workspace, true))
+            .expect("aggregate GC failure");
+        assert_eq!(report.repository_discovered_count, 1);
+        assert_eq!(report.repository_inspected_count, 0);
+        assert_eq!(report.repository_pre_gc_skipped_count, 0);
+        assert_eq!(report.repository_gc_failed_count, 1);
+        assert_eq!(report.repository_failure_count, 1);
+        let failed = &report.repositories[0];
+        assert_eq!(failed.status, WorktreeSweepRepositoryStatus::Failed);
+        assert!(failed.gc_attempted);
+        assert!(failed.effects_may_have_occurred);
+        assert!(failed.gc_report.is_none());
+        assert_eq!(
+            failed.failure.as_ref().expect("typed GC failure").kind,
+            WorktreeSweepFailureKind::GarbageCollection
+        );
+        assert!(orphan.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn gc_removes_finished_clean_worktree_and_keeps_branch() {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
@@ -10989,6 +11232,15 @@ mod tests {
             retention: WorktreeRetentionPolicy::default(),
             exclude_agent_id: None,
             machine_global_retention: None,
+        }
+    }
+
+    fn workspace_sweep_options(workspace: &Path, apply: bool) -> WorktreeSweepOptions {
+        WorktreeSweepOptions {
+            workspace: workspace.to_path_buf(),
+            apply,
+            remove_targets: true,
+            retention: WorktreeRetentionPolicy::default(),
         }
     }
 
