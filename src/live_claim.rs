@@ -428,7 +428,7 @@ where
     let bound_draft = BoundClaimDraft::bind(draft, &root)?;
     after_draft_bind(bound_draft.path())?;
     let (mut claims, initial_board) = load_stable_claim_board(&root, &lock)?;
-    ensure_claim_board_valid(&claims)?;
+    ensure_claim_board_allows_apply(&claims)?;
     bound_draft.verify(&root, &initial_board)?;
 
     let content = std::str::from_utf8(&bound_draft.generation.bytes)
@@ -467,7 +467,7 @@ where
     let updated_claim = parse_claim_file(file.clone(), &updated);
     ensure_claim_valid(&updated_claim)?;
     claims.push(updated_claim);
-    ensure_claim_board_valid(&claims)?;
+    ensure_claim_board_allows_apply(&claims)?;
     let final_claims = atomic_publish_claim(
         &root,
         &lock,
@@ -476,7 +476,7 @@ where
         updated.as_bytes(),
         &mut before_publish,
     )?;
-    ensure_claim_board_valid(&final_claims)?;
+    ensure_claim_board_allows_apply(&final_claims)?;
     let final_claim = final_claims
         .into_iter()
         .find(|claim| claim.display_id() == claim_id)
@@ -2183,32 +2183,134 @@ fn read_entry_generation(
 }
 
 fn ensure_claim_board_valid(claims: &[ParsedClaim]) -> Result<()> {
-    if claims
-        .iter()
-        .any(|claim| claim.issues.iter().any(|issue| issue.severity == "error"))
-    {
-        bail!("claim board contains an invalid entry; run live validate for bounded diagnostics");
-    }
-    let mut ids = BTreeSet::new();
     for claim in claims {
-        if !ids.insert(claim.display_id()) {
-            bail!("claim board contains duplicate claim ids");
-        }
+        ensure_claim_has_no_errors(claim, "claim board entry")?;
     }
-    if !overlapping_active_claim_files(claims).is_empty() {
-        bail!("claim board contains overlapping active ownership paths");
+    if let Some((left, right)) = first_duplicate_claim_pair(claims, |_, _| true) {
+        bail!(
+            "claim board entries `{}` and `{}` have duplicate `claim_id` fields",
+            left.file.display(),
+            right.file.display()
+        );
+    }
+    if let Some((left, right)) = first_overlapping_active_claim_pair(claims) {
+        bail!(
+            "claim board entries `{}` and `{}` have overlapping `owned_files` fields",
+            left.file.display(),
+            right.file.display()
+        );
     }
     Ok(())
+}
+
+fn ensure_claim_board_allows_apply(claims: &[ParsedClaim]) -> Result<()> {
+    for claim in claims {
+        let stored_status_error = claim
+            .issues
+            .iter()
+            .any(|issue| issue.severity == "error" && issue.field == "status");
+        if stored_status_error || (claim.status.is_some() && !claim.status_is_trustworthy) {
+            bail!(
+                "claim apply board entry `{}` has an invalid `{}` field",
+                claim.file.display(),
+                "status"
+            );
+        }
+        if !claim_is_provably_non_conflicting(claim) {
+            ensure_claim_has_no_errors(claim, "claim apply board entry")?;
+        }
+    }
+    if let Some((left, right)) = first_duplicate_claim_pair(claims, |left, right| {
+        !claim_is_provably_non_conflicting(left) || !claim_is_provably_non_conflicting(right)
+    }) {
+        bail!(
+            "claim apply board entries `{}` and `{}` have duplicate `claim_id` fields",
+            left.file.display(),
+            right.file.display()
+        );
+    }
+    if let Some((left, right)) = first_overlapping_active_claim_pair(claims) {
+        bail!(
+            "claim apply board entries `{}` and `{}` have overlapping `owned_files` fields",
+            left.file.display(),
+            right.file.display()
+        );
+    }
+    Ok(())
+}
+
+fn claim_can_conflict(claim: &ParsedClaim) -> bool {
+    matches!(claim.status.as_deref(), Some("active" | "blocked"))
+}
+
+fn claim_is_provably_non_conflicting(claim: &ParsedClaim) -> bool {
+    claim.status_is_trustworthy
+        && matches!(
+            claim.status.as_deref(),
+            Some("ready-for-review" | "handoff" | "done")
+        )
+}
+
+fn ensure_claim_has_no_errors(claim: &ParsedClaim, context: &str) -> Result<()> {
+    if let Some(issue) = claim.issues.iter().find(|issue| issue.severity == "error") {
+        bail!(
+            "{context} `{}` has an invalid `{}` field",
+            claim.file.display(),
+            issue.field
+        );
+    }
+    Ok(())
+}
+
+fn first_duplicate_claim_pair<F>(
+    claims: &[ParsedClaim],
+    mut blocks: F,
+) -> Option<(&ParsedClaim, &ParsedClaim)>
+where
+    F: FnMut(&ParsedClaim, &ParsedClaim) -> bool,
+{
+    for (index, left) in claims.iter().enumerate() {
+        for right in claims.iter().skip(index.saturating_add(1)) {
+            if left.display_id() == right.display_id() && blocks(left, right) {
+                return Some((left, right));
+            }
+        }
+    }
+    None
+}
+
+fn first_overlapping_active_claim_pair(
+    claims: &[ParsedClaim],
+) -> Option<(&ParsedClaim, &ParsedClaim)> {
+    for (index, left) in claims.iter().enumerate() {
+        if !claim_can_conflict(left) {
+            continue;
+        }
+        for right in claims.iter().skip(index.saturating_add(1)) {
+            if !claim_can_conflict(right) {
+                continue;
+            }
+            if left.owned_files.iter().any(|left_path| {
+                right
+                    .owned_files
+                    .iter()
+                    .any(|right_path| owned_paths_overlap(left_path, right_path))
+            }) {
+                return Some((left, right));
+            }
+        }
+    }
+    None
 }
 
 fn overlapping_active_claim_files(claims: &[ParsedClaim]) -> BTreeSet<PathBuf> {
     let mut overlapping = BTreeSet::new();
     for (index, left) in claims.iter().enumerate() {
-        if !matches!(left.status.as_deref(), Some("active" | "blocked")) {
+        if !claim_can_conflict(left) {
             continue;
         }
         for right in claims.iter().skip(index.saturating_add(1)) {
-            if !matches!(right.status.as_deref(), Some("active" | "blocked")) {
+            if !claim_can_conflict(right) {
                 continue;
             }
             if left.owned_files.iter().any(|left_path| {
@@ -2230,7 +2332,7 @@ fn owned_paths_overlap(left: &Path, right: &Path) -> bool {
 }
 
 fn ensure_claim_valid(claim: &ParsedClaim) -> Result<()> {
-    ensure_claim_board_valid(std::slice::from_ref(claim))
+    ensure_claim_has_no_errors(claim, "claim entry")
 }
 
 fn error_chain_has_kind(error: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
@@ -2247,6 +2349,7 @@ struct ParsedClaim {
     claim_id: Option<String>,
     owner: Option<String>,
     status: Option<String>,
+    status_is_trustworthy: bool,
     created: Option<String>,
     updated: Option<String>,
     heartbeat: Option<String>,
@@ -2309,6 +2412,7 @@ fn parse_claim_file(file: PathBuf, content: &str) -> ParsedClaim {
         claim_id: None,
         owner: None,
         status: None,
+        status_is_trustworthy: false,
         created: None,
         updated: None,
         heartbeat: None,
@@ -2321,6 +2425,7 @@ fn parse_claim_file(file: PathBuf, content: &str) -> ParsedClaim {
         push_parse_issue(&mut claim, "file", "claim file exceeds its bounded size");
         return claim;
     }
+    claim.status_is_trustworthy = has_single_valid_status_field(content);
 
     let mut header_values = Vec::new();
     let mut fields = BTreeMap::<String, Vec<String>>::new();
@@ -2583,6 +2688,20 @@ fn push_parse_issue(claim: &mut ParsedClaim, field: &str, message: &str) {
     });
 }
 
+fn has_single_valid_status_field(content: &str) -> bool {
+    let mut statuses = content.lines().filter_map(|line| {
+        if !line.starts_with("- ") {
+            return None;
+        }
+        let (key, value) = field_from_line(line.trim())?;
+        (key == "status").then_some(value)
+    });
+    let Some(status) = statuses.next() else {
+        return false;
+    };
+    VALID_STATUSES.contains(&status.as_str()) && statuses.next().is_none()
+}
+
 fn field_from_line(line: &str) -> Option<(String, String)> {
     let body = line.strip_prefix("- ")?;
     let (key, value) = body.split_once(':')?;
@@ -2749,7 +2868,7 @@ fn summary_from_parsed(claim: &ParsedClaim, now: &LiveClock) -> LiveClaimSummary
         ));
     }
 
-    let is_lock = matches!(claim.status.as_deref(), Some("active" | "blocked"));
+    let is_lock = claim_can_conflict(claim);
     LiveClaimSummary {
         claim_id: claim.display_id(),
         file: claim.file.clone(),
@@ -3874,7 +3993,15 @@ mod tests {
                 .count(),
             2
         );
-        assert!(status(temp.path(), &LiveClock::parse("2026-05-20T00:30:00Z")?).is_err());
+        let status_error = status(temp.path(), &LiveClock::parse("2026-05-20T00:30:00Z")?)
+            .expect_err("overlapping live claims must fail board validation");
+        let status_message = status_error.to_string();
+        assert!(status_message.contains("parent-claim.md"));
+        assert!(status_message.contains("child-claim.md"));
+        assert!(status_message.contains("overlapping"));
+        assert!(status_message.contains("`owned_files`"));
+        assert!(!status_message.contains("src/live_claim.rs"));
+        assert!(!status_message.contains("src/live_claim.rs/tests"));
 
         std::fs::write(
             directory.join("child-claim.md"),
@@ -3890,6 +4017,49 @@ mod tests {
             status(temp.path(), &LiveClock::parse("2026-05-20T00:30:00Z")?)?.claim_count,
             2
         );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_admission_ignores_duplicate_ids_only_when_every_claim_is_non_conflicting() -> Result<()>
+    {
+        let timestamp = "2026-05-20T00:00:00Z";
+        let duplicate_id = "raw-duplicate-id-value";
+        let mut done = parse_claim_file(
+            PathBuf::from(CLAIMS_DIR).join("done.md"),
+            &claim_text("done", "done", "done", timestamp, "src/done.rs"),
+        );
+        done.claim_id = Some(duplicate_id.to_string());
+        let mut handoff = parse_claim_file(
+            PathBuf::from(CLAIMS_DIR).join("handoff.md"),
+            &claim_text("handoff", "handoff", "handoff", timestamp, "src/handoff.rs"),
+        );
+        handoff.claim_id = Some(duplicate_id.to_string());
+
+        ensure_claim_board_allows_apply(&[done.clone(), handoff.clone()])?;
+
+        let strict_error = ensure_claim_board_valid(&[done.clone(), handoff.clone()])
+            .expect_err("strict board validation must keep reporting terminal duplicates");
+        let strict_message = strict_error.to_string();
+        assert!(strict_message.contains("done.md"));
+        assert!(strict_message.contains("handoff.md"));
+        assert!(strict_message.contains("duplicate"));
+        assert!(strict_message.contains("`claim_id`"));
+        assert!(!strict_message.contains(duplicate_id));
+
+        for status in ["active", "blocked", "completed"] {
+            let mut conflicting = handoff.clone();
+            conflicting.status = Some(status.to_string());
+            let error = ensure_claim_board_allows_apply(&[done.clone(), conflicting]).expect_err(
+                "a duplicate id involving a classified or unclassified claim must block",
+            );
+            let message = error.to_string();
+            assert!(message.contains("done.md"));
+            assert!(message.contains("handoff.md"));
+            assert!(message.contains("duplicate"));
+            assert!(message.contains("`claim_id`"));
+            assert!(!message.contains(duplicate_id));
+        }
         Ok(())
     }
 
@@ -3959,6 +4129,222 @@ mod tests {
         let replacement = apply_with_clock(temp.path(), &draft, "applied-owner", &now)?;
         assert_eq!(replacement.claim_id, "applied-claim-v2");
         assert!(replacement.created);
+        Ok(())
+    }
+
+    #[test]
+    fn apply_ignores_malformed_terminal_claims_while_validation_reports_them() -> Result<()> {
+        for status in ["done", "handoff"] {
+            let temp = tempfile::tempdir()?;
+            let directory = claims_dir(temp.path());
+            std::fs::create_dir_all(&directory)?;
+            let terminal_id = format!("malformed-{status}");
+            let terminal_path = write_claim(
+                temp.path(),
+                &terminal_id,
+                "terminal-owner",
+                status,
+                "2026-05-20T00:00:00Z",
+            )?;
+            let raw_owner = format!("TerminalOwnerSecret{status}");
+            let malformed = std::fs::read_to_string(&terminal_path)?
+                .replace("- Owner: terminal-owner", &format!("- Owner: {raw_owner}"));
+            std::fs::write(&terminal_path, malformed)?;
+
+            let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
+            let draft = temp.path().join("claim-draft.md");
+            let created_id = format!("created-after-{status}");
+            std::fs::write(
+                &draft,
+                initial_draft_text(
+                    &created_id,
+                    "new-owner",
+                    "active",
+                    now.raw(),
+                    "src/new_scope.rs",
+                ),
+            )?;
+
+            let created = apply_with_clock(temp.path(), &draft, "new-owner", &now)?;
+            assert_eq!(created.claim_id, created_id);
+            let validation = validate(temp.path(), &now)?;
+            assert!(!validation.valid);
+            let terminal = validation
+                .claims
+                .iter()
+                .find(|claim| {
+                    claim.file
+                        == PathBuf::from(CLAIMS_DIR)
+                            .join(&terminal_id)
+                            .with_extension("md")
+                })
+                .context("terminal claim validation")?;
+            assert!(terminal
+                .issues
+                .iter()
+                .any(|issue| issue.severity == "error" && issue.field == "owner"));
+            assert!(!serde_json::to_string(&validation)?.contains(&raw_owner));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn apply_rejects_malformed_live_claims_with_file_and_field_only() -> Result<()> {
+        for status in ["active", "blocked"] {
+            let temp = tempfile::tempdir()?;
+            let malformed_id = format!("malformed-{status}");
+            let raw_owner = format!("LiveOwnerSecret{status}");
+            write_claim(
+                temp.path(),
+                &malformed_id,
+                &raw_owner,
+                status,
+                "2026-05-20T00:00:00Z",
+            )?;
+            let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
+            let draft = temp.path().join("claim-draft.md");
+            let created_id = format!("blocked-by-{status}");
+            std::fs::write(
+                &draft,
+                initial_draft_text(
+                    &created_id,
+                    "new-owner",
+                    "active",
+                    now.raw(),
+                    "src/new_scope.rs",
+                ),
+            )?;
+
+            let error = apply_with_clock(temp.path(), &draft, "new-owner", &now)
+                .expect_err("a malformed live claim must block creation");
+            let message = error.to_string();
+            assert!(message.contains(&format!("{malformed_id}.md")));
+            assert!(message.contains("`owner`"));
+            assert!(!message.contains(&raw_owner));
+            assert!(!claims_dir(temp.path())
+                .join(format!("{created_id}.md"))
+                .exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn apply_does_not_trust_a_duplicate_terminal_status_when_diagnostics_are_full() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = claims_dir(temp.path());
+        std::fs::create_dir_all(&directory)?;
+        let mut malformed = "\u{1}\n".repeat(MAX_CLAIM_ISSUES);
+        malformed.push_str(&claim_text(
+            "ambiguous-terminal",
+            "terminal-owner",
+            "done",
+            "2026-05-20T00:00:00Z",
+            "src/terminal.rs",
+        ));
+        malformed = malformed.replace("- Status: done", "- Status: done\n- Status: active");
+        let malformed_file = PathBuf::from(CLAIMS_DIR).join("ambiguous-terminal.md");
+        let parsed = parse_claim_file(malformed_file.clone(), &malformed);
+        assert_eq!(parsed.issues.len(), MAX_CLAIM_ISSUES);
+        assert!(parsed.issues.iter().all(|issue| issue.field == "line"));
+        assert_eq!(parsed.status.as_deref(), Some("done"));
+        assert!(!parsed.status_is_trustworthy);
+        std::fs::write(directory.join("ambiguous-terminal.md"), malformed)?;
+
+        let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
+        let draft = temp.path().join("claim-draft.md");
+        std::fs::write(
+            &draft,
+            initial_draft_text(
+                "blocked-by-ambiguous-terminal",
+                "new-owner",
+                "active",
+                now.raw(),
+                "src/new_scope.rs",
+            ),
+        )?;
+        let error = apply_with_clock(temp.path(), &draft, "new-owner", &now)
+            .expect_err("a structurally ambiguous status must block apply admission");
+        let message = error.to_string();
+        assert!(message.contains("ambiguous-terminal.md"));
+        assert!(message.contains("`status`"));
+        assert!(!message.contains("done"));
+        assert!(!message.contains("active"));
+        assert!(!directory.join("blocked-by-ambiguous-terminal.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn apply_does_not_trust_a_duplicate_terminal_status_after_the_line_limit() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = claims_dir(temp.path());
+        std::fs::create_dir_all(&directory)?;
+        let mut malformed = claim_text(
+            "line-limited-terminal",
+            "terminal-owner",
+            "done",
+            "2026-05-20T00:00:00Z",
+            "src/terminal.rs",
+        );
+        malformed.push_str(&"\n".repeat(MAX_CLAIM_LINES));
+        malformed.push_str("- Status: active\n");
+        let malformed_file = PathBuf::from(CLAIMS_DIR).join("line-limited-terminal.md");
+        let parsed = parse_claim_file(malformed_file, &malformed);
+        assert_eq!(parsed.status.as_deref(), Some("done"));
+        assert!(!parsed.status_is_trustworthy);
+        assert!(parsed.issues.iter().any(|issue| issue.field == "lines"));
+        assert!(!parsed.issues.iter().any(|issue| issue.field == "status"));
+        std::fs::write(directory.join("line-limited-terminal.md"), malformed)?;
+
+        let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
+        let draft = temp.path().join("claim-draft.md");
+        std::fs::write(
+            &draft,
+            initial_draft_text(
+                "blocked-by-line-limited-terminal",
+                "new-owner",
+                "active",
+                now.raw(),
+                "src/new_scope.rs",
+            ),
+        )?;
+        let error = apply_with_clock(temp.path(), &draft, "new-owner", &now)
+            .expect_err("a status hidden after the parser line limit must block admission");
+        let message = error.to_string();
+        assert!(message.contains("line-limited-terminal.md"));
+        assert!(message.contains("`status`"));
+        assert!(!message.contains("done"));
+        assert!(!message.contains("active"));
+        assert!(!directory
+            .join("blocked-by-line-limited-terminal.md")
+            .exists());
+        Ok(())
+    }
+
+    #[test]
+    fn apply_rejects_a_malformed_draft_with_file_and_field_only() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::create_dir_all(claims_dir(temp.path()))?;
+        let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
+        let draft = temp.path().join("claim-draft.md");
+        let raw_owner = "MalformedDraftOwnerSecret";
+        std::fs::write(
+            &draft,
+            initial_draft_text(
+                "malformed-draft",
+                raw_owner,
+                "active",
+                now.raw(),
+                "src/live_claim.rs",
+            ),
+        )?;
+
+        let error = apply_with_clock(temp.path(), &draft, "draft-owner", &now)
+            .expect_err("the supported write path must reject a malformed draft");
+        let message = error.to_string();
+        assert!(message.contains("malformed-draft.md"));
+        assert!(message.contains("`owner`"));
+        assert!(!message.contains(raw_owner));
+        assert!(!claims_dir(temp.path()).join("malformed-draft.md").exists());
         Ok(())
     }
 
@@ -4322,17 +4708,44 @@ mod tests {
         let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
         assert_eq!(status(temp.path(), &now)?.claim_count, 1);
         std::fs::write(
-            directory.join("legacy-completed.md"),
+            directory.join("legacy-status.md"),
             claim_text(
-                "legacy-completed",
-                "legacy-completed",
+                "legacy-status",
+                "legacy-status",
                 "completed",
                 "2026-05-20T00:00:00Z",
                 "src/live_claim.rs",
             ),
         )?;
-        assert!(status(temp.path(), &now).is_err());
-        assert!(!validate(temp.path(), &now)?.valid);
+        let draft = temp.path().join("claim-draft.md");
+        std::fs::write(
+            &draft,
+            initial_draft_text(
+                "new-real-board-claim",
+                "new-owner",
+                "active",
+                now.raw(),
+                "src/new_scope.rs",
+            ),
+        )?;
+        let error = apply_with_clock(temp.path(), &draft, "new-owner", &now)
+            .expect_err("an unsupported status cannot be classified as non-conflicting");
+        let message = error.to_string();
+        assert!(message.contains("legacy-status.md"));
+        assert!(message.contains("`status`"));
+        assert!(!message.contains("completed"));
+        assert!(!directory.join("new-real-board-claim.md").exists());
+        let validation = validate(temp.path(), &now)?;
+        assert!(!validation.valid);
+        let legacy = validation
+            .claims
+            .iter()
+            .find(|claim| claim.file.ends_with("legacy-status.md"))
+            .context("legacy completed validation")?;
+        assert!(legacy
+            .issues
+            .iter()
+            .any(|issue| issue.severity == "error" && issue.field == "status"));
         Ok(())
     }
 
