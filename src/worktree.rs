@@ -2072,19 +2072,34 @@ pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<Worktr
         )
     })?;
     require_plain_directory(&workspace, "workspace")?;
-    let worktrees_root = workspace.join(".maco").join("worktrees");
-    let group_names = match fs::symlink_metadata(&worktrees_root) {
-        Ok(_) => bounded_plain_direct_child_names(
-            &worktrees_root,
-            MAX_WORKSPACE_SWEEP_GROUPS,
-            "workspace worktree root",
-        )?,
+    let metadata_root = workspace.join(".maco");
+    let worktrees_root = metadata_root.join("worktrees");
+    let group_names = match fs::symlink_metadata(&metadata_root) {
+        Ok(_) => {
+            require_plain_directory(&metadata_root, "workspace metadata root")?;
+            match fs::symlink_metadata(&worktrees_root) {
+                Ok(_) => bounded_plain_direct_child_names(
+                    &worktrees_root,
+                    MAX_WORKSPACE_SWEEP_GROUPS,
+                    "workspace worktree root",
+                )?,
+                Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to inspect workspace worktree root {}",
+                            worktrees_root.display()
+                        )
+                    })
+                }
+            }
+        }
         Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
-                    "failed to inspect workspace worktree root {}",
-                    worktrees_root.display()
+                    "failed to inspect workspace metadata root {}",
+                    metadata_root.display()
                 )
             })
         }
@@ -2094,9 +2109,6 @@ pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<Worktr
         let group = group_name
             .to_str()
             .context("workspace worktree group name is not valid UTF-8")?;
-        if group.starts_with(".maco-") {
-            continue;
-        }
         if group.is_empty() || group.len() > MAX_WORKSPACE_SWEEP_GROUP_NAME_BYTES {
             bail!("workspace worktree group name is invalid or out of bounds");
         }
@@ -2317,7 +2329,7 @@ fn resolve_sweep_repository_from_workspace(
             })?;
     let mut candidates = Vec::new();
     for child_name in child_names {
-        if child_name == OsStr::new(".maco") || child_name.to_string_lossy().starts_with(".maco-") {
+        if child_name == OsStr::new(".maco") {
             continue;
         }
         let candidate_group = match child_name.to_str() {
@@ -8048,6 +8060,68 @@ mod tests {
             WorktreeGcStatus::Removed
         );
         assert!(!created.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_sweep_inspects_repository_and_group_with_maco_prefix() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let repo_path = workspace.join(".maco-repository");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let worktree_root = workspace.join(".maco/worktrees/.maco-repository");
+        let created = create_gc_worktree(
+            &WorktreeManager::new(&repo_path),
+            "prefixed-lane",
+            &worktree_root,
+        );
+
+        let report = sweep_workspace_worktrees(workspace_sweep_options(&workspace, false))
+            .expect("sweep prefixed repository");
+        assert_eq!(report.repository_discovered_count, 1);
+        assert_eq!(report.repository_inspected_count, 1);
+        assert_eq!(report.repository_failure_count, 0);
+        assert_eq!(report.repositories.len(), 1);
+        assert_eq!(report.repositories[0].group, ".maco-repository");
+        assert_eq!(
+            report.repositories[0].status,
+            WorktreeSweepRepositoryStatus::Inspected
+        );
+        assert_eq!(
+            report.repositories[0].repository.as_deref(),
+            Some(repo_path.as_path())
+        );
+        assert!(created.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_sweep_rejects_symlinked_metadata_root_before_outside_gc() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let repo_path = workspace.join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let outside_metadata = temp.path().join("outside-metadata");
+        let outside_worktree_root = outside_metadata.join("worktrees/repo");
+        let created = create_gc_worktree(
+            &WorktreeManager::new(&repo_path),
+            "outside-lane",
+            &outside_worktree_root,
+        );
+        symlink(&outside_metadata, workspace.join(".maco")).expect("link metadata root");
+
+        let error = sweep_workspace_worktrees(workspace_sweep_options(&workspace, true))
+            .expect_err("symlinked metadata root must fail closed");
+        assert!(error
+            .to_string()
+            .contains("workspace metadata root is not a plain directory"));
+        assert!(created.path.exists());
     }
 
     #[cfg(target_os = "linux")]
