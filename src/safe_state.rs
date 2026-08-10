@@ -4584,28 +4584,20 @@ where
     value.try_into().unwrap_or(u64::MAX)
 }
 
-#[cfg(any(test, target_os = "macos"))]
-const fn signed_device_id_to_u64(value: i32) -> u64 {
+#[cfg(any(unix, test))]
+const fn device_id_bits_to_u64(value: i64) -> u64 {
     value as u64
 }
 
 /// Converts `stat::st_dev` to the representation returned by
 /// `std::os::unix::fs::MetadataExt::dev`.
 ///
-/// Darwin defines `dev_t` as a signed 32-bit integer. Rust's widening cast
-/// preserves each negative device identifier modulo 2^64; a checked unsigned
-/// conversion would instead reject every negative value and collapse them to
-/// one fallback identity.
-#[cfg(target_os = "macos")]
+/// Unix targets vary in the width and signedness of `dev_t`. Converting through
+/// `i64` sign-extends signed values, widens narrower unsigned values, and
+/// round-trips every `u64` bit pattern before preserving it modulo 2^64.
+#[cfg(unix)]
 pub(crate) const fn device_id_to_u64(value: libc::dev_t) -> u64 {
-    signed_device_id_to_u64(value)
-}
-
-/// Converts `stat::st_dev` to the representation returned by
-/// `std::os::unix::fs::MetadataExt::dev`.
-#[cfg(all(unix, not(target_os = "macos")))]
-pub(crate) fn device_id_to_u64(value: libc::dev_t) -> u64 {
-    unsigned_to_u64(value)
+    device_id_bits_to_u64(value as i64)
 }
 
 pub(crate) fn unsigned_to_u32<T>(value: T) -> u32
@@ -5299,13 +5291,15 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn darwin_signed_device_ids_remain_distinct() {
-        let negative_one = signed_device_id_to_u64(-1);
-        let negative_two = signed_device_id_to_u64(-2);
+    fn signed_and_unsigned_device_id_bits_are_preserved() {
+        let negative_one = device_id_bits_to_u64(-1);
+        let negative_two = device_id_bits_to_u64(-2);
+        let unsigned_high_bit = device_id_bits_to_u64(u64::MAX as i64);
 
         assert_eq!(negative_one, u64::MAX);
         assert_eq!(negative_two, u64::MAX - 1);
         assert_ne!(negative_one, negative_two);
+        assert_eq!(unsigned_high_bit, u64::MAX);
     }
 
     #[cfg(unix)]
