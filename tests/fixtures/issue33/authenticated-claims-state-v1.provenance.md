@@ -1,8 +1,11 @@
 # Issue 33 synthetic authenticated claims journal
 
 `generate_authenticated_claims_state_v1.py` deterministically writes the
-`authenticated-claims-state-v1/` tree and its SHA-256 manifest. Regenerate it
-from the repository root with:
+compact checkout tree `state/j/` and its SHA-256 manifest. The test helper
+installs the files under the authentic runtime path
+`authenticated-claims-state-v1/<physical-journal-id>/`; only the checked-in
+source layout is shortened so a default Windows checkout remains below
+`MAX_PATH`. Regenerate it from the repository root with:
 
 ```bash
 python3 tests/fixtures/issue33/generate_authenticated_claims_state_v1.py
@@ -21,8 +24,8 @@ snapshot records, chains their HMAC-SHA-256 tags, and signs the matching head.
 Three records are durable fixture entries; the fourth record and head use the
 canonical temporary-file forms exercised by the original Issue 33 state shape.
 The generator verifies the complete chain and head before writing any output.
-`authenticated-claims-state-v1.sha256` binds the exact generated inventory and
-bytes.
+`authenticated-claims-state-v1.sha256` binds the exact compact source inventory
+and bytes.
 
 The chosen proof property is independent of those contents: the fixture root
 contains the physical journal but deliberately contains no signed logical

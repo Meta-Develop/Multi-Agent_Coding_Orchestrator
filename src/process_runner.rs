@@ -12809,6 +12809,11 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
         })
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn strict_backend_available_for_tests() -> bool {
+        false
+    }
+
     #[cfg(target_os = "linux")]
     fn is_verified_backend_unavailable(error: &ProcessRunError) -> bool {
         if !matches!(error, ProcessRunError::ProcessOwnership { .. }) {

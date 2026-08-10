@@ -1349,17 +1349,11 @@ fn percentile(sorted: &[u64], percentile: usize) -> Option<u64> {
 }
 
 fn duration_millis(duration: Duration) -> u64 {
-    match u64::try_from(duration.as_millis()) {
-        Ok(value) => value,
-        Err(_) => u64::MAX,
-    }
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn saturating_usize_to_u64(value: usize) -> u64 {
-    match u64::try_from(value) {
-        Ok(value) => value,
-        Err(_) => u64::MAX,
-    }
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn invalid<T>(message: impl Into<String>) -> Result<T> {

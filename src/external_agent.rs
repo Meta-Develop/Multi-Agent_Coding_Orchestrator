@@ -20,6 +20,7 @@ use crate::process_runner::{
     WorkspaceAccess,
 };
 use crate::protected_path::{DeclaredPathCoordinate, ProtectedPathSpec};
+use crate::safe_state::unsigned_to_u32;
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -4238,8 +4239,9 @@ fn validate_external_program_identity(path: &Path, require_root_owned: bool) -> 
                 );
             }
             let mode = metadata.permissions().mode();
-            let root_sticky_directory =
-                metadata.uid() == 0 && metadata.is_dir() && mode & libc::S_ISVTX != 0;
+            let root_sticky_directory = metadata.uid() == 0
+                && metadata.is_dir()
+                && mode & unsigned_to_u32(libc::S_ISVTX) != 0;
             if (require_root_owned || !root_sticky_directory) && mode & 0o022 != 0 {
                 bail!(
                     "external executable ancestor is group/world-writable: {}",
@@ -5133,7 +5135,7 @@ fn materialize_control_exception_file_with(
                 | libc::O_NOFOLLOW
                 | libc::O_CLOEXEC
                 | libc::O_NONBLOCK,
-            0o600 as libc::mode_t,
+            0o600 as libc::c_uint,
         )
     };
     if file_fd < 0 {

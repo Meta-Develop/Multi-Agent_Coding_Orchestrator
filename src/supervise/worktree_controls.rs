@@ -7,7 +7,7 @@ pub(super) fn worktree_control_identity_from_metadata(
     WorktreeControlIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
-        file_type: metadata.mode() & libc::S_IFMT,
+        file_type: metadata.mode() & crate::safe_state::unsigned_to_u32(libc::S_IFMT),
     }
 }
 
@@ -37,9 +37,9 @@ pub(super) fn direct_worktree_control_identity(
     // SAFETY: `fstatat` succeeded and initialized `stat`.
     let stat = unsafe { stat.assume_init() };
     Ok(WorktreeControlIdentity {
-        device: stat.st_dev,
-        inode: stat.st_ino,
-        file_type: stat.st_mode & libc::S_IFMT,
+        device: crate::safe_state::device_id_to_u64(stat.st_dev),
+        inode: crate::safe_state::unsigned_to_u64(stat.st_ino),
+        file_type: crate::safe_state::unsigned_to_u32(stat.st_mode & libc::S_IFMT),
     })
 }
 
@@ -116,7 +116,9 @@ pub(super) fn provision_mandatory_worktree_controls(
 
     let git_identity = direct_worktree_control_identity(&workspace, ".git")
         .context("linked worktree .git marker must already exist")?;
-    if !matches!(git_identity.file_type, libc::S_IFREG | libc::S_IFDIR) {
+    if git_identity.file_type != crate::safe_state::unsigned_to_u32(libc::S_IFREG)
+        && git_identity.file_type != crate::safe_state::unsigned_to_u32(libc::S_IFDIR)
+    {
         bail!("linked worktree .git marker must be a regular file or directory");
     }
 
@@ -124,7 +126,7 @@ pub(super) fn provision_mandatory_worktree_controls(
     for &relative in MANDATORY_WORKTREE_DIRECTORY_CONTROLS {
         let directory = open_direct_worktree_directory(&workspace, relative)?;
         let identity = worktree_control_identity_from_metadata(&directory.metadata()?);
-        if identity.file_type != libc::S_IFDIR {
+        if identity.file_type != crate::safe_state::unsigned_to_u32(libc::S_IFDIR) {
             bail!("mandatory worktree control is not a directory: {relative}");
         }
         if direct_worktree_control_identity(&workspace, relative)? != identity {

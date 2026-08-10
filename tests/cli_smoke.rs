@@ -27,6 +27,10 @@ const ISSUE33_CLAIMS_V1_SHA256: &str =
 const ISSUE33_PHYSICAL_JOURNAL_ID: &str =
     "d9741d2f810d605133ddfb24bca389e7f1e96fd2a3da1bc5ca236da56519306f";
 #[cfg(unix)]
+const ISSUE33_FIXTURE_NAMESPACE: &str = "state";
+#[cfg(unix)]
+const ISSUE33_FIXTURE_JOURNAL: &str = "j";
+#[cfg(unix)]
 const ISSUE33_OPTIONAL_LOGICAL_ANCHOR: &str =
     ".snapshot-init-a61808fe40feb8b3433778bbc2ececcaa47c8c47fc1657f054c239efd3f0e984.json";
 const ISSUE33_PHYSICAL_JOURNAL_MANIFEST: &str =
@@ -484,15 +488,15 @@ fn write_private_test_state_file(path: &Path, contents: &[u8]) -> Result<()> {
 #[cfg(unix)]
 fn issue33_physical_journal_fixture() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/issue33/authenticated-claims-state-v1")
-        .join(ISSUE33_PHYSICAL_JOURNAL_ID)
+        .join("tests/fixtures/issue33")
+        .join(ISSUE33_FIXTURE_NAMESPACE)
+        .join(ISSUE33_FIXTURE_JOURNAL)
 }
 
 #[cfg(unix)]
 fn verify_issue33_physical_journal_fixture() -> Result<usize> {
     let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/issue33");
-    let expected_parent =
-        Path::new("authenticated-claims-state-v1").join(ISSUE33_PHYSICAL_JOURNAL_ID);
+    let expected_parent = Path::new(ISSUE33_FIXTURE_NAMESPACE).join(ISSUE33_FIXTURE_JOURNAL);
     let mut manifest_names = Vec::new();
 
     for (index, line) in ISSUE33_PHYSICAL_JOURNAL_MANIFEST.lines().enumerate() {
@@ -625,7 +629,8 @@ fn copy_issue33_physical_journal_fixture(destination: &Path) -> Result<usize> {
 #[cfg(unix)]
 fn copy_issue33_optional_logical_anchor_fixture(destination: &Path) -> Result<()> {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/issue33/authenticated-claims-state-v1")
+        .join("tests/fixtures/issue33")
+        .join(ISSUE33_FIXTURE_NAMESPACE)
         .join(ISSUE33_OPTIONAL_LOGICAL_ANCHOR);
     if !source.exists() {
         return Ok(());

@@ -15,10 +15,24 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
-  # Match the flake.lock development shell used for local verification.
-  RUSTUP_TOOLCHAIN: "1.94.1"
 
 jobs:
+  repository-portability:
+    name: Repository portability
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Run repository portability unit tests
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+      - name: Check tracked path portability
+        run: python3 scripts/check_repository_portability.py
+
   linux:
     name: Linux fmt, check, clippy, and test
     runs-on: ubuntu-latest
@@ -29,11 +43,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Select stable Rust with required components
+      - name: Install repository Rust toolchain
         run: |
-          rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+          rustup toolchain install
           rustc --version --verbose
           cargo --version --verbose
+          cargo clippy --version
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -49,6 +64,7 @@ jobs:
 
   portable-build:
     name: ${{ matrix.os }} compile and test build
+    needs: repository-portability
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -63,11 +79,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Select stable Rust
+      - name: Install repository Rust toolchain
         run: |
-          rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+          rustup toolchain install
           rustc --version --verbose
           cargo --version --verbose
+          cargo clippy --version
 
       - name: Check all targets against Cargo.lock
         run: cargo check --locked --all-targets
