@@ -94,7 +94,10 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{mpsc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Mutex,
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -257,9 +260,10 @@ type CancellableExternalRunner<'a> = dyn for<'review> Fn(
 fn run_with_caller_process_cancellation<T>(
     caller_cancellation: &ProcessCancellation,
     scheduler_cancellation: &ProcessCancellation,
+    cancellation_observed: &AtomicBool,
     run: impl FnOnce() -> T,
 ) -> T {
-    if caller_cancellation.is_cancelled() {
+    if observe_caller_cancellation(Some(caller_cancellation), cancellation_observed) {
         scheduler_cancellation.cancel();
         return run();
     }
@@ -270,7 +274,10 @@ fn run_with_caller_process_cancellation<T>(
             match finished_receiver.recv_timeout(Duration::from_millis(10)) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if caller_cancellation.is_cancelled() {
+                    if observe_caller_cancellation(
+                        Some(caller_cancellation),
+                        cancellation_observed,
+                    ) {
                         scheduler_cancellation.cancel();
                         break;
                     }
@@ -281,6 +288,17 @@ fn run_with_caller_process_cancellation<T>(
         let _ = finished_sender.send(());
         result
     })
+}
+
+fn observe_caller_cancellation(
+    caller_cancellation: Option<&ProcessCancellation>,
+    cancellation_observed: &AtomicBool,
+) -> bool {
+    let observed = caller_cancellation.is_some_and(ProcessCancellation::is_cancelled);
+    if observed {
+        cancellation_observed.store(true, Ordering::SeqCst);
+    }
+    observed
 }
 
 #[derive(Debug, Clone)]
@@ -1717,10 +1735,13 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner(
     let mut permit = |_plan: &SupervisorPlan| Ok(None);
     let outer_run_id = options.run_id.clone();
     let serialized_runner = Mutex::new(external_runner);
+    let cancellation_observed = AtomicBool::new(false);
     run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
         options,
         GeneratedFollowUpQueueEntrypoint::SuperviseRun,
         &outer_run_id,
+        None,
+        &cancellation_observed,
         None,
         &mut permit,
         &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
@@ -1735,6 +1756,8 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilo
     options: SupervisorRunOptions,
     outer_command_run_id: &RunId,
     caller_cancellation: Option<&ProcessCancellation>,
+    cancellation_observed: &AtomicBool,
+    source_dispatch_started: &AtomicBool,
     before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand, &ProcessCancellation) -> ExternalAgentRun
               + Send),
@@ -1752,6 +1775,7 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilo
                 Some(caller_cancellation) => run_with_caller_process_cancellation(
                     caller_cancellation,
                     scheduler_cancellation,
+                    cancellation_observed,
                     run,
                 ),
                 None => run(),
@@ -1762,6 +1786,8 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilo
         GeneratedFollowUpQueueEntrypoint::AutopilotRun,
         outer_command_run_id,
         caller_cancellation,
+        cancellation_observed,
+        Some(source_dispatch_started),
         before_dispatch,
         &cancellable_runner,
     )
@@ -1773,6 +1799,8 @@ fn run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
     outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
     outer_command_run_id: &RunId,
     caller_cancellation: Option<&ProcessCancellation>,
+    cancellation_observed: &AtomicBool,
+    source_dispatch_started: Option<&AtomicBool>,
     before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorCascadeOutcome> {
@@ -1784,7 +1812,7 @@ fn run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
-    if caller_cancellation.is_some_and(ProcessCancellation::is_cancelled) {
+    if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
         bail!("autopilot caller cancelled before exact injected loaded-plan dispatch");
     }
     if let Some(denial) = before_dispatch(&loaded.plan)? {
@@ -1793,9 +1821,15 @@ fn run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
             denial.denial_id.as_str()
         );
     }
+    if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
+        bail!("autopilot caller cancelled after gate before exact injected loaded-plan dispatch");
+    }
     let source_loaded = loaded.clone();
     let template = options.clone();
     let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
+    if let Some(source_dispatch_started) = source_dispatch_started {
+        source_dispatch_started.store(true, Ordering::SeqCst);
+    }
     let source_report = run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
@@ -1818,6 +1852,7 @@ fn run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
             runtime_catalog: FollowUpRuntimeCatalog::Injected,
         },
         caller_cancellation,
+        cancellation_observed,
         before_dispatch,
         external_runner,
     )
@@ -1832,6 +1867,7 @@ fn run_supervisor_plan_file_cascade_with_runner_and_gate(
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
 ) -> Result<SupervisorCascadeOutcome> {
     let serialized_runner = Mutex::new(external_runner);
+    let cancellation_observed = AtomicBool::new(false);
     let mut adapt_gate = |plan: &SupervisorPlan| {
         if before_dispatch(plan)? {
             Ok(None)
@@ -1843,6 +1879,8 @@ fn run_supervisor_plan_file_cascade_with_runner_and_gate(
         options,
         outer_entrypoint,
         outer_command_run_id,
+        None,
+        &cancellation_observed,
         None,
         &mut adapt_gate,
         &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
@@ -1876,6 +1914,7 @@ pub(crate) fn resume_supervisor_plan_file_cascade_with_runner(
     };
     let serialized_runner = Mutex::new(external_runner);
     let mut permit = |_plan: &SupervisorPlan| Ok(None);
+    let cancellation_observed = AtomicBool::new(false);
     run_generated_follow_up_cascade(
         &repo,
         &loaded,
@@ -1888,6 +1927,7 @@ pub(crate) fn resume_supervisor_plan_file_cascade_with_runner(
             runtime_catalog: FollowUpRuntimeCatalog::Injected,
         },
         None,
+        &cancellation_observed,
         &mut permit,
         &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),

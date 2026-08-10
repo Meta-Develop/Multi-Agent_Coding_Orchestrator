@@ -130,6 +130,7 @@ pub(super) fn run_generated_follow_up_cascade(
     supervisor_template: &SupervisorRunOptions,
     invocation: FollowUpCascadeInvocation<'_>,
     caller_cancellation: Option<&ProcessCancellation>,
+    cancellation_observed: &AtomicBool,
     before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorCascadeOutcome> {
@@ -288,7 +289,7 @@ pub(super) fn run_generated_follow_up_cascade(
             if reloaded.plan != effective {
                 bail!("generated follow-up ordinary plan file changed before dispatch");
             }
-            if caller_cancellation.is_some_and(ProcessCancellation::is_cancelled) {
+            if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
                 return Ok(FollowUpPreparation::Cancelled);
             }
             if let Some(denial) = before_dispatch(&reloaded.plan)? {
@@ -318,7 +319,7 @@ pub(super) fn run_generated_follow_up_cascade(
                     ));
                 }
             }
-            if caller_cancellation.is_some_and(ProcessCancellation::is_cancelled) {
+            if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
                 return Ok(FollowUpPreparation::Cancelled);
             }
             Ok(FollowUpPreparation::Ready {

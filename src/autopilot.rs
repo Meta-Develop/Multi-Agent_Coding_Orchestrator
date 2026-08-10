@@ -51,6 +51,7 @@ use std::{
     fs,
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -959,9 +960,13 @@ fn supervisor_terminal_cleanup_completed(report: &SupervisorFinalReport) -> bool
 }
 
 fn cancelled_cascade_cleanup_completed(
+    repo: &Path,
     cascade: &supervise::SupervisorCascadeOutcome,
     primary_worktree_untouched: bool,
-) -> bool {
+) -> Result<bool> {
+    let no_pending_worktree_operations = WorktreeManager::new(repo)
+        .pending_operations()?
+        .is_empty();
     let queue_cleanup_completed = cascade.follow_up_queue.as_ref().is_none_or(|queue| {
         queue.enqueue_committed
             && queue.claimed_count == 0
@@ -973,7 +978,7 @@ fn cancelled_cascade_cleanup_completed(
                 .checked_add(queue.acknowledged_terminal_count)
                 == Some(queue.item_count)
     });
-    primary_worktree_untouched
+    Ok(primary_worktree_untouched
         && cascade.follow_up_primary_worktree_untouched != Some(false)
         && supervisor_terminal_cleanup_completed(&cascade.source_report)
         && cascade
@@ -981,6 +986,17 @@ fn cancelled_cascade_cleanup_completed(
             .iter()
             .all(supervisor_terminal_cleanup_completed)
         && queue_cleanup_completed
+        && no_pending_worktree_operations)
+}
+
+fn cancelled_pre_dispatch_cleanup_completed(
+    repo: &Path,
+    primary_worktree_untouched: bool,
+) -> Result<bool> {
+    Ok(primary_worktree_untouched
+        && WorktreeManager::new(repo)
+            .pending_operations()?
+            .is_empty())
 }
 
 #[cfg(test)]
@@ -1027,6 +1043,8 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     validate_autopilot_profile(&requested_profile)?;
     let caller_cancellation = options.cancellation.clone();
     let max_child_dispatches = options.max_child_dispatches;
+    let cancellation_observed = AtomicBool::new(false);
+    let source_dispatch_started = AtomicBool::new(false);
 
     let repo = discover_repo_root(&options.repo)?;
     let source_is_goal_derived = matches!(&source, AutopilotRunSource::GoalSpec { .. });
@@ -1335,6 +1353,8 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                     cascade_concurrency_policy,
                     &options.run_id,
                     caller_cancellation.as_ref(),
+                    &cancellation_observed,
+                    &source_dispatch_started,
                     &mut follow_up_profile_gate,
                 )
             }
@@ -1345,6 +1365,8 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 supervisor_options,
                 &options.run_id,
                 caller_cancellation.as_ref(),
+                &cancellation_observed,
+                &source_dispatch_started,
                 &mut follow_up_profile_gate,
                 *external_runner,
             ),
@@ -1358,17 +1380,28 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     let cascade = match supervisor_result {
         Ok(cascade) => cascade,
         Err(error) => {
-            let caller_cancelled = caller_cancellation
-                .as_ref()
-                .is_some_and(ProcessCancellation::is_cancelled);
-            let source_dispatch_admitted = admitted_child_dispatches > 0;
+            let cancellation_was_observed = cancellation_observed.load(Ordering::SeqCst);
+            let source_dispatch_started = source_dispatch_started.load(Ordering::SeqCst);
+            let cancellation_cleanup_completed = if cancellation_was_observed
+                && !source_dispatch_started
+            {
+                match cancelled_pre_dispatch_cleanup_completed(
+                    &repo,
+                    command_primary_worktree_untouched,
+                ) {
+                    Ok(completed) => completed,
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
             let profile_refused_before_source_dispatch =
-                !source_dispatch_admitted && !profile_binding.permits_dispatch();
-            let admission_refused_before_source_dispatch = !source_dispatch_admitted
+                !source_dispatch_started && !profile_binding.permits_dispatch();
+            let admission_refused_before_source_dispatch = !source_dispatch_started
                 && before_dispatch_denial.as_ref().is_some_and(|denial| {
                     matches!(denial.reason, GateDenialReason::BudgetAdmission { .. })
                 });
-            let generated_follow_up_dispatch_performed = if !source_dispatch_admitted {
+            let generated_follow_up_dispatch_performed = if !source_dispatch_started {
                 false
             } else {
                 let evidence =
@@ -1428,14 +1461,14 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             )?;
             let report = final_report(FinalReportInput {
                 run_id: &options.run_id,
-                status: if caller_cancelled && !source_dispatch_admitted {
+                status: if cancellation_cleanup_completed {
                     AutopilotRunStatus::Cancelled
                 } else if admission_refused_before_source_dispatch {
                     AutopilotRunStatus::Refused
                 } else {
                     AutopilotRunStatus::Failed
                 },
-                attempt_count: usize::from(source_dispatch_admitted),
+                attempt_count: usize::from(source_dispatch_started),
                 max_repair_attempts: plan.max_repair_attempts,
                 artifacts,
                 plan: plan_summary(&plan),
@@ -1444,7 +1477,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 validation: skipped_autopilot_validation(),
                 pr: None,
                 review: None,
-                attempts: if source_dispatch_admitted {
+                attempts: if source_dispatch_started {
                     vec![attempt]
                 } else {
                     Vec::new()
@@ -1452,10 +1485,12 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 supervisor: None,
                 gate_denials: before_dispatch_denial.clone().into_iter().collect(),
                 primary_worktree_untouched: command_primary_worktree_untouched,
-                next_action: if caller_cancelled && source_dispatch_admitted {
+                next_action: if cancellation_was_observed && source_dispatch_started {
                     "caller cancellation was requested after supervisor dispatch, but terminal cleanup or finalization returned an error; inspect the supervisor checkpoint, claims, worktrees, and process evidence before retrying"
-                } else if caller_cancelled {
+                } else if cancellation_cleanup_completed {
                     "caller cancellation was observed before supervisor dispatch; start a new run only if the work is still required"
+                } else if cancellation_was_observed {
+                    "caller cancellation was observed before supervisor dispatch, but pending-worktree or primary-integrity cleanup evidence is incomplete; reconcile durable worktree operations before retrying"
                 } else if admission_refused_before_source_dispatch {
                     "review the configured child-dispatch maximum and start a new run with an adequate bound; no supervisor dispatch was attempted"
                 } else if profile_refused_before_source_dispatch {
@@ -1476,11 +1511,19 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     let generated_follow_up_dispatch_performed = cascade.generated_follow_up_dispatch_performed();
     let follow_up_cascade_success = cascade.follow_up_cascade_success;
     let follow_up_gate_denials = cascade.follow_up_gate_denials.clone();
-    let caller_cancelled = caller_cancellation
-        .as_ref()
-        .is_some_and(ProcessCancellation::is_cancelled);
-    let cancellation_cleanup_completed = caller_cancelled
-        && cancelled_cascade_cleanup_completed(&cascade, command_primary_worktree_untouched);
+    let cancellation_was_observed = cancellation_observed.load(Ordering::SeqCst);
+    let cancellation_cleanup_completed = if cancellation_was_observed {
+        match cancelled_cascade_cleanup_completed(
+            &repo,
+            &cascade,
+            command_primary_worktree_untouched,
+        ) {
+            Ok(completed) => completed,
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
     write_private_json(
         &mut artifact_writer,
         "follow-up-cascade-report.json",
@@ -1508,7 +1551,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         .is_some_and(|denial| matches!(denial.reason, GateDenialReason::BudgetAdmission { .. }));
     let status = if cancellation_cleanup_completed {
         AutopilotRunStatus::Cancelled
-    } else if caller_cancelled {
+    } else if cancellation_was_observed {
         AutopilotRunStatus::Failed
     } else if child_dispatch_admission_refused {
         AutopilotRunStatus::Refused
@@ -1524,7 +1567,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     let primary_worktree_untouched = command_primary_worktree_untouched;
     let next_action = if cancellation_cleanup_completed {
         "caller cancellation was observed and the supervised cleanup path completed; inspect the durable supervisor and queue evidence before starting a new run"
-    } else if caller_cancelled {
+    } else if cancellation_was_observed {
         "caller cancellation was observed but terminal cleanup evidence is incomplete; reconcile supervisor claims, semantic intents, worktrees, and the authenticated follow-up queue before retrying"
     } else if child_dispatch_admission_refused {
         "review the configured child-dispatch maximum and start a new run with an adequate bound; the refused generated follow-up was not dispatched"
