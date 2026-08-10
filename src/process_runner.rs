@@ -4627,8 +4627,51 @@ struct SandboxMountRegion {
 
 #[cfg(target_os = "linux")]
 impl ResolvedSystemdSandbox {
+    fn explicitly_binds_program(&self, program: &Path) -> bool {
+        std::iter::once(&self.workspace_root)
+            .chain(self.visible_read_only_roots.iter())
+            .chain(self.visible_read_write_roots.iter())
+            .chain(self.writable_artifact_roots.iter())
+            .any(|root| program.starts_with(root))
+            || self
+                .visible_read_only_files
+                .iter()
+                .chain(self.visible_read_write_files.iter())
+                .any(|file| program == file)
+    }
+
     fn validate_program_visibility(&self, program: &Path) -> std::io::Result<()> {
-        validate_systemd_program_visibility(program, &self.hidden_roots)
+        if let Some(hidden_root) = self
+            .hidden_roots
+            .iter()
+            .find(|root| program.starts_with(root))
+        {
+            return Err(environment_failure_io(
+                EnvironmentFailure::sandbox_unavailable(format!(
+                    "the sandbox cannot start program {} because sandbox.hidden_roots makes that root inaccessible inside the transient unit: {}; place the executable outside the hidden root before retrying",
+                    program.display(),
+                    hidden_root.display(),
+                )),
+                false,
+            ));
+        }
+        let Some(private_tmp_root) = [Path::new("/tmp"), Path::new("/var/tmp")]
+            .into_iter()
+            .find(|root| program.starts_with(root))
+        else {
+            return Ok(());
+        };
+        if self.explicitly_binds_program(program) {
+            return Ok(());
+        }
+        Err(environment_failure_io(
+            EnvironmentFailure::sandbox_unavailable(format!(
+                "the sandbox cannot start program {} because PrivateTmp=yes replaces that root inside the transient unit: {}; place the executable outside the hidden root before retrying",
+                program.display(),
+                private_tmp_root.display(),
+            )),
+            false,
+        ))
     }
 
     fn add_isolated_runtime_file(&mut self, file: &Path) -> std::io::Result<()> {
@@ -5517,38 +5560,6 @@ fn sandbox_mount_regions_conflict(left: &SandboxMountRegion, right: &SandboxMoun
         && left.device_minor == right.device_minor
         && (left.backing_path.starts_with(&right.backing_path)
             || right.backing_path.starts_with(&left.backing_path))
-}
-
-#[cfg(target_os = "linux")]
-fn hidden_systemd_program_root(program: &Path, hidden_roots: &[PathBuf]) -> Option<PathBuf> {
-    [Path::new("/tmp"), Path::new("/var/tmp")]
-        .into_iter()
-        .chain(hidden_roots.iter().map(PathBuf::as_path))
-        .find(|root| program.starts_with(root))
-        .map(Path::to_path_buf)
-}
-
-#[cfg(target_os = "linux")]
-fn validate_systemd_program_visibility(
-    program: &Path,
-    hidden_roots: &[PathBuf],
-) -> std::io::Result<()> {
-    let Some(hidden_root) = hidden_systemd_program_root(program, hidden_roots) else {
-        return Ok(());
-    };
-    let cause = if hidden_root == Path::new("/tmp") || hidden_root == Path::new("/var/tmp") {
-        "PrivateTmp=yes replaces that root inside the transient unit"
-    } else {
-        "sandbox.hidden_roots makes that root inaccessible inside the transient unit"
-    };
-    Err(environment_failure_io(
-        EnvironmentFailure::sandbox_unavailable(format!(
-            "the sandbox cannot start program {} because {cause}: {}; place the executable outside the hidden root before retrying",
-            program.display(),
-            hidden_root.display(),
-        )),
-        false,
-    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -10127,15 +10138,38 @@ mod tests {
     use super::*;
 
     #[cfg(target_os = "linux")]
+    fn program_visibility_sandbox(workspace_root: &Path) -> ResolvedSystemdSandbox {
+        ResolvedSystemdSandbox {
+            kind: SideEffectConfinementProfileKind::ExternalCodex,
+            workspace_root: workspace_root.to_path_buf(),
+            current_dir: workspace_root.to_path_buf(),
+            workspace_access: WorkspaceAccess::ReadWrite,
+            visible_read_only_roots: Vec::new(),
+            visible_read_only_files: Vec::new(),
+            visible_read_write_roots: Vec::new(),
+            visible_read_write_files: Vec::new(),
+            external_codex_writable_file_capabilities: Vec::new(),
+            writable_artifact_roots: Vec::new(),
+            hidden_roots: Vec::new(),
+            isolated_host_view: false,
+            resource_limits: ProcessResourceLimits::default(),
+            path_identities: Vec::new(),
+            mount_checks: Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn sandbox_program_visibility_rejects_private_tmp_and_hidden_roots() {
-        let hidden_roots = vec![PathBuf::from("/srv/private")];
+        let mut sandbox = program_visibility_sandbox(Path::new("/opt/maco/workspace"));
+        sandbox.hidden_roots = vec![PathBuf::from("/srv/private")];
         for program in [
             Path::new("/tmp/target/debug/probe"),
             Path::new("/var/tmp/target/debug/probe"),
             Path::new("/srv/private/bin/probe"),
         ] {
-            let error = validate_systemd_program_visibility(program, &hidden_roots)
+            let error = sandbox
+                .validate_program_visibility(program)
                 .expect_err("hidden program path must be rejected");
             let (failure, target_process_started) =
                 environment_failure_from_source(&error).expect("typed environment failure");
@@ -10147,16 +10181,68 @@ mod tests {
             assert!(failure.summary.contains(&program.display().to_string()));
         }
 
-        assert!(validate_systemd_program_visibility(
-            Path::new("/opt/maco/bin/probe"),
-            &hidden_roots
-        )
-        .is_ok());
-        assert!(validate_systemd_program_visibility(
-            Path::new("/tmp-adjacent/bin/probe"),
-            &hidden_roots
-        )
-        .is_ok());
+        assert!(sandbox
+            .validate_program_visibility(Path::new("/opt/maco/bin/probe"))
+            .is_ok());
+        assert!(sandbox
+            .validate_program_visibility(Path::new("/tmp-adjacent/bin/probe"))
+            .is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_program_visibility_accepts_explicit_private_tmp_bindings() {
+        let workspace_program = Path::new("/tmp/workspace/bin/probe");
+        let mut sandbox = program_visibility_sandbox(Path::new("/tmp/workspace"));
+        assert!(sandbox
+            .validate_program_visibility(workspace_program)
+            .is_ok());
+
+        sandbox.workspace_root = PathBuf::from("/opt/maco/workspace");
+        sandbox.current_dir = sandbox.workspace_root.clone();
+        let read_only_root_program = Path::new("/tmp/read-only-tools/bin/probe");
+        sandbox
+            .visible_read_only_roots
+            .push(PathBuf::from("/tmp/read-only-tools"));
+        assert!(sandbox
+            .validate_program_visibility(read_only_root_program)
+            .is_ok());
+
+        let read_write_root_program = Path::new("/var/tmp/read-write-tools/bin/probe");
+        sandbox
+            .visible_read_write_roots
+            .push(PathBuf::from("/var/tmp/read-write-tools"));
+        assert!(sandbox
+            .validate_program_visibility(read_write_root_program)
+            .is_ok());
+
+        let artifact_program = Path::new("/tmp/artifacts/bin/probe");
+        sandbox
+            .writable_artifact_roots
+            .push(PathBuf::from("/tmp/artifacts"));
+        assert!(sandbox
+            .validate_program_visibility(artifact_program)
+            .is_ok());
+
+        let read_only_file = PathBuf::from("/var/tmp/exact-read-only-probe");
+        sandbox.visible_read_only_files.push(read_only_file.clone());
+        assert!(sandbox.validate_program_visibility(&read_only_file).is_ok());
+
+        let read_write_file = PathBuf::from("/tmp/exact-read-write-probe");
+        sandbox
+            .visible_read_write_files
+            .push(read_write_file.clone());
+        assert!(sandbox.validate_program_visibility(&read_write_file).is_ok());
+
+        let hidden_program = Path::new("/tmp/workspace/hidden/probe");
+        sandbox.workspace_root = PathBuf::from("/tmp/workspace");
+        sandbox
+            .hidden_roots
+            .push(PathBuf::from("/tmp/workspace/hidden"));
+        let hidden_error = sandbox
+            .validate_program_visibility(hidden_program)
+            .expect_err("hidden roots must override an overlapping workspace bind");
+        assert!(hidden_error.to_string().contains("sandbox.hidden_roots"));
     }
 
     #[cfg(target_os = "linux")]
@@ -10189,8 +10275,9 @@ mod tests {
             .expect("resolve hidden invocation and target");
         assert_eq!(paths.first(), Some(&hidden_invocation));
         assert_eq!(paths.get(1), Some(&visible_target));
-        assert!(validate_systemd_program_visibility(&paths[0], &[]).is_err());
-        assert!(validate_systemd_program_visibility(&paths[1], &[]).is_ok());
+        let sandbox = program_visibility_sandbox(Path::new("/opt/maco/workspace"));
+        assert!(sandbox.validate_program_visibility(&paths[0]).is_err());
+        assert!(sandbox.validate_program_visibility(&paths[1]).is_ok());
 
         let hidden_target_root = tempfile::Builder::new()
             .prefix("maco-hidden-target-")
@@ -10215,9 +10302,9 @@ mod tests {
         );
         let paths = resolved_direct_program_paths(&spec, Path::new("/"))
             .expect("resolve visible invocation and hidden target");
-        assert!(validate_systemd_program_visibility(&paths[0], &[]).is_ok());
+        assert!(sandbox.validate_program_visibility(&paths[0]).is_ok());
         assert_eq!(paths.get(1), Some(&hidden_target));
-        assert!(validate_systemd_program_visibility(&paths[1], &[]).is_err());
+        assert!(sandbox.validate_program_visibility(&paths[1]).is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -10294,7 +10381,9 @@ mod tests {
     #[test]
     fn sandbox_environment_failure_message_names_cause_and_program_path() {
         let program = Path::new("/tmp/maco-target/debug/probe");
-        let source = validate_systemd_program_visibility(program, &[])
+        let sandbox = program_visibility_sandbox(Path::new("/opt/maco/workspace"));
+        let source = sandbox
+            .validate_program_visibility(program)
             .expect_err("PrivateTmp-hidden program must fail preflight");
         let error = containment_setup_error(
             "hostile scope probe".to_string(),
