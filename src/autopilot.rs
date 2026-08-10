@@ -5621,6 +5621,11 @@ mod tests {
         assert!(source_run_root.join(ARTIFACT_FINAL_MARKER).exists());
         ArtifactRunReader::open(repo, RunArtifactFamily::Supervise, source_run_id)
             .expect("open finalized Autopilot source supervisor artifacts");
+        assert!(repo
+            .join(RunArtifactFamily::Autopilot.run_root())
+            .join(report.run_id.as_str())
+            .join(ARTIFACT_FINAL_MARKER)
+            .exists());
         ArtifactRunReader::open(repo, RunArtifactFamily::Autopilot, &report.run_id)
             .expect("open finalized Autopilot artifacts");
 
@@ -5683,6 +5688,11 @@ mod tests {
             .list()
             .expect("list pre-dispatch Autopilot managed worktrees")
             .is_empty());
+        assert!(repo
+            .join(RunArtifactFamily::Autopilot.run_root())
+            .join(report.run_id.as_str())
+            .join(ARTIFACT_FINAL_MARKER)
+            .exists());
         ArtifactRunReader::open(repo, RunArtifactFamily::Autopilot, &report.run_id)
             .expect("open finalized pre-dispatch Autopilot artifacts");
         assert!(
@@ -6230,6 +6240,11 @@ mod tests {
                 .exists()
         );
         assert!(ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &run_id).is_err());
+        assert!(!repo
+            .join(RunArtifactFamily::Autopilot.run_root())
+            .join(run_id.as_str())
+            .join(ARTIFACT_FINAL_MARKER)
+            .exists());
         let collect_error = collect_autopilot_run(&repo, run_id.clone())
             .expect_err("crashed or interrupted Autopilot run must stay uncollectable");
         assert!(
