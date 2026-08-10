@@ -141,6 +141,7 @@ pub(super) fn run_generated_follow_up_cascade(
         &source_loaded.plan_metadata,
     )?;
     verify_authenticated_source_basis(repo, source_loaded, &source_report, &source_plan_sha256)?;
+    observe_caller_cancellation(caller_cancellation, cancellation_observed);
     // Authentication precedes every early return. Resume is therefore bound
     // to the immutable finalized source artifact even when that source has no
     // generated work, failed, or was not publishable.

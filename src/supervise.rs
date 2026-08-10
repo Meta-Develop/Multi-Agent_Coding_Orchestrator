@@ -274,10 +274,8 @@ fn run_with_caller_process_cancellation<T>(
             match finished_receiver.recv_timeout(Duration::from_millis(10)) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if observe_caller_cancellation(
-                        Some(caller_cancellation),
-                        cancellation_observed,
-                    ) {
+                    if observe_caller_cancellation(Some(caller_cancellation), cancellation_observed)
+                    {
                         scheduler_cancellation.cancel();
                         break;
                     }
@@ -285,6 +283,9 @@ fn run_with_caller_process_cancellation<T>(
             }
         });
         let result = run();
+        if observe_caller_cancellation(Some(caller_cancellation), cancellation_observed) {
+            scheduler_cancellation.cancel();
+        }
         let _ = finished_sender.send(());
         result
     })
@@ -1827,6 +1828,9 @@ fn run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
     let source_loaded = loaded.clone();
     let template = options.clone();
     let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
+    if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
+        bail!("autopilot caller cancelled after injected runtime catalog resolution before exact loaded-plan dispatch");
+    }
     if let Some(source_dispatch_started) = source_dispatch_started {
         source_dispatch_started.store(true, Ordering::SeqCst);
     }

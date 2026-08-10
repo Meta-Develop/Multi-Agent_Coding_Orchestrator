@@ -1063,6 +1063,9 @@ fn run_supervisor_plan_file_cascade_with_gate(
     let source_loaded = loaded.clone();
     let template = options.clone();
     let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
+    if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
+        bail!("autopilot caller cancelled after runtime catalog resolution before exact loaded-plan dispatch");
+    }
     if let Some(source_dispatch_started) = source_dispatch_started {
         source_dispatch_started.store(true, Ordering::SeqCst);
     }
