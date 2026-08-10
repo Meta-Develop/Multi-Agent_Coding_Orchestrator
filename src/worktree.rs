@@ -65,6 +65,10 @@ const MAX_WORKTREE_GIT_TEXT_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_WORKTREE_GIT_TEXT_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_WORKTREE_GIT_TEXT_FILES: usize = 4096;
 const MAX_PERSISTED_PATH_BYTES: usize = 16 * 1024;
+const MAX_WORKSPACE_SWEEP_GROUPS: usize = 4096;
+const MAX_WORKSPACE_SWEEP_LANES_PER_GROUP: usize = 4096;
+const MAX_WORKSPACE_SWEEP_CHILDREN: usize = 4096;
+const MAX_WORKSPACE_SWEEP_GROUP_NAME_BYTES: usize = 255;
 const WORKTREE_STATUS_RUNTIME_SEED: &str = "git-status";
 const WORKTREE_STATUS_RUNTIME_LOCK: &str = "bounded-status.lock";
 const WORKTREE_STATUS_SCAVENGE_LIMITS: PrivateDirectoryScavengeLimits =
@@ -179,6 +183,74 @@ pub struct WorktreeGcOptions {
     pub retention: WorktreeRetentionPolicy,
     pub exclude_agent_id: Option<String>,
     pub machine_global_retention: Option<MachineGlobalRetentionBinding>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorktreeSweepOptions {
+    pub workspace: PathBuf,
+    pub apply: bool,
+    pub remove_targets: bool,
+    pub retention: WorktreeRetentionPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorktreeSweepReport {
+    pub workspace: PathBuf,
+    pub apply: bool,
+    pub dry_run: bool,
+    pub remove_targets: bool,
+    pub max_age_seconds: Option<u64>,
+    pub max_count: Option<usize>,
+    pub repository_discovered_count: usize,
+    pub repository_inspected_count: usize,
+    pub repository_pre_gc_skipped_count: usize,
+    pub repository_gc_failed_count: usize,
+    pub repository_failure_count: usize,
+    pub considered_count: usize,
+    pub removed_count: usize,
+    pub protected_count: usize,
+    pub retained_count: usize,
+    pub target_removed_count: usize,
+    pub orphan_removed_count: usize,
+    pub repositories: Vec<WorktreeSweepRepositoryReport>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorktreeSweepRepositoryReport {
+    pub group: String,
+    pub worktree_root: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<PathBuf>,
+    pub status: WorktreeSweepRepositoryStatus,
+    pub gc_attempted: bool,
+    pub effects_may_have_occurred: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<WorktreeSweepFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gc_report: Option<WorktreeGcReport>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeSweepRepositoryStatus {
+    Inspected,
+    Skipped,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorktreeSweepFailure {
+    pub kind: WorktreeSweepFailureKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeSweepFailureKind {
+    RepositoryOpen,
+    RepositoryAssociation,
+    AmbiguousRepository,
+    GarbageCollection,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1990,6 +2062,516 @@ impl WorktreeManager {
         Repository::open(&self.repo_path)
             .with_context(|| format!("failed to open repository {}", self.repo_path.display()))
     }
+}
+
+pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<WorktreeSweepReport> {
+    let workspace = fs::canonicalize(&options.workspace).with_context(|| {
+        format!(
+            "failed to resolve workspace {}",
+            options.workspace.display()
+        )
+    })?;
+    require_plain_directory(&workspace, "workspace")?;
+    let worktrees_root = workspace.join(".maco").join("worktrees");
+    let group_names = match fs::symlink_metadata(&worktrees_root) {
+        Ok(_) => bounded_plain_direct_child_names(
+            &worktrees_root,
+            MAX_WORKSPACE_SWEEP_GROUPS,
+            "workspace worktree root",
+        )?,
+        Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect workspace worktree root {}",
+                    worktrees_root.display()
+                )
+            })
+        }
+    };
+    let mut groups = Vec::new();
+    for group_name in group_names {
+        let group = group_name
+            .to_str()
+            .context("workspace worktree group name is not valid UTF-8")?;
+        if group.starts_with(".maco-") {
+            continue;
+        }
+        if group.is_empty() || group.len() > MAX_WORKSPACE_SWEEP_GROUP_NAME_BYTES {
+            bail!("workspace worktree group name is invalid or out of bounds");
+        }
+        groups.push(group.to_string());
+    }
+
+    let dry_run = !options.apply;
+    let mut report = WorktreeSweepReport {
+        workspace: workspace.clone(),
+        apply: options.apply,
+        dry_run,
+        remove_targets: options.remove_targets,
+        max_age_seconds: options.retention.max_age.map(|age| age.as_secs()),
+        max_count: options.retention.max_count,
+        repository_discovered_count: groups.len(),
+        repository_inspected_count: 0,
+        repository_pre_gc_skipped_count: 0,
+        repository_gc_failed_count: 0,
+        repository_failure_count: 0,
+        considered_count: 0,
+        removed_count: 0,
+        protected_count: 0,
+        retained_count: 0,
+        target_removed_count: 0,
+        orphan_removed_count: 0,
+        repositories: Vec::with_capacity(groups.len()),
+    };
+
+    for group in groups {
+        let group_root = worktrees_root.join(&group);
+        let repository = match resolve_sweep_repository(&workspace, &group_root, &group) {
+            Ok(repository) => repository,
+            Err(failure) => {
+                report.repository_pre_gc_skipped_count = report
+                    .repository_pre_gc_skipped_count
+                    .checked_add(1)
+                    .context("workspace sweep skipped repository count overflowed")?;
+                report.repository_failure_count = report
+                    .repository_failure_count
+                    .checked_add(1)
+                    .context("workspace sweep repository failure count overflowed")?;
+                report.repositories.push(WorktreeSweepRepositoryReport {
+                    group,
+                    worktree_root: group_root,
+                    repository: None,
+                    status: WorktreeSweepRepositoryStatus::Skipped,
+                    gc_attempted: false,
+                    effects_may_have_occurred: false,
+                    failure: Some(failure),
+                    gc_report: None,
+                });
+                continue;
+            }
+        };
+        let gc_result = WorktreeManager::new(&repository).gc(WorktreeGcOptions {
+            worktree_root: Some(group_root.clone()),
+            dry_run,
+            remove_targets: options.remove_targets,
+            retention: options.retention,
+            exclude_agent_id: None,
+            machine_global_retention: None,
+        });
+        match gc_result {
+            Ok(gc_report) => {
+                add_sweep_gc_counts(&mut report, &gc_report)?;
+                report.repository_inspected_count = report
+                    .repository_inspected_count
+                    .checked_add(1)
+                    .context("workspace sweep inspected repository count overflowed")?;
+                report.repositories.push(WorktreeSweepRepositoryReport {
+                    group,
+                    worktree_root: group_root,
+                    repository: Some(repository),
+                    status: WorktreeSweepRepositoryStatus::Inspected,
+                    gc_attempted: true,
+                    effects_may_have_occurred: false,
+                    failure: None,
+                    gc_report: Some(gc_report),
+                });
+            }
+            Err(error) => {
+                report.repository_gc_failed_count = report
+                    .repository_gc_failed_count
+                    .checked_add(1)
+                    .context("workspace sweep GC failure count overflowed")?;
+                report.repository_failure_count = report
+                    .repository_failure_count
+                    .checked_add(1)
+                    .context("workspace sweep repository failure count overflowed")?;
+                report.repositories.push(WorktreeSweepRepositoryReport {
+                    group,
+                    worktree_root: group_root,
+                    repository: Some(repository),
+                    status: WorktreeSweepRepositoryStatus::Failed,
+                    gc_attempted: true,
+                    effects_may_have_occurred: true,
+                    failure: Some(WorktreeSweepFailure {
+                        kind: WorktreeSweepFailureKind::GarbageCollection,
+                        message: format!("{error:#}"),
+                    }),
+                    gc_report: None,
+                });
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+fn add_sweep_gc_counts(sweep: &mut WorktreeSweepReport, gc: &WorktreeGcReport) -> Result<()> {
+    sweep.considered_count = sweep
+        .considered_count
+        .checked_add(gc.considered_count)
+        .context("workspace sweep considered count overflowed")?;
+    sweep.removed_count = sweep
+        .removed_count
+        .checked_add(gc.removed_count)
+        .context("workspace sweep removed count overflowed")?;
+    sweep.protected_count = sweep
+        .protected_count
+        .checked_add(gc.protected_count)
+        .context("workspace sweep protected count overflowed")?;
+    sweep.retained_count = sweep
+        .retained_count
+        .checked_add(gc.retained_count)
+        .context("workspace sweep retained count overflowed")?;
+    sweep.target_removed_count = sweep
+        .target_removed_count
+        .checked_add(gc.target_removed_count)
+        .context("workspace sweep target count overflowed")?;
+    sweep.orphan_removed_count = sweep
+        .orphan_removed_count
+        .checked_add(gc.orphan_removed_count)
+        .context("workspace sweep orphan count overflowed")?;
+    Ok(())
+}
+
+fn resolve_sweep_repository(
+    workspace: &Path,
+    group_root: &Path,
+    group: &str,
+) -> std::result::Result<PathBuf, WorktreeSweepFailure> {
+    let lane_names = bounded_plain_direct_child_names(
+        group_root,
+        MAX_WORKSPACE_SWEEP_LANES_PER_GROUP,
+        "workspace worktree group",
+    )
+    .map_err(|error| sweep_failure(WorktreeSweepFailureKind::RepositoryAssociation, error))?;
+    let mut lane_associations = BTreeMap::new();
+    for lane_name in lane_names {
+        if lane_name.to_string_lossy().starts_with(".maco-") {
+            continue;
+        }
+        let lane_path = group_root.join(&lane_name);
+        let git_marker = lane_path.join(".git");
+        match fs::symlink_metadata(&git_marker) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(sweep_failure(
+                    WorktreeSweepFailureKind::RepositoryOpen,
+                    anyhow::Error::new(error).context(format!(
+                        "failed to inspect lane Git metadata {}",
+                        git_marker.display()
+                    )),
+                ))
+            }
+        }
+        let lane_repo = Repository::open(&lane_path).map_err(|error| {
+            sweep_failure(
+                WorktreeSweepFailureKind::RepositoryOpen,
+                anyhow::Error::new(error).context(format!(
+                    "failed to open lane repository {}",
+                    lane_path.display()
+                )),
+            )
+        })?;
+        let (common_dir, primary) =
+            validate_lane_sweep_association(workspace, group_root, &lane_path, &lane_repo)?;
+        lane_associations.insert(common_dir, primary);
+        if lane_associations.len() > 1 {
+            return Err(WorktreeSweepFailure {
+                kind: WorktreeSweepFailureKind::AmbiguousRepository,
+                message: format!(
+                    "workspace worktree group '{}' is associated with multiple primary repositories",
+                    group
+                ),
+            });
+        }
+    }
+    if let Some(primary) = lane_associations.into_values().next() {
+        let workspace_primary =
+            resolve_sweep_repository_from_workspace(workspace, group_root, group)?;
+        if workspace_primary != primary {
+            return Err(WorktreeSweepFailure {
+                kind: WorktreeSweepFailureKind::RepositoryAssociation,
+                message: format!(
+                    "workspace worktree group '{}' resolves to different lane and workspace repositories",
+                    group
+                ),
+            });
+        }
+        return Ok(primary);
+    }
+
+    resolve_sweep_repository_from_workspace(workspace, group_root, group)
+}
+
+fn resolve_sweep_repository_from_workspace(
+    workspace: &Path,
+    group_root: &Path,
+    group: &str,
+) -> std::result::Result<PathBuf, WorktreeSweepFailure> {
+    let child_names =
+        bounded_plain_direct_child_names(workspace, MAX_WORKSPACE_SWEEP_CHILDREN, "workspace")
+            .map_err(|error| {
+                sweep_failure(WorktreeSweepFailureKind::RepositoryAssociation, error)
+            })?;
+    let mut candidates = Vec::new();
+    for child_name in child_names {
+        if child_name == OsStr::new(".maco") || child_name.to_string_lossy().starts_with(".maco-") {
+            continue;
+        }
+        let candidate_group = match child_name.to_str() {
+            Some(name) => sanitize_path_segment(name),
+            None => "repository".to_string(),
+        };
+        if candidate_group != group {
+            continue;
+        }
+        let candidate_path = workspace.join(&child_name);
+        match fs::symlink_metadata(candidate_path.join(".git")) {
+            Ok(_) => candidates.push(candidate_path),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(sweep_failure(
+                    WorktreeSweepFailureKind::RepositoryOpen,
+                    anyhow::Error::new(error)
+                        .context("failed to inspect primary repository Git metadata"),
+                ))
+            }
+        }
+    }
+    if candidates.len() > 1 {
+        return Err(WorktreeSweepFailure {
+            kind: WorktreeSweepFailureKind::AmbiguousRepository,
+            message: format!(
+                "workspace worktree group '{}' matches multiple primary repository paths",
+                group
+            ),
+        });
+    }
+    let Some(candidate_path) = candidates.pop() else {
+        return Err(WorktreeSweepFailure {
+            kind: WorktreeSweepFailureKind::RepositoryAssociation,
+            message: format!(
+                "workspace worktree group '{}' has no resolvable primary repository",
+                group
+            ),
+        });
+    };
+    let primary = Repository::open(&candidate_path).map_err(|error| {
+        sweep_failure(
+            WorktreeSweepFailureKind::RepositoryOpen,
+            anyhow::Error::new(error).context(format!(
+                "failed to open primary repository {}",
+                candidate_path.display()
+            )),
+        )
+    })?;
+    validate_primary_sweep_association(workspace, group_root, &candidate_path, &primary, None)
+        .map(|(_, path)| path)
+}
+
+fn validate_lane_sweep_association(
+    workspace: &Path,
+    group_root: &Path,
+    lane_path: &Path,
+    lane: &Repository,
+) -> std::result::Result<(PathBuf, PathBuf), WorktreeSweepFailure> {
+    let lane_workdir = lane.workdir().ok_or_else(|| WorktreeSweepFailure {
+        kind: WorktreeSweepFailureKind::RepositoryAssociation,
+        message: format!("lane repository {} is bare", lane_path.display()),
+    })?;
+    let canonical_lane = fs::canonicalize(lane_path).map_err(|error| {
+        sweep_failure(
+            WorktreeSweepFailureKind::RepositoryAssociation,
+            anyhow::Error::new(error).context("failed to resolve lane path"),
+        )
+    })?;
+    let canonical_workdir = fs::canonicalize(lane_workdir).map_err(|error| {
+        sweep_failure(
+            WorktreeSweepFailureKind::RepositoryAssociation,
+            anyhow::Error::new(error).context("failed to resolve lane workdir"),
+        )
+    })?;
+    if canonical_workdir != canonical_lane {
+        return Err(WorktreeSweepFailure {
+            kind: WorktreeSweepFailureKind::RepositoryAssociation,
+            message: format!(
+                "lane repository workdir does not match its exact group child {}",
+                lane_path.display()
+            ),
+        });
+    }
+    let common_dir = fs::canonicalize(lane.commondir()).map_err(|error| {
+        sweep_failure(
+            WorktreeSweepFailureKind::RepositoryAssociation,
+            anyhow::Error::new(error).context("failed to resolve lane repository common directory"),
+        )
+    })?;
+    let primary_path = common_dir
+        .parent()
+        .ok_or_else(|| WorktreeSweepFailure {
+            kind: WorktreeSweepFailureKind::RepositoryAssociation,
+            message: "lane repository common directory has no primary parent".to_string(),
+        })?
+        .to_path_buf();
+    let primary = Repository::open(&primary_path).map_err(|error| {
+        sweep_failure(
+            WorktreeSweepFailureKind::RepositoryOpen,
+            anyhow::Error::new(error).context(format!(
+                "failed to open primary repository {}",
+                primary_path.display()
+            )),
+        )
+    })?;
+    validate_primary_sweep_association(
+        workspace,
+        group_root,
+        &primary_path,
+        &primary,
+        Some(&common_dir),
+    )
+}
+
+fn validate_primary_sweep_association(
+    workspace: &Path,
+    group_root: &Path,
+    primary_path: &Path,
+    primary: &Repository,
+    expected_common_dir: Option<&Path>,
+) -> std::result::Result<(PathBuf, PathBuf), WorktreeSweepFailure> {
+    let primary_workdir = primary.workdir().ok_or_else(|| WorktreeSweepFailure {
+        kind: WorktreeSweepFailureKind::RepositoryAssociation,
+        message: format!("primary repository {} is bare", primary_path.display()),
+    })?;
+    let canonical_primary = fs::canonicalize(primary_path).map_err(|error| {
+        sweep_failure(
+            WorktreeSweepFailureKind::RepositoryAssociation,
+            anyhow::Error::new(error).context("failed to resolve primary repository path"),
+        )
+    })?;
+    let canonical_workdir = fs::canonicalize(primary_workdir).map_err(|error| {
+        sweep_failure(
+            WorktreeSweepFailureKind::RepositoryAssociation,
+            anyhow::Error::new(error).context("failed to resolve primary repository workdir"),
+        )
+    })?;
+    let canonical_common = fs::canonicalize(primary.commondir()).map_err(|error| {
+        sweep_failure(
+            WorktreeSweepFailureKind::RepositoryAssociation,
+            anyhow::Error::new(error)
+                .context("failed to resolve primary repository common directory"),
+        )
+    })?;
+    let embedded_git = canonical_primary.join(".git");
+    let embedded_git_metadata = fs::symlink_metadata(&embedded_git).map_err(|error| {
+        sweep_failure(
+            WorktreeSweepFailureKind::RepositoryAssociation,
+            anyhow::Error::new(error).context("failed to inspect primary repository .git"),
+        )
+    })?;
+    if !embedded_git_metadata.is_dir() || embedded_git_metadata.file_type().is_symlink() {
+        return Err(WorktreeSweepFailure {
+            kind: WorktreeSweepFailureKind::RepositoryAssociation,
+            message: "resolved primary repository does not have a plain embedded .git directory"
+                .to_string(),
+        });
+    }
+    let canonical_embedded_git = fs::canonicalize(&embedded_git).map_err(|error| {
+        sweep_failure(
+            WorktreeSweepFailureKind::RepositoryAssociation,
+            anyhow::Error::new(error).context("failed to resolve primary repository .git"),
+        )
+    })?;
+    if canonical_primary != canonical_workdir
+        || canonical_common != canonical_embedded_git
+        || canonical_common.parent() != Some(canonical_primary.as_path())
+        || primary.path() != primary.commondir()
+    {
+        return Err(WorktreeSweepFailure {
+            kind: WorktreeSweepFailureKind::RepositoryAssociation,
+            message: "resolved repository is not an embedded-Git primary worktree".to_string(),
+        });
+    }
+    if expected_common_dir.is_some_and(|expected| expected != canonical_common) {
+        return Err(WorktreeSweepFailure {
+            kind: WorktreeSweepFailureKind::RepositoryAssociation,
+            message: "lane and primary repository common directories do not match".to_string(),
+        });
+    }
+    if canonical_primary.parent() != Some(workspace) {
+        return Err(WorktreeSweepFailure {
+            kind: WorktreeSweepFailureKind::RepositoryAssociation,
+            message: "primary repository is not a direct workspace child".to_string(),
+        });
+    }
+    let canonical_group_root = fs::canonicalize(group_root).map_err(|error| {
+        sweep_failure(
+            WorktreeSweepFailureKind::RepositoryAssociation,
+            anyhow::Error::new(error).context("failed to resolve workspace worktree group"),
+        )
+    })?;
+    let expected_group_root = default_worktree_root(primary);
+    let canonical_expected_root = fs::canonicalize(&expected_group_root).map_err(|error| {
+        sweep_failure(
+            WorktreeSweepFailureKind::RepositoryAssociation,
+            anyhow::Error::new(error)
+                .context("failed to resolve primary repository default worktree root"),
+        )
+    })?;
+    if canonical_group_root != canonical_expected_root {
+        return Err(WorktreeSweepFailure {
+            kind: WorktreeSweepFailureKind::RepositoryAssociation,
+            message: "primary repository is not associated with the exact worktree group"
+                .to_string(),
+        });
+    }
+    Ok((canonical_common, canonical_primary))
+}
+
+fn sweep_failure(kind: WorktreeSweepFailureKind, error: anyhow::Error) -> WorktreeSweepFailure {
+    WorktreeSweepFailure {
+        kind,
+        message: format!("{error:#}"),
+    }
+}
+
+fn require_plain_directory(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("{label} is not a plain directory: {}", path.display());
+    }
+    Ok(())
+}
+
+fn bounded_plain_direct_child_names(
+    root: &Path,
+    limit: usize,
+    label: &str,
+) -> Result<Vec<OsString>> {
+    require_plain_directory(root, label)?;
+    let mut names = Vec::new();
+    let mut observed_entries = 0usize;
+    for entry in
+        fs::read_dir(root).with_context(|| format!("failed to read {label} {}", root.display()))?
+    {
+        observed_entries = observed_entries
+            .checked_add(1)
+            .context("workspace sweep direct entry count overflowed")?;
+        if observed_entries > limit {
+            bail!("{label} exceeds the {limit} entry limit");
+        }
+        let entry = entry.with_context(|| format!("failed to read an entry in {label}"))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect an entry in {label}"))?;
+        if file_type.is_dir() && !file_type.is_symlink() {
+            names.push(entry.file_name());
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 struct WorktreeGcCandidate {
