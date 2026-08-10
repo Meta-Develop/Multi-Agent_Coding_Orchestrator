@@ -4596,16 +4596,16 @@ const fn signed_device_id_to_u64(value: i32) -> u64 {
 /// preserves each negative device identifier modulo 2^64; a checked unsigned
 /// conversion would instead reject every negative value and collapse them to
 /// one fallback identity.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 pub(crate) const fn device_id_to_u64(value: libc::dev_t) -> u64 {
-    #[cfg(target_os = "macos")]
-    {
-        signed_device_id_to_u64(value)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        value as u64
-    }
+    signed_device_id_to_u64(value)
+}
+
+/// Converts `stat::st_dev` to the representation returned by
+/// `std::os::unix::fs::MetadataExt::dev`.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn device_id_to_u64(value: libc::dev_t) -> u64 {
+    unsigned_to_u64(value)
 }
 
 pub(crate) fn unsigned_to_u32<T>(value: T) -> u32
