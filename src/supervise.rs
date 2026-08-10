@@ -1795,6 +1795,7 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilo
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
     options: SupervisorRunOptions,
     outer_entrypoint: GeneratedFollowUpQueueEntrypoint,

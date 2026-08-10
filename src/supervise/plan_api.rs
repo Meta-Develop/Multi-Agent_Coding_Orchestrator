@@ -1031,6 +1031,7 @@ pub(crate) fn run_supervisor_plan_file_cascade_for_autopilot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_supervisor_plan_file_cascade_with_gate(
     options: SupervisorRunOptions,
     concurrency_policy: SupervisorConcurrencyPolicy,

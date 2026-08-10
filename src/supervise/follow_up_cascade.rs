@@ -123,6 +123,7 @@ pub(super) fn ensure_generated_follow_up_cascade_needs_resume(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run_generated_follow_up_cascade(
     repo: &Path,
     source_loaded: &LoadedSupervisorPlan,

@@ -1378,18 +1378,14 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         Err(error) => {
             let cancellation_was_observed = cancellation_observed.load(Ordering::SeqCst);
             let source_dispatch_started = source_dispatch_started.load(Ordering::SeqCst);
-            let cancellation_cleanup_completed =
-                if cancellation_was_observed && !source_dispatch_started {
-                    match cancelled_pre_dispatch_cleanup_completed(
-                        &repo,
-                        command_primary_worktree_untouched,
-                    ) {
-                        Ok(completed) => completed,
-                        Err(_) => false,
-                    }
-                } else {
-                    false
-                };
+            let cancellation_cleanup_completed = if cancellation_was_observed
+                && !source_dispatch_started
+            {
+                cancelled_pre_dispatch_cleanup_completed(&repo, command_primary_worktree_untouched)
+                    .unwrap_or_default()
+            } else {
+                false
+            };
             let profile_refused_before_source_dispatch =
                 !source_dispatch_started && !profile_binding.permits_dispatch();
             let admission_refused_before_source_dispatch = !source_dispatch_started
@@ -1508,14 +1504,8 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     let follow_up_gate_denials = cascade.follow_up_gate_denials.clone();
     let cancellation_was_observed = cancellation_observed.load(Ordering::SeqCst);
     let cancellation_cleanup_completed = if cancellation_was_observed {
-        match cancelled_cascade_cleanup_completed(
-            &repo,
-            &cascade,
-            command_primary_worktree_untouched,
-        ) {
-            Ok(completed) => completed,
-            Err(_) => false,
-        }
+        cancelled_cascade_cleanup_completed(&repo, &cascade, command_primary_worktree_untouched)
+            .unwrap_or_default()
     } else {
         false
     };

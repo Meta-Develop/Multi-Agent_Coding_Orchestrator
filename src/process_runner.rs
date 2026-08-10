@@ -2819,10 +2819,10 @@ fn process_ownership_error(
 fn environment_failure_from_source(source: &std::io::Error) -> Option<(EnvironmentFailure, bool)> {
     #[cfg(target_os = "linux")]
     {
-        return source
+        source
             .get_ref()
             .and_then(|source| source.downcast_ref::<EnvironmentFailureSource>())
-            .map(|source| (source.failure.clone(), source.target_process_started));
+            .map(|source| (source.failure.clone(), source.target_process_started))
     }
     #[cfg(not(target_os = "linux"))]
     {
