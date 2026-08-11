@@ -1066,6 +1066,9 @@ struct ManagedWorktreeOperation {
     delete_branch: bool,
     force: bool,
     expected_branch_oid: Option<String>,
+    /// Legacy f3 GC digest retained only for authenticated format compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gc_dirtiness_checksum: Option<String>,
     /// Authenticated removal origin and, for GC, the exact reviewed state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     removal_safety: Option<ManagedRemovalSafety>,
@@ -1586,6 +1589,7 @@ impl WorktreeManager {
                 delete_branch: false,
                 force: cfg!(test),
                 expected_branch_oid: None,
+                gc_dirtiness_checksum: None,
                 removal_safety: None,
                 worktree_quarantine_path: None,
                 worktree_quarantine_identity: None,
@@ -1807,6 +1811,8 @@ impl WorktreeManager {
             operation.force = true;
             if operation.kind == ManagedWorktreeOperationKind::Remove {
                 operation.delete_branch |= delete_branch;
+                operation.gc_dirtiness_checksum = None;
+                operation.removal_safety = Some(ManagedRemovalSafety::Explicit);
             }
             registry_store.save(&registry_lock, &mut registry)?;
         }
@@ -1890,6 +1896,7 @@ impl WorktreeManager {
                 delete_branch,
                 force,
                 expected_branch_oid: Some(verified.branch_oid.to_string()),
+                gc_dirtiness_checksum: None,
                 removal_safety: Some(ManagedRemovalSafety::Explicit),
                 worktree_quarantine_path: Some(worktree_quarantine_path),
                 worktree_quarantine_identity: None,
@@ -3550,6 +3557,7 @@ fn remove_gc_candidate(
         delete_branch: false,
         force: true,
         expected_branch_oid: Some(candidate.branch_oid.to_string()),
+        gc_dirtiness_checksum: None,
         removal_safety: Some(ManagedRemovalSafety::GarbageCollection {
             dirtiness,
             target: target_snapshot,
@@ -3641,7 +3649,7 @@ enum WorktreeGcDirtiness {
 }
 
 fn gc_worktree_dirtiness(path: &Path) -> Result<WorktreeGcDirtiness> {
-    let status = bounded_repository_status_paths(
+    let status = bounded_repository_gc_status_paths(
         path,
         MAX_WORKTREE_STATUS_ENTRIES,
         MAX_WORKTREE_STATUS_OUTPUT_BYTES,
@@ -5739,6 +5747,16 @@ fn validate_registry_bounds(registry: &ManagedWorktreeRegistry) -> Result<()> {
             bail!("managed worktree registry operation key/name is not canonical");
         }
         validate_branch_name(&operation.branch)?;
+        if let Some(checksum) = operation.gc_dirtiness_checksum.as_deref() {
+            if operation.kind != ManagedWorktreeOperationKind::Remove
+                || checksum.len() > 128
+                || !checksum.starts_with("maco-v1-")
+                || !checksum.bytes().all(|byte| byte.is_ascii_graphic())
+                || operation.removal_safety.is_some()
+            {
+                bail!("managed worktree operation has invalid legacy GC safety state");
+            }
+        }
         if let Some(safety) = operation.removal_safety.as_ref() {
             if operation.kind != ManagedWorktreeOperationKind::Remove {
                 bail!("managed worktree create operation has removal safety state");
@@ -6836,21 +6854,18 @@ fn recover_remove_operation(
                     }
                 }
                 Some(ManagedRemovalSafety::Explicit) if operation.force => {}
-                Some(ManagedRemovalSafety::Explicit) | None => {
+                Some(ManagedRemovalSafety::Explicit) => {
                     ensure_clean_worktree(&verified.path).with_context(|| {
-                        if operation.removal_safety.is_none() {
-                            format!(
-                                "legacy pending removal '{}' has ambiguous safety state and must be clean",
-                                operation.name
-                            )
-                        } else {
-                            format!(
-                                "pending explicit removal '{}' requires a clean worktree",
-                                operation.name
-                            )
-                        }
+                        format!(
+                            "pending explicit removal '{}' requires a clean worktree",
+                            operation.name
+                        )
                     })?;
                 }
+                None => bail!(
+                    "legacy pending removal '{}' has ambiguous safety state; rerun explicit remove --force to reauthorize it",
+                    operation.name
+                ),
             }
         }
         ensure_removal_worktree_lock(repo, &binding)?;
@@ -8102,6 +8117,33 @@ pub(crate) fn bounded_repository_status_paths(
     bounded_repository_status_paths_bound(&binding, max_entries, max_output_bytes, timeout)
 }
 
+fn bounded_repository_gc_status_paths(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+) -> Result<BoundedStatusPathRecords> {
+    let binding = RepositoryBindingGuard::bind(path)?;
+    binding.verify()?;
+    let records =
+        bounded_worktree_records_with_ignored(path, max_entries, max_output_bytes, timeout)?;
+    let mut merged = parse_porcelain_v1_z(&records.status, max_entries)?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let ignored = parse_nul_paths(&records.ignored, max_entries)?;
+    for path in ignored {
+        if is_bounded_status_runtime_path(&path) {
+            continue;
+        }
+        merged.entry(path).or_insert([b'?', b'?']);
+        if merged.len() > max_entries {
+            bail!("bounded GC status exceeded its combined parsed entry limit");
+        }
+    }
+    binding.verify()?;
+    Ok(merged.into_iter().collect())
+}
+
 type BoundedStatusPathRecords = Vec<(PathBuf, [u8; 2])>;
 
 pub(crate) fn bounded_repository_status_paths_bound(
@@ -8154,6 +8196,7 @@ pub(crate) fn bounded_repository_visible_paths_bound_with_process_wait(
 struct BoundedWorktreeRecords {
     visible: Vec<u8>,
     status: Vec<u8>,
+    ignored: Vec<u8>,
     process_queue_wait: Duration,
 }
 
@@ -8162,6 +8205,25 @@ fn bounded_worktree_records(
     max_entries: usize,
     max_output_bytes: usize,
     timeout: Duration,
+) -> Result<BoundedWorktreeRecords> {
+    bounded_worktree_records_mode(path, max_entries, max_output_bytes, timeout, false)
+}
+
+fn bounded_worktree_records_with_ignored(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+) -> Result<BoundedWorktreeRecords> {
+    bounded_worktree_records_mode(path, max_entries, max_output_bytes, timeout, true)
+}
+
+fn bounded_worktree_records_mode(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+    collect_ignored: bool,
 ) -> Result<BoundedWorktreeRecords> {
     let (_process_lock, deadline, process_queue_wait) =
         enter_bounded_status_process_scope(timeout)?;
@@ -8175,6 +8237,7 @@ fn bounded_worktree_records(
         &state_root,
         |_| Ok(()),
         deadline,
+        collect_ignored,
     )?;
     records.process_queue_wait = process_queue_wait;
     Ok(records)
@@ -8219,6 +8282,7 @@ where
         state_root,
         after_index_snapshot,
         deadline,
+        false,
     )
     .map(|records| records.status.is_empty())
 }
@@ -8243,6 +8307,7 @@ where
         state_root,
         after_index_snapshot,
         deadline,
+        false,
     )
     .map(|records| records.status.is_empty())
 }
@@ -8254,6 +8319,7 @@ fn bounded_worktree_status_in_runtime_until<F>(
     state_root: &SafeRoot,
     after_index_snapshot: F,
     deadline: Instant,
+    collect_ignored: bool,
 ) -> Result<BoundedWorktreeRecords>
 where
     F: FnOnce(&SafeRoot) -> Result<()>,
@@ -8402,10 +8468,55 @@ where
             "bounded managed-worktree status",
         )?;
         ensure_worktree_status_deadline(deadline, "after bounded managed-worktree status")?;
+        let status_entries = bytes.iter().filter(|byte| **byte == 0).count();
+        let remaining_entries = max_entries
+            .checked_sub(status_entries)
+            .context("bounded worktree status exceeded its combined entry limit")?;
+        let remaining_output_bytes = max_output_bytes
+            .checked_sub(bytes.len())
+            .context("bounded worktree status exceeded its combined output limit")?;
+        let ignored = if collect_ignored {
+            let ignored = run_bounded_git_records(
+                &git_context,
+                [
+                    "--no-optional-locks",
+                    "ls-files",
+                    "-z",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                    "--exclude=!.maco",
+                    "--exclude=!.maco/**",
+                    "--exclude=!.maco-cache",
+                    "--exclude=!.maco-cache/**",
+                    "--exclude=!target",
+                    "--exclude=!target/**",
+                    "--exclude=!.agent/temp",
+                    "--exclude=!.agent/temp/**",
+                    "--exclude=!.agent/storage",
+                    "--exclude=!.agent/storage/**",
+                    "--exclude=!.agents/live",
+                    "--exclude=!.agents/live/**",
+                    "--exclude=!.agents/temp",
+                    "--exclude=!.agents/temp/**",
+                    "--exclude=!.agents/storage",
+                    "--exclude=!.agents/storage/**",
+                ],
+                remaining_entries,
+                remaining_output_bytes,
+                deadline,
+                "bounded managed-worktree ignored listing",
+            )?;
+            ensure_worktree_status_deadline(deadline, "after bounded ignored listing")?;
+            ignored
+        } else {
+            Vec::new()
+        };
         verify_repository_status_bindings(worktree_binding, &git_dir_binding, &common_dir_binding)?;
         Ok(BoundedWorktreeRecords {
             visible,
             status: bytes,
+            ignored,
             process_queue_wait: Duration::ZERO,
         })
     })();
@@ -9897,6 +10008,7 @@ mod tests {
                 delete_branch: false,
                 force: false,
                 expected_branch_oid: None,
+                gc_dirtiness_checksum: None,
                 removal_safety: None,
                 worktree_quarantine_path: None,
                 worktree_quarantine_identity: None,
@@ -10926,6 +11038,126 @@ mod tests {
         assert!(!created.path.exists());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_protects_ignored_only_output_until_its_exact_path_is_allowed() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        commit_descendant(&repo, ".gitignore", "scratch/\n").expect("ignore scratch");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = create_gc_worktree(&manager, "ignored-output", &worktree_root);
+        fs::create_dir(created.path.join("scratch")).expect("scratch directory");
+        fs::write(created.path.join("scratch/result.bin"), "only copy\n")
+            .expect("ignored worker output");
+
+        let protected = manager
+            .gc(gc_options(Some(worktree_root.clone()), false))
+            .expect("ignored-only protection");
+        assert_eq!(protected.removed_count, 0, "{protected:#?}");
+        assert_eq!(protected.protected_count, 1, "{protected:#?}");
+        assert_eq!(protected.entries[0].reason, WorktreeGcReason::UntrackedOnly);
+        assert_eq!(
+            protected.entries[0].untracked_paths,
+            vec![PathBuf::from("scratch/result.bin")]
+        );
+        assert!(created.path.exists());
+
+        let mut allowed = gc_options(Some(worktree_root), false);
+        allowed.allowed_untracked_paths = vec![PathBuf::from("scratch/result.bin")];
+        let reclaimed = manager.gc(allowed).expect("exact ignored path reclaim");
+        assert_eq!(reclaimed.removed_count, 1, "{reclaimed:#?}");
+        assert!(!created.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_refuses_late_ignored_output_after_reviewed_snapshot() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        commit_descendant(&repo, ".gitignore", "scratch/\n").expect("ignore scratch");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = create_gc_worktree(&manager, "late-ignored-output", &worktree_root);
+        fs::create_dir(created.path.join("scratch")).expect("scratch directory");
+        fs::write(created.path.join("scratch/approved.bin"), "approved\n")
+            .expect("approved ignored output");
+        fs::create_dir_all(created.path.join("target/debug")).expect("target");
+        let mut options = gc_options(Some(worktree_root), false);
+        options.allowed_untracked_paths = vec![PathBuf::from("scratch/approved.bin")];
+        let report = manager
+            .gc_with_target_liveness(options, |_| {
+                fs::write(created.path.join("scratch/late.bin"), "only copy\n")
+                    .expect("late ignored output");
+                WorktreeTargetLiveness::Clear
+            })
+            .expect("late ignored output protection");
+        assert_eq!(report.removed_count, 0, "{report:#?}");
+        assert_eq!(report.protected_count, 1, "{report:#?}");
+        assert_eq!(report.entries[0].reason, WorktreeGcReason::UntrackedOnly);
+        assert!(report.entries[0]
+            .untracked_paths
+            .contains(&PathBuf::from("scratch/late.bin")));
+        assert!(created.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_ignored_inventory_excludes_large_runtime_categories_before_bounds() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        commit_descendant(&repo, ".gitignore", "scratch/\n").expect("ignore scratch");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = create_gc_worktree(&manager, "runtime-inventory", &worktree_root);
+        for root in ["target/debug", ".agents/temp/runtime"] {
+            fs::create_dir_all(created.path.join(root)).expect("runtime directory");
+            for index in 0..3 {
+                fs::write(created.path.join(root).join(index.to_string()), "runtime\n")
+                    .expect("runtime entry");
+            }
+        }
+        assert!(matches!(
+            gc_worktree_dirtiness(&created.path).expect("runtime-only dirtiness"),
+            WorktreeGcDirtiness::Clean
+        ));
+        let runtime_only =
+            bounded_repository_gc_status_paths(&created.path, 4, 4096, WORKTREE_GC_STATUS_TIMEOUT)
+                .expect("runtime inventory must not spend ignored entry bounds");
+        assert!(runtime_only.is_empty());
+
+        fs::create_dir(created.path.join("scratch")).expect("scratch directory");
+        fs::write(created.path.join("scratch/output.bin"), "only copy\n")
+            .expect("arbitrary ignored output");
+        let with_output =
+            bounded_repository_gc_status_paths(&created.path, 4, 4096, WORKTREE_GC_STATUS_TIMEOUT)
+                .expect("one arbitrary ignored path fits the bound");
+        assert_eq!(
+            with_output,
+            vec![(PathBuf::from("scratch/output.bin"), [b'?', b'?'])]
+        );
+        for index in 0..5 {
+            fs::write(
+                created.path.join("scratch").join(format!("extra-{index}")),
+                "ignored\n",
+            )
+            .expect("extra arbitrary ignored output");
+        }
+        let general_status =
+            bounded_repository_status_paths(&created.path, 4, 4096, WORKTREE_GC_STATUS_TIMEOUT)
+                .expect("general status must not collect or spend bounds on ignored inventory");
+        assert!(general_status.is_empty());
+    }
+
     #[test]
     fn gc_rejects_non_exact_untracked_allowlist_paths() {
         let absolute = normalize_gc_allowed_untracked_paths(&[PathBuf::from("/tmp/TASK.md")])
@@ -11777,51 +12009,107 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn legacy_ambiguous_remove_requires_clean_before_quarantine() {
-        for dirty in [false, true] {
-            let temp = TempDir::new().expect("tempdir");
-            let repo_path = temp.path().join("repo");
-            let worktree_root = temp.path().join("worktrees");
-            WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-            let repo = Repository::open(&repo_path).expect("open repo");
-            commit_readme(&repo).expect("initial commit");
-            let manager = WorktreeManager::new(&repo_path);
-            let created = create_gc_worktree(&manager, "legacy-removal", &worktree_root);
-            let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
-            let lock = store.lock().expect("lock");
-            let mut registry = store.load(&lock).expect("registry");
-            let (binding, _, _, _) =
-                prepare_remove_operation_for_test(&repo, &store, &lock, &mut registry);
-            if dirty {
-                fs::write(created.path.join("worker-output.txt"), "only copy\n")
-                    .expect("legacy dirty output");
-            }
-            let operation = registry
-                .operations
-                .get(&binding.name)
-                .cloned()
-                .expect("prepared removal");
-            let result = recover_remove_operation_with_lease_using_target_liveness(
-                &repo,
-                &store,
-                &lock,
-                &mut registry,
-                operation,
-                None,
-                &|_| WorktreeTargetLiveness::Clear,
-            );
-            if dirty {
-                let error = result.expect_err("ambiguous dirty removal must fail closed");
-                assert!(
-                    error.to_string().contains("ambiguous safety state"),
-                    "{error:#}"
-                );
-                assert!(binding.path.exists());
-            } else {
-                result.expect("ambiguous clean removal remains recoverable");
-                assert!(!binding.path.exists());
-            }
-        }
+    fn clean_legacy_remove_refuses_until_explicit_force_reauthorization() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = create_gc_worktree(&manager, "legacy-removal", &worktree_root);
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
+        let lock = store.lock().expect("lock");
+        let mut registry = store.load(&lock).expect("registry");
+        let (binding, _, _, _) =
+            prepare_remove_operation_for_test(&repo, &store, &lock, &mut registry);
+        let operation = registry
+            .operations
+            .get(&binding.name)
+            .cloned()
+            .expect("prepared removal");
+        let error = recover_remove_operation_with_lease_using_target_liveness(
+            &repo,
+            &store,
+            &lock,
+            &mut registry,
+            operation,
+            None,
+            &|_| WorktreeTargetLiveness::Clear,
+        )
+        .expect_err("clean legacy removal must still require reauthorization");
+        assert!(
+            error.to_string().contains("ambiguous safety state"),
+            "{error:#}"
+        );
+        assert!(binding.path.exists());
+        drop(lock);
+        drop(store);
+        drop(repo);
+
+        let removed = manager
+            .remove(&binding.name, true, true)
+            .expect("explicit force reauthorizes pending legacy removal");
+        assert_eq!(removed.path, created.path);
+        assert!(!binding.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn f3_legacy_digest_round_trips_authenticated_and_remains_ambiguous() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        create_gc_worktree(&manager, "f3-digest", &worktree_root);
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
+        let lock = store.lock().expect("lock");
+        let mut registry = store.load(&lock).expect("registry");
+        let (binding, _, _, _) =
+            prepare_remove_operation_for_test(&repo, &store, &lock, &mut registry);
+        let digest = stable_checksum(b"legacy-f3-reviewed-state");
+        registry
+            .operations
+            .get_mut(&binding.name)
+            .expect("prepared removal")
+            .gc_dirtiness_checksum = Some(digest.clone());
+        store
+            .save(&lock, &mut registry)
+            .expect("persist f3-compatible digest field");
+        drop(lock);
+        drop(store);
+
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("reopen store");
+        let lock = store.lock().expect("reopen lock");
+        let mut registry = store.load(&lock).expect("authenticated legacy load");
+        let operation = registry
+            .operations
+            .get(&binding.name)
+            .cloned()
+            .expect("round-tripped operation");
+        assert_eq!(
+            operation.gc_dirtiness_checksum.as_deref(),
+            Some(digest.as_str())
+        );
+        assert!(operation.removal_safety.is_none());
+        let error = recover_remove_operation_with_lease_using_target_liveness(
+            &repo,
+            &store,
+            &lock,
+            &mut registry,
+            operation,
+            None,
+            &|_| WorktreeTargetLiveness::Clear,
+        )
+        .expect_err("legacy digest must never authorize recovery");
+        assert!(
+            error.to_string().contains("ambiguous safety state"),
+            "{error:#}"
+        );
+        assert!(binding.path.exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -13898,6 +14186,7 @@ mod tests {
                 delete_branch: false,
                 force: false,
                 expected_branch_oid: None,
+                gc_dirtiness_checksum: None,
                 removal_safety: None,
                 worktree_quarantine_path: None,
                 worktree_quarantine_identity: None,
@@ -13965,6 +14254,7 @@ mod tests {
                 delete_branch: false,
                 force: true,
                 expected_branch_oid: None,
+                gc_dirtiness_checksum: None,
                 removal_safety: None,
                 worktree_quarantine_path: None,
                 worktree_quarantine_identity: None,
@@ -14029,6 +14319,7 @@ mod tests {
                     delete_branch: false,
                     force: true,
                     expected_branch_oid: None,
+                    gc_dirtiness_checksum: None,
                     removal_safety: None,
                     worktree_quarantine_path: None,
                     worktree_quarantine_identity: None,
@@ -14091,6 +14382,7 @@ mod tests {
                 delete_branch: false,
                 force: false,
                 expected_branch_oid: None,
+                gc_dirtiness_checksum: None,
                 removal_safety: None,
                 worktree_quarantine_path: None,
                 worktree_quarantine_identity: None,
@@ -14349,6 +14641,7 @@ mod tests {
             delete_branch: false,
             force: false,
             expected_branch_oid: None,
+            gc_dirtiness_checksum: None,
             removal_safety: None,
             worktree_quarantine_path: None,
             worktree_quarantine_identity: None,
@@ -14459,6 +14752,7 @@ mod tests {
                 delete_branch: true,
                 force: true,
                 expected_branch_oid: Some(verified.branch_oid.to_string()),
+                gc_dirtiness_checksum: None,
                 removal_safety: None,
                 worktree_quarantine_path: Some(worktree_quarantine_path.clone()),
                 worktree_quarantine_identity: None,
@@ -14821,6 +15115,7 @@ mod tests {
                 delete_branch: true,
                 force: true,
                 expected_branch_oid: Some(verified.branch_oid.to_string()),
+                gc_dirtiness_checksum: None,
                 removal_safety: None,
                 worktree_quarantine_path: Some(worktree_quarantine.clone()),
                 worktree_quarantine_identity: None,

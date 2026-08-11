@@ -1293,7 +1293,11 @@ default and report their complete bounded path set; full-lane cleanup is
 eligible only when every such path exactly matches a repeatable
 `--allow-untracked-path <repo-relative-path>` value. This is an exact path list,
 not a glob or blanket ignore, and is bounded to 128 entries and 64 KiB in
-aggregate because a workspace sweep copies it into each per-root report. An
+aggregate because a workspace sweep copies it into each per-root report.
+Repository-ignored files are included in this classification and need the same
+exact authorization. Only documented MACO runtime categories (`target/`,
+`.maco/`, `.maco-cache/`, and the `.agent[s]` temp/storage/live roots) remain
+separately disposable. An
 untracked file may be a worker's only copy of real output. Apply mode repeats
 the bounded status classification immediately before journaling full-lane
 removal and protects the lane if a new tracked or unapproved untracked path
@@ -1302,7 +1306,8 @@ classification and the target's absent/present filesystem identity in its
 authenticated recovery journal, then revalidates both immediately before
 quarantine. New explicit removals record a distinct origin. Explicit `--force`
 bypasses dirtiness but never target liveness; a legacy operation with no origin
-is ambiguous and must be clean before recovery can quarantine it. GC also keeps
+is always ambiguous and cannot enter quarantine until the operator reruns the
+explicit force-removal command to reauthorize it. GC also keeps
 worktrees with
 active MACO execution leases or active path claims for the same agent id.
 Without retention filters, every eligible inactive managed worktree is selected
