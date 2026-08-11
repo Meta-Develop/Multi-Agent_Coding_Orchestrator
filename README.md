@@ -1306,8 +1306,10 @@ classification and the target's absent/present filesystem identity in its
 authenticated recovery journal, then revalidates both immediately before
 quarantine. New explicit removals record a distinct origin. Explicit `--force`
 bypasses dirtiness but never target liveness; a legacy operation with no origin
-is always ambiguous and cannot enter quarantine until the operator reruns the
-explicit force-removal command to reauthorize it. GC also keeps
+is always ambiguous in every unfinished recovery phase and cannot continue until
+the operator reruns the explicit force-removal command to reauthorize it. That
+command replaces the pending branch-deletion choice with its current explicit
+choice rather than inheriting a stale journal value. GC also keeps
 worktrees with
 active MACO execution leases or active path claims for the same agent id.
 Without retention filters, every eligible inactive managed worktree is selected

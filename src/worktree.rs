@@ -1810,7 +1810,7 @@ impl WorktreeManager {
         if let Some(operation) = registry.operations.get_mut(&name) {
             operation.force = true;
             if operation.kind == ManagedWorktreeOperationKind::Remove {
-                operation.delete_branch |= delete_branch;
+                operation.delete_branch = delete_branch;
                 operation.gc_dirtiness_checksum = None;
                 operation.removal_safety = Some(ManagedRemovalSafety::Explicit);
             }
@@ -6762,6 +6762,13 @@ fn recover_remove_operation(
             operation.name
         )
     })?;
+    if operation.removal_safety.is_none() {
+        bail!(
+            "legacy pending removal '{}' has ambiguous safety state in phase {}; rerun explicit remove --force to reauthorize it",
+            operation.name,
+            managed_operation_phase_label(operation.phase)
+        );
+    }
     let expected_branch_oid = operation
         .expected_branch_oid
         .as_deref()
@@ -12023,6 +12030,14 @@ mod tests {
         let mut registry = store.load(&lock).expect("registry");
         let (binding, _, _, _) =
             prepare_remove_operation_for_test(&repo, &store, &lock, &mut registry);
+        registry
+            .operations
+            .get_mut(&binding.name)
+            .expect("prepared removal")
+            .removal_safety = None;
+        store
+            .save(&lock, &mut registry)
+            .expect("persist authenticated legacy origin");
         let operation = registry
             .operations
             .get(&binding.name)
@@ -12056,6 +12071,64 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn quarantined_legacy_remove_requires_reauthorization_and_adopts_exact_branch_scope() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        create_gc_worktree(&manager, "legacy-quarantined", &worktree_root);
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
+        let lock = store.lock().expect("lock");
+        let mut registry = store.load(&lock).expect("registry");
+        let (binding, worktree_quarantine, _, _) =
+            prepare_remove_operation_for_test(&repo, &store, &lock, &mut registry);
+        ensure_removal_worktree_lock(&repo, &binding).expect("removal lock");
+        quarantine_bound_directory(
+            &binding.root,
+            &binding.path,
+            &worktree_quarantine,
+            &binding.path_identity,
+        )
+        .expect("quarantine worktree");
+        let operation = registry
+            .operations
+            .get_mut(&binding.name)
+            .expect("prepared removal");
+        operation.phase = ManagedWorktreeOperationPhase::WorktreeQuarantined;
+        operation.worktree_quarantine_identity = Some(binding.path_identity.clone());
+        operation.removal_safety = None;
+        assert!(
+            operation.delete_branch,
+            "legacy operation starts branch-destructive"
+        );
+        store
+            .save(&lock, &mut registry)
+            .expect("persist quarantined legacy operation");
+
+        let error = recover_pending_operations(&repo, &store, &lock, &mut registry)
+            .expect_err("quarantined legacy operation must require reauthorization");
+        assert!(
+            error.to_string().contains("worktree_quarantined"),
+            "{error:#}"
+        );
+        assert!(worktree_quarantine.exists());
+        drop(lock);
+        drop(store);
+        drop(repo);
+
+        manager
+            .remove(&binding.name, true, false)
+            .expect("explicit force reauthorizes without branch deletion");
+        assert!(!binding.path.exists());
+        let repo = Repository::open(&repo_path).expect("reopen repo");
+        assert!(repo.find_branch(&binding.branch, BranchType::Local).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn f3_legacy_digest_round_trips_authenticated_and_remains_ambiguous() {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
@@ -12071,11 +12144,12 @@ mod tests {
         let (binding, _, _, _) =
             prepare_remove_operation_for_test(&repo, &store, &lock, &mut registry);
         let digest = stable_checksum(b"legacy-f3-reviewed-state");
-        registry
+        let operation = registry
             .operations
             .get_mut(&binding.name)
-            .expect("prepared removal")
-            .gc_dirtiness_checksum = Some(digest.clone());
+            .expect("prepared removal");
+        operation.removal_safety = None;
+        operation.gc_dirtiness_checksum = Some(digest.clone());
         store
             .save(&lock, &mut registry)
             .expect("persist f3-compatible digest field");
@@ -14753,7 +14827,7 @@ mod tests {
                 force: true,
                 expected_branch_oid: Some(verified.branch_oid.to_string()),
                 gc_dirtiness_checksum: None,
-                removal_safety: None,
+                removal_safety: Some(ManagedRemovalSafety::Explicit),
                 worktree_quarantine_path: Some(worktree_quarantine_path.clone()),
                 worktree_quarantine_identity: None,
                 metadata_quarantine_path: Some(metadata_quarantine_path),
@@ -15116,7 +15190,7 @@ mod tests {
                 force: true,
                 expected_branch_oid: Some(verified.branch_oid.to_string()),
                 gc_dirtiness_checksum: None,
-                removal_safety: None,
+                removal_safety: Some(ManagedRemovalSafety::Explicit),
                 worktree_quarantine_path: Some(worktree_quarantine.clone()),
                 worktree_quarantine_identity: None,
                 metadata_quarantine_path: Some(metadata_quarantine.clone()),
