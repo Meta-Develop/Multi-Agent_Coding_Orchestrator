@@ -319,6 +319,8 @@ pub struct WorktreeGcEntry {
     pub status: WorktreeGcStatus,
     pub reason: WorktreeGcReason,
     pub target_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_liveness: Option<WorktreeTargetLivenessEvidence>,
     #[serde(
         default,
         serialize_with = "serialize_worktree_report_paths",
@@ -357,9 +359,46 @@ pub enum WorktreeGcReason {
     TargetWouldRemove,
     LiveTarget,
     TargetLivenessUnknown,
+    TargetIdentityChanged,
     NoTarget,
     UnregisteredOrphan,
     MachineGlobalGate,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorktreeTargetLivenessEvidence {
+    pub pid: Option<u32>,
+    pub source: WorktreeTargetLivenessSource,
+    pub cause: WorktreeTargetLivenessCause,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeTargetLivenessSource {
+    CargoTargetDir,
+    DefaultCargoTarget,
+    ProcessEnvironment,
+    ProcessCwd,
+    ProcessExecutable,
+    ProcessFileDescriptor,
+    ProcScan,
+    MountNamespace,
+    Platform,
+    TargetIdentity,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeTargetLivenessCause {
+    PathOverlap,
+    CargoLikeProcessInLane,
+    ReadFailed,
+    InvalidValue,
+    LimitExceeded,
+    TimedOut,
+    Unsupported,
+    NamespaceUnresolved,
+    IdentityChanged,
 }
 
 #[derive(Serialize)]
@@ -1829,7 +1868,7 @@ impl WorktreeManager {
         target_liveness: F,
     ) -> Result<WorktreeGcReport>
     where
-        F: Fn(&Path) -> WorktreeTargetLiveness,
+        F: Fn(&WorktreeGcTarget) -> WorktreeTargetLiveness,
     {
         validate_worktree_gc_mode(
             options.targets_only,
@@ -1899,6 +1938,7 @@ impl WorktreeManager {
                     status: WorktreeGcStatus::Retained,
                     reason: WorktreeGcReason::ExcludedCurrentWorktree,
                     target_path: None,
+                    target_liveness: None,
                     untracked_paths: Vec::new(),
                     gate_denial: None,
                     retention_operation_id: None,
@@ -1917,6 +1957,7 @@ impl WorktreeManager {
                     status: WorktreeGcStatus::Protected,
                     reason: WorktreeGcReason::ActiveClaim,
                     target_path: None,
+                    target_liveness: None,
                     untracked_paths: Vec::new(),
                     gate_denial: None,
                     retention_operation_id: None,
@@ -1944,6 +1985,7 @@ impl WorktreeManager {
                         status: WorktreeGcStatus::Protected,
                         reason: WorktreeGcReason::ActiveLease,
                         target_path: None,
+                        target_liveness: None,
                         untracked_paths: Vec::new(),
                         gate_denial: None,
                         retention_operation_id: None,
@@ -1968,6 +2010,7 @@ impl WorktreeManager {
                             status: WorktreeGcStatus::Protected,
                             reason: WorktreeGcReason::ActiveLease,
                             target_path: None,
+                            target_liveness: None,
                             untracked_paths: Vec::new(),
                             gate_denial: None,
                             retention_operation_id: None,
@@ -1993,6 +2036,7 @@ impl WorktreeManager {
                         status: WorktreeGcStatus::Protected,
                         reason: WorktreeGcReason::Dirty,
                         target_path: None,
+                        target_liveness: None,
                         untracked_paths: Vec::new(),
                         gate_denial: None,
                         retention_operation_id: None,
@@ -2016,6 +2060,7 @@ impl WorktreeManager {
                             status: WorktreeGcStatus::Protected,
                             reason: WorktreeGcReason::UntrackedOnly,
                             target_path: None,
+                            target_liveness: None,
                             untracked_paths: paths,
                             gate_denial: None,
                             retention_operation_id: None,
@@ -2064,6 +2109,7 @@ impl WorktreeManager {
                                     status: WorktreeGcStatus::Protected,
                                     reason: WorktreeGcReason::Dirty,
                                     target_path: None,
+                                    target_liveness: None,
                                     untracked_paths: Vec::new(),
                                     gate_denial: None,
                                     retention_operation_id: None,
@@ -2086,6 +2132,7 @@ impl WorktreeManager {
                                         status: WorktreeGcStatus::Protected,
                                         reason: WorktreeGcReason::UntrackedOnly,
                                         target_path: None,
+                                        target_liveness: None,
                                         untracked_paths: paths,
                                         gate_denial: None,
                                         retention_operation_id: None,
@@ -2096,10 +2143,10 @@ impl WorktreeManager {
                             }
                         };
                 }
-                let target_path = gc_target_path_if_present(&candidate.binding.path)?;
-                if let Some(reason) = target_path
-                    .as_deref()
-                    .and_then(|path| gc_target_liveness_reason(path, &target_liveness))
+                let target = gc_target_if_present(&candidate.binding.path)?;
+                if let Some((reason, evidence)) = target
+                    .as_ref()
+                    .and_then(|target| gc_target_liveness_protection(target, &target_liveness))
                 {
                     report.protected_count = report
                         .protected_count
@@ -2111,7 +2158,31 @@ impl WorktreeManager {
                         path: candidate.binding.path,
                         status: WorktreeGcStatus::Protected,
                         reason,
-                        target_path,
+                        target_path: target.as_ref().map(|target| target.path.clone()),
+                        target_liveness: Some(evidence),
+                        untracked_paths: candidate.untracked_paths,
+                        gate_denial: None,
+                        retention_operation_id: None,
+                    });
+                    continue;
+                }
+                if options.dry_run
+                    && target
+                        .as_ref()
+                        .is_some_and(|target| !worktree_gc_target_identity_is_current(target))
+                {
+                    report.protected_count = report
+                        .protected_count
+                        .checked_add(1)
+                        .context("worktree GC protected count overflowed")?;
+                    report.entries.push(WorktreeGcEntry {
+                        name: candidate.binding.name,
+                        branch: Some(candidate.binding.branch),
+                        path: candidate.binding.path,
+                        status: WorktreeGcStatus::Protected,
+                        reason: WorktreeGcReason::TargetIdentityChanged,
+                        target_path: target.as_ref().map(|target| target.path.clone()),
+                        target_liveness: Some(target_identity_changed_evidence()),
                         untracked_paths: candidate.untracked_paths,
                         gate_denial: None,
                         retention_operation_id: None,
@@ -2129,20 +2200,41 @@ impl WorktreeManager {
                         path: candidate.binding.path,
                         status: WorktreeGcStatus::WouldRemove,
                         reason: WorktreeGcReason::FinishedBranch,
-                        target_path,
+                        target_path: target.as_ref().map(|target| target.path.clone()),
+                        target_liveness: None,
                         untracked_paths: candidate.untracked_paths,
                         gate_denial: None,
                         retention_operation_id: None,
                     });
                     continue;
                 }
-                remove_gc_candidate(
+                let removal = remove_gc_candidate(
                     &repo,
                     &registry_store,
                     &registry_lock,
                     &mut registry,
                     &candidate,
+                    target.as_ref(),
                 )?;
+                if matches!(removal, WorktreeGcRemovalOutcome::TargetIdentityChanged) {
+                    report.protected_count = report
+                        .protected_count
+                        .checked_add(1)
+                        .context("worktree GC protected count overflowed")?;
+                    report.entries.push(WorktreeGcEntry {
+                        name: candidate.binding.name,
+                        branch: Some(candidate.binding.branch),
+                        path: candidate.binding.path,
+                        status: WorktreeGcStatus::Protected,
+                        reason: WorktreeGcReason::TargetIdentityChanged,
+                        target_path: target.as_ref().map(|target| target.path.clone()),
+                        target_liveness: Some(target_identity_changed_evidence()),
+                        untracked_paths: candidate.untracked_paths,
+                        gate_denial: None,
+                        retention_operation_id: None,
+                    });
+                    continue;
+                }
                 registered_names.remove(&candidate.binding.name);
                 report.removed_count = report
                     .removed_count
@@ -2154,7 +2246,8 @@ impl WorktreeManager {
                     path: candidate.binding.path,
                     status: WorktreeGcStatus::Removed,
                     reason: WorktreeGcReason::FinishedBranch,
-                    target_path,
+                    target_path: target.as_ref().map(|target| target.path.clone()),
+                    target_liveness: None,
                     untracked_paths: candidate.untracked_paths,
                     gate_denial: None,
                     retention_operation_id: None,
@@ -2162,10 +2255,11 @@ impl WorktreeManager {
                 continue;
             }
 
-            let target_path = gc_target_path_if_present(&candidate.binding.path)?;
+            let target = gc_target_if_present(&candidate.binding.path)?;
             if options.remove_targets {
-                if let Some(target_path) = target_path {
-                    if let Some(reason) = gc_target_liveness_reason(&target_path, &target_liveness)
+                if let Some(target) = target {
+                    if let Some((reason, evidence)) =
+                        gc_target_liveness_protection(&target, &target_liveness)
                     {
                         report.protected_count = report
                             .protected_count
@@ -2177,7 +2271,8 @@ impl WorktreeManager {
                             path: candidate.binding.path,
                             status: WorktreeGcStatus::Protected,
                             reason,
-                            target_path: Some(target_path),
+                            target_path: Some(target.path),
+                            target_liveness: Some(evidence),
                             untracked_paths: candidate.untracked_paths,
                             gate_denial: None,
                             retention_operation_id: None,
@@ -2185,9 +2280,49 @@ impl WorktreeManager {
                         continue;
                     }
                     let reason = if options.dry_run {
+                        if !worktree_gc_target_identity_is_current(&target) {
+                            report.protected_count = report
+                                .protected_count
+                                .checked_add(1)
+                                .context("worktree GC protected count overflowed")?;
+                            report.entries.push(WorktreeGcEntry {
+                                name: candidate.binding.name,
+                                branch: Some(candidate.binding.branch),
+                                path: candidate.binding.path,
+                                status: WorktreeGcStatus::Protected,
+                                reason: WorktreeGcReason::TargetIdentityChanged,
+                                target_path: Some(target.path),
+                                target_liveness: Some(target_identity_changed_evidence()),
+                                untracked_paths: candidate.untracked_paths,
+                                gate_denial: None,
+                                retention_operation_id: None,
+                            });
+                            continue;
+                        }
                         WorktreeGcReason::TargetWouldRemove
                     } else {
-                        remove_worktree_target_dir(&candidate.binding.path)?;
+                        if matches!(
+                            remove_worktree_target_dir(&candidate.binding.path, &target)?,
+                            WorktreeTargetRemovalOutcome::IdentityChanged
+                        ) {
+                            report.protected_count = report
+                                .protected_count
+                                .checked_add(1)
+                                .context("worktree GC protected count overflowed")?;
+                            report.entries.push(WorktreeGcEntry {
+                                name: candidate.binding.name,
+                                branch: Some(candidate.binding.branch),
+                                path: candidate.binding.path,
+                                status: WorktreeGcStatus::Protected,
+                                reason: WorktreeGcReason::TargetIdentityChanged,
+                                target_path: Some(target.path),
+                                target_liveness: Some(target_identity_changed_evidence()),
+                                untracked_paths: candidate.untracked_paths,
+                                gate_denial: None,
+                                retention_operation_id: None,
+                            });
+                            continue;
+                        }
                         report.target_removed_count = report
                             .target_removed_count
                             .checked_add(1)
@@ -2204,7 +2339,8 @@ impl WorktreeManager {
                         path: candidate.binding.path,
                         status: WorktreeGcStatus::Retained,
                         reason,
-                        target_path: Some(target_path),
+                        target_path: Some(target.path),
+                        target_liveness: None,
                         untracked_paths: candidate.untracked_paths,
                         gate_denial: None,
                         retention_operation_id: None,
@@ -2227,6 +2363,7 @@ impl WorktreeManager {
                     WorktreeGcReason::RetentionKeep
                 },
                 target_path: None,
+                target_liveness: None,
                 untracked_paths: candidate.untracked_paths,
                 gate_denial: None,
                 retention_operation_id: None,
@@ -3175,13 +3312,19 @@ struct WorktreeGcCandidate {
     untracked_paths: Vec<PathBuf>,
 }
 
+enum WorktreeGcRemovalOutcome {
+    Removed,
+    TargetIdentityChanged,
+}
+
 fn remove_gc_candidate(
     repo: &Repository,
     registry_store: &ManagedWorktreeRegistryStore,
     registry_lock: &ManagedWorktreeRegistryLock,
     registry: &mut ManagedWorktreeRegistry,
     candidate: &WorktreeGcCandidate,
-) -> Result<()> {
+    target: Option<&WorktreeGcTarget>,
+) -> Result<WorktreeGcRemovalOutcome> {
     if registry.operations.len() >= MAX_MANAGED_OPERATIONS {
         bail!("managed worktree registry has no remaining operation capacity");
     }
@@ -3203,6 +3346,9 @@ fn remove_gc_candidate(
         &binding.name,
         &binding.metadata_dir_identity,
     );
+    if target.is_some_and(|target| !worktree_gc_target_identity_is_current(target)) {
+        return Ok(WorktreeGcRemovalOutcome::TargetIdentityChanged);
+    }
     registry.operations.insert(
         binding.name.clone(),
         ManagedWorktreeOperation {
@@ -3246,7 +3392,8 @@ fn remove_gc_candidate(
         registry_lock,
         registry,
         Some(removal_lease),
-    )
+    )?;
+    Ok(WorktreeGcRemovalOutcome::Removed)
 }
 
 fn resolve_worktree_root(repo: &Repository, requested_root: Option<PathBuf>) -> Result<PathBuf> {
@@ -3411,11 +3558,29 @@ fn retention_selects_gc_candidate(
     count_expired || age_expired
 }
 
-fn gc_target_path_if_present(worktree_path: &Path) -> Result<Option<PathBuf>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorktreeGcTarget {
+    path: PathBuf,
+    canonical_path: PathBuf,
+    identity: FileIdentity,
+}
+
+fn gc_target_if_present(worktree_path: &Path) -> Result<Option<WorktreeGcTarget>> {
     let target_path = worktree_path.join("target");
     match fs::symlink_metadata(&target_path) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            Ok(Some(target_path))
+            let identity = identity_for_path(&target_path)?;
+            let canonical_path = fs::canonicalize(&target_path).with_context(|| {
+                format!(
+                    "failed to resolve worktree target {}",
+                    target_path.display()
+                )
+            })?;
+            Ok(Some(WorktreeGcTarget {
+                path: target_path,
+                canonical_path,
+                identity,
+            }))
         }
         Ok(_) => bail!(
             "worktree target path is not a plain directory: {}",
@@ -3428,52 +3593,114 @@ fn gc_target_path_if_present(worktree_path: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorktreeTargetLiveness {
-    Clear,
-    Live,
-    Unknown,
+fn worktree_gc_target_identity_is_current(target: &WorktreeGcTarget) -> bool {
+    identity_for_path(&target.path)
+        .ok()
+        .is_some_and(|identity| identity == target.identity)
 }
 
-fn gc_target_liveness_reason<F>(target_path: &Path, target_liveness: &F) -> Option<WorktreeGcReason>
+fn target_identity_changed_evidence() -> WorktreeTargetLivenessEvidence {
+    target_liveness_evidence(
+        None,
+        WorktreeTargetLivenessSource::TargetIdentity,
+        WorktreeTargetLivenessCause::IdentityChanged,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorktreeTargetLiveness {
+    Clear,
+    Live(WorktreeTargetLivenessEvidence),
+    Unknown(WorktreeTargetLivenessEvidence),
+}
+
+fn gc_target_liveness_protection<F>(
+    target: &WorktreeGcTarget,
+    target_liveness: &F,
+) -> Option<(WorktreeGcReason, WorktreeTargetLivenessEvidence)>
 where
-    F: Fn(&Path) -> WorktreeTargetLiveness,
+    F: Fn(&WorktreeGcTarget) -> WorktreeTargetLiveness,
 {
-    match target_liveness(target_path) {
+    match target_liveness(target) {
         WorktreeTargetLiveness::Clear => None,
-        WorktreeTargetLiveness::Live => Some(WorktreeGcReason::LiveTarget),
-        WorktreeTargetLiveness::Unknown => Some(WorktreeGcReason::TargetLivenessUnknown),
+        WorktreeTargetLiveness::Live(evidence) => Some((WorktreeGcReason::LiveTarget, evidence)),
+        WorktreeTargetLiveness::Unknown(evidence) => {
+            Some((WorktreeGcReason::TargetLivenessUnknown, evidence))
+        }
     }
 }
 
+fn target_liveness_evidence(
+    pid: Option<u32>,
+    source: WorktreeTargetLivenessSource,
+    cause: WorktreeTargetLivenessCause,
+) -> WorktreeTargetLivenessEvidence {
+    WorktreeTargetLivenessEvidence { pid, source, cause }
+}
+
 #[cfg(target_os = "linux")]
-fn worktree_target_liveness(target_path: &Path) -> WorktreeTargetLiveness {
-    let target_path = match fs::canonicalize(target_path) {
-        Ok(target_path) => target_path,
-        Err(_) => return WorktreeTargetLiveness::Unknown,
-    };
+fn worktree_target_liveness(target: &WorktreeGcTarget) -> WorktreeTargetLiveness {
+    if identity_for_path(&target.path)
+        .ok()
+        .as_ref()
+        .is_none_or(|identity| identity != &target.identity)
+    {
+        return WorktreeTargetLiveness::Unknown(target_liveness_evidence(
+            None,
+            WorktreeTargetLivenessSource::TargetIdentity,
+            WorktreeTargetLivenessCause::IdentityChanged,
+        ));
+    }
     let deadline = match Instant::now().checked_add(WORKTREE_GC_PROC_SCAN_TIMEOUT) {
         Some(deadline) => deadline,
-        None => return WorktreeTargetLiveness::Unknown,
+        None => {
+            return WorktreeTargetLiveness::Unknown(target_liveness_evidence(
+                None,
+                WorktreeTargetLivenessSource::ProcScan,
+                WorktreeTargetLivenessCause::LimitExceeded,
+            ))
+        }
     };
     let entries = match fs::read_dir("/proc") {
         Ok(entries) => entries,
-        Err(_) => return WorktreeTargetLiveness::Unknown,
+        Err(_) => {
+            return WorktreeTargetLiveness::Unknown(target_liveness_evidence(
+                None,
+                WorktreeTargetLivenessSource::ProcScan,
+                WorktreeTargetLivenessCause::ReadFailed,
+            ))
+        }
     };
     let current_uid = unsafe { libc::geteuid() };
     let mut observed = 0usize;
-    let mut scan_unknown = false;
+    let mut scan_unknown = None;
     for entry in entries {
         if Instant::now() >= deadline {
-            return WorktreeTargetLiveness::Unknown;
+            return WorktreeTargetLiveness::Unknown(target_liveness_evidence(
+                None,
+                WorktreeTargetLivenessSource::ProcScan,
+                WorktreeTargetLivenessCause::TimedOut,
+            ));
         }
         observed = match observed.checked_add(1) {
             Some(observed) if observed <= MAX_WORKTREE_GC_PROC_ENTRIES => observed,
-            _ => return WorktreeTargetLiveness::Unknown,
+            _ => {
+                return WorktreeTargetLiveness::Unknown(target_liveness_evidence(
+                    None,
+                    WorktreeTargetLivenessSource::ProcScan,
+                    WorktreeTargetLivenessCause::LimitExceeded,
+                ))
+            }
         };
         let entry = match entry {
             Ok(entry) => entry,
-            Err(_) => return WorktreeTargetLiveness::Unknown,
+            Err(_) => {
+                return WorktreeTargetLiveness::Unknown(target_liveness_evidence(
+                    None,
+                    WorktreeTargetLivenessSource::ProcScan,
+                    WorktreeTargetLivenessCause::ReadFailed,
+                ))
+            }
         };
         let pid = match entry
             .file_name()
@@ -3487,112 +3714,155 @@ fn worktree_target_liveness(target_path: &Path) -> WorktreeTargetLiveness {
         let metadata = match fs::metadata(&process_root) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => continue,
-            Err(_) => return WorktreeTargetLiveness::Unknown,
+            Err(_) => {
+                return WorktreeTargetLiveness::Unknown(target_liveness_evidence(
+                    Some(pid),
+                    WorktreeTargetLivenessSource::ProcScan,
+                    WorktreeTargetLivenessCause::ReadFailed,
+                ))
+            }
         };
         if metadata.uid() != current_uid {
             continue;
         }
-        let mut environ = Vec::new();
-        let file = match fs::File::open(process_root.join("environ")) {
-            Ok(file) => file,
-            Err(error) if error.kind() == ErrorKind::NotFound => continue,
-            Err(_) => {
-                let cargo_like = linux_process_is_cargo_like(&process_root);
-                let association = linux_process_target_association(
-                    &process_root,
-                    &target_path,
-                    deadline,
-                    cargo_like,
-                );
-                if unreadable_process_target_liveness(cargo_like, association)
-                    == WorktreeTargetLiveness::Unknown
-                {
-                    scan_unknown = true;
+        match linux_process_target_liveness(&process_root, pid, target, deadline) {
+            WorktreeTargetLiveness::Clear => {}
+            WorktreeTargetLiveness::Live(evidence) => {
+                return WorktreeTargetLiveness::Live(evidence)
+            }
+            WorktreeTargetLiveness::Unknown(evidence) => {
+                scan_unknown.get_or_insert(evidence);
+            }
+        }
+    }
+    match scan_unknown {
+        Some(evidence) => WorktreeTargetLiveness::Unknown(evidence),
+        None => WorktreeTargetLiveness::Clear,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_target_liveness(
+    process_root: &Path,
+    pid: u32,
+    target: &WorktreeGcTarget,
+    deadline: Instant,
+) -> WorktreeTargetLiveness {
+    let cargo_like = linux_process_is_cargo_like(process_root);
+    let mut environment_unknown = None;
+    let mut target_environment_observed = false;
+    match linux_process_environ(process_root) {
+        Ok(Some(environ)) => {
+            for variable in environ.split(|byte| *byte == 0) {
+                let Some(value) = variable.strip_prefix(b"CARGO_TARGET_DIR=") else {
+                    continue;
+                };
+                target_environment_observed = true;
+                if value.is_empty() {
+                    environment_unknown.get_or_insert_with(|| {
+                        target_liveness_evidence(
+                            Some(pid),
+                            WorktreeTargetLivenessSource::ProcessEnvironment,
+                            WorktreeTargetLivenessCause::InvalidValue,
+                        )
+                    });
+                    continue;
                 }
-                continue;
-            }
-        };
-        if file
-            .take(MAX_WORKTREE_GC_PROC_ENVIRON_BYTES.saturating_add(1))
-            .read_to_end(&mut environ)
-            .is_err()
-        {
-            scan_unknown = true;
-            continue;
-        }
-        if u64::try_from(environ.len())
-            .ok()
-            .is_none_or(|length| length > MAX_WORKTREE_GC_PROC_ENVIRON_BYTES)
-        {
-            scan_unknown = true;
-            continue;
-        }
-        for variable in environ.split(|byte| *byte == 0) {
-            let Some(value) = variable.strip_prefix(b"CARGO_TARGET_DIR=") else {
-                continue;
-            };
-            if value.is_empty() {
-                scan_unknown = true;
-                continue;
-            }
-            let configured = PathBuf::from(OsString::from_vec(value.to_vec()));
-            let configured = if configured.is_absolute() {
-                configured
-            } else {
-                let cwd = match fs::read_link(process_root.join("cwd")) {
-                    Ok(cwd) => cwd,
-                    Err(error) if error.kind() == ErrorKind::NotFound => continue,
-                    Err(_) => {
-                        scan_unknown = true;
+                let configured = PathBuf::from(OsString::from_vec(value.to_vec()));
+                let configured = match linux_resolve_process_path(process_root, &configured) {
+                    Some(configured) => configured,
+                    None => {
+                        environment_unknown.get_or_insert_with(|| {
+                            target_liveness_evidence(
+                                Some(pid),
+                                WorktreeTargetLivenessSource::MountNamespace,
+                                WorktreeTargetLivenessCause::NamespaceUnresolved,
+                            )
+                        });
                         continue;
                     }
                 };
-                cwd.join(configured)
-            };
-            let configured = match normalize_proc_target_path(&configured) {
-                Some(configured) => configured,
-                None => {
-                    scan_unknown = true;
-                    continue;
+                if path_or_identity_overlaps_target(&configured, target) {
+                    return WorktreeTargetLiveness::Live(target_liveness_evidence(
+                        Some(pid),
+                        WorktreeTargetLivenessSource::CargoTargetDir,
+                        WorktreeTargetLivenessCause::PathOverlap,
+                    ));
                 }
-            };
-            let configured = match fs::canonicalize(configured) {
-                Ok(configured) => configured,
-                Err(_) => {
-                    scan_unknown = true;
-                    continue;
-                }
-            };
-            if configured.starts_with(&target_path) || target_path.starts_with(&configured) {
-                return WorktreeTargetLiveness::Live;
             }
         }
+        Ok(None) => return WorktreeTargetLiveness::Clear,
+        Err(cause) => {
+            environment_unknown = Some(target_liveness_evidence(
+                Some(pid),
+                WorktreeTargetLivenessSource::ProcessEnvironment,
+                cause,
+            ));
+        }
     }
-    if scan_unknown {
-        WorktreeTargetLiveness::Unknown
-    } else {
-        WorktreeTargetLiveness::Clear
+
+    match linux_process_target_association(process_root, pid, target, deadline, cargo_like) {
+        WorktreeTargetLiveness::Live(evidence) => WorktreeTargetLiveness::Live(evidence),
+        WorktreeTargetLiveness::Unknown(evidence) => WorktreeTargetLiveness::Unknown(evidence),
+        WorktreeTargetLiveness::Clear if cargo_like || target_environment_observed => {
+            match environment_unknown {
+                Some(evidence) => WorktreeTargetLiveness::Unknown(evidence),
+                None => WorktreeTargetLiveness::Clear,
+            }
+        }
+        WorktreeTargetLiveness::Clear => WorktreeTargetLiveness::Clear,
     }
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorktreeTargetAssociation {
-    Unrelated,
-    Associated,
-    Unknown,
+fn linux_process_environ(
+    process_root: &Path,
+) -> std::result::Result<Option<Vec<u8>>, WorktreeTargetLivenessCause> {
+    let mut environ = Vec::new();
+    let file = match fs::File::open(process_root.join("environ")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(WorktreeTargetLivenessCause::ReadFailed),
+    };
+    file.take(MAX_WORKTREE_GC_PROC_ENVIRON_BYTES.saturating_add(1))
+        .read_to_end(&mut environ)
+        .map_err(|_| WorktreeTargetLivenessCause::ReadFailed)?;
+    if u64::try_from(environ.len())
+        .ok()
+        .is_none_or(|length| length > MAX_WORKTREE_GC_PROC_ENVIRON_BYTES)
+    {
+        return Err(WorktreeTargetLivenessCause::LimitExceeded);
+    }
+    Ok(Some(environ))
 }
 
 #[cfg(target_os = "linux")]
-fn unreadable_process_target_liveness(
-    cargo_like: bool,
-    target_association: WorktreeTargetAssociation,
-) -> WorktreeTargetLiveness {
-    if cargo_like || target_association != WorktreeTargetAssociation::Unrelated {
-        WorktreeTargetLiveness::Unknown
+fn linux_resolve_process_path(process_root: &Path, configured: &Path) -> Option<PathBuf> {
+    let namespaced = if configured.is_absolute() {
+        let configured = normalize_proc_target_path(configured)?;
+        let relative = configured.strip_prefix(Path::new("/")).ok()?;
+        process_root.join("root").join(relative)
     } else {
-        WorktreeTargetLiveness::Clear
-    }
+        process_root.join("cwd").join(configured)
+    };
+    fs::canonicalize(namespaced).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn path_or_identity_overlaps_target(path: &Path, target: &WorktreeGcTarget) -> bool {
+    path.starts_with(&target.canonical_path)
+        || target.canonical_path.starts_with(path)
+        || identity_for_path(path)
+            .ok()
+            .is_some_and(|identity| identity == target.identity)
+}
+
+#[cfg(target_os = "linux")]
+fn path_is_within_or_identical_to_target(path: &Path, target: &WorktreeGcTarget) -> bool {
+    path.starts_with(&target.canonical_path)
+        || identity_for_path(path)
+            .ok()
+            .is_some_and(|identity| identity == target.identity)
 }
 
 #[cfg(target_os = "linux")]
@@ -3623,55 +3893,116 @@ fn linux_build_process_name(name: &[u8]) -> bool {
 #[cfg(target_os = "linux")]
 fn linux_process_target_association(
     process_root: &Path,
-    target_path: &Path,
+    pid: u32,
+    target: &WorktreeGcTarget,
     deadline: Instant,
     cargo_like: bool,
-) -> WorktreeTargetAssociation {
-    let lane_path = target_path.parent().unwrap_or(target_path);
-    for link in ["cwd", "exe"] {
-        if fs::read_link(process_root.join(link))
-            .ok()
-            .is_some_and(|path| path.starts_with(lane_path))
-        {
-            return WorktreeTargetAssociation::Associated;
+) -> WorktreeTargetLiveness {
+    let lane_path = target
+        .canonical_path
+        .parent()
+        .unwrap_or(&target.canonical_path);
+    for (link, source) in [
+        ("cwd", WorktreeTargetLivenessSource::ProcessCwd),
+        ("exe", WorktreeTargetLivenessSource::ProcessExecutable),
+    ] {
+        match fs::canonicalize(process_root.join(link)) {
+            Ok(path) if path_is_within_or_identical_to_target(&path, target) => {
+                return WorktreeTargetLiveness::Live(target_liveness_evidence(
+                    Some(pid),
+                    source,
+                    WorktreeTargetLivenessCause::PathOverlap,
+                ));
+            }
+            Ok(path) if path.starts_with(lane_path) && cargo_like => {
+                return WorktreeTargetLiveness::Live(target_liveness_evidence(
+                    Some(pid),
+                    WorktreeTargetLivenessSource::DefaultCargoTarget,
+                    WorktreeTargetLivenessCause::CargoLikeProcessInLane,
+                ));
+            }
+            Ok(path) if path.starts_with(lane_path) => {
+                return WorktreeTargetLiveness::Unknown(target_liveness_evidence(
+                    Some(pid),
+                    source,
+                    WorktreeTargetLivenessCause::PathOverlap,
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) if cargo_like => {
+                return WorktreeTargetLiveness::Unknown(target_liveness_evidence(
+                    Some(pid),
+                    source,
+                    WorktreeTargetLivenessCause::ReadFailed,
+                ));
+            }
+            Err(_) => {}
         }
     }
 
     let descriptors = match fs::read_dir(process_root.join("fd")) {
         Ok(descriptors) => descriptors,
-        Err(_) => return bounded_association_failure(cargo_like),
+        Err(_) => return bounded_association_failure(pid, cargo_like),
     };
     let mut observed = 0usize;
     for descriptor in descriptors {
         if Instant::now() >= deadline {
-            return bounded_association_failure(cargo_like);
+            return bounded_association_failure_with_cause(
+                pid,
+                cargo_like,
+                WorktreeTargetLivenessCause::TimedOut,
+            );
         }
         observed = match observed.checked_add(1) {
             Some(observed) if observed <= MAX_WORKTREE_GC_PROC_FDS => observed,
-            _ => return bounded_association_failure(cargo_like),
+            _ => {
+                return bounded_association_failure_with_cause(
+                    pid,
+                    cargo_like,
+                    WorktreeTargetLivenessCause::LimitExceeded,
+                )
+            }
         };
         let descriptor = match descriptor {
             Ok(descriptor) => descriptor,
-            Err(_) => return bounded_association_failure(cargo_like),
+            Err(_) => return bounded_association_failure(pid, cargo_like),
         };
-        match fs::read_link(descriptor.path()) {
-            Ok(path) if path.starts_with(target_path) => {
-                return WorktreeTargetAssociation::Associated;
+        match fs::canonicalize(descriptor.path()) {
+            Ok(path) if path_is_within_or_identical_to_target(&path, target) => {
+                return WorktreeTargetLiveness::Live(target_liveness_evidence(
+                    Some(pid),
+                    WorktreeTargetLivenessSource::ProcessFileDescriptor,
+                    WorktreeTargetLivenessCause::PathOverlap,
+                ));
             }
             Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(_) => return bounded_association_failure(cargo_like),
+            Err(_) => return bounded_association_failure(pid, cargo_like),
         }
     }
-    WorktreeTargetAssociation::Unrelated
+    WorktreeTargetLiveness::Clear
 }
 
 #[cfg(target_os = "linux")]
-fn bounded_association_failure(cargo_like: bool) -> WorktreeTargetAssociation {
+fn bounded_association_failure(pid: u32, cargo_like: bool) -> WorktreeTargetLiveness {
+    bounded_association_failure_with_cause(pid, cargo_like, WorktreeTargetLivenessCause::ReadFailed)
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_association_failure_with_cause(
+    pid: u32,
+    cargo_like: bool,
+    cause: WorktreeTargetLivenessCause,
+) -> WorktreeTargetLiveness {
     if cargo_like {
-        WorktreeTargetAssociation::Unknown
+        WorktreeTargetLiveness::Unknown(target_liveness_evidence(
+            Some(pid),
+            WorktreeTargetLivenessSource::ProcessFileDescriptor,
+            cause,
+        ))
     } else {
-        WorktreeTargetAssociation::Unrelated
+        WorktreeTargetLiveness::Clear
     }
 }
 
@@ -3700,13 +4031,41 @@ fn normalize_proc_target_path(path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn worktree_target_liveness(_target_path: &Path) -> WorktreeTargetLiveness {
-    WorktreeTargetLiveness::Unknown
+fn worktree_target_liveness(_target: &WorktreeGcTarget) -> WorktreeTargetLiveness {
+    WorktreeTargetLiveness::Unknown(target_liveness_evidence(
+        None,
+        WorktreeTargetLivenessSource::Platform,
+        WorktreeTargetLivenessCause::Unsupported,
+    ))
 }
 
-fn remove_worktree_target_dir(worktree_path: &Path) -> Result<()> {
+enum WorktreeTargetRemovalOutcome {
+    Removed,
+    IdentityChanged,
+}
+
+fn remove_worktree_target_dir(
+    worktree_path: &Path,
+    target: &WorktreeGcTarget,
+) -> Result<WorktreeTargetRemovalOutcome> {
     let root = SafeRoot::open_existing(worktree_path)?;
-    remove_direct_child_tree(&root, "target", None, TreeLinkPolicy::UnlinkLinks)
+    match remove_direct_child_tree(
+        &root,
+        "target",
+        Some(&target.identity),
+        TreeLinkPolicy::UnlinkLinks,
+    ) {
+        Ok(()) => Ok(WorktreeTargetRemovalOutcome::Removed),
+        Err(_error)
+            if identity_for_path(&target.path)
+                .ok()
+                .as_ref()
+                .is_none_or(|identity| identity != &target.identity) =>
+        {
+            Ok(WorktreeTargetRemovalOutcome::IdentityChanged)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn prune_unregistered_worktree_directories(
@@ -3755,6 +4114,7 @@ fn prune_unregistered_worktree_directories(
                 status: WorktreeGcStatus::OrphanWouldPrune,
                 reason: WorktreeGcReason::UnregisteredOrphan,
                 target_path: None,
+                target_liveness: None,
                 untracked_paths: Vec::new(),
                 gate_denial: None,
                 retention_operation_id: None,
@@ -3792,6 +4152,7 @@ fn prune_unregistered_worktree_directories(
                     status: WorktreeGcStatus::OrphanQuarantined,
                     reason: WorktreeGcReason::UnregisteredOrphan,
                     target_path: None,
+                    target_liveness: None,
                     untracked_paths: Vec::new(),
                     gate_denial: None,
                     retention_operation_id: Some(operation_id),
@@ -3811,6 +4172,7 @@ fn prune_unregistered_worktree_directories(
                     status: WorktreeGcStatus::Protected,
                     reason: WorktreeGcReason::MachineGlobalGate,
                     target_path: None,
+                    target_liveness: None,
                     untracked_paths: Vec::new(),
                     gate_denial: Some(denial.clone()),
                     retention_operation_id: None,
@@ -9892,7 +10254,7 @@ mod tests {
 
         let full = manager
             .gc_with_target_liveness(gc_options(Some(worktree_root.clone()), false), |_| {
-                WorktreeTargetLiveness::Live
+                test_live_target_liveness()
             })
             .expect("full GC live-target refusal");
         assert_eq!(full.removed_count, 0);
@@ -9903,7 +10265,7 @@ mod tests {
         let target_only = manager
             .gc_with_target_liveness(
                 gc_targets_only_options(Some(worktree_root.clone()), false),
-                |_| WorktreeTargetLiveness::Live,
+                |_| test_live_target_liveness(),
             )
             .expect("target-only live-target refusal");
         assert_eq!(target_only.target_removed_count, 0);
@@ -9923,12 +10285,131 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn gc_refuses_target_replacement_between_probe_and_removal() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+
+        for (root_name, targets_only) in [("full-root", false), ("target-root", true)] {
+            let worktree_root = temp.path().join(root_name);
+            let created = create_gc_worktree(
+                &manager,
+                &format!("replacement-{root_name}"),
+                &worktree_root,
+            );
+            let target = created.path.join("target");
+            let moved = created.path.join("target-original");
+            fs::create_dir_all(target.join("debug")).expect("target");
+            let mut options = if targets_only {
+                gc_targets_only_options(Some(worktree_root), false)
+            } else {
+                gc_options(Some(worktree_root), false)
+            };
+            options.targets_only = targets_only;
+
+            let report = manager
+                .gc_with_target_liveness(options, |_| {
+                    fs::rename(&target, &moved).expect("move probed target");
+                    fs::create_dir(&target).expect("create replacement target");
+                    WorktreeTargetLiveness::Clear
+                })
+                .expect("replacement must become a structured protection");
+
+            assert_eq!(report.removed_count, 0, "{report:#?}");
+            assert_eq!(report.target_removed_count, 0, "{report:#?}");
+            assert_eq!(report.protected_count, 1, "{report:#?}");
+            assert_eq!(
+                report.entries[0].reason,
+                WorktreeGcReason::TargetIdentityChanged
+            );
+            assert_eq!(
+                report.entries[0]
+                    .target_liveness
+                    .as_ref()
+                    .expect("identity evidence")
+                    .source,
+                WorktreeTargetLivenessSource::TargetIdentity
+            );
+            assert!(created.path.exists());
+            assert!(target.exists(), "replacement target must survive");
+            assert!(moved.exists(), "original target must survive");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_unknown_and_live_evidence_protects_every_target_reclaim_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+
+        for (root_name, targets_only, retained, live) in [
+            ("full-unknown", false, false, false),
+            ("retained-unknown", false, true, false),
+            ("target-unknown", true, false, false),
+            ("retained-live", false, true, true),
+        ] {
+            let worktree_root = temp.path().join(root_name);
+            let created = create_gc_worktree(&manager, root_name, &worktree_root);
+            fs::create_dir_all(created.path.join("target/debug")).expect("target");
+            let mut options = if targets_only {
+                gc_targets_only_options(Some(worktree_root), false)
+            } else {
+                gc_options(Some(worktree_root), false)
+            };
+            if retained {
+                options.retention.max_count = Some(1);
+            }
+            let report = manager
+                .gc_with_target_liveness(options, |_| {
+                    if live {
+                        test_live_target_liveness()
+                    } else {
+                        test_unknown_target_liveness()
+                    }
+                })
+                .expect("liveness refusal report");
+            assert_eq!(report.removed_count, 0, "{report:#?}");
+            assert_eq!(report.target_removed_count, 0, "{report:#?}");
+            assert_eq!(report.protected_count, 1, "{report:#?}");
+            assert_eq!(
+                report.entries[0].reason,
+                if live {
+                    WorktreeGcReason::LiveTarget
+                } else {
+                    WorktreeGcReason::TargetLivenessUnknown
+                }
+            );
+            let evidence = report.entries[0]
+                .target_liveness
+                .as_ref()
+                .expect("actionable evidence");
+            assert_eq!(evidence.pid, Some(if live { 42 } else { 43 }));
+            let json = serde_json::to_value(&report.entries[0]).expect("serialize evidence");
+            assert_eq!(
+                json.pointer("/target_liveness/pid"),
+                Some(&serde_json::json!(if live { 42 } else { 43 }))
+            );
+            assert!(json.pointer("/target_liveness/source").is_some());
+            assert!(json.pointer("/target_liveness/cause").is_some());
+            assert!(created.path.join("target").exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn linux_target_liveness_observes_absolute_and_relative_cargo_target_dirs() {
         let temp = TempDir::new().expect("tempdir");
         let lane = temp.path().join("lane");
-        let target = lane.join("target");
-        let absolute = target.join("absolute");
-        let relative = target.join("relative");
+        let target_path = lane.join("target");
+        let absolute = target_path.join("absolute");
+        let relative = target_path.join("relative");
         fs::create_dir_all(&absolute).expect("absolute target");
         fs::create_dir_all(&relative).expect("relative target");
 
@@ -9942,18 +10423,78 @@ mod tests {
                 command.current_dir(cwd);
             }
             let mut child = command.spawn().expect("spawn target process");
-            let mut observed_live = false;
+            let mut observed_live = None;
             for _ in 0..100 {
-                if worktree_target_liveness(&target) == WorktreeTargetLiveness::Live {
-                    observed_live = true;
-                    break;
+                let target = gc_target_if_present(&lane)
+                    .expect("bind target")
+                    .expect("target exists");
+                if let WorktreeTargetLiveness::Live(evidence) = worktree_target_liveness(&target) {
+                    if evidence.pid == Some(child.id()) {
+                        observed_live = Some(evidence);
+                        break;
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
             let _ = child.kill();
             let _ = child.wait();
-            assert!(observed_live, "child CARGO_TARGET_DIR must be observed");
+            let evidence = observed_live.expect("child CARGO_TARGET_DIR must be observed");
+            assert_eq!(
+                evidence.source,
+                WorktreeTargetLivenessSource::CargoTargetDir
+            );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_target_liveness_observes_default_cargo_target_from_process_cwd() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let lane = temp.path().join("lane");
+        fs::create_dir_all(lane.join("target/debug")).expect("target");
+        let bash = std::process::Command::new("sh")
+            .args(["-c", "command -v bash"])
+            .output()
+            .expect("locate bash");
+        assert!(bash.status.success());
+        let bash = String::from_utf8(bash.stdout)
+            .expect("bash path utf8")
+            .trim()
+            .to_string();
+        let cargo = temp.path().join("cargo");
+        symlink(bash, &cargo).expect("cargo-named bash shim");
+        let mut child = std::process::Command::new(&cargo)
+            .args(["-c", "while :; do :; done"])
+            .current_dir(&lane)
+            .env_remove("CARGO_TARGET_DIR")
+            .spawn()
+            .expect("spawn cargo-like process");
+        let target = gc_target_if_present(&lane)
+            .expect("bind target")
+            .expect("target exists");
+        let mut observed = None;
+        for _ in 0..100 {
+            if let WorktreeTargetLiveness::Live(evidence) = worktree_target_liveness(&target) {
+                if evidence.pid == Some(child.id()) {
+                    observed = Some(evidence);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let evidence = observed.expect("default cargo target must be observed");
+        assert_eq!(
+            evidence.source,
+            WorktreeTargetLivenessSource::DefaultCargoTarget
+        );
+        assert_eq!(
+            evidence.cause,
+            WorktreeTargetLivenessCause::CargoLikeProcessInLane
+        );
     }
 
     #[test]
@@ -10000,23 +10541,21 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn unreadable_process_liveness_ignores_unrelated_and_protects_associated_or_build_processes() {
+    fn unreadable_process_liveness_ignores_unrelated_and_protects_build_processes() {
         assert_eq!(
-            unreadable_process_target_liveness(false, WorktreeTargetAssociation::Unrelated),
+            bounded_association_failure(42, false),
             WorktreeTargetLiveness::Clear
         );
+        let WorktreeTargetLiveness::Unknown(evidence) = bounded_association_failure(42, true)
+        else {
+            panic!("build process inspection failure must be unknown");
+        };
+        assert_eq!(evidence.pid, Some(42));
         assert_eq!(
-            unreadable_process_target_liveness(false, WorktreeTargetAssociation::Associated),
-            WorktreeTargetLiveness::Unknown
+            evidence.source,
+            WorktreeTargetLivenessSource::ProcessFileDescriptor
         );
-        assert_eq!(
-            unreadable_process_target_liveness(true, WorktreeTargetAssociation::Unrelated),
-            WorktreeTargetLiveness::Unknown
-        );
-        assert_eq!(
-            unreadable_process_target_liveness(false, WorktreeTargetAssociation::Unknown),
-            WorktreeTargetLiveness::Unknown
-        );
+        assert_eq!(evidence.cause, WorktreeTargetLivenessCause::ReadFailed);
     }
 
     #[cfg(target_os = "linux")]
@@ -12878,6 +13417,22 @@ mod tests {
         let mut options = gc_options(worktree_root, dry_run);
         options.targets_only = true;
         options
+    }
+
+    fn test_live_target_liveness() -> WorktreeTargetLiveness {
+        WorktreeTargetLiveness::Live(target_liveness_evidence(
+            Some(42),
+            WorktreeTargetLivenessSource::CargoTargetDir,
+            WorktreeTargetLivenessCause::PathOverlap,
+        ))
+    }
+
+    fn test_unknown_target_liveness() -> WorktreeTargetLiveness {
+        WorktreeTargetLiveness::Unknown(target_liveness_evidence(
+            Some(43),
+            WorktreeTargetLivenessSource::MountNamespace,
+            WorktreeTargetLivenessCause::NamespaceUnresolved,
+        ))
     }
 
     fn workspace_sweep_options(workspace: &Path, apply: bool) -> WorktreeSweepOptions {

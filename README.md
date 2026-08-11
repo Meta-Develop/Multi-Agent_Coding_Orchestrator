@@ -1315,20 +1315,31 @@ untracked-path allowances, and machine-global orphan-cleanup bindings, and it
 does not run orphan pruning. Tracked changes, active claims, and active leases
 still protect the target; an untracked-only lane does not require an allowlist
 because the lane and its files remain. On Linux, every target deletion scans a
-bounded `/proc` snapshot for same-user processes whose `CARGO_TARGET_DIR` is the
-candidate target or a nested/containing directory. An unreadable environment is
-also treated as potentially live when the process is cargo/rustc/rustdoc/sccache,
-its readable `cwd` or executable overlaps the lane, or a readable file descriptor
-overlaps the target. Bounds or read failures inside that association scan fail
-closed for build-like processes; unrelated non-build processes with no readable
-lane association do not globally disable cleanup merely because their procfs
-details are restricted. A live match is reported as `live_target`; an incomplete,
-oversized, timed-out, or potentially associated unreadable scan is reported as
-`target_liveness_unknown`, and both refuse deletion. The same check also protects
-a target included in full-lane removal. On non-Linux platforms the detector
-conservatively reports unknown, so target deletion remains disabled until a native
-detector is implemented. The check runs immediately before deletion to narrow,
-but cannot eliminate, the process-start race.
+bounded `/proc` snapshot for same-user processes. Explicit `CARGO_TARGET_DIR`
+values are resolved in the process's own view: absolute paths through
+`/proc/<pid>/root` and relative paths through `/proc/<pid>/cwd`. Canonical path
+containment and, where it identifies the exact directory, filesystem identity
+detect aliases across mount namespaces. The fallback association scan always
+runs, even after a readable environment has no target variable: a
+cargo/rustc/rustdoc/sccache-like process with a `cwd` inside the lane protects the
+default Cargo target, while a process `cwd`, executable, or readable file
+descriptor inside the target is live. Bounds or read failures fail closed for
+build-like or otherwise lane-associated processes; unrelated non-build processes
+with no readable lane association do not globally disable cleanup merely because
+their procfs details are restricted. A live match is reported as `live_target`;
+an incomplete, oversized, timed-out, or unreconciled potentially relevant scan is
+reported as `target_liveness_unknown`, and both refuse deletion. Reports include
+bounded typed PID, source, and cause evidence in JSON and human output.
+
+The target directory's filesystem identity is bound before the liveness probe.
+Target-only deletion passes that expected identity into the handle-relative tree
+remover, and full-lane deletion rechecks it immediately before recording the
+removal operation. Replacement is reported as `target_identity_changed` and the
+lane is retained. The same protections apply to a target included in full-lane
+removal. On non-Linux platforms the detector conservatively reports unknown, so
+target deletion remains disabled until a native detector is implemented. The
+check runs immediately before deletion to narrow, but cannot eliminate, the
+process-start race.
 
 Sweep every repository group beneath one workspace. The first command is a
 dry-run because workspace sweeps never remove anything unless `--apply` is

@@ -59,6 +59,7 @@ use crate::{
         WorktreeGcStatus, WorktreeManager, WorktreeRecord, WorktreeRetentionPolicy,
         WorktreeSweepDiscoveryStatus, WorktreeSweepFailureKind, WorktreeSweepOptions,
         WorktreeSweepReport, WorktreeSweepRepositoryStatus, WorktreeSweepRootKind,
+        WorktreeTargetLivenessCause, WorktreeTargetLivenessEvidence, WorktreeTargetLivenessSource,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -5009,8 +5010,9 @@ fn print_worktree_gc_report(report: &WorktreeGcReport, json: bool) -> Result<()>
             .map(|operation_id| format!(" retention-operation={}", operation_id.get()))
             .unwrap_or_default();
         let untracked = worktree_gc_untracked_suffix(&entry.untracked_paths);
+        let liveness = worktree_target_liveness_suffix(entry.target_liveness.as_ref());
         println!(
-            "{}\t{}\t{}\t{}\t{}{}{}{}{}",
+            "{}\t{}\t{}\t{}\t{}{}{}{}{}{}",
             worktree_gc_status_label(entry.status),
             worktree_gc_reason_label(entry.reason),
             entry.name,
@@ -5019,7 +5021,8 @@ fn print_worktree_gc_report(report: &WorktreeGcReport, json: bool) -> Result<()>
             target,
             gate_denial,
             retention,
-            untracked
+            untracked,
+            liveness
         );
     }
     Ok(())
@@ -5142,14 +5145,16 @@ fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Resu
             for entry in &gc_report.entries {
                 let branch = entry.branch.as_deref().unwrap_or("-");
                 let untracked = worktree_gc_untracked_suffix(&entry.untracked_paths);
+                let liveness = worktree_target_liveness_suffix(entry.target_liveness.as_ref());
                 println!(
-                    "    {}\t{}\t{}\t{}\t{}{}",
+                    "    {}\t{}\t{}\t{}\t{}{}{}",
                     worktree_gc_status_label(entry.status),
                     worktree_gc_reason_label(entry.reason),
                     entry.name,
                     branch,
                     entry.path.display(),
-                    untracked
+                    untracked,
+                    liveness
                 );
             }
         }
@@ -5169,6 +5174,50 @@ fn worktree_gc_untracked_suffix(paths: &[PathBuf]) -> String {
                 .collect::<Vec<_>>()
                 .join(",")
         )
+    }
+}
+
+fn worktree_target_liveness_suffix(evidence: Option<&WorktreeTargetLivenessEvidence>) -> String {
+    let Some(evidence) = evidence else {
+        return String::new();
+    };
+    format!(
+        " target-liveness-pid={} target-liveness-source={} target-liveness-cause={}",
+        evidence
+            .pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        worktree_target_liveness_source_label(evidence.source),
+        worktree_target_liveness_cause_label(evidence.cause),
+    )
+}
+
+fn worktree_target_liveness_source_label(source: WorktreeTargetLivenessSource) -> &'static str {
+    match source {
+        WorktreeTargetLivenessSource::CargoTargetDir => "cargo-target-dir",
+        WorktreeTargetLivenessSource::DefaultCargoTarget => "default-cargo-target",
+        WorktreeTargetLivenessSource::ProcessEnvironment => "process-environment",
+        WorktreeTargetLivenessSource::ProcessCwd => "process-cwd",
+        WorktreeTargetLivenessSource::ProcessExecutable => "process-executable",
+        WorktreeTargetLivenessSource::ProcessFileDescriptor => "process-file-descriptor",
+        WorktreeTargetLivenessSource::ProcScan => "proc-scan",
+        WorktreeTargetLivenessSource::MountNamespace => "mount-namespace",
+        WorktreeTargetLivenessSource::Platform => "platform",
+        WorktreeTargetLivenessSource::TargetIdentity => "target-identity",
+    }
+}
+
+fn worktree_target_liveness_cause_label(cause: WorktreeTargetLivenessCause) -> &'static str {
+    match cause {
+        WorktreeTargetLivenessCause::PathOverlap => "path-overlap",
+        WorktreeTargetLivenessCause::CargoLikeProcessInLane => "cargo-like-process-in-lane",
+        WorktreeTargetLivenessCause::ReadFailed => "read-failed",
+        WorktreeTargetLivenessCause::InvalidValue => "invalid-value",
+        WorktreeTargetLivenessCause::LimitExceeded => "limit-exceeded",
+        WorktreeTargetLivenessCause::TimedOut => "timed-out",
+        WorktreeTargetLivenessCause::Unsupported => "unsupported",
+        WorktreeTargetLivenessCause::NamespaceUnresolved => "namespace-unresolved",
+        WorktreeTargetLivenessCause::IdentityChanged => "identity-changed",
     }
 }
 
@@ -5249,6 +5298,7 @@ fn worktree_gc_reason_label(reason: WorktreeGcReason) -> &'static str {
         WorktreeGcReason::TargetWouldRemove => "target-would-remove",
         WorktreeGcReason::LiveTarget => "live-target",
         WorktreeGcReason::TargetLivenessUnknown => "target-liveness-unknown",
+        WorktreeGcReason::TargetIdentityChanged => "target-identity-changed",
         WorktreeGcReason::NoTarget => "no-target",
         WorktreeGcReason::UnregisteredOrphan => "unregistered-orphan",
         WorktreeGcReason::MachineGlobalGate => "machine-global-gate",
@@ -5534,6 +5584,7 @@ mod tests {
                 target_path: Some(PathBuf::from(
                     "/workspace/.maco/worktrees/repo/retained-lane/target",
                 )),
+                target_liveness: None,
                 untracked_paths: Vec::new(),
                 gate_denial: None,
                 retention_operation_id: None,
@@ -5545,6 +5596,21 @@ mod tests {
         applied.dry_run = false;
         applied.target_removed_count = 2;
         assert_eq!(worktree_gc_target_action_count(&applied), 2);
+    }
+
+    #[test]
+    fn worktree_target_liveness_evidence_has_actionable_human_rendering() {
+        let evidence = WorktreeTargetLivenessEvidence {
+            pid: Some(1234),
+            source: WorktreeTargetLivenessSource::DefaultCargoTarget,
+            cause: WorktreeTargetLivenessCause::CargoLikeProcessInLane,
+        };
+        assert_eq!(
+            worktree_target_liveness_suffix(Some(&evidence)),
+            " target-liveness-pid=1234 target-liveness-source=default-cargo-target \
+             target-liveness-cause=cargo-like-process-in-lane"
+        );
+        assert_eq!(worktree_target_liveness_suffix(None), "");
     }
 
     #[test]
