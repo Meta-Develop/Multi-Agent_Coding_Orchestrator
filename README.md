@@ -1318,10 +1318,15 @@ inspected root has zero actions; human output prints an explicit warning for the
 former. Each root includes its resolved repository when available, a typed
 failure when resolution or GC fails, and its nested GC summary. A failure in one
 root does not stop later roots from being inspected. Retention flags and
-`--keep-targets` are passed to the existing per-repository GC engine, so dirty
-worktrees and lanes with active leases or claims remain protected. Existing
-machine-global quarantine gates also remain in force; the sweep does not weaken
-them.
+`--keep-targets` are passed independently to each discovered root, so
+`--max-count` is a per-root limit and dirty worktrees or lanes with active
+leases or claims remain protected. Existing machine-global quarantine gates
+also remain in force; the sweep does not weaken them. A workspace-managed group
+is associated only when it is the exact result of the creation default-root
+function. In particular, `<repo>/.maco/worktrees` is not adopted as that
+repository's managed root because its creation default is
+`<repo-parent>/.maco/worktrees/<repo>`; sweep the parent workspace for that
+layout, or use the separately validated `<repo>/.worktrees` convention.
 
 Perform explicitly authorized force cleanup and delete a MACO-owned branch:
 

@@ -1679,6 +1679,7 @@ impl WorktreeManager {
 
     pub fn gc(&self, options: WorktreeGcOptions) -> Result<WorktreeGcReport> {
         let repo = self.open_repository()?;
+        let restrict_to_requested_root = options.worktree_root.is_some();
         let worktree_root = resolve_worktree_root(&repo, options.worktree_root.clone())?;
         let active_claims = active_claim_agent_ids(&repo)?;
         let exclude_agent_id = options
@@ -1715,7 +1716,7 @@ impl WorktreeManager {
             if registry.operations.contains_key(&binding.name) {
                 continue;
             }
-            if binding.root != worktree_root {
+            if restrict_to_requested_root && binding.root != worktree_root {
                 continue;
             }
             report.considered_count = report
@@ -2293,7 +2294,6 @@ fn discover_repository_local_sweep_roots(
     let mut roots = Vec::new();
     if path_entry_exists(&workspace.join(".git"))? {
         add_repository_local_sweep_root(workspace, &mut roots)?;
-        return Ok(roots);
     }
 
     for child in
@@ -2923,13 +2923,9 @@ fn resolve_worktree_root(repo: &Repository, requested_root: Option<PathBuf>) -> 
             .join(root)
     };
     match fs::symlink_metadata(&root) {
-        Ok(metadata) => {
-            if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                bail!("worktree root is not a plain directory: {}", root.display());
-            }
-            fs::canonicalize(&root)
-                .with_context(|| format!("failed to resolve worktree root {}", root.display()))
-        }
+        Ok(_) => SafeRoot::open_existing(&root)
+            .map(|root| root.path().to_path_buf())
+            .with_context(|| format!("failed to bind worktree root {}", root.display())),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(root),
         Err(error) => Err(error)
             .with_context(|| format!("failed to inspect worktree root {}", root.display())),
@@ -8355,6 +8351,83 @@ mod tests {
         assert!(created.path.exists(), "sweep remains dry-run by default");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_sweep_discovers_direct_child_repo_local_and_managed_roots_once_each() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let repo_path = workspace.join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let managed = create_gc_worktree(
+            &manager,
+            "managed-lane",
+            &workspace.join(".maco/worktrees/repo"),
+        );
+        let local = create_gc_worktree(&manager, "repo-local-lane", &repo_path.join(".worktrees"));
+
+        let report = sweep_workspace_worktrees(workspace_sweep_options(&workspace, false))
+            .expect("sweep direct-child repository roots");
+
+        assert_eq!(report.worktree_root_discovered_count, 2);
+        assert_eq!(report.repository_inspected_count, 2);
+        assert_eq!(report.considered_count, 2);
+        assert_eq!(report.removed_count, 2);
+        assert_eq!(
+            report
+                .repositories
+                .iter()
+                .map(|entry| (
+                    entry.root_kind,
+                    entry.gc_report.as_ref().map(|gc| gc.considered_count)
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (WorktreeSweepRootKind::WorkspaceManaged, Some(1)),
+                (WorktreeSweepRootKind::RepositoryLocal, Some(1)),
+            ]
+        );
+        assert!(managed.path.exists());
+        assert!(local.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_sweep_refuses_symlinked_repository_local_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).expect("outside root");
+        let sentinel = outside.join("sentinel");
+        fs::write(&sentinel, "preserve\n").expect("outside sentinel");
+        symlink(&outside, repo_path.join(".worktrees")).expect("symlink local root");
+
+        let report = sweep_workspace_worktrees(workspace_sweep_options(&repo_path, true))
+            .expect("typed symlinked root refusal");
+
+        assert_eq!(report.worktree_root_discovered_count, 1);
+        assert_eq!(report.repository_inspected_count, 0);
+        assert_eq!(report.repository_pre_gc_skipped_count, 1);
+        assert_eq!(
+            report.repositories[0].root_kind,
+            WorktreeSweepRootKind::RepositoryLocal
+        );
+        assert!(report.repositories[0]
+            .failure
+            .as_ref()
+            .expect("typed refusal")
+            .message
+            .contains("not a plain directory"));
+        assert!(sentinel.exists());
+    }
+
     #[test]
     fn workspace_sweep_reports_zero_roots_as_a_distinct_discovery_state() {
         let temp = TempDir::new().expect("tempdir");
@@ -8419,6 +8492,55 @@ mod tests {
         assert!(!local.path.exists());
         assert!(other.path.exists());
         assert_eq!(manager.list().expect("remaining worktrees"), vec![other]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_without_requested_root_preserves_all_authenticated_root_scope() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let first = create_gc_worktree(&manager, "first-lane", &repo_path.join(".worktrees"));
+        let second =
+            create_gc_worktree(&manager, "second-lane", &repo_path.join(".other-worktrees"));
+
+        let report = manager
+            .gc(gc_options(None, false))
+            .expect("default GC spans authenticated managed roots");
+
+        assert_eq!(report.considered_count, 2);
+        assert_eq!(report.removed_count, 2);
+        assert!(!first.path.exists());
+        assert!(!second.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_rejects_requested_root_beneath_intermediate_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let actual_parent = temp.path().join("actual-parent");
+        fs::create_dir(&actual_parent).expect("actual parent");
+        let actual_root = actual_parent.join("worktrees");
+        let created = create_gc_worktree(&manager, "linked-root-lane", &actual_root);
+        let linked_parent = temp.path().join("linked-parent");
+        symlink(&actual_parent, &linked_parent).expect("intermediate parent symlink");
+
+        let error = manager
+            .gc(gc_options(Some(linked_parent.join("worktrees")), false))
+            .expect_err("intermediate symlink must be rejected");
+
+        assert!(error.to_string().contains("failed to bind worktree root"));
+        assert!(created.path.exists());
     }
 
     #[cfg(target_os = "linux")]

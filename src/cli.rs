@@ -3230,7 +3230,7 @@ struct SweepWorktreeArgs {
     /// Remove only eligible clean worktrees older than this many seconds.
     #[arg(long)]
     max_age_seconds: Option<u64>,
-    /// Keep at most this many newest eligible clean worktrees per repository.
+    /// Keep at most this many newest eligible clean worktrees per discovered root.
     #[arg(long)]
     max_count: Option<usize>,
     /// Emit machine-readable JSON.
@@ -5041,7 +5041,7 @@ fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Resu
         println!("{warning}");
     }
     println!(
-        "Repositories: discovered={} inspected={} skipped-before-gc={} gc-failed={} total-failures={}",
+        "Discovered roots: total={} inspected={} skipped-before-gc={} gc-failed={} total-failures={}",
         report.repository_discovered_count,
         report.repository_inspected_count,
         report.repository_pre_gc_skipped_count,
