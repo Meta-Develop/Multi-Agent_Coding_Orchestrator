@@ -25,6 +25,10 @@ use crate::{
         MergeArbitrationReport, MergeCandidate, MergeCollectOptions, MergeForceOptions,
         MergePreviewOptions, ValidationEvidenceBundle, ValidationReport,
     },
+    orchestration_event::{
+        append_external_orchestration_event, normalize_orchestration_node_id,
+        ExternalOrchestrationPayload, OrchestrationEventKind, OrchestrationRole,
+    },
     orchestrator::{
         self, AgentRunStatus, OrchestrationResumeOptions, OrchestrationRunControls,
         OrchestrationRunOptions, OrchestrationSummary, RunId, SemanticCoordinationMode,
@@ -57,7 +61,7 @@ use crate::{
     },
 };
 use anyhow::{bail, Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use git2::Repository;
 use serde::Serialize;
 use serde_json::Value;
@@ -89,6 +93,7 @@ const MAX_PROMPT_PATHS: usize = 64;
 const MAX_SUPERVISE_GOAL_FILE_BYTES: u64 = 256 * 1024;
 const MAX_EVALUATION_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_EVALUATION_PLAN_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_EXTERNAL_EVENT_PAYLOAD_CLI_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "maco")]
@@ -1299,6 +1304,19 @@ impl ScopeCommand {
                 workspace: args.workspace,
                 bind: args.bind,
             }),
+            ScopeSubcommand::Event(args) => {
+                let payload = parse_external_event_payload(&args.payload)?;
+                let event = append_external_orchestration_event(
+                    args.repo,
+                    RunId::new(&args.run)?,
+                    &args.node,
+                    args.parent.as_deref(),
+                    args.role.into(),
+                    args.kind.into(),
+                    payload,
+                )?;
+                print_query_report(&event, args.json)
+            }
         }
     }
 }
@@ -1307,6 +1325,88 @@ impl ScopeCommand {
 enum ScopeSubcommand {
     /// Serve the localhost-only Scope observability backend.
     Serve(ScopeServeArgs),
+    /// Append one disclosure-safe event for an external root or directly spawned child.
+    Event(EmitScopeEventArgs),
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ExternalEventRoleArg {
+    Root,
+    Orchestrator,
+    Worker,
+    Auditor,
+}
+
+impl From<ExternalEventRoleArg> for OrchestrationRole {
+    fn from(value: ExternalEventRoleArg) -> Self {
+        match value {
+            ExternalEventRoleArg::Root => Self::Root,
+            ExternalEventRoleArg::Orchestrator => Self::Orchestrator,
+            ExternalEventRoleArg::Worker => Self::Worker,
+            ExternalEventRoleArg::Auditor => Self::Auditor,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ExternalEventKindArg {
+    Spawn,
+    Status,
+    Journal,
+}
+
+impl From<ExternalEventKindArg> for OrchestrationEventKind {
+    fn from(value: ExternalEventKindArg) -> Self {
+        match value {
+            ExternalEventKindArg::Spawn => Self::Spawn,
+            ExternalEventKindArg::Status => Self::Status,
+            ExternalEventKindArg::Journal => Self::Journal,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct EmitScopeEventArgs {
+    /// Repository whose external root-event stream receives this event.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// External driver run id under `.maco/o2-autopilot/runs`.
+    #[arg(long)]
+    run: String,
+    /// Canonical id for the external root or directly spawned child.
+    #[arg(long, value_parser = parse_orchestration_node_id)]
+    node: String,
+    /// Canonical parent node id. Omit it for the topmost external root.
+    #[arg(long, value_parser = parse_orchestration_node_id)]
+    parent: Option<String>,
+    /// External role. The supervisor role is intentionally unavailable here.
+    #[arg(long, value_enum)]
+    role: ExternalEventRoleArg,
+    /// External event kind. Gate and decision kinds are intentionally unavailable here.
+    #[arg(long, value_enum)]
+    kind: ExternalEventKindArg,
+    /// Disclosure-safe JSON: runtime is required; optional status is a short token.
+    #[arg(long)]
+    payload: String,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+fn parse_orchestration_node_id(value: &str) -> Result<String, String> {
+    normalize_orchestration_node_id(value).map_err(|error| format!("{error:#}"))
+}
+
+fn parse_external_event_payload(value: &str) -> Result<ExternalOrchestrationPayload> {
+    if value.len() > MAX_EXTERNAL_EVENT_PAYLOAD_CLI_BYTES {
+        bail!(
+            "external orchestration payload exceeds its {MAX_EXTERNAL_EVENT_PAYLOAD_CLI_BYTES}-byte CLI limit"
+        );
+    }
+    let payload = serde_json::from_str::<ExternalOrchestrationPayload>(value)
+        .context("external orchestration payload must match the disclosure-safe schema")?;
+    payload.validate()?;
+    Ok(payload)
 }
 
 #[derive(Debug, Args)]
