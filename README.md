@@ -29,7 +29,7 @@ The current implementation covers a local-first command-line slice:
 - `maco worktree list` lists verified registered agent worktrees. `maco worktree pending` is a strict existing-only authenticated reader: absent state returns an empty list, while transitional or invalid state is refused without creating locks, migrating, scavenging, recovering, or writing.
 - `maco worktree remove <agent-id> --force` performs explicitly authorized cleanup of authenticated managed state; non-force removal is temporarily disabled.
 - `maco worktree gc` removes clean, inactive managed worktrees while retaining branch refs, protects dirty worktrees and active leases/claims, removes retained `target/` build artifacts by default, supports dry-run and max-age/max-count retention filters, and routes unregistered leftover directories through recoverable machine-global quarantine.
-- `maco worktree sweep --workspace <path>` enumerates every repository group under a workspace's `.maco/worktrees` root and aggregates the existing per-repository GC reports. It is dry-run by default; removal requires `--apply`, and an unresolved repository is reported as a typed per-repository failure without aborting the remaining groups.
+- `maco worktree sweep --workspace <path>` discovers both workspace-managed `.maco/worktrees/<repo>` roots and exact repository-local `<repo>/.worktrees` roots, then aggregates the existing per-root GC reports. It is dry-run by default; removal requires `--apply`, an unresolved repository is reported as a typed per-root failure without aborting later roots, and a total discovery miss is reported separately from an inspected root with nothing to reclaim.
 - `SyncCoordinator` provides an in-memory exclusive path-claim layer for local agent coordination.
 - `maco sync claim <agent-id> <path>...` records durable exclusive path claims.
 - `maco sync release <token>` releases one durable claim.
@@ -1306,14 +1306,22 @@ cargo run -- worktree sweep --workspace /exact/path/to/workspace \
   --apply --keep-targets
 ```
 
-The aggregate report distinguishes repository groups that were inspected from
-groups skipped before GC and groups whose GC attempt failed. Each group includes
-its resolved repository when available, a typed failure when resolution or GC
-fails, and its nested GC summary. A failure in one group does not stop later
-groups from being inspected. Retention flags and `--keep-targets` are passed to
-the existing per-repository GC engine, so dirty worktrees and lanes with active
-leases or claims remain protected. Existing machine-global quarantine gates also
-remain in force; the sweep does not weaken them.
+The sweep discovers workspace-managed `.maco/worktrees/<repo>` roots through the
+same default-root function used by managed creation. It also recognizes the
+exact canonical `.worktrees` child of either the workspace repository itself or
+a direct repository child; custom per-creation roots have no persisted
+repository-level configuration to discover. The aggregate report identifies
+each root kind and distinguishes roots that were inspected from roots skipped
+before GC and roots whose GC attempt failed. `discovery_status` is
+`no_roots_discovered` for a total miss and `roots_discovered` even when every
+inspected root has zero actions; human output prints an explicit warning for the
+former. Each root includes its resolved repository when available, a typed
+failure when resolution or GC fails, and its nested GC summary. A failure in one
+root does not stop later roots from being inspected. Retention flags and
+`--keep-targets` are passed to the existing per-repository GC engine, so dirty
+worktrees and lanes with active leases or claims remain protected. Existing
+machine-global quarantine gates also remain in force; the sweep does not weaken
+them.
 
 Perform explicitly authorized force cleanup and delete a MACO-owned branch:
 

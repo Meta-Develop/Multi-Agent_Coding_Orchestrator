@@ -56,8 +56,9 @@ use crate::{
     worktree::{
         sweep_workspace_worktrees, RepositoryInfo, WorktreeCreateOptions, WorktreeGcOptions,
         WorktreeGcReason, WorktreeGcReport, WorktreeGcStatus, WorktreeManager, WorktreeRecord,
-        WorktreeRetentionPolicy, WorktreeSweepFailureKind, WorktreeSweepOptions,
-        WorktreeSweepReport, WorktreeSweepRepositoryStatus,
+        WorktreeRetentionPolicy, WorktreeSweepDiscoveryStatus, WorktreeSweepFailureKind,
+        WorktreeSweepOptions, WorktreeSweepReport, WorktreeSweepRepositoryStatus,
+        WorktreeSweepRootKind,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -5032,6 +5033,14 @@ fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Resu
     );
     println!("Workspace: {}", report.workspace.display());
     println!(
+        "Discovery: {} (roots={})",
+        worktree_sweep_discovery_status_label(report.discovery_status),
+        report.worktree_root_discovered_count
+    );
+    if let Some(warning) = worktree_sweep_discovery_warning(report.discovery_status) {
+        println!("{warning}");
+    }
+    println!(
         "Repositories: discovered={} inspected={} skipped-before-gc={} gc-failed={} total-failures={}",
         report.repository_discovered_count,
         report.repository_inspected_count,
@@ -5053,8 +5062,9 @@ fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Resu
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "Repository group={} status={} repository={} worktree-root={} gc-attempted={} effects-may-have-occurred={}",
+            "Repository group={} root-kind={} status={} repository={} worktree-root={} gc-attempted={} effects-may-have-occurred={}",
             repository.group,
+            worktree_sweep_root_kind_label(repository.root_kind),
             worktree_sweep_repository_status_label(repository.status),
             resolved_repository,
             repository.worktree_root.display(),
@@ -5103,6 +5113,29 @@ fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Resu
         }
     }
     Ok(())
+}
+
+fn worktree_sweep_discovery_status_label(status: WorktreeSweepDiscoveryStatus) -> &'static str {
+    match status {
+        WorktreeSweepDiscoveryStatus::NoRootsDiscovered => "no-roots-discovered",
+        WorktreeSweepDiscoveryStatus::RootsDiscovered => "roots-discovered",
+    }
+}
+
+fn worktree_sweep_discovery_warning(status: WorktreeSweepDiscoveryStatus) -> Option<&'static str> {
+    match status {
+        WorktreeSweepDiscoveryStatus::NoRootsDiscovered => {
+            Some("WARNING: no worktree roots were discovered; this is not a clean-sweep result.")
+        }
+        WorktreeSweepDiscoveryStatus::RootsDiscovered => None,
+    }
+}
+
+fn worktree_sweep_root_kind_label(kind: WorktreeSweepRootKind) -> &'static str {
+    match kind {
+        WorktreeSweepRootKind::WorkspaceManaged => "workspace-managed",
+        WorktreeSweepRootKind::RepositoryLocal => "repository-local",
+    }
 }
 
 fn worktree_gc_target_action_count(report: &WorktreeGcReport) -> usize {
@@ -5287,6 +5320,19 @@ mod tests {
         let error = Cli::try_parse_from(["maco", "worktree", "sweep"])
             .expect_err("workspace sweep must require --workspace");
         assert!(error.to_string().contains("--workspace"));
+    }
+
+    #[test]
+    fn worktree_sweep_zero_root_formatter_emits_prominent_warning() {
+        let warning =
+            worktree_sweep_discovery_warning(WorktreeSweepDiscoveryStatus::NoRootsDiscovered)
+                .expect("zero-root sweep warning");
+        assert!(warning.starts_with("WARNING:"));
+        assert!(warning.contains("not a clean-sweep result"));
+        assert_eq!(
+            worktree_sweep_discovery_warning(WorktreeSweepDiscoveryStatus::RootsDiscovered),
+            None
+        );
     }
 
     #[test]
