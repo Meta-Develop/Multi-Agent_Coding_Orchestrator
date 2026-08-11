@@ -886,6 +886,22 @@ pub fn run_autopilot_plan_file_with_profile_and_retention(
         profile,
         machine_global_retention,
         AutopilotRunSource::PlanFile,
+        None,
+    )
+}
+
+pub fn run_autopilot_plan_file_with_profile_retention_and_parent(
+    options: AutopilotRunOptions,
+    profile: Option<AutopilotProfile>,
+    machine_global_retention: Option<MachineGlobalRetentionBinding>,
+    parent_node: Option<String>,
+) -> Result<AutopilotFinalReport> {
+    run_autopilot_with_profile_and_retention(
+        options,
+        profile,
+        machine_global_retention,
+        AutopilotRunSource::PlanFile,
+        parent_node,
     )
 }
 
@@ -901,6 +917,24 @@ pub fn run_autopilot_goal_spec_with_profile_and_retention(
         profile,
         machine_global_retention,
         AutopilotRunSource::GoalSpec { goal, spec },
+        None,
+    )
+}
+
+pub fn run_autopilot_goal_spec_with_profile_retention_and_parent(
+    options: AutopilotRunOptions,
+    goal: &str,
+    spec: &str,
+    profile: Option<AutopilotProfile>,
+    machine_global_retention: Option<MachineGlobalRetentionBinding>,
+    parent_node: Option<String>,
+) -> Result<AutopilotFinalReport> {
+    run_autopilot_with_profile_and_retention(
+        options,
+        profile,
+        machine_global_retention,
+        AutopilotRunSource::GoalSpec { goal, spec },
+        parent_node,
     )
 }
 
@@ -927,12 +961,14 @@ fn run_autopilot_with_profile_and_retention(
     profile: Option<AutopilotProfile>,
     machine_global_retention: Option<MachineGlobalRetentionBinding>,
     source: AutopilotRunSource<'_>,
+    parent_node: Option<String>,
 ) -> Result<AutopilotFinalReport> {
     run_autopilot_with_profile_retention_and_dispatch(
         options,
         profile,
         machine_global_retention,
         source,
+        parent_node,
         AutopilotCascadeDispatch::Production(std::marker::PhantomData),
     )
 }
@@ -1012,6 +1048,7 @@ fn run_autopilot_plan_file_with_injected_supervisor_and_runner(
         profile,
         Some(machine_global_retention),
         AutopilotRunSource::PlanFile,
+        None,
         AutopilotCascadeDispatch::Injected {
             supervisor_plan,
             external_runner,
@@ -1024,6 +1061,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     profile: Option<AutopilotProfile>,
     machine_global_retention: Option<MachineGlobalRetentionBinding>,
     source: AutopilotRunSource<'_>,
+    parent_node: Option<String>,
     mut cascade_dispatch: AutopilotCascadeDispatch<'_>,
 ) -> Result<AutopilotFinalReport> {
     let machine_global_retention = machine_global_retention.context(
@@ -1271,6 +1309,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         repo: repo.clone(),
         plan_file: supervisor_plan_path,
         run_id: supervisor_run_id,
+        parent_node,
         codex_bin,
         runtime,
         // Autopilot's own authenticated artifacts are local runtime state. The
@@ -1732,6 +1771,7 @@ fn run_autopilot_plan_file_disabled_legacy(
             repo: repo.clone(),
             plan_file: supervisor_plan_path,
             run_id: supervisor_run_id.clone(),
+            parent_node: None,
             codex_bin,
             runtime,
             // Autopilot already ran the real primary-change preflight; nested
@@ -6399,6 +6439,7 @@ mod tests {
                 repo: repo.clone(),
                 plan_file: supervisor_plan_file,
                 run_id: supervisor_run_id.clone(),
+                parent_node: None,
                 codex_bin: PathBuf::from("unused-injected-codex"),
                 runtime: SupervisorRuntime::Codex,
                 allow_dirty_primary: true,

@@ -307,6 +307,7 @@ pub struct SupervisorRunOptions {
     pub repo: PathBuf,
     pub plan_file: PathBuf,
     pub run_id: RunId,
+    pub parent_node: Option<String>,
     pub codex_bin: PathBuf,
     pub runtime: SupervisorRuntime,
     pub allow_dirty_primary: bool,

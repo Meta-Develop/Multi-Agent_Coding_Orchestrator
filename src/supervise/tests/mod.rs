@@ -491,6 +491,7 @@ fn injected_options(repo: &Path, root: &Path, run_id: &str) -> SupervisorRunOpti
         repo: repo.to_path_buf(),
         plan_file: root.join(format!("{run_id}.json")),
         run_id: RunId::new(run_id).expect("valid injected run id"),
+        parent_node: None,
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,

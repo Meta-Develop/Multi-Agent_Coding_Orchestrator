@@ -1165,6 +1165,7 @@ pub fn reaudit_supervisor_assignment(
         repo: repo.clone(),
         plan_file: PathBuf::from("evidence-only-reaudit"),
         run_id: request.run_id,
+        parent_node: None,
         codex_bin: request.codex_bin,
         runtime: request.runtime,
         allow_dirty_primary: request.allow_dirty_primary,

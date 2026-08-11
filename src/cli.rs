@@ -845,6 +845,7 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 repo: resolved_repo,
                 plan_file,
                 run_id: resolved_run_id.clone(),
+                parent_node: args.parent_node,
                 codex_bin: args.codex_bin,
                 runtime: args.runtime,
                 allow_dirty_primary: args.allow_dirty_primary,
@@ -1007,6 +1008,9 @@ struct RunSuperviseArgs {
     /// Stable run id for durable `.maco/o2/runs/<run-id>` artifacts. Omit to generate one.
     #[arg(long)]
     run_id: Option<String>,
+    /// External orchestration node that directly spawned this supervisor run.
+    #[arg(long, value_parser = parse_orchestration_node_id)]
+    parent_node: Option<String>,
     /// Codex-compatible executable to invoke. Ignored by the deterministic Fake runtime.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
@@ -1610,6 +1614,7 @@ impl AutopilotCommand {
                     args.run_id.as_deref(),
                     args.json,
                 )?;
+                let parent_node = args.parent_node;
                 let options = AutopilotRunOptions {
                     repo: resolved.repo,
                     plan_file,
@@ -1628,12 +1633,20 @@ impl AutopilotCommand {
                 });
                 let report = match goal_spec {
                     Some(goal_spec) => {
-                        autopilot::run_autopilot_goal_spec_with_profile_and_retention(
-                            options, "", &goal_spec, profile, retention,
+                        autopilot::run_autopilot_goal_spec_with_profile_retention_and_parent(
+                            options,
+                            "",
+                            &goal_spec,
+                            profile,
+                            retention,
+                            parent_node,
                         )?
                     }
-                    None => autopilot::run_autopilot_plan_file_with_profile_and_retention(
-                        options, profile, retention,
+                    None => autopilot::run_autopilot_plan_file_with_profile_retention_and_parent(
+                        options,
+                        profile,
+                        retention,
+                        parent_node,
                     )?,
                 };
                 print_query_report(&report, args.json)?;
@@ -1708,6 +1721,9 @@ struct RunAutopilotArgs {
     /// Stable run id for durable `.maco/autopilot/runs/<run-id>` artifacts. Omit to generate one.
     #[arg(long)]
     run_id: Option<String>,
+    /// External orchestration node that directly spawned this autopilot run.
+    #[arg(long, value_parser = parse_orchestration_node_id)]
+    parent_node: Option<String>,
     /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
     #[arg(long)]
     codex_bin: Option<PathBuf>,
@@ -5808,6 +5824,50 @@ mod tests {
             ];
             conflicting.extend(retention);
             assert!(Cli::try_parse_from(conflicting).is_err());
+        }
+    }
+
+    #[test]
+    fn live_run_entrypoints_accept_only_canonical_parent_nodes() {
+        let retention = [
+            "--machine-global-config",
+            "/tmp/maco-machine-global.json",
+            "--machine-global-runtime-root-id",
+            "runtime",
+        ];
+        for command in ["supervise", "autopilot"] {
+            let mut valid = vec![
+                "maco",
+                command,
+                "run",
+                "plan.json",
+                "--parent-node",
+                "driver-root",
+            ];
+            valid.extend(retention);
+            let parsed = Cli::try_parse_from(valid)
+                .unwrap_or_else(|error| panic!("{command} parent node must parse: {error}"));
+            let parent_node = match parsed.command {
+                Command::Supervise(SuperviseCommand {
+                    command: SuperviseSubcommand::Run(args),
+                }) => args.parent_node,
+                Command::Autopilot(AutopilotCommand {
+                    command: AutopilotSubcommand::Run(args),
+                }) => args.parent_node,
+                _ => panic!("expected a live run command"),
+            };
+            assert_eq!(parent_node.as_deref(), Some("driver-root"));
+
+            let mut invalid = vec![
+                "maco",
+                command,
+                "run",
+                "plan.json",
+                "--parent-node",
+                "invalid/parent",
+            ];
+            invalid.extend(retention);
+            assert!(Cli::try_parse_from(invalid).is_err());
         }
     }
 
