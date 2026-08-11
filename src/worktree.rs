@@ -181,6 +181,7 @@ pub struct WorktreeGcOptions {
     pub dry_run: bool,
     pub remove_targets: bool,
     pub retention: WorktreeRetentionPolicy,
+    pub allowed_untracked_paths: Vec<PathBuf>,
     pub exclude_agent_id: Option<String>,
     pub machine_global_retention: Option<MachineGlobalRetentionBinding>,
 }
@@ -191,6 +192,7 @@ pub struct WorktreeSweepOptions {
     pub apply: bool,
     pub remove_targets: bool,
     pub retention: WorktreeRetentionPolicy,
+    pub allowed_untracked_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -201,6 +203,7 @@ pub struct WorktreeSweepReport {
     pub remove_targets: bool,
     pub max_age_seconds: Option<u64>,
     pub max_count: Option<usize>,
+    pub allowed_untracked_paths: Vec<PathBuf>,
     pub discovery_status: WorktreeSweepDiscoveryStatus,
     pub worktree_root_discovered_count: usize,
     pub repository_discovered_count: usize,
@@ -276,6 +279,7 @@ pub struct WorktreeGcReport {
     pub remove_targets: bool,
     pub max_age_seconds: Option<u64>,
     pub max_count: Option<usize>,
+    pub allowed_untracked_paths: Vec<PathBuf>,
     pub considered_count: usize,
     pub removed_count: usize,
     pub protected_count: usize,
@@ -293,6 +297,8 @@ pub struct WorktreeGcEntry {
     pub status: WorktreeGcStatus,
     pub reason: WorktreeGcReason,
     pub target_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub untracked_paths: Vec<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate_denial: Option<GateDenial>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -317,7 +323,8 @@ pub enum WorktreeGcReason {
     FinishedBranch,
     RetentionKeep,
     ExcludedCurrentWorktree,
-    Dirty,
+    TrackedDirty,
+    UntrackedOnly,
     ActiveLease,
     ActiveClaim,
     TargetRemoved,
@@ -1082,6 +1089,7 @@ impl WorktreeManager {
                 dry_run: false,
                 remove_targets: true,
                 retention,
+                allowed_untracked_paths: Vec::new(),
                 exclude_agent_id,
                 machine_global_retention: None,
             })?;
@@ -1151,6 +1159,7 @@ impl WorktreeManager {
                 dry_run: false,
                 remove_targets: true,
                 retention,
+                allowed_untracked_paths: Vec::new(),
                 exclude_agent_id,
                 machine_global_retention: None,
             })?;
@@ -1681,6 +1690,8 @@ impl WorktreeManager {
         let repo = self.open_repository()?;
         let restrict_to_requested_root = options.worktree_root.is_some();
         let worktree_root = resolve_worktree_root(&repo, options.worktree_root.clone())?;
+        let allowed_untracked_paths =
+            normalize_gc_allowed_untracked_paths(&options.allowed_untracked_paths)?;
         let active_claims = active_claim_agent_ids(&repo)?;
         let exclude_agent_id = options
             .exclude_agent_id
@@ -1692,6 +1703,7 @@ impl WorktreeManager {
             remove_targets: options.remove_targets,
             max_age_seconds: options.retention.max_age.map(|age| age.as_secs()),
             max_count: options.retention.max_count,
+            allowed_untracked_paths: allowed_untracked_paths.iter().cloned().collect(),
             considered_count: 0,
             removed_count: 0,
             protected_count: 0,
@@ -1735,6 +1747,7 @@ impl WorktreeManager {
                     status: WorktreeGcStatus::Retained,
                     reason: WorktreeGcReason::ExcludedCurrentWorktree,
                     target_path: None,
+                    untracked_paths: Vec::new(),
                     gate_denial: None,
                     retention_operation_id: None,
                 });
@@ -1752,6 +1765,7 @@ impl WorktreeManager {
                     status: WorktreeGcStatus::Protected,
                     reason: WorktreeGcReason::ActiveClaim,
                     target_path: None,
+                    untracked_paths: Vec::new(),
                     gate_denial: None,
                     retention_operation_id: None,
                 });
@@ -1778,6 +1792,7 @@ impl WorktreeManager {
                         status: WorktreeGcStatus::Protected,
                         reason: WorktreeGcReason::ActiveLease,
                         target_path: None,
+                        untracked_paths: Vec::new(),
                         gate_denial: None,
                         retention_operation_id: None,
                     });
@@ -1801,6 +1816,7 @@ impl WorktreeManager {
                             status: WorktreeGcStatus::Protected,
                             reason: WorktreeGcReason::ActiveLease,
                             target_path: None,
+                            untracked_paths: Vec::new(),
                             gate_denial: None,
                             retention_operation_id: None,
                         });
@@ -1811,27 +1827,56 @@ impl WorktreeManager {
                     }
                 }
             };
-            if !gc_worktree_is_clean(&verified.path)? {
-                report.protected_count = report
-                    .protected_count
-                    .checked_add(1)
-                    .context("worktree GC protected count overflowed")?;
-                report.entries.push(WorktreeGcEntry {
-                    name: binding.name,
-                    branch: Some(binding.branch),
-                    path: verified.path,
-                    status: WorktreeGcStatus::Protected,
-                    reason: WorktreeGcReason::Dirty,
-                    target_path: None,
-                    gate_denial: None,
-                    retention_operation_id: None,
-                });
-                continue;
-            }
+            let untracked_paths = match gc_worktree_dirtiness(&verified.path)? {
+                WorktreeGcDirtiness::Clean => Vec::new(),
+                WorktreeGcDirtiness::TrackedDirty => {
+                    report.protected_count = report
+                        .protected_count
+                        .checked_add(1)
+                        .context("worktree GC protected count overflowed")?;
+                    report.entries.push(WorktreeGcEntry {
+                        name: binding.name,
+                        branch: Some(binding.branch),
+                        path: verified.path,
+                        status: WorktreeGcStatus::Protected,
+                        reason: WorktreeGcReason::TrackedDirty,
+                        target_path: None,
+                        untracked_paths: Vec::new(),
+                        gate_denial: None,
+                        retention_operation_id: None,
+                    });
+                    continue;
+                }
+                WorktreeGcDirtiness::UntrackedOnly(paths) => {
+                    if !paths
+                        .iter()
+                        .all(|path| allowed_untracked_paths.contains(path))
+                    {
+                        report.protected_count = report
+                            .protected_count
+                            .checked_add(1)
+                            .context("worktree GC protected count overflowed")?;
+                        report.entries.push(WorktreeGcEntry {
+                            name: binding.name,
+                            branch: Some(binding.branch),
+                            path: verified.path,
+                            status: WorktreeGcStatus::Protected,
+                            reason: WorktreeGcReason::UntrackedOnly,
+                            target_path: None,
+                            untracked_paths: paths,
+                            gate_denial: None,
+                            retention_operation_id: None,
+                        });
+                        continue;
+                    }
+                    paths
+                }
+            };
             candidates.push(WorktreeGcCandidate {
                 binding,
                 branch_oid: verified.branch_oid,
                 removal_lease,
+                untracked_paths,
             });
         }
 
@@ -1841,10 +1886,58 @@ impl WorktreeManager {
                 .cmp(&gc_created_at(&left.binding))
                 .then_with(|| left.binding.name.cmp(&right.binding.name))
         });
-        for (index, candidate) in candidates.into_iter().enumerate() {
+        for (index, mut candidate) in candidates.into_iter().enumerate() {
             let should_remove =
                 retention_selects_gc_candidate(&candidate.binding, index, now, options.retention);
             if should_remove {
+                if !options.dry_run {
+                    candidate.untracked_paths =
+                        match gc_worktree_dirtiness(&candidate.binding.path)? {
+                            WorktreeGcDirtiness::Clean => Vec::new(),
+                            WorktreeGcDirtiness::TrackedDirty => {
+                                report.protected_count = report
+                                    .protected_count
+                                    .checked_add(1)
+                                    .context("worktree GC protected count overflowed")?;
+                                report.entries.push(WorktreeGcEntry {
+                                    name: candidate.binding.name,
+                                    branch: Some(candidate.binding.branch),
+                                    path: candidate.binding.path,
+                                    status: WorktreeGcStatus::Protected,
+                                    reason: WorktreeGcReason::TrackedDirty,
+                                    target_path: None,
+                                    untracked_paths: Vec::new(),
+                                    gate_denial: None,
+                                    retention_operation_id: None,
+                                });
+                                continue;
+                            }
+                            WorktreeGcDirtiness::UntrackedOnly(paths) => {
+                                if !paths
+                                    .iter()
+                                    .all(|path| allowed_untracked_paths.contains(path))
+                                {
+                                    report.protected_count = report
+                                        .protected_count
+                                        .checked_add(1)
+                                        .context("worktree GC protected count overflowed")?;
+                                    report.entries.push(WorktreeGcEntry {
+                                        name: candidate.binding.name,
+                                        branch: Some(candidate.binding.branch),
+                                        path: candidate.binding.path,
+                                        status: WorktreeGcStatus::Protected,
+                                        reason: WorktreeGcReason::UntrackedOnly,
+                                        target_path: None,
+                                        untracked_paths: paths,
+                                        gate_denial: None,
+                                        retention_operation_id: None,
+                                    });
+                                    continue;
+                                }
+                                paths
+                            }
+                        };
+                }
                 let target_path = gc_target_path_if_present(&candidate.binding.path)?;
                 if options.dry_run {
                     report.removed_count = report
@@ -1858,6 +1951,7 @@ impl WorktreeManager {
                         status: WorktreeGcStatus::WouldRemove,
                         reason: WorktreeGcReason::FinishedBranch,
                         target_path,
+                        untracked_paths: candidate.untracked_paths,
                         gate_denial: None,
                         retention_operation_id: None,
                     });
@@ -1882,6 +1976,7 @@ impl WorktreeManager {
                     status: WorktreeGcStatus::Removed,
                     reason: WorktreeGcReason::FinishedBranch,
                     target_path,
+                    untracked_paths: candidate.untracked_paths,
                     gate_denial: None,
                     retention_operation_id: None,
                 });
@@ -1912,6 +2007,7 @@ impl WorktreeManager {
                         status: WorktreeGcStatus::Retained,
                         reason,
                         target_path: Some(target_path),
+                        untracked_paths: candidate.untracked_paths,
                         gate_denial: None,
                         retention_operation_id: None,
                     });
@@ -1933,6 +2029,7 @@ impl WorktreeManager {
                     WorktreeGcReason::RetentionKeep
                 },
                 target_path: None,
+                untracked_paths: candidate.untracked_paths,
                 gate_denial: None,
                 retention_operation_id: None,
             });
@@ -2086,6 +2183,8 @@ impl WorktreeManager {
 }
 
 pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<WorktreeSweepReport> {
+    let allowed_untracked_paths =
+        normalize_gc_allowed_untracked_paths(&options.allowed_untracked_paths)?;
     let workspace = fs::canonicalize(&options.workspace).with_context(|| {
         format!(
             "failed to resolve workspace {}",
@@ -2114,6 +2213,7 @@ pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<Worktr
         remove_targets: options.remove_targets,
         max_age_seconds: options.retention.max_age.map(|age| age.as_secs()),
         max_count: options.retention.max_count,
+        allowed_untracked_paths: allowed_untracked_paths.iter().cloned().collect(),
         discovery_status,
         worktree_root_discovered_count: roots.len(),
         repository_discovered_count: roots.len(),
@@ -2172,6 +2272,7 @@ pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<Worktr
             dry_run,
             remove_targets: options.remove_targets,
             retention: options.retention,
+            allowed_untracked_paths: allowed_untracked_paths.iter().cloned().collect(),
             exclude_agent_id: None,
             machine_global_retention: None,
         });
@@ -2837,6 +2938,7 @@ struct WorktreeGcCandidate {
     binding: ManagedWorktreeBinding,
     branch_oid: Oid,
     removal_lease: Option<ManagedWorktreeRemovalLease>,
+    untracked_paths: Vec<PathBuf>,
 }
 
 fn remove_gc_candidate(
@@ -2972,14 +3074,47 @@ fn is_active_lease_error(error: &anyhow::Error) -> bool {
         || message.contains("state lock")
 }
 
-fn gc_worktree_is_clean(path: &Path) -> Result<bool> {
-    Ok(bounded_repository_status_paths(
+enum WorktreeGcDirtiness {
+    Clean,
+    TrackedDirty,
+    UntrackedOnly(Vec<PathBuf>),
+}
+
+fn gc_worktree_dirtiness(path: &Path) -> Result<WorktreeGcDirtiness> {
+    let status = bounded_repository_status_paths(
         path,
         MAX_WORKTREE_STATUS_ENTRIES,
         MAX_WORKTREE_STATUS_OUTPUT_BYTES,
         WORKTREE_GC_STATUS_TIMEOUT,
-    )?
-    .is_empty())
+    )?;
+    if status.is_empty() {
+        return Ok(WorktreeGcDirtiness::Clean);
+    }
+    if status.iter().any(|(_, status)| *status != [b'?', b'?']) {
+        return Ok(WorktreeGcDirtiness::TrackedDirty);
+    }
+    Ok(WorktreeGcDirtiness::UntrackedOnly(
+        status.into_iter().map(|(path, _)| path).collect(),
+    ))
+}
+
+fn normalize_gc_allowed_untracked_paths(paths: &[PathBuf]) -> Result<BTreeSet<PathBuf>> {
+    let mut normalized = BTreeSet::new();
+    for path in paths {
+        if path.as_os_str().is_empty()
+            || path.is_absolute()
+            || path
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            bail!(
+                "allowed untracked path must be an exact repository-relative path: {}",
+                path.display()
+            );
+        }
+        normalized.insert(path.clone());
+    }
+    Ok(normalized)
 }
 
 fn gc_created_at(binding: &ManagedWorktreeBinding) -> i64 {
@@ -3076,6 +3211,7 @@ fn prune_unregistered_worktree_directories(
                 status: WorktreeGcStatus::OrphanWouldPrune,
                 reason: WorktreeGcReason::UnregisteredOrphan,
                 target_path: None,
+                untracked_paths: Vec::new(),
                 gate_denial: None,
                 retention_operation_id: None,
             });
@@ -3112,6 +3248,7 @@ fn prune_unregistered_worktree_directories(
                     status: WorktreeGcStatus::OrphanQuarantined,
                     reason: WorktreeGcReason::UnregisteredOrphan,
                     target_path: None,
+                    untracked_paths: Vec::new(),
                     gate_denial: None,
                     retention_operation_id: Some(operation_id),
                 });
@@ -3130,6 +3267,7 @@ fn prune_unregistered_worktree_directories(
                     status: WorktreeGcStatus::Protected,
                     reason: WorktreeGcReason::MachineGlobalGate,
                     target_path: None,
+                    untracked_paths: Vec::new(),
                     gate_denial: Some(denial.clone()),
                     retention_operation_id: None,
                 });
@@ -8897,7 +9035,8 @@ mod tests {
         commit_readme(&repo).expect("initial commit");
         let manager = WorktreeManager::new(&repo_path);
         let created = create_gc_worktree(&manager, "agent-dirty-gc", &worktree_root);
-        fs::write(created.path.join("scratch.txt"), "local work\n").expect("dirty worktree");
+        fs::write(created.path.join("README.md"), "tracked local work\n")
+            .expect("dirty tracked worktree");
 
         let report = manager
             .gc(gc_options(Some(worktree_root), false))
@@ -8906,8 +9045,89 @@ mod tests {
         assert_eq!(report.removed_count, 0);
         assert_eq!(report.protected_count, 1);
         assert_eq!(report.entries[0].status, WorktreeGcStatus::Protected);
-        assert_eq!(report.entries[0].reason, WorktreeGcReason::Dirty);
+        assert_eq!(report.entries[0].reason, WorktreeGcReason::TrackedDirty);
+        assert!(report.entries[0].untracked_paths.is_empty());
         assert!(created.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_classifies_untracked_only_and_requires_exact_allowlist_for_lane_removal() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = create_gc_worktree(&manager, "agent-untracked-gc", &worktree_root);
+        fs::write(created.path.join("TASK.md"), "task brief\n").expect("untracked task brief");
+
+        let protected = manager
+            .gc(gc_options(Some(worktree_root.clone()), false))
+            .expect("classify untracked-only worktree");
+
+        assert_eq!(protected.removed_count, 0);
+        assert_eq!(protected.protected_count, 1);
+        assert_eq!(protected.entries[0].status, WorktreeGcStatus::Protected);
+        assert_eq!(protected.entries[0].reason, WorktreeGcReason::UntrackedOnly);
+        assert_eq!(
+            protected.entries[0].untracked_paths,
+            vec![PathBuf::from("TASK.md")]
+        );
+        assert!(created.path.exists());
+
+        fs::write(created.path.join("result.txt"), "worker output\n")
+            .expect("second untracked output");
+        let mut partial = gc_options(Some(worktree_root.clone()), false);
+        partial.allowed_untracked_paths = vec![PathBuf::from("TASK.md")];
+        let partially_allowed = manager
+            .gc(partial)
+            .expect("partial allowlist remains protected");
+        assert_eq!(partially_allowed.removed_count, 0);
+        assert_eq!(partially_allowed.protected_count, 1);
+        assert_eq!(
+            partially_allowed.entries[0].reason,
+            WorktreeGcReason::UntrackedOnly
+        );
+        assert!(partially_allowed.entries[0]
+            .untracked_paths
+            .contains(&PathBuf::from("result.txt")));
+        assert!(created.path.exists());
+        fs::remove_file(created.path.join("result.txt")).expect("remove second output");
+
+        let mut allowed = gc_options(Some(worktree_root), false);
+        allowed.allowed_untracked_paths = vec![PathBuf::from("TASK.md")];
+        let reclaimed = manager
+            .gc(allowed)
+            .expect("reclaim explicitly allowed task brief");
+
+        assert_eq!(reclaimed.removed_count, 1);
+        assert_eq!(reclaimed.protected_count, 0);
+        assert_eq!(
+            reclaimed.allowed_untracked_paths,
+            vec![PathBuf::from("TASK.md")]
+        );
+        assert_eq!(reclaimed.entries[0].status, WorktreeGcStatus::Removed);
+        assert_eq!(
+            reclaimed.entries[0].untracked_paths,
+            vec![PathBuf::from("TASK.md")]
+        );
+        assert!(!created.path.exists());
+    }
+
+    #[test]
+    fn gc_rejects_non_exact_untracked_allowlist_paths() {
+        let absolute = normalize_gc_allowed_untracked_paths(&[PathBuf::from("/tmp/TASK.md")])
+            .expect_err("absolute allowlist path");
+        assert!(absolute
+            .to_string()
+            .contains("must be an exact repository-relative path"));
+        let escaping = normalize_gc_allowed_untracked_paths(&[PathBuf::from("../TASK.md")])
+            .expect_err("escaping allowlist path");
+        assert!(escaping
+            .to_string()
+            .contains("must be an exact repository-relative path"));
     }
 
     #[cfg(target_os = "linux")]
@@ -8987,6 +9207,7 @@ mod tests {
                     max_age: None,
                     max_count: Some(1),
                 },
+                allowed_untracked_paths: Vec::new(),
                 exclude_agent_id: None,
                 machine_global_retention: None,
             })
@@ -11853,6 +12074,7 @@ mod tests {
             dry_run,
             remove_targets: true,
             retention: WorktreeRetentionPolicy::default(),
+            allowed_untracked_paths: Vec::new(),
             exclude_agent_id: None,
             machine_global_retention: None,
         }
@@ -11864,6 +12086,7 @@ mod tests {
             apply,
             remove_targets: true,
             retention: WorktreeRetentionPolicy::default(),
+            allowed_untracked_paths: Vec::new(),
         }
     }
 

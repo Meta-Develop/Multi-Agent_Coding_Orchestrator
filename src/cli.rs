@@ -2194,6 +2194,7 @@ impl WorktreeCommand {
                         max_age: args.max_age_seconds.map(Duration::from_secs),
                         max_count: args.max_count,
                     },
+                    allowed_untracked_paths: args.allow_untracked_paths,
                     exclude_agent_id: None,
                     machine_global_retention,
                 })?;
@@ -2208,6 +2209,7 @@ impl WorktreeCommand {
                         max_age: args.max_age_seconds.map(Duration::from_secs),
                         max_count: args.max_count,
                     },
+                    allowed_untracked_paths: args.allow_untracked_paths,
                 })?;
                 print_worktree_sweep_report(&report, args.json)
             }
@@ -3202,6 +3204,9 @@ struct GcWorktreeArgs {
     /// Keep at most this many newest eligible clean worktrees.
     #[arg(long)]
     max_count: Option<usize>,
+    /// Exact repository-relative untracked path allowed during full-lane removal. Repeatable.
+    #[arg(long = "allow-untracked-path")]
+    allow_untracked_paths: Vec<PathBuf>,
     /// Exact reviewed config used to gate nonempty unregistered-directory cleanup.
     #[arg(long)]
     machine_global_config: Option<PathBuf>,
@@ -3233,6 +3238,9 @@ struct SweepWorktreeArgs {
     /// Keep at most this many newest eligible clean worktrees per discovered root.
     #[arg(long)]
     max_count: Option<usize>,
+    /// Exact repository-relative untracked path allowed during full-lane removal. Repeatable.
+    #[arg(long = "allow-untracked-path")]
+    allow_untracked_paths: Vec<PathBuf>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -4965,6 +4973,9 @@ fn print_worktree_gc_report(report: &WorktreeGcReport, json: bool) -> Result<()>
     println!("Retained: {}", report.retained_count);
     println!("Targets cleaned: {}", report.target_removed_count);
     println!("Orphans pruned: {}", report.orphan_removed_count);
+    for path in &report.allowed_untracked_paths {
+        println!("Allowed untracked path: {}", path.display());
+    }
     for entry in &report.entries {
         let branch = entry.branch.as_deref().unwrap_or("-");
         let target = entry
@@ -4981,8 +4992,9 @@ fn print_worktree_gc_report(report: &WorktreeGcReport, json: bool) -> Result<()>
             .retention_operation_id
             .map(|operation_id| format!(" retention-operation={}", operation_id.get()))
             .unwrap_or_default();
+        let untracked = worktree_gc_untracked_suffix(&entry.untracked_paths);
         println!(
-            "{}\t{}\t{}\t{}\t{}{}{}{}",
+            "{}\t{}\t{}\t{}\t{}{}{}{}{}",
             worktree_gc_status_label(entry.status),
             worktree_gc_reason_label(entry.reason),
             entry.name,
@@ -4990,7 +5002,8 @@ fn print_worktree_gc_report(report: &WorktreeGcReport, json: bool) -> Result<()>
             entry.path.display(),
             target,
             gate_denial,
-            retention
+            retention,
+            untracked
         );
     }
     Ok(())
@@ -5039,6 +5052,9 @@ fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Resu
     );
     if let Some(warning) = worktree_sweep_discovery_warning(report.discovery_status) {
         println!("{warning}");
+    }
+    for path in &report.allowed_untracked_paths {
+        println!("Allowed untracked path: {}", path.display());
     }
     println!(
         "Discovered roots: total={} inspected={} skipped-before-gc={} gc-failed={} total-failures={}",
@@ -5101,18 +5117,35 @@ fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Resu
             );
             for entry in &gc_report.entries {
                 let branch = entry.branch.as_deref().unwrap_or("-");
+                let untracked = worktree_gc_untracked_suffix(&entry.untracked_paths);
                 println!(
-                    "    {}\t{}\t{}\t{}\t{}",
+                    "    {}\t{}\t{}\t{}\t{}{}",
                     worktree_gc_status_label(entry.status),
                     worktree_gc_reason_label(entry.reason),
                     entry.name,
                     branch,
-                    entry.path.display()
+                    entry.path.display(),
+                    untracked
                 );
             }
         }
     }
     Ok(())
+}
+
+fn worktree_gc_untracked_suffix(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " untracked={}",
+            paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
 }
 
 fn worktree_sweep_discovery_status_label(status: WorktreeSweepDiscoveryStatus) -> &'static str {
@@ -5184,7 +5217,8 @@ fn worktree_gc_reason_label(reason: WorktreeGcReason) -> &'static str {
         WorktreeGcReason::FinishedBranch => "finished-branch",
         WorktreeGcReason::RetentionKeep => "retention-keep",
         WorktreeGcReason::ExcludedCurrentWorktree => "excluded-current-worktree",
-        WorktreeGcReason::Dirty => "dirty",
+        WorktreeGcReason::TrackedDirty => "tracked-dirty",
+        WorktreeGcReason::UntrackedOnly => "untracked-only",
         WorktreeGcReason::ActiveLease => "active-lease",
         WorktreeGcReason::ActiveClaim => "active-claim",
         WorktreeGcReason::TargetRemoved => "target-removed",
@@ -5349,6 +5383,10 @@ mod tests {
             "--max-count",
             "12",
             "--keep-targets",
+            "--allow-untracked-path",
+            "TASK.md",
+            "--allow-untracked-path",
+            "notes/output.txt",
             "--json",
         ])
         .expect("fully configured workspace sweep should parse");
@@ -5363,6 +5401,10 @@ mod tests {
         assert_eq!(args.max_age_seconds, Some(86_400));
         assert_eq!(args.max_count, Some(12));
         assert!(args.keep_targets);
+        assert_eq!(
+            args.allow_untracked_paths,
+            vec![PathBuf::from("TASK.md"), PathBuf::from("notes/output.txt")]
+        );
         assert!(args.json);
     }
 
@@ -5378,6 +5420,34 @@ mod tests {
         };
         assert_eq!(args.repo, PathBuf::from("repo"));
         assert!(!args.dry_run, "worktree gc must remain apply-by-default");
+        assert!(args.allow_untracked_paths.is_empty());
+    }
+
+    #[test]
+    fn worktree_gc_parses_repeatable_exact_untracked_allowlist() {
+        let parsed = Cli::try_parse_from([
+            "maco",
+            "worktree",
+            "gc",
+            "--allow-untracked-path",
+            "TASK.md",
+            "--allow-untracked-path",
+            "worker/output.json",
+        ])
+        .expect("repeatable untracked allowlist should parse");
+        let Command::Worktree(WorktreeCommand {
+            command: WorktreeSubcommand::Gc(args),
+        }) = parsed.command
+        else {
+            panic!("expected worktree gc command");
+        };
+        assert_eq!(
+            args.allow_untracked_paths,
+            vec![
+                PathBuf::from("TASK.md"),
+                PathBuf::from("worker/output.json")
+            ]
+        );
     }
 
     #[test]
@@ -5387,6 +5457,7 @@ mod tests {
             remove_targets: true,
             max_age_seconds: None,
             max_count: Some(1),
+            allowed_untracked_paths: Vec::new(),
             considered_count: 1,
             removed_count: 0,
             protected_count: 0,
@@ -5402,6 +5473,7 @@ mod tests {
                 target_path: Some(PathBuf::from(
                     "/workspace/.maco/worktrees/repo/retained-lane/target",
                 )),
+                untracked_paths: Vec::new(),
                 gate_denial: None,
                 retention_operation_id: None,
             }],

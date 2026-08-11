@@ -28,7 +28,7 @@ The current implementation covers a local-first command-line slice:
 - `maco worktree create <agent-id>` is temporarily disabled at its public entry point pending capability-bound repository cleanliness input.
 - `maco worktree list` lists verified registered agent worktrees. `maco worktree pending` is a strict existing-only authenticated reader: absent state returns an empty list, while transitional or invalid state is refused without creating locks, migrating, scavenging, recovering, or writing.
 - `maco worktree remove <agent-id> --force` performs explicitly authorized cleanup of authenticated managed state; non-force removal is temporarily disabled.
-- `maco worktree gc` removes clean, inactive managed worktrees while retaining branch refs, protects dirty worktrees and active leases/claims, removes retained `target/` build artifacts by default, supports dry-run and max-age/max-count retention filters, and routes unregistered leftover directories through recoverable machine-global quarantine.
+- `maco worktree gc` removes clean, inactive managed worktrees while retaining branch refs, protects tracked changes and unapproved untracked-only lanes plus active leases/claims, supports an exact repeatable untracked-path allowlist for reviewed full-lane cleanup, removes retained `target/` build artifacts by default, supports dry-run and max-age/max-count retention filters, and routes unregistered leftover directories through recoverable machine-global quarantine.
 - `maco worktree sweep --workspace <path>` discovers both workspace-managed `.maco/worktrees/<repo>` roots and exact repository-local `<repo>/.worktrees` roots, then aggregates the existing per-root GC reports. It is dry-run by default; removal requires `--apply`, an unresolved repository is reported as a typed per-root failure without aborting later roots, and a total discovery miss is reported separately from an inspected root with nothing to reclaim.
 - `SyncCoordinator` provides an in-memory exclusive path-claim layer for local agent coordination.
 - `maco sync claim <agent-id> <path>...` records durable exclusive path claims.
@@ -1271,6 +1271,8 @@ artifacts:
 
 ```bash
 cargo run -- worktree gc --repo . --dry-run --json
+cargo run -- worktree gc --repo . --dry-run \
+  --allow-untracked-path TASK.md --json
 cargo run -- worktree gc --repo . \
   --machine-global-config /exact/path/to/machine-global.json \
   --machine-global-worktree-root-id worktrees \
@@ -1283,9 +1285,18 @@ cargo run -- worktree gc --repo . \
   --keep-targets
 ```
 
-GC keeps worktrees with uncommitted changes, active MACO execution leases, or
-active path claims for the same agent id. Without retention filters, every clean
-inactive managed worktree is eligible for removal; with `--max-count` and/or
+GC classifies tracked changes separately from untracked-only paths. Tracked
+changes always protect the lane. Untracked-only lanes are also protected by
+default and report their complete bounded path set; full-lane cleanup is
+eligible only when every such path exactly matches a repeatable
+`--allow-untracked-path <repo-relative-path>` value. This is an exact path list,
+not a glob or blanket ignore, because an untracked file may be a worker's only
+copy of real output. Apply mode repeats the bounded status classification
+immediately before journaling full-lane removal and protects the lane if a new
+tracked or unapproved untracked path appeared. GC also keeps worktrees with
+active MACO execution leases or active path claims for the same agent id.
+Without retention filters, every eligible inactive managed worktree is selected
+for removal; with `--max-count` and/or
 `--max-age-seconds`, retained clean worktrees keep the checkout but lose their
 `target/` directory unless `--keep-targets` is set. A second pass prunes
 unregistered direct-child directories left under the managed worktree root. A
