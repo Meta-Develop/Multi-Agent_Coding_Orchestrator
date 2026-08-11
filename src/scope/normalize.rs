@@ -70,13 +70,7 @@ impl ScopeSnapshot {
         let mut events = self
             .projects
             .iter()
-            .flat_map(|project| project.runs.iter())
-            .flat_map(|run| {
-                run.events.iter().cloned().map(|event| FamilyEvent {
-                    family: run.family.clone(),
-                    event,
-                })
-            })
+            .flat_map(project_events)
             .collect::<Vec<_>>();
         sort_and_deduplicate_family_events(&mut events);
         events
@@ -112,12 +106,43 @@ pub struct FamilyEvent {
     pub event: NormalizedEvent,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamFilter {
+    pub repo: Option<String>,
+    pub family: Option<String>,
+    pub run: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamCursor {
+    Beginning,
+    After(u64),
+    Live,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SequencedFamilyEvent {
+    pub id: u64,
+    pub family: String,
+    pub event: NormalizedEvent,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamBatch {
+    pub events: Vec<SequencedFamilyEvent>,
+    pub cursor: u64,
+    pub more: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct CachedScope {
     repositories: Vec<RepositoryTarget>,
     snapshot: Option<ScopeSnapshot>,
     run_roots: Vec<RunRootWatch>,
     journals: BTreeMap<RunKey, JournalWatch>,
+    current_stream: Vec<SequencedFamilyEvent>,
+    stream_history: Vec<SequencedFamilyEvent>,
+    next_event_id: u64,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -168,6 +193,9 @@ impl CachedScope {
             snapshot: None,
             run_roots: Vec::new(),
             journals: BTreeMap::new(),
+            current_stream: Vec::new(),
+            stream_history: Vec::new(),
+            next_event_id: 1,
         }
     }
 
@@ -235,7 +263,8 @@ impl CachedScope {
             })?;
             let (events, position) =
                 read_journal_suffix(&path, &key.repo, &key.run, &watch.position)?;
-            self.append_run_events(&key, events)?;
+            let inserted = self.append_run_events(&key, events)?;
+            self.record_events(&key.family, inserted)?;
             if let Some(current) = self.journals.get_mut(&key) {
                 current.position = position;
             }
@@ -252,11 +281,78 @@ impl CachedScope {
             .ok_or_else(|| invalid_data("Scope cache has not been initialized"))
     }
 
+    pub fn stream_events(
+        &self,
+        filter: &StreamFilter,
+        cursor: StreamCursor,
+        limit: usize,
+    ) -> StreamBatch {
+        let latest = self.next_event_id.saturating_sub(1);
+        if cursor == StreamCursor::Live || limit == 0 {
+            return StreamBatch {
+                events: Vec::new(),
+                cursor: latest,
+                more: false,
+            };
+        }
+
+        let after = match cursor {
+            StreamCursor::Beginning => 0,
+            StreamCursor::After(id) => id.min(latest),
+            StreamCursor::Live => latest,
+        };
+        let source = if cursor == StreamCursor::Beginning {
+            &self.current_stream
+        } else {
+            &self.stream_history
+        };
+        let mut events = Vec::new();
+        let mut more = false;
+        for event in source.iter().filter(|event| {
+            event.id > after
+                && filter
+                    .repo
+                    .as_ref()
+                    .is_none_or(|repo| event.event.repo == *repo)
+                && filter
+                    .family
+                    .as_ref()
+                    .is_none_or(|family| event.family == *family)
+                && filter
+                    .run
+                    .as_ref()
+                    .is_none_or(|run| event.event.run == *run)
+        }) {
+            if events.len() == limit {
+                more = true;
+                break;
+            }
+            events.push(event.clone());
+        }
+        let cursor = if more {
+            events.last().map(|event| event.id).unwrap_or(after)
+        } else {
+            latest
+        };
+        StreamBatch {
+            events,
+            cursor,
+            more,
+        }
+    }
+
     fn rebuild_all(&mut self) -> io::Result<()> {
         let snapshot = scan_repositories(&self.repositories)?;
+        let events = snapshot.all_events();
         self.snapshot = Some(snapshot);
         self.rebuild_journal_watches();
         self.run_roots = run_root_watches(&self.repositories)?;
+        self.current_stream.clear();
+        self.stream_history.clear();
+        self.next_event_id = 1;
+        for event in events {
+            self.record_event(event.family, event.event)?;
+        }
         Ok(())
     }
 
@@ -272,6 +368,8 @@ impl CachedScope {
             )));
         };
         let project = scan_repository(&target)?;
+        let project_events = project_events(&project);
+        self.reconcile_repository_stream(repo_id, project_events)?;
         let snapshot = self
             .snapshot
             .as_mut()
@@ -295,7 +393,11 @@ impl CachedScope {
         Ok(())
     }
 
-    fn append_run_events(&mut self, key: &RunKey, events: Vec<NormalizedEvent>) -> io::Result<()> {
+    fn append_run_events(
+        &mut self,
+        key: &RunKey,
+        events: Vec<NormalizedEvent>,
+    ) -> io::Result<Vec<NormalizedEvent>> {
         let snapshot = self
             .snapshot
             .as_mut()
@@ -317,18 +419,110 @@ impl CachedScope {
             )));
         };
 
+        let mut inserted = Vec::new();
         for event in events {
             match run
                 .events
                 .binary_search_by(|existing| compare_events(existing, &event))
             {
                 Ok(_) => {}
-                Err(index) => run.events.insert(index, event),
+                Err(index) => {
+                    run.events.insert(index, event.clone());
+                    inserted.push(event);
+                }
             }
         }
         ensure_event_limit(&run.events)?;
         run.event_count = run.events.len();
         run.final_report_exists = final_report_exists(&run.family, &run.run_dir)?;
+        Ok(inserted)
+    }
+
+    fn record_events(&mut self, family: &str, events: Vec<NormalizedEvent>) -> io::Result<()> {
+        for event in events {
+            self.record_event(family.to_string(), event)?;
+        }
+        Ok(())
+    }
+
+    fn record_event(&mut self, family: String, event: NormalizedEvent) -> io::Result<u64> {
+        let id = self.next_event_id;
+        self.next_event_id = self
+            .next_event_id
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("Scope stream event id overflow"))?;
+        let event = SequencedFamilyEvent { id, family, event };
+        self.current_stream.push(event.clone());
+        self.stream_history.push(event);
+        Ok(id)
+    }
+
+    fn reconcile_repository_stream(
+        &mut self,
+        repo_id: &str,
+        mut events: Vec<FamilyEvent>,
+    ) -> io::Result<()> {
+        events.sort_by(compare_family_events);
+        let mut previous = self
+            .current_stream
+            .iter()
+            .filter(|event| event.event.repo == repo_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        previous.sort_by(|left, right| {
+            compare_family_events(
+                &FamilyEvent {
+                    family: left.family.clone(),
+                    event: left.event.clone(),
+                },
+                &FamilyEvent {
+                    family: right.family.clone(),
+                    event: right.event.clone(),
+                },
+            )
+        });
+
+        let mut retained = Vec::with_capacity(events.len());
+        let mut previous_index = 0_usize;
+        for event in events {
+            while let Some(old) = previous.get(previous_index) {
+                let old_event = FamilyEvent {
+                    family: old.family.clone(),
+                    event: old.event.clone(),
+                };
+                match compare_family_events(&old_event, &event) {
+                    std::cmp::Ordering::Less => previous_index += 1,
+                    std::cmp::Ordering::Equal => {
+                        retained.push(old.clone());
+                        previous_index += 1;
+                        break;
+                    }
+                    std::cmp::Ordering::Greater => break,
+                }
+            }
+            if retained
+                .last()
+                .is_none_or(|last| last.family != event.family || last.event != event.event)
+            {
+                let id = self.next_event_id;
+                self.next_event_id = self
+                    .next_event_id
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("Scope stream event id overflow"))?;
+                let sequenced = SequencedFamilyEvent {
+                    id,
+                    family: event.family,
+                    event: event.event,
+                };
+                retained.push(sequenced.clone());
+                self.stream_history.push(sequenced);
+            }
+        }
+
+        self.current_stream
+            .retain(|event| event.event.repo != repo_id);
+        self.current_stream.extend(retained);
+        self.current_stream.sort_by_key(|event| event.id);
         Ok(())
     }
 
@@ -382,7 +576,7 @@ impl CachedScope {
                 },
                 JournalWatch {
                     repository_root: target.path.clone(),
-                    family_directory: *family_directory,
+                    family_directory,
                     position,
                 },
             );
@@ -1989,9 +2183,7 @@ fn sort_and_deduplicate(events: &mut Vec<NormalizedEvent>) {
 }
 
 fn sort_and_deduplicate_family_events(events: &mut Vec<FamilyEvent>) {
-    events.sort_by(|left, right| {
-        compare_events(&left.event, &right.event).then_with(|| left.family.cmp(&right.family))
-    });
+    events.sort_by(compare_family_events);
     let mut seen = BTreeSet::new();
     events.retain(|event| {
         let Ok(encoded) = serde_json::to_string(&event.event) else {
@@ -1999,6 +2191,23 @@ fn sort_and_deduplicate_family_events(events: &mut Vec<FamilyEvent>) {
         };
         seen.insert((event.family.clone(), encoded))
     });
+}
+
+fn project_events(project: &ProjectSnapshot) -> Vec<FamilyEvent> {
+    project
+        .runs
+        .iter()
+        .flat_map(|run| {
+            run.events.iter().cloned().map(|event| FamilyEvent {
+                family: run.family.clone(),
+                event,
+            })
+        })
+        .collect()
+}
+
+fn compare_family_events(left: &FamilyEvent, right: &FamilyEvent) -> std::cmp::Ordering {
+    compare_events(&left.event, &right.event).then_with(|| left.family.cmp(&right.family))
 }
 
 fn compare_events(left: &NormalizedEvent, right: &NormalizedEvent) -> std::cmp::Ordering {
@@ -2123,6 +2332,18 @@ mod tests {
                 .len(),
             1
         );
+        let initial_stream = cache.stream_events(
+            &StreamFilter {
+                repo: None,
+                family: None,
+                run: None,
+            },
+            StreamCursor::Beginning,
+            16,
+        );
+        assert_eq!(initial_stream.events.len(), 1);
+        assert_eq!(initial_stream.events[0].id, 1);
+        assert_eq!(initial_stream.cursor, 1);
 
         let mut file = OpenOptions::new()
             .append(true)
@@ -2140,6 +2361,19 @@ mod tests {
             .expect("appended run");
         assert_eq!(events.len(), 2);
         assert!(events.iter().any(|event| event.node == "second"));
+        let appended_stream = cache.stream_events(
+            &StreamFilter {
+                repo: Some("repo-one".to_string()),
+                family: Some("o2".to_string()),
+                run: Some("cached".to_string()),
+            },
+            StreamCursor::After(1),
+            16,
+        );
+        assert_eq!(appended_stream.events.len(), 1);
+        assert_eq!(appended_stream.events[0].id, 2);
+        assert_eq!(appended_stream.events[0].event.node, "second");
+        assert_eq!(appended_stream.cursor, 2);
         let key = RunKey {
             repo: "repo-one".to_string(),
             family: "o2".to_string(),
@@ -2162,6 +2396,18 @@ mod tests {
             .expect("rebuilt snapshot")
             .events_for_run("repo-one", "o2", "cached")
             .expect("rebuilt run")
+            .is_empty());
+        assert!(cache
+            .stream_events(
+                &StreamFilter {
+                    repo: None,
+                    family: None,
+                    run: None,
+                },
+                StreamCursor::Beginning,
+                16,
+            )
+            .events
             .is_empty());
     }
 

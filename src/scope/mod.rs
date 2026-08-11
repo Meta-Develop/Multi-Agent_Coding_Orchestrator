@@ -12,7 +12,9 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use crate::inbox::load_workspace_repositories;
-use normalize::{CachedScope, FamilyEvent, NormalizedEvent, RepositoryTarget};
+use normalize::{
+    CachedScope, NormalizedEvent, RepositoryTarget, StreamBatch, StreamCursor, StreamFilter,
+};
 use server::ScopeDataSource;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,13 +89,18 @@ impl ScopeDataSource for ScanningDataSource {
             .map(<[NormalizedEvent]>::to_vec))
     }
 
-    fn stream_events(&self) -> Result<Vec<FamilyEvent>> {
+    fn stream_events(
+        &self,
+        filter: &StreamFilter,
+        cursor: StreamCursor,
+        limit: usize,
+    ) -> Result<StreamBatch> {
         let mut state = self.state()?;
         state
             .cache
             .refresh()
             .context("failed to refresh Scope repositories")?;
-        Ok(state.cache.snapshot()?.all_events())
+        Ok(state.cache.stream_events(filter, cursor, limit))
     }
 }
 
