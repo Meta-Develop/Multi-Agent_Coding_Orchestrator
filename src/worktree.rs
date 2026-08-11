@@ -2369,7 +2369,10 @@ impl WorktreeManager {
                     continue;
                 }
 
-                let boundary_target = gc_target_if_present(&candidate.binding.path)?;
+                let boundary_target = gc_target_at_apply_boundary(
+                    &candidate.binding.path,
+                    preflight_target.as_ref(),
+                )?;
                 if !worktree_gc_target_bindings_match(
                     preflight_target.as_ref(),
                     boundary_target.as_ref(),
@@ -2413,8 +2416,8 @@ impl WorktreeManager {
                         target_liveness: &target_liveness,
                     },
                 )?;
-                match removal {
-                    WorktreeGcRemovalOutcome::Removed => {}
+                let removed_untracked_paths = match removal {
+                    WorktreeGcRemovalOutcome::Removed { untracked_paths } => untracked_paths,
                     WorktreeGcRemovalOutcome::TargetIdentityChanged => {
                         add_gc_candidate_protection(
                             &mut report,
@@ -2440,7 +2443,7 @@ impl WorktreeManager {
                         )?;
                         continue;
                     }
-                }
+                };
                 registered_names.remove(&candidate.binding.name);
                 report.removed_count = report
                     .removed_count
@@ -2464,7 +2467,7 @@ impl WorktreeManager {
                     target_liveness: None,
                     apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
                     apparent_target_bytes: candidate.apparent_target_bytes,
-                    untracked_paths: candidate.untracked_paths,
+                    untracked_paths: removed_untracked_paths,
                     gate_denial: None,
                     retention_operation_id: None,
                 });
@@ -2488,7 +2491,10 @@ impl WorktreeManager {
                     let (reason, target) = if options.dry_run {
                         (WorktreeGcReason::TargetWouldRemove, preflight_target)
                     } else {
-                        let boundary_target = gc_target_if_present(&candidate.binding.path)?;
+                        let boundary_target = gc_target_at_apply_boundary(
+                            &candidate.binding.path,
+                            Some(&preflight_target),
+                        )?;
                         if !worktree_gc_target_bindings_match(
                             Some(&preflight_target),
                             boundary_target.as_ref(),
@@ -3614,7 +3620,9 @@ enum WorktreeGcDirtinessDisposition {
 }
 
 enum WorktreeGcRemovalOutcome {
-    Removed,
+    Removed {
+        untracked_paths: Vec<PathBuf>,
+    },
     TargetIdentityChanged,
     DirtinessChanged {
         reason: WorktreeGcReason,
@@ -3680,6 +3688,10 @@ fn remove_gc_candidate(
         }
         WorktreeGcDirtiness::Clean | WorktreeGcDirtiness::UntrackedOnly(_) => {}
     }
+    let final_untracked_paths = match &final_dirtiness {
+        WorktreeGcDirtiness::UntrackedOnly(paths) => paths.clone(),
+        WorktreeGcDirtiness::Clean | WorktreeGcDirtiness::TrackedDirty => Vec::new(),
+    };
     let dirtiness = managed_gc_dirtiness_snapshot(&final_dirtiness)?;
     let target_snapshot = match target {
         Some(target) => ManagedGcTargetSnapshot::Present {
@@ -3738,7 +3750,9 @@ fn remove_gc_candidate(
         Some(removal_lease),
         checks.target_liveness,
     )?;
-    Ok(WorktreeGcRemovalOutcome::Removed)
+    Ok(WorktreeGcRemovalOutcome::Removed {
+        untracked_paths: final_untracked_paths,
+    })
 }
 
 fn resolve_worktree_root(repo: &Repository, requested_root: Option<PathBuf>) -> Result<PathBuf> {
@@ -4138,6 +4152,24 @@ fn gc_target_if_present(worktree_path: &Path) -> Result<Option<WorktreeGcTarget>
         Err(error) => {
             Err(error).with_context(|| format!("failed to inspect {}", target_path.display()))
         }
+    }
+}
+
+fn gc_target_at_apply_boundary(
+    worktree_path: &Path,
+    preflight_target: Option<&WorktreeGcTarget>,
+) -> Result<Option<WorktreeGcTarget>> {
+    match gc_target_if_present(worktree_path) {
+        Ok(target) => Ok(target),
+        Err(error) if preflight_target.is_some() => {
+            let target_path = worktree_path.join("target");
+            match fs::symlink_metadata(&target_path) {
+                Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => Ok(None),
+                Err(inspect_error) if inspect_error.kind() == ErrorKind::NotFound => Ok(None),
+                Ok(_) | Err(_) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -10770,42 +10802,69 @@ mod tests {
         let repo = Repository::open(&repo_path).expect("open repo");
         commit_readme(&repo).expect("initial commit");
         let manager = WorktreeManager::new(&repo_path);
-        let managed = create_gc_worktree(
-            &manager,
-            "managed-lane",
-            &workspace.join(".maco/worktrees/repo"),
-        );
-        let local = create_gc_worktree(&manager, "repo-local-lane", &repo_path.join(".worktrees"));
+        let managed_root = workspace.join(".maco/worktrees/repo");
+        let local_root = repo_path.join(".worktrees");
+        let managed_old = create_gc_worktree(&manager, "managed-old-lane", &managed_root);
+        fs::write(managed_old.path.join("sizing.bin"), vec![b'm'; 64 * 1024])
+            .expect("managed old artifact");
+        let managed_new = create_gc_worktree(&manager, "managed-new-lane", &managed_root);
+        fs::write(managed_new.path.join("sizing.bin"), vec![b'n'; 64])
+            .expect("managed new artifact");
+        let local_old = create_gc_worktree(&manager, "local-old-lane", &local_root);
+        fs::write(local_old.path.join("sizing.bin"), vec![b'l'; 128 * 1024])
+            .expect("local old artifact");
+        let local_new = create_gc_worktree(&manager, "local-new-lane", &local_root);
+        fs::write(local_new.path.join("sizing.bin"), vec![b'r'; 128]).expect("local new artifact");
+        let managed_old_size =
+            gc_worktree_size_estimate(&managed_old.path).expect("managed old size");
+        let managed_new_size =
+            gc_worktree_size_estimate(&managed_new.path).expect("managed new size");
+        let local_old_size = gc_worktree_size_estimate(&local_old.path).expect("local old size");
+        let local_new_size = gc_worktree_size_estimate(&local_new.path).expect("local new size");
+        let per_root_budget = managed_new_size
+            .worktree_bytes
+            .max(local_new_size.worktree_bytes);
+        assert!(managed_old_size.worktree_bytes > per_root_budget);
+        assert!(local_old_size.worktree_bytes > per_root_budget);
 
-        let report = sweep_workspace_worktrees(workspace_sweep_options(&workspace, false))
-            .expect("sweep direct-child repository roots");
+        let mut options = workspace_sweep_options(&workspace, false);
+        options.remove_targets = false;
+        options.retention.max_total_bytes = Some(per_root_budget);
+        options.allowed_untracked_paths = vec![PathBuf::from("sizing.bin")];
+        let report =
+            sweep_workspace_worktrees(options).expect("sweep direct-child repository roots");
 
         assert_eq!(report.worktree_root_discovered_count, 2);
         assert_eq!(report.repository_inspected_count, 2);
-        assert_eq!(report.considered_count, 2);
-        assert_eq!(report.removed_count, 2);
+        assert_eq!(report.considered_count, 4);
+        assert_eq!(report.removed_count, 2, "{report:#?}");
+        assert_eq!(report.retained_count, 2, "{report:#?}");
         let nested_apparent_bytes = report
             .repositories
             .iter()
-            .map(|entry| {
-                entry
-                    .gc_report
-                    .as_ref()
-                    .expect("nested GC report")
-                    .apparent_considered_bytes
+            .try_fold(0u64, |total, entry| {
+                total.checked_add(
+                    entry
+                        .gc_report
+                        .as_ref()
+                        .expect("nested GC report")
+                        .apparent_considered_bytes,
+                )
             })
-            .sum::<u64>();
+            .expect("nested apparent byte sum");
         let nested_reclaimable_bytes = report
             .repositories
             .iter()
-            .map(|entry| {
-                entry
-                    .gc_report
-                    .as_ref()
-                    .expect("nested GC report")
-                    .estimated_reclaimable_bytes
+            .try_fold(0u64, |total, entry| {
+                total.checked_add(
+                    entry
+                        .gc_report
+                        .as_ref()
+                        .expect("nested GC report")
+                        .estimated_reclaimable_bytes,
+                )
             })
-            .sum::<u64>();
+            .expect("nested reclaimable byte sum");
         assert!(nested_apparent_bytes > 0);
         assert_eq!(report.apparent_considered_bytes, nested_apparent_bytes);
         assert_eq!(report.estimated_reclaimable_bytes, nested_reclaimable_bytes);
@@ -10816,16 +10875,54 @@ mod tests {
                 .iter()
                 .map(|entry| (
                     entry.root_kind,
-                    entry.gc_report.as_ref().map(|gc| gc.considered_count)
+                    entry.gc_report.as_ref().map(|gc| (
+                        gc.considered_count,
+                        gc.removed_count,
+                        gc.retained_count,
+                        gc.max_total_bytes,
+                    ))
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                (WorktreeSweepRootKind::WorkspaceManaged, Some(1)),
-                (WorktreeSweepRootKind::RepositoryLocal, Some(1)),
+                (
+                    WorktreeSweepRootKind::WorkspaceManaged,
+                    Some((2, 1, 1, Some(per_root_budget))),
+                ),
+                (
+                    WorktreeSweepRootKind::RepositoryLocal,
+                    Some((2, 1, 1, Some(per_root_budget))),
+                ),
             ]
         );
-        assert!(managed.path.exists());
-        assert!(local.path.exists());
+        for (root_kind, retained_name, expected_reclaimable) in [
+            (
+                WorktreeSweepRootKind::WorkspaceManaged,
+                managed_new.name.as_str(),
+                managed_old_size.worktree_bytes,
+            ),
+            (
+                WorktreeSweepRootKind::RepositoryLocal,
+                local_new.name.as_str(),
+                local_old_size.worktree_bytes,
+            ),
+        ] {
+            let gc = report
+                .repositories
+                .iter()
+                .find(|entry| entry.root_kind == root_kind)
+                .and_then(|entry| entry.gc_report.as_ref())
+                .expect("per-root GC report");
+            assert_eq!(gc.estimated_reclaimable_bytes, expected_reclaimable);
+            assert!(gc.entries.iter().any(|entry| {
+                entry.name == retained_name
+                    && entry.status == WorktreeGcStatus::Retained
+                    && entry.reason == WorktreeGcReason::RetentionKeep
+            }));
+        }
+        assert!(managed_old.path.exists());
+        assert!(managed_new.path.exists());
+        assert!(local_old.path.exists());
+        assert!(local_new.path.exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -12052,6 +12149,39 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn gc_apply_boundary_maps_file_and_symlink_target_replacements_to_identity_change() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        for replacement in ["file", "symlink"] {
+            let lane = temp.path().join(format!("{replacement}-lane"));
+            let target = lane.join("target");
+            fs::create_dir_all(target.join("debug")).expect("preflight target");
+            let preflight = gc_target_if_present(&lane)
+                .expect("bind preflight target")
+                .expect("preflight target exists");
+            fs::remove_dir_all(&target).expect("remove preflight target");
+            if replacement == "file" {
+                fs::write(&target, "replacement\n").expect("file replacement");
+            } else {
+                let outside = temp.path().join("outside-target");
+                fs::create_dir_all(&outside).expect("outside target");
+                symlink(&outside, &target).expect("symlink replacement");
+            }
+
+            let boundary = gc_target_at_apply_boundary(&lane, Some(&preflight))
+                .expect("replacement becomes structured absence");
+            assert!(boundary.is_none());
+            assert!(!worktree_gc_target_bindings_match(
+                Some(&preflight),
+                boundary.as_ref()
+            ));
+            assert!(fs::symlink_metadata(&target).is_ok());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn gc_unknown_and_live_evidence_protects_every_target_reclaim_path() {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
@@ -12419,6 +12549,117 @@ mod tests {
             assert!(created.path.join("target").exists());
             assert!(repo.find_branch(&created.branch, BranchType::Local).is_ok());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_full_removal_reports_final_approved_untracked_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = create_gc_worktree(&manager, "final-untracked", &worktree_root);
+        fs::create_dir_all(created.path.join("target/debug")).expect("target");
+        let final_path = PathBuf::from("late-approved.txt");
+        let mut options = gc_options(Some(worktree_root), false);
+        options.allowed_untracked_paths = vec![final_path.clone()];
+        let liveness_calls = std::cell::Cell::new(0usize);
+
+        let report = manager
+            .gc_with_target_liveness(options, |_| {
+                let call = liveness_calls.get();
+                liveness_calls.set(call.saturating_add(1));
+                if call == 1 {
+                    fs::write(created.path.join(&final_path), "late approved output\n")
+                        .expect("late approved output");
+                }
+                WorktreeTargetLiveness::Clear
+            })
+            .expect("full removal with final approved output");
+
+        assert!(liveness_calls.get() >= 2);
+        assert_eq!(report.removed_count, 1, "{report:#?}");
+        assert_eq!(report.protected_count, 0, "{report:#?}");
+        assert_eq!(report.entries[0].status, WorktreeGcStatus::Removed);
+        assert_eq!(report.entries[0].untracked_paths, vec![final_path]);
+        assert!(!created.path.exists());
+        assert!(repo.find_branch(&created.branch, BranchType::Local).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_boundary_protection_does_not_consume_count_or_size_retention() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let old = create_gc_worktree(&manager, "boundary-protection-old", &worktree_root);
+        fs::create_dir_all(old.path.join("target/debug")).expect("old target");
+        fs::write(old.path.join("target/debug/artifact"), vec![b'o'; 64]).expect("old artifact");
+        let new = create_gc_worktree(&manager, "boundary-protection-new", &worktree_root);
+        fs::create_dir_all(new.path.join("target/debug")).expect("new target");
+        fs::write(
+            new.path.join("target/debug/artifact"),
+            vec![b'n'; 64 * 1024],
+        )
+        .expect("new artifact");
+        let old_size = gc_worktree_size_estimate(&old.path).expect("old size");
+        let new_size = gc_worktree_size_estimate(&new.path).expect("new size");
+        assert!(new_size.worktree_bytes > old_size.worktree_bytes);
+
+        let mut options = gc_options(Some(worktree_root), false);
+        options.remove_targets = false;
+        options.retention = WorktreeRetentionPolicy {
+            max_age: None,
+            max_count: Some(1),
+            max_total_bytes: Some(old_size.worktree_bytes),
+        };
+        let liveness_calls = std::cell::Cell::new(0usize);
+        let report = manager
+            .gc_with_target_liveness(options, |target| {
+                let call = liveness_calls.get();
+                liveness_calls.set(call.saturating_add(1));
+                assert_eq!(target.path, new.path.join("target"));
+                if call == 1 {
+                    fs::write(new.path.join("README.md"), "late tracked edit\n")
+                        .expect("late tracked edit");
+                }
+                WorktreeTargetLiveness::Clear
+            })
+            .expect("boundary-protected retention GC");
+
+        assert_eq!(liveness_calls.get(), 2, "preflight and boundary probes");
+        assert_eq!(report.removed_count, 0, "{report:#?}");
+        assert_eq!(report.retained_count, 1, "{report:#?}");
+        assert_eq!(report.protected_count, 1, "{report:#?}");
+        assert_eq!(report.estimated_reclaimable_bytes, 0, "{report:#?}");
+        assert_eq!(report.estimated_reclaimed_bytes, 0, "{report:#?}");
+        assert_eq!(
+            report
+                .entries
+                .iter()
+                .find(|entry| entry.name == new.name)
+                .expect("new protected entry")
+                .reason,
+            WorktreeGcReason::Dirty
+        );
+        assert_eq!(
+            report
+                .entries
+                .iter()
+                .find(|entry| entry.name == old.name)
+                .expect("old retained entry")
+                .reason,
+            WorktreeGcReason::RetentionKeep
+        );
+        assert!(old.path.join("target").exists());
+        assert!(new.path.join("target").exists());
     }
 
     #[cfg(target_os = "linux")]
