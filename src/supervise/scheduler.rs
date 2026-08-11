@@ -1280,8 +1280,11 @@ fn initialize_scheduler_evidence(
     *initialization.field_guide_prompt_slot = Some(field_guide_prompt);
     *initialization.sync_store_slot = Some(SyncStore::open(initialization.repo)?);
     *initialization.semantic_store_slot = Some(SemanticIntentStore::open(initialization.repo)?);
-    *initialization.orchestration_journal =
-        initialize_orchestration_event_journal(initialization.repo, &initialization.options.run_id);
+    *initialization.orchestration_journal = initialize_orchestration_event_journal(
+        initialization.repo,
+        &initialization.options.run_id,
+        initialization.options.parent_node.as_deref(),
+    );
     record_orchestration_event(
         initialization.orchestration_journal,
         initialization.artifact_writer,
@@ -2062,6 +2065,7 @@ mod decomposition_tests {
             repo: repo.to_path_buf(),
             plan_file: repo.join("plan.json"),
             run_id: RunId::new(run_id).expect("valid scheduler test run id"),
+            parent_node: None,
             codex_bin: PathBuf::from("unused-test-codex"),
             runtime: SupervisorRuntime::Fake,
             allow_dirty_primary: true,
@@ -2130,7 +2134,11 @@ mod decomposition_tests {
             let prepared = vec![PreparedSemanticAssignment::default()];
             let field_guide =
                 SupervisorFieldGuidePrompt::empty().expect("empty scheduler field guide");
-            let mut journal = initialize_orchestration_event_journal(&repo, &options.run_id);
+            let mut journal = initialize_orchestration_event_journal(
+                &repo,
+                &options.run_id,
+                options.parent_node.as_deref(),
+            );
             let mut autonomy_kpis = AutonomyKpiCollector::default();
             let shared_artifacts = Mutex::new(SharedSupervisorArtifacts {
                 writer: &mut artifact_writer,
@@ -2207,7 +2215,11 @@ mod decomposition_tests {
                 .collect::<Vec<_>>();
             let field_guide =
                 SupervisorFieldGuidePrompt::empty().expect("empty scheduler field guide");
-            let mut journal = initialize_orchestration_event_journal(&repo, &options.run_id);
+            let mut journal = initialize_orchestration_event_journal(
+                &repo,
+                &options.run_id,
+                options.parent_node.as_deref(),
+            );
             let mut autonomy_kpis = AutonomyKpiCollector::default();
             let shared_artifacts = Mutex::new(SharedSupervisorArtifacts {
                 writer: &mut artifact_writer,
@@ -2636,7 +2648,8 @@ mod decomposition_tests {
     #[test]
     fn evidence_initialization_populates_stores_journal_and_baseline() {
         let (_temp, repo) = test_repository();
-        let options = test_options(&repo, "direct-evidence-initialization");
+        let mut options = test_options(&repo, "direct-evidence-initialization");
+        options.parent_node = Some("external-root".to_string());
         let plan = test_plan(Vec::new());
         let consultant = SupervisorConsultantPlan::default();
         let assignment_metadata = AssignmentMetadata::new();
@@ -2679,6 +2692,18 @@ mod decomposition_tests {
         assert!(semantic_store.is_some());
         assert!(journal.is_some());
         assert!(baseline.is_some());
+        let root_event = journal
+            .as_ref()
+            .expect("initialized orchestration journal")
+            .create_event(
+                options.run_id.as_str(),
+                None,
+                OrchestrationRole::Supervisor,
+                OrchestrationEventKind::Status,
+                json!({"status": "running"}),
+            )
+            .expect("create root supervisor event");
+        assert_eq!(root_event.parent.as_deref(), Some("external-root"));
     }
 
     #[test]
@@ -2699,7 +2724,7 @@ mod decomposition_tests {
         .expect("write persistence schema fixture");
         let _field_guide_store = FieldGuideStore::open(&repo, FieldGuideLimits::default())
             .expect("initialize authenticated persistence fixture");
-        let mut journal = initialize_orchestration_event_journal(&repo, &run_id);
+        let mut journal = initialize_orchestration_event_journal(&repo, &run_id, None);
         assert!(journal.is_some());
         let plan = test_plan(Vec::new());
         let mut report =

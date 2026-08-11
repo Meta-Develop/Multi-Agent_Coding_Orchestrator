@@ -1847,6 +1847,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         repo: temp.path().to_path_buf(),
         plan_file: temp.path().join("plan.json"),
         run_id: RunId::new("unverified-containment-stops-followups").expect("valid run id"),
+        parent_node: None,
         codex_bin: PathBuf::from("unused-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,

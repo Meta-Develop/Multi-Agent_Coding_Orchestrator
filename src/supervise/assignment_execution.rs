@@ -2976,6 +2976,7 @@ mod decomposition_tests {
             repo: repo.clone(),
             plan_file: temp.path().join("plan.json"),
             run_id: RunId::new("direct-assignment-phases").expect("valid fixture run id"),
+            parent_node: None,
             codex_bin: PathBuf::from("unused-codex"),
             runtime: SupervisorRuntime::Fake,
             allow_dirty_primary: false,
@@ -3009,7 +3010,11 @@ mod decomposition_tests {
             RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
         let runtime_model_catalog = RuntimeModelCatalog::LocalDeterministicFake;
         let cancellation = ProcessCancellation::new();
-        let mut journal = initialize_orchestration_event_journal(&repo, &options.run_id);
+        let mut journal = initialize_orchestration_event_journal(
+            &repo,
+            &options.run_id,
+            options.parent_node.as_deref(),
+        );
         let mut autonomy_kpis = AutonomyKpiCollector::default();
         let artifacts = Mutex::new(SharedSupervisorArtifacts {
             writer: &mut artifact_writer,
@@ -3253,6 +3258,7 @@ mod decomposition_tests {
             repo: PathBuf::from("/unused/repo"),
             plan_file: PathBuf::from("/unused/plan.json"),
             run_id: RunId::new("missing-machine-global-binding").expect("valid run id"),
+            parent_node: None,
             codex_bin: PathBuf::from("unused-codex"),
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
@@ -3344,6 +3350,7 @@ done
             repo: workspace.clone(),
             plan_file: workspace.join("plan.json"),
             run_id: RunId::new("active-claim-preserves-supervise-staging")?,
+            parent_node: None,
             codex_bin: agent.clone(),
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,

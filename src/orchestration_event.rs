@@ -3,17 +3,32 @@ use std::{
     time::{SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 
-use crate::artifacts::{ArtifactFileDisposition, ArtifactRunWriter};
+use crate::artifacts::{
+    discover_repo_root, repository_auth_writer, ArtifactFileDisposition, ArtifactRunWriter,
+};
 use crate::{
     merge::{CandidateValidationBinding, ValidationStatus},
+    orchestrator::RunId,
+    safe_state::{AtomicStateWriter, BoundedRegularReader, KernelStateLock, SafeRoot},
     sync::normalize_repo_relative_path,
     worktree::normalize_agent_id,
 };
+use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
 pub const ORCHESTRATION_EVENT_PATH: &str = "events/orchestration.jsonl";
+const EXTERNAL_EVENT_RUN_ROOT: &str = ".maco/o2-autopilot/runs";
+const EXTERNAL_EVENT_DIRECTORY: &str = "events";
+const EXTERNAL_EVENT_JOURNAL: &str = "orchestration.jsonl";
+const EXTERNAL_EVENT_LOCK: &str = "orchestration.lock";
+const MAX_EXTERNAL_EVENT_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_EXTERNAL_EVENT_LINE_BYTES: usize = 1024 * 1024;
+const MAX_EXTERNAL_EVENT_RECORDS: usize = 32 * 1024;
+const MAX_EXTERNAL_EVENT_PAYLOAD_BYTES: usize = 4 * 1024;
+const MAX_EXTERNAL_EVENT_STATUS_BYTES: usize = 64;
+const MAX_ORCHESTRATION_NODE_ID_BYTES: usize = 256;
 const MAX_ARBITRATION_REASON_BYTES: usize = 4 * 1024;
 const MAX_ARBITRATION_REPORT_PATH_BYTES: usize = 4 * 1024;
 
@@ -25,6 +40,7 @@ thread_local! {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrchestrationRole {
+    Root,
     Supervisor,
     Orchestrator,
     Worker,
@@ -42,6 +58,83 @@ pub enum OrchestrationEventKind {
     Escalate,
     Gate,
     Claim,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExternalAgentRuntime {
+    ClaudeCode,
+    Codex,
+    Human,
+    Other,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalOrchestrationPayload {
+    pub runtime: ExternalAgentRuntime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+impl ExternalOrchestrationPayload {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(status) = &self.status {
+            let normalized = normalize_external_status(status)?;
+            if normalized != *status {
+                bail!("external orchestration status must be canonical");
+            }
+        }
+        let encoded = serde_json::to_vec(self)
+            .context("failed to encode external orchestration event payload")?;
+        if encoded.len() > MAX_EXTERNAL_EVENT_PAYLOAD_BYTES {
+            bail!(
+                "external orchestration payload exceeds its {MAX_EXTERNAL_EVENT_PAYLOAD_BYTES}-byte limit"
+            );
+        }
+        Ok(())
+    }
+}
+
+pub fn normalize_orchestration_node_id(value: &str) -> anyhow::Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("orchestration node id cannot be empty");
+    }
+    if matches!(trimmed, "." | "..") {
+        bail!("orchestration node id cannot be '.' or '..'");
+    }
+    if trimmed.len() > MAX_ORCHESTRATION_NODE_ID_BYTES {
+        bail!("orchestration node id exceeds its {MAX_ORCHESTRATION_NODE_ID_BYTES}-byte limit");
+    }
+    if !trimmed
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    {
+        bail!("orchestration node id may only contain ASCII letters, digits, '.', '_' and '-'");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_external_status(value: &str) -> anyhow::Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("external orchestration status cannot be empty");
+    }
+    if trimmed.len() > MAX_EXTERNAL_EVENT_STATUS_BYTES {
+        bail!(
+            "external orchestration status exceeds its {MAX_EXTERNAL_EVENT_STATUS_BYTES}-byte limit"
+        );
+    }
+    if !trimmed
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    {
+        bail!(
+            "external orchestration status may only contain ASCII letters, digits, '.', '_' and '-'"
+        );
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Field-guide provenance actions carried by a [`OrchestrationEventKind::Journal`]
@@ -256,6 +349,7 @@ pub enum OrchestrationEventError {
 pub struct OrchestrationEventJournal {
     repository_id: String,
     run_id: String,
+    root_parent: Option<String>,
     enabled: bool,
 }
 
@@ -264,6 +358,20 @@ impl OrchestrationEventJournal {
         Self {
             repository_id: repository_id.into(),
             run_id: run_id.into(),
+            root_parent: None,
+            enabled: true,
+        }
+    }
+
+    pub fn with_root_parent(
+        repository_id: impl Into<String>,
+        run_id: impl Into<String>,
+        root_parent: Option<String>,
+    ) -> Self {
+        Self {
+            repository_id: repository_id.into(),
+            run_id: run_id.into(),
+            root_parent,
             enabled: true,
         }
     }
@@ -348,17 +456,191 @@ impl OrchestrationEventJournal {
         kind: OrchestrationEventKind,
         payload: Value,
     ) -> Result<OrchestrationEvent, OrchestrationEventError> {
+        let node = node.into();
+        let parent = parent.map(str::to_owned).or_else(|| {
+            (role == OrchestrationRole::Supervisor && node == self.run_id)
+                .then(|| self.root_parent.clone())
+                .flatten()
+        });
         Ok(OrchestrationEvent {
             ts: format_rfc3339_utc(timestamp)?,
             repo: self.repository_id.clone(),
             run: self.run_id.clone(),
-            node: node.into(),
-            parent: parent.map(str::to_owned),
+            node,
+            parent,
             role,
             kind,
             payload,
         })
     }
+}
+
+pub fn append_external_orchestration_event(
+    repo: impl AsRef<Path>,
+    run_id: RunId,
+    node: &str,
+    parent: Option<&str>,
+    role: OrchestrationRole,
+    kind: OrchestrationEventKind,
+    payload: ExternalOrchestrationPayload,
+) -> anyhow::Result<OrchestrationEvent> {
+    if role == OrchestrationRole::Supervisor {
+        bail!("external orchestration events cannot claim the supervisor role");
+    }
+    if !matches!(
+        kind,
+        OrchestrationEventKind::Spawn
+            | OrchestrationEventKind::Status
+            | OrchestrationEventKind::Journal
+    ) {
+        bail!("external orchestration events support only spawn, status, or journal kinds");
+    }
+    payload.validate()?;
+    let node = normalize_orchestration_node_id(node)?;
+    let parent = parent.map(normalize_orchestration_node_id).transpose()?;
+    let repo = discover_repo_root(repo.as_ref())?;
+    let auth_writer = repository_auth_writer(&repo)?;
+    let repository_id = auth_writer.authenticator().binding().repository_id.clone();
+    let event = OrchestrationEventJournal::new(&repository_id, run_id.as_str())
+        .create_event(
+            node,
+            parent.as_deref(),
+            role,
+            kind,
+            serde_json::to_value(payload)
+                .context("failed to encode external orchestration event payload")?,
+        )
+        .context("failed to create external orchestration event")?;
+    let encoded = encode_event_line(&event)
+        .context("failed to encode external orchestration event journal record")?;
+    if encoded.len() > MAX_EXTERNAL_EVENT_LINE_BYTES {
+        bail!(
+            "external orchestration event exceeds its {MAX_EXTERNAL_EVENT_LINE_BYTES}-byte line limit"
+        );
+    }
+
+    let events_root = SafeRoot::open_or_create_managed(
+        repo.join(EXTERNAL_EVENT_RUN_ROOT)
+            .join(run_id.as_str())
+            .join(EXTERNAL_EVENT_DIRECTORY),
+    )
+    .context("failed to open the external orchestration event directory")?;
+    let lock = KernelStateLock::acquire_direct(&events_root, EXTERNAL_EVENT_LOCK)
+        .context("failed to lock the external orchestration event journal")?;
+    let mut journal = if events_root.direct_child_exists(EXTERNAL_EVENT_JOURNAL)? {
+        BoundedRegularReader::read_direct(
+            &events_root,
+            EXTERNAL_EVENT_JOURNAL,
+            MAX_EXTERNAL_EVENT_JOURNAL_BYTES,
+        )
+        .context("failed to read the external orchestration event journal")?
+    } else {
+        Vec::new()
+    };
+    let record_count = validate_external_event_journal(&journal, &repository_id, run_id.as_str())?;
+    if record_count >= MAX_EXTERNAL_EVENT_RECORDS {
+        bail!(
+            "external orchestration event journal exceeds its {MAX_EXTERNAL_EVENT_RECORDS}-record limit"
+        );
+    }
+    let proposed_bytes = journal
+        .len()
+        .checked_add(encoded.len())
+        .context("external orchestration event journal byte count overflowed")?;
+    if u64::try_from(proposed_bytes).unwrap_or(u64::MAX) > MAX_EXTERNAL_EVENT_JOURNAL_BYTES {
+        bail!(
+            "external orchestration event journal exceeds its {MAX_EXTERNAL_EVENT_JOURNAL_BYTES}-byte limit"
+        );
+    }
+    journal.extend_from_slice(&encoded);
+    AtomicStateWriter::scavenge_direct_temps(&events_root, EXTERNAL_EVENT_JOURNAL)?;
+    AtomicStateWriter::write_direct_fenced(&events_root, EXTERNAL_EVENT_JOURNAL, &journal, || {
+        lock.verify_direct_binding(&events_root)
+    })
+    .context("failed to commit the external orchestration event journal")?;
+    auth_writer.verify()?;
+    Ok(event)
+}
+
+fn validate_external_event_journal(
+    journal: &[u8],
+    repository_id: &str,
+    run_id: &str,
+) -> anyhow::Result<usize> {
+    if journal.is_empty() {
+        return Ok(0);
+    }
+    if journal.last() != Some(&b'\n') {
+        bail!("external orchestration event journal ends with an incomplete record");
+    }
+
+    let mut record_count = 0_usize;
+    for line in journal[..journal.len() - 1].split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            bail!("external orchestration event journal contains an empty record");
+        }
+        if line.len() > MAX_EXTERNAL_EVENT_LINE_BYTES {
+            bail!(
+                "external orchestration event journal line exceeds its {MAX_EXTERNAL_EVENT_LINE_BYTES}-byte limit"
+            );
+        }
+        record_count = record_count
+            .checked_add(1)
+            .context("external orchestration event record count overflowed")?;
+        if record_count > MAX_EXTERNAL_EVENT_RECORDS {
+            bail!(
+                "external orchestration event journal exceeds its {MAX_EXTERNAL_EVENT_RECORDS}-record limit"
+            );
+        }
+        let raw: Value = serde_json::from_slice(line)
+            .context("external orchestration event journal contains invalid JSON")?;
+        let object = raw
+            .as_object()
+            .context("external orchestration event journal record must be an object")?;
+        let expected_fields = [
+            "ts", "repo", "run", "node", "parent", "role", "kind", "payload",
+        ];
+        if object.len() != expected_fields.len()
+            || expected_fields
+                .iter()
+                .any(|field| !object.contains_key(*field))
+        {
+            bail!("external orchestration event journal record has an invalid field set");
+        }
+        let event: OrchestrationEvent = serde_json::from_value(raw)
+            .context("external orchestration event journal record violates the event schema")?;
+        if event.repo != repository_id || event.run != run_id {
+            bail!(
+                "external orchestration event journal record does not match its repository and run binding"
+            );
+        }
+        if !is_canonical_event_timestamp(&event.ts) {
+            bail!("external orchestration event journal record has an invalid timestamp");
+        }
+        if normalize_orchestration_node_id(&event.node)? != event.node {
+            bail!("external orchestration event journal node id is not canonical");
+        }
+        if let Some(parent) = &event.parent {
+            if normalize_orchestration_node_id(parent)? != *parent {
+                bail!("external orchestration event journal parent id is not canonical");
+            }
+        }
+    }
+    Ok(record_count)
+}
+
+fn is_canonical_event_timestamp(timestamp: &str) -> bool {
+    let bytes = timestamp.as_bytes();
+    bytes.len() == 20
+        && bytes.get(4) == Some(&b'-')
+        && bytes.get(7) == Some(&b'-')
+        && bytes.get(10) == Some(&b'T')
+        && bytes.get(13) == Some(&b':')
+        && bytes.get(16) == Some(&b':')
+        && bytes.get(19) == Some(&b'Z')
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit()
+        })
 }
 
 pub fn encode_event_line(event: &OrchestrationEvent) -> Result<Vec<u8>, serde_json::Error> {
@@ -695,6 +977,7 @@ mod tests {
     #[test]
     fn every_supported_role_and_kind_uses_the_normalized_name() {
         let roles = [
+            (OrchestrationRole::Root, "root"),
             (OrchestrationRole::Supervisor, "supervisor"),
             (OrchestrationRole::Orchestrator, "orchestrator"),
             (OrchestrationRole::Worker, "worker"),
@@ -756,6 +1039,204 @@ mod tests {
                 kind
             );
         }
+    }
+
+    #[test]
+    fn old_and_root_event_wire_records_round_trip() {
+        let old_record = json!({
+            "ts": "2026-08-11T01:02:03Z",
+            "repo": "repo-id",
+            "run": "old-run",
+            "node": "old-run",
+            "parent": null,
+            "role": "supervisor",
+            "kind": "status",
+            "payload": {"status": "running"}
+        });
+        let old_event: OrchestrationEvent =
+            serde_json::from_value(old_record.clone()).expect("deserialize old event");
+        assert_eq!(old_event.role, OrchestrationRole::Supervisor);
+        assert_eq!(
+            serde_json::to_value(old_event).expect("serialize old event"),
+            old_record
+        );
+
+        let root_record = json!({
+            "ts": "2026-08-11T01:02:04Z",
+            "repo": "repo-id",
+            "run": "driver-run",
+            "node": "driver-root",
+            "parent": null,
+            "role": "root",
+            "kind": "spawn",
+            "payload": {"runtime": "claude-code"}
+        });
+        let root_event: OrchestrationEvent =
+            serde_json::from_value(root_record.clone()).expect("deserialize root event");
+        assert_eq!(root_event.role, OrchestrationRole::Root);
+        assert_eq!(
+            serde_json::to_value(root_event).expect("serialize root event"),
+            root_record
+        );
+    }
+
+    #[test]
+    fn legacy_closed_role_reader_rejects_the_new_root_variant() {
+        #[derive(Debug, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum LegacyRole {
+            Supervisor,
+            Orchestrator,
+            Worker,
+            Auditor,
+        }
+
+        assert!(serde_json::from_value::<LegacyRole>(json!("root")).is_err());
+        assert!(serde_json::from_value::<LegacyRole>(json!("supervisor")).is_ok());
+    }
+
+    #[test]
+    fn configured_root_parent_is_applied_only_to_the_root_supervisor_node() {
+        let journal = OrchestrationEventJournal::with_root_parent(
+            "repo-id",
+            "supervise-run",
+            Some("driver-root".to_string()),
+        );
+        let root = journal
+            .create_event_at(
+                UNIX_EPOCH,
+                "supervise-run",
+                None,
+                OrchestrationRole::Supervisor,
+                OrchestrationEventKind::Status,
+                json!({"status": "running"}),
+            )
+            .expect("create root supervisor event");
+        let peer = journal
+            .create_event_at(
+                UNIX_EPOCH,
+                "peer-supervisor",
+                None,
+                OrchestrationRole::Supervisor,
+                OrchestrationEventKind::Status,
+                json!({"status": "running"}),
+            )
+            .expect("create peer supervisor event");
+
+        assert_eq!(root.parent.as_deref(), Some("driver-root"));
+        assert!(peer.parent.is_none());
+    }
+
+    #[test]
+    fn external_payload_schema_rejects_prompt_content_and_unknown_fields() {
+        let error = serde_json::from_value::<ExternalOrchestrationPayload>(json!({
+            "runtime": "codex",
+            "prompt": "private task contents"
+        }))
+        .expect_err("prompt field must be rejected");
+        assert!(error.to_string().contains("unknown field"));
+        assert!(ExternalOrchestrationPayload {
+            runtime: ExternalAgentRuntime::Human,
+            status: Some("running".to_string()),
+        }
+        .validate()
+        .is_ok());
+        assert!(ExternalOrchestrationPayload {
+            runtime: ExternalAgentRuntime::Other,
+            status: Some("not safe to disclose".to_string()),
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn external_events_append_to_one_validated_atomic_journal() {
+        let (_temp, repo_path) = committed_repo();
+        let run_id = RunId::new("driver-session").expect("run id");
+        let root = append_external_orchestration_event(
+            &repo_path,
+            run_id.clone(),
+            "driver-root",
+            None,
+            OrchestrationRole::Root,
+            OrchestrationEventKind::Spawn,
+            ExternalOrchestrationPayload {
+                runtime: ExternalAgentRuntime::ClaudeCode,
+                status: Some("running".to_string()),
+            },
+        )
+        .expect("append root event");
+        let child = append_external_orchestration_event(
+            &repo_path,
+            run_id,
+            "direct-worker",
+            Some("driver-root"),
+            OrchestrationRole::Worker,
+            OrchestrationEventKind::Status,
+            ExternalOrchestrationPayload {
+                runtime: ExternalAgentRuntime::Codex,
+                status: Some("completed".to_string()),
+            },
+        )
+        .expect("append child event");
+
+        assert_eq!(root.role, OrchestrationRole::Root);
+        assert_eq!(child.parent.as_deref(), Some("driver-root"));
+        let journal_path = repo_path
+            .join(EXTERNAL_EVENT_RUN_ROOT)
+            .join("driver-session")
+            .join(EXTERNAL_EVENT_DIRECTORY)
+            .join(EXTERNAL_EVENT_JOURNAL);
+        let records = fs::read_to_string(journal_path)
+            .expect("read external journal")
+            .lines()
+            .map(|line| serde_json::from_str::<OrchestrationEvent>(line).expect("event record"))
+            .collect::<Vec<_>>();
+        assert_eq!(records, vec![root, child]);
+    }
+
+    #[test]
+    fn external_append_refuses_a_corrupt_existing_stream_without_replacing_it() {
+        let (_temp, repo_path) = committed_repo();
+        let run_id = RunId::new("corrupt-driver-session").expect("run id");
+        append_external_orchestration_event(
+            &repo_path,
+            run_id.clone(),
+            "driver-root",
+            None,
+            OrchestrationRole::Root,
+            OrchestrationEventKind::Spawn,
+            ExternalOrchestrationPayload {
+                runtime: ExternalAgentRuntime::Human,
+                status: None,
+            },
+        )
+        .expect("append initial event");
+        let journal_path = repo_path
+            .join(EXTERNAL_EVENT_RUN_ROOT)
+            .join(run_id.as_str())
+            .join(EXTERNAL_EVENT_DIRECTORY)
+            .join(EXTERNAL_EVENT_JOURNAL);
+        fs::write(&journal_path, b"{not-json}\n").expect("inject corrupt journal");
+
+        let error = append_external_orchestration_event(
+            &repo_path,
+            run_id,
+            "direct-worker",
+            Some("driver-root"),
+            OrchestrationRole::Worker,
+            OrchestrationEventKind::Status,
+            ExternalOrchestrationPayload {
+                runtime: ExternalAgentRuntime::Codex,
+                status: Some("running".to_string()),
+            },
+        )
+        .expect_err("corrupt journal must fail closed");
+        assert!(error.to_string().contains("invalid JSON"));
+        assert_eq!(
+            fs::read(journal_path).expect("read corrupt journal"),
+            b"{not-json}\n"
+        );
     }
 
     #[test]

@@ -89,11 +89,13 @@ pub(super) fn append_child_attempt_history(
 pub(super) fn initialize_orchestration_event_journal(
     repo: &Path,
     run_id: &RunId,
+    parent_node: Option<&str>,
 ) -> Option<OrchestrationEventJournal> {
     match repository_authenticator_key_only(repo) {
-        Ok(authenticator) => Some(OrchestrationEventJournal::new(
+        Ok(authenticator) => Some(OrchestrationEventJournal::with_root_parent(
             authenticator.binding().repository_id.clone(),
             run_id.as_str(),
+            parent_node.map(str::to_owned),
         )),
         Err(error) => {
             tracing::warn!(

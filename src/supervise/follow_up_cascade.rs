@@ -391,6 +391,7 @@ pub(super) fn run_generated_follow_up_cascade(
             repo: repo.to_path_buf(),
             plan_file: plan_file.path().to_path_buf(),
             run_id: subordinate_run_id.clone(),
+            parent_node: Some(supervisor_template.run_id.as_str().to_string()),
             codex_bin: supervisor_template.codex_bin.clone(),
             runtime: supervisor_template.runtime,
             allow_dirty_primary: supervisor_template.allow_dirty_primary,

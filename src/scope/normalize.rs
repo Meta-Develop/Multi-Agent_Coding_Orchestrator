@@ -2224,10 +2224,11 @@ fn compare_events(left: &NormalizedEvent, right: &NormalizedEvent) -> std::cmp::
 
 fn role_rank(role: OrchestrationRole) -> u8 {
     match role {
-        OrchestrationRole::Supervisor => 0,
-        OrchestrationRole::Orchestrator => 1,
-        OrchestrationRole::Worker => 2,
-        OrchestrationRole::Auditor => 3,
+        OrchestrationRole::Root => 0,
+        OrchestrationRole::Supervisor => 1,
+        OrchestrationRole::Orchestrator => 2,
+        OrchestrationRole::Worker => 3,
+        OrchestrationRole::Auditor => 4,
     }
 }
 

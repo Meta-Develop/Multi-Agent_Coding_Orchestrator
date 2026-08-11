@@ -568,6 +568,7 @@ fn safe_claim_conflict_narrows_scope_before_child_launch() {
         repo: repo_path.clone(),
         plan_file: temp.path().join("claim-conflict-safe-narrowing.json"),
         run_id: run_id.clone(),
+        parent_node: None,
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
@@ -627,6 +628,7 @@ fn validation_gate_reenters_child_with_injection_safe_prompt_and_journal() {
         repo: repo_path.clone(),
         plan_file: temp.path().join("validation-gate-correction.json"),
         run_id: run_id.clone(),
+        parent_node: None,
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
@@ -715,6 +717,7 @@ fn repeated_validation_denial_uses_one_correlation_across_prompts_and_journal() 
             .path()
             .join("repeated-validation-gate-correlation.json"),
         run_id: run_id.clone(),
+        parent_node: None,
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
@@ -783,6 +786,7 @@ fn primary_integrity_failure_dominates_validation_retry() {
             .path()
             .join("primary-integrity-dominates-validation.json"),
         run_id: run_id.clone(),
+        parent_node: None,
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
@@ -1025,6 +1029,7 @@ fn active_gate_is_escalated_when_corrective_child_operation_panics() {
             .path()
             .join("active-gate-corrective-operation-panic.json"),
         run_id: run_id.clone(),
+        parent_node: None,
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
@@ -1201,6 +1206,7 @@ fn completed_external_side_effect_escalates_through_gate_controller_without_seco
             .path()
             .join("completed-external-side-effect-no-retry.json"),
         run_id: run_id.clone(),
+        parent_node: None,
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,

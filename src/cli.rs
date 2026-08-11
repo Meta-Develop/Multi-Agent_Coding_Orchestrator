@@ -25,6 +25,10 @@ use crate::{
         MergeArbitrationReport, MergeCandidate, MergeCollectOptions, MergeForceOptions,
         MergePreviewOptions, ValidationEvidenceBundle, ValidationReport,
     },
+    orchestration_event::{
+        append_external_orchestration_event, normalize_orchestration_node_id,
+        ExternalOrchestrationPayload, OrchestrationEventKind, OrchestrationRole,
+    },
     orchestrator::{
         self, AgentRunStatus, OrchestrationResumeOptions, OrchestrationRunControls,
         OrchestrationRunOptions, OrchestrationSummary, RunId, SemanticCoordinationMode,
@@ -57,7 +61,7 @@ use crate::{
     },
 };
 use anyhow::{bail, Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use git2::Repository;
 use serde::Serialize;
 use serde_json::Value;
@@ -89,6 +93,7 @@ const MAX_PROMPT_PATHS: usize = 64;
 const MAX_SUPERVISE_GOAL_FILE_BYTES: u64 = 256 * 1024;
 const MAX_EVALUATION_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_EVALUATION_PLAN_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_EXTERNAL_EVENT_PAYLOAD_CLI_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "maco")]
@@ -840,6 +845,7 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 repo: resolved_repo,
                 plan_file,
                 run_id: resolved_run_id.clone(),
+                parent_node: args.parent_node.map(Into::into),
                 codex_bin: args.codex_bin,
                 runtime: args.runtime,
                 allow_dirty_primary: args.allow_dirty_primary,
@@ -1002,6 +1008,9 @@ struct RunSuperviseArgs {
     /// Stable run id for durable `.maco/o2/runs/<run-id>` artifacts. Omit to generate one.
     #[arg(long)]
     run_id: Option<String>,
+    /// External orchestration node that directly spawned this supervisor run.
+    #[arg(long, value_parser = parse_boxed_orchestration_node_id)]
+    parent_node: Option<Box<str>>,
     /// Codex-compatible executable to invoke. Ignored by the deterministic Fake runtime.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
@@ -1299,6 +1308,19 @@ impl ScopeCommand {
                 workspace: args.workspace,
                 bind: args.bind,
             }),
+            ScopeSubcommand::Event(args) => {
+                let payload = parse_external_event_payload(&args.payload)?;
+                let event = append_external_orchestration_event(
+                    args.repo,
+                    RunId::new(&args.run)?,
+                    &args.node,
+                    args.parent.as_deref(),
+                    args.role.into(),
+                    args.kind.into(),
+                    payload,
+                )?;
+                print_query_report(&event, args.json)
+            }
         }
     }
 }
@@ -1307,6 +1329,92 @@ impl ScopeCommand {
 enum ScopeSubcommand {
     /// Serve the localhost-only Scope observability backend.
     Serve(ScopeServeArgs),
+    /// Append one disclosure-safe event for an external root or directly spawned child.
+    Event(EmitScopeEventArgs),
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ExternalEventRoleArg {
+    Root,
+    Orchestrator,
+    Worker,
+    Auditor,
+}
+
+impl From<ExternalEventRoleArg> for OrchestrationRole {
+    fn from(value: ExternalEventRoleArg) -> Self {
+        match value {
+            ExternalEventRoleArg::Root => Self::Root,
+            ExternalEventRoleArg::Orchestrator => Self::Orchestrator,
+            ExternalEventRoleArg::Worker => Self::Worker,
+            ExternalEventRoleArg::Auditor => Self::Auditor,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ExternalEventKindArg {
+    Spawn,
+    Status,
+    Journal,
+}
+
+impl From<ExternalEventKindArg> for OrchestrationEventKind {
+    fn from(value: ExternalEventKindArg) -> Self {
+        match value {
+            ExternalEventKindArg::Spawn => Self::Spawn,
+            ExternalEventKindArg::Status => Self::Status,
+            ExternalEventKindArg::Journal => Self::Journal,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct EmitScopeEventArgs {
+    /// Repository whose external root-event stream receives this event.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// External driver run id under `.maco/o2-autopilot/runs`.
+    #[arg(long)]
+    run: String,
+    /// Canonical id for the external root or directly spawned child.
+    #[arg(long, value_parser = parse_orchestration_node_id)]
+    node: String,
+    /// Canonical parent node id. Omit it for the topmost external root.
+    #[arg(long, value_parser = parse_orchestration_node_id)]
+    parent: Option<String>,
+    /// External role. The supervisor role is intentionally unavailable here.
+    #[arg(long, value_enum)]
+    role: ExternalEventRoleArg,
+    /// External event kind. Gate and decision kinds are intentionally unavailable here.
+    #[arg(long, value_enum)]
+    kind: ExternalEventKindArg,
+    /// Disclosure-safe JSON: runtime is required; optional status is a short token.
+    #[arg(long)]
+    payload: String,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+fn parse_orchestration_node_id(value: &str) -> Result<String, String> {
+    normalize_orchestration_node_id(value).map_err(|error| format!("{error:#}"))
+}
+
+fn parse_boxed_orchestration_node_id(value: &str) -> Result<Box<str>, String> {
+    parse_orchestration_node_id(value).map(String::into_boxed_str)
+}
+
+fn parse_external_event_payload(value: &str) -> Result<ExternalOrchestrationPayload> {
+    if value.len() > MAX_EXTERNAL_EVENT_PAYLOAD_CLI_BYTES {
+        bail!(
+            "external orchestration payload exceeds its {MAX_EXTERNAL_EVENT_PAYLOAD_CLI_BYTES}-byte CLI limit"
+        );
+    }
+    let payload = serde_json::from_str::<ExternalOrchestrationPayload>(value)
+        .context("external orchestration payload must match the disclosure-safe schema")?;
+    payload.validate()?;
+    Ok(payload)
 }
 
 #[derive(Debug, Args)]
@@ -1510,6 +1618,7 @@ impl AutopilotCommand {
                     args.run_id.as_deref(),
                     args.json,
                 )?;
+                let parent_node = args.parent_node.map(Into::into);
                 let options = AutopilotRunOptions {
                     repo: resolved.repo,
                     plan_file,
@@ -1528,12 +1637,20 @@ impl AutopilotCommand {
                 });
                 let report = match goal_spec {
                     Some(goal_spec) => {
-                        autopilot::run_autopilot_goal_spec_with_profile_and_retention(
-                            options, "", &goal_spec, profile, retention,
+                        autopilot::run_autopilot_goal_spec_with_profile_retention_and_parent(
+                            options,
+                            "",
+                            &goal_spec,
+                            profile,
+                            retention,
+                            parent_node,
                         )?
                     }
-                    None => autopilot::run_autopilot_plan_file_with_profile_and_retention(
-                        options, profile, retention,
+                    None => autopilot::run_autopilot_plan_file_with_profile_retention_and_parent(
+                        options,
+                        profile,
+                        retention,
+                        parent_node,
                     )?,
                 };
                 print_query_report(&report, args.json)?;
@@ -1608,6 +1725,9 @@ struct RunAutopilotArgs {
     /// Stable run id for durable `.maco/autopilot/runs/<run-id>` artifacts. Omit to generate one.
     #[arg(long)]
     run_id: Option<String>,
+    /// External orchestration node that directly spawned this autopilot run.
+    #[arg(long, value_parser = parse_boxed_orchestration_node_id)]
+    parent_node: Option<Box<str>>,
     /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
     #[arg(long)]
     codex_bin: Option<PathBuf>,
@@ -5708,6 +5828,50 @@ mod tests {
             ];
             conflicting.extend(retention);
             assert!(Cli::try_parse_from(conflicting).is_err());
+        }
+    }
+
+    #[test]
+    fn live_run_entrypoints_accept_only_canonical_parent_nodes() {
+        let retention = [
+            "--machine-global-config",
+            "/tmp/maco-machine-global.json",
+            "--machine-global-runtime-root-id",
+            "runtime",
+        ];
+        for command in ["supervise", "autopilot"] {
+            let mut valid = vec![
+                "maco",
+                command,
+                "run",
+                "plan.json",
+                "--parent-node",
+                "driver-root",
+            ];
+            valid.extend(retention);
+            let parsed = Cli::try_parse_from(valid)
+                .unwrap_or_else(|error| panic!("{command} parent node must parse: {error}"));
+            let parent_node = match parsed.command {
+                Command::Supervise(SuperviseCommand {
+                    command: SuperviseSubcommand::Run(args),
+                }) => args.parent_node,
+                Command::Autopilot(AutopilotCommand {
+                    command: AutopilotSubcommand::Run(args),
+                }) => args.parent_node,
+                _ => panic!("expected a live run command"),
+            };
+            assert_eq!(parent_node.as_deref(), Some("driver-root"));
+
+            let mut invalid = vec![
+                "maco",
+                command,
+                "run",
+                "plan.json",
+                "--parent-node",
+                "invalid/parent",
+            ];
+            invalid.extend(retention);
+            assert!(Cli::try_parse_from(invalid).is_err());
         }
     }
 
