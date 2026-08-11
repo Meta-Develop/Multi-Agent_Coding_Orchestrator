@@ -12756,11 +12756,12 @@ mod tests {
         let target = gc_target_if_present(&binding.path)
             .expect("target inspection")
             .expect("target exists");
-        registry
+        let operation = registry
             .operations
             .get_mut(&binding.name)
-            .expect("prepared removal")
-            .removal_safety = Some(ManagedRemovalSafety::GarbageCollection {
+            .expect("prepared removal");
+        operation.delete_branch = false;
+        operation.removal_safety = Some(ManagedRemovalSafety::GarbageCollection {
             dirtiness,
             target: ManagedGcTargetSnapshot::Present {
                 identity: target.identity,
@@ -14896,9 +14897,9 @@ mod tests {
                 worktree_root: Some(worktree_root),
             })
             .expect("create worktree");
-        let residue = created.path.join("target/debug/deps");
+        let residue = created.path.join("scratch/nested/deps");
         fs::create_dir_all(&residue).expect("create residue directory");
-        fs::write(residue.join("artifact.d"), "ignored build output\n").expect("write residue");
+        fs::write(residue.join("artifact.d"), "untracked worker output\n").expect("write residue");
 
         let removed = manager
             .remove("agent-residue", true, true)
