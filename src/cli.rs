@@ -845,7 +845,7 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 repo: resolved_repo,
                 plan_file,
                 run_id: resolved_run_id.clone(),
-                parent_node: args.parent_node,
+                parent_node: args.parent_node.map(Into::into),
                 codex_bin: args.codex_bin,
                 runtime: args.runtime,
                 allow_dirty_primary: args.allow_dirty_primary,
@@ -1009,8 +1009,8 @@ struct RunSuperviseArgs {
     #[arg(long)]
     run_id: Option<String>,
     /// External orchestration node that directly spawned this supervisor run.
-    #[arg(long, value_parser = parse_orchestration_node_id)]
-    parent_node: Option<String>,
+    #[arg(long, value_parser = parse_boxed_orchestration_node_id)]
+    parent_node: Option<Box<str>>,
     /// Codex-compatible executable to invoke. Ignored by the deterministic Fake runtime.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
@@ -1401,6 +1401,10 @@ fn parse_orchestration_node_id(value: &str) -> Result<String, String> {
     normalize_orchestration_node_id(value).map_err(|error| format!("{error:#}"))
 }
 
+fn parse_boxed_orchestration_node_id(value: &str) -> Result<Box<str>, String> {
+    parse_orchestration_node_id(value).map(String::into_boxed_str)
+}
+
 fn parse_external_event_payload(value: &str) -> Result<ExternalOrchestrationPayload> {
     if value.len() > MAX_EXTERNAL_EVENT_PAYLOAD_CLI_BYTES {
         bail!(
@@ -1614,7 +1618,7 @@ impl AutopilotCommand {
                     args.run_id.as_deref(),
                     args.json,
                 )?;
-                let parent_node = args.parent_node;
+                let parent_node = args.parent_node.map(Into::into);
                 let options = AutopilotRunOptions {
                     repo: resolved.repo,
                     plan_file,
@@ -1722,8 +1726,8 @@ struct RunAutopilotArgs {
     #[arg(long)]
     run_id: Option<String>,
     /// External orchestration node that directly spawned this autopilot run.
-    #[arg(long, value_parser = parse_orchestration_node_id)]
-    parent_node: Option<String>,
+    #[arg(long, value_parser = parse_boxed_orchestration_node_id)]
+    parent_node: Option<Box<str>>,
     /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
     #[arg(long)]
     codex_bin: Option<PathBuf>,
