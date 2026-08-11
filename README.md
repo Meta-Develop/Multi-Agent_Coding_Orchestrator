@@ -1297,11 +1297,13 @@ aggregate because a workspace sweep copies it into each per-root report. An
 untracked file may be a worker's only copy of real output. Apply mode repeats
 the bounded status classification immediately before journaling full-lane
 removal and protects the lane if a new tracked or unapproved untracked path
-appeared. GC removal records that reviewed state in its authenticated recovery
-journal and revalidates it immediately before quarantine. A legacy or explicit
-force-removal operation without this GC-specific state remains force-compatible;
-an absent state is never interpreted as proof that a GC candidate is clean. GC
-also keeps worktrees with
+appeared. GC removal records the exact, platform-lossless clean or untracked-path
+classification and the target's absent/present filesystem identity in its
+authenticated recovery journal, then revalidates both immediately before
+quarantine. New explicit removals record a distinct origin. Explicit `--force`
+bypasses dirtiness but never target liveness; a legacy operation with no origin
+is ambiguous and must be clean before recovery can quarantine it. GC also keeps
+worktrees with
 active MACO execution leases or active path claims for the same agent id.
 Without retention filters, every eligible inactive managed worktree is selected
 for removal; with `--max-count` and/or
@@ -1324,7 +1326,11 @@ bounded `/proc` snapshot for same-user processes. Explicit `CARGO_TARGET_DIR`
 values are resolved in the process's own view: absolute paths through
 `/proc/<pid>/root` and relative paths through `/proc/<pid>/cwd`. Canonical path
 containment and bounded ancestor identity checks in both directions detect
-aliases across mount namespaces without assuming textual path equality. The
+aliases across mount namespaces without assuming textual path equality. Process
+paths retain their `/proc/<pid>/root` access path for identity checks. Observer
+canonical-path comparisons are used only when the process and observer mount
+namespace identities match; a different namespace relies on rooted filesystem
+identities and incomplete evidence is unknown. The
 detector also parses bounded process command lines for split and `--name=value`
 forms of Cargo's `--target-dir` and `--manifest-path` and rustc's `--out-dir`.
 An explicit output under the target is live; a manifest inside the lane with no
@@ -1332,7 +1338,10 @@ explicit output protects the default Cargo target. The fallback association
 scan always runs, even after a readable environment or command line has no
 explicit target: a cargo/rustc/rustdoc/sccache-like process with a `cwd` inside
 the lane protects the default Cargo target, while a process `cwd`, executable,
-or readable file descriptor inside the target is live. Environment,
+or readable file descriptor inside the target is live. File descriptors are
+read with `readlink`; recognized non-filesystem `pipe`, `socket`, `anon_inode`,
+and synthetic `memfd` targets are skipped, while deleted filesystem links under
+the target still protect it. Environment,
 command-line, cwd, executable, file-descriptor, bound, read, or timeout failures
 are unknown, not clear. A live match is reported as `live_target`; an incomplete,
 oversized, timed-out, or unreconciled scan is reported as
@@ -1344,9 +1353,10 @@ Target-only deletion passes that expected identity into the handle-relative tree
 remover, and full-lane deletion rechecks it immediately before recording the
 removal operation. Replacement is reported as `target_identity_changed` and the
 lane is retained. The same protections apply to a target included in full-lane
-removal. Recovery from a prepared removal rebinds the source and target, reruns
-the real liveness detector, and revalidates the persisted GC dirtiness state
-before quarantine. On non-Linux platforms the detector conservatively reports
+removal. Recovery from a prepared removal rebinds the source, refuses any GC
+target absent/present or identity change, reruns the real liveness detector for
+every target including explicit-force removals, and revalidates the exact GC
+dirtiness state before quarantine. On non-Linux platforms the detector conservatively reports
 unknown, so target deletion remains disabled until a native detector is
 implemented. These checks run at the removal boundary to narrow the race, but a
 non-cooperating process can still start or create output after the final check.
