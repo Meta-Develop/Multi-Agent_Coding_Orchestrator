@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     io::{self, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
@@ -14,9 +13,9 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::{artifacts::state_auth::sha256_hex, orchestration_event::OrchestrationEvent};
+use crate::orchestration_event::OrchestrationEvent;
 
-use super::normalize::FamilyEvent;
+use super::normalize::{StreamBatch, StreamCursor, StreamFilter};
 
 const SCOPE_HTML: &str = include_str!("placeholder.html");
 const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
@@ -68,7 +67,12 @@ pub(crate) trait ScopeDataSource: Send + Sync {
         run_id: &str,
     ) -> Result<Option<Vec<OrchestrationEvent>>>;
 
-    fn stream_events(&self) -> Result<Vec<FamilyEvent>>;
+    fn stream_events(
+        &self,
+        filter: &StreamFilter,
+        cursor: StreamCursor,
+        limit: usize,
+    ) -> Result<StreamBatch>;
 }
 
 #[derive(Serialize)]
@@ -219,7 +223,21 @@ fn handle_connection(
             ),
             Err(_) => write_internal_error(&mut stream),
         },
-        "/api/stream" => write_event_stream(&mut stream, source, shutdown, config),
+        "/api/stream" => {
+            let stream_options = match parse_stream_options(&request) {
+                Ok(options) => options,
+                Err(message) => {
+                    return write_json_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        &json!({"error": message}),
+                        &[],
+                        config.max_json_response_bytes,
+                    );
+                }
+            };
+            write_event_stream(&mut stream, source, shutdown, config, stream_options)
+        }
         path => write_run_events_response(&mut stream, source.as_ref(), path, config),
     }
 }
@@ -323,11 +341,131 @@ fn decode_hex(byte: u8) -> Option<u8> {
     }
 }
 
+fn parse_stream_options(request: &Request) -> std::result::Result<StreamOptions, String> {
+    let mut repo = None;
+    let mut family = None;
+    let mut run = None;
+    let mut since = None;
+    let mut repo_seen = false;
+    let mut family_seen = false;
+    let mut run_seen = false;
+    if let Some(query) = request.query.as_deref() {
+        for field in query.split('&').filter(|field| !field.is_empty()) {
+            let (encoded_name, encoded_value) = field.split_once('=').unwrap_or((field, ""));
+            let name = decode_query_component(encoded_name)
+                .ok_or_else(|| "invalid stream query encoding".to_string())?;
+            let value = decode_query_component(encoded_value)
+                .ok_or_else(|| "invalid stream query encoding".to_string())?;
+            match name.as_str() {
+                "repo" => set_stream_filter(&mut repo, &mut repo_seen, value, "repo")?,
+                "family" => set_stream_filter(&mut family, &mut family_seen, value, "family")?,
+                "run" => set_stream_filter(&mut run, &mut run_seen, value, "run")?,
+                "since" => {
+                    if since.replace(value).is_some() {
+                        return Err("duplicate stream query parameter 'since'".to_string());
+                    }
+                }
+                _ => return Err(format!("unknown stream query parameter '{name}'")),
+            }
+        }
+    }
+
+    let cursor = if let Some(last_event_id) = request
+        .last_event_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        StreamCursor::After(parse_event_id(last_event_id, "Last-Event-ID")?)
+    } else {
+        match since.as_deref() {
+            None | Some("") => StreamCursor::Beginning,
+            Some("now") => StreamCursor::Live,
+            Some(value) => StreamCursor::After(parse_event_id(value, "since")?),
+        }
+    };
+    Ok(StreamOptions {
+        filter: StreamFilter { repo, family, run },
+        cursor,
+    })
+}
+
+fn set_stream_filter(
+    destination: &mut Option<String>,
+    seen: &mut bool,
+    value: String,
+    name: &str,
+) -> std::result::Result<(), String> {
+    if *seen {
+        return Err(format!("duplicate stream query parameter '{name}'"));
+    }
+    *seen = true;
+    if !value.is_empty() {
+        *destination = Some(value);
+    }
+    Ok(())
+}
+
+fn parse_event_id(value: &str, source: &str) -> std::result::Result<u64, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{source} must be a decimal event id"));
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{source} event id is out of range"))
+}
+
+fn decode_query_component(encoded: &str) -> Option<String> {
+    let encoded = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(encoded.len().min(MAX_DECODED_ROUTE_SEGMENT_BYTES));
+    let mut index = 0;
+    while index < encoded.len() {
+        let byte = match encoded[index] {
+            b'%' => {
+                let high = decode_hex(*encoded.get(index + 1)?)?;
+                let low = decode_hex(*encoded.get(index + 2)?)?;
+                index += 3;
+                (high << 4) | low
+            }
+            b'+' => {
+                index += 1;
+                b' '
+            }
+            byte => {
+                index += 1;
+                byte
+            }
+        };
+        if decoded.len() >= MAX_DECODED_ROUTE_SEGMENT_BYTES {
+            return None;
+        }
+        decoded.push(byte);
+    }
+    let decoded = String::from_utf8(decoded).ok()?;
+    (!decoded.chars().any(char::is_control)).then_some(decoded)
+}
+
+/// `/api/stream` wire contract for the Scope UI.
+///
+/// `repo`, `family`, and `run` query values are optional exact-match UTF-8
+/// filters. With no cursor, the response starts with the current matching
+/// history for compatibility. `since=now` starts at the live edge, while a
+/// decimal `since=<id>` resumes after that event. A non-empty decimal
+/// `Last-Event-ID` header overrides `since`, which lets browser EventSource
+/// reconnects resume a `since=now` request. Every data record carries an
+/// `id: <decimal>` SSE field. IDs increase for the lifetime of the server
+/// process; an ID beyond the current process range is clamped to the live edge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StreamOptions {
+    filter: StreamFilter,
+    cursor: StreamCursor,
+}
+
 fn write_event_stream(
     stream: &mut TcpStream,
     source: Arc<dyn ScopeDataSource>,
     shutdown: Arc<AtomicBool>,
     config: ServerConfig,
+    options: StreamOptions,
 ) -> io::Result<()> {
     stream.write_all(
         concat!(
@@ -342,38 +480,32 @@ fn write_event_stream(
     )?;
     stream.flush()?;
 
-    let mut previous_scan = BTreeSet::new();
+    let mut cursor = options.cursor;
     let mut last_heartbeat = Instant::now();
     while !shutdown.load(Ordering::Acquire) {
-        match source.stream_events() {
-            Ok(events) => {
-                if events.len() > config.max_stream_events_per_scan {
-                    stream.write_all(b": event scan exceeds limit\n\n")?;
-                } else {
-                    let mut current_scan = BTreeSet::new();
-                    for event in events {
-                        let payload = ScopeEventPayload {
-                            family: &event.family,
-                            event: &event.event,
+        let mut more = false;
+        match source.stream_events(&options.filter, cursor, config.max_stream_events_per_scan) {
+            Ok(batch) => {
+                for event in batch.events {
+                    let payload = ScopeEventPayload {
+                        family: &event.family,
+                        event: &event.event,
+                    };
+                    let serialized =
+                        match serialize_json_bounded(&payload, config.max_sse_event_bytes) {
+                            Ok(serialized) => serialized,
+                            Err(_) => {
+                                stream.write_all(b": event exceeds serialization limit\n\n")?;
+                                continue;
+                            }
                         };
-                        let serialized =
-                            match serialize_json_bounded(&payload, config.max_sse_event_bytes) {
-                                Ok(serialized) => serialized,
-                                Err(_) => {
-                                    stream.write_all(b": event exceeds serialization limit\n\n")?;
-                                    continue;
-                                }
-                            };
-                        let event_id = sha256_hex(&serialized);
-                        let first_in_scan = current_scan.insert(event_id.clone());
-                        if first_in_scan && !previous_scan.contains(&event_id) {
-                            stream.write_all(b"data: ")?;
-                            stream.write_all(&serialized)?;
-                            stream.write_all(b"\n\n")?;
-                        }
-                    }
-                    previous_scan = current_scan;
+                    writeln!(stream, "id: {}", event.id)?;
+                    stream.write_all(b"data: ")?;
+                    stream.write_all(&serialized)?;
+                    stream.write_all(b"\n\n")?;
                 }
+                cursor = StreamCursor::After(batch.cursor);
+                more = batch.more;
             }
             Err(_) => {
                 stream.write_all(b": scan error\n\n")?;
@@ -381,6 +513,10 @@ fn write_event_stream(
             }
         }
         stream.flush()?;
+
+        if more {
+            continue;
+        }
 
         if last_heartbeat.elapsed() >= config.stream_heartbeat_interval {
             stream.write_all(b": heartbeat\n\n")?;
@@ -411,6 +547,8 @@ fn wait_for_stream_poll(shutdown: &AtomicBool, config: ServerConfig) {
 struct Request {
     method: String,
     path: String,
+    query: Option<String>,
+    last_event_id: Option<String>,
 }
 
 fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
@@ -456,16 +594,40 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
             "invalid HTTP request line",
         ));
     }
-    let path = target.split('?').next().unwrap_or_default();
+    let (path, query) = target
+        .split_once('?')
+        .map_or((target, None), |(path, query)| (path, Some(query)));
     if !path.starts_with('/') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "HTTP request target must be an origin-form path",
         ));
     }
+    let mut last_event_id = None;
+    let mut last_event_id_seen = false;
+    for line in header.lines().skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("Last-Event-ID") {
+            if last_event_id_seen {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate Last-Event-ID header",
+                ));
+            }
+            last_event_id_seen = true;
+            last_event_id = Some(value.trim().to_string());
+        }
+    }
     Ok(Some(Request {
         method: method.to_string(),
         path: path.to_string(),
+        query: query.map(str::to_string),
+        last_event_id,
     }))
 }
 
@@ -626,12 +788,13 @@ mod tests {
     };
 
     use crate::orchestration_event::{OrchestrationEventKind, OrchestrationRole};
+    use crate::scope::normalize::{FamilyEvent, SequencedFamilyEvent};
 
     use super::*;
 
     struct TestDataSource {
         projects: Value,
-        events: Mutex<Vec<FamilyEvent>>,
+        events: Mutex<Vec<SequencedFamilyEvent>>,
         expected_route: Option<(String, String, String)>,
     }
 
@@ -639,12 +802,12 @@ mod tests {
         fn new(projects: Value, events: Vec<OrchestrationEvent>) -> Self {
             Self {
                 projects,
-                events: Mutex::new(
+                events: Mutex::new(sequence_events(
                     events
                         .into_iter()
                         .map(|event| family_event("o2", event))
                         .collect(),
-                ),
+                )),
                 expected_route: None,
             }
         }
@@ -656,14 +819,16 @@ mod tests {
         }
 
         fn set_events(&self, events: Vec<OrchestrationEvent>) {
-            *self.events.lock().expect("lock test events") = events
-                .into_iter()
-                .map(|event| family_event("o2", event))
-                .collect();
+            *self.events.lock().expect("lock test events") = sequence_events(
+                events
+                    .into_iter()
+                    .map(|event| family_event("o2", event))
+                    .collect(),
+            );
         }
 
         fn set_stream_events(&self, events: Vec<FamilyEvent>) {
-            *self.events.lock().expect("lock test events") = events;
+            *self.events.lock().expect("lock test events") = sequence_events(events);
         }
     }
 
@@ -693,9 +858,73 @@ mod tests {
             ))
         }
 
-        fn stream_events(&self) -> Result<Vec<FamilyEvent>> {
-            Ok(self.events.lock().expect("lock test events").clone())
+        fn stream_events(
+            &self,
+            filter: &StreamFilter,
+            cursor: StreamCursor,
+            limit: usize,
+        ) -> Result<StreamBatch> {
+            let events = self.events.lock().expect("lock test events");
+            let latest = events.last().map(|event| event.id).unwrap_or_default();
+            if cursor == StreamCursor::Live {
+                return Ok(StreamBatch {
+                    events: Vec::new(),
+                    cursor: latest,
+                    more: false,
+                });
+            }
+            let after = match cursor {
+                StreamCursor::Beginning => 0,
+                StreamCursor::After(id) => id.min(latest),
+                StreamCursor::Live => latest,
+            };
+            let mut selected = events
+                .iter()
+                .filter(|event| {
+                    event.id > after
+                        && filter
+                            .repo
+                            .as_ref()
+                            .is_none_or(|repo| event.event.repo == *repo)
+                        && filter
+                            .family
+                            .as_ref()
+                            .is_none_or(|family| event.family == *family)
+                        && filter
+                            .run
+                            .as_ref()
+                            .is_none_or(|run| event.event.run == *run)
+                })
+                .take(limit.saturating_add(1))
+                .cloned()
+                .collect::<Vec<_>>();
+            let more = selected.len() > limit;
+            if more {
+                selected.truncate(limit);
+            }
+            let cursor = if more {
+                selected.last().map(|event| event.id).unwrap_or(after)
+            } else {
+                latest
+            };
+            Ok(StreamBatch {
+                events: selected,
+                cursor,
+                more,
+            })
         }
+    }
+
+    fn sequence_events(events: Vec<FamilyEvent>) -> Vec<SequencedFamilyEvent> {
+        events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| SequencedFamilyEvent {
+                id: u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1),
+                family: event.family,
+                event: event.event,
+            })
+            .collect()
     }
 
     struct TestServer {
@@ -772,15 +1001,22 @@ mod tests {
     }
 
     fn open_stream(address: SocketAddr, path: &str) -> TcpStream {
+        open_stream_with_headers(address, path, &[])
+    }
+
+    fn open_stream_with_headers(address: SocketAddr, path: &str, headers: &[&str]) -> TcpStream {
         let mut stream = TcpStream::connect(address).expect("connect to test server");
         stream
             .set_read_timeout(Some(Duration::from_millis(20)))
             .expect("set test read timeout");
-        write!(
-            stream,
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-        )
-        .expect("write test request");
+        write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n")
+            .expect("write test request line");
+        for header in headers {
+            write!(stream, "{header}\r\n").expect("write test request header");
+        }
+        stream
+            .write_all(b"Connection: close\r\n\r\n")
+            .expect("finish test request");
         stream
     }
 
@@ -865,6 +1101,48 @@ mod tests {
             "a".repeat(MAX_DECODED_ROUTE_SEGMENT_BYTES + 1)
         );
         assert!(parse_run_events_path(&oversized).is_none());
+    }
+
+    #[test]
+    fn parses_filtered_resumable_stream_contract() {
+        let options = parse_stream_options(&Request {
+            method: "GET".to_string(),
+            path: "/api/stream".to_string(),
+            query: Some("repo=repo+space&family=o2%2Dautopilot&run=run%2Fone&since=41".to_string()),
+            last_event_id: None,
+        })
+        .expect("stream options");
+        assert_eq!(options.filter.repo.as_deref(), Some("repo space"));
+        assert_eq!(options.filter.family.as_deref(), Some("o2-autopilot"));
+        assert_eq!(options.filter.run.as_deref(), Some("run/one"));
+        assert_eq!(options.cursor, StreamCursor::After(41));
+
+        let options = parse_stream_options(&Request {
+            method: "GET".to_string(),
+            path: "/api/stream".to_string(),
+            query: Some("since=now".to_string()),
+            last_event_id: Some("9".to_string()),
+        })
+        .expect("Last-Event-ID override");
+        assert_eq!(options.cursor, StreamCursor::After(9));
+
+        for query in [
+            "unknown=value",
+            "repo=one&repo=two",
+            "since=not-a-number",
+            "repo=%FF",
+        ] {
+            assert!(
+                parse_stream_options(&Request {
+                    method: "GET".to_string(),
+                    path: "/api/stream".to_string(),
+                    query: Some(query.to_string()),
+                    last_event_id: None,
+                })
+                .is_err(),
+                "accepted {query}"
+            );
+        }
     }
 
     #[test]
@@ -981,22 +1259,21 @@ mod tests {
             json!({"projects": []}),
             vec![event("first", json!({})), event("second", json!({}))],
         ));
-        let mut scan_config = test_config();
-        scan_config.max_stream_events_per_scan = 1;
-        let mut scan_server = TestServer::start(source, scan_config);
+        let mut batch_config = test_config();
+        batch_config.max_stream_events_per_scan = 1;
+        let mut scan_server = TestServer::start(source, batch_config);
         let mut stream = open_stream(scan_server.address, "/api/stream");
         let mut scan_response = Vec::new();
-        read_until(
-            &mut stream,
-            &mut scan_response,
-            ": event scan exceeds limit",
-        );
-        assert!(!String::from_utf8_lossy(&scan_response).contains("data: "));
+        read_until(&mut stream, &mut scan_response, "\"node\":\"second\"");
+        let scan_response = String::from_utf8(scan_response).expect("batched SSE UTF-8");
+        assert_eq!(scan_response.matches("data: ").count(), 2);
+        assert!(scan_response.contains("id: 1\n"));
+        assert!(scan_response.contains("id: 2\n"));
         scan_server.stop();
     }
 
     #[test]
-    fn stream_deduplicates_unchanged_events_emits_new_events_and_heartbeats() {
+    fn stream_cursor_emits_each_event_once_and_sends_heartbeats() {
         let first = event("worker-1", json!({"status": "running"}));
         let second = event("worker-2", json!({"status": "ready"}));
         let source = Arc::new(TestDataSource::new(
@@ -1017,7 +1294,64 @@ mod tests {
         let response = String::from_utf8(response).expect("SSE response UTF-8");
         assert_eq!(response.matches("\"node\":\"worker-1\"").count(), 1);
         assert_eq!(response.matches("\"node\":\"worker-2\"").count(), 1);
+        assert_eq!(response.matches("id: 1\n").count(), 1);
+        assert_eq!(response.matches("id: 2\n").count(), 1);
         assert!(response.contains(": heartbeat\n\n"));
+        server.stop();
+    }
+
+    #[test]
+    fn stream_filters_resumes_and_can_start_at_live_edge() {
+        let first = event("first", json!({"status": "old"}));
+        let mut other_run = event("other-run", json!({}));
+        other_run.run = "run-2".to_string();
+        let source = Arc::new(TestDataSource::new(
+            json!({"projects": []}),
+            vec![first.clone(), other_run.clone()],
+        ));
+        let stream_source: Arc<dyn ScopeDataSource> = source.clone();
+        let mut server = TestServer::start(stream_source, test_config());
+
+        let mut filtered = open_stream(
+            server.address,
+            "/api/stream?repo=repo&family=o2&run=run-1&since=0",
+        );
+        let mut filtered_response = Vec::new();
+        read_until(&mut filtered, &mut filtered_response, "\"node\":\"first\"");
+        let filtered_response = String::from_utf8(filtered_response).expect("filtered SSE UTF-8");
+        assert!(!filtered_response.contains("other-run"));
+        assert!(filtered_response.contains("id: 1\n"));
+
+        let mut resumed = open_stream_with_headers(
+            server.address,
+            "/api/stream?since=now",
+            &["Last-Event-ID: 1"],
+        );
+        let mut resumed_response = Vec::new();
+        read_until(
+            &mut resumed,
+            &mut resumed_response,
+            "\"node\":\"other-run\"",
+        );
+        let resumed_response = String::from_utf8(resumed_response).expect("resumed SSE UTF-8");
+        assert!(!resumed_response.contains("\"node\":\"first\""));
+        assert!(resumed_response.contains("id: 2\n"));
+
+        let mut live = open_stream(server.address, "/api/stream?since=now");
+        let mut live_response = Vec::new();
+        read_until(
+            &mut live,
+            &mut live_response,
+            "Content-Type: text/event-stream",
+        );
+        assert!(!String::from_utf8_lossy(&live_response).contains("data: "));
+        let new_event = event("live", json!({"status": "new"}));
+        source.set_events(vec![first, other_run, new_event]);
+        read_until(&mut live, &mut live_response, "\"node\":\"live\"");
+        let live_response = String::from_utf8(live_response).expect("live-edge SSE UTF-8");
+        assert!(!live_response.contains("\"node\":\"first\""));
+        assert!(!live_response.contains("\"node\":\"other-run\""));
+        assert!(live_response.contains("id: 3\n"));
         server.stop();
     }
 

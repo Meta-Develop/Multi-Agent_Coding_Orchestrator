@@ -5,15 +5,20 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use crate::inbox::load_workspace_repositories;
-use normalize::{scan_repositories, FamilyEvent, NormalizedEvent, RepositoryTarget};
+use normalize::{
+    CachedScope, NormalizedEvent, RepositoryTarget, StreamBatch, StreamCursor, StreamFilter,
+};
 use server::ScopeDataSource;
+
+const CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScopeServeOptions {
@@ -22,24 +27,67 @@ pub struct ScopeServeOptions {
     pub bind: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ScanningDataSource {
-    repositories: Vec<RepositoryTarget>,
+    state: Mutex<ScanningDataSourceState>,
+}
+
+#[derive(Debug)]
+struct ScanningDataSourceState {
+    cache: CachedScope,
+    projects: Option<Value>,
+    refresh_after: Option<Instant>,
 }
 
 impl ScanningDataSource {
     fn new(repositories: Vec<RepositoryTarget>) -> Self {
-        Self { repositories }
+        Self {
+            state: Mutex::new(ScanningDataSourceState {
+                cache: CachedScope::new(repositories),
+                projects: None,
+                refresh_after: None,
+            }),
+        }
     }
 
-    fn snapshot(&self) -> Result<normalize::ScopeSnapshot> {
-        scan_repositories(&self.repositories).context("failed to scan Scope repositories")
+    fn state(&self) -> Result<MutexGuard<'_, ScanningDataSourceState>> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Scope cache lock is poisoned"))
+    }
+}
+
+impl ScanningDataSourceState {
+    fn refresh_if_due(&mut self) -> Result<bool> {
+        if self
+            .refresh_after
+            .is_some_and(|refresh_after| Instant::now() < refresh_after)
+        {
+            return Ok(false);
+        }
+        let changed = self
+            .cache
+            .refresh()
+            .context("failed to refresh Scope repositories")?;
+        self.refresh_after = Some(Instant::now() + CACHE_REFRESH_INTERVAL);
+        Ok(changed)
     }
 }
 
 impl ScopeDataSource for ScanningDataSource {
     fn projects(&self) -> Result<Value> {
-        serde_json::to_value(self.snapshot()?).context("failed to serialize Scope projects")
+        let mut state = self.state()?;
+        let changed = state.refresh_if_due()?;
+        if changed || state.projects.is_none() {
+            state.projects = Some(
+                serde_json::to_value(state.cache.snapshot()?)
+                    .context("failed to serialize Scope projects")?,
+            );
+        }
+        state
+            .projects
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Scope projects cache was not initialized"))
     }
 
     fn events(
@@ -48,14 +96,24 @@ impl ScopeDataSource for ScanningDataSource {
         family: &str,
         run_id: &str,
     ) -> Result<Option<Vec<NormalizedEvent>>> {
-        let snapshot = self.snapshot()?;
-        Ok(snapshot
+        let mut state = self.state()?;
+        state.refresh_if_due()?;
+        Ok(state
+            .cache
+            .snapshot()?
             .events_for_run(repo_id, family, run_id)
             .map(<[NormalizedEvent]>::to_vec))
     }
 
-    fn stream_events(&self) -> Result<Vec<FamilyEvent>> {
-        Ok(self.snapshot()?.all_events())
+    fn stream_events(
+        &self,
+        filter: &StreamFilter,
+        cursor: StreamCursor,
+        limit: usize,
+    ) -> Result<StreamBatch> {
+        let mut state = self.state()?;
+        state.refresh_if_due()?;
+        Ok(state.cache.stream_events(filter, cursor, limit))
     }
 }
 
@@ -309,6 +367,62 @@ mod tests {
 
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].id, "repeated");
+    }
+
+    #[test]
+    fn coalesces_cache_validation_within_the_refresh_interval() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("fixture-repo");
+        let journal = repo.join(".maco/o2/runs/run-1/events/orchestration.jsonl");
+        fs::create_dir_all(journal.parent().expect("journal parent"))
+            .expect("fixture event directory");
+        let first_event = concat!(
+            r#"{"ts":"2026-07-20T12:00:00Z","repo":"fixture-repo","run":"run-1","node":"worker-1","parent":null,"role":"worker","kind":"status","payload":{}}"#,
+            "\n"
+        );
+        let second_event = concat!(
+            r#"{"ts":"2026-07-20T12:00:01Z","repo":"fixture-repo","run":"run-1","node":"worker-2","parent":null,"role":"worker","kind":"status","payload":{}}"#,
+            "\n"
+        );
+        fs::write(&journal, first_event).expect("fixture journal");
+
+        let targets = resolve_repositories(&options(vec![repo], None)).expect("fixture target");
+        let source = ScanningDataSource::new(targets);
+        let mut state = source.state().expect("source state");
+        assert!(state.refresh_if_due().expect("initial refresh"));
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .expect("append journal");
+        file.write_all(second_event.as_bytes())
+            .expect("append event");
+        drop(file);
+
+        assert!(!state.refresh_if_due().expect("coalesced refresh"));
+        assert_eq!(
+            state
+                .cache
+                .snapshot()
+                .expect("cached snapshot")
+                .events_for_run("fixture-repo", "o2", "run-1")
+                .expect("cached run")
+                .len(),
+            1
+        );
+
+        state.refresh_after = None;
+        assert!(state.refresh_if_due().expect("due refresh"));
+        assert_eq!(
+            state
+                .cache
+                .snapshot()
+                .expect("refreshed snapshot")
+                .events_for_run("fixture-repo", "o2", "run-1")
+                .expect("refreshed run")
+                .len(),
+            2
+        );
     }
 
     #[test]
