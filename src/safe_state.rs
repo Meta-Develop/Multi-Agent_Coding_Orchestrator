@@ -4607,6 +4607,11 @@ where
     value.try_into().unwrap_or(u32::MAX)
 }
 
+#[cfg(unix)]
+fn inventory_entry_size_bytes(value: libc::off_t) -> Result<u64> {
+    u64::try_from(value).context("repository inventory entry size is negative or unrepresentable")
+}
+
 #[cfg(target_os = "linux")]
 fn stat_mtime_seconds(stat: &libc::stat) -> i64 {
     stat.st_mtime
@@ -4701,7 +4706,7 @@ where
             let entry = BoundedTreeEntry {
                 relative_path: relative.clone(),
                 kind,
-                size_bytes: u64::try_from(stat.st_size).unwrap_or(0),
+                size_bytes: inventory_entry_size_bytes(stat.st_size)?,
                 hard_link_count: unsigned_to_u64(stat.st_nlink),
                 unix_mode: unsigned_to_u32(stat.st_mode & 0o7777),
                 identity: identity_from_stat(&stat),
@@ -5315,6 +5320,13 @@ mod tests {
             device_id_to_u64(stat.st_dev),
             file.metadata().expect("metadata").dev()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_entry_size_conversion_rejects_negative_values() {
+        assert_eq!(inventory_entry_size_bytes(0).expect("zero size"), 0);
+        assert!(inventory_entry_size_bytes(-1).is_err());
     }
 
     #[cfg(target_os = "linux")]

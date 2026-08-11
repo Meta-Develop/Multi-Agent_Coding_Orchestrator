@@ -2276,147 +2276,72 @@ impl WorktreeManager {
                 .cmp(&gc_created_at(&left.binding))
                 .then_with(|| left.binding.name.cmp(&right.binding.name))
         });
-        let retention_configured = worktree_retention_is_configured(options.retention);
-        let mut retained_apparent_bytes = 0u64;
-        let mut size_budget_exhausted = false;
-        for (index, mut candidate) in candidates.into_iter().enumerate() {
-            let age_or_count_selects = retention_age_or_count_selects_gc_candidate(
-                &candidate.binding,
-                index,
+        let mut retention_state = WorktreeGcRetentionState::default();
+        for mut candidate in candidates {
+            let decision = worktree_gc_retention_decision(
+                &candidate,
                 now,
+                options.targets_only,
                 options.retention,
-            );
-            let size_selects = if age_or_count_selects {
-                false
-            } else if let Some(max_total_bytes) = options.retention.max_total_bytes {
-                if size_budget_exhausted {
-                    true
-                } else {
-                    let total = retained_apparent_bytes
-                        .checked_add(candidate.apparent_worktree_bytes)
-                        .context("worktree GC retained apparent bytes overflowed")?;
-                    if total <= max_total_bytes {
-                        retained_apparent_bytes = total;
-                        false
-                    } else {
-                        size_budget_exhausted = true;
-                        true
-                    }
-                }
-            } else {
-                false
-            };
-            let should_remove = !options.targets_only
-                && (!retention_configured || age_or_count_selects || size_selects);
-            if should_remove {
-                if !options.dry_run {
-                    candidate.untracked_paths =
-                        match gc_worktree_dirtiness(&candidate.binding.path)? {
-                            WorktreeGcDirtiness::Clean => Vec::new(),
-                            WorktreeGcDirtiness::TrackedDirty => {
-                                report.protected_count = report
-                                    .protected_count
-                                    .checked_add(1)
-                                    .context("worktree GC protected count overflowed")?;
-                                report.entries.push(WorktreeGcEntry {
-                                    name: candidate.binding.name,
-                                    branch: Some(candidate.binding.branch),
-                                    path: candidate.binding.path,
-                                    status: WorktreeGcStatus::Protected,
-                                    reason: WorktreeGcReason::Dirty,
-                                    target_path: None,
-                                    target_liveness: None,
-                                    apparent_worktree_bytes: Some(
-                                        candidate.apparent_worktree_bytes,
-                                    ),
-                                    apparent_target_bytes: candidate.apparent_target_bytes,
-                                    untracked_paths: Vec::new(),
-                                    gate_denial: None,
-                                    retention_operation_id: None,
-                                });
-                                continue;
-                            }
-                            WorktreeGcDirtiness::UntrackedOnly(paths) => {
-                                if !paths
-                                    .iter()
-                                    .all(|path| allowed_untracked_paths.contains(path))
-                                {
-                                    report.protected_count = report
-                                        .protected_count
-                                        .checked_add(1)
-                                        .context("worktree GC protected count overflowed")?;
-                                    report.entries.push(WorktreeGcEntry {
-                                        name: candidate.binding.name,
-                                        branch: Some(candidate.binding.branch),
-                                        path: candidate.binding.path,
-                                        status: WorktreeGcStatus::Protected,
-                                        reason: WorktreeGcReason::UntrackedOnly,
-                                        target_path: None,
-                                        target_liveness: None,
-                                        apparent_worktree_bytes: Some(
-                                            candidate.apparent_worktree_bytes,
-                                        ),
-                                        apparent_target_bytes: candidate.apparent_target_bytes,
-                                        untracked_paths: paths,
-                                        gate_denial: None,
-                                        retention_operation_id: None,
-                                    });
-                                    continue;
-                                }
-                                paths
-                            }
-                        };
-                }
-                let target = gc_target_if_present(&candidate.binding.path)?;
-                if let Some((reason, evidence)) = target
+                retention_state,
+            )?;
+            let preflight_target = gc_target_if_present(&candidate.binding.path)?;
+            let target_cleanup = options.remove_targets && preflight_target.is_some();
+            if decision.should_remove || target_cleanup {
+                if let Some((reason, evidence)) = preflight_target
                     .as_ref()
                     .and_then(|target| gc_target_liveness_protection(target, &target_liveness))
                 {
-                    report.protected_count = report
-                        .protected_count
-                        .checked_add(1)
-                        .context("worktree GC protected count overflowed")?;
-                    report.entries.push(WorktreeGcEntry {
-                        name: candidate.binding.name,
-                        branch: Some(candidate.binding.branch),
-                        path: candidate.binding.path,
-                        status: WorktreeGcStatus::Protected,
+                    add_gc_candidate_protection(
+                        &mut report,
+                        &candidate,
                         reason,
-                        target_path: target.as_ref().map(|target| target.path.clone()),
-                        target_liveness: Some(evidence),
-                        apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
-                        apparent_target_bytes: candidate.apparent_target_bytes,
-                        untracked_paths: candidate.untracked_paths,
-                        gate_denial: None,
-                        retention_operation_id: None,
-                    });
+                        preflight_target.as_ref().map(|target| target.path.clone()),
+                        Some(evidence),
+                        candidate.untracked_paths.clone(),
+                    )?;
                     continue;
                 }
-                if options.dry_run
-                    && target
-                        .as_ref()
-                        .is_some_and(|target| !worktree_gc_target_identity_is_current(target))
+                match worktree_gc_dirtiness_disposition(
+                    gc_worktree_dirtiness(&candidate.binding.path)?,
+                    options.targets_only,
+                    &allowed_untracked_paths,
+                ) {
+                    WorktreeGcDirtinessDisposition::Eligible(paths) => {
+                        candidate.untracked_paths = paths;
+                    }
+                    WorktreeGcDirtinessDisposition::Protected {
+                        reason,
+                        untracked_paths,
+                    } => {
+                        add_gc_candidate_protection(
+                            &mut report,
+                            &candidate,
+                            reason,
+                            preflight_target.as_ref().map(|target| target.path.clone()),
+                            None,
+                            untracked_paths,
+                        )?;
+                        continue;
+                    }
+                }
+                if preflight_target
+                    .as_ref()
+                    .is_some_and(|target| !worktree_gc_target_identity_is_current(target))
                 {
-                    report.protected_count = report
-                        .protected_count
-                        .checked_add(1)
-                        .context("worktree GC protected count overflowed")?;
-                    report.entries.push(WorktreeGcEntry {
-                        name: candidate.binding.name,
-                        branch: Some(candidate.binding.branch),
-                        path: candidate.binding.path,
-                        status: WorktreeGcStatus::Protected,
-                        reason: WorktreeGcReason::TargetIdentityChanged,
-                        target_path: target.as_ref().map(|target| target.path.clone()),
-                        target_liveness: Some(target_identity_changed_evidence()),
-                        apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
-                        apparent_target_bytes: candidate.apparent_target_bytes,
-                        untracked_paths: candidate.untracked_paths,
-                        gate_denial: None,
-                        retention_operation_id: None,
-                    });
+                    add_gc_candidate_protection(
+                        &mut report,
+                        &candidate,
+                        WorktreeGcReason::TargetIdentityChanged,
+                        preflight_target.as_ref().map(|target| target.path.clone()),
+                        Some(target_identity_changed_evidence()),
+                        candidate.untracked_paths.clone(),
+                    )?;
                     continue;
                 }
+            }
+
+            if decision.should_remove {
                 if options.dry_run {
                     report.estimated_reclaimable_bytes = report
                         .estimated_reclaimable_bytes
@@ -2432,7 +2357,7 @@ impl WorktreeManager {
                         path: candidate.binding.path,
                         status: WorktreeGcStatus::WouldRemove,
                         reason: WorktreeGcReason::FinishedBranch,
-                        target_path: target.as_ref().map(|target| target.path.clone()),
+                        target_path: preflight_target.as_ref().map(|target| target.path.clone()),
                         target_liveness: None,
                         apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
                         apparent_target_bytes: candidate.apparent_target_bytes,
@@ -2440,6 +2365,40 @@ impl WorktreeManager {
                         gate_denial: None,
                         retention_operation_id: None,
                     });
+                    retention_state = decision.committed_state;
+                    continue;
+                }
+
+                let boundary_target = gc_target_if_present(&candidate.binding.path)?;
+                if !worktree_gc_target_bindings_match(
+                    preflight_target.as_ref(),
+                    boundary_target.as_ref(),
+                ) {
+                    add_gc_candidate_protection(
+                        &mut report,
+                        &candidate,
+                        WorktreeGcReason::TargetIdentityChanged,
+                        boundary_target
+                            .as_ref()
+                            .or(preflight_target.as_ref())
+                            .map(|target| target.path.clone()),
+                        Some(target_identity_changed_evidence()),
+                        candidate.untracked_paths.clone(),
+                    )?;
+                    continue;
+                }
+                if let Some((reason, evidence)) = boundary_target
+                    .as_ref()
+                    .and_then(|target| gc_target_liveness_protection(target, &target_liveness))
+                {
+                    add_gc_candidate_protection(
+                        &mut report,
+                        &candidate,
+                        reason,
+                        boundary_target.as_ref().map(|target| target.path.clone()),
+                        Some(evidence),
+                        candidate.untracked_paths.clone(),
+                    )?;
                     continue;
                 }
                 let removal = remove_gc_candidate(
@@ -2448,7 +2407,7 @@ impl WorktreeManager {
                     &registry_lock,
                     &mut registry,
                     &candidate,
-                    target.as_ref(),
+                    boundary_target.as_ref(),
                     WorktreeGcRemovalChecks {
                         allowed_untracked_paths: &allowed_untracked_paths,
                         target_liveness: &target_liveness,
@@ -2457,48 +2416,28 @@ impl WorktreeManager {
                 match removal {
                     WorktreeGcRemovalOutcome::Removed => {}
                     WorktreeGcRemovalOutcome::TargetIdentityChanged => {
-                        report.protected_count = report
-                            .protected_count
-                            .checked_add(1)
-                            .context("worktree GC protected count overflowed")?;
-                        report.entries.push(WorktreeGcEntry {
-                            name: candidate.binding.name,
-                            branch: Some(candidate.binding.branch),
-                            path: candidate.binding.path,
-                            status: WorktreeGcStatus::Protected,
-                            reason: WorktreeGcReason::TargetIdentityChanged,
-                            target_path: target.as_ref().map(|target| target.path.clone()),
-                            target_liveness: Some(target_identity_changed_evidence()),
-                            apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
-                            apparent_target_bytes: candidate.apparent_target_bytes,
-                            untracked_paths: candidate.untracked_paths,
-                            gate_denial: None,
-                            retention_operation_id: None,
-                        });
+                        add_gc_candidate_protection(
+                            &mut report,
+                            &candidate,
+                            WorktreeGcReason::TargetIdentityChanged,
+                            boundary_target.as_ref().map(|target| target.path.clone()),
+                            Some(target_identity_changed_evidence()),
+                            candidate.untracked_paths.clone(),
+                        )?;
                         continue;
                     }
                     WorktreeGcRemovalOutcome::DirtinessChanged {
                         reason,
                         untracked_paths,
                     } => {
-                        report.protected_count = report
-                            .protected_count
-                            .checked_add(1)
-                            .context("worktree GC protected count overflowed")?;
-                        report.entries.push(WorktreeGcEntry {
-                            name: candidate.binding.name,
-                            branch: Some(candidate.binding.branch),
-                            path: candidate.binding.path,
-                            status: WorktreeGcStatus::Protected,
+                        add_gc_candidate_protection(
+                            &mut report,
+                            &candidate,
                             reason,
-                            target_path: target.as_ref().map(|target| target.path.clone()),
-                            target_liveness: None,
-                            apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
-                            apparent_target_bytes: candidate.apparent_target_bytes,
+                            boundary_target.as_ref().map(|target| target.path.clone()),
+                            None,
                             untracked_paths,
-                            gate_denial: None,
-                            retention_operation_id: None,
-                        });
+                        )?;
                         continue;
                     }
                 }
@@ -2521,7 +2460,7 @@ impl WorktreeManager {
                     path: candidate.binding.path,
                     status: WorktreeGcStatus::Removed,
                     reason: WorktreeGcReason::FinishedBranch,
-                    target_path: target.as_ref().map(|target| target.path.clone()),
+                    target_path: boundary_target.as_ref().map(|target| target.path.clone()),
                     target_liveness: None,
                     apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
                     apparent_target_bytes: candidate.apparent_target_bytes,
@@ -2529,122 +2468,124 @@ impl WorktreeManager {
                     gate_denial: None,
                     retention_operation_id: None,
                 });
+                retention_state = decision.committed_state;
                 continue;
             }
 
-            let target = gc_target_if_present(&candidate.binding.path)?;
             if options.remove_targets {
-                if let Some(target) = target {
-                    if let Some((reason, evidence)) =
-                        gc_target_liveness_protection(&target, &target_liveness)
-                    {
-                        report.protected_count = report
-                            .protected_count
-                            .checked_add(1)
-                            .context("worktree GC protected count overflowed")?;
-                        report.entries.push(WorktreeGcEntry {
-                            name: candidate.binding.name,
-                            branch: Some(candidate.binding.branch),
-                            path: candidate.binding.path,
-                            status: WorktreeGcStatus::Protected,
-                            reason,
-                            target_path: Some(target.path.clone()),
-                            target_liveness: Some(evidence),
-                            apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
-                            apparent_target_bytes: candidate.apparent_target_bytes,
-                            untracked_paths: candidate.untracked_paths,
-                            gate_denial: None,
-                            retention_operation_id: None,
-                        });
-                        continue;
-                    }
+                if let Some(preflight_target) = preflight_target {
                     let Some(target_bytes) = candidate.apparent_target_bytes else {
-                        report.protected_count = report
-                            .protected_count
-                            .checked_add(1)
-                            .context("worktree GC protected count overflowed")?;
-                        report.entries.push(WorktreeGcEntry {
-                            name: candidate.binding.name,
-                            branch: Some(candidate.binding.branch),
-                            path: candidate.binding.path,
-                            status: WorktreeGcStatus::Protected,
-                            reason: WorktreeGcReason::SizeMeasurementFailed,
-                            target_path: Some(target.path.clone()),
-                            target_liveness: None,
-                            apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
-                            apparent_target_bytes: None,
-                            untracked_paths: candidate.untracked_paths,
-                            gate_denial: None,
-                            retention_operation_id: None,
-                        });
+                        add_gc_candidate_protection(
+                            &mut report,
+                            &candidate,
+                            WorktreeGcReason::SizeMeasurementFailed,
+                            Some(preflight_target.path.clone()),
+                            None,
+                            candidate.untracked_paths.clone(),
+                        )?;
                         continue;
                     };
-                    let reason = if options.dry_run {
-                        if !worktree_gc_target_identity_is_current(&target) {
-                            report.protected_count = report
-                                .protected_count
-                                .checked_add(1)
-                                .context("worktree GC protected count overflowed")?;
-                            report.entries.push(WorktreeGcEntry {
-                                name: candidate.binding.name,
-                                branch: Some(candidate.binding.branch),
-                                path: candidate.binding.path,
-                                status: WorktreeGcStatus::Protected,
-                                reason: WorktreeGcReason::TargetIdentityChanged,
-                                target_path: Some(target.path),
-                                target_liveness: Some(target_identity_changed_evidence()),
-                                apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
-                                apparent_target_bytes: candidate.apparent_target_bytes,
-                                untracked_paths: candidate.untracked_paths,
-                                gate_denial: None,
-                                retention_operation_id: None,
-                            });
+                    let (reason, target) = if options.dry_run {
+                        (WorktreeGcReason::TargetWouldRemove, preflight_target)
+                    } else {
+                        let boundary_target = gc_target_if_present(&candidate.binding.path)?;
+                        if !worktree_gc_target_bindings_match(
+                            Some(&preflight_target),
+                            boundary_target.as_ref(),
+                        ) {
+                            add_gc_candidate_protection(
+                                &mut report,
+                                &candidate,
+                                WorktreeGcReason::TargetIdentityChanged,
+                                boundary_target
+                                    .as_ref()
+                                    .or(Some(&preflight_target))
+                                    .map(|target| target.path.clone()),
+                                Some(target_identity_changed_evidence()),
+                                candidate.untracked_paths.clone(),
+                            )?;
                             continue;
                         }
-                        report.estimated_reclaimable_bytes = report
-                            .estimated_reclaimable_bytes
-                            .checked_add(target_bytes)
-                            .context("worktree GC estimated reclaimable bytes overflowed")?;
-                        WorktreeGcReason::TargetWouldRemove
-                    } else {
-                        if matches!(
-                            remove_worktree_target_dir(&candidate.binding.path, &target)?,
-                            WorktreeTargetRemovalOutcome::IdentityChanged
+                        let Some(boundary_target) = boundary_target else {
+                            add_gc_candidate_protection(
+                                &mut report,
+                                &candidate,
+                                WorktreeGcReason::TargetIdentityChanged,
+                                Some(preflight_target.path.clone()),
+                                Some(target_identity_changed_evidence()),
+                                candidate.untracked_paths.clone(),
+                            )?;
+                            continue;
+                        };
+                        if let Some((reason, evidence)) =
+                            gc_target_liveness_protection(&boundary_target, &target_liveness)
+                        {
+                            add_gc_candidate_protection(
+                                &mut report,
+                                &candidate,
+                                reason,
+                                Some(boundary_target.path.clone()),
+                                Some(evidence),
+                                candidate.untracked_paths.clone(),
+                            )?;
+                            continue;
+                        }
+                        match worktree_gc_dirtiness_disposition(
+                            gc_worktree_dirtiness(&candidate.binding.path)?,
+                            options.targets_only,
+                            &allowed_untracked_paths,
                         ) {
-                            report.protected_count = report
-                                .protected_count
-                                .checked_add(1)
-                                .context("worktree GC protected count overflowed")?;
-                            report.entries.push(WorktreeGcEntry {
-                                name: candidate.binding.name,
-                                branch: Some(candidate.binding.branch),
-                                path: candidate.binding.path,
-                                status: WorktreeGcStatus::Protected,
-                                reason: WorktreeGcReason::TargetIdentityChanged,
-                                target_path: Some(target.path),
-                                target_liveness: Some(target_identity_changed_evidence()),
-                                apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
-                                apparent_target_bytes: candidate.apparent_target_bytes,
-                                untracked_paths: candidate.untracked_paths,
-                                gate_denial: None,
-                                retention_operation_id: None,
-                            });
+                            WorktreeGcDirtinessDisposition::Eligible(paths) => {
+                                candidate.untracked_paths = paths;
+                            }
+                            WorktreeGcDirtinessDisposition::Protected {
+                                reason,
+                                untracked_paths,
+                            } => {
+                                add_gc_candidate_protection(
+                                    &mut report,
+                                    &candidate,
+                                    reason,
+                                    Some(boundary_target.path.clone()),
+                                    None,
+                                    untracked_paths,
+                                )?;
+                                continue;
+                            }
+                        }
+                        if !worktree_gc_target_identity_is_current(&boundary_target)
+                            || matches!(
+                                remove_worktree_target_dir(
+                                    &candidate.binding.path,
+                                    &boundary_target,
+                                )?,
+                                WorktreeTargetRemovalOutcome::IdentityChanged
+                            )
+                        {
+                            add_gc_candidate_protection(
+                                &mut report,
+                                &candidate,
+                                WorktreeGcReason::TargetIdentityChanged,
+                                Some(boundary_target.path.clone()),
+                                Some(target_identity_changed_evidence()),
+                                candidate.untracked_paths.clone(),
+                            )?;
                             continue;
                         }
                         report.target_removed_count = report
                             .target_removed_count
                             .checked_add(1)
                             .context("worktree GC target count overflowed")?;
-                        report.estimated_reclaimable_bytes = report
-                            .estimated_reclaimable_bytes
-                            .checked_add(target_bytes)
-                            .context("worktree GC estimated reclaimable bytes overflowed")?;
                         report.estimated_reclaimed_bytes = report
                             .estimated_reclaimed_bytes
                             .checked_add(target_bytes)
                             .context("worktree GC estimated reclaimed bytes overflowed")?;
-                        WorktreeGcReason::TargetRemoved
+                        (WorktreeGcReason::TargetRemoved, boundary_target)
                     };
+                    report.estimated_reclaimable_bytes = report
+                        .estimated_reclaimable_bytes
+                        .checked_add(target_bytes)
+                        .context("worktree GC estimated reclaimable bytes overflowed")?;
                     report.retained_count = report
                         .retained_count
                         .checked_add(1)
@@ -2663,6 +2604,7 @@ impl WorktreeManager {
                         gate_denial: None,
                         retention_operation_id: None,
                     });
+                    retention_state = decision.committed_state;
                     continue;
                 }
             }
@@ -2688,6 +2630,7 @@ impl WorktreeManager {
                 gate_denial: None,
                 retention_operation_id: None,
             });
+            retention_state = decision.committed_state;
         }
 
         if !options.targets_only {
@@ -3650,6 +3593,26 @@ struct WorktreeGcCandidate {
     apparent_target_bytes: Option<u64>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct WorktreeGcRetentionState {
+    eligible_count: usize,
+    retained_apparent_bytes: u64,
+    size_budget_exhausted: bool,
+}
+
+struct WorktreeGcRetentionDecision {
+    should_remove: bool,
+    committed_state: WorktreeGcRetentionState,
+}
+
+enum WorktreeGcDirtinessDisposition {
+    Eligible(Vec<PathBuf>),
+    Protected {
+        reason: WorktreeGcReason,
+        untracked_paths: Vec<PathBuf>,
+    },
+}
+
 enum WorktreeGcRemovalOutcome {
     Removed,
     TargetIdentityChanged,
@@ -3960,6 +3923,126 @@ fn retention_age_or_count_selects_gc_candidate(
             .is_some_and(|age_nanos| age_nanos >= max_age.as_nanos())
     });
     count_expired || age_expired
+}
+
+fn worktree_gc_retention_decision(
+    candidate: &WorktreeGcCandidate,
+    now: i64,
+    targets_only: bool,
+    retention: WorktreeRetentionPolicy,
+    state: WorktreeGcRetentionState,
+) -> Result<WorktreeGcRetentionDecision> {
+    let age_or_count_selects = retention_age_or_count_selects_gc_candidate(
+        &candidate.binding,
+        state.eligible_count,
+        now,
+        retention,
+    );
+    let mut committed_state = state;
+    committed_state.eligible_count = committed_state
+        .eligible_count
+        .checked_add(1)
+        .context("worktree GC eligible count overflowed")?;
+    let size_selects = if age_or_count_selects {
+        false
+    } else if let Some(max_total_bytes) = retention.max_total_bytes {
+        if state.size_budget_exhausted {
+            true
+        } else {
+            let retained_bytes = state
+                .retained_apparent_bytes
+                .checked_add(candidate.apparent_worktree_bytes)
+                .context("worktree GC retained apparent byte count overflowed")?;
+            if retained_bytes <= max_total_bytes {
+                committed_state.retained_apparent_bytes = retained_bytes;
+                false
+            } else {
+                committed_state.size_budget_exhausted = true;
+                true
+            }
+        }
+    } else {
+        false
+    };
+    Ok(WorktreeGcRetentionDecision {
+        should_remove: !targets_only
+            && (!worktree_retention_is_configured(retention)
+                || age_or_count_selects
+                || size_selects),
+        committed_state,
+    })
+}
+
+fn worktree_gc_dirtiness_disposition(
+    dirtiness: WorktreeGcDirtiness,
+    targets_only: bool,
+    allowed_untracked_paths: &BTreeSet<PathBuf>,
+) -> WorktreeGcDirtinessDisposition {
+    match dirtiness {
+        WorktreeGcDirtiness::Clean => WorktreeGcDirtinessDisposition::Eligible(Vec::new()),
+        WorktreeGcDirtiness::TrackedDirty => WorktreeGcDirtinessDisposition::Protected {
+            reason: WorktreeGcReason::Dirty,
+            untracked_paths: Vec::new(),
+        },
+        WorktreeGcDirtiness::UntrackedOnly(paths)
+            if targets_only
+                || paths
+                    .iter()
+                    .all(|path| allowed_untracked_paths.contains(path)) =>
+        {
+            WorktreeGcDirtinessDisposition::Eligible(paths)
+        }
+        WorktreeGcDirtiness::UntrackedOnly(paths) => WorktreeGcDirtinessDisposition::Protected {
+            reason: WorktreeGcReason::UntrackedOnly,
+            untracked_paths: paths,
+        },
+    }
+}
+
+fn worktree_gc_target_bindings_match(
+    expected: Option<&WorktreeGcTarget>,
+    observed: Option<&WorktreeGcTarget>,
+) -> bool {
+    match (expected, observed) {
+        (None, None) => true,
+        (Some(expected), Some(observed)) => {
+            expected.path == observed.path
+                && expected.canonical_path == observed.canonical_path
+                && expected.identity == observed.identity
+                && expected.lane_canonical_path == observed.lane_canonical_path
+                && expected.lane_identity == observed.lane_identity
+        }
+        (None, Some(_)) | (Some(_), None) => false,
+    }
+}
+
+fn add_gc_candidate_protection(
+    report: &mut WorktreeGcReport,
+    candidate: &WorktreeGcCandidate,
+    reason: WorktreeGcReason,
+    target_path: Option<PathBuf>,
+    target_liveness: Option<WorktreeTargetLivenessEvidence>,
+    untracked_paths: Vec<PathBuf>,
+) -> Result<()> {
+    report.protected_count = report
+        .protected_count
+        .checked_add(1)
+        .context("worktree GC protected count overflowed")?;
+    report.entries.push(WorktreeGcEntry {
+        name: candidate.binding.name.clone(),
+        branch: Some(candidate.binding.branch.clone()),
+        path: candidate.binding.path.clone(),
+        status: WorktreeGcStatus::Protected,
+        reason,
+        target_path,
+        target_liveness,
+        apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
+        apparent_target_bytes: candidate.apparent_target_bytes,
+        untracked_paths,
+        gate_denial: None,
+        retention_operation_id: None,
+    });
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10701,6 +10784,32 @@ mod tests {
         assert_eq!(report.repository_inspected_count, 2);
         assert_eq!(report.considered_count, 2);
         assert_eq!(report.removed_count, 2);
+        let nested_apparent_bytes = report
+            .repositories
+            .iter()
+            .map(|entry| {
+                entry
+                    .gc_report
+                    .as_ref()
+                    .expect("nested GC report")
+                    .apparent_considered_bytes
+            })
+            .sum::<u64>();
+        let nested_reclaimable_bytes = report
+            .repositories
+            .iter()
+            .map(|entry| {
+                entry
+                    .gc_report
+                    .as_ref()
+                    .expect("nested GC report")
+                    .estimated_reclaimable_bytes
+            })
+            .sum::<u64>();
+        assert!(nested_apparent_bytes > 0);
+        assert_eq!(report.apparent_considered_bytes, nested_apparent_bytes);
+        assert_eq!(report.estimated_reclaimable_bytes, nested_reclaimable_bytes);
+        assert_eq!(report.estimated_reclaimed_bytes, 0);
         assert_eq!(
             report
                 .repositories
@@ -11686,6 +11795,74 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn gc_late_protection_does_not_consume_count_or_size_retention() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let old = create_gc_worktree(&manager, "late-protection-old", &worktree_root);
+        fs::create_dir_all(old.path.join("target/debug")).expect("old target");
+        fs::write(old.path.join("target/debug/artifact"), vec![b'o'; 64]).expect("old artifact");
+        let new = create_gc_worktree(&manager, "late-protection-new", &worktree_root);
+        fs::create_dir_all(new.path.join("target/debug")).expect("new target");
+        fs::write(
+            new.path.join("target/debug/artifact"),
+            vec![b'n'; 64 * 1024],
+        )
+        .expect("new artifact");
+        let old_size = gc_worktree_size_estimate(&old.path).expect("old size");
+        let new_size = gc_worktree_size_estimate(&new.path).expect("new size");
+        assert!(new_size.worktree_bytes > old_size.worktree_bytes);
+
+        let mut options = gc_options(Some(worktree_root), false);
+        options.remove_targets = false;
+        options.retention = WorktreeRetentionPolicy {
+            max_age: None,
+            max_count: Some(1),
+            max_total_bytes: Some(old_size.worktree_bytes),
+        };
+        let liveness_calls = std::cell::Cell::new(0usize);
+        let report = manager
+            .gc_with_target_liveness(options, |target| {
+                liveness_calls.set(liveness_calls.get().saturating_add(1));
+                assert_eq!(target.path, new.path.join("target"));
+                test_live_target_liveness()
+            })
+            .expect("late-protected retention GC");
+
+        assert_eq!(liveness_calls.get(), 1, "retained lane is not probed");
+        assert_eq!(report.removed_count, 0, "{report:#?}");
+        assert_eq!(report.retained_count, 1, "{report:#?}");
+        assert_eq!(report.protected_count, 1, "{report:#?}");
+        assert_eq!(report.estimated_reclaimable_bytes, 0, "{report:#?}");
+        assert_eq!(report.estimated_reclaimed_bytes, 0, "{report:#?}");
+        assert_eq!(
+            report
+                .entries
+                .iter()
+                .find(|entry| entry.name == new.name)
+                .expect("new protected entry")
+                .reason,
+            WorktreeGcReason::LiveTarget
+        );
+        assert_eq!(
+            report
+                .entries
+                .iter()
+                .find(|entry| entry.name == old.name)
+                .expect("old retained entry")
+                .reason,
+            WorktreeGcReason::RetentionKeep
+        );
+        assert!(old.path.join("target").exists());
+        assert!(new.path.join("target").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn gc_size_measurement_failure_protects_the_lane_without_byte_credit() {
         use std::os::unix::fs::symlink;
 
@@ -12187,6 +12364,60 @@ mod tests {
                 .pending_operations()
                 .expect("pending operations")
                 .is_empty());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_target_cleanup_rechecks_dirtiness_after_boundary_liveness() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+
+        for (root_name, targets_only) in [
+            ("boundary-target-only", true),
+            ("boundary-retained-target", false),
+        ] {
+            let worktree_root = temp.path().join(root_name);
+            let created = create_gc_worktree(&manager, root_name, &worktree_root);
+            fs::create_dir_all(created.path.join("target/debug")).expect("target");
+            fs::write(created.path.join("target/debug/artifact"), "artifact\n")
+                .expect("target artifact");
+            let mut options = if targets_only {
+                gc_targets_only_options(Some(worktree_root), false)
+            } else {
+                let mut options = gc_options(Some(worktree_root), false);
+                options.retention.max_count = Some(1);
+                options
+            };
+            options.targets_only = targets_only;
+            let liveness_calls = std::cell::Cell::new(0usize);
+
+            let report = manager
+                .gc_with_target_liveness(options, |_| {
+                    let call = liveness_calls.get();
+                    liveness_calls.set(call.saturating_add(1));
+                    if call == 1 {
+                        fs::write(created.path.join("README.md"), "late tracked edit\n")
+                            .expect("late tracked edit");
+                    }
+                    WorktreeTargetLiveness::Clear
+                })
+                .expect("boundary dirtiness protection");
+
+            assert_eq!(liveness_calls.get(), 2, "preflight and boundary probes");
+            assert_eq!(report.removed_count, 0, "{report:#?}");
+            assert_eq!(report.target_removed_count, 0, "{report:#?}");
+            assert_eq!(report.protected_count, 1, "{report:#?}");
+            assert_eq!(report.estimated_reclaimable_bytes, 0, "{report:#?}");
+            assert_eq!(report.estimated_reclaimed_bytes, 0, "{report:#?}");
+            assert_eq!(report.entries[0].reason, WorktreeGcReason::Dirty);
+            assert!(created.path.exists());
+            assert!(created.path.join("target").exists());
+            assert!(repo.find_branch(&created.branch, BranchType::Local).is_ok());
         }
     }
 

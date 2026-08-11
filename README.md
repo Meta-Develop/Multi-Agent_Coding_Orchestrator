@@ -1319,7 +1319,8 @@ newest to oldest and retains the newest prefix whose combined apparent size is
 within the byte budget. Protected or otherwise ineligible lanes are not charged
 to that retention budget, so it is not a global on-disk ceiling. Apparent size
 is filesystem metadata length, not allocated blocks or a promise about physical
-disk space. The report exposes the
+disk space, and sums descendants only rather than the lane root inode itself.
+The report exposes the
 apparent bytes considered and estimates for bytes reclaimable and actually
 reclaimed; full-lane estimates already include `target/`, while target-only
 estimates count only `target/`, so they are not double-counted. Sizing is a
@@ -1334,6 +1335,12 @@ destructive second pass requires the three-part machine-global binding above, tr
 all discovered orphans as one preflight set, and uses recoverable quarantine rather
 than direct deletion. Dry-run discovery remains non-mutating and does not require the
 binding.
+
+The byte counters cover authenticated managed lanes and managed `target/`
+cleanup only; orphan quarantine is reported by orphan counts and is not included
+in the byte estimates. Creation-time size retention reserves the newly created
+lane before considering older lanes. If that new lane alone exceeds the budget,
+it remains reserved and the effective byte allowance for older lanes is zero.
 
 `--targets-only` removes eligible `target/` directories while retaining every
 managed lane, branch, untracked file, and registered association. Because it is
