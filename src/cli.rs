@@ -2190,6 +2190,7 @@ impl WorktreeCommand {
                     worktree_root: args.worktree_root,
                     dry_run: args.dry_run,
                     remove_targets: !args.keep_targets,
+                    targets_only: args.targets_only,
                     retention: WorktreeRetentionPolicy {
                         max_age: args.max_age_seconds.map(Duration::from_secs),
                         max_count: args.max_count,
@@ -2205,6 +2206,7 @@ impl WorktreeCommand {
                     workspace: args.workspace,
                     apply: args.apply,
                     remove_targets: !args.keep_targets,
+                    targets_only: args.targets_only,
                     retention: WorktreeRetentionPolicy {
                         max_age: args.max_age_seconds.map(Duration::from_secs),
                         max_count: args.max_count,
@@ -3198,6 +3200,9 @@ struct GcWorktreeArgs {
     /// Keep per-worktree target/ directories for retained worktrees.
     #[arg(long)]
     keep_targets: bool,
+    /// Reclaim eligible target/ directories while retaining every lane and branch.
+    #[arg(long)]
+    targets_only: bool,
     /// Remove only eligible clean worktrees older than this many seconds.
     #[arg(long)]
     max_age_seconds: Option<u64>,
@@ -3232,6 +3237,9 @@ struct SweepWorktreeArgs {
     /// Keep per-worktree target/ directories for retained worktrees.
     #[arg(long)]
     keep_targets: bool,
+    /// Reclaim eligible target/ directories while retaining every lane and branch.
+    #[arg(long)]
+    targets_only: bool,
     /// Remove only eligible clean worktrees older than this many seconds.
     #[arg(long)]
     max_age_seconds: Option<u64>,
@@ -4964,8 +4972,13 @@ fn print_worktree_gc_report(report: &WorktreeGcReport, json: bool) -> Result<()>
         return Ok(());
     }
     println!(
-        "Worktree GC: {}",
-        if report.dry_run { "dry-run" } else { "applied" }
+        "Worktree GC: {}{}",
+        if report.dry_run { "dry-run" } else { "applied" },
+        if report.targets_only {
+            " targets-only"
+        } else {
+            ""
+        }
     );
     println!("Considered: {}", report.considered_count);
     println!("Removed: {}", report.removed_count);
@@ -5044,8 +5057,13 @@ fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Resu
         "Orphans pruned"
     };
     println!(
-        "Workspace worktree sweep: {}",
-        if report.dry_run { "dry-run" } else { "applied" }
+        "Workspace worktree sweep: {}{}",
+        if report.dry_run { "dry-run" } else { "applied" },
+        if report.targets_only {
+            " targets-only"
+        } else {
+            ""
+        }
     );
     println!("Workspace: {}", report.workspace.display());
     println!(
@@ -5229,6 +5247,8 @@ fn worktree_gc_reason_label(reason: WorktreeGcReason) -> &'static str {
         WorktreeGcReason::ActiveClaim => "active-claim",
         WorktreeGcReason::TargetRemoved => "target-removed",
         WorktreeGcReason::TargetWouldRemove => "target-would-remove",
+        WorktreeGcReason::LiveTarget => "live-target",
+        WorktreeGcReason::TargetLivenessUnknown => "target-liveness-unknown",
         WorktreeGcReason::NoTarget => "no-target",
         WorktreeGcReason::UnregisteredOrphan => "unregistered-orphan",
         WorktreeGcReason::MachineGlobalGate => "machine-global-gate",
@@ -5353,6 +5373,7 @@ mod tests {
         assert_eq!(args.workspace, PathBuf::from("/srv/workspace"));
         assert!(!args.apply, "workspace sweep must default to dry-run");
         assert!(!args.keep_targets);
+        assert!(!args.targets_only);
         assert_eq!(args.max_age_seconds, None);
         assert_eq!(args.max_count, None);
         assert!(!args.json);
@@ -5407,6 +5428,7 @@ mod tests {
         assert_eq!(args.max_age_seconds, Some(86_400));
         assert_eq!(args.max_count, Some(12));
         assert!(args.keep_targets);
+        assert!(!args.targets_only);
         assert_eq!(
             args.allow_untracked_paths,
             vec![PathBuf::from("TASK.md"), PathBuf::from("notes/output.txt")]
@@ -5426,6 +5448,7 @@ mod tests {
         };
         assert_eq!(args.repo, PathBuf::from("repo"));
         assert!(!args.dry_run, "worktree gc must remain apply-by-default");
+        assert!(!args.targets_only);
         assert!(args.allow_untracked_paths.is_empty());
     }
 
@@ -5457,10 +5480,42 @@ mod tests {
     }
 
     #[test]
+    fn worktree_gc_and_sweep_parse_targets_only_mode() {
+        let gc = Cli::try_parse_from(["maco", "worktree", "gc", "--targets-only"])
+            .expect("target-only GC should parse");
+        let Command::Worktree(WorktreeCommand {
+            command: WorktreeSubcommand::Gc(gc),
+        }) = gc.command
+        else {
+            panic!("expected worktree gc command");
+        };
+        assert!(gc.targets_only);
+
+        let sweep = Cli::try_parse_from([
+            "maco",
+            "worktree",
+            "sweep",
+            "--workspace",
+            "workspace",
+            "--targets-only",
+        ])
+        .expect("target-only sweep should parse");
+        let Command::Worktree(WorktreeCommand {
+            command: WorktreeSubcommand::Sweep(sweep),
+        }) = sweep.command
+        else {
+            panic!("expected worktree sweep command");
+        };
+        assert!(sweep.targets_only);
+        assert!(!sweep.apply);
+    }
+
+    #[test]
     fn worktree_sweep_dry_run_target_summary_counts_would_remove_entries() {
         let dry_run = WorktreeGcReport {
             dry_run: true,
             remove_targets: true,
+            targets_only: false,
             max_age_seconds: None,
             max_count: Some(1),
             allowed_untracked_paths: Vec::new(),

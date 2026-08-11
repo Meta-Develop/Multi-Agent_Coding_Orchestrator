@@ -28,7 +28,7 @@ The current implementation covers a local-first command-line slice:
 - `maco worktree create <agent-id>` is temporarily disabled at its public entry point pending capability-bound repository cleanliness input.
 - `maco worktree list` lists verified registered agent worktrees. `maco worktree pending` is a strict existing-only authenticated reader: absent state returns an empty list, while transitional or invalid state is refused without creating locks, migrating, scavenging, recovering, or writing.
 - `maco worktree remove <agent-id> --force` performs explicitly authorized cleanup of authenticated managed state; non-force removal is temporarily disabled.
-- `maco worktree gc` removes clean, inactive managed worktrees while retaining branch refs, protects tracked changes and unapproved untracked-only lanes plus active leases/claims, supports an exact repeatable untracked-path allowlist for reviewed full-lane cleanup, removes retained `target/` build artifacts by default, supports dry-run and max-age/max-count retention filters, and routes unregistered leftover directories through recoverable machine-global quarantine.
+- `maco worktree gc` removes clean, inactive managed worktrees while retaining branch refs, protects tracked changes and unapproved untracked-only lanes plus active leases/claims, supports an exact repeatable untracked-path allowlist for reviewed full-lane cleanup, offers a liveness-checked target-only mode that retains lanes and branches, removes retained `target/` build artifacts by default, supports dry-run and max-age/max-count retention filters, and routes unregistered leftover directories through recoverable machine-global quarantine.
 - `maco worktree sweep --workspace <path>` discovers both workspace-managed `.maco/worktrees/<repo>` roots and exact repository-local `<repo>/.worktrees` roots, then aggregates the existing per-root GC reports. It is dry-run by default; removal requires `--apply`, an unresolved repository is reported as a typed per-root failure without aborting later roots, and a total discovery miss is reported separately from an inspected root with nothing to reclaim.
 - `SyncCoordinator` provides an in-memory exclusive path-claim layer for local agent coordination.
 - `maco sync claim <agent-id> <path>...` records durable exclusive path claims.
@@ -1273,6 +1273,8 @@ artifacts:
 cargo run -- worktree gc --repo . --dry-run --json
 cargo run -- worktree gc --repo . --dry-run \
   --allow-untracked-path TASK.md --json
+cargo run -- worktree gc --repo . --targets-only --dry-run --json
+cargo run -- worktree gc --repo . --targets-only
 cargo run -- worktree gc --repo . \
   --machine-global-config /exact/path/to/machine-global.json \
   --machine-global-worktree-root-id worktrees \
@@ -1305,6 +1307,28 @@ destructive second pass requires the three-part machine-global binding above, tr
 all discovered orphans as one preflight set, and uses recoverable quarantine rather
 than direct deletion. Dry-run discovery remains non-mutating and does not require the
 binding.
+
+`--targets-only` removes eligible `target/` directories while retaining every
+managed lane, branch, untracked file, and registered association. Because it is
+a separate operation, it rejects `--keep-targets`, retention filters,
+untracked-path allowances, and machine-global orphan-cleanup bindings, and it
+does not run orphan pruning. Tracked changes, active claims, and active leases
+still protect the target; an untracked-only lane does not require an allowlist
+because the lane and its files remain. On Linux, every target deletion scans a
+bounded `/proc` snapshot for same-user processes whose `CARGO_TARGET_DIR` is the
+candidate target or a nested/containing directory. An unreadable environment is
+also treated as potentially live when the process is cargo/rustc/rustdoc/sccache,
+its readable `cwd` or executable overlaps the lane, or a readable file descriptor
+overlaps the target. Bounds or read failures inside that association scan fail
+closed for build-like processes; unrelated non-build processes with no readable
+lane association do not globally disable cleanup merely because their procfs
+details are restricted. A live match is reported as `live_target`; an incomplete,
+oversized, timed-out, or potentially associated unreadable scan is reported as
+`target_liveness_unknown`, and both refuse deletion. The same check also protects
+a target included in full-lane removal. On non-Linux platforms the detector
+conservatively reports unknown, so target deletion remains disabled until a native
+detector is implemented. The check runs immediately before deletion to narrow,
+but cannot eliminate, the process-start race.
 
 Sweep every repository group beneath one workspace. The first command is a
 dry-run because workspace sweeps never remove anything unless `--apply` is
