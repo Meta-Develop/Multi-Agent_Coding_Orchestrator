@@ -1290,8 +1290,9 @@ changes always protect the lane. Untracked-only lanes are also protected by
 default and report their complete bounded path set; full-lane cleanup is
 eligible only when every such path exactly matches a repeatable
 `--allow-untracked-path <repo-relative-path>` value. This is an exact path list,
-not a glob or blanket ignore, because an untracked file may be a worker's only
-copy of real output. Apply mode repeats the bounded status classification
+not a glob or blanket ignore, and is bounded to 128 entries and 64 KiB in
+aggregate because a workspace sweep copies it into each per-root report. An
+untracked file may be a worker's only copy of real output. Apply mode repeats the bounded status classification
 immediately before journaling full-lane removal and protects the lane if a new
 tracked or unapproved untracked path appeared. GC also keeps worktrees with
 active MACO execution leases or active path claims for the same agent id.

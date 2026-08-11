@@ -36,7 +36,7 @@ use git2::{
     Branch, BranchType, ErrorCode, ObjectType, Oid, Repository, RepositoryInitOptions, Transaction,
     WorktreeAddOptions, WorktreeLockStatus,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
@@ -69,6 +69,9 @@ const MAX_WORKSPACE_SWEEP_GROUPS: usize = 4096;
 const MAX_WORKSPACE_SWEEP_LANES_PER_GROUP: usize = 4096;
 const MAX_WORKSPACE_SWEEP_CHILDREN: usize = 4096;
 const MAX_WORKSPACE_SWEEP_GROUP_NAME_BYTES: usize = 255;
+const MAX_GC_ALLOWED_UNTRACKED_PATHS: usize = 128;
+const MAX_GC_ALLOWED_UNTRACKED_PATH_BYTES: usize = 16 * 1024;
+const MAX_GC_ALLOWED_UNTRACKED_TOTAL_BYTES: usize = 64 * 1024;
 const WORKTREE_STATUS_RUNTIME_SEED: &str = "git-status";
 const WORKTREE_STATUS_RUNTIME_LOCK: &str = "bounded-status.lock";
 const WORKTREE_STATUS_SCAVENGE_LIMITS: PrivateDirectoryScavengeLimits =
@@ -203,6 +206,7 @@ pub struct WorktreeSweepReport {
     pub remove_targets: bool,
     pub max_age_seconds: Option<u64>,
     pub max_count: Option<usize>,
+    #[serde(serialize_with = "serialize_worktree_report_paths")]
     pub allowed_untracked_paths: Vec<PathBuf>,
     pub discovery_status: WorktreeSweepDiscoveryStatus,
     pub worktree_root_discovered_count: usize,
@@ -279,6 +283,7 @@ pub struct WorktreeGcReport {
     pub remove_targets: bool,
     pub max_age_seconds: Option<u64>,
     pub max_count: Option<usize>,
+    #[serde(serialize_with = "serialize_worktree_report_paths")]
     pub allowed_untracked_paths: Vec<PathBuf>,
     pub considered_count: usize,
     pub removed_count: usize,
@@ -297,7 +302,11 @@ pub struct WorktreeGcEntry {
     pub status: WorktreeGcStatus,
     pub reason: WorktreeGcReason,
     pub target_path: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        serialize_with = "serialize_worktree_report_paths",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub untracked_paths: Vec<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate_denial: Option<GateDenial>,
@@ -323,7 +332,7 @@ pub enum WorktreeGcReason {
     FinishedBranch,
     RetentionKeep,
     ExcludedCurrentWorktree,
-    TrackedDirty,
+    Dirty,
     UntrackedOnly,
     ActiveLease,
     ActiveClaim,
@@ -332,6 +341,109 @@ pub enum WorktreeGcReason {
     NoTarget,
     UnregisteredOrphan,
     MachineGlobalGate,
+}
+
+#[derive(Serialize)]
+struct WorktreeReportPathWire {
+    platform: &'static str,
+    encoding: &'static str,
+    data: String,
+}
+
+fn serialize_worktree_report_paths<S>(
+    paths: &[PathBuf],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    paths
+        .iter()
+        .map(|path| worktree_report_path_wire(path))
+        .collect::<Vec<_>>()
+        .serialize(serializer)
+}
+
+fn worktree_report_path_wire(path: &Path) -> WorktreeReportPathWire {
+    #[cfg(unix)]
+    {
+        let mut data = String::with_capacity(path.as_os_str().as_bytes().len().saturating_mul(2));
+        for byte in path.as_os_str().as_bytes() {
+            use std::fmt::Write as _;
+            let _ = write!(&mut data, "{byte:02x}");
+        }
+        return WorktreeReportPathWire {
+            platform: std::env::consts::OS,
+            encoding: "unix-bytes-hex-v1",
+            data,
+        };
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let mut data = String::new();
+        for unit in path.as_os_str().encode_wide() {
+            use std::fmt::Write as _;
+            let _ = write!(&mut data, "{unit:04x}");
+        }
+        return WorktreeReportPathWire {
+            platform: std::env::consts::OS,
+            encoding: "windows-wide-hex-v1",
+            data,
+        };
+    }
+
+    #[allow(unreachable_code)]
+    WorktreeReportPathWire {
+        platform: std::env::consts::OS,
+        encoding: "utf8-lossy-v1",
+        data: path.to_string_lossy().into_owned(),
+    }
+}
+
+pub(crate) fn worktree_report_path_text(path: &Path) -> String {
+    if let Some(text) = path.to_str() {
+        let mut escaped = String::new();
+        for character in text.chars() {
+            match character {
+                '\\' => escaped.push_str("\\\\"),
+                ',' => escaped.push_str("\\x2C"),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                character if character.is_control() => {
+                    use std::fmt::Write as _;
+                    let _ = write!(&mut escaped, "\\u{{{:X}}}", u32::from(character));
+                }
+                character => escaped.push(character),
+            }
+        }
+        return escaped;
+    }
+
+    #[cfg(unix)]
+    {
+        let mut escaped = String::new();
+        for byte in path.as_os_str().as_bytes() {
+            match *byte {
+                b'\\' => escaped.push_str("\\\\"),
+                b',' => escaped.push_str("\\x2C"),
+                b'\n' => escaped.push_str("\\n"),
+                b'\r' => escaped.push_str("\\r"),
+                b'\t' => escaped.push_str("\\t"),
+                0x20..=0x7e => escaped.push(char::from(*byte)),
+                _ => {
+                    use std::fmt::Write as _;
+                    let _ = write!(&mut escaped, "\\x{byte:02X}");
+                }
+            }
+        }
+        return escaped;
+    }
+
+    #[allow(unreachable_code)]
+    "<unrepresentable-path>".to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -1839,7 +1951,7 @@ impl WorktreeManager {
                         branch: Some(binding.branch),
                         path: verified.path,
                         status: WorktreeGcStatus::Protected,
-                        reason: WorktreeGcReason::TrackedDirty,
+                        reason: WorktreeGcReason::Dirty,
                         target_path: None,
                         untracked_paths: Vec::new(),
                         gate_denial: None,
@@ -1904,7 +2016,7 @@ impl WorktreeManager {
                                     branch: Some(candidate.binding.branch),
                                     path: candidate.binding.path,
                                     status: WorktreeGcStatus::Protected,
-                                    reason: WorktreeGcReason::TrackedDirty,
+                                    reason: WorktreeGcReason::Dirty,
                                     target_path: None,
                                     untracked_paths: Vec::new(),
                                     gate_denial: None,
@@ -3099,7 +3211,11 @@ fn gc_worktree_dirtiness(path: &Path) -> Result<WorktreeGcDirtiness> {
 }
 
 fn normalize_gc_allowed_untracked_paths(paths: &[PathBuf]) -> Result<BTreeSet<PathBuf>> {
+    if paths.len() > MAX_GC_ALLOWED_UNTRACKED_PATHS {
+        bail!("untracked path allowlist exceeds its {MAX_GC_ALLOWED_UNTRACKED_PATHS}-entry limit");
+    }
     let mut normalized = BTreeSet::new();
+    let mut total_bytes = 0usize;
     for path in paths {
         if path.as_os_str().is_empty()
             || path.is_absolute()
@@ -3112,9 +3228,39 @@ fn normalize_gc_allowed_untracked_paths(paths: &[PathBuf]) -> Result<BTreeSet<Pa
                 path.display()
             );
         }
+        let path_bytes = worktree_path_native_bytes(path);
+        if path_bytes > MAX_GC_ALLOWED_UNTRACKED_PATH_BYTES {
+            bail!(
+                "allowed untracked path exceeds its {MAX_GC_ALLOWED_UNTRACKED_PATH_BYTES}-byte limit"
+            );
+        }
+        total_bytes = total_bytes
+            .checked_add(path_bytes)
+            .context("untracked path allowlist byte count overflowed")?;
+        if total_bytes > MAX_GC_ALLOWED_UNTRACKED_TOTAL_BYTES {
+            bail!(
+                "untracked path allowlist exceeds its {MAX_GC_ALLOWED_UNTRACKED_TOTAL_BYTES}-byte aggregate limit"
+            );
+        }
         normalized.insert(path.clone());
     }
     Ok(normalized)
+}
+
+fn worktree_path_native_bytes(path: &Path) -> usize {
+    #[cfg(unix)]
+    {
+        return path.as_os_str().as_bytes().len();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        return path.as_os_str().encode_wide().count().saturating_mul(2);
+    }
+
+    #[allow(unreachable_code)]
+    path.to_string_lossy().len()
 }
 
 fn gc_created_at(binding: &ManagedWorktreeBinding) -> i64 {
@@ -9045,7 +9191,7 @@ mod tests {
         assert_eq!(report.removed_count, 0);
         assert_eq!(report.protected_count, 1);
         assert_eq!(report.entries[0].status, WorktreeGcStatus::Protected);
-        assert_eq!(report.entries[0].reason, WorktreeGcReason::TrackedDirty);
+        assert_eq!(report.entries[0].reason, WorktreeGcReason::Dirty);
         assert!(report.entries[0].untracked_paths.is_empty());
         assert!(created.path.exists());
     }
@@ -9128,6 +9274,68 @@ mod tests {
         assert!(escaping
             .to_string()
             .contains("must be an exact repository-relative path"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_report_serializes_non_utf8_untracked_paths_losslessly_and_escapes_human_text() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = create_gc_worktree(&manager, "agent-non-utf8-gc", &worktree_root);
+        let raw_name = b"odd,\n\t-\xff.txt".to_vec();
+        let relative = PathBuf::from(OsString::from_vec(raw_name.clone()));
+        fs::write(created.path.join(&relative), "worker output\n").expect("non-UTF-8 output");
+
+        let report = manager
+            .gc(gc_options(Some(worktree_root), true))
+            .expect("classify non-UTF-8 output");
+        let json = serde_json::to_value(&report).expect("lossless report JSON");
+        let wire = &json["entries"][0]["untracked_paths"][0];
+        assert_eq!(wire["encoding"], "unix-bytes-hex-v1");
+        assert_eq!(
+            wire["data"],
+            raw_name
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let human = worktree_report_path_text(&relative);
+        assert_eq!(human, "odd\\x2C\\n\\t-\\xFF.txt");
+        assert!(!human.contains(','));
+        assert!(!human.contains('\n'));
+        assert!(!human.contains('\t'));
+    }
+
+    #[test]
+    fn gc_untracked_allowlist_is_bounded_before_report_cloning() {
+        let too_many = vec![PathBuf::from("TASK.md"); MAX_GC_ALLOWED_UNTRACKED_PATHS + 1];
+        assert!(normalize_gc_allowed_untracked_paths(&too_many)
+            .expect_err("entry bound")
+            .to_string()
+            .contains("entry limit"));
+
+        let oversized = PathBuf::from("x".repeat(MAX_GC_ALLOWED_UNTRACKED_PATH_BYTES + 1));
+        assert!(normalize_gc_allowed_untracked_paths(&[oversized])
+            .expect_err("path byte bound")
+            .to_string()
+            .contains("byte limit"));
+
+        let aggregate =
+            vec![
+                PathBuf::from("x".repeat(MAX_GC_ALLOWED_UNTRACKED_PATH_BYTES));
+                MAX_GC_ALLOWED_UNTRACKED_TOTAL_BYTES / MAX_GC_ALLOWED_UNTRACKED_PATH_BYTES + 1
+            ];
+        assert!(normalize_gc_allowed_untracked_paths(&aggregate)
+            .expect_err("aggregate byte bound")
+            .to_string()
+            .contains("aggregate limit"));
     }
 
     #[cfg(target_os = "linux")]

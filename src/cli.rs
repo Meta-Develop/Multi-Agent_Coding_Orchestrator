@@ -54,11 +54,11 @@ use crate::{
         ClaimStatusReport, ClaimTelemetryOutcome, MegafileClaimWarning, OwnerReport, SyncStore,
     },
     worktree::{
-        sweep_workspace_worktrees, RepositoryInfo, WorktreeCreateOptions, WorktreeGcOptions,
-        WorktreeGcReason, WorktreeGcReport, WorktreeGcStatus, WorktreeManager, WorktreeRecord,
-        WorktreeRetentionPolicy, WorktreeSweepDiscoveryStatus, WorktreeSweepFailureKind,
-        WorktreeSweepOptions, WorktreeSweepReport, WorktreeSweepRepositoryStatus,
-        WorktreeSweepRootKind,
+        sweep_workspace_worktrees, worktree_report_path_text, RepositoryInfo,
+        WorktreeCreateOptions, WorktreeGcOptions, WorktreeGcReason, WorktreeGcReport,
+        WorktreeGcStatus, WorktreeManager, WorktreeRecord, WorktreeRetentionPolicy,
+        WorktreeSweepDiscoveryStatus, WorktreeSweepFailureKind, WorktreeSweepOptions,
+        WorktreeSweepReport, WorktreeSweepRepositoryStatus, WorktreeSweepRootKind,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -4974,7 +4974,10 @@ fn print_worktree_gc_report(report: &WorktreeGcReport, json: bool) -> Result<()>
     println!("Targets cleaned: {}", report.target_removed_count);
     println!("Orphans pruned: {}", report.orphan_removed_count);
     for path in &report.allowed_untracked_paths {
-        println!("Allowed untracked path: {}", path.display());
+        println!(
+            "Allowed untracked path: {}",
+            worktree_report_path_text(path)
+        );
     }
     for entry in &report.entries {
         let branch = entry.branch.as_deref().unwrap_or("-");
@@ -5054,7 +5057,10 @@ fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Resu
         println!("{warning}");
     }
     for path in &report.allowed_untracked_paths {
-        println!("Allowed untracked path: {}", path.display());
+        println!(
+            "Allowed untracked path: {}",
+            worktree_report_path_text(path)
+        );
     }
     println!(
         "Discovered roots: total={} inspected={} skipped-before-gc={} gc-failed={} total-failures={}",
@@ -5141,7 +5147,7 @@ fn worktree_gc_untracked_suffix(paths: &[PathBuf]) -> String {
             " untracked={}",
             paths
                 .iter()
-                .map(|path| path.display().to_string())
+                .map(|path| worktree_report_path_text(path))
                 .collect::<Vec<_>>()
                 .join(",")
         )
@@ -5217,7 +5223,7 @@ fn worktree_gc_reason_label(reason: WorktreeGcReason) -> &'static str {
         WorktreeGcReason::FinishedBranch => "finished-branch",
         WorktreeGcReason::RetentionKeep => "retention-keep",
         WorktreeGcReason::ExcludedCurrentWorktree => "excluded-current-worktree",
-        WorktreeGcReason::TrackedDirty => "tracked-dirty",
+        WorktreeGcReason::Dirty => "dirty",
         WorktreeGcReason::UntrackedOnly => "untracked-only",
         WorktreeGcReason::ActiveLease => "active-lease",
         WorktreeGcReason::ActiveClaim => "active-claim",
