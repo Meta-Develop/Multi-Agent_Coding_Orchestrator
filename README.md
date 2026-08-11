@@ -28,7 +28,7 @@ The current implementation covers a local-first command-line slice:
 - `maco worktree create <agent-id>` is temporarily disabled at its public entry point pending capability-bound repository cleanliness input.
 - `maco worktree list` lists verified registered agent worktrees. `maco worktree pending` is a strict existing-only authenticated reader: absent state returns an empty list, while transitional or invalid state is refused without creating locks, migrating, scavenging, recovering, or writing.
 - `maco worktree remove <agent-id> --force` performs explicitly authorized cleanup of authenticated managed state; non-force removal is temporarily disabled.
-- `maco worktree gc` removes clean, inactive managed worktrees while retaining branch refs, protects tracked changes and unapproved untracked-only lanes plus active leases/claims, supports an exact repeatable untracked-path allowlist for reviewed full-lane cleanup, offers a liveness-checked target-only mode that retains lanes and branches, removes retained `target/` build artifacts by default, supports dry-run and max-age/max-count retention filters, and routes unregistered leftover directories through recoverable machine-global quarantine.
+- `maco worktree gc` removes clean, inactive managed worktrees while retaining branch refs, protects tracked changes and unapproved untracked-only lanes plus active leases/claims, supports an exact repeatable untracked-path allowlist for reviewed full-lane cleanup, offers a liveness-checked target-only mode that retains lanes and branches, removes retained `target/` build artifacts by default, supports dry-run and max-age/max-count/apparent-byte retention filters, reports estimated reclaimable and reclaimed bytes, and routes unregistered leftover directories through recoverable machine-global quarantine.
 - `maco worktree sweep --workspace <path>` discovers both workspace-managed `.maco/worktrees/<repo>` roots and exact repository-local `<repo>/.worktrees` roots, then aggregates the existing per-root GC reports. It is dry-run by default; removal requires `--apply`, an unresolved repository is reported as a typed per-root failure without aborting later roots, and a total discovery miss is reported separately from an inspected root with nothing to reclaim.
 - `SyncCoordinator` provides an in-memory exclusive path-claim layer for local agent coordination.
 - `maco sync claim <agent-id> <path>...` records durable exclusive path claims.
@@ -1279,7 +1279,7 @@ cargo run -- worktree gc --repo . \
   --machine-global-config /exact/path/to/machine-global.json \
   --machine-global-worktree-root-id worktrees \
   --machine-global-correlation scheduled-worktree-gc \
-  --max-count 10 --max-age-seconds 604800 --json
+  --max-count 10 --max-age-seconds 604800 --max-total-bytes 10737418240 --json
 cargo run -- worktree gc --repo . \
   --machine-global-config /exact/path/to/machine-global.json \
   --machine-global-worktree-root-id worktrees \
@@ -1313,9 +1313,22 @@ choice rather than inheriting a stale journal value. GC also keeps
 worktrees with
 active MACO execution leases or active path claims for the same agent id.
 Without retention filters, every eligible inactive managed worktree is selected
-for removal; with `--max-count` and/or
-`--max-age-seconds`, retained clean worktrees keep the checkout but lose their
-`target/` directory unless `--keep-targets` is set. A second pass prunes
+for removal. `--max-total-bytes` adds a size dimension to `--max-count` and
+`--max-age-seconds`: after age/count exclusions, GC walks eligible lanes from
+newest to oldest and retains the newest prefix whose combined apparent size is
+within the byte budget. Protected or otherwise ineligible lanes are not charged
+to that retention budget, so it is not a global on-disk ceiling. Apparent size
+is filesystem metadata length, not allocated blocks or a promise about physical
+disk space. The report exposes the
+apparent bytes considered and estimates for bytes reclaimable and actually
+reclaimed; full-lane estimates already include `target/`, while target-only
+estimates count only `target/`, so they are not double-counted. Sizing is a
+bounded, descriptor-relative, non-symlink-following walk; Linux additionally
+confines the walk to the lane's exact mount. A timeout, limit, unsupported
+platform, invalid target binding, or other sizing failure reports
+`size_measurement_failed` and protects that lane instead of guessing. Retained
+clean worktrees keep the checkout but lose their `target/` directory unless
+`--keep-targets` is set. A second pass prunes
 unregistered direct-child directories left under the managed worktree root. A
 destructive second pass requires the three-part machine-global binding above, treats
 all discovered orphans as one preflight set, and uses recoverable quarantine rather
@@ -1324,7 +1337,8 @@ binding.
 
 `--targets-only` removes eligible `target/` directories while retaining every
 managed lane, branch, untracked file, and registered association. Because it is
-a separate operation, it rejects `--keep-targets`, retention filters,
+a separate operation, it rejects `--keep-targets`, every retention filter
+(including `--max-total-bytes`),
 untracked-path allowances, and machine-global orphan-cleanup bindings, and it
 does not run orphan pruning. Tracked changes, active claims, and active leases
 still protect the target; an untracked-only lane does not require an allowlist
@@ -1393,8 +1407,8 @@ former. Each root includes its resolved repository when available, a typed
 failure when resolution or GC fails, and its nested GC summary. A failure in one
 root does not stop later roots from being inspected. Retention flags and
 `--keep-targets` are passed independently to each discovered root, so
-`--max-count` is a per-root limit and dirty worktrees or lanes with active
-leases or claims remain protected. Existing machine-global quarantine gates
+`--max-count` and `--max-total-bytes` are per-root limits and dirty worktrees or
+lanes with active leases or claims remain protected. Existing machine-global quarantine gates
 also remain in force; the sweep does not weaken them. A workspace-managed group
 is associated only when it is the exact result of the creation default-root
 function. In particular, `<repo>/.maco/worktrees` is not adopted as that

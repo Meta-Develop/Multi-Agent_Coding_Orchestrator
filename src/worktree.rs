@@ -96,6 +96,9 @@ const WORKTREE_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const WORKTREE_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKTREE_GC_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_WORKTREE_GC_SIZE_ENTRIES: usize = 500_000;
+const MAX_WORKTREE_GC_SIZE_TOTAL_PATH_BYTES: usize = 256 * 1024 * 1024;
+const WORKTREE_GC_SIZE_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(target_os = "linux")]
 const MAX_WORKTREE_GC_PROC_ENTRIES: usize = 262_144;
 #[cfg(target_os = "linux")]
@@ -195,6 +198,8 @@ pub struct PendingWorktreeOperation {
 pub struct WorktreeRetentionPolicy {
     pub max_age: Option<Duration>,
     pub max_count: Option<usize>,
+    /// Maximum apparent bytes retained across newest age/count survivors.
+    pub max_total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -228,6 +233,7 @@ pub struct WorktreeSweepReport {
     pub targets_only: bool,
     pub max_age_seconds: Option<u64>,
     pub max_count: Option<usize>,
+    pub max_total_bytes: Option<u64>,
     #[serde(serialize_with = "serialize_worktree_report_paths")]
     pub allowed_untracked_paths: Vec<PathBuf>,
     pub discovery_status: WorktreeSweepDiscoveryStatus,
@@ -243,6 +249,9 @@ pub struct WorktreeSweepReport {
     pub retained_count: usize,
     pub target_removed_count: usize,
     pub orphan_removed_count: usize,
+    pub apparent_considered_bytes: u64,
+    pub estimated_reclaimable_bytes: u64,
+    pub estimated_reclaimed_bytes: u64,
     pub repositories: Vec<WorktreeSweepRepositoryReport>,
 }
 
@@ -306,6 +315,7 @@ pub struct WorktreeGcReport {
     pub targets_only: bool,
     pub max_age_seconds: Option<u64>,
     pub max_count: Option<usize>,
+    pub max_total_bytes: Option<u64>,
     #[serde(serialize_with = "serialize_worktree_report_paths")]
     pub allowed_untracked_paths: Vec<PathBuf>,
     pub considered_count: usize,
@@ -314,6 +324,9 @@ pub struct WorktreeGcReport {
     pub retained_count: usize,
     pub target_removed_count: usize,
     pub orphan_removed_count: usize,
+    pub apparent_considered_bytes: u64,
+    pub estimated_reclaimable_bytes: u64,
+    pub estimated_reclaimed_bytes: u64,
     pub entries: Vec<WorktreeGcEntry>,
 }
 
@@ -327,6 +340,8 @@ pub struct WorktreeGcEntry {
     pub target_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_liveness: Option<WorktreeTargetLivenessEvidence>,
+    pub apparent_worktree_bytes: Option<u64>,
+    pub apparent_target_bytes: Option<u64>,
     #[serde(
         default,
         serialize_with = "serialize_worktree_report_paths",
@@ -366,6 +381,7 @@ pub enum WorktreeGcReason {
     LiveTarget,
     TargetLivenessUnknown,
     TargetIdentityChanged,
+    SizeMeasurementFailed,
     NoTarget,
     UnregisteredOrphan,
     MachineGlobalGate,
@@ -1355,12 +1371,20 @@ impl WorktreeManager {
             WorktreeCreationPolicy::Standard,
         )?;
         cleanliness.require_clean_for_manager(self)?;
-        if retention.max_age.is_some() || retention.max_count.is_some() {
+        if worktree_retention_is_configured(retention) {
+            let max_total_bytes = retention
+                .max_total_bytes
+                .map(|max_total_bytes| -> Result<u64> {
+                    let current = gc_worktree_size_estimate(&record.path)?;
+                    Ok(max_total_bytes.saturating_sub(current.worktree_bytes))
+                })
+                .transpose()?;
             let retention = WorktreeRetentionPolicy {
                 max_age: retention.max_age,
                 max_count: retention
                     .max_count
                     .map(|max_count| max_count.saturating_sub(1)),
+                max_total_bytes,
             };
             self.gc(WorktreeGcOptions {
                 worktree_root,
@@ -1426,12 +1450,20 @@ impl WorktreeManager {
             CreationCleanliness::TestOnly,
             WorktreeCreationPolicy::Standard,
         )?;
-        if retention.max_age.is_some() || retention.max_count.is_some() {
+        if worktree_retention_is_configured(retention) {
+            let max_total_bytes = retention
+                .max_total_bytes
+                .map(|max_total_bytes| -> Result<u64> {
+                    let current = gc_worktree_size_estimate(&record.path)?;
+                    Ok(max_total_bytes.saturating_sub(current.worktree_bytes))
+                })
+                .transpose()?;
             let retention = WorktreeRetentionPolicy {
                 max_age: retention.max_age,
                 max_count: retention
                     .max_count
                     .map(|max_count| max_count.saturating_sub(1)),
+                max_total_bytes,
             };
             self.gc(WorktreeGcOptions {
                 worktree_root,
@@ -2008,6 +2040,7 @@ impl WorktreeManager {
             targets_only: options.targets_only,
             max_age_seconds: options.retention.max_age.map(|age| age.as_secs()),
             max_count: options.retention.max_count,
+            max_total_bytes: options.retention.max_total_bytes,
             allowed_untracked_paths: allowed_untracked_paths.iter().cloned().collect(),
             considered_count: 0,
             removed_count: 0,
@@ -2015,6 +2048,9 @@ impl WorktreeManager {
             retained_count: 0,
             target_removed_count: 0,
             orphan_removed_count: 0,
+            apparent_considered_bytes: 0,
+            estimated_reclaimable_bytes: 0,
+            estimated_reclaimed_bytes: 0,
             entries: Vec::new(),
         };
 
@@ -2053,6 +2089,8 @@ impl WorktreeManager {
                     reason: WorktreeGcReason::ExcludedCurrentWorktree,
                     target_path: None,
                     target_liveness: None,
+                    apparent_worktree_bytes: None,
+                    apparent_target_bytes: None,
                     untracked_paths: Vec::new(),
                     gate_denial: None,
                     retention_operation_id: None,
@@ -2072,6 +2110,8 @@ impl WorktreeManager {
                     reason: WorktreeGcReason::ActiveClaim,
                     target_path: None,
                     target_liveness: None,
+                    apparent_worktree_bytes: None,
+                    apparent_target_bytes: None,
                     untracked_paths: Vec::new(),
                     gate_denial: None,
                     retention_operation_id: None,
@@ -2100,6 +2140,8 @@ impl WorktreeManager {
                         reason: WorktreeGcReason::ActiveLease,
                         target_path: None,
                         target_liveness: None,
+                        apparent_worktree_bytes: None,
+                        apparent_target_bytes: None,
                         untracked_paths: Vec::new(),
                         gate_denial: None,
                         retention_operation_id: None,
@@ -2125,6 +2167,8 @@ impl WorktreeManager {
                             reason: WorktreeGcReason::ActiveLease,
                             target_path: None,
                             target_liveness: None,
+                            apparent_worktree_bytes: None,
+                            apparent_target_bytes: None,
                             untracked_paths: Vec::new(),
                             gate_denial: None,
                             retention_operation_id: None,
@@ -2136,6 +2180,34 @@ impl WorktreeManager {
                     }
                 }
             };
+            let size = match gc_worktree_size_estimate(&verified.path) {
+                Ok(size) => size,
+                Err(_) => {
+                    report.protected_count = report
+                        .protected_count
+                        .checked_add(1)
+                        .context("worktree GC protected count overflowed")?;
+                    report.entries.push(WorktreeGcEntry {
+                        name: binding.name,
+                        branch: Some(binding.branch),
+                        path: verified.path,
+                        status: WorktreeGcStatus::Protected,
+                        reason: WorktreeGcReason::SizeMeasurementFailed,
+                        target_path: None,
+                        target_liveness: None,
+                        apparent_worktree_bytes: None,
+                        apparent_target_bytes: None,
+                        untracked_paths: Vec::new(),
+                        gate_denial: None,
+                        retention_operation_id: None,
+                    });
+                    continue;
+                }
+            };
+            report.apparent_considered_bytes = report
+                .apparent_considered_bytes
+                .checked_add(size.worktree_bytes)
+                .context("worktree GC apparent considered bytes overflowed")?;
             let untracked_paths = match gc_worktree_dirtiness(&verified.path)? {
                 WorktreeGcDirtiness::Clean => Vec::new(),
                 WorktreeGcDirtiness::TrackedDirty => {
@@ -2151,6 +2223,8 @@ impl WorktreeManager {
                         reason: WorktreeGcReason::Dirty,
                         target_path: None,
                         target_liveness: None,
+                        apparent_worktree_bytes: Some(size.worktree_bytes),
+                        apparent_target_bytes: size.target_bytes,
                         untracked_paths: Vec::new(),
                         gate_denial: None,
                         retention_operation_id: None,
@@ -2175,6 +2249,8 @@ impl WorktreeManager {
                             reason: WorktreeGcReason::UntrackedOnly,
                             target_path: None,
                             target_liveness: None,
+                            apparent_worktree_bytes: Some(size.worktree_bytes),
+                            apparent_target_bytes: size.target_bytes,
                             untracked_paths: paths,
                             gate_denial: None,
                             retention_operation_id: None,
@@ -2189,6 +2265,8 @@ impl WorktreeManager {
                 branch_oid: verified.branch_oid,
                 removal_lease,
                 untracked_paths,
+                apparent_worktree_bytes: size.worktree_bytes,
+                apparent_target_bytes: size.target_bytes,
             });
         }
 
@@ -2198,14 +2276,38 @@ impl WorktreeManager {
                 .cmp(&gc_created_at(&left.binding))
                 .then_with(|| left.binding.name.cmp(&right.binding.name))
         });
+        let retention_configured = worktree_retention_is_configured(options.retention);
+        let mut retained_apparent_bytes = 0u64;
+        let mut size_budget_exhausted = false;
         for (index, mut candidate) in candidates.into_iter().enumerate() {
+            let age_or_count_selects = retention_age_or_count_selects_gc_candidate(
+                &candidate.binding,
+                index,
+                now,
+                options.retention,
+            );
+            let size_selects = if age_or_count_selects {
+                false
+            } else if let Some(max_total_bytes) = options.retention.max_total_bytes {
+                if size_budget_exhausted {
+                    true
+                } else {
+                    let total = retained_apparent_bytes
+                        .checked_add(candidate.apparent_worktree_bytes)
+                        .context("worktree GC retained apparent bytes overflowed")?;
+                    if total <= max_total_bytes {
+                        retained_apparent_bytes = total;
+                        false
+                    } else {
+                        size_budget_exhausted = true;
+                        true
+                    }
+                }
+            } else {
+                false
+            };
             let should_remove = !options.targets_only
-                && retention_selects_gc_candidate(
-                    &candidate.binding,
-                    index,
-                    now,
-                    options.retention,
-                );
+                && (!retention_configured || age_or_count_selects || size_selects);
             if should_remove {
                 if !options.dry_run {
                     candidate.untracked_paths =
@@ -2224,6 +2326,10 @@ impl WorktreeManager {
                                     reason: WorktreeGcReason::Dirty,
                                     target_path: None,
                                     target_liveness: None,
+                                    apparent_worktree_bytes: Some(
+                                        candidate.apparent_worktree_bytes,
+                                    ),
+                                    apparent_target_bytes: candidate.apparent_target_bytes,
                                     untracked_paths: Vec::new(),
                                     gate_denial: None,
                                     retention_operation_id: None,
@@ -2247,6 +2353,10 @@ impl WorktreeManager {
                                         reason: WorktreeGcReason::UntrackedOnly,
                                         target_path: None,
                                         target_liveness: None,
+                                        apparent_worktree_bytes: Some(
+                                            candidate.apparent_worktree_bytes,
+                                        ),
+                                        apparent_target_bytes: candidate.apparent_target_bytes,
                                         untracked_paths: paths,
                                         gate_denial: None,
                                         retention_operation_id: None,
@@ -2274,6 +2384,8 @@ impl WorktreeManager {
                         reason,
                         target_path: target.as_ref().map(|target| target.path.clone()),
                         target_liveness: Some(evidence),
+                        apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
+                        apparent_target_bytes: candidate.apparent_target_bytes,
                         untracked_paths: candidate.untracked_paths,
                         gate_denial: None,
                         retention_operation_id: None,
@@ -2297,6 +2409,8 @@ impl WorktreeManager {
                         reason: WorktreeGcReason::TargetIdentityChanged,
                         target_path: target.as_ref().map(|target| target.path.clone()),
                         target_liveness: Some(target_identity_changed_evidence()),
+                        apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
+                        apparent_target_bytes: candidate.apparent_target_bytes,
                         untracked_paths: candidate.untracked_paths,
                         gate_denial: None,
                         retention_operation_id: None,
@@ -2304,6 +2418,10 @@ impl WorktreeManager {
                     continue;
                 }
                 if options.dry_run {
+                    report.estimated_reclaimable_bytes = report
+                        .estimated_reclaimable_bytes
+                        .checked_add(candidate.apparent_worktree_bytes)
+                        .context("worktree GC estimated reclaimable bytes overflowed")?;
                     report.removed_count = report
                         .removed_count
                         .checked_add(1)
@@ -2316,6 +2434,8 @@ impl WorktreeManager {
                         reason: WorktreeGcReason::FinishedBranch,
                         target_path: target.as_ref().map(|target| target.path.clone()),
                         target_liveness: None,
+                        apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
+                        apparent_target_bytes: candidate.apparent_target_bytes,
                         untracked_paths: candidate.untracked_paths,
                         gate_denial: None,
                         retention_operation_id: None,
@@ -2349,6 +2469,8 @@ impl WorktreeManager {
                             reason: WorktreeGcReason::TargetIdentityChanged,
                             target_path: target.as_ref().map(|target| target.path.clone()),
                             target_liveness: Some(target_identity_changed_evidence()),
+                            apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
+                            apparent_target_bytes: candidate.apparent_target_bytes,
                             untracked_paths: candidate.untracked_paths,
                             gate_denial: None,
                             retention_operation_id: None,
@@ -2371,6 +2493,8 @@ impl WorktreeManager {
                             reason,
                             target_path: target.as_ref().map(|target| target.path.clone()),
                             target_liveness: None,
+                            apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
+                            apparent_target_bytes: candidate.apparent_target_bytes,
                             untracked_paths,
                             gate_denial: None,
                             retention_operation_id: None,
@@ -2383,6 +2507,14 @@ impl WorktreeManager {
                     .removed_count
                     .checked_add(1)
                     .context("worktree GC removed count overflowed")?;
+                report.estimated_reclaimable_bytes = report
+                    .estimated_reclaimable_bytes
+                    .checked_add(candidate.apparent_worktree_bytes)
+                    .context("worktree GC estimated reclaimable bytes overflowed")?;
+                report.estimated_reclaimed_bytes = report
+                    .estimated_reclaimed_bytes
+                    .checked_add(candidate.apparent_worktree_bytes)
+                    .context("worktree GC estimated reclaimed bytes overflowed")?;
                 report.entries.push(WorktreeGcEntry {
                     name: candidate.binding.name,
                     branch: Some(candidate.binding.branch),
@@ -2391,6 +2523,8 @@ impl WorktreeManager {
                     reason: WorktreeGcReason::FinishedBranch,
                     target_path: target.as_ref().map(|target| target.path.clone()),
                     target_liveness: None,
+                    apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
+                    apparent_target_bytes: candidate.apparent_target_bytes,
                     untracked_paths: candidate.untracked_paths,
                     gate_denial: None,
                     retention_operation_id: None,
@@ -2414,14 +2548,37 @@ impl WorktreeManager {
                             path: candidate.binding.path,
                             status: WorktreeGcStatus::Protected,
                             reason,
-                            target_path: Some(target.path),
+                            target_path: Some(target.path.clone()),
                             target_liveness: Some(evidence),
+                            apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
+                            apparent_target_bytes: candidate.apparent_target_bytes,
                             untracked_paths: candidate.untracked_paths,
                             gate_denial: None,
                             retention_operation_id: None,
                         });
                         continue;
                     }
+                    let Some(target_bytes) = candidate.apparent_target_bytes else {
+                        report.protected_count = report
+                            .protected_count
+                            .checked_add(1)
+                            .context("worktree GC protected count overflowed")?;
+                        report.entries.push(WorktreeGcEntry {
+                            name: candidate.binding.name,
+                            branch: Some(candidate.binding.branch),
+                            path: candidate.binding.path,
+                            status: WorktreeGcStatus::Protected,
+                            reason: WorktreeGcReason::SizeMeasurementFailed,
+                            target_path: Some(target.path.clone()),
+                            target_liveness: None,
+                            apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
+                            apparent_target_bytes: None,
+                            untracked_paths: candidate.untracked_paths,
+                            gate_denial: None,
+                            retention_operation_id: None,
+                        });
+                        continue;
+                    };
                     let reason = if options.dry_run {
                         if !worktree_gc_target_identity_is_current(&target) {
                             report.protected_count = report
@@ -2436,12 +2593,18 @@ impl WorktreeManager {
                                 reason: WorktreeGcReason::TargetIdentityChanged,
                                 target_path: Some(target.path),
                                 target_liveness: Some(target_identity_changed_evidence()),
+                                apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
+                                apparent_target_bytes: candidate.apparent_target_bytes,
                                 untracked_paths: candidate.untracked_paths,
                                 gate_denial: None,
                                 retention_operation_id: None,
                             });
                             continue;
                         }
+                        report.estimated_reclaimable_bytes = report
+                            .estimated_reclaimable_bytes
+                            .checked_add(target_bytes)
+                            .context("worktree GC estimated reclaimable bytes overflowed")?;
                         WorktreeGcReason::TargetWouldRemove
                     } else {
                         if matches!(
@@ -2460,6 +2623,8 @@ impl WorktreeManager {
                                 reason: WorktreeGcReason::TargetIdentityChanged,
                                 target_path: Some(target.path),
                                 target_liveness: Some(target_identity_changed_evidence()),
+                                apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
+                                apparent_target_bytes: candidate.apparent_target_bytes,
                                 untracked_paths: candidate.untracked_paths,
                                 gate_denial: None,
                                 retention_operation_id: None,
@@ -2470,6 +2635,14 @@ impl WorktreeManager {
                             .target_removed_count
                             .checked_add(1)
                             .context("worktree GC target count overflowed")?;
+                        report.estimated_reclaimable_bytes = report
+                            .estimated_reclaimable_bytes
+                            .checked_add(target_bytes)
+                            .context("worktree GC estimated reclaimable bytes overflowed")?;
+                        report.estimated_reclaimed_bytes = report
+                            .estimated_reclaimed_bytes
+                            .checked_add(target_bytes)
+                            .context("worktree GC estimated reclaimed bytes overflowed")?;
                         WorktreeGcReason::TargetRemoved
                     };
                     report.retained_count = report
@@ -2484,6 +2657,8 @@ impl WorktreeManager {
                         reason,
                         target_path: Some(target.path),
                         target_liveness: None,
+                        apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
+                        apparent_target_bytes: Some(target_bytes),
                         untracked_paths: candidate.untracked_paths,
                         gate_denial: None,
                         retention_operation_id: None,
@@ -2507,6 +2682,8 @@ impl WorktreeManager {
                 },
                 target_path: None,
                 target_liveness: None,
+                apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
+                apparent_target_bytes: None,
                 untracked_paths: candidate.untracked_paths,
                 gate_denial: None,
                 retention_operation_id: None,
@@ -2701,6 +2878,7 @@ pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<Worktr
         targets_only: options.targets_only,
         max_age_seconds: options.retention.max_age.map(|age| age.as_secs()),
         max_count: options.retention.max_count,
+        max_total_bytes: options.retention.max_total_bytes,
         allowed_untracked_paths: allowed_untracked_paths.iter().cloned().collect(),
         discovery_status,
         worktree_root_discovered_count: roots.len(),
@@ -2715,6 +2893,9 @@ pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<Worktr
         retained_count: 0,
         target_removed_count: 0,
         orphan_removed_count: 0,
+        apparent_considered_bytes: 0,
+        estimated_reclaimable_bytes: 0,
+        estimated_reclaimed_bytes: 0,
         repositories: Vec::with_capacity(roots.len()),
     };
 
@@ -2827,7 +3008,7 @@ fn validate_worktree_gc_mode(
     if !remove_targets {
         bail!("target-only GC conflicts with keeping target directories");
     }
-    if retention.max_age.is_some() || retention.max_count.is_some() {
+    if worktree_retention_is_configured(retention) {
         bail!("target-only GC does not accept worktree retention filters");
     }
     if !allowed_untracked_paths.is_empty() {
@@ -3013,6 +3194,18 @@ fn add_sweep_gc_counts(sweep: &mut WorktreeSweepReport, gc: &WorktreeGcReport) -
         .orphan_removed_count
         .checked_add(gc.orphan_removed_count)
         .context("workspace sweep orphan count overflowed")?;
+    sweep.apparent_considered_bytes = sweep
+        .apparent_considered_bytes
+        .checked_add(gc.apparent_considered_bytes)
+        .context("workspace sweep apparent considered bytes overflowed")?;
+    sweep.estimated_reclaimable_bytes = sweep
+        .estimated_reclaimable_bytes
+        .checked_add(gc.estimated_reclaimable_bytes)
+        .context("workspace sweep estimated reclaimable bytes overflowed")?;
+    sweep.estimated_reclaimed_bytes = sweep
+        .estimated_reclaimed_bytes
+        .checked_add(gc.estimated_reclaimed_bytes)
+        .context("workspace sweep estimated reclaimed bytes overflowed")?;
     Ok(())
 }
 
@@ -3453,6 +3646,8 @@ struct WorktreeGcCandidate {
     branch_oid: Oid,
     removal_lease: Option<ManagedWorktreeRemovalLease>,
     untracked_paths: Vec<PathBuf>,
+    apparent_worktree_bytes: u64,
+    apparent_target_bytes: Option<u64>,
 }
 
 enum WorktreeGcRemovalOutcome {
@@ -3742,15 +3937,18 @@ fn gc_created_at(binding: &ManagedWorktreeBinding) -> i64 {
     binding.created_at_unix_nanos.unwrap_or(0)
 }
 
-fn retention_selects_gc_candidate(
+fn worktree_retention_is_configured(retention: WorktreeRetentionPolicy) -> bool {
+    retention.max_age.is_some()
+        || retention.max_count.is_some()
+        || retention.max_total_bytes.is_some()
+}
+
+fn retention_age_or_count_selects_gc_candidate(
     binding: &ManagedWorktreeBinding,
     index: usize,
     now: i64,
     retention: WorktreeRetentionPolicy,
 ) -> bool {
-    if retention.max_age.is_none() && retention.max_count.is_none() {
-        return true;
-    }
     let count_expired = retention
         .max_count
         .is_some_and(|max_count| index >= max_count);
@@ -3762,6 +3960,56 @@ fn retention_selects_gc_candidate(
             .is_some_and(|age_nanos| age_nanos >= max_age.as_nanos())
     });
     count_expired || age_expired
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorktreeGcSizeEstimate {
+    worktree_bytes: u64,
+    target_bytes: Option<u64>,
+}
+
+fn gc_worktree_size_estimate(worktree_path: &Path) -> Result<WorktreeGcSizeEstimate> {
+    let target = gc_target_if_present(worktree_path)?;
+    let mut worktree_bytes = 0u64;
+    let mut target_bytes = 0u64;
+    BoundedTreeWalker::walk_with(
+        worktree_path,
+        BoundedTreeWalkLimits {
+            max_depth: 128,
+            max_entries: MAX_WORKTREE_GC_SIZE_ENTRIES,
+            max_path_bytes: MAX_PERSISTED_PATH_BYTES,
+            max_total_path_bytes: MAX_WORKTREE_GC_SIZE_TOTAL_PATH_BYTES,
+            max_duration: WORKTREE_GC_SIZE_TIMEOUT,
+            // Linux supplies statx mount identities for strict mount confinement.
+            // Other Unix platforms still get descriptor-relative, no-follow walking.
+            same_device: cfg!(target_os = "linux"),
+        },
+        |entry| {
+            worktree_bytes = worktree_bytes
+                .checked_add(entry.size_bytes)
+                .context("worktree apparent byte estimate overflowed")?;
+            if target.is_some() && entry.relative_path.starts_with(Path::new("target")) {
+                target_bytes = target_bytes
+                    .checked_add(entry.size_bytes)
+                    .context("worktree target apparent byte estimate overflowed")?;
+            }
+            Ok(if entry.kind == BoundedTreeEntryKind::Directory {
+                BoundedTreeWalkAction::RecordAndDescend
+            } else {
+                BoundedTreeWalkAction::Skip
+            })
+        },
+    )
+    .with_context(|| {
+        format!(
+            "failed to measure apparent bytes beneath managed worktree {}",
+            worktree_path.display()
+        )
+    })?;
+    Ok(WorktreeGcSizeEstimate {
+        worktree_bytes,
+        target_bytes: target.map(|_| target_bytes),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4868,6 +5116,8 @@ fn prune_unregistered_worktree_directories(
                 reason: WorktreeGcReason::UnregisteredOrphan,
                 target_path: None,
                 target_liveness: None,
+                apparent_worktree_bytes: None,
+                apparent_target_bytes: None,
                 untracked_paths: Vec::new(),
                 gate_denial: None,
                 retention_operation_id: None,
@@ -4906,6 +5156,8 @@ fn prune_unregistered_worktree_directories(
                     reason: WorktreeGcReason::UnregisteredOrphan,
                     target_path: None,
                     target_liveness: None,
+                    apparent_worktree_bytes: None,
+                    apparent_target_bytes: None,
                     untracked_paths: Vec::new(),
                     gate_denial: None,
                     retention_operation_id: Some(operation_id),
@@ -4926,6 +5178,8 @@ fn prune_unregistered_worktree_directories(
                     reason: WorktreeGcReason::MachineGlobalGate,
                     target_path: None,
                     target_liveness: None,
+                    apparent_worktree_bytes: None,
+                    apparent_target_bytes: None,
                     untracked_paths: Vec::new(),
                     gate_denial: Some(denial.clone()),
                     retention_operation_id: None,
@@ -10355,15 +10609,20 @@ mod tests {
             preview.repositories[0].status,
             WorktreeSweepRepositoryStatus::Inspected
         );
+        let preview_gc = preview.repositories[0]
+            .gc_report
+            .as_ref()
+            .expect("preview GC report");
+        assert_eq!(preview_gc.entries[0].status, WorktreeGcStatus::WouldRemove);
         assert_eq!(
-            preview.repositories[0]
-                .gc_report
-                .as_ref()
-                .expect("preview GC report")
-                .entries[0]
-                .status,
-            WorktreeGcStatus::WouldRemove
+            preview.apparent_considered_bytes,
+            preview_gc.apparent_considered_bytes
         );
+        assert_eq!(
+            preview.estimated_reclaimable_bytes,
+            preview_gc.estimated_reclaimable_bytes
+        );
+        assert_eq!(preview.estimated_reclaimed_bytes, 0);
         assert!(created.path.exists());
 
         let applied = sweep_workspace_worktrees(workspace_sweep_options(&workspace, true))
@@ -10409,7 +10668,7 @@ mod tests {
         assert_eq!(report.repository_discovered_count, 1);
         assert_eq!(report.repository_inspected_count, 1);
         assert_eq!(report.considered_count, 1);
-        assert_eq!(report.removed_count, 1);
+        assert_eq!(report.removed_count, 1, "{report:#?}");
         assert_eq!(
             report.repositories[0].root_kind,
             WorktreeSweepRootKind::RepositoryLocal
@@ -10555,7 +10814,7 @@ mod tests {
             .expect("GC one relative managed root");
 
         assert_eq!(report.considered_count, 1);
-        assert_eq!(report.removed_count, 1);
+        assert_eq!(report.removed_count, 1, "{report:#?}");
         assert!(!local.path.exists());
         assert!(other.path.exists());
         assert_eq!(manager.list().expect("remaining worktrees"), vec![other]);
@@ -10822,20 +11081,21 @@ mod tests {
             "retention-new",
             &worktree_root,
         );
-        fs::create_dir_all(old.path.join("target/debug")).expect("old target");
         fs::create_dir_all(new.path.join("target/debug")).expect("new target");
         let mut options = workspace_sweep_options(&workspace, false);
         options.remove_targets = false;
         options.retention = WorktreeRetentionPolicy {
             max_age: Some(Duration::from_secs(3600)),
             max_count: Some(1),
+            max_total_bytes: Some(u64::MAX),
         };
 
         let report = sweep_workspace_worktrees(options).expect("retained workspace sweep");
         assert_eq!(report.max_age_seconds, Some(3600));
         assert_eq!(report.max_count, Some(1));
+        assert_eq!(report.max_total_bytes, Some(u64::MAX));
         assert!(!report.remove_targets);
-        assert_eq!(report.removed_count, 1);
+        assert_eq!(report.removed_count, 1, "{report:#?}");
         assert_eq!(report.retained_count, 1);
         assert_eq!(report.target_removed_count, 0);
         let gc = report.repositories[0]
@@ -10844,6 +11104,7 @@ mod tests {
             .expect("nested GC report");
         assert_eq!(gc.max_age_seconds, Some(3600));
         assert_eq!(gc.max_count, Some(1));
+        assert_eq!(gc.max_total_bytes, Some(u64::MAX));
         assert!(!gc.remove_targets);
         assert!(gc.entries.iter().any(|entry| {
             entry.status == WorktreeGcStatus::Retained
@@ -10851,7 +11112,6 @@ mod tests {
         }));
         assert!(old.path.exists());
         assert!(new.path.exists());
-        assert!(old.path.join("target").exists());
         assert!(new.path.join("target").exists());
     }
 
@@ -10938,13 +11198,12 @@ mod tests {
         commit_readme(&repo).expect("initial commit");
         let manager = WorktreeManager::new(&repo_path);
         let created = create_gc_worktree(&manager, "agent-finished", &worktree_root);
-        fs::create_dir_all(created.path.join("target/debug")).expect("create target");
 
         let report = manager
             .gc(gc_options(Some(worktree_root.clone()), false))
             .expect("gc finished worktree");
 
-        assert_eq!(report.removed_count, 1);
+        assert_eq!(report.removed_count, 1, "{report:#?}");
         assert_eq!(report.entries[0].status, WorktreeGcStatus::Removed);
         assert_eq!(report.entries[0].reason, WorktreeGcReason::FinishedBranch);
         assert!(!created.path.exists());
@@ -11310,22 +11569,26 @@ mod tests {
         fs::create_dir_all(new.path.join("target/debug")).expect("new target");
 
         let report = manager
-            .gc(WorktreeGcOptions {
-                worktree_root: Some(worktree_root),
-                dry_run: false,
-                remove_targets: true,
-                targets_only: false,
-                retention: WorktreeRetentionPolicy {
-                    max_age: None,
-                    max_count: Some(1),
+            .gc_with_target_liveness(
+                WorktreeGcOptions {
+                    worktree_root: Some(worktree_root),
+                    dry_run: false,
+                    remove_targets: true,
+                    targets_only: false,
+                    retention: WorktreeRetentionPolicy {
+                        max_age: None,
+                        max_count: Some(1),
+                        max_total_bytes: None,
+                    },
+                    allowed_untracked_paths: Vec::new(),
+                    exclude_agent_id: None,
+                    machine_global_retention: None,
                 },
-                allowed_untracked_paths: Vec::new(),
-                exclude_agent_id: None,
-                machine_global_retention: None,
-            })
+                |_| WorktreeTargetLiveness::Clear,
+            )
             .expect("gc with retention");
 
-        assert_eq!(report.removed_count, 1);
+        assert_eq!(report.removed_count, 1, "{report:#?}");
         assert_eq!(report.retained_count, 1);
         assert_eq!(report.target_removed_count, 1, "{report:#?}");
         assert!(!old.path.exists());
@@ -11336,6 +11599,126 @@ mod tests {
             .iter()
             .any(|entry| entry.name == "agent-new-gc"
                 && entry.reason == WorktreeGcReason::TargetRemoved));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_size_retention_keeps_the_newest_prefix_and_counts_lane_bytes_once() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let protected = create_gc_worktree(&manager, "size-protected", &worktree_root);
+        fs::write(protected.path.join("README.md"), vec![b'p'; 64 * 1024])
+            .expect("protected tracked edit");
+        let old = create_gc_worktree(&manager, "size-old", &worktree_root);
+        fs::create_dir_all(old.path.join("target/debug")).expect("old target");
+        fs::write(
+            old.path.join("target/debug/artifact"),
+            vec![b'o'; 32 * 1024],
+        )
+        .expect("old artifact");
+        let new = create_gc_worktree(&manager, "size-new", &worktree_root);
+        fs::create_dir_all(new.path.join("target/debug")).expect("new target");
+        fs::write(new.path.join("target/debug/artifact"), vec![b'n'; 128]).expect("new artifact");
+        let protected_size = gc_worktree_size_estimate(&protected.path).expect("protected size");
+        let old_size = gc_worktree_size_estimate(&old.path).expect("old size");
+        let new_size = gc_worktree_size_estimate(&new.path).expect("new size");
+        assert!(old_size.worktree_bytes > new_size.worktree_bytes);
+
+        let mut options = gc_options(Some(worktree_root), false);
+        options.remove_targets = false;
+        options.retention.max_total_bytes = Some(new_size.worktree_bytes);
+        let report = manager
+            .gc_with_target_liveness(options, |_| WorktreeTargetLiveness::Clear)
+            .expect("size-retained GC");
+
+        assert_eq!(report.max_total_bytes, Some(new_size.worktree_bytes));
+        assert_eq!(report.removed_count, 1, "{report:#?}");
+        assert_eq!(report.retained_count, 1, "{report:#?}");
+        assert_eq!(report.protected_count, 1, "{report:#?}");
+        assert_eq!(
+            report.apparent_considered_bytes,
+            protected_size
+                .worktree_bytes
+                .checked_add(old_size.worktree_bytes)
+                .expect("test protected and old size sum")
+                .checked_add(new_size.worktree_bytes)
+                .expect("test size sum")
+        );
+        assert_eq!(report.estimated_reclaimable_bytes, old_size.worktree_bytes);
+        assert_eq!(report.estimated_reclaimed_bytes, old_size.worktree_bytes);
+        let json = serde_json::to_value(&report).expect("serialize size report");
+        assert_eq!(json["max_total_bytes"], new_size.worktree_bytes);
+        assert_eq!(json["estimated_reclaimable_bytes"], old_size.worktree_bytes);
+        assert!(
+            old_size.target_bytes.expect("old target size") < old_size.worktree_bytes,
+            "full-lane bytes must include, not double-count, target bytes"
+        );
+        let removed = report
+            .entries
+            .iter()
+            .find(|entry| entry.name == old.name)
+            .expect("removed size entry");
+        assert_eq!(
+            removed.apparent_worktree_bytes,
+            Some(old_size.worktree_bytes)
+        );
+        assert_eq!(removed.apparent_target_bytes, old_size.target_bytes);
+        assert!(!old.path.exists());
+        assert!(protected.path.exists());
+        assert!(new.path.exists());
+        assert!(new.path.join("target").exists());
+        assert!(repo.find_branch(&old.branch, BranchType::Local).is_ok());
+        assert_eq!(
+            report
+                .entries
+                .iter()
+                .find(|entry| entry.name == protected.name)
+                .expect("protected size entry")
+                .reason,
+            WorktreeGcReason::Dirty
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_size_measurement_failure_protects_the_lane_without_byte_credit() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = create_gc_worktree(&manager, "size-failure", &worktree_root);
+        let outside = temp.path().join("outside-target");
+        fs::create_dir(&outside).expect("outside target");
+        symlink(&outside, created.path.join("target")).expect("linked target");
+
+        let report = manager
+            .gc_with_target_liveness(gc_options(Some(worktree_root), false), |_| {
+                panic!("a failed size binding must not reach liveness")
+            })
+            .expect("structured size failure");
+
+        assert_eq!(report.removed_count, 0, "{report:#?}");
+        assert_eq!(report.protected_count, 1, "{report:#?}");
+        assert_eq!(report.apparent_considered_bytes, 0);
+        assert_eq!(report.estimated_reclaimable_bytes, 0);
+        assert_eq!(report.estimated_reclaimed_bytes, 0);
+        assert_eq!(
+            report.entries[0].reason,
+            WorktreeGcReason::SizeMeasurementFailed
+        );
+        assert_eq!(report.entries[0].apparent_worktree_bytes, None);
+        assert!(created.path.exists());
+        assert!(outside.exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -11368,6 +11751,12 @@ mod tests {
         assert_eq!(report.orphan_removed_count, 0);
         assert_eq!(report.entries[0].status, WorktreeGcStatus::Retained);
         assert_eq!(report.entries[0].reason, WorktreeGcReason::TargetRemoved);
+        let target_bytes = report.entries[0]
+            .apparent_target_bytes
+            .expect("target byte estimate");
+        assert_eq!(report.estimated_reclaimable_bytes, target_bytes);
+        assert_eq!(report.estimated_reclaimed_bytes, target_bytes);
+        assert!(report.apparent_considered_bytes >= target_bytes);
         assert_eq!(
             report.entries[0].untracked_paths,
             vec![PathBuf::from("TASK.md")]
@@ -11464,6 +11853,8 @@ mod tests {
             assert_eq!(report.removed_count, 0, "{report:#?}");
             assert_eq!(report.target_removed_count, 0, "{report:#?}");
             assert_eq!(report.protected_count, 1, "{report:#?}");
+            assert_eq!(report.estimated_reclaimable_bytes, 0, "{report:#?}");
+            assert_eq!(report.estimated_reclaimed_bytes, 0, "{report:#?}");
             assert_eq!(
                 report.entries[0].reason,
                 WorktreeGcReason::TargetIdentityChanged
@@ -11521,6 +11912,8 @@ mod tests {
             assert_eq!(report.removed_count, 0, "{report:#?}");
             assert_eq!(report.target_removed_count, 0, "{report:#?}");
             assert_eq!(report.protected_count, 1, "{report:#?}");
+            assert_eq!(report.estimated_reclaimable_bytes, 0, "{report:#?}");
+            assert_eq!(report.estimated_reclaimed_bytes, 0, "{report:#?}");
             assert_eq!(
                 report.entries[0].reason,
                 if live {
@@ -11779,6 +12172,8 @@ mod tests {
                 .expect("late output protection");
             assert_eq!(report.removed_count, 0, "{report:#?}");
             assert_eq!(report.protected_count, 1, "{report:#?}");
+            assert_eq!(report.estimated_reclaimable_bytes, 0, "{report:#?}");
+            assert_eq!(report.estimated_reclaimed_bytes, 0, "{report:#?}");
             assert_eq!(
                 report.entries[0].reason,
                 if tracked {
@@ -12328,11 +12723,26 @@ mod tests {
         let retention = WorktreeRetentionPolicy {
             max_age: None,
             max_count: Some(1),
+            max_total_bytes: None,
         };
         assert!(validate_worktree_gc_mode(true, true, retention, &[], false)
             .expect_err("retention conflict")
             .to_string()
             .contains("retention filters"));
+        assert!(validate_worktree_gc_mode(
+            true,
+            true,
+            WorktreeRetentionPolicy {
+                max_age: None,
+                max_count: None,
+                max_total_bytes: Some(1),
+            },
+            &[],
+            false,
+        )
+        .expect_err("size retention conflict")
+        .to_string()
+        .contains("retention filters"));
         assert!(validate_worktree_gc_mode(
             true,
             true,
@@ -12402,12 +12812,50 @@ mod tests {
                 WorktreeRetentionPolicy {
                     max_age: None,
                     max_count: Some(1),
+                    max_total_bytes: None,
                 },
             )
             .expect("create with retention");
 
         assert!(!old.path.exists());
         assert!(new.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_size_retention_reserves_the_new_lane_before_reclaiming_older_lanes() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let old = create_gc_worktree(&manager, "size-create-old", &worktree_root);
+        fs::create_dir(old.path.join(".maco")).expect("old runtime directory");
+        fs::write(old.path.join(".maco/cache"), vec![b'o'; 1024]).expect("old runtime artifact");
+
+        let new = manager
+            .create_for_test_with_retention(
+                WorktreeCreateOptions {
+                    agent_id: "size-create-new".to_string(),
+                    branch: None,
+                    base: None,
+                    worktree_root: Some(worktree_root),
+                },
+                WorktreeRetentionPolicy {
+                    max_age: None,
+                    max_count: None,
+                    max_total_bytes: Some(0),
+                },
+            )
+            .expect("create with size retention");
+
+        assert!(!old.path.exists());
+        assert!(
+            new.path.exists(),
+            "the just-created lane is always reserved"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -12557,13 +13005,21 @@ mod tests {
         fs::create_dir_all(created.path.join("target/debug")).expect("target");
 
         let report = manager
-            .gc(gc_options(Some(worktree_root), true))
+            .gc_with_target_liveness(gc_options(Some(worktree_root), true), |_| {
+                WorktreeTargetLiveness::Clear
+            })
             .expect("dry-run gc");
 
         assert!(report.dry_run);
-        assert_eq!(report.removed_count, 1);
+        assert_eq!(report.removed_count, 1, "{report:#?}");
         assert_eq!(report.entries[0].status, WorktreeGcStatus::WouldRemove);
         assert_eq!(report.entries[0].reason, WorktreeGcReason::FinishedBranch);
+        let lane_bytes = report.entries[0]
+            .apparent_worktree_bytes
+            .expect("dry-run lane byte estimate");
+        assert_eq!(report.apparent_considered_bytes, lane_bytes);
+        assert_eq!(report.estimated_reclaimable_bytes, lane_bytes);
+        assert_eq!(report.estimated_reclaimed_bytes, 0);
         assert!(created.path.exists());
         assert!(created.path.join("target").exists());
     }

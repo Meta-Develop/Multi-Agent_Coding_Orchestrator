@@ -2154,6 +2154,7 @@ impl WorktreeCommand {
                 let retention = WorktreeRetentionPolicy {
                     max_age: args.gc_max_age_seconds.map(Duration::from_secs),
                     max_count: args.gc_max_count,
+                    max_total_bytes: args.gc_max_total_bytes,
                 };
                 let record = manager.create_with_retention(
                     WorktreeCreateOptions {
@@ -2195,6 +2196,7 @@ impl WorktreeCommand {
                     retention: WorktreeRetentionPolicy {
                         max_age: args.max_age_seconds.map(Duration::from_secs),
                         max_count: args.max_count,
+                        max_total_bytes: args.max_total_bytes,
                     },
                     allowed_untracked_paths: args.allow_untracked_paths,
                     exclude_agent_id: None,
@@ -2211,6 +2213,7 @@ impl WorktreeCommand {
                     retention: WorktreeRetentionPolicy {
                         max_age: args.max_age_seconds.map(Duration::from_secs),
                         max_count: args.max_count,
+                        max_total_bytes: args.max_total_bytes,
                     },
                     allowed_untracked_paths: args.allow_untracked_paths,
                 })?;
@@ -3182,6 +3185,9 @@ struct CreateWorktreeArgs {
     /// After creation, keep at most this many newest eligible clean worktrees.
     #[arg(long)]
     gc_max_count: Option<usize>,
+    /// After creation, retain at most this many apparent, not allocated, bytes in newest eligible lanes.
+    #[arg(long)]
+    gc_max_total_bytes: Option<u64>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -3201,7 +3207,7 @@ struct GcWorktreeArgs {
     /// Keep per-worktree target/ directories for retained worktrees.
     #[arg(long)]
     keep_targets: bool,
-    /// Reclaim eligible target/ directories while retaining every lane and branch.
+    /// Reclaim eligible target/ directories while retaining every lane and branch; conflicts with retention filters.
     #[arg(long)]
     targets_only: bool,
     /// Remove only eligible clean worktrees older than this many seconds.
@@ -3210,6 +3216,9 @@ struct GcWorktreeArgs {
     /// Keep at most this many newest eligible clean worktrees.
     #[arg(long)]
     max_count: Option<usize>,
+    /// Retain a newest eligible prefix within this many apparent, not allocated, bytes; sizing failure protects a lane.
+    #[arg(long)]
+    max_total_bytes: Option<u64>,
     /// Exact repository-relative untracked path allowed during full-lane removal. Repeatable.
     #[arg(long = "allow-untracked-path")]
     allow_untracked_paths: Vec<PathBuf>,
@@ -3238,7 +3247,7 @@ struct SweepWorktreeArgs {
     /// Keep per-worktree target/ directories for retained worktrees.
     #[arg(long)]
     keep_targets: bool,
-    /// Reclaim eligible target/ directories while retaining every lane and branch.
+    /// Reclaim eligible target/ directories while retaining every lane and branch; conflicts with retention filters.
     #[arg(long)]
     targets_only: bool,
     /// Remove only eligible clean worktrees older than this many seconds.
@@ -3247,6 +3256,9 @@ struct SweepWorktreeArgs {
     /// Keep at most this many newest eligible clean worktrees per discovered root.
     #[arg(long)]
     max_count: Option<usize>,
+    /// Retain a newest eligible prefix within this many apparent, not allocated, bytes per discovered root.
+    #[arg(long)]
+    max_total_bytes: Option<u64>,
     /// Exact repository-relative untracked path allowed during full-lane removal. Repeatable.
     #[arg(long = "allow-untracked-path")]
     allow_untracked_paths: Vec<PathBuf>,
@@ -4987,6 +4999,18 @@ fn print_worktree_gc_report(report: &WorktreeGcReport, json: bool) -> Result<()>
     println!("Retained: {}", report.retained_count);
     println!("Targets cleaned: {}", report.target_removed_count);
     println!("Orphans pruned: {}", report.orphan_removed_count);
+    println!(
+        "Apparent bytes considered: {}",
+        report.apparent_considered_bytes
+    );
+    println!(
+        "Estimated bytes reclaimable: {}",
+        report.estimated_reclaimable_bytes
+    );
+    println!(
+        "Estimated bytes reclaimed: {}",
+        report.estimated_reclaimed_bytes
+    );
     for path in &report.allowed_untracked_paths {
         println!(
             "Allowed untracked path: {}",
@@ -5097,6 +5121,18 @@ fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Resu
     println!("Retained: {}", report.retained_count);
     println!("{target_label}: {target_action_count}");
     println!("{orphan_label}: {}", report.orphan_removed_count);
+    println!(
+        "Apparent bytes considered: {}",
+        report.apparent_considered_bytes
+    );
+    println!(
+        "Estimated bytes reclaimable: {}",
+        report.estimated_reclaimable_bytes
+    );
+    println!(
+        "Estimated bytes reclaimed: {}",
+        report.estimated_reclaimed_bytes
+    );
 
     for repository in &report.repositories {
         let resolved_repository = repository
@@ -5128,7 +5164,7 @@ fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Resu
                 "targets-cleaned"
             };
             println!(
-                "  GC: considered={} {}={} protected={} retained={} {}={} orphans={}",
+                "  GC: considered={} {}={} protected={} retained={} {}={} orphans={} apparent-bytes={} reclaimable-bytes={} reclaimed-bytes={}",
                 gc_report.considered_count,
                 if gc_report.dry_run {
                     "would-remove"
@@ -5140,7 +5176,10 @@ fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Resu
                 gc_report.retained_count,
                 target_action_label,
                 worktree_gc_target_action_count(gc_report),
-                gc_report.orphan_removed_count
+                gc_report.orphan_removed_count,
+                gc_report.apparent_considered_bytes,
+                gc_report.estimated_reclaimable_bytes,
+                gc_report.estimated_reclaimed_bytes
             );
             for entry in &gc_report.entries {
                 let branch = entry.branch.as_deref().unwrap_or("-");
@@ -5300,6 +5339,7 @@ fn worktree_gc_reason_label(reason: WorktreeGcReason) -> &'static str {
         WorktreeGcReason::LiveTarget => "live-target",
         WorktreeGcReason::TargetLivenessUnknown => "target-liveness-unknown",
         WorktreeGcReason::TargetIdentityChanged => "target-identity-changed",
+        WorktreeGcReason::SizeMeasurementFailed => "size-measurement-failed",
         WorktreeGcReason::NoTarget => "no-target",
         WorktreeGcReason::UnregisteredOrphan => "unregistered-orphan",
         WorktreeGcReason::MachineGlobalGate => "machine-global-gate",
@@ -5427,6 +5467,7 @@ mod tests {
         assert!(!args.targets_only);
         assert_eq!(args.max_age_seconds, None);
         assert_eq!(args.max_count, None);
+        assert_eq!(args.max_total_bytes, None);
         assert!(!args.json);
 
         let error = Cli::try_parse_from(["maco", "worktree", "sweep"])
@@ -5460,6 +5501,8 @@ mod tests {
             "86400",
             "--max-count",
             "12",
+            "--max-total-bytes",
+            "10737418240",
             "--keep-targets",
             "--allow-untracked-path",
             "TASK.md",
@@ -5478,6 +5521,7 @@ mod tests {
         assert!(args.apply);
         assert_eq!(args.max_age_seconds, Some(86_400));
         assert_eq!(args.max_count, Some(12));
+        assert_eq!(args.max_total_bytes, Some(10_737_418_240));
         assert!(args.keep_targets);
         assert!(!args.targets_only);
         assert_eq!(
@@ -5500,7 +5544,22 @@ mod tests {
         assert_eq!(args.repo, PathBuf::from("repo"));
         assert!(!args.dry_run, "worktree gc must remain apply-by-default");
         assert!(!args.targets_only);
+        assert_eq!(args.max_total_bytes, None);
         assert!(args.allow_untracked_paths.is_empty());
+    }
+
+    #[test]
+    fn worktree_gc_parses_apparent_byte_retention() {
+        let parsed =
+            Cli::try_parse_from(["maco", "worktree", "gc", "--max-total-bytes", "2147483648"])
+                .expect("size retention should parse");
+        let Command::Worktree(WorktreeCommand {
+            command: WorktreeSubcommand::Gc(args),
+        }) = parsed.command
+        else {
+            panic!("expected worktree gc command");
+        };
+        assert_eq!(args.max_total_bytes, Some(2_147_483_648));
     }
 
     #[test]
@@ -5569,6 +5628,7 @@ mod tests {
             targets_only: false,
             max_age_seconds: None,
             max_count: Some(1),
+            max_total_bytes: None,
             allowed_untracked_paths: Vec::new(),
             considered_count: 1,
             removed_count: 0,
@@ -5576,6 +5636,9 @@ mod tests {
             retained_count: 1,
             target_removed_count: 0,
             orphan_removed_count: 0,
+            apparent_considered_bytes: 0,
+            estimated_reclaimable_bytes: 0,
+            estimated_reclaimed_bytes: 0,
             entries: vec![crate::worktree::WorktreeGcEntry {
                 name: "retained-lane".to_string(),
                 branch: Some("maco/retained-lane".to_string()),
@@ -5586,6 +5649,8 @@ mod tests {
                     "/workspace/.maco/worktrees/repo/retained-lane/target",
                 )),
                 target_liveness: None,
+                apparent_worktree_bytes: None,
+                apparent_target_bytes: None,
                 untracked_paths: Vec::new(),
                 gate_denial: None,
                 retention_operation_id: None,
