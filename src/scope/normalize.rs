@@ -100,6 +100,8 @@ pub struct RunSummary {
     pub event_count: usize,
     #[serde(skip)]
     pub events: Vec<NormalizedEvent>,
+    #[serde(skip)]
+    journal: Option<JournalPosition>,
 }
 
 pub type NormalizedEvent = OrchestrationEvent;
@@ -108,6 +110,423 @@ pub type NormalizedEvent = OrchestrationEvent;
 pub struct FamilyEvent {
     pub family: String,
     pub event: NormalizedEvent,
+}
+
+#[derive(Clone, Debug)]
+pub struct CachedScope {
+    repositories: Vec<RepositoryTarget>,
+    snapshot: Option<ScopeSnapshot>,
+    run_roots: Vec<RunRootWatch>,
+    journals: BTreeMap<RunKey, JournalWatch>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RunKey {
+    repo: String,
+    family: String,
+    run: String,
+}
+
+#[derive(Clone, Debug)]
+struct RunRootWatch {
+    repo: String,
+    repository_root: PathBuf,
+    family_directory: &'static str,
+    path: PathBuf,
+    fingerprint: Option<FileFingerprint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JournalPosition {
+    path: PathBuf,
+    offset: u64,
+    record_count: usize,
+    fingerprint: FileFingerprint,
+}
+
+#[derive(Clone, Debug)]
+struct JournalWatch {
+    repository_root: PathBuf,
+    family_directory: &'static str,
+    position: JournalPosition,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileFingerprint {
+    length: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl CachedScope {
+    pub fn new(repositories: Vec<RepositoryTarget>) -> Self {
+        Self {
+            repositories,
+            snapshot: None,
+            run_roots: Vec::new(),
+            journals: BTreeMap::new(),
+        }
+    }
+
+    pub fn refresh(&mut self) -> io::Result<bool> {
+        if self.snapshot.is_none() {
+            self.rebuild_all()?;
+            return Ok(true);
+        }
+
+        let mut rebuild_repositories = BTreeSet::new();
+        for watch in &self.run_roots {
+            let fingerprint = watch.current_fingerprint()?;
+            if fingerprint != watch.fingerprint {
+                rebuild_repositories.insert(watch.repo.clone());
+            }
+        }
+
+        for (key, watch) in &self.journals {
+            if rebuild_repositories.contains(&key.repo) {
+                continue;
+            }
+            match watch.fingerprint(key)? {
+                Some(fingerprint)
+                    if same_file_identity(&fingerprint, &watch.position.fingerprint)
+                        && fingerprint.length >= watch.position.offset =>
+                {
+                    if fingerprint.length == watch.position.offset
+                        && fingerprint != watch.position.fingerprint
+                    {
+                        rebuild_repositories.insert(key.repo.clone());
+                    }
+                }
+                _ => {
+                    rebuild_repositories.insert(key.repo.clone());
+                }
+            }
+        }
+
+        let mut changed = !rebuild_repositories.is_empty();
+        for repo_id in &rebuild_repositories {
+            self.rebuild_repository(repo_id)?;
+        }
+
+        let keys = self.journals.keys().cloned().collect::<Vec<_>>();
+        for key in keys {
+            if rebuild_repositories.contains(&key.repo) {
+                continue;
+            }
+            let Some(watch) = self.journals.get(&key).cloned() else {
+                continue;
+            };
+            let Some(fingerprint) = watch.fingerprint(&key)? else {
+                self.rebuild_repository(&key.repo)?;
+                changed = true;
+                continue;
+            };
+            if fingerprint.length <= watch.position.offset {
+                continue;
+            }
+            let path = watch.validated_path(&key)?.ok_or_else(|| {
+                invalid_data(format!(
+                    "Scope journal disappeared for '{}/{}/{}'",
+                    key.repo, key.family, key.run
+                ))
+            })?;
+            let (events, position) =
+                read_journal_suffix(&path, &key.repo, &key.run, &watch.position)?;
+            self.append_run_events(&key, events)?;
+            if let Some(current) = self.journals.get_mut(&key) {
+                current.position = position;
+            }
+            changed = true;
+        }
+
+        self.refresh_run_root_fingerprints()?;
+        Ok(changed)
+    }
+
+    pub fn snapshot(&self) -> io::Result<&ScopeSnapshot> {
+        self.snapshot
+            .as_ref()
+            .ok_or_else(|| invalid_data("Scope cache has not been initialized"))
+    }
+
+    fn rebuild_all(&mut self) -> io::Result<()> {
+        let snapshot = scan_repositories(&self.repositories)?;
+        self.snapshot = Some(snapshot);
+        self.rebuild_journal_watches();
+        self.run_roots = run_root_watches(&self.repositories)?;
+        Ok(())
+    }
+
+    fn rebuild_repository(&mut self, repo_id: &str) -> io::Result<()> {
+        let Some(target) = self
+            .repositories
+            .iter()
+            .find(|target| target.id == repo_id)
+            .cloned()
+        else {
+            return Err(invalid_data(format!(
+                "Scope cache lost repository target '{repo_id}'"
+            )));
+        };
+        let project = scan_repository(&target)?;
+        let snapshot = self
+            .snapshot
+            .as_mut()
+            .ok_or_else(|| invalid_data("Scope cache has not been initialized"))?;
+        if let Some(existing) = snapshot
+            .projects
+            .iter_mut()
+            .find(|existing| existing.id == repo_id)
+        {
+            *existing = project;
+        } else {
+            snapshot.projects.push(project);
+            snapshot.projects.sort_by(|left, right| {
+                left.id
+                    .cmp(&right.id)
+                    .then_with(|| left.path.cmp(&right.path))
+            });
+        }
+        self.journals.retain(|key, _| key.repo != repo_id);
+        self.extend_journal_watches_for(repo_id);
+        Ok(())
+    }
+
+    fn append_run_events(&mut self, key: &RunKey, events: Vec<NormalizedEvent>) -> io::Result<()> {
+        let snapshot = self
+            .snapshot
+            .as_mut()
+            .ok_or_else(|| invalid_data("Scope cache has not been initialized"))?;
+        let Some(run) = snapshot
+            .projects
+            .iter_mut()
+            .find(|project| project.id == key.repo)
+            .and_then(|project| {
+                project
+                    .runs
+                    .iter_mut()
+                    .find(|run| run.family == key.family && run.run == key.run)
+            })
+        else {
+            return Err(invalid_data(format!(
+                "Scope cache lost run '{}/{}/{}'",
+                key.repo, key.family, key.run
+            )));
+        };
+
+        for event in events {
+            match run
+                .events
+                .binary_search_by(|existing| compare_events(existing, &event))
+            {
+                Ok(_) => {}
+                Err(index) => run.events.insert(index, event),
+            }
+        }
+        ensure_event_limit(&run.events)?;
+        run.event_count = run.events.len();
+        run.final_report_exists = final_report_exists(&run.family, &run.run_dir)?;
+        Ok(())
+    }
+
+    fn rebuild_journal_watches(&mut self) {
+        self.journals.clear();
+        let repo_ids = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .projects
+                    .iter()
+                    .map(|project| project.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for repo_id in repo_ids {
+            self.extend_journal_watches_for(&repo_id);
+        }
+    }
+
+    fn extend_journal_watches_for(&mut self, repo_id: &str) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        let Some(project) = snapshot
+            .projects
+            .iter()
+            .find(|project| project.id == repo_id)
+        else {
+            return;
+        };
+        let Some(target) = self.repositories.iter().find(|target| target.id == repo_id) else {
+            return;
+        };
+        for run in &project.runs {
+            let Some(position) = run.journal.clone() else {
+                continue;
+            };
+            let Some((_, family_directory)) = RUN_FAMILIES
+                .iter()
+                .find(|(family, _)| *family == run.family)
+            else {
+                continue;
+            };
+            self.journals.insert(
+                RunKey {
+                    repo: repo_id.to_string(),
+                    family: run.family.clone(),
+                    run: run.run.clone(),
+                },
+                JournalWatch {
+                    repository_root: target.path.clone(),
+                    family_directory: *family_directory,
+                    position,
+                },
+            );
+        }
+    }
+
+    fn refresh_run_root_fingerprints(&mut self) -> io::Result<()> {
+        for watch in &mut self.run_roots {
+            watch.fingerprint = watch.current_fingerprint()?;
+        }
+        Ok(())
+    }
+}
+
+impl RunRootWatch {
+    fn current_fingerprint(&self) -> io::Result<Option<FileFingerprint>> {
+        let components = [".maco", self.family_directory, "runs"];
+        let Some(path) = validate_directory_chain(&self.repository_root, &components)? else {
+            return Ok(None);
+        };
+        if path != self.path {
+            return Err(invalid_data(format!(
+                "Scope run root path changed for repository '{}'",
+                self.repo
+            )));
+        }
+        directory_fingerprint(&path)
+    }
+}
+
+impl JournalWatch {
+    fn validated_path(&self, key: &RunKey) -> io::Result<Option<PathBuf>> {
+        let components = [
+            ".maco",
+            self.family_directory,
+            "runs",
+            key.run.as_str(),
+            "events",
+        ];
+        let Some(events_directory) = validate_directory_chain(&self.repository_root, &components)?
+        else {
+            return Ok(None);
+        };
+        let path = events_directory.join("orchestration.jsonl");
+        if path != self.position.path {
+            return Err(invalid_data(format!(
+                "Scope journal path changed for '{}/{}/{}'",
+                key.repo, key.family, key.run
+            )));
+        }
+        Ok(Some(path))
+    }
+
+    fn fingerprint(&self, key: &RunKey) -> io::Result<Option<FileFingerprint>> {
+        let Some(path) = self.validated_path(key)? else {
+            return Ok(None);
+        };
+        journal_fingerprint(&path)
+    }
+}
+
+fn run_root_watches(repositories: &[RepositoryTarget]) -> io::Result<Vec<RunRootWatch>> {
+    let mut watches = Vec::with_capacity(repositories.len().saturating_mul(RUN_FAMILIES.len()));
+    for target in repositories {
+        for (_, family_directory) in RUN_FAMILIES {
+            let path = target
+                .path
+                .join(".maco")
+                .join(family_directory)
+                .join("runs");
+            let components = [".maco", family_directory, "runs"];
+            let fingerprint = match validate_directory_chain(&target.path, &components)? {
+                Some(validated) => {
+                    if validated != path {
+                        return Err(invalid_data(format!(
+                            "Scope run root path changed for repository '{}'",
+                            target.id
+                        )));
+                    }
+                    directory_fingerprint(&validated)?
+                }
+                None => None,
+            };
+            watches.push(RunRootWatch {
+                repo: target.id.clone(),
+                repository_root: target.path.clone(),
+                family_directory,
+                path,
+                fingerprint,
+            });
+        }
+    }
+    Ok(watches)
+}
+
+fn directory_fingerprint(path: &Path) -> io::Result<Option<FileFingerprint>> {
+    let metadata = match no_follow_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(invalid_data(format!(
+            "Scope refuses symlinked directory {}",
+            path.display()
+        )));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(invalid_data(format!(
+            "Scope expected a directory at {}",
+            path.display()
+        )));
+    }
+    Ok(Some(fingerprint(&metadata)))
+}
+
+fn journal_fingerprint(path: &Path) -> io::Result<Option<FileFingerprint>> {
+    let Some(file) = open_regular_file(path)? else {
+        return Ok(None);
+    };
+    Ok(Some(fingerprint(&file.metadata()?)))
+}
+
+fn fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
+    FileFingerprint {
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    }
+}
+
+fn same_file_identity(left: &FileFingerprint, right: &FileFingerprint) -> bool {
+    #[cfg(unix)]
+    {
+        left.device == right.device && left.inode == right.inode
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        true
+    }
 }
 
 pub fn scan_repositories(repositories: &[RepositoryTarget]) -> io::Result<ScopeSnapshot> {
@@ -168,7 +587,7 @@ fn scan_repository(target: &RepositoryTarget) -> io::Result<ProjectSnapshot> {
             let modified = no_follow_metadata(&run_dir)
                 .and_then(|metadata| metadata.modified())
                 .unwrap_or(UNIX_EPOCH);
-            let mut events = scan_run_events(target, family, run_name, &run_dir)?;
+            let (mut events, journal) = scan_run_events(target, family, run_name, &run_dir)?;
             sort_and_deduplicate(&mut events);
             discovered.push((
                 RunSummary {
@@ -179,6 +598,7 @@ fn scan_repository(target: &RepositoryTarget) -> io::Result<ProjectSnapshot> {
                     modified_unix_seconds: unix_seconds(modified),
                     event_count: events.len(),
                     events,
+                    journal,
                 },
                 modified,
             ));
@@ -204,11 +624,12 @@ fn scan_run_events(
     family: &str,
     run_id: &str,
     run_dir: &Path,
-) -> io::Result<Vec<NormalizedEvent>> {
+) -> io::Result<(Vec<NormalizedEvent>, Option<JournalPosition>)> {
     if let Some(events_dir) = validate_directory_chain(run_dir, &["events"])? {
         let journal = events_dir.join("orchestration.jsonl");
         if is_regular_file(&journal)? {
-            return read_journal(&journal, &target.id, run_id);
+            let journal = read_journal_with_position(&journal, &target.id, run_id)?;
+            return Ok((journal.events, Some(journal.position)));
         }
     }
 
@@ -273,14 +694,28 @@ fn scan_run_events(
     read_queue_tsv(&run_dir.join("queue.tsv"), &target.id, run_id, &mut events)?;
     read_escalations(run_dir, &target.id, run_id, &mut events)?;
     ensure_event_limit(&events)?;
-    Ok(events)
+    Ok((events, None))
 }
 
+#[cfg(test)]
 fn read_journal(path: &Path, repo_id: &str, run_id: &str) -> io::Result<Vec<NormalizedEvent>> {
+    Ok(read_journal_with_position(path, repo_id, run_id)?.events)
+}
+
+struct JournalRead {
+    events: Vec<NormalizedEvent>,
+    position: JournalPosition,
+}
+
+fn read_journal_with_position(path: &Path, repo_id: &str, run_id: &str) -> io::Result<JournalRead> {
     let Some(file) = open_regular_file(path)? else {
-        return Ok(Vec::new());
+        return Err(invalid_data(format!(
+            "Scope journal disappeared while reading {}",
+            path.display()
+        )));
     };
-    if file.metadata()?.len() > MAX_JOURNAL_BYTES {
+    let metadata = file.metadata()?;
+    if metadata.len() > MAX_JOURNAL_BYTES {
         return Err(invalid_data(format!(
             "Scope orchestration journal exceeds the {MAX_JOURNAL_BYTES} byte limit: {}",
             path.display()
@@ -331,7 +766,104 @@ fn read_journal(path: &Path, repo_id: &str, run_id: &str) -> io::Result<Vec<Norm
         push_event(&mut events, event)?;
     }
     sort_and_deduplicate(&mut events);
-    Ok(events)
+    let metadata = reader.into_inner().metadata()?;
+    Ok(JournalRead {
+        events,
+        position: JournalPosition {
+            path: path.to_path_buf(),
+            offset: total_bytes,
+            record_count,
+            fingerprint: fingerprint(&metadata),
+        },
+    })
+}
+
+fn read_journal_suffix(
+    path: &Path,
+    repo_id: &str,
+    run_id: &str,
+    previous: &JournalPosition,
+) -> io::Result<(Vec<NormalizedEvent>, JournalPosition)> {
+    let Some(mut file) = open_regular_file(path)? else {
+        return Err(invalid_data(format!(
+            "Scope journal disappeared while reading {}",
+            path.display()
+        )));
+    };
+    let metadata = file.metadata()?;
+    let current_fingerprint = fingerprint(&metadata);
+    if !same_file_identity(&current_fingerprint, &previous.fingerprint)
+        || metadata.len() < previous.offset
+    {
+        return Err(invalid_data(format!(
+            "Scope journal changed identity or was truncated while reading {}",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_JOURNAL_BYTES {
+        return Err(invalid_data(format!(
+            "Scope orchestration journal exceeds the {MAX_JOURNAL_BYTES} byte limit: {}",
+            path.display()
+        )));
+    }
+
+    file.seek(SeekFrom::Start(previous.offset))?;
+    let available = metadata.len().saturating_sub(previous.offset);
+    let mut reader = BufReader::new(file.take(available));
+    let mut events = Vec::new();
+    let mut line = Vec::new();
+    let mut consumed = 0_u64;
+    let mut record_count = previous.record_count;
+    loop {
+        line.clear();
+        let bytes_read = reader.read_until(b'\n', &mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+        consumed = consumed.saturating_add(u64::try_from(bytes_read).unwrap_or(u64::MAX));
+        if line.len() > MAX_JOURNAL_LINE_BYTES {
+            return Err(invalid_data(format!(
+                "Scope orchestration journal line exceeds the {MAX_JOURNAL_LINE_BYTES} byte limit: {}",
+                path.display()
+            )));
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        record_count += 1;
+        if record_count > MAX_JOURNAL_RECORDS {
+            return Err(invalid_data(format!(
+                "Scope orchestration journal exceeds the {MAX_JOURNAL_RECORDS} record limit: {}",
+                path.display()
+            )));
+        }
+        let Ok(mut event) = serde_json::from_slice::<NormalizedEvent>(&line) else {
+            continue;
+        };
+        if event.ts.is_empty() || event.node.is_empty() {
+            continue;
+        }
+        event.repo = repo_id.to_string();
+        event.run = run_id.to_string();
+        push_event(&mut events, event)?;
+    }
+
+    let offset = previous.offset.saturating_add(consumed);
+    if offset > MAX_JOURNAL_BYTES {
+        return Err(invalid_data(format!(
+            "Scope orchestration journal grew beyond the {MAX_JOURNAL_BYTES} byte limit: {}",
+            path.display()
+        )));
+    }
+    Ok((
+        events,
+        JournalPosition {
+            path: path.to_path_buf(),
+            offset,
+            record_count,
+            fingerprint: current_fingerprint,
+        },
+    ))
 }
 
 fn read_supervisor_plan(
@@ -1549,6 +2081,8 @@ fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use super::*;
 
     fn target(repo: &Path) -> RepositoryTarget {
@@ -1561,6 +2095,74 @@ mod tests {
     fn write(path: &Path, contents: &str) {
         fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture parent");
         fs::write(path, contents).expect("write fixture");
+    }
+
+    fn journal_event(node: &str) -> String {
+        format!(
+            "{{\"ts\":\"2026-07-20T00:00:00Z\",\"repo\":\"journal-repo\",\"run\":\"journal-run\",\"node\":\"{node}\",\"parent\":null,\"role\":\"worker\",\"kind\":\"status\",\"payload\":{{}}}}\n"
+        )
+    }
+
+    #[test]
+    fn cached_scope_reads_appended_journal_suffix_and_rebuilds_truncation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal = temp
+            .path()
+            .join(".maco/o2/runs/cached/events/orchestration.jsonl");
+        write(&journal, &journal_event("first"));
+        let mut cache = CachedScope::new(vec![target(temp.path())]);
+
+        assert!(cache.refresh().expect("initial cache refresh"));
+        assert!(!cache.refresh().expect("unchanged cache refresh"));
+        assert_eq!(
+            cache
+                .snapshot()
+                .expect("cached snapshot")
+                .events_for_run("repo-one", "o2", "cached")
+                .expect("cached run")
+                .len(),
+            1
+        );
+
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .expect("append journal");
+        file.write_all(journal_event("second").as_bytes())
+            .expect("append event");
+        drop(file);
+
+        assert!(cache.refresh().expect("appended cache refresh"));
+        let events = cache
+            .snapshot()
+            .expect("appended snapshot")
+            .events_for_run("repo-one", "o2", "cached")
+            .expect("appended run");
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|event| event.node == "second"));
+        let key = RunKey {
+            repo: "repo-one".to_string(),
+            family: "o2".to_string(),
+            run: "cached".to_string(),
+        };
+        assert_eq!(
+            cache
+                .journals
+                .get(&key)
+                .expect("journal watch")
+                .position
+                .offset,
+            fs::metadata(&journal).expect("journal metadata").len()
+        );
+
+        fs::write(&journal, b"{}\n").expect("truncate journal");
+        assert!(cache.refresh().expect("truncated cache refresh"));
+        assert!(cache
+            .snapshot()
+            .expect("rebuilt snapshot")
+            .events_for_run("repo-one", "o2", "cached")
+            .expect("rebuilt run")
+            .is_empty());
     }
 
     #[test]

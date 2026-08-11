@@ -5,14 +5,14 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use crate::inbox::load_workspace_repositories;
-use normalize::{scan_repositories, FamilyEvent, NormalizedEvent, RepositoryTarget};
+use normalize::{CachedScope, FamilyEvent, NormalizedEvent, RepositoryTarget};
 use server::ScopeDataSource;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,24 +22,51 @@ pub struct ScopeServeOptions {
     pub bind: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ScanningDataSource {
-    repositories: Vec<RepositoryTarget>,
+    state: Mutex<ScanningDataSourceState>,
+}
+
+#[derive(Debug)]
+struct ScanningDataSourceState {
+    cache: CachedScope,
+    projects: Option<Value>,
 }
 
 impl ScanningDataSource {
     fn new(repositories: Vec<RepositoryTarget>) -> Self {
-        Self { repositories }
+        Self {
+            state: Mutex::new(ScanningDataSourceState {
+                cache: CachedScope::new(repositories),
+                projects: None,
+            }),
+        }
     }
 
-    fn snapshot(&self) -> Result<normalize::ScopeSnapshot> {
-        scan_repositories(&self.repositories).context("failed to scan Scope repositories")
+    fn state(&self) -> Result<MutexGuard<'_, ScanningDataSourceState>> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Scope cache lock is poisoned"))
     }
 }
 
 impl ScopeDataSource for ScanningDataSource {
     fn projects(&self) -> Result<Value> {
-        serde_json::to_value(self.snapshot()?).context("failed to serialize Scope projects")
+        let mut state = self.state()?;
+        let changed = state
+            .cache
+            .refresh()
+            .context("failed to refresh Scope repositories")?;
+        if changed || state.projects.is_none() {
+            state.projects = Some(
+                serde_json::to_value(state.cache.snapshot()?)
+                    .context("failed to serialize Scope projects")?,
+            );
+        }
+        state
+            .projects
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Scope projects cache was not initialized"))
     }
 
     fn events(
@@ -48,14 +75,25 @@ impl ScopeDataSource for ScanningDataSource {
         family: &str,
         run_id: &str,
     ) -> Result<Option<Vec<NormalizedEvent>>> {
-        let snapshot = self.snapshot()?;
-        Ok(snapshot
+        let mut state = self.state()?;
+        state
+            .cache
+            .refresh()
+            .context("failed to refresh Scope repositories")?;
+        Ok(state
+            .cache
+            .snapshot()?
             .events_for_run(repo_id, family, run_id)
             .map(<[NormalizedEvent]>::to_vec))
     }
 
     fn stream_events(&self) -> Result<Vec<FamilyEvent>> {
-        Ok(self.snapshot()?.all_events())
+        let mut state = self.state()?;
+        state
+            .cache
+            .refresh()
+            .context("failed to refresh Scope repositories")?;
+        Ok(state.cache.snapshot()?.all_events())
     }
 }
 
