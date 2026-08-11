@@ -5197,6 +5197,7 @@ fn worktree_target_liveness_source_label(source: WorktreeTargetLivenessSource) -
         WorktreeTargetLivenessSource::CargoTargetDir => "cargo-target-dir",
         WorktreeTargetLivenessSource::DefaultCargoTarget => "default-cargo-target",
         WorktreeTargetLivenessSource::ProcessEnvironment => "process-environment",
+        WorktreeTargetLivenessSource::ProcessCommandLine => "process-command-line",
         WorktreeTargetLivenessSource::ProcessCwd => "process-cwd",
         WorktreeTargetLivenessSource::ProcessExecutable => "process-executable",
         WorktreeTargetLivenessSource::ProcessFileDescriptor => "process-file-descriptor",

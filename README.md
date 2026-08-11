@@ -1294,9 +1294,14 @@ eligible only when every such path exactly matches a repeatable
 `--allow-untracked-path <repo-relative-path>` value. This is an exact path list,
 not a glob or blanket ignore, and is bounded to 128 entries and 64 KiB in
 aggregate because a workspace sweep copies it into each per-root report. An
-untracked file may be a worker's only copy of real output. Apply mode repeats the bounded status classification
-immediately before journaling full-lane removal and protects the lane if a new
-tracked or unapproved untracked path appeared. GC also keeps worktrees with
+untracked file may be a worker's only copy of real output. Apply mode repeats
+the bounded status classification immediately before journaling full-lane
+removal and protects the lane if a new tracked or unapproved untracked path
+appeared. GC removal records that reviewed state in its authenticated recovery
+journal and revalidates it immediately before quarantine. A legacy or explicit
+force-removal operation without this GC-specific state remains force-compatible;
+an absent state is never interpreted as proof that a GC candidate is clean. GC
+also keeps worktrees with
 active MACO execution leases or active path claims for the same agent id.
 Without retention filters, every eligible inactive managed worktree is selected
 for removal; with `--max-count` and/or
@@ -1318,28 +1323,33 @@ because the lane and its files remain. On Linux, every target deletion scans a
 bounded `/proc` snapshot for same-user processes. Explicit `CARGO_TARGET_DIR`
 values are resolved in the process's own view: absolute paths through
 `/proc/<pid>/root` and relative paths through `/proc/<pid>/cwd`. Canonical path
-containment and, where it identifies the exact directory, filesystem identity
-detect aliases across mount namespaces. The fallback association scan always
-runs, even after a readable environment has no target variable: a
-cargo/rustc/rustdoc/sccache-like process with a `cwd` inside the lane protects the
-default Cargo target, while a process `cwd`, executable, or readable file
-descriptor inside the target is live. Bounds or read failures fail closed for
-build-like or otherwise lane-associated processes; unrelated non-build processes
-with no readable lane association do not globally disable cleanup merely because
-their procfs details are restricted. A live match is reported as `live_target`;
-an incomplete, oversized, timed-out, or unreconciled potentially relevant scan is
-reported as `target_liveness_unknown`, and both refuse deletion. Reports include
-bounded typed PID, source, and cause evidence in JSON and human output.
+containment and bounded ancestor identity checks in both directions detect
+aliases across mount namespaces without assuming textual path equality. The
+detector also parses bounded process command lines for split and `--name=value`
+forms of Cargo's `--target-dir` and `--manifest-path` and rustc's `--out-dir`.
+An explicit output under the target is live; a manifest inside the lane with no
+explicit output protects the default Cargo target. The fallback association
+scan always runs, even after a readable environment or command line has no
+explicit target: a cargo/rustc/rustdoc/sccache-like process with a `cwd` inside
+the lane protects the default Cargo target, while a process `cwd`, executable,
+or readable file descriptor inside the target is live. Environment,
+command-line, cwd, executable, file-descriptor, bound, read, or timeout failures
+are unknown, not clear. A live match is reported as `live_target`; an incomplete,
+oversized, timed-out, or unreconciled scan is reported as
+`target_liveness_unknown`, and both refuse deletion. Reports include bounded
+typed PID, source, and cause evidence in JSON and human output.
 
 The target directory's filesystem identity is bound before the liveness probe.
 Target-only deletion passes that expected identity into the handle-relative tree
 remover, and full-lane deletion rechecks it immediately before recording the
 removal operation. Replacement is reported as `target_identity_changed` and the
 lane is retained. The same protections apply to a target included in full-lane
-removal. On non-Linux platforms the detector conservatively reports unknown, so
-target deletion remains disabled until a native detector is implemented. The
-check runs immediately before deletion to narrow, but cannot eliminate, the
-process-start race.
+removal. Recovery from a prepared removal rebinds the source and target, reruns
+the real liveness detector, and revalidates the persisted GC dirtiness state
+before quarantine. On non-Linux platforms the detector conservatively reports
+unknown, so target deletion remains disabled until a native detector is
+implemented. These checks run at the removal boundary to narrow the race, but a
+non-cooperating process can still start or create output after the final check.
 
 Sweep every repository group beneath one workspace. The first command is a
 dry-run because workspace sweeps never remove anything unless `--apply` is
