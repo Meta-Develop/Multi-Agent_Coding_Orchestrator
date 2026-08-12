@@ -3977,21 +3977,17 @@ fn read_remote_binding_secret(path: &Path) -> Result<ZeroizingBytes> {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::fs::MetadataExt;
-
-        let path_volume = path_metadata
-            .volume_serial_number()
-            .context("publication binding key path omitted volume identity")?;
-        let file_volume = file_metadata
-            .volume_serial_number()
-            .context("open publication binding key omitted volume identity")?;
-        let path_index = path_metadata
-            .file_index()
-            .context("publication binding key path omitted file identity")?;
-        let file_index = file_metadata
-            .file_index()
-            .context("open publication binding key omitted file identity")?;
-        if path_volume != file_volume || path_index != file_index {
+        let path_snapshot =
+            crate::file_identity::open_windows_path_identity(path).with_context(|| {
+                format!(
+                    "failed to open publication binding key identity {}",
+                    path.display()
+                )
+            })?;
+        validate_remote_binding_secret_metadata(path, &path_snapshot.metadata)?;
+        let file_identity = crate::file_identity::windows_file_identity(&file)
+            .context("failed to inspect open publication binding key identity")?;
+        if path_snapshot.identity != file_identity {
             bail!(
                 "publication remote binding key {} changed while being opened",
                 path.display()
@@ -4619,7 +4615,13 @@ fn prune_publication_journal(directory: &Path, retain: usize) -> Result<()> {
 }
 
 fn publication_journal_records(directory: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    #[cfg(not(windows))]
     let directory_metadata = validate_publication_journal_directory(directory)?;
+    #[cfg(windows)]
+    let directory_identity = {
+        validate_publication_journal_directory(directory)?;
+        windows_publication_journal_directory_identity(directory)?
+    };
     let mut paths = Vec::new();
     let mut entry_count = 0_usize;
     for entry in fs::read_dir(directory)
@@ -4642,8 +4644,16 @@ fn publication_journal_records(directory: &Path) -> Result<Vec<(u64, PathBuf)>> 
         })?;
         paths.push(entry.path());
     }
+    #[cfg(not(windows))]
     let listed = validate_publication_journal_directory(directory)?;
-    if !publication_same_filesystem_identity(&directory_metadata, &listed) {
+    #[cfg(windows)]
+    validate_publication_journal_directory(directory)?;
+    #[cfg(windows)]
+    let identity_matches =
+        directory_identity == windows_publication_journal_directory_identity(directory)?;
+    #[cfg(not(windows))]
+    let identity_matches = publication_same_filesystem_identity(&directory_metadata, &listed);
+    if !identity_matches {
         bail!("publication journal directory changed identity while it was listed");
     }
 
@@ -4679,8 +4689,16 @@ fn publication_journal_records(directory: &Path) -> Result<Vec<(u64, PathBuf)>> 
         }
     }
     records.sort_by_key(|(sequence, _)| *sequence);
+    #[cfg(not(windows))]
     let after = validate_publication_journal_directory(directory)?;
-    if !publication_same_filesystem_identity(&directory_metadata, &after) {
+    #[cfg(windows)]
+    validate_publication_journal_directory(directory)?;
+    #[cfg(windows)]
+    let identity_matches =
+        directory_identity == windows_publication_journal_directory_identity(directory)?;
+    #[cfg(not(windows))]
+    let identity_matches = publication_same_filesystem_identity(&directory_metadata, &after);
+    if !identity_matches {
         bail!("publication journal directory changed identity while records were inspected");
     }
     Ok(records)
@@ -4736,6 +4754,29 @@ fn validate_publication_journal_directory(directory: &Path) -> Result<fs::Metada
     Ok(metadata)
 }
 
+#[cfg(windows)]
+fn windows_publication_journal_directory_identity(
+    directory: &Path,
+) -> Result<crate::file_identity::WindowsFileIdentity> {
+    let snapshot =
+        crate::file_identity::open_windows_path_identity(directory).with_context(|| {
+            format!(
+                "failed to open publication journal directory identity {}",
+                directory.display()
+            )
+        })?;
+    if snapshot.metadata.file_type().is_symlink()
+        || publication_metadata_is_windows_reparse_point(&snapshot.metadata)
+        || !snapshot.metadata.file_type().is_dir()
+    {
+        bail!(
+            "publication journal directory {} is not a real directory",
+            directory.display()
+        );
+    }
+    Ok(snapshot.identity)
+}
+
 fn validate_publication_journal_record_metadata(
     path: &Path,
     metadata: &fs::Metadata,
@@ -4785,6 +4826,12 @@ fn validate_publication_journal_record_metadata(
 
 #[cfg(test)]
 fn read_publication_journal_record(path: &Path) -> Result<Vec<u8>> {
+    #[cfg(windows)]
+    let path_snapshot = crate::file_identity::open_windows_path_identity(path)
+        .with_context(|| format!("failed to inspect journal record {}", path.display()))?;
+    #[cfg(windows)]
+    let path_metadata = &path_snapshot.metadata;
+    #[cfg(not(windows))]
     let path_metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect journal record {}", path.display()))?;
     validate_publication_journal_record_metadata(path, &path_metadata)?;
@@ -4802,13 +4849,30 @@ fn read_publication_journal_record(path: &Path) -> Result<Vec<u8>> {
         .metadata()
         .with_context(|| format!("failed to inspect opened journal record {}", path.display()))?;
     validate_publication_journal_record_metadata(path, &file_metadata)?;
-    if !publication_same_filesystem_identity(&path_metadata, &file_metadata) {
+    #[cfg(windows)]
+    let file_identity = crate::file_identity::windows_file_identity(&file).with_context(|| {
+        format!(
+            "failed to inspect opened journal record identity {}",
+            path.display()
+        )
+    })?;
+    #[cfg(windows)]
+    let identity_matches = path_snapshot.identity == file_identity;
+    #[cfg(not(windows))]
+    let identity_matches = publication_same_filesystem_identity(&path_metadata, &file_metadata);
+    if !identity_matches {
         bail!(
             "publication journal record {} changed while it was opened",
             path.display()
         );
     }
     let mut bytes = Vec::new();
+    #[cfg(windows)]
+    (&file)
+        .take(PUBLICATION_JOURNAL_MAX_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read journal record {}", path.display()))?;
+    #[cfg(not(windows))]
     file.take(PUBLICATION_JOURNAL_MAX_RECORD_BYTES + 1)
         .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read journal record {}", path.display()))?;
@@ -4821,12 +4885,20 @@ fn read_publication_journal_record(path: &Path) -> Result<Vec<u8>> {
             path.display()
         );
     }
+    #[cfg(windows)]
+    let after_snapshot = crate::file_identity::open_windows_path_identity(path)
+        .with_context(|| format!("failed to recheck journal record {}", path.display()))?;
+    #[cfg(windows)]
+    let after = &after_snapshot.metadata;
+    #[cfg(not(windows))]
     let after = fs::symlink_metadata(path)
         .with_context(|| format!("failed to recheck journal record {}", path.display()))?;
     validate_publication_journal_record_metadata(path, &after)?;
-    if !publication_same_filesystem_identity(&file_metadata, &after)
-        || after.len() != file_metadata.len()
-    {
+    #[cfg(windows)]
+    let identity_matches = file_identity == after_snapshot.identity;
+    #[cfg(not(windows))]
+    let identity_matches = publication_same_filesystem_identity(&file_metadata, &after);
+    if !identity_matches || after.len() != file_metadata.len() {
         bail!(
             "publication journal record {} changed after it was read",
             path.display()
@@ -4841,13 +4913,7 @@ fn publication_same_filesystem_identity(left: &fs::Metadata, right: &fs::Metadat
         use std::os::unix::fs::MetadataExt;
         left.dev() == right.dev() && left.ino() == right.ino()
     }
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::fs::MetadataExt;
-        left.volume_serial_number() == right.volume_serial_number()
-            && left.file_index() == right.file_index()
-    }
-    #[cfg(not(any(unix, target_os = "windows")))]
+    #[cfg(not(unix))]
     {
         let _ = (left, right);
         false
@@ -5177,6 +5243,17 @@ fn validate_publication_object_store_is_self_contained(
     }
 
     let config_path = repo.commondir().join("config");
+    #[cfg(windows)]
+    let path_snapshot = crate::file_identity::open_windows_path_identity(&config_path)
+        .with_context(|| {
+            format!(
+                "failed to inspect publication source config {}",
+                config_path.display()
+            )
+        })?;
+    #[cfg(windows)]
+    let path_metadata = &path_snapshot.metadata;
+    #[cfg(not(windows))]
     let path_metadata = fs::symlink_metadata(&config_path).with_context(|| {
         format!(
             "failed to inspect publication source config {}",
@@ -5205,9 +5282,14 @@ fn validate_publication_object_store_is_self_contained(
     let file_metadata = config_file
         .metadata()
         .context("failed to inspect open publication source config")?;
-    if !publication_same_filesystem_identity(&path_metadata, &file_metadata)
-        || file_metadata.len() != path_metadata.len()
-    {
+    #[cfg(windows)]
+    let file_identity = crate::file_identity::windows_file_identity(&config_file)
+        .context("failed to inspect open publication source config identity")?;
+    #[cfg(windows)]
+    let identity_matches = path_snapshot.identity == file_identity;
+    #[cfg(not(windows))]
+    let identity_matches = publication_same_filesystem_identity(&path_metadata, &file_metadata);
+    if !identity_matches || file_metadata.len() != path_metadata.len() {
         bail!("HTTPS publication source config changed while it was opened");
     }
     let mut config_bytes = Vec::new();
@@ -5215,10 +5297,20 @@ fn validate_publication_object_store_is_self_contained(
         .take(MAX_PUBLICATION_SOURCE_CONFIG_BYTES + 1)
         .read_to_end(&mut config_bytes)
         .context("failed to read publication source config")?;
+    #[cfg(windows)]
+    let after_snapshot = crate::file_identity::open_windows_path_identity(&config_path)
+        .context("failed to recheck publication source config")?;
+    #[cfg(windows)]
+    let after = &after_snapshot.metadata;
+    #[cfg(not(windows))]
     let after = fs::symlink_metadata(&config_path)
         .context("failed to recheck publication source config")?;
+    #[cfg(windows)]
+    let identity_matches = file_identity == after_snapshot.identity;
+    #[cfg(not(windows))]
+    let identity_matches = publication_same_filesystem_identity(&file_metadata, &after);
     if config_bytes.len() as u64 != file_metadata.len()
-        || !publication_same_filesystem_identity(&file_metadata, &after)
+        || !identity_matches
         || after.len() != file_metadata.len()
     {
         bail!("HTTPS publication source config changed while it was read");

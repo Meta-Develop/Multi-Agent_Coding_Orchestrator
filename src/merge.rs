@@ -4915,13 +4915,7 @@ fn same_filesystem_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
         use std::os::unix::fs::MetadataExt;
         left.dev() == right.dev() && left.ino() == right.ino()
     }
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::fs::MetadataExt;
-        left.volume_serial_number() == right.volume_serial_number()
-            && left.file_index() == right.file_index()
-    }
-    #[cfg(not(any(unix, target_os = "windows")))]
+    #[cfg(not(unix))]
     {
         let _ = (left, right);
         false
@@ -5041,6 +5035,17 @@ fn require_git_success(output: GitCommandOutput, label: &str) -> Result<()> {
 }
 
 fn hash_optional_file(path: &Path) -> Result<Option<Oid>> {
+    #[cfg(windows)]
+    let path_snapshot = match crate::file_identity::open_windows_path_identity(path) {
+        Ok(snapshot) => snapshot,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
+        }
+    };
+    #[cfg(windows)]
+    let path_metadata = &path_snapshot.metadata;
+    #[cfg(not(windows))]
     let path_metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -5063,13 +5068,26 @@ fn hash_optional_file(path: &Path) -> Result<Option<Oid>> {
         .metadata()
         .with_context(|| format!("failed to inspect opened {}", path.display()))?;
     validate_repository_index_metadata(path, &file_metadata)?;
-    if !same_filesystem_identity(&path_metadata, &file_metadata) {
+    #[cfg(windows)]
+    let file_identity = crate::file_identity::windows_file_identity(&file)
+        .with_context(|| format!("failed to inspect opened file identity {}", path.display()))?;
+    #[cfg(windows)]
+    let identity_matches = path_snapshot.identity == file_identity;
+    #[cfg(not(windows))]
+    let identity_matches = same_filesystem_identity(&path_metadata, &file_metadata);
+    if !identity_matches {
         bail!(
             "repository index {} changed while it was opened",
             path.display()
         );
     }
     let mut bytes = Vec::new();
+    #[cfg(windows)]
+    (&file)
+        .take(REPOSITORY_INDEX_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    #[cfg(not(windows))]
     file.take(REPOSITORY_INDEX_MAX_BYTES + 1)
         .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -5080,10 +5098,20 @@ fn hash_optional_file(path: &Path) -> Result<Option<Oid>> {
             path.display()
         );
     }
+    #[cfg(windows)]
+    let after_snapshot = crate::file_identity::open_windows_path_identity(path)
+        .with_context(|| format!("failed to recheck {}", path.display()))?;
+    #[cfg(windows)]
+    let after = &after_snapshot.metadata;
+    #[cfg(not(windows))]
     let after = fs::symlink_metadata(path)
         .with_context(|| format!("failed to recheck {}", path.display()))?;
     validate_repository_index_metadata(path, &after)?;
-    if !same_filesystem_identity(&file_metadata, &after) || after.len() != file_metadata.len() {
+    #[cfg(windows)]
+    let identity_matches = file_identity == after_snapshot.identity;
+    #[cfg(not(windows))]
+    let identity_matches = same_filesystem_identity(&file_metadata, &after);
+    if !identity_matches || after.len() != file_metadata.len() {
         bail!(
             "repository index {} changed after it was read",
             path.display()
@@ -7007,20 +7035,18 @@ fn validate_open_lock_file(path: &Path, file: &fs::File) -> Result<()> {
     {
         use std::os::windows::fs::MetadataExt;
 
-        let path_volume = path_metadata
-            .volume_serial_number()
-            .context("repository lock path omitted volume identity")?;
-        let file_volume = file_metadata
-            .volume_serial_number()
-            .context("open repository lock omitted volume identity")?;
-        let path_index = path_metadata
-            .file_index()
-            .context("repository lock path omitted file identity")?;
-        let file_index = file_metadata
-            .file_index()
-            .context("open repository lock omitted file identity")?;
-        if path_volume != file_volume
-            || path_index != file_index
+        let path_snapshot =
+            crate::file_identity::open_windows_path_identity(path).with_context(|| {
+                format!("failed to open repository lock identity {}", path.display())
+            })?;
+        let path_metadata = &path_snapshot.metadata;
+        let file_identity = crate::file_identity::windows_file_identity(file)
+            .context("failed to inspect open repository lock identity")?;
+        if !path_metadata.file_type().is_file()
+            || path_metadata.file_type().is_symlink()
+            || metadata_is_windows_reparse_point(path_metadata)
+            || path_metadata.number_of_links() != Some(1)
+            || path_snapshot.identity != file_identity
             || file_metadata.number_of_links() != Some(1)
         {
             bail!(

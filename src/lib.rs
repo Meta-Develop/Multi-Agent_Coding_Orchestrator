@@ -13,6 +13,8 @@ pub(crate) mod effect_wal;
 pub mod evaluation;
 pub mod external_agent;
 pub mod field_guide;
+#[cfg(any(windows, test))]
+pub(crate) mod file_identity;
 pub(crate) mod follow_up_queue;
 pub mod gate_denial;
 pub mod inbox;
