@@ -1490,8 +1490,9 @@
           render();
         });
         elements.scrubber.addEventListener("input", function () {
+          var requestedCursor = Number(elements.scrubber.value);
           stopPlayback();
-          state.cursor = Math.max(0, Math.min(state.events.length, Number(elements.scrubber.value)));
+          state.cursor = Math.max(0, Math.min(state.events.length, requestedCursor));
           state.live = state.cursor === state.events.length;
           state.lastLogCursor = -1;
           updateControls();

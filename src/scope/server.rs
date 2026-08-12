@@ -1225,6 +1225,22 @@ mod tests {
         assert!(response.contains("state.eventIds.has(normalizedId)"));
         assert!(!response.contains("if (!state.selectedProject || !state.selectedRun) return"));
 
+        let scrubber_handler_start = response
+            .find("elements.scrubber.addEventListener(\"input\"")
+            .expect("scrubber input handler");
+        let scrubber_handler_end = response[scrubber_handler_start..]
+            .find("elements.speed.addEventListener")
+            .map(|offset| scrubber_handler_start + offset)
+            .expect("end of scrubber input handler");
+        let scrubber_handler = &response[scrubber_handler_start..scrubber_handler_end];
+        let cursor_capture = scrubber_handler
+            .find("var requestedCursor = Number(elements.scrubber.value);")
+            .expect("scrubber cursor capture");
+        let playback_stop = scrubber_handler
+            .find("stopPlayback();")
+            .expect("scrubber playback stop");
+        assert!(cursor_capture < playback_stop);
+
         assert!(response.contains("var projectionGroups = new Map()"));
         assert!(response.contains("state.view === \"repository\""));
         assert!(response.contains("state.view === \"combined\""));
