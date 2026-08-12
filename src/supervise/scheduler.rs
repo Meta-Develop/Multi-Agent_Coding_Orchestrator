@@ -20,6 +20,13 @@ impl SupervisorConcurrencyPolicy {
             Self::Fixed(limit) => limit.get(),
         }
     }
+
+    pub(crate) const fn configured_limit(self) -> Option<usize> {
+        match self {
+            Self::Auto => None,
+            Self::Fixed(limit) => Some(limit.get()),
+        }
+    }
 }
 
 impl fmt::Display for SupervisorConcurrencyPolicy {
@@ -1159,6 +1166,7 @@ struct SupervisorFinalReportConstruction<'context> {
     plan: &'context SupervisorPlan,
     runtime_model_catalog: Option<&'context RuntimeModelCatalog>,
     max_concurrent_children: usize,
+    admission_policy_input: SupervisorAdmissionPolicyInput,
     achieved_concurrency: AchievedConcurrency,
     has_multiple_independent_assignment_scopes: bool,
     run_id: RunId,
@@ -1392,6 +1400,7 @@ fn build_supervisor_final_report(
         plan,
         runtime_model_catalog,
         max_concurrent_children,
+        admission_policy_input,
         achieved_concurrency,
         has_multiple_independent_assignment_scopes,
         run_id,
@@ -1475,12 +1484,13 @@ fn build_supervisor_final_report(
         completed_assignment_count: achieved_concurrency.completed_assignment_count,
         concurrency: SupervisorConcurrencyReport {
             configured_max_concurrent_children: max_concurrent_children,
-            policy_input_observation: ProcessObservation::NotRetained,
-            policy_input: None,
-            policy_input_unavailable_reason: Some(
-                "the scheduler receives only the resolved concurrency bound; the originating auto-versus-fixed policy input is not retained at the scheduler reporting boundary"
-                    .to_string(),
+            policy_input_observation: ProcessObservation::SchedulerObserved,
+            policy_input: Some(
+                serde_json::to_string(&admission_policy_input)
+                    .expect("admission policy input is JSON serializable"),
             ),
+            policy_input_details: Some(admission_policy_input),
+            policy_input_unavailable_reason: None,
             achieved_max_concurrent_children: achieved_concurrency.peak,
             achieved_mean_concurrent_children: achieved_concurrency.mean,
             achieved_mean_observation: if achieved_concurrency.mean.is_some() {
@@ -1968,6 +1978,8 @@ struct PreparedSupervisorRun {
     consultant: SupervisorConsultantPlan,
     assignment_metadata: AssignmentMetadata,
     plan_metadata: SupervisorPlanMetadata,
+    max_concurrent_children: usize,
+    admission_policy_input: SupervisorAdmissionPolicyInput,
     runtime_model_catalog: RuntimeModelCatalogAcquisition,
     budget_ledger: RunBudgetLedger,
     runtime: SupervisorRuntime,
@@ -2019,6 +2031,13 @@ fn prepare_supervisor_run(
     }
     let runtime = options.runtime;
     let repo = discover_repo_root(&options.repo)?;
+    let admission_policy_input = SupervisorAdmissionPolicyInput::resolve(
+        &repo,
+        max_concurrent_children,
+        plan_metadata.admission,
+        options.admission_overrides,
+    )?;
+    let max_concurrent_children = admission_policy_input.resolved_bound;
     let evidence_only_reaudit = plan_metadata
         .evidence_only_reaudit
         .as_ref()
@@ -2064,6 +2083,8 @@ fn prepare_supervisor_run(
         consultant,
         assignment_metadata,
         plan_metadata,
+        max_concurrent_children,
+        admission_policy_input,
         runtime_model_catalog,
         budget_ledger,
         runtime,
@@ -2088,6 +2109,7 @@ struct RuntimeModelCatalogFailureFinalization<'context, 'checkpoint> {
     checkpoint_writer: &'checkpoint mut SupervisorCheckpointWriter,
     run_dir: &'context Path,
     max_concurrent_children: usize,
+    admission_policy_input: SupervisorAdmissionPolicyInput,
     has_multiple_independent_assignment_scopes: bool,
 }
 
@@ -2105,6 +2127,7 @@ fn persist_runtime_model_catalog_environment_failure(
         checkpoint_writer,
         run_dir,
         max_concurrent_children,
+        admission_policy_input,
         has_multiple_independent_assignment_scopes,
     } = finalization;
     let run_budget_report = budget_ledger.report()?;
@@ -2121,6 +2144,7 @@ fn persist_runtime_model_catalog_environment_failure(
         plan,
         runtime_model_catalog: None,
         max_concurrent_children,
+        admission_policy_input,
         achieved_concurrency: AchievedConcurrency::default(),
         has_multiple_independent_assignment_scopes,
         run_id: options.run_id.clone(),
@@ -2187,6 +2211,8 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         consultant,
         assignment_metadata,
         plan_metadata,
+        max_concurrent_children,
+        admission_policy_input,
         runtime_model_catalog,
         budget_ledger,
         runtime,
@@ -2223,6 +2249,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                     checkpoint_writer: &mut checkpoint_writer,
                     run_dir: &run_dir,
                     max_concurrent_children,
+                    admission_policy_input,
                     has_multiple_independent_assignment_scopes:
                         has_multiple_independent_assignment_scopes(
                             &assignment_schedule,
@@ -2613,6 +2640,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         plan: &plan,
         runtime_model_catalog: Some(&runtime_model_catalog),
         max_concurrent_children,
+        admission_policy_input,
         achieved_concurrency,
         has_multiple_independent_assignment_scopes: has_multiple_independent_assignment_scopes(
             &assignment_schedule,
@@ -3008,6 +3036,7 @@ mod decomposition_tests {
             codex_bin: PathBuf::from("unused-test-codex"),
             runtime: SupervisorRuntime::Fake,
             allow_dirty_primary: true,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
                 config: repo.join("unused-machine-global.json"),
                 root_id: "runtime".to_string(),
@@ -3209,6 +3238,13 @@ mod decomposition_tests {
             plan,
             runtime_model_catalog: Some(&TEST_RUNTIME_MODEL_CATALOG),
             max_concurrent_children: 1,
+            admission_policy_input: SupervisorAdmissionPolicyInput::resolve(
+                Path::new("."),
+                1,
+                SupervisorAdmissionConfig::default(),
+                SupervisorAdmissionConfig::default(),
+            )
+            .expect("test admission policy"),
             achieved_concurrency: AchievedConcurrency::default(),
             has_multiple_independent_assignment_scopes: false,
             run_id,
@@ -3609,6 +3645,19 @@ mod decomposition_tests {
             .expect("new reports always carry execution metadata");
         assert_eq!(execution.assignment_count, 2);
         assert_eq!(execution.concurrency.configured_max_concurrent_children, 1);
+        assert_eq!(
+            execution
+                .concurrency
+                .policy_input_details
+                .as_ref()
+                .expect("retained policy input")
+                .resolved_bound,
+            1
+        );
+        assert_eq!(
+            execution.concurrency.policy_input_observation,
+            ProcessObservation::SchedulerObserved
+        );
         assert_eq!(execution.concurrency.achieved_max_concurrent_children, 0);
         assert!(execution.role_bindings.values().all(|binding| {
             binding.observation == RoleBindingObservation::SyntheticFake
@@ -3616,6 +3665,43 @@ mod decomposition_tests {
                 && binding.resolved_reasoning_effort.is_none()
         }));
         assert_eq!(report.role_usage.len(), 5);
+    }
+
+    #[test]
+    fn admission_resolution_uses_strictest_entrypoint_plan_quota_and_host_bound() {
+        let temp = tempfile::tempdir().expect("temporary admission repository");
+        let plan = SupervisorAdmissionConfig {
+            max_concurrent_children: Some(12),
+            provider_inflight_limit: Some(9),
+            host_memory_available_mib: Some(8_192),
+            host_memory_per_child_mib: Some(1_024),
+            host_fd_available: Some(640),
+            host_fds_per_child: Some(128),
+            host_disk_available_mib: Some(9_000),
+            host_disk_per_child_mib: Some(1_000),
+            host_fallback_children: Some(2),
+        };
+        let cli = SupervisorAdmissionConfig {
+            max_concurrent_children: Some(10),
+            provider_inflight_limit: Some(7),
+            host_fd_available: Some(384),
+            ..SupervisorAdmissionConfig::default()
+        };
+
+        let resolved = SupervisorAdmissionPolicyInput::resolve(temp.path(), 20, plan, cli)
+            .expect("resolve admission policy");
+
+        assert_eq!(resolved.effective.max_concurrent_children, Some(10));
+        assert_eq!(resolved.provider_inflight_bound, 7);
+        assert_eq!(resolved.host.memory_bound, Some(8));
+        assert_eq!(resolved.host.fd_bound, Some(3));
+        assert_eq!(resolved.host.disk_bound, Some(9));
+        assert_eq!(resolved.host.resolved_bound, 3);
+        assert_eq!(resolved.resolved_bound, 3);
+        assert_eq!(
+            resolved.provider_inflight_source,
+            AdmissionInputSource::Configured
+        );
     }
 
     #[test]
@@ -3687,9 +3773,9 @@ mod decomposition_tests {
     }
 
     #[test]
-    fn supervisor_final_economics_v2_fixture_covers_execution_contract() {
+    fn supervisor_final_economics_v4_fixture_covers_execution_contract() {
         let profile: RoleEconomicsProfile = serde_json::from_str(include_str!(
-            "../../tests/fixtures/supervise/supervisor-final-economics-v2.json"
+            "../../tests/fixtures/supervise/supervisor-final-economics-v4.json"
         ))
         .expect("parse supervisor-final economics fixture");
 
@@ -3705,6 +3791,14 @@ mod decomposition_tests {
         assert_eq!(execution.assignment_count, 2);
         assert_eq!(execution.concurrency.configured_max_concurrent_children, 2);
         assert_eq!(execution.concurrency.achieved_max_concurrent_children, 2);
+        assert_eq!(
+            execution
+                .concurrency
+                .policy_input_details
+                .expect("typed admission policy input")
+                .resolved_bound,
+            2
+        );
         assert_eq!(execution.role_bindings.len(), 5);
         assert_eq!(
             execution.usage.total_usage,

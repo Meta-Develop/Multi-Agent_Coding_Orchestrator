@@ -972,6 +972,7 @@ fn supervisor_traceability_reports_missing_changes_and_diff_binding() {
         ],
         coverage_gaps: Vec::new(),
         run_budget: SupervisorBudgetConfig::default(),
+        admission: SupervisorAdmissionConfig::default(),
         evidence_only_reaudit: None,
         generated_follow_up: None,
     };
@@ -1020,6 +1021,7 @@ fn supervisor_traceability_binds_ordinary_success_to_observed_paths_and_diff() {
         }],
         coverage_gaps: Vec::new(),
         run_budget: SupervisorBudgetConfig::default(),
+        admission: SupervisorAdmissionConfig::default(),
         evidence_only_reaudit: None,
         generated_follow_up: None,
     };
@@ -1153,6 +1155,7 @@ fn admitted_nested_assignment_retains_ordinary_pipeline_and_acceptance_evidence(
         assignment_schedule: schedule,
         coverage_gaps: Vec::new(),
         run_budget: SupervisorBudgetConfig::default(),
+        admission: SupervisorAdmissionConfig::default(),
         evidence_only_reaudit: None,
         generated_follow_up: None,
     };
@@ -1425,6 +1428,54 @@ fn ordered_role_tiers_and_all_frontier_profile_round_trip_through_plan_json() {
             ..
         }) if budget_degrade_models == &vec![BALANCED_PROFILE_MODEL.to_string(), ECONOMY_PROFILE_MODEL.to_string()]
     )));
+}
+
+#[test]
+fn admission_policy_inputs_round_trip_through_plan_json_and_reject_zero() {
+    let mut document =
+        serde_json::from_slice::<Value>(&bounded_loader_plan_json()).expect("parse plan fixture");
+    document.as_object_mut().expect("plan object").insert(
+        "concurrency".to_string(),
+        json!({
+            "max_concurrent_children": 12,
+            "provider_inflight_limit": 9,
+            "host_memory_available_mib": 8192,
+            "host_memory_per_child_mib": 1024,
+            "host_fd_available": 640,
+            "host_fds_per_child": 128,
+            "host_disk_available_mib": 9000,
+            "host_disk_per_child_mib": 1000,
+            "host_fallback_children": 2
+        }),
+    );
+    let loaded = parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&document).expect("serialize configured plan"),
+    )
+    .expect("parse configured admission policy");
+    let normalized = supervisor_plan_value(
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )
+    .expect("normalize configured admission policy");
+    assert_eq!(normalized["concurrency"], document["concurrency"]);
+    let reparsed = parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&normalized).expect("serialize normalized policy"),
+    )
+    .expect("reparse normalized policy");
+    assert_eq!(
+        reparsed.plan_metadata.admission,
+        loaded.plan_metadata.admission
+    );
+
+    document["concurrency"]["provider_inflight_limit"] = json!(0);
+    assert!(parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&document).expect("serialize invalid policy")
+    )
+    .expect_err("zero provider quota must fail")
+    .to_string()
+    .contains("concurrency.provider_inflight_limit must be greater than zero"));
 }
 
 #[test]

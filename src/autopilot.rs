@@ -1315,6 +1315,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         // Autopilot's own authenticated artifacts are local runtime state. The
         // outer typed dirty-primary gate already handled operator worktree state.
         allow_dirty_primary: true,
+        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         machine_global_retention: Some(machine_global_retention),
     };
     // Goal decomposition can admit multiple independent planning roots. Capability-bound
@@ -1777,6 +1778,7 @@ fn run_autopilot_plan_file_disabled_legacy(
             // Autopilot already ran the real primary-change preflight; nested
             // supervise should not reject autopilot's own runtime artifacts.
             allow_dirty_primary: true,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             // Autopilot run remains disabled under Issue #22. If that entrypoint
             // reaches supervise before it grows an explicit CLI binding, the
             // verified child preparation path must fail closed.
@@ -6443,6 +6445,7 @@ mod tests {
                 codex_bin: PathBuf::from("unused-injected-codex"),
                 runtime: SupervisorRuntime::Codex,
                 allow_dirty_primary: true,
+                admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
                 machine_global_retention: Some(retention),
             },
             &mut resume_runner,

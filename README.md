@@ -2628,28 +2628,47 @@ assignments but leaves a non-empty child worktree diff, the retained runner
 still launches the parent read-only `REVIEW_AUDITOR` and requires it to cover
 the child orchestrator id and changed paths.
 The retained supervisor runner does not apply worker changes to the primary worktree
-automatically. Omitting `--max-concurrent-children` selects `auto`, which derives
-the effective child-execution bound from measured host capacity instead of a
-hardcoded constant. `--max-concurrent-children auto` spells out that same mode,
-while `--max-concurrent-children 1` is the explicit serial opt-out. Zero is
-rejected before run artifacts are reserved. `max_child_assignments` separately
-bounds plan fan-out; it is not the concurrency limit. This default keeps the
-goal-to-swarm path tracked by Issue #22 free of an extra concurrency flag.
+automatically. Omitting `--max-concurrent-children` selects `auto`, whose
+network-bound entrypoint ceiling is a conservative four children rather than the
+host CPU count. Final admission takes the minimum of that entrypoint ceiling (or
+the explicit positive flag), the optional plan/CLI maximum, a configured provider
+in-flight quota, and host memory/file-descriptor/disk bounds. There is no live
+provider probing: `provider_inflight_limit` and `--provider-inflight-limit` are
+operator-supplied quota data. Host available/per-child inputs can likewise be
+specified in a plan's `concurrency` object or with the corresponding
+`--host-*-available-*` and `--host-*-per-child-*` flags. Missing host observations
+fall back conservatively to one child. Zero inputs are rejected before dispatch.
+`max_child_assignments` separately bounds plan fan-out; it is not the concurrency
+limit.
+
+```json
+{
+  "concurrency": {
+    "max_concurrent_children": 8,
+    "provider_inflight_limit": 6,
+    "host_memory_per_child_mib": 1024,
+    "host_fds_per_child": 128,
+    "host_disk_per_child_mib": 512,
+    "host_fallback_children": 1
+  }
+}
+```
 
 Every newly finalized `supervisor-final.json` carries
-`role_economics_profile.schema_version=2` plus execution telemetry: planned,
+`role_economics_profile.schema_version=4` plus execution telemetry: planned,
 started, and completed assignment counts; the resolved configured child bound;
 scheduler-observed peak and active-interval mean concurrency; configured and
 resolved model/reasoning bindings for every role; and usage/cost with explicit
-observation markers. The scheduler boundary currently retains the resolved
-bound but not the originating `auto` versus fixed policy token, so that policy
-input is serialized as `not_retained` rather than reconstructed. Missing
+observation markers. `concurrency.policy_input` contains canonical JSON for
+evaluation compatibility, while `concurrency.policy_input_details` retains the
+typed entrypoint, plan, CLI, provider-quota, measured/configured host-resource,
+and resolved-minimum inputs with `scheduler_observed` provenance. Missing
 catalog, runtime-default model, nested-worker usage, and unpriced cost values
 remain explicit unavailable observations. A width-one run with multiple
 independent assignment or spec scopes emits a final-report warning. Readers
 continue accepting historical reports that omit this block or carry economics
-profile schema version 1; the generated schema describes the required version
-2 contract for newly finalized reports.
+profile schema versions 1 through 3; the generated schema describes the required
+version 4 contract for newly finalized reports.
 
 A worker assignment may opt into `"kind":"megafile_decomposition"` only with an
 exact canonical `"target_path"` inside its assigned paths. Ordinary assignments

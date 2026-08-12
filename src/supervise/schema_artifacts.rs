@@ -336,6 +336,7 @@ fn concurrency_report_schema_value() -> serde_json::Value {
         "additionalProperties": false,
         "required": [
             "configured_max_concurrent_children", "policy_input_observation", "policy_input",
+            "policy_input_details",
             "policy_input_unavailable_reason", "achieved_max_concurrent_children",
             "achieved_mean_concurrent_children", "achieved_mean_observation",
             "achieved_mean_unavailable_reason"
@@ -344,11 +345,80 @@ fn concurrency_report_schema_value() -> serde_json::Value {
             "configured_max_concurrent_children": {"type": "integer", "minimum": 1},
             "policy_input_observation": process_observation_schema_value(),
             "policy_input": {"type": ["string", "null"]},
+            "policy_input_details": {
+                "anyOf": [admission_policy_input_schema_value(), {"type": "null"}]
+            },
             "policy_input_unavailable_reason": {"type": ["string", "null"]},
             "achieved_max_concurrent_children": {"type": "integer", "minimum": 0},
             "achieved_mean_concurrent_children": {"type": ["number", "null"], "minimum": 0},
             "achieved_mean_observation": process_observation_schema_value(),
             "achieved_mean_unavailable_reason": {"type": ["string", "null"]}
+        }
+    })
+}
+
+fn admission_policy_input_schema_value() -> serde_json::Value {
+    let optional_positive = json!({"type": ["integer", "null"], "minimum": 1});
+    let admission_config = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "max_concurrent_children": optional_positive.clone(),
+            "provider_inflight_limit": optional_positive.clone(),
+            "host_memory_available_mib": optional_positive.clone(),
+            "host_memory_per_child_mib": optional_positive.clone(),
+            "host_fd_available": optional_positive.clone(),
+            "host_fds_per_child": optional_positive.clone(),
+            "host_disk_available_mib": optional_positive.clone(),
+            "host_disk_per_child_mib": optional_positive.clone(),
+            "host_fallback_children": optional_positive.clone()
+        }
+    });
+    let source = json!({
+        "type": "string",
+        "enum": ["configured", "conservative_default", "measured"]
+    });
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "entrypoint_bound", "plan", "cli", "effective",
+            "provider_inflight_bound", "provider_inflight_source", "host", "resolved_bound"
+        ],
+        "properties": {
+            "entrypoint_bound": {"type": "integer", "minimum": 1},
+            "plan": admission_config.clone(),
+            "cli": admission_config.clone(),
+            "effective": admission_config,
+            "provider_inflight_bound": {"type": "integer", "minimum": 1},
+            "provider_inflight_source": source.clone(),
+            "host": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "memory_available_mib", "memory_available_source", "memory_per_child_mib",
+                    "memory_bound", "fd_available", "fd_available_source", "fds_per_child",
+                    "fd_bound", "disk_available_mib", "disk_available_source",
+                    "disk_per_child_mib", "disk_bound", "fallback_children", "resolved_bound"
+                ],
+                "properties": {
+                    "memory_available_mib": optional_positive.clone(),
+                    "memory_available_source": source.clone(),
+                    "memory_per_child_mib": {"type": "integer", "minimum": 1},
+                    "memory_bound": optional_positive.clone(),
+                    "fd_available": optional_positive.clone(),
+                    "fd_available_source": source.clone(),
+                    "fds_per_child": {"type": "integer", "minimum": 1},
+                    "fd_bound": optional_positive.clone(),
+                    "disk_available_mib": optional_positive.clone(),
+                    "disk_available_source": source,
+                    "disk_per_child_mib": {"type": "integer", "minimum": 1},
+                    "disk_bound": optional_positive,
+                    "fallback_children": {"type": "integer", "minimum": 1},
+                    "resolved_bound": {"type": "integer", "minimum": 1}
+                }
+            },
+            "resolved_bound": {"type": "integer", "minimum": 1}
         }
     })
 }

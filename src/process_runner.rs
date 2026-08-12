@@ -31,6 +31,7 @@ const PIPE_CHANNEL_CAPACITY: usize = 8;
 const MAX_PIPE_EVENTS_PER_POLL: usize = PIPE_CHANNEL_CAPACITY * 2;
 const DEFAULT_MAX_STDIN_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_TEE_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_NETWORK_BOUND_CHILDREN: usize = 4;
 const MAX_REQUIRED_STREAM_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROCESS_ARGUMENTS: usize = 2048;
 const MAX_PROCESS_ARGUMENT_BYTES: usize = 64 * 1024;
@@ -84,12 +85,14 @@ const SYSTEMD_RUNTIME_OVERHEAD: Duration = Duration::from_secs(30);
 #[cfg(target_os = "linux")]
 const SYSTEMD_ORPHAN_SAFETY_FUSE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Cgroup-aware process capacity shared by supervise admission and strict containment.
+/// CPU-aware process capacity used by strict containment, plus a separate conservative default
+/// for the network-bound supervise scheduler.
 ///
 /// Production uses `available_parallelism`, which reflects the runtime's effective CPU
 /// quota/affinity where the standard library can observe it. A failed production measurement
 /// degrades to one usable lane instead of removing the containment bound. Unit tests pin the
-/// shared capacity so both supervise admission and strict containment have deterministic width.
+/// containment capacity. Supervise admission separately composes its configured provider quota
+/// and measured memory, file-descriptor, and disk inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HostProcessCapacity {
     parallelism: NonZeroUsize,
@@ -124,7 +127,44 @@ impl HostProcessCapacity {
     }
 
     pub(crate) const fn supervisor_children(self) -> usize {
-        self.parallelism.get()
+        DEFAULT_NETWORK_BOUND_CHILDREN
+    }
+
+    pub(crate) fn supervisor_resources(
+        repo: &Path,
+        inputs: HostResourceInputs,
+    ) -> HostResourceCapacity {
+        let memory_available_mib = inputs
+            .memory_available_mib
+            .or_else(measured_available_memory_mib);
+        let fd_available = inputs.fd_available.or_else(measured_available_fds);
+        let disk_available_mib = inputs
+            .disk_available_mib
+            .or_else(|| measured_available_disk_mib(repo));
+        let memory_bound =
+            memory_available_mib.map(|available| (available / inputs.memory_per_child_mib).max(1));
+        let fd_bound = fd_available.map(|available| (available / inputs.fds_per_child).max(1));
+        let disk_bound =
+            disk_available_mib.map(|available| (available / inputs.disk_per_child_mib).max(1));
+        let resolved_children = [memory_bound, fd_bound, disk_bound]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(inputs.fallback_children)
+            .max(1);
+        HostResourceCapacity {
+            resolved_children,
+            memory_available_mib,
+            memory_per_child_mib: inputs.memory_per_child_mib,
+            memory_bound,
+            fd_available,
+            fds_per_child: inputs.fds_per_child,
+            fd_bound,
+            disk_available_mib,
+            disk_per_child_mib: inputs.disk_per_child_mib,
+            disk_bound,
+            fallback_children: inputs.fallback_children,
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -135,6 +175,82 @@ impl HostProcessCapacity {
             .get()
             .saturating_add(RESERVED_EXPEDITED_SYSTEMD_SLOTS)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostResourceInputs {
+    pub(crate) memory_available_mib: Option<usize>,
+    pub(crate) memory_per_child_mib: usize,
+    pub(crate) fd_available: Option<usize>,
+    pub(crate) fds_per_child: usize,
+    pub(crate) disk_available_mib: Option<usize>,
+    pub(crate) disk_per_child_mib: usize,
+    pub(crate) fallback_children: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostResourceCapacity {
+    pub(crate) resolved_children: usize,
+    pub(crate) memory_available_mib: Option<usize>,
+    pub(crate) memory_per_child_mib: usize,
+    pub(crate) memory_bound: Option<usize>,
+    pub(crate) fd_available: Option<usize>,
+    pub(crate) fds_per_child: usize,
+    pub(crate) fd_bound: Option<usize>,
+    pub(crate) disk_available_mib: Option<usize>,
+    pub(crate) disk_per_child_mib: usize,
+    pub(crate) disk_bound: Option<usize>,
+    pub(crate) fallback_children: usize,
+}
+
+fn measured_available_memory_mib() -> Option<usize> {
+    let contents = fs::read_to_string("/proc/meminfo").ok()?;
+    let kib = contents.lines().find_map(|line| {
+        let value = line.strip_prefix("MemAvailable:")?.trim();
+        value.strip_suffix(" kB")?.trim().parse::<usize>().ok()
+    })?;
+    Some((kib / 1024).max(1))
+}
+
+#[cfg(unix)]
+fn measured_available_fds() -> Option<usize> {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: getrlimit initializes the provided rlimit on success.
+    let status = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
+    if status != 0 {
+        return None;
+    }
+    // SAFETY: the successful getrlimit call initialized `limit`.
+    let limit = unsafe { limit.assume_init() };
+    let limit = usize::try_from(limit.rlim_cur).ok()?;
+    let open = fs::read_dir("/proc/self/fd").ok()?.count();
+    Some(limit.saturating_sub(open).max(1))
+}
+
+#[cfg(not(unix))]
+fn measured_available_fds() -> Option<usize> {
+    None
+}
+
+#[cfg(unix)]
+fn measured_available_disk_mib(path: &Path) -> Option<usize> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut status = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: statvfs reads a valid NUL-terminated path and initializes `status` on success.
+    let result = unsafe { libc::statvfs(path.as_ptr(), status.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: the successful statvfs call initialized `status`.
+    let status = unsafe { status.assume_init() };
+    let bytes = u128::from(status.f_bavail).checked_mul(u128::from(status.f_frsize))?;
+    usize::try_from(bytes / (1024 * 1024)).ok()
+}
+
+#[cfg(not(unix))]
+fn measured_available_disk_mib(_path: &Path) -> Option<usize> {
+    None
 }
 
 /// A run-scoped cancellation signal for independently contained child processes.
@@ -10666,7 +10782,10 @@ mod tests {
         let capacity =
             HostProcessCapacity::from_measurement(Err(io::Error::other("injected failure")));
 
-        assert_eq!(capacity.supervisor_children(), 1);
+        assert_eq!(
+            capacity.supervisor_children(),
+            DEFAULT_NETWORK_BOUND_CHILDREN
+        );
         #[cfg(target_os = "linux")]
         assert_eq!(
             capacity.systemd_unit_slots(),
@@ -10678,9 +10797,33 @@ mod tests {
     fn measured_host_capacity_is_pinned_for_test_supervise_and_containment() {
         let capacity = HostProcessCapacity::measured();
 
-        assert_eq!(capacity.supervisor_children(), 3);
+        assert_eq!(
+            capacity.supervisor_children(),
+            DEFAULT_NETWORK_BOUND_CHILDREN
+        );
         #[cfg(target_os = "linux")]
         assert_eq!(capacity.systemd_unit_slots(), 4);
+    }
+
+    #[test]
+    fn supervisor_resource_capacity_uses_the_strictest_explicit_host_bound() {
+        let capacity = HostProcessCapacity::supervisor_resources(
+            Path::new("."),
+            HostResourceInputs {
+                memory_available_mib: Some(8_192),
+                memory_per_child_mib: 1_024,
+                fd_available: Some(640),
+                fds_per_child: 128,
+                disk_available_mib: Some(9_000),
+                disk_per_child_mib: 1_000,
+                fallback_children: 1,
+            },
+        );
+
+        assert_eq!(capacity.memory_bound, Some(8));
+        assert_eq!(capacity.fd_bound, Some(5));
+        assert_eq!(capacity.disk_bound, Some(9));
+        assert_eq!(capacity.resolved_children, 5);
     }
 
     #[cfg(target_os = "linux")]

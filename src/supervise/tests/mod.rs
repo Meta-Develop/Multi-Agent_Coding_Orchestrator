@@ -495,6 +495,7 @@ fn injected_options(repo: &Path, root: &Path, run_id: &str) -> SupervisorRunOpti
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
+        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         machine_global_retention: Some(injected_machine_global_retention(root)),
     }
 }

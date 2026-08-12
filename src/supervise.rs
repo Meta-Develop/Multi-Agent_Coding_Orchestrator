@@ -42,9 +42,9 @@ use crate::{
     pre_action_review::{RatioMetric, RepoPathRule, ReviewContext, ReviewMetricSnapshot},
     process_runner::{
         read_bounded_regular_file_nofollow, run_process, trusted_system_executable,
-        EnvironmentMode, HostProcessCapacity, ProcessCancellation, ProcessSpec,
-        ProcessTreeEvidence, SideEffectConfinementEvidence, SideEffectConfinementProfile,
-        StdinMode, StrictOfflineWorkspaceProfile, WorkspaceAccess,
+        EnvironmentMode, HostProcessCapacity, HostResourceCapacity, HostResourceInputs,
+        ProcessCancellation, ProcessSpec, ProcessTreeEvidence, SideEffectConfinementEvidence,
+        SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile, WorkspaceAccess,
     },
     review::{
         aggregate_review_lenses_against_requests, build_review_lens_request,
@@ -316,6 +316,7 @@ pub struct SupervisorRunOptions {
     pub codex_bin: PathBuf,
     pub runtime: SupervisorRuntime,
     pub allow_dirty_primary: bool,
+    pub admission_overrides: SupervisorAdmissionConfig,
     /// Explicit reviewed binding for recoverable cleanup of every private
     /// output-staging directory created by this supervise run.
     ///
@@ -430,6 +431,248 @@ pub struct SupervisorBudgetConfig {
     pub limits: RunBudgetLimits,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub role_token_reservations: BTreeMap<AgentRole, usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorAdmissionConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_children: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_inflight_limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_memory_available_mib: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_memory_per_child_mib: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_fd_available: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_fds_per_child: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_disk_available_mib: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_disk_per_child_mib: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_fallback_children: Option<usize>,
+}
+
+const DEFAULT_PROVIDER_INFLIGHT_LIMIT: usize = 4;
+const DEFAULT_HOST_MEMORY_PER_CHILD_MIB: usize = 1_024;
+const DEFAULT_HOST_FDS_PER_CHILD: usize = 128;
+const DEFAULT_HOST_DISK_PER_CHILD_MIB: usize = 512;
+const DEFAULT_HOST_FALLBACK_CHILDREN: usize = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionInputSource {
+    Configured,
+    ConservativeDefault,
+    Measured,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorHostResourcePolicyInput {
+    pub memory_available_mib: Option<usize>,
+    pub memory_available_source: AdmissionInputSource,
+    pub memory_per_child_mib: usize,
+    pub memory_bound: Option<usize>,
+    pub fd_available: Option<usize>,
+    pub fd_available_source: AdmissionInputSource,
+    pub fds_per_child: usize,
+    pub fd_bound: Option<usize>,
+    pub disk_available_mib: Option<usize>,
+    pub disk_available_source: AdmissionInputSource,
+    pub disk_per_child_mib: usize,
+    pub disk_bound: Option<usize>,
+    pub fallback_children: usize,
+    pub resolved_bound: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorAdmissionPolicyInput {
+    pub entrypoint_bound: usize,
+    pub plan: SupervisorAdmissionConfig,
+    pub cli: SupervisorAdmissionConfig,
+    pub effective: SupervisorAdmissionConfig,
+    pub provider_inflight_bound: usize,
+    pub provider_inflight_source: AdmissionInputSource,
+    pub host: SupervisorHostResourcePolicyInput,
+    pub resolved_bound: usize,
+}
+
+impl SupervisorAdmissionConfig {
+    fn is_unconfigured(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn validate(self) -> Result<Self> {
+        for (name, value) in [
+            ("max_concurrent_children", self.max_concurrent_children),
+            ("provider_inflight_limit", self.provider_inflight_limit),
+            ("host_memory_available_mib", self.host_memory_available_mib),
+            ("host_memory_per_child_mib", self.host_memory_per_child_mib),
+            ("host_fd_available", self.host_fd_available),
+            ("host_fds_per_child", self.host_fds_per_child),
+            ("host_disk_available_mib", self.host_disk_available_mib),
+            ("host_disk_per_child_mib", self.host_disk_per_child_mib),
+            ("host_fallback_children", self.host_fallback_children),
+        ] {
+            if value == Some(0) {
+                bail!("concurrency.{name} must be greater than zero");
+            }
+        }
+        Ok(self)
+    }
+
+    fn strictest(self, other: Self) -> Self {
+        fn min_optional(left: Option<usize>, right: Option<usize>) -> Option<usize> {
+            match (left, right) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (left, right) => left.or(right),
+            }
+        }
+        fn max_optional(left: Option<usize>, right: Option<usize>) -> Option<usize> {
+            match (left, right) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (left, right) => left.or(right),
+            }
+        }
+        Self {
+            max_concurrent_children: min_optional(
+                self.max_concurrent_children,
+                other.max_concurrent_children,
+            ),
+            provider_inflight_limit: min_optional(
+                self.provider_inflight_limit,
+                other.provider_inflight_limit,
+            ),
+            host_memory_available_mib: min_optional(
+                self.host_memory_available_mib,
+                other.host_memory_available_mib,
+            ),
+            host_memory_per_child_mib: max_optional(
+                self.host_memory_per_child_mib,
+                other.host_memory_per_child_mib,
+            ),
+            host_fd_available: min_optional(self.host_fd_available, other.host_fd_available),
+            host_fds_per_child: max_optional(self.host_fds_per_child, other.host_fds_per_child),
+            host_disk_available_mib: min_optional(
+                self.host_disk_available_mib,
+                other.host_disk_available_mib,
+            ),
+            host_disk_per_child_mib: max_optional(
+                self.host_disk_per_child_mib,
+                other.host_disk_per_child_mib,
+            ),
+            host_fallback_children: min_optional(
+                self.host_fallback_children,
+                other.host_fallback_children,
+            ),
+        }
+    }
+}
+
+impl SupervisorAdmissionPolicyInput {
+    fn resolve(
+        repo: &Path,
+        entrypoint_bound: usize,
+        plan: SupervisorAdmissionConfig,
+        cli: SupervisorAdmissionConfig,
+    ) -> Result<Self> {
+        validate_max_concurrent_children(entrypoint_bound)?;
+        let plan = plan.validate()?;
+        let cli = cli.validate()?;
+        let effective = plan.strictest(cli);
+        let provider_inflight_bound = effective
+            .provider_inflight_limit
+            .unwrap_or(DEFAULT_PROVIDER_INFLIGHT_LIMIT);
+        let host = HostProcessCapacity::supervisor_resources(
+            repo,
+            HostResourceInputs {
+                memory_available_mib: effective.host_memory_available_mib,
+                memory_per_child_mib: effective
+                    .host_memory_per_child_mib
+                    .unwrap_or(DEFAULT_HOST_MEMORY_PER_CHILD_MIB),
+                fd_available: effective.host_fd_available,
+                fds_per_child: effective
+                    .host_fds_per_child
+                    .unwrap_or(DEFAULT_HOST_FDS_PER_CHILD),
+                disk_available_mib: effective.host_disk_available_mib,
+                disk_per_child_mib: effective
+                    .host_disk_per_child_mib
+                    .unwrap_or(DEFAULT_HOST_DISK_PER_CHILD_MIB),
+                fallback_children: effective
+                    .host_fallback_children
+                    .unwrap_or(DEFAULT_HOST_FALLBACK_CHILDREN),
+            },
+        );
+        let configured_bound = effective
+            .max_concurrent_children
+            .unwrap_or(entrypoint_bound);
+        let resolved_bound = entrypoint_bound
+            .min(configured_bound)
+            .min(provider_inflight_bound)
+            .min(host.resolved_children)
+            .max(1);
+        Ok(Self {
+            entrypoint_bound,
+            plan,
+            cli,
+            effective,
+            provider_inflight_bound,
+            provider_inflight_source: if effective.provider_inflight_limit.is_some() {
+                AdmissionInputSource::Configured
+            } else {
+                AdmissionInputSource::ConservativeDefault
+            },
+            host: SupervisorHostResourcePolicyInput::from_capacity(host, effective),
+            resolved_bound,
+        })
+    }
+}
+
+impl SupervisorHostResourcePolicyInput {
+    fn from_capacity(
+        capacity: HostResourceCapacity,
+        configured: SupervisorAdmissionConfig,
+    ) -> Self {
+        Self {
+            memory_available_mib: capacity.memory_available_mib,
+            memory_available_source: if configured.host_memory_available_mib.is_some() {
+                AdmissionInputSource::Configured
+            } else if capacity.memory_available_mib.is_some() {
+                AdmissionInputSource::Measured
+            } else {
+                AdmissionInputSource::ConservativeDefault
+            },
+            memory_per_child_mib: capacity.memory_per_child_mib,
+            memory_bound: capacity.memory_bound,
+            fd_available: capacity.fd_available,
+            fd_available_source: if configured.host_fd_available.is_some() {
+                AdmissionInputSource::Configured
+            } else if capacity.fd_available.is_some() {
+                AdmissionInputSource::Measured
+            } else {
+                AdmissionInputSource::ConservativeDefault
+            },
+            fds_per_child: capacity.fds_per_child,
+            fd_bound: capacity.fd_bound,
+            disk_available_mib: capacity.disk_available_mib,
+            disk_available_source: if configured.host_disk_available_mib.is_some() {
+                AdmissionInputSource::Configured
+            } else if capacity.disk_available_mib.is_some() {
+                AdmissionInputSource::Measured
+            } else {
+                AdmissionInputSource::ConservativeDefault
+            },
+            disk_per_child_mib: capacity.disk_per_child_mib,
+            disk_bound: capacity.disk_bound,
+            fallback_children: capacity.fallback_children,
+            resolved_bound: capacity.resolved_children,
+        }
+    }
 }
 
 impl SupervisorBudgetConfig {
@@ -695,7 +938,7 @@ impl RuntimeModelCatalog {
     }
 }
 
-const SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION: u32 = 3;
+const SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct RoleEconomicsProfile {
@@ -788,6 +1031,8 @@ pub struct SupervisorConcurrencyReport {
     pub policy_input_observation: ProcessObservation,
     #[serde(default)]
     pub policy_input: Option<String>,
+    #[serde(default)]
+    pub policy_input_details: Option<SupervisorAdmissionPolicyInput>,
     #[serde(default)]
     pub policy_input_unavailable_reason: Option<String>,
     pub achieved_max_concurrent_children: usize,
@@ -965,6 +1210,7 @@ struct SupervisorPlanMetadata {
     assignment_schedule: Vec<AssignmentScheduleEntry>,
     coverage_gaps: Vec<SupervisorCoverageGap>,
     run_budget: SupervisorBudgetConfig,
+    admission: SupervisorAdmissionConfig,
     evidence_only_reaudit: Option<EvidenceOnlyReauditPlan>,
     generated_follow_up: Option<GeneratedFollowUpPlanContext>,
 }

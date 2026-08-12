@@ -202,6 +202,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
         assignment_schedule,
         coverage_gaps: Vec::new(),
         run_budget: SupervisorBudgetConfig::default(),
+        admission: SupervisorAdmissionConfig::default(),
         evidence_only_reaudit: None,
         generated_follow_up: None,
     };
@@ -328,6 +329,15 @@ fn supervisor_plan_metadata_from_value(
         })
         .transpose()?
         .unwrap_or_default();
+    let admission = value
+        .get("concurrency")
+        .map(|concurrency| {
+            serde_json::from_value::<SupervisorAdmissionConfig>(concurrency.clone())
+                .context("concurrency is invalid")?
+                .validate()
+        })
+        .transpose()?
+        .unwrap_or_default();
     let evidence_only_reaudit = value
         .get("evidence_only_reaudit")
         .map(|operation| {
@@ -350,6 +360,7 @@ fn supervisor_plan_metadata_from_value(
     let mut metadata = SupervisorPlanMetadata {
         spec_fragment_ids,
         run_budget,
+        admission,
         evidence_only_reaudit,
         generated_follow_up,
         ..SupervisorPlanMetadata::default()
@@ -776,6 +787,13 @@ pub(super) fn supervisor_plan_value(
                 .context("failed to serialize run_budget plan field")?,
         );
     }
+    if !plan_metadata.admission.is_unconfigured() {
+        object.insert(
+            "concurrency".to_string(),
+            serde_json::to_value(plan_metadata.admission)
+                .context("failed to serialize concurrency plan field")?,
+        );
+    }
     if let Some(operation) = &plan_metadata.evidence_only_reaudit {
         object.insert(
             "evidence_only_reaudit".to_string(),
@@ -1174,6 +1192,7 @@ pub fn reaudit_supervisor_assignment(
         codex_bin: request.codex_bin,
         runtime: request.runtime,
         allow_dirty_primary: request.allow_dirty_primary,
+        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         machine_global_retention: request.machine_global_retention,
     };
     let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
@@ -1317,6 +1336,7 @@ pub(super) fn evidence_only_reaudit_plan_from_source(
         }],
         coverage_gaps: Vec::new(),
         run_budget: source_loaded.plan_metadata.run_budget,
+        admission: source_loaded.plan_metadata.admission,
         evidence_only_reaudit: Some(operation),
         generated_follow_up: None,
     };

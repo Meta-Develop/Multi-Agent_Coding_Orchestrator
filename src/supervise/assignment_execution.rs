@@ -2992,6 +2992,7 @@ mod decomposition_tests {
             codex_bin: PathBuf::from("unused-codex"),
             runtime: SupervisorRuntime::Fake,
             allow_dirty_primary: false,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
                 config: temp.path().join("unused-machine-global.json"),
                 root_id: "runtime".to_string(),
@@ -3276,6 +3277,7 @@ mod decomposition_tests {
             codex_bin: PathBuf::from("unused-codex"),
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             machine_global_retention: None,
         };
         let command = ExternalAgentCommand::codex(
@@ -3368,6 +3370,7 @@ done
             codex_bin: agent.clone(),
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
                 config: config.clone(),
                 root_id: "runtime".to_string(),
