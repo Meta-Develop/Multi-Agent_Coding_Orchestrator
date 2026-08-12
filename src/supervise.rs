@@ -42,9 +42,9 @@ use crate::{
     pre_action_review::{RatioMetric, RepoPathRule, ReviewContext, ReviewMetricSnapshot},
     process_runner::{
         read_bounded_regular_file_nofollow, run_process, trusted_system_executable,
-        EnvironmentMode, HostProcessCapacity, ProcessCancellation, ProcessSpec,
-        ProcessTreeEvidence, SideEffectConfinementEvidence, SideEffectConfinementProfile,
-        StdinMode, StrictOfflineWorkspaceProfile, WorkspaceAccess,
+        EnvironmentMode, HostProcessCapacity, HostResourceCapacity, HostResourceInputs,
+        ProcessCancellation, ProcessSpec, ProcessTreeEvidence, SideEffectConfinementEvidence,
+        SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile, WorkspaceAccess,
     },
     review::{
         aggregate_review_lenses_against_requests, build_review_lens_request,
@@ -181,7 +181,9 @@ const LICENSED_BREAKAGE_AUDIT_VALIDATION_NAME: &str = "licensed_breakage_declara
 const MIN_SUPERVISOR_DEPTH: u8 = 2;
 const MAX_SUPERVISOR_DEPTH: u8 = 32;
 const SUPERVISOR_SCHEMA_VERSION: u32 = 1;
-pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NAME: &str = "provisional-phase-a-hybrid-effort-v1";
+pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NAME: &str =
+    "provisional-phase-a-hybrid-model-tier-v2";
+pub const ALL_FRONTIER_PROFILE_NAME: &str = "all-frontier-v1";
 pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_EVIDENCE: &str =
     "provisional deterministic fake phase-A evidence";
 pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NOTICE: &str =
@@ -192,7 +194,10 @@ pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NOTICE: &str =
      contained, authenticated runtime-advertised model catalog and applies each role's declared \
      unavailable-model fallback; the upstream catalog may be cached when refresh fails, so \
      membership is runtime-advertised availability rather than a fresh entitlement guarantee";
-const DEFAULT_PROFILE_MODEL: &str = "gpt-5.6-sol";
+const FRONTIER_PROFILE_MODEL: &str = "gpt-5.6-sol";
+const BALANCED_PROFILE_MODEL: &str = "gpt-5.6-terra";
+const ECONOMY_PROFILE_MODEL: &str = "gpt-5.6-luna";
+const DEFAULT_PROFILE_MODEL: &str = FRONTIER_PROFILE_MODEL;
 const CODEX_MODEL_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const LENIENT_JSON_EXTRACTION_WARNING: &str = "report required lenient JSON extraction";
 const GITLINK_MODE: u32 = 0o160000;
@@ -311,6 +316,9 @@ pub struct SupervisorRunOptions {
     pub codex_bin: PathBuf,
     pub runtime: SupervisorRuntime,
     pub allow_dirty_primary: bool,
+    pub admission_overrides: SupervisorAdmissionConfig,
+    pub budget_overrides: RunBudgetLimits,
+    pub budget_max_duration_seconds: Option<u64>,
     /// Explicit reviewed binding for recoverable cleanup of every private
     /// output-staging directory created by this supervise run.
     ///
@@ -427,6 +435,248 @@ pub struct SupervisorBudgetConfig {
     pub role_token_reservations: BTreeMap<AgentRole, usize>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorAdmissionConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_children: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_inflight_limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_memory_available_mib: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_memory_per_child_mib: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_fd_available: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_fds_per_child: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_disk_available_mib: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_disk_per_child_mib: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_fallback_children: Option<usize>,
+}
+
+const DEFAULT_PROVIDER_INFLIGHT_LIMIT: usize = 4;
+const DEFAULT_HOST_MEMORY_PER_CHILD_MIB: usize = 1_024;
+const DEFAULT_HOST_FDS_PER_CHILD: usize = 128;
+const DEFAULT_HOST_DISK_PER_CHILD_MIB: usize = 512;
+const DEFAULT_HOST_FALLBACK_CHILDREN: usize = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionInputSource {
+    Configured,
+    ConservativeDefault,
+    Measured,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorHostResourcePolicyInput {
+    pub memory_available_mib: Option<usize>,
+    pub memory_available_source: AdmissionInputSource,
+    pub memory_per_child_mib: usize,
+    pub memory_bound: Option<usize>,
+    pub fd_available: Option<usize>,
+    pub fd_available_source: AdmissionInputSource,
+    pub fds_per_child: usize,
+    pub fd_bound: Option<usize>,
+    pub disk_available_mib: Option<usize>,
+    pub disk_available_source: AdmissionInputSource,
+    pub disk_per_child_mib: usize,
+    pub disk_bound: Option<usize>,
+    pub fallback_children: usize,
+    pub resolved_bound: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorAdmissionPolicyInput {
+    pub entrypoint_bound: usize,
+    pub plan: SupervisorAdmissionConfig,
+    pub cli: SupervisorAdmissionConfig,
+    pub effective: SupervisorAdmissionConfig,
+    pub provider_inflight_bound: usize,
+    pub provider_inflight_source: AdmissionInputSource,
+    pub host: SupervisorHostResourcePolicyInput,
+    pub resolved_bound: usize,
+}
+
+impl SupervisorAdmissionConfig {
+    fn is_unconfigured(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn validate(self) -> Result<Self> {
+        for (name, value) in [
+            ("max_concurrent_children", self.max_concurrent_children),
+            ("provider_inflight_limit", self.provider_inflight_limit),
+            ("host_memory_available_mib", self.host_memory_available_mib),
+            ("host_memory_per_child_mib", self.host_memory_per_child_mib),
+            ("host_fd_available", self.host_fd_available),
+            ("host_fds_per_child", self.host_fds_per_child),
+            ("host_disk_available_mib", self.host_disk_available_mib),
+            ("host_disk_per_child_mib", self.host_disk_per_child_mib),
+            ("host_fallback_children", self.host_fallback_children),
+        ] {
+            if value == Some(0) {
+                bail!("concurrency.{name} must be greater than zero");
+            }
+        }
+        Ok(self)
+    }
+
+    fn strictest(self, other: Self) -> Self {
+        fn min_optional(left: Option<usize>, right: Option<usize>) -> Option<usize> {
+            match (left, right) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (left, right) => left.or(right),
+            }
+        }
+        fn max_optional(left: Option<usize>, right: Option<usize>) -> Option<usize> {
+            match (left, right) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (left, right) => left.or(right),
+            }
+        }
+        Self {
+            max_concurrent_children: min_optional(
+                self.max_concurrent_children,
+                other.max_concurrent_children,
+            ),
+            provider_inflight_limit: min_optional(
+                self.provider_inflight_limit,
+                other.provider_inflight_limit,
+            ),
+            host_memory_available_mib: min_optional(
+                self.host_memory_available_mib,
+                other.host_memory_available_mib,
+            ),
+            host_memory_per_child_mib: max_optional(
+                self.host_memory_per_child_mib,
+                other.host_memory_per_child_mib,
+            ),
+            host_fd_available: min_optional(self.host_fd_available, other.host_fd_available),
+            host_fds_per_child: max_optional(self.host_fds_per_child, other.host_fds_per_child),
+            host_disk_available_mib: min_optional(
+                self.host_disk_available_mib,
+                other.host_disk_available_mib,
+            ),
+            host_disk_per_child_mib: max_optional(
+                self.host_disk_per_child_mib,
+                other.host_disk_per_child_mib,
+            ),
+            host_fallback_children: min_optional(
+                self.host_fallback_children,
+                other.host_fallback_children,
+            ),
+        }
+    }
+}
+
+impl SupervisorAdmissionPolicyInput {
+    fn resolve(
+        repo: &Path,
+        entrypoint_bound: usize,
+        plan: SupervisorAdmissionConfig,
+        cli: SupervisorAdmissionConfig,
+    ) -> Result<Self> {
+        validate_max_concurrent_children(entrypoint_bound)?;
+        let plan = plan.validate()?;
+        let cli = cli.validate()?;
+        let effective = plan.strictest(cli);
+        let provider_inflight_bound = effective
+            .provider_inflight_limit
+            .unwrap_or(DEFAULT_PROVIDER_INFLIGHT_LIMIT);
+        let host = HostProcessCapacity::supervisor_resources(
+            repo,
+            HostResourceInputs {
+                memory_available_mib: effective.host_memory_available_mib,
+                memory_per_child_mib: effective
+                    .host_memory_per_child_mib
+                    .unwrap_or(DEFAULT_HOST_MEMORY_PER_CHILD_MIB),
+                fd_available: effective.host_fd_available,
+                fds_per_child: effective
+                    .host_fds_per_child
+                    .unwrap_or(DEFAULT_HOST_FDS_PER_CHILD),
+                disk_available_mib: effective.host_disk_available_mib,
+                disk_per_child_mib: effective
+                    .host_disk_per_child_mib
+                    .unwrap_or(DEFAULT_HOST_DISK_PER_CHILD_MIB),
+                fallback_children: effective
+                    .host_fallback_children
+                    .unwrap_or(DEFAULT_HOST_FALLBACK_CHILDREN),
+            },
+        );
+        let configured_bound = effective
+            .max_concurrent_children
+            .unwrap_or(entrypoint_bound);
+        let resolved_bound = entrypoint_bound
+            .min(configured_bound)
+            .min(provider_inflight_bound)
+            .min(host.resolved_children)
+            .max(1);
+        Ok(Self {
+            entrypoint_bound,
+            plan,
+            cli,
+            effective,
+            provider_inflight_bound,
+            provider_inflight_source: if effective.provider_inflight_limit.is_some() {
+                AdmissionInputSource::Configured
+            } else {
+                AdmissionInputSource::ConservativeDefault
+            },
+            host: SupervisorHostResourcePolicyInput::from_capacity(host, effective),
+            resolved_bound,
+        })
+    }
+}
+
+impl SupervisorHostResourcePolicyInput {
+    fn from_capacity(
+        capacity: HostResourceCapacity,
+        configured: SupervisorAdmissionConfig,
+    ) -> Self {
+        Self {
+            memory_available_mib: capacity.memory_available_mib,
+            memory_available_source: if configured.host_memory_available_mib.is_some() {
+                AdmissionInputSource::Configured
+            } else if capacity.memory_available_mib.is_some() {
+                AdmissionInputSource::Measured
+            } else {
+                AdmissionInputSource::ConservativeDefault
+            },
+            memory_per_child_mib: capacity.memory_per_child_mib,
+            memory_bound: capacity.memory_bound,
+            fd_available: capacity.fd_available,
+            fd_available_source: if configured.host_fd_available.is_some() {
+                AdmissionInputSource::Configured
+            } else if capacity.fd_available.is_some() {
+                AdmissionInputSource::Measured
+            } else {
+                AdmissionInputSource::ConservativeDefault
+            },
+            fds_per_child: capacity.fds_per_child,
+            fd_bound: capacity.fd_bound,
+            disk_available_mib: capacity.disk_available_mib,
+            disk_available_source: if configured.host_disk_available_mib.is_some() {
+                AdmissionInputSource::Configured
+            } else if capacity.disk_available_mib.is_some() {
+                AdmissionInputSource::Measured
+            } else {
+                AdmissionInputSource::ConservativeDefault
+            },
+            disk_per_child_mib: capacity.disk_per_child_mib,
+            disk_bound: capacity.disk_bound,
+            fallback_children: capacity.fallback_children,
+            resolved_bound: capacity.resolved_children,
+        }
+    }
+}
+
 impl SupervisorBudgetConfig {
     fn is_unconfigured(&self) -> bool {
         self.limits.is_unconfigured() && self.role_token_reservations.is_empty()
@@ -453,19 +703,72 @@ pub struct RoleModelSelection {
     pub unavailable_model_fallback: UnavailableModelFallback,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnavailableModelFallback {
     #[default]
     FailClosed,
     RuntimeDefault,
     LocalDeterministicFake,
+    OrderedCatalogChain(OrderedCatalogFallback),
 }
 
 impl UnavailableModelFallback {
     const fn is_fail_closed(&self) -> bool {
         matches!(self, Self::FailClosed)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderedCatalogFallback {
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budget_degrade_models: Vec<String>,
+    #[serde(default)]
+    pub on_exhausted: TerminalUnavailableModelFallback,
+}
+
+impl OrderedCatalogFallback {
+    fn validate(&self, configured_model: Option<&str>) -> Result<()> {
+        if self.models.is_empty() {
+            bail!("ordered model fallback chain must contain at least one model");
+        }
+        let mut models = BTreeSet::new();
+        for model in &self.models {
+            if model.trim().is_empty() || model != model.trim() {
+                bail!("ordered model fallback chain entries must be non-empty and trimmed");
+            }
+            if !models.insert(model) {
+                bail!("ordered model fallback chain contains duplicate model '{model}'");
+            }
+            if configured_model == Some(model.as_str()) {
+                bail!("ordered model fallback chain repeats configured model '{model}'");
+            }
+        }
+        let mut degrade_models = BTreeSet::new();
+        for model in &self.budget_degrade_models {
+            if model.trim().is_empty() || model != model.trim() {
+                bail!("budget model downgrade entries must be non-empty and trimmed");
+            }
+            if !degrade_models.insert(model) {
+                bail!("budget model downgrade list contains duplicate model '{model}'");
+            }
+            if configured_model == Some(model.as_str()) {
+                bail!("budget model downgrade list repeats configured model '{model}'");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalUnavailableModelFallback {
+    #[default]
+    FailClosed,
+    RuntimeDefault,
+    LocalDeterministicFake,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -485,6 +788,14 @@ enum RuntimeModelCatalog {
 
 type RuntimeModelCatalogAcquisition =
     std::result::Result<RuntimeModelCatalog, Box<EnvironmentFailure>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoleModelResolution {
+    selection: RoleModelSelection,
+    observation: ModelResolutionObservation,
+    configured_model_chain: Vec<String>,
+    resolved_candidate_index: Option<usize>,
+}
 
 impl RuntimeModelCatalog {
     fn for_supervisor(
@@ -531,12 +842,11 @@ impl RuntimeModelCatalog {
         selections: impl IntoIterator<Item = RoleModelSelection>,
     ) -> RoleModelAvailability {
         match self {
-            Self::Codex(catalog) => {
-                if selections
-                    .into_iter()
-                    .filter_map(|selection| selection.model)
-                    .all(|model| catalog.contains(&model))
-                {
+            Self::Codex(_) => {
+                if selections.into_iter().all(|selection| {
+                    self.resolve_role_model_selection(&selection, SupervisorRuntime::Codex)
+                        .is_ok_and(|resolution| resolution.selection.model.is_some())
+                }) {
                     RoleModelAvailability::Available
                 } else {
                     RoleModelAvailability::Unavailable
@@ -545,9 +855,92 @@ impl RuntimeModelCatalog {
             Self::LocalDeterministicFake => RoleModelAvailability::Unavailable,
         }
     }
+
+    fn resolve_role_model_selection(
+        &self,
+        configured: &RoleModelSelection,
+        runtime: SupervisorRuntime,
+    ) -> Result<RoleModelResolution> {
+        let mut candidates = configured.model.iter().cloned().collect::<Vec<_>>();
+        let terminal = match &configured.unavailable_model_fallback {
+            UnavailableModelFallback::OrderedCatalogChain(chain) => {
+                chain.validate(configured.model.as_deref())?;
+                for model in &chain.models {
+                    candidates.push(model.clone());
+                }
+                chain.on_exhausted
+            }
+            UnavailableModelFallback::FailClosed => TerminalUnavailableModelFallback::FailClosed,
+            UnavailableModelFallback::RuntimeDefault => {
+                TerminalUnavailableModelFallback::RuntimeDefault
+            }
+            UnavailableModelFallback::LocalDeterministicFake => {
+                TerminalUnavailableModelFallback::LocalDeterministicFake
+            }
+        };
+        if candidates.is_empty() {
+            return Ok(RoleModelResolution {
+                selection: configured.clone(),
+                observation: ModelResolutionObservation::PreferredModel,
+                configured_model_chain: candidates,
+                resolved_candidate_index: None,
+            });
+        }
+        for (index, model) in candidates.iter().enumerate() {
+            if self.availability(Some(model), runtime)? == RoleModelAvailability::Available {
+                return Ok(RoleModelResolution {
+                    selection: RoleModelSelection {
+                        model: Some(model.clone()),
+                        reasoning_effort: configured.reasoning_effort.clone(),
+                        unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+                    },
+                    observation: if index == 0 {
+                        ModelResolutionObservation::PreferredModel
+                    } else {
+                        ModelResolutionObservation::CatalogFallback
+                    },
+                    configured_model_chain: candidates,
+                    resolved_candidate_index: Some(index),
+                });
+            }
+        }
+        let (selection, observation) = match terminal {
+            TerminalUnavailableModelFallback::FailClosed => {
+                bail!(
+                    "configured models [{}] are unavailable and the role fallback is fail_closed",
+                    candidates.join(", ")
+                )
+            }
+            TerminalUnavailableModelFallback::RuntimeDefault => (
+                RoleModelSelection {
+                    model: None,
+                    reasoning_effort: configured.reasoning_effort.clone(),
+                    unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+                },
+                ModelResolutionObservation::RuntimeDefault,
+            ),
+            TerminalUnavailableModelFallback::LocalDeterministicFake
+                if runtime == SupervisorRuntime::Fake =>
+            {
+                (
+                    RoleModelSelection::default(),
+                    ModelResolutionObservation::LocalDeterministicFake,
+                )
+            }
+            TerminalUnavailableModelFallback::LocalDeterministicFake => {
+                bail!("local_deterministic_fake fallback is valid only for the fake runtime")
+            }
+        };
+        Ok(RoleModelResolution {
+            selection,
+            observation,
+            configured_model_chain: candidates,
+            resolved_candidate_index: None,
+        })
+    }
 }
 
-const SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION: u32 = 2;
+const SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct RoleEconomicsProfile {
@@ -584,7 +977,54 @@ pub struct SupervisorExecutionMetadata {
     pub completed_assignment_count: usize,
     pub concurrency: SupervisorConcurrencyReport,
     pub role_bindings: BTreeMap<AgentRole, ResolvedRoleExecutionBinding>,
+    #[serde(default)]
+    pub budget_degradations: Vec<BudgetDegradationRecord>,
     pub usage: SupervisorExecutionUsageReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetDegradationRecord {
+    pub sequence: usize,
+    pub assignment_id: String,
+    pub budget_action: BudgetAction,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budget_reasons: Vec<BudgetReason>,
+    pub change: BudgetDegradationChange,
+    pub effective_child_model: Option<String>,
+    pub effective_child_reasoning_effort: Option<String>,
+    pub effective_fan_out: usize,
+    pub observation: BudgetDegradationObservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetDegradationObservation {
+    AdmissionPolicyResolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BudgetDegradationChange {
+    ReasoningEffort {
+        role: AgentRole,
+        before: String,
+        after: String,
+    },
+    ModelTier {
+        role: AgentRole,
+        before: String,
+        after: String,
+        resolved_candidate_index: usize,
+    },
+    FanOut {
+        before: usize,
+        after: usize,
+    },
+    Halt {
+        before_new_dispatch_allowed: bool,
+        after_new_dispatch_allowed: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -593,6 +1033,8 @@ pub struct SupervisorConcurrencyReport {
     pub policy_input_observation: ProcessObservation,
     #[serde(default)]
     pub policy_input: Option<String>,
+    #[serde(default)]
+    pub policy_input_details: Option<SupervisorAdmissionPolicyInput>,
     #[serde(default)]
     pub policy_input_unavailable_reason: Option<String>,
     pub achieved_max_concurrent_children: usize,
@@ -620,8 +1062,25 @@ pub struct ResolvedRoleExecutionBinding {
     pub resolved_model: Option<String>,
     pub resolved_reasoning_effort: Option<String>,
     pub observation: RoleBindingObservation,
+    #[serde(default)]
+    pub resolution_observation: ModelResolutionObservation,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configured_model_chain: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_candidate_index: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelResolutionObservation {
+    PreferredModel,
+    CatalogFallback,
+    RuntimeDefault,
+    LocalDeterministicFake,
+    #[default]
+    NotResolved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -632,6 +1091,7 @@ pub enum RoleBindingObservation {
     SyntheticFake,
     CatalogUnavailable,
     ResolutionFailed,
+    AssignmentSpecific,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -649,6 +1109,25 @@ const fn default_role_economics_profile_schema_version() -> u32 {
 }
 
 impl RoleModelSelection {
+    fn validate_model_fallback(&self) -> Result<()> {
+        if let UnavailableModelFallback::OrderedCatalogChain(chain) =
+            &self.unavailable_model_fallback
+        {
+            chain.validate(self.model.as_deref())?;
+        }
+        Ok(())
+    }
+
+    fn configured_model_chain(&self) -> Vec<String> {
+        let mut models = self.model.iter().cloned().collect::<Vec<_>>();
+        if let UnavailableModelFallback::OrderedCatalogChain(chain) =
+            &self.unavailable_model_fallback
+        {
+            models.extend(chain.models.iter().cloned());
+        }
+        models
+    }
+
     pub fn resolve_for_availability(
         &self,
         availability: RoleModelAvailability,
@@ -666,7 +1145,7 @@ impl RoleModelSelection {
             }
             return Ok(self.clone());
         }
-        match self.unavailable_model_fallback {
+        match &self.unavailable_model_fallback {
             UnavailableModelFallback::FailClosed => {
                 bail!("configured model is unavailable and the role fallback is fail_closed")
             }
@@ -682,6 +1161,9 @@ impl RoleModelSelection {
             }
             UnavailableModelFallback::LocalDeterministicFake => {
                 bail!("local_deterministic_fake fallback is valid only for the fake runtime")
+            }
+            UnavailableModelFallback::OrderedCatalogChain(_) => {
+                bail!("ordered model fallback chains require a runtime model catalog")
             }
         }
     }
@@ -730,6 +1212,8 @@ struct SupervisorPlanMetadata {
     assignment_schedule: Vec<AssignmentScheduleEntry>,
     coverage_gaps: Vec<SupervisorCoverageGap>,
     run_budget: SupervisorBudgetConfig,
+    run_budget_max_duration_seconds: Option<u64>,
+    admission: SupervisorAdmissionConfig,
     evidence_only_reaudit: Option<EvidenceOnlyReauditPlan>,
     generated_follow_up: Option<GeneratedFollowUpPlanContext>,
 }
@@ -2427,9 +2911,14 @@ impl SupervisorPlan {
         for (role, selection) in &self.role_models {
             role_models.insert(*role, selection.clone());
         }
+        let profile_name = if self.role_models == all_frontier_role_models() {
+            ALL_FRONTIER_PROFILE_NAME
+        } else {
+            PROVISIONAL_DEFAULT_HYBRID_PROFILE_NAME
+        };
         RoleEconomicsProfile {
             schema_version: SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION,
-            name: PROVISIONAL_DEFAULT_HYBRID_PROFILE_NAME.to_string(),
+            name: profile_name.to_string(),
             evidence: PROVISIONAL_DEFAULT_HYBRID_PROFILE_EVIDENCE.to_string(),
             evidence_notice: PROVISIONAL_DEFAULT_HYBRID_PROFILE_NOTICE.to_string(),
             production_eligible: false,
@@ -2927,9 +3416,36 @@ struct AssignmentExecutionContext<'a, 'writer> {
     semantic_block_gate: Option<&'a SemanticBlockGate>,
     artifacts: &'a Mutex<SharedSupervisorArtifacts<'writer>>,
     budget_ledger: &'a RunBudgetLedger,
+    budget_policy: AssignmentBudgetPolicy,
+    admission_commit: Option<AdmissionCommitSignal>,
     runtime_model_catalog: &'a RuntimeModelCatalog,
     cancellation: ProcessCancellation,
     external_runner: &'a CancellableExternalRunner<'a>,
+}
+
+#[derive(Clone)]
+struct AdmissionCommitSignal {
+    sender: mpsc::SyncSender<()>,
+    notified: Arc<AtomicBool>,
+}
+
+impl AdmissionCommitSignal {
+    fn new() -> (Self, mpsc::Receiver<()>) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        (
+            Self {
+                sender,
+                notified: Arc::new(AtomicBool::new(false)),
+            },
+            receiver,
+        )
+    }
+
+    fn notify(&self) {
+        if !self.notified.swap(true, Ordering::SeqCst) {
+            let _ = self.sender.send(());
+        }
+    }
 }
 
 enum DispatchBudgetAdmission<'a> {
@@ -3174,7 +3690,16 @@ fn test_runtime_model_catalog(
                 AgentRole::Auditor,
             ]
             .into_iter()
-            .filter_map(|role| effective_role_model_selection(plan, role).model)
+            .flat_map(|role| {
+                let selection = effective_role_model_selection(plan, role);
+                let mut models = selection.configured_model_chain();
+                if let UnavailableModelFallback::OrderedCatalogChain(chain) =
+                    selection.unavailable_model_fallback
+                {
+                    models.extend(chain.budget_degrade_models);
+                }
+                models
+            })
             .chain(
                 plan.review_lenses
                     .iter()

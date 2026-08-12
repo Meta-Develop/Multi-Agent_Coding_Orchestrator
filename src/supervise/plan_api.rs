@@ -202,6 +202,8 @@ fn supervisor_plan_and_consultant_from_goal_spec(
         assignment_schedule,
         coverage_gaps: Vec::new(),
         run_budget: SupervisorBudgetConfig::default(),
+        run_budget_max_duration_seconds: None,
+        admission: SupervisorAdmissionConfig::default(),
         evidence_only_reaudit: None,
         generated_follow_up: None,
     };
@@ -244,6 +246,11 @@ pub(super) fn parse_supervisor_plan_with_consultant(
     let consultant = consultant_from_plan_value(&value)?;
     let mut plan: SupervisorPlan =
         serde_json::from_value(value.clone()).context("supervisor plan fields are invalid")?;
+    for (role, selection) in &plan.role_models {
+        selection
+            .validate_model_fallback()
+            .with_context(|| format!("role_models.{} fallback is invalid", role.as_str()))?;
+    }
     let plan_metadata = supervisor_plan_metadata_from_value(&value, plan.max_depth)?;
     plan.assignments = assignments_from_plan_value(&value)?;
     let (plan, plan_metadata) = validate_supervisor_plan(plan, plan_metadata)?;
@@ -315,11 +322,36 @@ fn supervisor_plan_metadata_from_value(
     max_depth: u8,
 ) -> Result<SupervisorPlanMetadata> {
     let spec_fragment_ids = optional_string_array(value, "spec_fragment_ids")?;
-    let run_budget = value
+    let (run_budget, run_budget_max_duration_seconds) = value
         .get("run_budget")
-        .map(|budget| {
-            serde_json::from_value::<SupervisorBudgetConfig>(budget.clone())
-                .context("run_budget is invalid")
+        .map(|budget| -> Result<(SupervisorBudgetConfig, Option<u64>)> {
+            let mut budget = budget
+                .as_object()
+                .context("run_budget must be an object")?
+                .clone();
+            let max_duration_seconds = budget
+                .remove("max_duration_seconds")
+                .map(|duration| -> Result<u64> {
+                    let duration = serde_json::from_value::<u64>(duration)
+                        .context("run_budget.max_duration_seconds must be a positive integer")?;
+                    if duration == 0 {
+                        bail!("run_budget.max_duration_seconds must be greater than zero");
+                    }
+                    Ok(duration)
+                })
+                .transpose()?;
+            let config = serde_json::from_value::<SupervisorBudgetConfig>(Value::Object(budget))
+                .context("run_budget is invalid")?;
+            Ok((config, max_duration_seconds))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let admission = value
+        .get("concurrency")
+        .map(|concurrency| {
+            serde_json::from_value::<SupervisorAdmissionConfig>(concurrency.clone())
+                .context("concurrency is invalid")?
+                .validate()
         })
         .transpose()?
         .unwrap_or_default();
@@ -345,6 +377,8 @@ fn supervisor_plan_metadata_from_value(
     let mut metadata = SupervisorPlanMetadata {
         spec_fragment_ids,
         run_budget,
+        run_budget_max_duration_seconds,
+        admission,
         evidence_only_reaudit,
         generated_follow_up,
         ..SupervisorPlanMetadata::default()
@@ -764,11 +798,22 @@ pub(super) fn supervisor_plan_value(
                 .context("failed to serialize plan coverage gaps")?,
         );
     }
-    if !plan_metadata.run_budget.is_unconfigured() {
+    if !plan_metadata.run_budget.is_unconfigured()
+        || plan_metadata.run_budget_max_duration_seconds.is_some()
+    {
         object.insert(
             "run_budget".to_string(),
-            serde_json::to_value(&plan_metadata.run_budget)
-                .context("failed to serialize run_budget plan field")?,
+            supervisor_run_budget_value(
+                &plan_metadata.run_budget,
+                plan_metadata.run_budget_max_duration_seconds,
+            )?,
+        );
+    }
+    if !plan_metadata.admission.is_unconfigured() {
+        object.insert(
+            "concurrency".to_string(),
+            serde_json::to_value(plan_metadata.admission)
+                .context("failed to serialize concurrency plan field")?,
         );
     }
     if let Some(operation) = &plan_metadata.evidence_only_reaudit {
@@ -793,8 +838,10 @@ pub(super) fn supervisor_plan_value(
         );
         object.insert(
             "run_budget".to_string(),
-            serde_json::to_value(&plan_metadata.run_budget)
-                .context("failed to serialize generated follow-up run_budget field")?,
+            supervisor_run_budget_value(
+                &plan_metadata.run_budget,
+                plan_metadata.run_budget_max_duration_seconds,
+            )?,
         );
     }
     if !consultant.is_default() || plan_metadata.generated_follow_up.is_some() {
@@ -803,6 +850,24 @@ pub(super) fn supervisor_plan_value(
             serde_json::to_value(consultant)
                 .context("failed to serialize consultant plan field")?,
         );
+    }
+    Ok(value)
+}
+
+fn supervisor_run_budget_value(
+    run_budget: &SupervisorBudgetConfig,
+    max_duration_seconds: Option<u64>,
+) -> Result<Value> {
+    let mut value =
+        serde_json::to_value(run_budget).context("failed to serialize run_budget plan field")?;
+    if let Some(max_duration_seconds) = max_duration_seconds {
+        value
+            .as_object_mut()
+            .context("serialized run_budget must be an object")?
+            .insert(
+                "max_duration_seconds".to_string(),
+                Value::from(max_duration_seconds),
+            );
     }
     Ok(value)
 }
@@ -1169,6 +1234,9 @@ pub fn reaudit_supervisor_assignment(
         codex_bin: request.codex_bin,
         runtime: request.runtime,
         allow_dirty_primary: request.allow_dirty_primary,
+        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+        budget_overrides: crate::supervise::RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
         machine_global_retention: request.machine_global_retention,
     };
     let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
@@ -1312,6 +1380,10 @@ pub(super) fn evidence_only_reaudit_plan_from_source(
         }],
         coverage_gaps: Vec::new(),
         run_budget: source_loaded.plan_metadata.run_budget,
+        run_budget_max_duration_seconds: source_loaded
+            .plan_metadata
+            .run_budget_max_duration_seconds,
+        admission: source_loaded.plan_metadata.admission,
         evidence_only_reaudit: Some(operation),
         generated_follow_up: None,
     };

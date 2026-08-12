@@ -688,14 +688,14 @@ fn concurrency_policy_parses_auto_and_positive_limits_with_auto_default() {
 }
 
 #[test]
-fn concurrency_policy_resolves_auto_from_pinned_host_capacity() {
+fn concurrency_policy_auto_is_independent_of_cpu_parallelism() {
     let capacity = HostProcessCapacity::from_parallelism(
         NonZeroUsize::new(13).expect("test capacity is non-zero"),
     );
     assert_eq!(
         SupervisorConcurrencyPolicy::Auto.resolve(capacity),
-        13,
-        "auto must preserve the measured capacity without a fixed ceiling"
+        4,
+        "network-bound auto admission must not silently equal CPU parallelism"
     );
     assert_eq!(
         SupervisorConcurrencyPolicy::Fixed(NonZeroUsize::new(1).expect("serial limit is non-zero"))
@@ -706,11 +706,11 @@ fn concurrency_policy_resolves_auto_from_pinned_host_capacity() {
 }
 
 #[test]
-fn concurrency_policy_auto_uses_globally_pinned_test_capacity() {
+fn concurrency_policy_auto_uses_conservative_network_default() {
     assert_eq!(
         SupervisorConcurrencyPolicy::Auto.resolve(HostProcessCapacity::measured()),
-        3,
-        "test auto admission must share the three-lane containment capacity"
+        4,
+        "supervise admission must remain independent of containment CPU slots"
     );
 }
 

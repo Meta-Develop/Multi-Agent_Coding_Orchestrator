@@ -49,6 +49,9 @@ pub(super) fn execute_supervisor_assignment(
     if let Some(tracker) = outcome.gate_tracker.take() {
         tracker.move_into_outcome(&mut outcome);
     }
+    if let Some(signal) = &context.admission_commit {
+        signal.notify();
+    }
     outcome
 }
 
@@ -525,6 +528,7 @@ fn prepare_child_attempt<'a>(
         field_guide,
         artifacts,
         budget_ledger,
+        budget_policy,
         runtime_model_catalog,
         ..
     } = context;
@@ -552,6 +556,11 @@ fn prepare_child_attempt<'a>(
         max_attempts > 1,
     );
     let corrective_retry_used = retry_feedback.is_some();
+    let budget_plan = budget_policy.apply(plan);
+    let resolved_prompt_plan = evidence_only_reaudit
+        .is_none()
+        .then(|| runtime_resolved_prompt_plan(&budget_plan, options.runtime, runtime_model_catalog))
+        .transpose()?;
     let RenderedPromptWithMeasurements {
         prompt,
         mut measurements,
@@ -580,7 +589,7 @@ fn prepare_child_attempt<'a>(
     } else {
         render_child_orchestrator_prompt_with_incoming_root_and_field_guide(
             ChildOrchestratorPromptContext {
-                plan,
+                plan: resolved_prompt_plan.as_ref().unwrap_or(&budget_plan),
                 assignment,
                 run_dir,
                 worktree,
@@ -661,11 +670,11 @@ fn prepare_child_attempt<'a>(
         &attempt_artifacts.prompt_path,
         &attempt_artifacts.log_path,
         &attempt_artifacts.report_path,
-        Duration::from_secs(plan.child_timeout_seconds),
+        Duration::from_secs(budget_plan.child_timeout_seconds),
     );
     command = apply_role_model_selection(
         command,
-        plan,
+        &budget_plan,
         assignment.role,
         options.runtime,
         runtime_model_catalog,
@@ -729,7 +738,7 @@ fn prepare_child_attempt<'a>(
         bail!("descriptor-held invocation scratch roots changed during setup");
     }
     let budget_reservation = match reserve_dispatch_budget(
-        plan,
+        &budget_plan,
         budget_config,
         budget_ledger,
         assignment.role,
@@ -754,6 +763,9 @@ fn prepare_child_attempt<'a>(
             return Ok(AssignmentExecutionDisposition::Complete);
         }
     };
+    if let Some(signal) = &context.admission_commit {
+        signal.notify();
+    }
     Ok(AssignmentExecutionDisposition::Continue(
         PreparedChildAttempt {
             attempt_artifacts,
@@ -2980,6 +2992,9 @@ mod decomposition_tests {
             codex_bin: PathBuf::from("unused-codex"),
             runtime: SupervisorRuntime::Fake,
             allow_dirty_primary: false,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
             machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
                 config: temp.path().join("unused-machine-global.json"),
                 root_id: "runtime".to_string(),
@@ -3053,6 +3068,8 @@ mod decomposition_tests {
             semantic_block_gate: None,
             artifacts: &artifacts,
             budget_ledger: &budget_ledger,
+            budget_policy: AssignmentBudgetPolicy::default(),
+            admission_commit: None,
             runtime_model_catalog: &runtime_model_catalog,
             cancellation,
             external_runner: &runner,
@@ -3262,6 +3279,9 @@ mod decomposition_tests {
             codex_bin: PathBuf::from("unused-codex"),
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
             machine_global_retention: None,
         };
         let command = ExternalAgentCommand::codex(
@@ -3354,6 +3374,9 @@ done
             codex_bin: agent.clone(),
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
             machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
                 config: config.clone(),
                 root_id: "runtime".to_string(),

@@ -149,7 +149,7 @@ fn concurrent_disjoint_assignments_make_progress_and_finalize_in_plan_order() {
 }
 
 #[test]
-fn auto_policy_serializes_overlap_without_head_of_line_blocking() {
+fn network_auto_policy_serializes_overlap_without_head_of_line_blocking() {
     #[derive(Default)]
     struct ScheduleState {
         events: Vec<String>,
@@ -209,7 +209,7 @@ fn auto_policy_serializes_overlap_without_head_of_line_blocking() {
         SupervisorConcurrencyPolicy::Auto.resolve(HostProcessCapacity::from_parallelism(
             NonZeroUsize::new(2).expect("test capacity is non-zero"),
         ));
-    assert_eq!(auto_bound, 2);
+    assert_eq!(auto_bound, 4);
     let report = run_supervisor_plan_with_concurrent_runner(
         plan,
         SupervisorConsultantPlan::default(),

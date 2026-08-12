@@ -395,6 +395,9 @@ pub(super) fn run_generated_follow_up_cascade(
             codex_bin: supervisor_template.codex_bin.clone(),
             runtime: supervisor_template.runtime,
             allow_dirty_primary: supervisor_template.allow_dirty_primary,
+            admission_overrides: supervisor_template.admission_overrides,
+            budget_overrides: supervisor_template.budget_overrides,
+            budget_max_duration_seconds: supervisor_template.budget_max_duration_seconds,
             machine_global_retention: Some(retention.clone()),
         };
         let result = run_follow_up_supervisor_loaded_plan(

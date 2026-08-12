@@ -3,7 +3,8 @@ use super::*;
 /// Admission policy for concurrently runnable supervisor children.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SupervisorConcurrencyPolicy {
-    /// Use the same measured, cgroup-aware process capacity as strict systemd containment.
+    /// Use the conservative network-bound child default before quota and host-resource inputs
+    /// are composed by admission preflight.
     ///
     /// The issue #24 swarm-health circuit breaker remains the admission safety backstop: higher
     /// default fan-out never bypasses its pre-dispatch check or active-child drain behavior.
@@ -18,6 +19,13 @@ impl SupervisorConcurrencyPolicy {
         match self {
             Self::Auto => capacity.supervisor_children(),
             Self::Fixed(limit) => limit.get(),
+        }
+    }
+
+    pub(crate) const fn configured_limit(self) -> Option<usize> {
+        match self {
+            Self::Auto => None,
+            Self::Fixed(limit) => Some(limit.get()),
         }
     }
 }
@@ -237,7 +245,6 @@ struct AssignmentSchedulerContext<'context, 'writer> {
     runtime_model_catalog: &'context RuntimeModelCatalog,
     external_runner: &'context CancellableExternalRunner<'context>,
     release_per_assignment: bool,
-    max_concurrent_children: usize,
 }
 
 struct SchedulerProgress {
@@ -247,10 +254,11 @@ struct SchedulerProgress {
     budget_denied_assignment_indices: BTreeSet<usize>,
     circuit_breaker_trip: Option<CircuitBreakerTrip>,
     concurrency: SchedulerConcurrencyTracker,
+    budget_degradation: BudgetDegradationController,
 }
 
 impl SchedulerProgress {
-    fn new(assignment_count: usize) -> Self {
+    fn new(assignment_count: usize, max_concurrent_children: usize) -> Self {
         Self {
             indexed_outcomes: (0..assignment_count).map(|_| None).collect(),
             health_breaker: SwarmHealthCircuitBreaker::default(),
@@ -258,7 +266,244 @@ impl SchedulerProgress {
             budget_denied_assignment_indices: BTreeSet::new(),
             circuit_breaker_trip: None,
             concurrency: SchedulerConcurrencyTracker::new(),
+            budget_degradation: BudgetDegradationController::new(max_concurrent_children),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct AssignmentBudgetPolicy {
+    role_models: BTreeMap<AgentRole, RoleModelSelection>,
+}
+
+impl AssignmentBudgetPolicy {
+    pub(super) fn apply(&self, plan: &SupervisorPlan) -> SupervisorPlan {
+        let mut effective = plan.clone();
+        for (role, selection) in &self.role_models {
+            effective.role_models.insert(*role, selection.clone());
+        }
+        effective
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum BudgetDegradationRung {
+    #[default]
+    Effort,
+    ModelTier,
+    FanOut,
+    Exhausted,
+}
+
+#[derive(Debug, Clone)]
+struct BudgetDegradationController {
+    rung: BudgetDegradationRung,
+    policy: AssignmentBudgetPolicy,
+    effective_fan_out: usize,
+    records: Vec<BudgetDegradationRecord>,
+    last_new_dispatch_allowed: bool,
+}
+
+impl BudgetDegradationController {
+    fn new(max_concurrent_children: usize) -> Self {
+        Self {
+            rung: BudgetDegradationRung::Effort,
+            policy: AssignmentBudgetPolicy::default(),
+            effective_fan_out: max_concurrent_children.max(1),
+            records: Vec::new(),
+            last_new_dispatch_allowed: true,
+        }
+    }
+
+    fn assignment_policy(
+        &mut self,
+        assignment_id: &str,
+        report: &RunBudgetReport,
+        plan: &SupervisorPlan,
+        catalog: &RuntimeModelCatalog,
+        runtime: SupervisorRuntime,
+    ) -> Result<Option<AssignmentBudgetPolicy>> {
+        if !report.new_dispatch_allowed || report.action == BudgetAction::OwnerEscalation {
+            self.record_halt(assignment_id, report);
+            return Ok(None);
+        }
+        if report.action == BudgetAction::Degrade
+            && report.reasons.iter().any(|reason| {
+                matches!(
+                    reason,
+                    BudgetReason::SoftTokenCeilingReached | BudgetReason::SoftCostCeilingReached
+                )
+            })
+        {
+            self.advance(assignment_id, report, plan, catalog, runtime)?;
+        }
+        self.last_new_dispatch_allowed = report.new_dispatch_allowed;
+        Ok(Some(self.policy.clone()))
+    }
+
+    fn advance(
+        &mut self,
+        assignment_id: &str,
+        report: &RunBudgetReport,
+        plan: &SupervisorPlan,
+        catalog: &RuntimeModelCatalog,
+        runtime: SupervisorRuntime,
+    ) -> Result<()> {
+        let change = match self.rung {
+            BudgetDegradationRung::Effort => {
+                let mut selection = self
+                    .policy
+                    .role_models
+                    .get(&AgentRole::ChildOrchestrator)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        effective_role_model_selection(plan, AgentRole::ChildOrchestrator)
+                    });
+                let before = selection
+                    .reasoning_effort
+                    .clone()
+                    .unwrap_or_else(|| "runtime_default".to_string());
+                let after = lower_reasoning_effort(&before).to_string();
+                selection.reasoning_effort = Some(after.clone());
+                self.policy
+                    .role_models
+                    .insert(AgentRole::ChildOrchestrator, selection);
+                self.rung = BudgetDegradationRung::ModelTier;
+                BudgetDegradationChange::ReasoningEffort {
+                    role: AgentRole::ChildOrchestrator,
+                    before,
+                    after,
+                }
+            }
+            BudgetDegradationRung::ModelTier => {
+                let configured = self
+                    .policy
+                    .role_models
+                    .get(&AgentRole::ChildOrchestrator)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        effective_role_model_selection(plan, AgentRole::ChildOrchestrator)
+                    });
+                let resolved = catalog.resolve_role_model_selection(&configured, runtime)?;
+                let Some(before) = resolved.selection.model.clone() else {
+                    self.rung = BudgetDegradationRung::FanOut;
+                    return self.advance(assignment_id, report, plan, catalog, runtime);
+                };
+                let candidates = match &configured.unavailable_model_fallback {
+                    UnavailableModelFallback::OrderedCatalogChain(chain) => {
+                        &chain.budget_degrade_models
+                    }
+                    _ => {
+                        self.rung = BudgetDegradationRung::FanOut;
+                        return self.advance(assignment_id, report, plan, catalog, runtime);
+                    }
+                };
+                let Some((resolved_candidate_index, after)) = candidates
+                    .iter()
+                    .enumerate()
+                    .find(|(_, model)| {
+                        model.as_str() != before
+                            && catalog
+                                .availability(Some(model.as_str()), runtime)
+                                .is_ok_and(|availability| {
+                                    availability == RoleModelAvailability::Available
+                                })
+                    })
+                    .map(|(index, model)| (index, model.clone()))
+                else {
+                    self.rung = BudgetDegradationRung::FanOut;
+                    return self.advance(assignment_id, report, plan, catalog, runtime);
+                };
+                self.policy.role_models.insert(
+                    AgentRole::ChildOrchestrator,
+                    RoleModelSelection {
+                        model: Some(after.clone()),
+                        reasoning_effort: resolved.selection.reasoning_effort,
+                        unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+                    },
+                );
+                self.rung = BudgetDegradationRung::FanOut;
+                BudgetDegradationChange::ModelTier {
+                    role: AgentRole::ChildOrchestrator,
+                    before,
+                    after,
+                    resolved_candidate_index,
+                }
+            }
+            BudgetDegradationRung::FanOut => {
+                let before = self.effective_fan_out;
+                self.effective_fan_out = (before / 2).max(1);
+                self.rung = BudgetDegradationRung::Exhausted;
+                if self.effective_fan_out == before {
+                    return Ok(());
+                }
+                BudgetDegradationChange::FanOut {
+                    before,
+                    after: self.effective_fan_out,
+                }
+            }
+            BudgetDegradationRung::Exhausted => return Ok(()),
+        };
+        let effective = self
+            .policy
+            .role_models
+            .get(&AgentRole::ChildOrchestrator)
+            .cloned()
+            .unwrap_or_else(|| effective_role_model_selection(plan, AgentRole::ChildOrchestrator));
+        let resolved = catalog.resolve_role_model_selection(&effective, runtime)?;
+        self.records.push(BudgetDegradationRecord {
+            sequence: self.records.len().saturating_add(1),
+            assignment_id: assignment_id.to_string(),
+            budget_action: report.action,
+            budget_reasons: report.reasons.clone(),
+            change,
+            effective_child_model: resolved.selection.model,
+            effective_child_reasoning_effort: resolved.selection.reasoning_effort,
+            effective_fan_out: self.effective_fan_out,
+            observation: BudgetDegradationObservation::AdmissionPolicyResolved,
+        });
+        Ok(())
+    }
+
+    fn record_halt(&mut self, assignment_id: &str, report: &RunBudgetReport) {
+        if self.records.iter().any(|record| {
+            record.assignment_id == assignment_id
+                && matches!(record.change, BudgetDegradationChange::Halt { .. })
+        }) {
+            return;
+        }
+        self.records.push(BudgetDegradationRecord {
+            sequence: self.records.len().saturating_add(1),
+            assignment_id: assignment_id.to_string(),
+            budget_action: report.action,
+            budget_reasons: report.reasons.clone(),
+            change: BudgetDegradationChange::Halt {
+                before_new_dispatch_allowed: self.last_new_dispatch_allowed,
+                after_new_dispatch_allowed: report.new_dispatch_allowed,
+            },
+            effective_child_model: self
+                .policy
+                .role_models
+                .get(&AgentRole::ChildOrchestrator)
+                .and_then(|selection| selection.model.clone()),
+            effective_child_reasoning_effort: self
+                .policy
+                .role_models
+                .get(&AgentRole::ChildOrchestrator)
+                .and_then(|selection| selection.reasoning_effort.clone()),
+            effective_fan_out: self.effective_fan_out,
+            observation: BudgetDegradationObservation::AdmissionPolicyResolved,
+        });
+    }
+}
+
+fn lower_reasoning_effort(effort: &str) -> &str {
+    match effort {
+        "xhigh" => "high",
+        "high" => "medium",
+        "medium" => "low",
+        "low" | "minimal" => "minimal",
+        _ => "low",
     }
 }
 
@@ -485,16 +730,20 @@ fn run_serial_assignment_schedule(
         if !progress.health_breaker.permits_admission() {
             break;
         }
-        if !context
+        let budget_report = context
             .budget_ledger
             .report()
-            .context("failed to inspect run budget before serial admission")?
-            .new_dispatch_allowed
-        {
+            .context("failed to inspect run budget before serial admission")?;
+        if !budget_report.new_dispatch_allowed {
             progress.budget_prevented_dispatch = true;
             progress
                 .budget_denied_assignment_indices
                 .extend(pending.iter().copied());
+            for index in &pending {
+                progress
+                    .budget_degradation
+                    .record_halt(&context.plan.assignments[*index].id, &budget_report);
+            }
             break;
         }
         let mut next = None;
@@ -511,6 +760,20 @@ fn run_serial_assignment_schedule(
         }
         let Some(index) = next else {
             bail!("supervisor scheduler could not select a hierarchy-ready pending assignment");
+        };
+        let Some(budget_policy) = progress.budget_degradation.assignment_policy(
+            &context.plan.assignments[index].id,
+            &budget_report,
+            context.plan,
+            context.runtime_model_catalog,
+            context.options.runtime,
+        )?
+        else {
+            progress.budget_prevented_dispatch = true;
+            progress
+                .budget_denied_assignment_indices
+                .extend(pending.iter().copied());
+            break;
         };
         pending.remove(&index);
         let assignment = &context.plan.assignments[index];
@@ -552,6 +815,8 @@ fn run_serial_assignment_schedule(
             semantic_block_gate: None,
             artifacts: context.artifacts,
             budget_ledger: context.budget_ledger,
+            budget_policy,
+            admission_commit: None,
             runtime_model_catalog: context.runtime_model_catalog,
             cancellation: cancellation.clone(),
             external_runner: context.external_runner,
@@ -631,21 +896,25 @@ fn run_concurrent_assignment_schedule(
                     context.assignment_schedule,
                     context.artifacts,
                 )?;
-                while active.len() < context.max_concurrent_children {
+                while active.len() < progress.budget_degradation.effective_fan_out {
                     if !progress.health_breaker.permits_admission() {
                         stop_scheduling = true;
                         break;
                     }
-                    if !context
+                    let budget_report = context
                         .budget_ledger
                         .report()
-                        .context("failed to inspect run budget before concurrent admission")?
-                        .new_dispatch_allowed
-                    {
+                        .context("failed to inspect run budget before concurrent admission")?;
+                    if !budget_report.new_dispatch_allowed {
                         progress.budget_prevented_dispatch |= !pending.is_empty();
                         progress
                             .budget_denied_assignment_indices
                             .extend(pending.iter().copied());
+                        for index in &pending {
+                            progress
+                                .budget_degradation
+                                .record_halt(&context.plan.assignments[*index].id, &budget_report);
+                        }
                         stop_scheduling = true;
                         break;
                     }
@@ -659,6 +928,24 @@ fn run_concurrent_assignment_schedule(
                     let Some(index) = next else {
                         break;
                     };
+                    let Some(budget_policy) = progress.budget_degradation.assignment_policy(
+                        &context.plan.assignments[index].id,
+                        &budget_report,
+                        context.plan,
+                        context.runtime_model_catalog,
+                        context.options.runtime,
+                    )?
+                    else {
+                        progress.budget_prevented_dispatch |= !pending.is_empty();
+                        progress
+                            .budget_denied_assignment_indices
+                            .extend(pending.iter().copied());
+                        stop_scheduling = true;
+                        break;
+                    };
+                    if active.len() >= progress.budget_degradation.effective_fan_out {
+                        break;
+                    }
                     pending.remove(&index);
                     let assignment = &context.plan.assignments[index];
                     record_assignment_started_checkpoint(
@@ -677,6 +964,7 @@ fn run_concurrent_assignment_schedule(
                     let completion_sender = completion_sender.clone();
                     let assignment_cancellation = cancellation.clone();
                     let concurrency = progress.concurrency.clone();
+                    let (admission_commit, admission_receiver) = AdmissionCommitSignal::new();
                     let spawn_result = thread::Builder::new().spawn_scoped(scope, move || {
                         let _completion = CompletionSignal {
                             index,
@@ -719,6 +1007,8 @@ fn run_concurrent_assignment_schedule(
                             semantic_block_gate: semantic_block_order.map(|_| semantic_block_gate),
                             artifacts: context.artifacts,
                             budget_ledger: context.budget_ledger,
+                            budget_policy,
+                            admission_commit: Some(admission_commit),
                             runtime_model_catalog: context.runtime_model_catalog,
                             cancellation: assignment_cancellation,
                             external_runner: context.external_runner,
@@ -727,6 +1017,12 @@ fn run_concurrent_assignment_schedule(
                     match spawn_result {
                         Ok(handle) => {
                             active.insert(index, handle);
+                            admission_receiver.recv().with_context(|| {
+                                format!(
+                                    "supervisor assignment '{}' ended before committing or declining budget admission",
+                                    assignment.id
+                                )
+                            })?;
                         }
                         Err(error) => {
                             cancellation.cancel();
@@ -871,6 +1167,7 @@ struct SupervisorFinalReportConstruction<'context> {
     plan: &'context SupervisorPlan,
     runtime_model_catalog: Option<&'context RuntimeModelCatalog>,
     max_concurrent_children: usize,
+    admission_policy_input: SupervisorAdmissionPolicyInput,
     achieved_concurrency: AchievedConcurrency,
     has_multiple_independent_assignment_scopes: bool,
     run_id: RunId,
@@ -880,6 +1177,7 @@ struct SupervisorFinalReportConstruction<'context> {
     publishable: bool,
     success: bool,
     run_budget_report: Option<RunBudgetReport>,
+    budget_degradations: Vec<BudgetDegradationRecord>,
     evidence_only_reaudit: Option<EvidenceOnlyReauditPlan>,
     role_usage: BTreeMap<AgentRole, RoleUsageReport>,
     review_lens_usage: Vec<ReviewLensUsageReport>,
@@ -948,43 +1246,66 @@ fn resolved_role_execution_bindings(
     .into_iter()
     .map(|role| {
         let configured = effective_role_model_selection(plan, role);
-        let (resolved_model, resolved_reasoning_effort, observation, unavailable_reason) =
+        let (
+            resolved_model,
+            resolved_reasoning_effort,
+            observation,
+            resolution_observation,
+            configured_model_chain,
+            resolved_candidate_index,
+            unavailable_reason,
+        ) =
             match runtime_model_catalog {
                 None => (
                     None,
                     None,
                     RoleBindingObservation::CatalogUnavailable,
+                    ModelResolutionObservation::NotResolved,
+                    configured.configured_model_chain(),
+                    None,
                     Some(
                         "runtime model catalog acquisition failed before role selection could be resolved"
                             .to_string(),
                     ),
                 ),
-                Some(_) if runtime == SupervisorRuntime::Fake => (
-                    None,
-                    None,
-                    RoleBindingObservation::SyntheticFake,
-                    Some(
-                        "the deterministic fake runtime does not execute a provider model or reasoning effort"
-                            .to_string(),
-                    ),
-                ),
+                Some(catalog) if runtime == SupervisorRuntime::Fake => {
+                    let resolution = catalog.resolve_role_model_selection(&configured, runtime);
+                    let resolution_observation = resolution
+                        .as_ref()
+                        .map(|resolution| resolution.observation)
+                        .unwrap_or(ModelResolutionObservation::NotResolved);
+                    (
+                        None,
+                        None,
+                        RoleBindingObservation::SyntheticFake,
+                        resolution_observation,
+                        configured.configured_model_chain(),
+                        None,
+                        Some(
+                            "the deterministic fake runtime does not execute a provider model or reasoning effort"
+                                .to_string(),
+                        ),
+                    )
+                }
                 Some(catalog) => {
-                    let resolved = catalog
-                        .availability(configured.model.as_deref(), runtime)
-                        .and_then(|availability| {
-                            configured.resolve_for_availability(availability, runtime)
-                        });
+                    let resolved = catalog.resolve_role_model_selection(&configured, runtime);
                     match resolved {
-                        Ok(resolved) if resolved.model.is_some() => (
-                            resolved.model,
-                            resolved.reasoning_effort,
+                        Ok(resolved) if resolved.selection.model.is_some() => (
+                            resolved.selection.model,
+                            resolved.selection.reasoning_effort,
                             RoleBindingObservation::RuntimeCatalogResolved,
+                            resolved.observation,
+                            resolved.configured_model_chain,
+                            resolved.resolved_candidate_index,
                             None,
                         ),
                         Ok(resolved) => (
                             None,
-                            resolved.reasoning_effort,
+                            resolved.selection.reasoning_effort,
                             RoleBindingObservation::RuntimeDefaultResolved,
+                            resolved.observation,
+                            resolved.configured_model_chain,
+                            resolved.resolved_candidate_index,
                             Some(
                                 "the runtime-default fallback was selected, so the concrete provider model slug is not process-observable"
                                     .to_string(),
@@ -994,6 +1315,9 @@ fn resolved_role_execution_bindings(
                             None,
                             None,
                             RoleBindingObservation::ResolutionFailed,
+                            ModelResolutionObservation::NotResolved,
+                            configured.configured_model_chain(),
+                            None,
                             Some(format!("role model resolution failed: {error:#}")),
                         ),
                     }
@@ -1007,6 +1331,9 @@ fn resolved_role_execution_bindings(
                 resolved_model,
                 resolved_reasoning_effort,
                 observation,
+                resolution_observation,
+                configured_model_chain,
+                resolved_candidate_index,
                 unavailable_reason,
             },
         )
@@ -1074,6 +1401,7 @@ fn build_supervisor_final_report(
         plan,
         runtime_model_catalog,
         max_concurrent_children,
+        admission_policy_input,
         achieved_concurrency,
         has_multiple_independent_assignment_scopes,
         run_id,
@@ -1083,6 +1411,7 @@ fn build_supervisor_final_report(
         publishable,
         success,
         run_budget_report,
+        budget_degradations,
         evidence_only_reaudit,
         role_usage,
         review_lens_usage,
@@ -1120,6 +1449,26 @@ fn build_supervisor_final_report(
     let role_usage = complete_role_usage_reports(role_usage);
     let mut role_economics_profile =
         execution_role_economics_profile(plan, runtime, runtime_model_catalog);
+    let mut role_bindings = resolved_role_execution_bindings(plan, runtime, runtime_model_catalog);
+    if budget_degradations.iter().any(|record| {
+        matches!(
+            record.change,
+            BudgetDegradationChange::ReasoningEffort { .. }
+                | BudgetDegradationChange::ModelTier { .. }
+        )
+    }) {
+        if let Some(binding) = role_bindings.get_mut(&AgentRole::ChildOrchestrator) {
+            binding.resolved_model = None;
+            binding.resolved_reasoning_effort = None;
+            binding.observation = RoleBindingObservation::AssignmentSpecific;
+            binding.resolution_observation = ModelResolutionObservation::NotResolved;
+            binding.resolved_candidate_index = None;
+            binding.unavailable_reason = Some(
+                "budget pressure produced assignment-specific child model or effort bindings; inspect budget_degradations for the resolved per-assignment policy and commands_run for process evidence"
+                    .to_string(),
+            );
+        }
+    }
     if has_multiple_independent_assignment_scopes && achieved_concurrency.peak == 1 {
         collected.findings.push(Finding {
             severity: FindingSeverity::Warning,
@@ -1136,12 +1485,13 @@ fn build_supervisor_final_report(
         completed_assignment_count: achieved_concurrency.completed_assignment_count,
         concurrency: SupervisorConcurrencyReport {
             configured_max_concurrent_children: max_concurrent_children,
-            policy_input_observation: ProcessObservation::NotRetained,
-            policy_input: None,
-            policy_input_unavailable_reason: Some(
-                "the scheduler receives only the resolved concurrency bound; the originating auto-versus-fixed policy input is not retained at the scheduler reporting boundary"
-                    .to_string(),
+            policy_input_observation: ProcessObservation::SchedulerObserved,
+            policy_input: Some(
+                serde_json::to_string(&admission_policy_input)
+                    .expect("admission policy input is JSON serializable"),
             ),
+            policy_input_details: Some(admission_policy_input),
+            policy_input_unavailable_reason: None,
             achieved_max_concurrent_children: achieved_concurrency.peak,
             achieved_mean_concurrent_children: achieved_concurrency.mean,
             achieved_mean_observation: if achieved_concurrency.mean.is_some() {
@@ -1153,7 +1503,8 @@ fn build_supervisor_final_report(
                 "no assignment execution interval was observed by the scheduler".to_string()
             }),
         },
-        role_bindings: resolved_role_execution_bindings(plan, runtime, runtime_model_catalog),
+        role_bindings,
+        budget_degradations,
         usage: supervisor_execution_usage_report(total_usage, total_cost_usd, usage_complete),
     });
     SupervisorFinalReport {
@@ -1628,6 +1979,8 @@ struct PreparedSupervisorRun {
     consultant: SupervisorConsultantPlan,
     assignment_metadata: AssignmentMetadata,
     plan_metadata: SupervisorPlanMetadata,
+    max_concurrent_children: usize,
+    admission_policy_input: SupervisorAdmissionPolicyInput,
     runtime_model_catalog: RuntimeModelCatalogAcquisition,
     budget_ledger: RunBudgetLedger,
     runtime: SupervisorRuntime,
@@ -1653,11 +2006,24 @@ fn prepare_supervisor_run(
         plan,
         consultant,
         assignment_metadata,
-        plan_metadata,
+        mut plan_metadata,
     } = loaded;
     validate_max_concurrent_children(max_concurrent_children)?;
-    let budget_ledger = RunBudgetLedger::new(plan_metadata.run_budget.limits)
-        .context("failed to initialize the supervise run budget ledger")?;
+    plan_metadata.run_budget.limits = plan_metadata
+        .run_budget
+        .limits
+        .strictest(options.budget_overrides)
+        .context("failed to compose plan and CLI run budgets")?;
+    let max_duration_seconds = match (
+        plan_metadata.run_budget_max_duration_seconds,
+        options.budget_max_duration_seconds,
+    ) {
+        (Some(plan), Some(cli)) => Some(plan.min(cli)),
+        (plan, cli) => plan.or(cli),
+    };
+    let budget_ledger =
+        RunBudgetLedger::new_with_duration(plan_metadata.run_budget.limits, max_duration_seconds)
+            .context("failed to initialize the supervise run budget ledger")?;
     match worktree_creation {
         SupervisorWorktreeCreation::Bound(_)
             if execution_runtime != SupervisorExecutionRuntime::Verified =>
@@ -1679,6 +2045,13 @@ fn prepare_supervisor_run(
     }
     let runtime = options.runtime;
     let repo = discover_repo_root(&options.repo)?;
+    let admission_policy_input = SupervisorAdmissionPolicyInput::resolve(
+        &repo,
+        max_concurrent_children,
+        plan_metadata.admission,
+        options.admission_overrides,
+    )?;
+    let max_concurrent_children = admission_policy_input.resolved_bound;
     let evidence_only_reaudit = plan_metadata
         .evidence_only_reaudit
         .as_ref()
@@ -1724,6 +2097,8 @@ fn prepare_supervisor_run(
         consultant,
         assignment_metadata,
         plan_metadata,
+        max_concurrent_children,
+        admission_policy_input,
         runtime_model_catalog,
         budget_ledger,
         runtime,
@@ -1748,6 +2123,7 @@ struct RuntimeModelCatalogFailureFinalization<'context, 'checkpoint> {
     checkpoint_writer: &'checkpoint mut SupervisorCheckpointWriter,
     run_dir: &'context Path,
     max_concurrent_children: usize,
+    admission_policy_input: SupervisorAdmissionPolicyInput,
     has_multiple_independent_assignment_scopes: bool,
 }
 
@@ -1765,6 +2141,7 @@ fn persist_runtime_model_catalog_environment_failure(
         checkpoint_writer,
         run_dir,
         max_concurrent_children,
+        admission_policy_input,
         has_multiple_independent_assignment_scopes,
     } = finalization;
     let run_budget_report = budget_ledger.report()?;
@@ -1781,6 +2158,7 @@ fn persist_runtime_model_catalog_environment_failure(
         plan,
         runtime_model_catalog: None,
         max_concurrent_children,
+        admission_policy_input,
         achieved_concurrency: AchievedConcurrency::default(),
         has_multiple_independent_assignment_scopes,
         run_id: options.run_id.clone(),
@@ -1790,6 +2168,7 @@ fn persist_runtime_model_catalog_environment_failure(
         publishable: false,
         success: false,
         run_budget_report: Some(run_budget_report.clone()),
+        budget_degradations: Vec::new(),
         evidence_only_reaudit: plan_metadata.evidence_only_reaudit.clone(),
         role_usage: BTreeMap::new(),
         review_lens_usage: Vec::new(),
@@ -1846,6 +2225,8 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         consultant,
         assignment_metadata,
         plan_metadata,
+        max_concurrent_children,
+        admission_policy_input,
         runtime_model_catalog,
         budget_ledger,
         runtime,
@@ -1882,6 +2263,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                     checkpoint_writer: &mut checkpoint_writer,
                     run_dir: &run_dir,
                     max_concurrent_children,
+                    admission_policy_input,
                     has_multiple_independent_assignment_scopes:
                         has_multiple_independent_assignment_scopes(
                             &assignment_schedule,
@@ -1912,6 +2294,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     let mut primary_run_baseline = None;
     let mut budget_prevented_dispatch = false;
     let mut budget_denied_assignment_indices = BTreeSet::new();
+    let mut budget_degradations = Vec::new();
     let mut circuit_breaker_trip = None;
     let mut achieved_concurrency = AchievedConcurrency::default();
     let run_result = (|| -> Result<()> {
@@ -1959,7 +2342,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 .map(|_| PreparedSemanticAssignment::default())
                 .collect()
         };
-        let (scheduler_result, progress) = {
+        let (scheduler_result, mut progress) = {
             let cancellation = ProcessCancellation::new();
             let shared_artifacts = Mutex::new(SharedSupervisorArtifacts {
                 writer: &mut artifact_writer,
@@ -1969,7 +2352,8 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
             });
             let semantic_block_gate = SemanticBlockGate::default();
             let serial_semantic_warn_intents = Mutex::new(Vec::<(usize, SemanticIntent)>::new());
-            let mut progress = SchedulerProgress::new(plan.assignments.len());
+            let mut progress =
+                SchedulerProgress::new(plan.assignments.len(), max_concurrent_children);
             let scheduler_context = AssignmentSchedulerContext {
                 plan: &plan,
                 budget_config,
@@ -1994,7 +2378,6 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 runtime_model_catalog: &runtime_model_catalog,
                 external_runner,
                 release_per_assignment,
-                max_concurrent_children,
             };
             let scheduler_result = if max_concurrent_children == 1 {
                 if let Err(error) = run_serial_assignment_schedule(
@@ -2005,8 +2388,18 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 ) {
                     achieved_concurrency = progress.concurrency.finish();
                     budget_prevented_dispatch |= progress.budget_prevented_dispatch;
+                    if let Ok(report) = budget_ledger.report() {
+                        if !report.new_dispatch_allowed {
+                            for index in &progress.budget_denied_assignment_indices {
+                                progress
+                                    .budget_degradation
+                                    .record_halt(&plan.assignments[*index].id, &report);
+                            }
+                        }
+                    }
                     budget_denied_assignment_indices
                         .extend(progress.budget_denied_assignment_indices);
+                    budget_degradations.append(&mut progress.budget_degradation.records);
                     circuit_breaker_trip = progress.circuit_breaker_trip;
                     return Err(error);
                 }
@@ -2023,7 +2416,17 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         };
         achieved_concurrency = progress.concurrency.finish();
         budget_prevented_dispatch |= progress.budget_prevented_dispatch;
+        if let Ok(report) = budget_ledger.report() {
+            if !report.new_dispatch_allowed {
+                for index in &progress.budget_denied_assignment_indices {
+                    progress
+                        .budget_degradation
+                        .record_halt(&plan.assignments[*index].id, &report);
+                }
+            }
+        }
         budget_denied_assignment_indices.extend(progress.budget_denied_assignment_indices);
+        budget_degradations.append(&mut progress.budget_degradation.records);
         circuit_breaker_trip = progress.circuit_breaker_trip;
 
         let fatal_errors = collect_indexed_assignment_outcomes(
@@ -2251,6 +2654,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         plan: &plan,
         runtime_model_catalog: Some(&runtime_model_catalog),
         max_concurrent_children,
+        admission_policy_input,
         achieved_concurrency,
         has_multiple_independent_assignment_scopes: has_multiple_independent_assignment_scopes(
             &assignment_schedule,
@@ -2263,6 +2667,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         publishable,
         success,
         run_budget_report,
+        budget_degradations,
         evidence_only_reaudit: plan_metadata.evidence_only_reaudit.clone(),
         role_usage,
         review_lens_usage,
@@ -2386,6 +2791,243 @@ mod decomposition_tests {
         }
     }
 
+    #[test]
+    fn role_binding_telemetry_retains_catalog_fallback_resolution() {
+        let plan = test_plan(Vec::new());
+        let catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs([FRONTIER_PROFILE_MODEL])
+                .expect("fallback catalog"),
+        );
+        let bindings =
+            resolved_role_execution_bindings(&plan, SupervisorRuntime::Codex, Some(&catalog));
+        let binding = &bindings[&AgentRole::ChildOrchestrator];
+        assert_eq!(
+            binding.configured_model.as_deref(),
+            Some(BALANCED_PROFILE_MODEL)
+        );
+        assert_eq!(
+            binding.resolved_model.as_deref(),
+            Some(FRONTIER_PROFILE_MODEL)
+        );
+        assert_eq!(
+            binding.observation,
+            RoleBindingObservation::RuntimeCatalogResolved
+        );
+        assert_eq!(
+            binding.resolution_observation,
+            ModelResolutionObservation::CatalogFallback
+        );
+        assert_eq!(binding.resolved_candidate_index, Some(1));
+        assert_eq!(
+            binding.configured_model_chain,
+            vec![
+                BALANCED_PROFILE_MODEL.to_string(),
+                FRONTIER_PROFILE_MODEL.to_string(),
+                ECONOMY_PROFILE_MODEL.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
+        let plan = test_plan(Vec::new());
+        let catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs([
+                FRONTIER_PROFILE_MODEL,
+                BALANCED_PROFILE_MODEL,
+                ECONOMY_PROFILE_MODEL,
+            ])
+            .expect("degradation catalog"),
+        );
+        let ledger = RunBudgetLedger::new(RunBudgetLimits {
+            soft_tokens: Some(1),
+            hard_tokens: Some(4),
+            soft_cost_usd: None,
+            hard_cost_usd: None,
+        })
+        .expect("degradation ledger");
+        let soft = ledger
+            .reserve(BudgetReservationRequest {
+                role: AgentRole::ChildOrchestrator,
+                tokens: 1,
+                cost_usd: None,
+            })
+            .expect("soft reservation")
+            .report()
+            .clone();
+        assert_eq!(soft.action, BudgetAction::Degrade);
+
+        let mut controller = BudgetDegradationController::new(8);
+        let effort_policy = controller
+            .assignment_policy(
+                "effort-assignment",
+                &soft,
+                &plan,
+                &catalog,
+                SupervisorRuntime::Codex,
+            )
+            .expect("effort degradation")
+            .expect("effort admission");
+        assert_eq!(
+            effort_policy.role_models[&AgentRole::ChildOrchestrator]
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
+        );
+        let model_policy = controller
+            .assignment_policy(
+                "model-assignment",
+                &soft,
+                &plan,
+                &catalog,
+                SupervisorRuntime::Codex,
+            )
+            .expect("model degradation")
+            .expect("model admission");
+        assert_eq!(
+            model_policy.role_models[&AgentRole::ChildOrchestrator]
+                .model
+                .as_deref(),
+            Some(ECONOMY_PROFILE_MODEL)
+        );
+        controller
+            .assignment_policy(
+                "fanout-assignment",
+                &soft,
+                &plan,
+                &catalog,
+                SupervisorRuntime::Codex,
+            )
+            .expect("fan-out degradation")
+            .expect("fan-out admission");
+        assert_eq!(controller.effective_fan_out, 4);
+
+        let hard = ledger
+            .reserve(BudgetReservationRequest {
+                role: AgentRole::ChildOrchestrator,
+                tokens: 3,
+                cost_usd: None,
+            })
+            .expect("hard reservation")
+            .report()
+            .clone();
+        assert_eq!(hard.action, BudgetAction::OwnerEscalation);
+        assert!(controller
+            .assignment_policy(
+                "halted-assignment",
+                &hard,
+                &plan,
+                &catalog,
+                SupervisorRuntime::Codex,
+            )
+            .expect("halt decision")
+            .is_none());
+
+        assert_eq!(controller.records.len(), 4);
+        assert!(matches!(
+            &controller.records[0].change,
+            BudgetDegradationChange::ReasoningEffort { before, after, .. }
+                if before == "xhigh" && after == "high"
+        ));
+        assert!(matches!(
+            &controller.records[1].change,
+            BudgetDegradationChange::ModelTier {
+                before,
+                after,
+                resolved_candidate_index: 0,
+                ..
+            } if before == BALANCED_PROFILE_MODEL && after == ECONOMY_PROFILE_MODEL
+        ));
+        assert_eq!(
+            controller.records[2].change,
+            BudgetDegradationChange::FanOut {
+                before: 8,
+                after: 4
+            }
+        );
+        assert_eq!(
+            controller.records[3].change,
+            BudgetDegradationChange::Halt {
+                before_new_dispatch_allowed: true,
+                after_new_dispatch_allowed: false
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&controller.records).expect("degradation artifact sample"),
+            json!([
+                {
+                    "sequence": 1,
+                    "assignment_id": "effort-assignment",
+                    "budget_action": "degrade",
+                    "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
+                    "change": {"kind": "reasoning_effort", "role": "child_orchestrator", "before": "xhigh", "after": "high"},
+                    "effective_child_model": BALANCED_PROFILE_MODEL,
+                    "effective_child_reasoning_effort": "high",
+                    "effective_fan_out": 8,
+                    "observation": "admission_policy_resolved"
+                },
+                {
+                    "sequence": 2,
+                    "assignment_id": "model-assignment",
+                    "budget_action": "degrade",
+                    "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
+                    "change": {"kind": "model_tier", "role": "child_orchestrator", "before": BALANCED_PROFILE_MODEL, "after": ECONOMY_PROFILE_MODEL, "resolved_candidate_index": 0},
+                    "effective_child_model": ECONOMY_PROFILE_MODEL,
+                    "effective_child_reasoning_effort": "high",
+                    "effective_fan_out": 8,
+                    "observation": "admission_policy_resolved"
+                },
+                {
+                    "sequence": 3,
+                    "assignment_id": "fanout-assignment",
+                    "budget_action": "degrade",
+                    "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
+                    "change": {"kind": "fan_out", "before": 8, "after": 4},
+                    "effective_child_model": ECONOMY_PROFILE_MODEL,
+                    "effective_child_reasoning_effort": "high",
+                    "effective_fan_out": 4,
+                    "observation": "admission_policy_resolved"
+                },
+                {
+                    "sequence": 4,
+                    "assignment_id": "halted-assignment",
+                    "budget_action": "owner_escalation",
+                    "budget_reasons": ["soft_token_ceiling_reached", "hard_token_ceiling_reached", "missing_pricing"],
+                    "change": {"kind": "halt", "before_new_dispatch_allowed": true, "after_new_dispatch_allowed": false},
+                    "effective_child_model": ECONOMY_PROFILE_MODEL,
+                    "effective_child_reasoning_effort": "high",
+                    "effective_fan_out": 4,
+                    "observation": "admission_policy_resolved"
+                }
+            ])
+        );
+        let mut construction = test_report_construction(
+            &plan,
+            RunId::new("budget-degradation-artifact").expect("run id"),
+        );
+        construction.budget_degradations = controller.records.clone();
+        let final_report = build_supervisor_final_report(construction);
+        assert_eq!(
+            final_report
+                .role_economics_profile
+                .as_ref()
+                .and_then(|profile| profile.execution.as_ref())
+                .expect("execution telemetry")
+                .budget_degradations,
+            controller.records
+        );
+        let schema = supervisor_final_report_schema_value();
+        let execution = &schema["properties"]["role_economics_profile"]["properties"]["execution"];
+        assert!(execution["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|field| field == "budget_degradations")));
+        assert_eq!(
+            execution["properties"]["budget_degradations"]["items"]["properties"]["change"]
+                ["oneOf"][2]["properties"]["kind"]["const"],
+            "fan_out"
+        );
+    }
+
     fn root_schedule(plan: &SupervisorPlan) -> Vec<AssignmentScheduleEntry> {
         plan.assignments
             .iter()
@@ -2408,6 +3050,9 @@ mod decomposition_tests {
             codex_bin: PathBuf::from("unused-test-codex"),
             runtime: SupervisorRuntime::Fake,
             allow_dirty_primary: true,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
             machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
                 config: repo.join("unused-machine-global.json"),
                 root_id: "runtime".to_string(),
@@ -2516,7 +3161,6 @@ mod decomposition_tests {
                 runtime_model_catalog: &runtime_model_catalog,
                 external_runner: &runner,
                 release_per_assignment: false,
-                max_concurrent_children: 2,
             };
             $body
         }};
@@ -2597,7 +3241,6 @@ mod decomposition_tests {
                 runtime_model_catalog: &runtime_model_catalog,
                 external_runner: &runner,
                 release_per_assignment: true,
-                max_concurrent_children: $max_children,
             };
             $body
         }};
@@ -2611,6 +3254,13 @@ mod decomposition_tests {
             plan,
             runtime_model_catalog: Some(&TEST_RUNTIME_MODEL_CATALOG),
             max_concurrent_children: 1,
+            admission_policy_input: SupervisorAdmissionPolicyInput::resolve(
+                Path::new("."),
+                1,
+                SupervisorAdmissionConfig::default(),
+                SupervisorAdmissionConfig::default(),
+            )
+            .expect("test admission policy"),
             achieved_concurrency: AchievedConcurrency::default(),
             has_multiple_independent_assignment_scopes: false,
             run_id,
@@ -2620,6 +3270,7 @@ mod decomposition_tests {
             publishable: false,
             success: true,
             run_budget_report: None,
+            budget_degradations: Vec::new(),
             evidence_only_reaudit: None,
             role_usage: BTreeMap::new(),
             review_lens_usage: Vec::new(),
@@ -2709,7 +3360,7 @@ mod decomposition_tests {
     #[test]
     fn serial_scheduler_preserves_schedule_error_context() {
         with_invalid_schedule_context!(context, {
-            let mut progress = SchedulerProgress::new(1);
+            let mut progress = SchedulerProgress::new(1, 1);
             let cancellation = ProcessCancellation::new();
             let serial_intents = Mutex::new(Vec::new());
             let error = run_serial_assignment_schedule(
@@ -2730,7 +3381,7 @@ mod decomposition_tests {
     #[test]
     fn concurrent_scheduler_preserves_schedule_error_context_before_spawning() {
         with_invalid_schedule_context!(context, {
-            let mut progress = SchedulerProgress::new(1);
+            let mut progress = SchedulerProgress::new(1, 1);
             let cancellation = ProcessCancellation::new();
             let semantic_block_gate = SemanticBlockGate::default();
             let error = run_concurrent_assignment_schedule(
@@ -2755,7 +3406,7 @@ mod decomposition_tests {
             vec![test_assignment("serial-child", "README.md")],
             1,
             {
-                let mut progress = SchedulerProgress::new(1);
+                let mut progress = SchedulerProgress::new(1, 2);
                 let cancellation = ProcessCancellation::new();
                 let serial_intents = Mutex::new(Vec::new());
 
@@ -2836,7 +3487,7 @@ mod decomposition_tests {
             ],
             2,
             {
-                let mut progress = SchedulerProgress::new(2);
+                let mut progress = SchedulerProgress::new(2, 2);
                 let cancellation = ProcessCancellation::new();
                 let semantic_block_gate = SemanticBlockGate::default();
 
@@ -3010,6 +3661,19 @@ mod decomposition_tests {
             .expect("new reports always carry execution metadata");
         assert_eq!(execution.assignment_count, 2);
         assert_eq!(execution.concurrency.configured_max_concurrent_children, 1);
+        assert_eq!(
+            execution
+                .concurrency
+                .policy_input_details
+                .as_ref()
+                .expect("retained policy input")
+                .resolved_bound,
+            1
+        );
+        assert_eq!(
+            execution.concurrency.policy_input_observation,
+            ProcessObservation::SchedulerObserved
+        );
         assert_eq!(execution.concurrency.achieved_max_concurrent_children, 0);
         assert!(execution.role_bindings.values().all(|binding| {
             binding.observation == RoleBindingObservation::SyntheticFake
@@ -3017,6 +3681,43 @@ mod decomposition_tests {
                 && binding.resolved_reasoning_effort.is_none()
         }));
         assert_eq!(report.role_usage.len(), 5);
+    }
+
+    #[test]
+    fn admission_resolution_uses_strictest_entrypoint_plan_quota_and_host_bound() {
+        let temp = tempfile::tempdir().expect("temporary admission repository");
+        let plan = SupervisorAdmissionConfig {
+            max_concurrent_children: Some(12),
+            provider_inflight_limit: Some(9),
+            host_memory_available_mib: Some(8_192),
+            host_memory_per_child_mib: Some(1_024),
+            host_fd_available: Some(640),
+            host_fds_per_child: Some(128),
+            host_disk_available_mib: Some(9_000),
+            host_disk_per_child_mib: Some(1_000),
+            host_fallback_children: Some(2),
+        };
+        let cli = SupervisorAdmissionConfig {
+            max_concurrent_children: Some(10),
+            provider_inflight_limit: Some(7),
+            host_fd_available: Some(384),
+            ..SupervisorAdmissionConfig::default()
+        };
+
+        let resolved = SupervisorAdmissionPolicyInput::resolve(temp.path(), 20, plan, cli)
+            .expect("resolve admission policy");
+
+        assert_eq!(resolved.effective.max_concurrent_children, Some(10));
+        assert_eq!(resolved.provider_inflight_bound, 7);
+        assert_eq!(resolved.host.memory_bound, Some(8));
+        assert_eq!(resolved.host.fd_bound, Some(3));
+        assert_eq!(resolved.host.disk_bound, Some(9));
+        assert_eq!(resolved.host.resolved_bound, 3);
+        assert_eq!(resolved.resolved_bound, 3);
+        assert_eq!(
+            resolved.provider_inflight_source,
+            AdmissionInputSource::Configured
+        );
     }
 
     #[test]
@@ -3088,9 +3789,9 @@ mod decomposition_tests {
     }
 
     #[test]
-    fn supervisor_final_economics_v2_fixture_covers_execution_contract() {
+    fn supervisor_final_economics_v4_fixture_covers_execution_contract() {
         let profile: RoleEconomicsProfile = serde_json::from_str(include_str!(
-            "../../tests/fixtures/supervise/supervisor-final-economics-v2.json"
+            "../../tests/fixtures/supervise/supervisor-final-economics-v4.json"
         ))
         .expect("parse supervisor-final economics fixture");
 
@@ -3106,6 +3807,14 @@ mod decomposition_tests {
         assert_eq!(execution.assignment_count, 2);
         assert_eq!(execution.concurrency.configured_max_concurrent_children, 2);
         assert_eq!(execution.concurrency.achieved_max_concurrent_children, 2);
+        assert_eq!(
+            execution
+                .concurrency
+                .policy_input_details
+                .expect("typed admission policy input")
+                .resolved_bound,
+            2
+        );
         assert_eq!(execution.role_bindings.len(), 5);
         assert_eq!(
             execution.usage.total_usage,
@@ -3200,6 +3909,57 @@ mod decomposition_tests {
                 .expect("prepared budget report")
                 .new_dispatch_allowed
         );
+    }
+
+    #[test]
+    fn preflight_composes_cli_budget_overrides_with_plan_by_strictest_limit() {
+        let (_temp, repo) = test_repository();
+        let mut metadata = SupervisorPlanMetadata::default();
+        metadata.run_budget.limits = RunBudgetLimits {
+            soft_tokens: Some(100),
+            hard_tokens: Some(200),
+            soft_cost_usd: Some(0.5),
+            hard_cost_usd: Some(1.0),
+        };
+        metadata.run_budget_max_duration_seconds = Some(600);
+        let loaded = LoadedSupervisorPlan {
+            plan: test_plan(vec![test_assignment("budgeted-child", "README.md")]),
+            consultant: SupervisorConsultantPlan::default(),
+            assignment_metadata: AssignmentMetadata::new(),
+            plan_metadata: metadata,
+        };
+        let mut options = test_options(&repo, "strictest-cli-plan-budget");
+        options.budget_overrides = RunBudgetLimits {
+            hard_tokens: Some(50),
+            hard_cost_usd: Some(0.4),
+            ..RunBudgetLimits::default()
+        };
+        options.budget_max_duration_seconds = Some(300);
+
+        let prepared = prepare_supervisor_run(
+            loaded,
+            &options,
+            1,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            SupervisorWorktreeCreation::TestOnly,
+            Ok(RuntimeModelCatalog::LocalDeterministicFake),
+        )
+        .expect("prepare run with CLI budget overrides");
+        let report = prepared
+            .budget_ledger
+            .report()
+            .expect("composed run budget report");
+
+        assert_eq!(
+            report.limits,
+            RunBudgetLimits {
+                soft_tokens: Some(50),
+                hard_tokens: Some(50),
+                soft_cost_usd: Some(0.4),
+                hard_cost_usd: Some(0.4),
+            }
+        );
+        assert_eq!(report.max_duration_seconds, Some(300));
     }
 
     #[test]

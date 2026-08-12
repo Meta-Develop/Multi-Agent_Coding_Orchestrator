@@ -31,6 +31,7 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
         "hard_tokens": 20,
         "soft_cost_usd": 0.01,
         "hard_cost_usd": 0.02,
+        "max_duration_seconds": 600,
         "role_token_reservations": {
             "child_orchestrator": 10,
             "auditor": 10
@@ -49,6 +50,10 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
             hard_cost_usd: Some(0.02),
         }
     );
+    assert_eq!(
+        loaded.plan_metadata.run_budget_max_duration_seconds,
+        Some(600)
+    );
     let normalized = supervisor_plan_value(
         &loaded.plan,
         &loaded.consultant,
@@ -57,6 +62,14 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
     )
     .expect("normalize budget plan");
     assert_eq!(normalized["run_budget"], budget_source["run_budget"]);
+
+    budget_source["run_budget"]["max_duration_seconds"] = json!(0);
+    assert!(parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&budget_source).expect("serialize invalid duration budget")
+    )
+    .expect_err("zero duration budget must fail")
+    .to_string()
+    .contains("run_budget.max_duration_seconds must be greater than zero"));
 
     let schema = supervisor_final_report_schema_value();
     let required = schema["properties"]["run_budget"]["required"]
@@ -67,6 +80,7 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
         "reserved",
         "committed",
         "remaining",
+        "elapsed_seconds",
         "usage_complete",
         "action",
         "new_dispatch_allowed",
@@ -82,6 +96,13 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
             .is_some_and(|reasons| reasons
                 .iter()
                 .any(|reason| reason == "missing_provider_usage"))
+    );
+    assert!(
+        schema["properties"]["run_budget"]["properties"]["reasons"]["items"]["enum"]
+            .as_array()
+            .is_some_and(|reasons| reasons
+                .iter()
+                .any(|reason| reason == "max_duration_reached"))
     );
     let autonomy = &schema["properties"]["autonomy_kpis"];
     let required = autonomy["required"]
@@ -435,6 +456,152 @@ fn budget_integration_concurrent_scheduler_cannot_oversubscribe_and_drains_admit
     assert!(report.findings.iter().any(|finding| finding
         .message
         .contains("run budget stopped one or more new dispatches")));
+}
+
+#[test]
+fn budget_integration_scheduler_applies_and_persists_degrade_ladder_before_halt() {
+    let (temp, repo_path) = injected_repository();
+    let assignments = (0..7)
+        .map(|index| {
+            injected_named_assignment(
+                &format!("degrade-child-{index}"),
+                &format!("degrade-{index}.txt"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let plan = injected_multi_plan(assignments.clone(), 0);
+    let budget = injected_run_budget(Some(10), Some(60), None, None, 10, 1);
+    let run_id = "budget-degrade-production-scheduler";
+    let mut options = injected_options(&repo_path, temp.path(), run_id);
+    options.admission_overrides = SupervisorAdmissionConfig {
+        provider_inflight_limit: Some(8),
+        host_memory_available_mib: Some(8_192),
+        host_memory_per_child_mib: Some(1_024),
+        host_fd_available: Some(1_024),
+        host_fds_per_child: Some(128),
+        host_disk_available_mib: Some(4_096),
+        host_disk_per_child_mib: Some(512),
+        ..SupervisorAdmissionConfig::default()
+    };
+    let child_bindings = Arc::new(Mutex::new(BTreeMap::<String, (String, String)>::new()));
+    let runner = {
+        let child_bindings = Arc::clone(&child_bindings);
+        let assignments = assignments.clone();
+        move |command: &ExternalAgentCommand| {
+            let name = command
+                .output_last_message
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default();
+            let assignment = assignments
+                .iter()
+                .find(|assignment| name.starts_with(&assignment.id))
+                .unwrap_or_else(|| panic!("missing assignment for {name}"));
+            if name.contains("review-auditor") {
+                let child = injected_child_report(assignment);
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(assignment, &child),
+                );
+            } else {
+                child_bindings
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(
+                        assignment.id.clone(),
+                        (
+                            command.model.clone().expect("resolved child model"),
+                            command
+                                .reasoning_effort
+                                .clone()
+                                .expect("resolved child effort"),
+                        ),
+                    );
+                write_injected_assignment_report(command, assignment);
+            }
+            write_injected_usage(command, 7, 3);
+            injected_verified_run(command)
+        }
+    };
+
+    let report = run_supervisor_plan_with_budget_and_concurrent_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        budget,
+        options,
+        8,
+        &runner,
+    )
+    .expect("finalize production scheduler degradation run");
+
+    assert!(
+        !report.success,
+        "hard halt must leave the final assignment pending"
+    );
+    let child_bindings = child_bindings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(child_bindings.len(), 6);
+    assert_eq!(
+        child_bindings["degrade-child-0"],
+        (BALANCED_PROFILE_MODEL.to_string(), "xhigh".to_string())
+    );
+    assert_eq!(
+        child_bindings["degrade-child-1"],
+        (BALANCED_PROFILE_MODEL.to_string(), "high".to_string())
+    );
+    assert_eq!(
+        child_bindings["degrade-child-2"],
+        (ECONOMY_PROFILE_MODEL.to_string(), "high".to_string())
+    );
+    assert!(!child_bindings.contains_key("degrade-child-6"));
+
+    let execution = report
+        .role_economics_profile
+        .as_ref()
+        .and_then(|profile| profile.execution.as_ref())
+        .expect("execution telemetry");
+    assert_eq!(execution.budget_degradations.len(), 4);
+    assert!(matches!(
+        execution.budget_degradations[0].change,
+        BudgetDegradationChange::ReasoningEffort { .. }
+    ));
+    assert!(matches!(
+        execution.budget_degradations[1].change,
+        BudgetDegradationChange::ModelTier { .. }
+    ));
+    assert_eq!(
+        execution.budget_degradations[2].change,
+        BudgetDegradationChange::FanOut {
+            before: 8,
+            after: 4
+        }
+    );
+    assert!(matches!(
+        execution.budget_degradations[3].change,
+        BudgetDegradationChange::Halt { .. }
+    ));
+    assert_eq!(
+        execution.role_bindings[&AgentRole::ChildOrchestrator].observation,
+        RoleBindingObservation::AssignmentSpecific
+    );
+
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            repo_path
+                .join(RunArtifactFamily::Supervise.run_root())
+                .join(run_id)
+                .join(RunArtifactFamily::Supervise.final_report_relative_path()),
+        )
+        .expect("persisted supervisor-final.json"),
+    )
+    .expect("parse persisted supervisor-final.json");
+    assert_eq!(
+        persisted["role_economics_profile"]["execution"]["budget_degradations"]
+            .as_array()
+            .map(Vec::len),
+        Some(4)
+    );
 }
 
 #[test]

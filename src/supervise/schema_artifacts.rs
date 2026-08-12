@@ -99,7 +99,8 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
         "type": "object",
         "additionalProperties": false,
         "required": [
-            "resolved_model", "resolved_reasoning_effort", "observation"
+            "resolved_model", "resolved_reasoning_effort", "observation",
+            "resolution_observation"
         ],
         "properties": {
             "configured_model": {"type": "string"},
@@ -110,9 +111,22 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                 "type": "string",
                 "enum": [
                     "runtime_catalog_resolved", "runtime_default_resolved", "synthetic_fake",
-                    "catalog_unavailable", "resolution_failed"
+                    "catalog_unavailable", "resolution_failed", "assignment_specific"
                 ]
             },
+            "resolution_observation": {
+                "type": "string",
+                "enum": [
+                    "preferred_model", "catalog_fallback", "runtime_default",
+                    "local_deterministic_fake", "not_resolved"
+                ]
+            },
+            "configured_model_chain": {
+                "type": "array",
+                "items": {"type": "string"},
+                "uniqueItems": true
+            },
+            "resolved_candidate_index": {"type": "integer", "minimum": 0},
             "unavailable_reason": {"type": "string"}
         }
     });
@@ -123,8 +137,44 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
             "model": {"type": "string"},
             "reasoning_effort": {"type": "string"},
             "unavailable_model_fallback": {
-                "type": "string",
-                "enum": ["fail_closed", "runtime_default", "local_deterministic_fake"]
+                "oneOf": [
+                    {
+                        "type": "string",
+                        "enum": ["fail_closed", "runtime_default", "local_deterministic_fake"]
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["ordered_catalog_chain"],
+                        "properties": {
+                            "ordered_catalog_chain": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["models", "on_exhausted"],
+                                "properties": {
+                                    "models": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "items": {"type": "string"},
+                                        "uniqueItems": true
+                                    },
+                                    "budget_degrade_models": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "uniqueItems": true
+                                    },
+                                    "on_exhausted": {
+                                        "type": "string",
+                                        "enum": [
+                                            "fail_closed", "runtime_default",
+                                            "local_deterministic_fake"
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                ]
             }
         }
     });
@@ -164,7 +214,7 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                 "additionalProperties": false,
                 "required": [
                     "assignment_count", "started_assignment_count", "completed_assignment_count",
-                    "concurrency", "role_bindings", "usage"
+                    "concurrency", "role_bindings", "budget_degradations", "usage"
                 ],
                 "properties": {
                     "assignment_count": {"type": "integer", "minimum": 0},
@@ -172,8 +222,88 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                     "completed_assignment_count": {"type": "integer", "minimum": 0},
                     "concurrency": concurrency_report_schema_value(),
                     "role_bindings": role_map_schema_value(role_binding),
+                    "budget_degradations": budget_degradation_records_schema_value(),
                     "usage": execution_usage_schema_value()
                 }
+            }
+        }
+    })
+}
+
+fn budget_degradation_records_schema_value() -> serde_json::Value {
+    let change = json!({
+        "oneOf": [
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "role", "before", "after"],
+                "properties": {
+                    "kind": {"const": "reasoning_effort"},
+                    "role": agent_role_schema_value(),
+                    "before": {"type": "string"},
+                    "after": {"type": "string"}
+                }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "role", "before", "after", "resolved_candidate_index"],
+                "properties": {
+                    "kind": {"const": "model_tier"},
+                    "role": agent_role_schema_value(),
+                    "before": {"type": "string"},
+                    "after": {"type": "string"},
+                    "resolved_candidate_index": {"type": "integer", "minimum": 0}
+                }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "before", "after"],
+                "properties": {
+                    "kind": {"const": "fan_out"},
+                    "before": {"type": "integer", "minimum": 1},
+                    "after": {"type": "integer", "minimum": 1}
+                }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "before_new_dispatch_allowed", "after_new_dispatch_allowed"],
+                "properties": {
+                    "kind": {"const": "halt"},
+                    "before_new_dispatch_allowed": {"type": "boolean"},
+                    "after_new_dispatch_allowed": {"type": "boolean"}
+                }
+            }
+        ]
+    });
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "sequence", "assignment_id", "budget_action", "budget_reasons", "change",
+                "effective_child_model", "effective_child_reasoning_effort", "effective_fan_out",
+                "observation"
+            ],
+            "properties": {
+                "sequence": {"type": "integer", "minimum": 1},
+                "assignment_id": {"type": "string", "minLength": 1},
+                "budget_action": {"type": "string", "enum": ["continue", "degrade", "owner_escalation"]},
+                "budget_reasons": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": [
+                        "soft_token_ceiling_reached", "hard_token_ceiling_reached",
+                        "soft_cost_ceiling_reached", "hard_cost_ceiling_reached",
+                        "max_duration_reached",
+                        "missing_pricing", "estimated_provider_usage", "missing_provider_usage",
+                        "missing_actual_cost"
+                    ]},
+                    "uniqueItems": true
+                },
+                "change": change
+                ,"effective_child_model": {"type": ["string", "null"]}
+                ,"effective_child_reasoning_effort": {"type": ["string", "null"]}
+                ,"effective_fan_out": {"type": "integer", "minimum": 1}
+                ,"observation": {"const": "admission_policy_resolved"}
             }
         }
     })
@@ -207,6 +337,7 @@ fn concurrency_report_schema_value() -> serde_json::Value {
         "additionalProperties": false,
         "required": [
             "configured_max_concurrent_children", "policy_input_observation", "policy_input",
+            "policy_input_details",
             "policy_input_unavailable_reason", "achieved_max_concurrent_children",
             "achieved_mean_concurrent_children", "achieved_mean_observation",
             "achieved_mean_unavailable_reason"
@@ -215,11 +346,80 @@ fn concurrency_report_schema_value() -> serde_json::Value {
             "configured_max_concurrent_children": {"type": "integer", "minimum": 1},
             "policy_input_observation": process_observation_schema_value(),
             "policy_input": {"type": ["string", "null"]},
+            "policy_input_details": {
+                "anyOf": [admission_policy_input_schema_value(), {"type": "null"}]
+            },
             "policy_input_unavailable_reason": {"type": ["string", "null"]},
             "achieved_max_concurrent_children": {"type": "integer", "minimum": 0},
             "achieved_mean_concurrent_children": {"type": ["number", "null"], "minimum": 0},
             "achieved_mean_observation": process_observation_schema_value(),
             "achieved_mean_unavailable_reason": {"type": ["string", "null"]}
+        }
+    })
+}
+
+fn admission_policy_input_schema_value() -> serde_json::Value {
+    let optional_positive = json!({"type": ["integer", "null"], "minimum": 1});
+    let admission_config = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "max_concurrent_children": optional_positive.clone(),
+            "provider_inflight_limit": optional_positive.clone(),
+            "host_memory_available_mib": optional_positive.clone(),
+            "host_memory_per_child_mib": optional_positive.clone(),
+            "host_fd_available": optional_positive.clone(),
+            "host_fds_per_child": optional_positive.clone(),
+            "host_disk_available_mib": optional_positive.clone(),
+            "host_disk_per_child_mib": optional_positive.clone(),
+            "host_fallback_children": optional_positive.clone()
+        }
+    });
+    let source = json!({
+        "type": "string",
+        "enum": ["configured", "conservative_default", "measured"]
+    });
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "entrypoint_bound", "plan", "cli", "effective",
+            "provider_inflight_bound", "provider_inflight_source", "host", "resolved_bound"
+        ],
+        "properties": {
+            "entrypoint_bound": {"type": "integer", "minimum": 1},
+            "plan": admission_config.clone(),
+            "cli": admission_config.clone(),
+            "effective": admission_config,
+            "provider_inflight_bound": {"type": "integer", "minimum": 1},
+            "provider_inflight_source": source.clone(),
+            "host": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "memory_available_mib", "memory_available_source", "memory_per_child_mib",
+                    "memory_bound", "fd_available", "fd_available_source", "fds_per_child",
+                    "fd_bound", "disk_available_mib", "disk_available_source",
+                    "disk_per_child_mib", "disk_bound", "fallback_children", "resolved_bound"
+                ],
+                "properties": {
+                    "memory_available_mib": optional_positive.clone(),
+                    "memory_available_source": source.clone(),
+                    "memory_per_child_mib": {"type": "integer", "minimum": 1},
+                    "memory_bound": optional_positive.clone(),
+                    "fd_available": optional_positive.clone(),
+                    "fd_available_source": source.clone(),
+                    "fds_per_child": {"type": "integer", "minimum": 1},
+                    "fd_bound": optional_positive.clone(),
+                    "disk_available_mib": optional_positive.clone(),
+                    "disk_available_source": source,
+                    "disk_per_child_mib": {"type": "integer", "minimum": 1},
+                    "disk_bound": optional_positive,
+                    "fallback_children": {"type": "integer", "minimum": 1},
+                    "resolved_bound": {"type": "integer", "minimum": 1}
+                }
+            },
+            "resolved_bound": {"type": "integer", "minimum": 1}
         }
     })
 }
@@ -443,6 +643,7 @@ fn run_budget_report_schema_value() -> serde_json::Value {
             "reserved",
             "committed",
             "remaining",
+            "elapsed_seconds",
             "active_reservations",
             "usage_complete",
             "action",
@@ -459,6 +660,7 @@ fn run_budget_report_schema_value() -> serde_json::Value {
                     "hard_cost_usd": {"type": "number", "exclusiveMinimum": 0}
                 }
             },
+            "max_duration_seconds": {"type": "integer", "minimum": 1},
             "consumed": amount(),
             "reserved": amount(),
             "committed": amount(),
@@ -469,9 +671,11 @@ fn run_budget_report_schema_value() -> serde_json::Value {
                     "soft_tokens": {"type": "integer", "minimum": 0},
                     "hard_tokens": {"type": "integer", "minimum": 0},
                     "soft_cost_usd": {"type": "number", "minimum": 0},
-                    "hard_cost_usd": {"type": "number", "minimum": 0}
+                    "hard_cost_usd": {"type": "number", "minimum": 0},
+                    "max_duration_seconds": {"type": "integer", "minimum": 0}
                 }
             },
+            "elapsed_seconds": {"type": "integer", "minimum": 0},
             "roles": {
                 "type": "array",
                 "items": {
@@ -519,6 +723,7 @@ fn run_budget_report_schema_value() -> serde_json::Value {
                         "hard_token_ceiling_reached",
                         "soft_cost_ceiling_reached",
                         "hard_cost_ceiling_reached",
+                        "max_duration_reached",
                         "missing_pricing",
                         "estimated_provider_usage",
                         "missing_provider_usage",

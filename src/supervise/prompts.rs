@@ -1107,21 +1107,49 @@ fn role_model_selection(
 }
 
 pub(super) fn provisional_default_role_model_selection(role: AgentRole) -> RoleModelSelection {
-    let reasoning_effort = match role {
-        AgentRole::Worker => "medium",
-        AgentRole::GateClassifier => "high",
-        AgentRole::Supervisor | AgentRole::ChildOrchestrator | AgentRole::Auditor => "xhigh",
+    let (model, reasoning_effort, fallbacks, budget_degrade_models, on_exhausted) = match role {
+        AgentRole::Supervisor => (
+            FRONTIER_PROFILE_MODEL,
+            "xhigh",
+            vec![BALANCED_PROFILE_MODEL, ECONOMY_PROFILE_MODEL],
+            vec![BALANCED_PROFILE_MODEL, ECONOMY_PROFILE_MODEL],
+            TerminalUnavailableModelFallback::RuntimeDefault,
+        ),
+        AgentRole::ChildOrchestrator | AgentRole::Auditor => (
+            BALANCED_PROFILE_MODEL,
+            "xhigh",
+            vec![FRONTIER_PROFILE_MODEL, ECONOMY_PROFILE_MODEL],
+            vec![ECONOMY_PROFILE_MODEL],
+            TerminalUnavailableModelFallback::RuntimeDefault,
+        ),
+        AgentRole::Worker => (
+            ECONOMY_PROFILE_MODEL,
+            "medium",
+            vec![BALANCED_PROFILE_MODEL, FRONTIER_PROFILE_MODEL],
+            Vec::new(),
+            TerminalUnavailableModelFallback::RuntimeDefault,
+        ),
+        AgentRole::GateClassifier => (
+            BALANCED_PROFILE_MODEL,
+            "high",
+            vec![FRONTIER_PROFILE_MODEL, ECONOMY_PROFILE_MODEL],
+            Vec::new(),
+            TerminalUnavailableModelFallback::LocalDeterministicFake,
+        ),
     };
     RoleModelSelection {
-        model: Some(DEFAULT_PROFILE_MODEL.to_string()),
+        model: Some(model.to_string()),
         reasoning_effort: Some(reasoning_effort.to_string()),
-        unavailable_model_fallback: match role {
-            AgentRole::GateClassifier => UnavailableModelFallback::LocalDeterministicFake,
-            AgentRole::Supervisor
-            | AgentRole::ChildOrchestrator
-            | AgentRole::Worker
-            | AgentRole::Auditor => UnavailableModelFallback::RuntimeDefault,
-        },
+        unavailable_model_fallback: UnavailableModelFallback::OrderedCatalogChain(
+            OrderedCatalogFallback {
+                models: fallbacks.into_iter().map(str::to_string).collect(),
+                budget_degrade_models: budget_degrade_models
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                on_exhausted,
+            },
+        ),
     }
 }
 
@@ -1136,6 +1164,28 @@ pub(super) fn provisional_default_role_models() -> BTreeMap<AgentRole, RoleModel
     .into_iter()
     .map(|role| (role, provisional_default_role_model_selection(role)))
     .collect()
+}
+
+pub fn all_frontier_role_models() -> BTreeMap<AgentRole, RoleModelSelection> {
+    provisional_default_role_models()
+        .into_iter()
+        .map(|(role, mut selection)| {
+            selection.model = Some(FRONTIER_PROFILE_MODEL.to_string());
+            selection.unavailable_model_fallback =
+                UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
+                    models: vec![
+                        BALANCED_PROFILE_MODEL.to_string(),
+                        ECONOMY_PROFILE_MODEL.to_string(),
+                    ],
+                    budget_degrade_models: vec![
+                        BALANCED_PROFILE_MODEL.to_string(),
+                        ECONOMY_PROFILE_MODEL.to_string(),
+                    ],
+                    on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
+                });
+            (role, selection)
+        })
+        .collect()
 }
 
 pub(super) fn effective_role_model_selection(
@@ -1156,9 +1206,26 @@ pub(super) fn apply_role_model_selection(
     catalog: &RuntimeModelCatalog,
 ) -> Result<ExternalAgentCommand> {
     let configured = effective_role_model_selection(plan, role);
-    let availability = catalog.availability(configured.model.as_deref(), runtime)?;
-    let selection = configured.resolve_for_availability(availability, runtime)?;
+    let selection = catalog
+        .resolve_role_model_selection(&configured, runtime)?
+        .selection;
     Ok(command.with_model_selection(selection.model, selection.reasoning_effort))
+}
+
+pub(super) fn runtime_resolved_prompt_plan(
+    plan: &SupervisorPlan,
+    runtime: SupervisorRuntime,
+    catalog: &RuntimeModelCatalog,
+) -> Result<SupervisorPlan> {
+    let mut resolved = plan.clone();
+    for role in [AgentRole::ChildOrchestrator, AgentRole::Worker] {
+        let configured = effective_role_model_selection(plan, role);
+        let selection = catalog
+            .resolve_role_model_selection(&configured, runtime)?
+            .selection;
+        resolved.role_models.insert(role, selection);
+    }
+    Ok(resolved)
 }
 
 pub(super) fn apply_review_lens_model_selection(

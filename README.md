@@ -86,7 +86,8 @@ The current implementation covers a local-first command-line slice:
   non-publishable. `maco supervise plan/status/collect` remain available. The
   supervisor scheduler launches opt-in O1 child orchestrators through the
   Codex CLI in isolated child worktrees under an O2 supervisor, with
-  automatic resource-bounded fan-out as the default. It measures host capacity
+  conservative network-bound fan-out as the default. Admission composes that
+  ceiling with configured provider quota and measured/configured host capacity,
   and launches hierarchy-ready assignments concurrently only while their
   normalized claim scopes are disjoint; `--max-concurrent-children 1` is the
   explicit serial opt-out. Overlapping scopes are never admitted together. The
@@ -1249,11 +1250,94 @@ Issue #28 production broker path.
 ### Provisional named hybrid default
 
 When a supervisor plan supplies no `role_models` override, MACO selects the
-named `provisional-phase-a-hybrid-effort-v1` profile. The profile assigns
-`gpt-5.6-sol` to every role, with `xhigh` reasoning effort for the supervisor,
-child orchestrator, and auditor, `medium` for workers, and `high` for the
-`gate_classifier`. A per-role `role_models` entry replaces that role's
-selection.
+named `provisional-phase-a-hybrid-model-tier-v2` profile. The profile assigns
+the frontier `gpt-5.6-sol` tier to the supervisor, balanced `gpt-5.6-terra` to
+child orchestrators, auditors, and the gate classifier, and economy
+`gpt-5.6-luna` to workers. Reasoning effort remains `xhigh` for the supervisor,
+child orchestrator, and auditor, `medium` for workers, and `high` for the gate
+classifier. A per-role `role_models` entry replaces that role's selection.
+
+Each default role selection carries an ordered catalog fallback chain. MACO
+consults the authenticated runtime catalog once, chooses the first advertised
+slug from the configured primary plus fallback list, and records
+`resolution_observation=catalog_fallback` with the selected candidate index
+when the primary is missing. Only after the list is exhausted does the role's
+terminal `runtime_default`, `fail_closed`, or `local_deterministic_fake` action
+apply. The same resolved worker selection is written into nested-worker prompt
+context, so command and prompt paths cannot silently disagree.
+
+The chain is ordinary plan/profile data and round-trips without a code-shape
+change:
+
+```json
+{
+  "model": "gpt-5.6-terra",
+  "reasoning_effort": "xhigh",
+  "unavailable_model_fallback": {
+    "ordered_catalog_chain": {
+      "models": ["gpt-5.6-sol", "gpt-5.6-luna"],
+      "budget_degrade_models": ["gpt-5.6-luna"],
+      "on_exhausted": "runtime_default"
+    }
+  }
+}
+```
+
+An explicit `all-frontier-v1` profile remains selectable by supplying
+`role_models` for all five roles with `model=gpt-5.6-sol`; the public
+`all_frontier_role_models()` helper constructs that profile data while
+preserving each role's reasoning-effort floor.
+
+The availability fallback order and the economics downgrade order are distinct
+data. `models` answers which advertised model may substitute when the primary
+is absent. `budget_degrade_models` is a monotone cheaper-tier list consulted
+only after a run crosses a soft budget ceiling; an arbitrary plan fallback is
+never assumed to be cheaper.
+
+### Budget-pressure degradation
+
+The scheduler consumes `BudgetAction::Degrade` before admitting new work. On
+successive admissions while a soft token or cost ceiling remains reached it
+lowers the child-orchestrator reasoning effort, selects the first
+runtime-advertised entry from that role's `budget_degrade_models`, and halves
+the remaining fan-out bound (never below one). A hard ceiling still halts new
+dispatch and drains already-started assignments. Concurrent admission waits
+until each newly spawned assignment has either committed its child budget
+reservation or completed without one, so the next policy decision cannot race
+past an invisible reservation.
+
+Every applied rung is retained in
+`role_economics_profile.execution.budget_degradations` with the assignment ID,
+budget reasons, typed before/after change, and the full effective child model,
+effort, and fan-out. `observation=admission_policy_resolved` deliberately says
+that this is scheduler admission evidence; `commands_run` remains the process
+evidence for a dispatch that actually started. When assignments use different
+bindings, the aggregate child role binding is marked `assignment_specific`
+instead of claiming one model or effort for the whole run.
+
+### CLI run ceilings
+
+`maco supervise run` and `maco autopilot run` accept the same per-supervisor-run
+hard ceilings:
+
+- `--max-tokens` (`--max-total-tokens` alias)
+- `--max-cost-usd` (`--max-total-cost-usd` alias)
+- `--max-duration-seconds` (`--max-total-duration-seconds` alias)
+
+Token, cost, and duration values must be finite positive values. Token and cost
+flags tighten an authored or goal-derived plan's `run_budget` values by taking
+the minimum. If the resulting hard ceiling is below a plan soft threshold, the
+soft threshold is clamped to the hard ceiling. Duration likewise composes with
+`run_budget.max_duration_seconds` by taking the minimum and stops new admission
+once elapsed time reaches the bound. The effective limits, elapsed seconds, and
+remaining duration are retained in `supervisor-final.json`.
+
+Autopilot propagates these limits to its source and generated follow-up
+supervise dispatches. Each supervise run still owns an independent in-memory
+ledger. A durable workspace/machine ledger across runs and integration with
+provider rate-limit signals remain deliberately deferred behind the real
+provider boundary (#77); the attachment seams are supervisor ledger creation
+and the autopilot/inbox dispatch boundary.
 
 On the production Codex path, the no-override child-orchestrator and auditor
 commands are constructed with the profile's explicit model and role-specific
@@ -2569,28 +2653,47 @@ assignments but leaves a non-empty child worktree diff, the retained runner
 still launches the parent read-only `REVIEW_AUDITOR` and requires it to cover
 the child orchestrator id and changed paths.
 The retained supervisor runner does not apply worker changes to the primary worktree
-automatically. Omitting `--max-concurrent-children` selects `auto`, which derives
-the effective child-execution bound from measured host capacity instead of a
-hardcoded constant. `--max-concurrent-children auto` spells out that same mode,
-while `--max-concurrent-children 1` is the explicit serial opt-out. Zero is
-rejected before run artifacts are reserved. `max_child_assignments` separately
-bounds plan fan-out; it is not the concurrency limit. This default keeps the
-goal-to-swarm path tracked by Issue #22 free of an extra concurrency flag.
+automatically. Omitting `--max-concurrent-children` selects `auto`, whose
+network-bound entrypoint ceiling is a conservative four children rather than the
+host CPU count. Final admission takes the minimum of that entrypoint ceiling (or
+the explicit positive flag), the optional plan/CLI maximum, a configured provider
+in-flight quota, and host memory/file-descriptor/disk bounds. There is no live
+provider probing: `provider_inflight_limit` and `--provider-inflight-limit` are
+operator-supplied quota data. Host available/per-child inputs can likewise be
+specified in a plan's `concurrency` object or with the corresponding
+`--host-*-available-*` and `--host-*-per-child-*` flags. Missing host observations
+fall back conservatively to one child. Zero inputs are rejected before dispatch.
+`max_child_assignments` separately bounds plan fan-out; it is not the concurrency
+limit.
+
+```json
+{
+  "concurrency": {
+    "max_concurrent_children": 8,
+    "provider_inflight_limit": 6,
+    "host_memory_per_child_mib": 1024,
+    "host_fds_per_child": 128,
+    "host_disk_per_child_mib": 512,
+    "host_fallback_children": 1
+  }
+}
+```
 
 Every newly finalized `supervisor-final.json` carries
-`role_economics_profile.schema_version=2` plus execution telemetry: planned,
+`role_economics_profile.schema_version=4` plus execution telemetry: planned,
 started, and completed assignment counts; the resolved configured child bound;
 scheduler-observed peak and active-interval mean concurrency; configured and
 resolved model/reasoning bindings for every role; and usage/cost with explicit
-observation markers. The scheduler boundary currently retains the resolved
-bound but not the originating `auto` versus fixed policy token, so that policy
-input is serialized as `not_retained` rather than reconstructed. Missing
+observation markers. `concurrency.policy_input` contains canonical JSON for
+evaluation compatibility, while `concurrency.policy_input_details` retains the
+typed entrypoint, plan, CLI, provider-quota, measured/configured host-resource,
+and resolved-minimum inputs with `scheduler_observed` provenance. Missing
 catalog, runtime-default model, nested-worker usage, and unpriced cost values
 remain explicit unavailable observations. A width-one run with multiple
 independent assignment or spec scopes emits a final-report warning. Readers
 continue accepting historical reports that omit this block or carry economics
-profile schema version 1; the generated schema describes the required version
-2 contract for newly finalized reports.
+profile schema versions 1 through 3; the generated schema describes the required
+version 4 contract for newly finalized reports.
 
 A worker assignment may opt into `"kind":"megafile_decomposition"` only with an
 exact canonical `"target_path"` inside its assigned paths. Ordinary assignments

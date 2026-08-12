@@ -215,6 +215,9 @@ fn run_licensed_scenario(
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
+        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+        budget_overrides: crate::supervise::RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
         machine_global_retention: Some(injected_machine_global_retention(temp.path())),
     };
     let declaration_sha256 = assignment
@@ -913,6 +916,9 @@ fn licensed_follow_up_survives_authenticated_final_report_resume_without_redispa
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
+        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+        budget_overrides: crate::supervise::RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
         machine_global_retention: Some(injected_machine_global_retention(temp.path())),
     };
     let declaration_sha256 = licensed_breakage_declaration_sha256(
@@ -990,6 +996,9 @@ fn licensed_follow_up_cascade_dispatches_one_authenticated_round_and_keeps_prima
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+        budget_overrides: crate::supervise::RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
         machine_global_retention: Some(secure_machine_global_retention(
             temp.path(),
             "licensed-cascade-depth-two",
@@ -1139,6 +1148,9 @@ fn generated_follow_up_exact_loaded_plan_drift_refuses_before_child_dispatch() {
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+        budget_overrides: crate::supervise::RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
         machine_global_retention: Some(secure_machine_global_retention(
             temp.path(),
             "licensed-cascade-exact-plan-refusal",
@@ -1282,6 +1294,9 @@ fn run_generated_round_last_moment_mutation(
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+        budget_overrides: crate::supervise::RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
         machine_global_retention: Some(retention),
     };
     let declaration_sha256 = licensed_breakage_declaration_sha256(
@@ -1562,6 +1577,9 @@ fn generated_follow_up_initial_deleted_retention_is_typed_without_queue() {
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+        budget_overrides: crate::supervise::RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
         machine_global_retention: Some(retention),
     };
     let declaration_sha256 = licensed_breakage_declaration_sha256(
@@ -1659,6 +1677,9 @@ fn licensed_follow_up_enqueue_interruption_resumes_without_rerunning_source() {
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+        budget_overrides: crate::supervise::RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
         machine_global_retention: Some(secure_machine_global_retention(
             temp.path(),
             "licensed-cascade-enqueue-resume",
@@ -1789,6 +1810,9 @@ fn immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+        budget_overrides: crate::supervise::RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
         machine_global_retention: Some(retention.clone()),
     };
     let declaration_sha256 = licensed_breakage_declaration_sha256(
@@ -1914,6 +1938,9 @@ fn immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan
             codex_bin: PathBuf::from("unused-injected-codex"),
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
             machine_global_retention: Some(retention),
         },
         &mut preexisting_runner,
@@ -2016,6 +2043,9 @@ fn run_held_finalized_subordinate_scenario(
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+        budget_overrides: crate::supervise::RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
         machine_global_retention: Some(retention.clone()),
     };
     let declaration_sha256 = licensed_breakage_declaration_sha256(
@@ -2151,6 +2181,9 @@ fn run_held_finalized_subordinate_scenario(
             codex_bin: PathBuf::from("unused-injected-codex"),
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
             machine_global_retention: Some(retention),
         },
         &mut subordinate_runner,

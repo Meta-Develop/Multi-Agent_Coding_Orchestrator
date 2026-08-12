@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, MutexGuard},
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 
@@ -47,6 +48,40 @@ impl RunBudgetLimits {
             return Err(BudgetError::InvalidLimitOrder { resource: "cost" });
         }
         Ok(self)
+    }
+
+    pub(crate) fn strictest(self, other: Self) -> Result<Self> {
+        fn min_optional<T: Ord + Copy>(left: Option<T>, right: Option<T>) -> Option<T> {
+            match (left, right) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (left, right) => left.or(right),
+            }
+        }
+        fn min_cost(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+            match (left, right) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (left, right) => left.or(right),
+            }
+        }
+        self.validate()?;
+        other.validate()?;
+        let hard_tokens = min_optional(self.hard_tokens, other.hard_tokens);
+        let hard_cost_usd = min_cost(self.hard_cost_usd, other.hard_cost_usd);
+        let soft_tokens = min_optional(
+            min_optional(self.soft_tokens, other.soft_tokens),
+            hard_tokens,
+        );
+        let soft_cost_usd = min_cost(
+            min_cost(self.soft_cost_usd, other.soft_cost_usd),
+            hard_cost_usd,
+        );
+        Self {
+            soft_tokens,
+            hard_tokens,
+            soft_cost_usd,
+            hard_cost_usd,
+        }
+        .validate()
     }
 
     pub(super) fn has_cost_ceiling(self) -> bool {
@@ -116,6 +151,8 @@ pub struct BudgetRemaining {
     pub soft_cost_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hard_cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -125,6 +162,7 @@ pub enum BudgetReason {
     HardTokenCeilingReached,
     SoftCostCeilingReached,
     HardCostCeilingReached,
+    MaxDurationReached,
     MissingPricing,
     EstimatedProviderUsage,
     MissingProviderUsage,
@@ -153,10 +191,14 @@ pub struct RoleBudgetReport {
 #[serde(deny_unknown_fields)]
 pub struct RunBudgetReport {
     pub limits: RunBudgetLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_seconds: Option<u64>,
     pub consumed: BudgetAmount,
     pub reserved: BudgetAmount,
     pub committed: BudgetAmount,
     pub remaining: BudgetRemaining,
+    #[serde(default)]
+    pub elapsed_seconds: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<RoleBudgetReport>,
     pub active_reservations: usize,
@@ -279,6 +321,8 @@ pub(super) type Result<T> = std::result::Result<T, BudgetError>;
 #[derive(Debug, Clone)]
 pub(super) struct RunBudgetLedger {
     limits: RunBudgetLimits,
+    max_duration_seconds: Option<u64>,
+    started_at: Instant,
     inner: Arc<Mutex<LedgerState>>,
 }
 
@@ -355,18 +399,44 @@ struct ReconciliationCharge {
 }
 
 impl RunBudgetLedger {
+    #[cfg(test)]
     pub(super) fn new(limits: RunBudgetLimits) -> Result<Self> {
+        Self::new_with_duration(limits, None)
+    }
+
+    pub(super) fn new_with_duration(
+        limits: RunBudgetLimits,
+        max_duration_seconds: Option<u64>,
+    ) -> Result<Self> {
+        if max_duration_seconds == Some(0) {
+            return Err(BudgetError::ZeroLimit {
+                name: "maximum duration",
+            });
+        }
         Ok(Self {
             limits: limits.validate()?,
+            max_duration_seconds,
+            started_at: Instant::now(),
             inner: Arc::new(Mutex::new(LedgerState::default())),
         })
+    }
+
+    #[cfg(test)]
+    fn new_with_elapsed(
+        limits: RunBudgetLimits,
+        max_duration_seconds: Option<u64>,
+        elapsed: Duration,
+    ) -> Result<Self> {
+        let mut ledger = Self::new_with_duration(limits, max_duration_seconds)?;
+        ledger.started_at = Instant::now() - elapsed;
+        Ok(ledger)
     }
 
     /// Atomically checks the current commitments and reserves budget before dispatch.
     pub(super) fn reserve(&self, request: BudgetReservationRequest) -> Result<BudgetAdmission> {
         validate_reservation_request(&request)?;
         let mut state = self.lock_state()?;
-        let current_report = report_for(self.limits, &state)?;
+        let current_report = self.report_for_state(&state)?;
         if !current_report.new_dispatch_allowed {
             return Ok(BudgetAdmission::Refused {
                 refusal: BudgetAdmissionRefusal::NewDispatchStopped,
@@ -377,7 +447,7 @@ impl RunBudgetLedger {
             let mut next = state.clone();
             next.force_stop = true;
             next.persistent_reasons.insert(BudgetReason::MissingPricing);
-            let report = report_for(self.limits, &next)?;
+            let report = self.report_for_state(&next)?;
             *state = next;
             return Ok(BudgetAdmission::Refused {
                 refusal: BudgetAdmissionRefusal::MissingCostEstimate,
@@ -401,7 +471,7 @@ impl RunBudgetLedger {
             next.force_stop = true;
             next.persistent_reasons
                 .insert(BudgetReason::HardTokenCeilingReached);
-            let report = report_for(self.limits, &next)?;
+            let report = self.report_for_state(&next)?;
             *state = next;
             return Ok(BudgetAdmission::Refused {
                 refusal: BudgetAdmissionRefusal::HardTokenCeiling {
@@ -424,7 +494,7 @@ impl RunBudgetLedger {
                 next.force_stop = true;
                 next.persistent_reasons
                     .insert(BudgetReason::HardCostCeilingReached);
-                let report = report_for(self.limits, &next)?;
+                let report = self.report_for_state(&next)?;
                 *state = next;
                 return Ok(BudgetAdmission::Refused {
                     refusal: BudgetAdmissionRefusal::HardCostCeiling {
@@ -451,7 +521,7 @@ impl RunBudgetLedger {
         let mut next = state.clone();
         next.next_reservation_id = next_id;
         add_reservation(&mut next, reservation.clone())?;
-        let report = report_for(self.limits, &next)?;
+        let report = self.report_for_state(&next)?;
         *state = next;
         Ok(BudgetAdmission::Admitted {
             reservation,
@@ -476,7 +546,7 @@ impl RunBudgetLedger {
         let mut next = state.clone();
         remove_reservation(&mut next, id)?;
         apply_charge(&mut next, reservation.role, &charge, self.limits)?;
-        let report = report_for(self.limits, &next)?;
+        let report = self.report_for_state(&next)?;
         *state = next;
         Ok(BudgetReconciliation {
             reservation,
@@ -493,7 +563,7 @@ impl RunBudgetLedger {
         let mut state = self.lock_state()?;
         let mut next = state.clone();
         let reservation = remove_reservation(&mut next, id)?;
-        let report = report_for(self.limits, &next)?;
+        let report = self.report_for_state(&next)?;
         *state = next;
         Ok(BudgetRelease {
             reservation,
@@ -503,7 +573,16 @@ impl RunBudgetLedger {
 
     pub(super) fn report(&self) -> Result<RunBudgetReport> {
         let state = self.lock_state()?;
-        report_for(self.limits, &state)
+        self.report_for_state(&state)
+    }
+
+    fn report_for_state(&self, state: &LedgerState) -> Result<RunBudgetReport> {
+        report_for(
+            self.limits,
+            self.max_duration_seconds,
+            state,
+            self.started_at.elapsed(),
+        )
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, LedgerState>> {
@@ -737,7 +816,12 @@ fn apply_charge(
     Ok(())
 }
 
-fn report_for(limits: RunBudgetLimits, state: &LedgerState) -> Result<RunBudgetReport> {
+fn report_for(
+    limits: RunBudgetLimits,
+    max_duration_seconds: Option<u64>,
+    state: &LedgerState,
+    elapsed: Duration,
+) -> Result<RunBudgetReport> {
     let committed_tokens = state
         .consumed_tokens
         .checked_add(state.reserved_tokens)
@@ -773,10 +857,16 @@ fn report_for(limits: RunBudgetLimits, state: &LedgerState) -> Result<RunBudgetR
     if hard_cost_reached {
         reasons.insert(BudgetReason::HardCostCeilingReached);
     }
+    let max_duration_reached =
+        max_duration_seconds.is_some_and(|limit| elapsed >= Duration::from_secs(limit));
+    if max_duration_reached {
+        reasons.insert(BudgetReason::MaxDurationReached);
+    }
     let cost_ceiling_unenforceable = limits.has_cost_ceiling() && !committed_cost_complete;
     let new_dispatch_allowed = !state.force_stop
         && !hard_tokens_reached
         && !hard_cost_reached
+        && !max_duration_reached
         && !cost_ceiling_unenforceable;
     let action = if !new_dispatch_allowed {
         BudgetAction::OwnerEscalation
@@ -809,6 +899,7 @@ fn report_for(limits: RunBudgetLimits, state: &LedgerState) -> Result<RunBudgetR
 
     Ok(RunBudgetReport {
         limits,
+        max_duration_seconds,
         consumed: BudgetAmount {
             tokens: state.consumed_tokens,
             cost_usd: state.cost_complete.then_some(state.consumed_cost_usd),
@@ -846,7 +937,10 @@ fn report_for(limits: RunBudgetLimits, state: &LedgerState) -> Result<RunBudgetR
                 })
                 .transpose()?
                 .flatten(),
+            max_duration_seconds: max_duration_seconds
+                .map(|limit| limit.saturating_sub(elapsed.as_secs())),
         },
+        elapsed_seconds: elapsed.as_secs(),
         roles,
         active_reservations: state.active.len(),
         usage_complete: state.usage_complete,
@@ -958,6 +1052,64 @@ mod tests {
             })
             .expect_err("zero limit"),
             BudgetError::ZeroLimit { name: "hard token" }
+        );
+    }
+
+    #[test]
+    fn cli_hard_limits_tighten_plan_limits_and_clamp_soft_thresholds() {
+        let plan = RunBudgetLimits {
+            soft_tokens: Some(100),
+            hard_tokens: Some(200),
+            soft_cost_usd: Some(0.5),
+            hard_cost_usd: Some(1.0),
+        };
+        let cli = RunBudgetLimits {
+            hard_tokens: Some(50),
+            hard_cost_usd: Some(0.4),
+            ..RunBudgetLimits::default()
+        };
+
+        assert_eq!(
+            plan.strictest(cli).expect("compose strictest limits"),
+            RunBudgetLimits {
+                soft_tokens: Some(50),
+                hard_tokens: Some(50),
+                soft_cost_usd: Some(0.4),
+                hard_cost_usd: Some(0.4),
+            }
+        );
+    }
+
+    #[test]
+    fn elapsed_duration_stops_new_dispatch_and_is_reported() {
+        let ledger = RunBudgetLedger::new_with_elapsed(
+            RunBudgetLimits::default(),
+            Some(5),
+            Duration::from_secs(6),
+        )
+        .expect("duration ledger");
+
+        let report = ledger.report().expect("duration report");
+        assert_eq!(report.max_duration_seconds, Some(5));
+        assert!(report.elapsed_seconds >= 6);
+        assert_eq!(report.remaining.max_duration_seconds, Some(0));
+        assert!(!report.new_dispatch_allowed);
+        assert_eq!(report.action, BudgetAction::OwnerEscalation);
+        assert!(report.reasons.contains(&BudgetReason::MaxDurationReached));
+        assert!(matches!(
+            ledger.reserve(request(1, None)).expect("duration refusal"),
+            BudgetAdmission::Refused {
+                refusal: BudgetAdmissionRefusal::NewDispatchStopped,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            RunBudgetLedger::new_with_duration(RunBudgetLimits::default(), Some(0))
+                .expect_err("zero duration must fail"),
+            BudgetError::ZeroLimit {
+                name: "maximum duration"
+            }
         );
     }
 
