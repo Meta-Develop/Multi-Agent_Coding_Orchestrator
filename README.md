@@ -2185,6 +2185,19 @@ independent path or worker scopes emit a
 `planning_width_pinned_to_one` validation warning; the structured warning is
 also available from the planning API for run-report telemetry.
 
+Library callers may opt into provider-backed proposal through
+`propose_task_decomposition_with_optional_provider`. With no provider, that API
+uses the same deterministic heuristic planner described above. With a provider,
+the response must be a `ProviderTaskPlan` JSON object in the existing
+provider-neutral `WorkProposal.summary`; commands and patches are rejected, and
+fragment references, inventoried file paths, structural bounds, and assignment
+disjointness are validated before the proposal is accepted. A
+`TaskPlanningSession` can feed completed/failed assignments, coverage gaps, and
+bounded notes into at most two provider re-plan attempts. Invalid responses and
+failed provider calls count against that cap. The local `FakeProvider` exercises
+this boundary; no network provider is configured or selected by supervise, so
+the CLI remains heuristic/offline by default.
+
 The emitted document is directly usable as a supervisor plan and preserves
 lowering traceability through top-level `spec_fragment_ids`, per-assignment
 `spec_fragment_ids`, and `assignment_schedule`. Unmatched fragments appear as

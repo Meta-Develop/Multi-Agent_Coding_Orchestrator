@@ -5,6 +5,7 @@ use crate::llm::{
     },
     transcript::{RedactionSummary, TurnRole},
 };
+use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Debug, Clone)]
@@ -45,6 +46,15 @@ impl FakeProvider {
         proposal: WorkProposal,
     ) -> &mut Self {
         self.push_outcome(request_id, FakeOutcome::Response { proposal })
+    }
+
+    pub fn push_json_response<T: Serialize>(
+        &mut self,
+        request_id: impl Into<String>,
+        value: &T,
+    ) -> Result<&mut Self, serde_json::Error> {
+        let summary = serde_json::to_string(value)?;
+        Ok(self.push_response(request_id, WorkProposal::summary(summary)))
     }
 
     pub fn push_failure(
@@ -217,6 +227,20 @@ mod tests {
         assert_eq!(second.proposal.summary, "second");
         assert_eq!(provider.calls().len(), 2);
         assert_eq!(provider.calls()[0].request_id, "req-1");
+    }
+
+    #[test]
+    fn fake_provider_scripts_typed_json_summaries() {
+        let mut provider = FakeProvider::new("fake", "fake-model");
+        provider
+            .push_json_response("json", &serde_json::json!({"assignments": []}))
+            .expect("script JSON response");
+
+        let response = provider
+            .complete(request("json", "task"))
+            .expect("response");
+
+        assert_eq!(response.proposal.summary, r#"{"assignments":[]}"#);
     }
 
     #[test]
