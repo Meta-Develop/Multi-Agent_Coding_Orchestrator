@@ -105,6 +105,7 @@ jobs:
           autopilot::tests::unsupported_depth_shapes_are_typed_preflight_permission_expansions
           autopilot::tests::validate_autopilot_plan_refuses_empty_path_proposal
           autopilot::tests::write_lease_excludes_competing_access_through_review_and_releases_on_error
+          cli::tests::merge_apply_auto_reap_waits_for_trunk_then_reaps_on_finalization_rerun
           cli::tests::merge_apply_json_delivers_unclaimed_edits_denial_to_integration_controller
           external_agent::tests::verified_contained_fake_app_server_proves_duplex_ordering_and_confinement
           merge::tests::authenticated_megafile_failure_refuses_merge_before_primary_mutation
@@ -178,7 +179,7 @@ jobs:
           supervise::tests::licensed_breakage::licensed_follow_up_enqueue_interruption_resumes_without_rerunning_source
           supervise::tests::licensed_breakage::licensed_follow_up_survives_authenticated_final_report_resume_without_redispatch
           supervise::tests::licensed_breakage::licensed_worker_failure_remains_subject_to_child_and_parent_auditor_gates
-          supervise::tests::plan_runtime::configured_lens_selection_supersedes_role_wide_auditor_fallback_at_dispatch
+          supervise::tests::plan_runtime::configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor
           supervise::tests::plan_runtime::goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps
           supervise::tests::plan_runtime::known_unavailable_child_runtime_default_reaches_production_app_server_argv_before_dispatch
           supervise::tests::plan_runtime::local_deterministic_fake_fallback_reaches_shared_supervisor_core_without_external_dispatch
@@ -201,7 +202,6 @@ jobs:
           supervise::tests::run_artifacts::scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch
           supervise::tests::run_artifacts::verified_run_entry_creates_and_materializes_assignment_worktree
           supervise::tests::run_artifacts::verified_run_entry_refuses_dirty_repository_before_assignment_creation
-          supervise::tests::scheduler::auto_policy_serializes_overlap_without_head_of_line_blocking
           supervise::tests::scheduler::concurrent_disjoint_assignments_make_progress_and_finalize_in_plan_order
           supervise::tests::scheduler::concurrent_failure_isolated_and_retry_retains_assignment_slot
           supervise::tests::scheduler::external_termination_named_conflict_release_and_reacquisition_form_one_recovery_sequence
@@ -238,6 +238,9 @@ jobs:
           worktree::tests::gc_targets_only_reclaims_untracked_lane_target_and_keeps_lane_branch_and_orphan
           worktree::tests::gc_unknown_and_live_evidence_protects_every_target_reclaim_path
           worktree::tests::gc_without_requested_root_preserves_all_authenticated_root_scope
+          worktree::tests::lifecycle_dry_run_aggregates_worktree_and_explicit_o2_artifact_policy
+          worktree::tests::lifecycle_requires_explicit_trunk_containment_without_changing_manual_gc
+          worktree::tests::lifecycle_retry_supersedes_exact_authenticated_predecessor_despite_retention
           worktree::tests::neutral_worktree_production_cleanliness_seam_uses_exact_base_without_claim
           worktree::tests::remove_prepared_gc_recovery_refuses_changed_dirtiness_snapshot
           worktree::tests::repository_cleanliness_capability_creates_clean_managed_worktree
