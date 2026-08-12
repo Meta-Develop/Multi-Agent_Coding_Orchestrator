@@ -181,15 +181,16 @@ const LICENSED_BREAKAGE_AUDIT_VALIDATION_NAME: &str = "licensed_breakage_declara
 const MIN_SUPERVISOR_DEPTH: u8 = 2;
 const MAX_SUPERVISOR_DEPTH: u8 = 32;
 const SUPERVISOR_SCHEMA_VERSION: u32 = 1;
-pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NAME: &str =
+pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NAME: &str = "provisional-phase-a-hybrid-effort-v1";
+pub const LEGACY_PROVISIONAL_DEFAULT_MODEL_TIER_PROFILE_NAME: &str =
     "provisional-phase-a-hybrid-model-tier-v2";
 pub const ALL_FRONTIER_PROFILE_NAME: &str = "all-frontier-v1";
 pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_EVIDENCE: &str =
-    "provisional deterministic fake phase-A evidence";
+    "single-slug model decision with provisional effort-axis execution evidence";
 pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NOTICE: &str =
-    "selected provisionally from deterministic fake phase-A evidence over a hand-authored plan; \
-     no real-provider or isolated-repository comparison was observed, so this profile is \
-     production-ineligible and must not be represented as evidence-backed production economics; \
+    "the single standard model slug is evidence-backed, while assignment-level effort matching \
+     remains production-ineligible until real-provider resolved-effort telemetry is evaluated; \
+     this profile must not be represented as measured production effort economics; \
      before verified Codex dispatch, MACO resolves exact slug membership from one bounded, \
      contained, authenticated runtime-advertised model catalog and applies each role's declared \
      unavailable-model fallback; the upstream catalog may be cached when refresh fails, so \
@@ -731,9 +732,6 @@ pub struct OrderedCatalogFallback {
 
 impl OrderedCatalogFallback {
     fn validate(&self, configured_model: Option<&str>) -> Result<()> {
-        if self.models.is_empty() {
-            bail!("ordered model fallback chain must contain at least one model");
-        }
         let mut models = BTreeSet::new();
         for model in &self.models {
             if model.trim().is_empty() || model != model.trim() {
@@ -940,7 +938,7 @@ impl RuntimeModelCatalog {
     }
 }
 
-const SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION: u32 = 4;
+const SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct RoleEconomicsProfile {
@@ -978,8 +976,35 @@ pub struct SupervisorExecutionMetadata {
     pub concurrency: SupervisorConcurrencyReport,
     pub role_bindings: BTreeMap<AgentRole, ResolvedRoleExecutionBinding>,
     #[serde(default)]
+    pub assignment_effort_bindings: Vec<AssignmentEffortBinding>,
+    #[serde(default)]
     pub budget_degradations: Vec<BudgetDegradationRecord>,
     pub usage: SupervisorExecutionUsageReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentEffortBinding {
+    pub assignment_id: String,
+    pub duty_id: String,
+    pub role: AgentRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_reasoning_effort: Option<ReasoningEffort>,
+    pub fallback_reasoning_effort: String,
+    pub resolved_reasoning_effort: String,
+    pub resolution_observation: EffortResolutionObservation,
+    pub process_observation: ProcessObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffortResolutionObservation {
+    RoleFallback,
+    AssignmentOverride,
+    HardFloorClamped,
+    BudgetDegraded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1203,7 +1228,56 @@ struct LoadedSupervisorPlan {
     plan_metadata: SupervisorPlanMetadata,
 }
 
-type AssignmentMetadata = BTreeMap<(String, String), WorkerAssignmentMetadata>;
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AssignmentMetadata {
+    workers: BTreeMap<(String, String), WorkerAssignmentMetadata>,
+    reasoning_efforts: BTreeMap<String, ReasoningEffort>,
+}
+
+impl AssignmentMetadata {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn insert(
+        &mut self,
+        key: (String, String),
+        value: WorkerAssignmentMetadata,
+    ) -> Option<WorkerAssignmentMetadata> {
+        self.workers.insert(key, value)
+    }
+
+    fn get(&self, key: &(String, String)) -> Option<&WorkerAssignmentMetadata> {
+        self.workers.get(key)
+    }
+
+    fn insert_reasoning_effort(
+        &mut self,
+        assignment_id: String,
+        effort: ReasoningEffort,
+    ) -> Option<ReasoningEffort> {
+        self.reasoning_efforts.insert(assignment_id, effort)
+    }
+
+    fn reasoning_effort(&self, assignment_id: &str) -> Option<ReasoningEffort> {
+        self.reasoning_efforts.get(assignment_id).copied()
+    }
+
+    fn retain_assignment(&mut self, assignment_id: &str) {
+        self.workers.retain(|(owner, _), _| owner == assignment_id);
+        self.reasoning_efforts
+            .retain(|owner, _| owner == assignment_id);
+    }
+}
+
+impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMetadata {
+    fn from(workers: BTreeMap<(String, String), WorkerAssignmentMetadata>) -> Self {
+        Self {
+            workers,
+            reasoning_efforts: BTreeMap::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct SupervisorPlanMetadata {
@@ -1493,6 +1567,118 @@ pub enum AgentRole {
     Auditor,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+    Ultra,
+}
+
+impl ReasoningEffort {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            "max" => Some(Self::Max),
+            "ultra" => Some(Self::Ultra),
+            _ => None,
+        }
+    }
+
+    const fn lowered(self) -> Self {
+        match self {
+            Self::Ultra => Self::Max,
+            Self::Max => Self::Xhigh,
+            Self::Xhigh => Self::High,
+            Self::High => Self::Medium,
+            Self::Medium => Self::Low,
+            Self::Low | Self::Minimal => Self::Minimal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedReasoningEffort {
+    requested: Option<ReasoningEffort>,
+    fallback: String,
+    resolved: String,
+    observation: EffortResolutionObservation,
+}
+
+fn resolve_reasoning_effort(
+    role: AgentRole,
+    requested: Option<ReasoningEffort>,
+    fallback: Option<&str>,
+    budget_degradation_steps: usize,
+) -> ResolvedReasoningEffort {
+    let fallback = fallback.unwrap_or("runtime_default").to_string();
+    let mut effort = requested
+        .or_else(|| ReasoningEffort::parse(&fallback))
+        .unwrap_or_else(|| {
+            role.reasoning_effort_floor()
+                .unwrap_or(ReasoningEffort::Low)
+        });
+    let mut observation = if requested.is_some() {
+        EffortResolutionObservation::AssignmentOverride
+    } else {
+        EffortResolutionObservation::RoleFallback
+    };
+    for _ in 0..budget_degradation_steps {
+        effort = effort.lowered();
+        observation = EffortResolutionObservation::BudgetDegraded;
+    }
+    if let Some(floor) = role.reasoning_effort_floor() {
+        if effort < floor {
+            effort = floor;
+            observation = EffortResolutionObservation::HardFloorClamped;
+        }
+    }
+    ResolvedReasoningEffort {
+        requested,
+        fallback,
+        resolved: effort.as_str().to_string(),
+        observation,
+    }
+}
+
+fn enforce_role_reasoning_effort_floor(
+    role: AgentRole,
+    reasoning_effort: Option<String>,
+) -> Option<String> {
+    let Some(floor) = role.reasoning_effort_floor() else {
+        return reasoning_effort;
+    };
+    let should_clamp = reasoning_effort
+        .as_deref()
+        .and_then(ReasoningEffort::parse)
+        .is_none_or(|effort| effort < floor);
+    if should_clamp {
+        Some(floor.as_str().to_string())
+    } else {
+        reasoning_effort
+    }
+}
+
 impl AgentRole {
     const fn as_str(self) -> &'static str {
         match self {
@@ -1501,6 +1687,14 @@ impl AgentRole {
             Self::Worker => "worker",
             Self::GateClassifier => "gate_classifier",
             Self::Auditor => "auditor",
+        }
+    }
+
+    const fn reasoning_effort_floor(self) -> Option<ReasoningEffort> {
+        match self {
+            Self::GateClassifier => Some(ReasoningEffort::High),
+            Self::Auditor => Some(ReasoningEffort::Xhigh),
+            Self::Supervisor | Self::ChildOrchestrator | Self::Worker => None,
         }
     }
 }
@@ -2901,6 +3095,7 @@ struct ParentReviewAuditorPromptContext<'a> {
 struct ReviewLensAuditorPromptContext<'a> {
     assignment: &'a OrchestratorAssignment,
     lens: &'a ReviewLensConfig,
+    resolved_reasoning_effort: Option<&'a str>,
     request: &'a ReviewLensRequest,
     required_coverage: &'a ReviewCoverageRequirement,
 }
@@ -2910,6 +3105,10 @@ impl SupervisorPlan {
         let mut role_models = provisional_default_role_models();
         for (role, selection) in &self.role_models {
             role_models.insert(*role, selection.clone());
+        }
+        for (role, selection) in &mut role_models {
+            selection.reasoning_effort =
+                enforce_role_reasoning_effort_floor(*role, selection.reasoning_effort.take());
         }
         let profile_name = if self.role_models == all_frontier_role_models() {
             ALL_FRONTIER_PROFILE_NAME

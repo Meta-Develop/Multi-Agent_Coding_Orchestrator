@@ -1621,6 +1621,13 @@ fn prepare_parent_auditor<'a>(
         command_record_relative: PathBuf::from("logs").join(format!("{auditor_stem}.summary.json")),
     };
     let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+    let assignment_reasoning_effort = context.assignment_metadata.reasoning_effort(&assignment.id);
+    let resolved_auditor_effort = resolve_reasoning_effort(
+        AgentRole::Auditor,
+        assignment_reasoning_effort,
+        lens.backend.reasoning_effort(),
+        0,
+    );
     let RenderedPromptWithMeasurements {
         prompt: auditor_prompt,
         mut measurements,
@@ -1628,6 +1635,7 @@ fn prepare_parent_auditor<'a>(
         ReviewLensAuditorPromptContext {
             assignment,
             lens,
+            resolved_reasoning_effort: Some(&resolved_auditor_effort.resolved),
             request: expected_request,
             required_coverage,
         },
@@ -1665,6 +1673,7 @@ fn prepare_parent_auditor<'a>(
     auditor_command = apply_review_lens_model_selection(
         auditor_command,
         lens,
+        assignment_reasoning_effort,
         options.runtime,
         runtime_model_catalog,
     )?;

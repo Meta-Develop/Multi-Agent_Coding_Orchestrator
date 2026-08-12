@@ -1250,46 +1250,53 @@ fixtures do not claim that command exists.
 Gate-policy/classifier corpus experiments remain separate and depend on the
 Issue #28 production broker path.
 
-### Provisional named hybrid default
+### Provisional named effort default
 
 When a supervisor plan supplies no `role_models` override, MACO selects the
-named `provisional-phase-a-hybrid-model-tier-v2` profile. The profile assigns
-the frontier `gpt-5.6-sol` tier to the supervisor, balanced `gpt-5.6-terra` to
-child orchestrators, auditors, and the gate classifier, and economy
-`gpt-5.6-luna` to workers. Reasoning effort remains `xhigh` for the supervisor,
-child orchestrator, and auditor, `medium` for workers, and `high` for the gate
-classifier. A per-role `role_models` entry replaces that role's selection.
+named `provisional-phase-a-hybrid-effort-v1` profile. Every role's ordinary
+default model binding is the single standard slug `gpt-5.6-sol`; cheaper model
+tiers are not availability substitutes in the default profile. The effort
+fallbacks remain `xhigh` for the supervisor, child orchestrator, and auditor,
+`medium` for workers, and `high` for the gate classifier. A per-role
+`role_models` entry can still replace authored role data, but the acceptance
+gate and review-auditor hard floors remain enforced.
 
-Each default role selection carries an ordered catalog fallback chain. MACO
-consults the authenticated runtime catalog once, chooses the first advertised
-slug from the configured primary plus fallback list, and records
-`resolution_observation=catalog_fallback` with the selected candidate index
-when the primary is missing. Only after the list is exhausted does the role's
-terminal `runtime_default`, `fail_closed`, or `local_deterministic_fake` action
-apply. The same resolved worker selection is written into nested-worker prompt
-context, so command and prompt paths cannot silently disagree.
+Each default role selection retains the ordered-catalog data shape and typed
+resolution observations. Its ordinary availability `models` list is empty, so
+the default path never silently substitutes a cheaper slug. The separately
+named `budget_degrade_models` list remains available only to the Issue #78
+budget-pressure ladder. MACO consults the authenticated runtime catalog once;
+when `gpt-5.6-sol` is present, every default role resolves to it.
 
 The chain is ordinary plan/profile data and round-trips without a code-shape
 change:
 
 ```json
 {
-  "model": "gpt-5.6-terra",
+  "model": "gpt-5.6-sol",
   "reasoning_effort": "xhigh",
   "unavailable_model_fallback": {
     "ordered_catalog_chain": {
-      "models": ["gpt-5.6-sol", "gpt-5.6-luna"],
-      "budget_degrade_models": ["gpt-5.6-luna"],
+      "models": [],
+      "budget_degrade_models": ["gpt-5.6-terra", "gpt-5.6-luna"],
       "on_exhausted": "runtime_default"
     }
   }
 }
 ```
 
-An explicit `all-frontier-v1` profile remains selectable by supplying
-`role_models` for all five roles with `model=gpt-5.6-sol`; the public
-`all_frontier_role_models()` helper constructs that profile data while
-preserving each role's reasoning-effort floor.
+The compatibility name `all-frontier-v1` remains available when a plan supplies
+the public `all_frontier_role_models()` data explicitly. Historical execution
+telemetry using `provisional-phase-a-hybrid-model-tier-v2` remains readable,
+but newly finalized reports use the effort-only name.
+
+An assignment may select a typed `reasoning_effort` value (`minimal`, `low`,
+`medium`, `high`, `xhigh`, `max`, or `ultra`). Missing assignment values use
+the role fallback. The selected task effort applies to child, nested-worker,
+gate-classifier, and review-auditor duties; gate-classifier duties clamp at
+`high` and review-auditor duties clamp at `xhigh`. The clamp is retained as
+`resolution_observation=hard_floor_clamped` rather than silently rewriting the
+authored request.
 
 The availability fallback order and the economics downgrade order are distinct
 data. `models` answers which advertised model may substitute when the primary
@@ -1301,7 +1308,7 @@ never assumed to be cheaper.
 
 The scheduler consumes `BudgetAction::Degrade` before admitting new work. On
 successive admissions while a soft token or cost ceiling remains reached it
-lowers the child-orchestrator reasoning effort, selects the first
+lowers the assignment-resolved child-orchestrator reasoning effort, selects the first
 runtime-advertised entry from that role's `budget_degrade_models`, and halves
 the remaining fan-out bound (never below one). A hard ceiling still halts new
 dispatch and drains already-started assignments. Concurrent admission waits
@@ -1343,8 +1350,8 @@ provider boundary (#77); the attachment seams are supervisor ledger creation
 and the autopilot/inbox dispatch boundary.
 
 On the production Codex path, the no-override child-orchestrator and auditor
-commands are constructed with the profile's explicit model and role-specific
-reasoning effort. Worker selection remains declarative data in the child
+commands are constructed with the profile's explicit model and resolved
+assignment effort. Worker selection remains declarative data in the child
 orchestrator prompt because nested workers are not launched as separately
 process-observable commands; it is not per-worker model or usage evidence. The
 supervisor entry completes the reported role profile rather than claiming that
@@ -1380,11 +1387,12 @@ therefore membership is runtime-advertised availability at preflight time, not
 proof of a fresh entitlement check or a guarantee that a later provider launch
 will succeed. MACO does not retry by cycling model names.
 
-This default is operationally selected, but it is not an evidence-backed
-production recommendation. Its source remains provisional deterministic-fake
-Phase A evidence over a hand-authored plan, so the profile is reported as
-`production_eligible=false`. Genuine Issue #26 evidence is required before the
-profile can be qualified for production or revised on empirical grounds.
+The single-slug model binding follows the evidence-backed cost-per-accepted-task
+decision. Assignment-level effort matching is operationally selected but has
+not yet been evaluated with real-provider resolved-effort telemetry, so the
+combined profile remains `production_eligible=false`. Genuine Issue #26
+evidence is required before its effort policy can be qualified for production
+or revised on empirical grounds.
 
 ### Platform boundary
 
@@ -2763,10 +2771,11 @@ limit.
 ```
 
 Every newly finalized `supervisor-final.json` carries
-`role_economics_profile.schema_version=4` plus execution telemetry: planned,
+`role_economics_profile.schema_version=5` plus execution telemetry: planned,
 started, and completed assignment counts; the resolved configured child bound;
 scheduler-observed peak and active-interval mean concurrency; configured and
-resolved model/reasoning bindings for every role; and usage/cost with explicit
+resolved model/reasoning bindings for every role; resolved effort for every
+assignment duty in `assignment_effort_bindings`; and usage/cost with explicit
 observation markers. `concurrency.policy_input` contains canonical JSON for
 evaluation compatibility, while `concurrency.policy_input_details` retains the
 typed entrypoint, plan, CLI, provider-quota, measured/configured host-resource,
@@ -2776,7 +2785,8 @@ remain explicit unavailable observations. A width-one run with multiple
 independent assignment or spec scopes emits a final-report warning. Readers
 continue accepting historical reports that omit this block or carry economics
 profile schema versions 1 through 3; the generated schema describes the required
-version 4 contract for newly finalized reports.
+version 5 contract for newly finalized reports. Version 4 profiles and the
+withdrawn model-tier profile name remain deserializable compatibility input.
 
 A worker assignment may opt into `"kind":"megafile_decomposition"` only with an
 exact canonical `"target_path"` inside its assigned paths. Ordinary assignments
