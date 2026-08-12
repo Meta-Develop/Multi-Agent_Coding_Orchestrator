@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "manifest_version": 1,
   "experiment_id": "issue26-phase-a-readme-v1",
   "fake_seed": 26,
@@ -26,126 +26,144 @@
       "right_profile_id": "hybrid-frontier-economy-v1",
       "repetition": 0,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     },
     {
       "left_profile_id": "frontier-all-v1",
       "right_profile_id": "balanced-all-v1",
       "repetition": 0,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     },
     {
       "left_profile_id": "frontier-all-v1",
       "right_profile_id": "economy-all-v1",
       "repetition": 0,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     },
     {
       "left_profile_id": "hybrid-frontier-economy-v1",
       "right_profile_id": "balanced-all-v1",
       "repetition": 0,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     },
     {
       "left_profile_id": "hybrid-frontier-economy-v1",
       "right_profile_id": "economy-all-v1",
       "repetition": 0,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     },
     {
       "left_profile_id": "balanced-all-v1",
       "right_profile_id": "economy-all-v1",
       "repetition": 0,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     },
     {
       "left_profile_id": "frontier-all-v1",
       "right_profile_id": "hybrid-frontier-economy-v1",
       "repetition": 1,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     },
     {
       "left_profile_id": "frontier-all-v1",
       "right_profile_id": "balanced-all-v1",
       "repetition": 1,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     },
     {
       "left_profile_id": "frontier-all-v1",
       "right_profile_id": "economy-all-v1",
       "repetition": 1,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     },
     {
       "left_profile_id": "hybrid-frontier-economy-v1",
       "right_profile_id": "balanced-all-v1",
       "repetition": 1,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     },
     {
       "left_profile_id": "hybrid-frontier-economy-v1",
       "right_profile_id": "economy-all-v1",
       "repetition": 1,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     },
     {
       "left_profile_id": "balanced-all-v1",
       "right_profile_id": "economy-all-v1",
       "repetition": 1,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     },
     {
       "left_profile_id": "frontier-all-v1",
       "right_profile_id": "hybrid-frontier-economy-v1",
       "repetition": 2,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     },
     {
       "left_profile_id": "frontier-all-v1",
       "right_profile_id": "balanced-all-v1",
       "repetition": 2,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     },
     {
       "left_profile_id": "frontier-all-v1",
       "right_profile_id": "economy-all-v1",
       "repetition": 2,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     },
     {
       "left_profile_id": "hybrid-frontier-economy-v1",
       "right_profile_id": "balanced-all-v1",
       "repetition": 2,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     },
     {
       "left_profile_id": "hybrid-frontier-economy-v1",
       "right_profile_id": "economy-all-v1",
       "repetition": 2,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     },
     {
       "left_profile_id": "balanced-all-v1",
       "right_profile_id": "economy-all-v1",
       "repetition": 2,
       "comparability": "incomparable",
-      "unavailable_reason": "not_process_observable: one or both runs lack a complete observed dispatch record"
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
     }
   ],
   "profile_summaries": [

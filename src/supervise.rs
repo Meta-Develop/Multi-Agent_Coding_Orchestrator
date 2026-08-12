@@ -96,7 +96,7 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Mutex,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -547,8 +547,12 @@ impl RuntimeModelCatalog {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+const SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct RoleEconomicsProfile {
+    #[serde(default = "default_role_economics_profile_schema_version")]
+    pub schema_version: u32,
     pub name: String,
     pub evidence: String,
     pub evidence_notice: String,
@@ -558,6 +562,90 @@ pub struct RoleEconomicsProfile {
     #[serde(default)]
     pub overridden_roles: Vec<AgentRole>,
     pub role_models: BTreeMap<AgentRole, RoleModelSelection>,
+    #[serde(default)]
+    pub model_catalog_observation: RuntimeModelCatalogObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<SupervisorExecutionMetadata>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeModelCatalogObservation {
+    Consulted,
+    ConsultationFailed,
+    #[default]
+    NotConsulted,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct SupervisorExecutionMetadata {
+    pub assignment_count: usize,
+    pub started_assignment_count: usize,
+    pub completed_assignment_count: usize,
+    pub concurrency: SupervisorConcurrencyReport,
+    pub role_bindings: BTreeMap<AgentRole, ResolvedRoleExecutionBinding>,
+    pub usage: SupervisorExecutionUsageReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct SupervisorConcurrencyReport {
+    pub configured_max_concurrent_children: usize,
+    pub policy_input_observation: ProcessObservation,
+    #[serde(default)]
+    pub policy_input: Option<String>,
+    #[serde(default)]
+    pub policy_input_unavailable_reason: Option<String>,
+    pub achieved_max_concurrent_children: usize,
+    pub achieved_mean_concurrent_children: Option<f64>,
+    pub achieved_mean_observation: ProcessObservation,
+    #[serde(default)]
+    pub achieved_mean_unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessObservation {
+    SchedulerObserved,
+    NotRetained,
+    #[default]
+    NotProcessObservable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ResolvedRoleExecutionBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_reasoning_effort: Option<String>,
+    pub resolved_model: Option<String>,
+    pub resolved_reasoning_effort: Option<String>,
+    pub observation: RoleBindingObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleBindingObservation {
+    RuntimeCatalogResolved,
+    RuntimeDefaultResolved,
+    SyntheticFake,
+    CatalogUnavailable,
+    ResolutionFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct SupervisorExecutionUsageReport {
+    pub total_usage: Option<Usage>,
+    pub total_cost_usd: Option<f64>,
+    pub usage_complete: bool,
+    pub observation: RoleUsageObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+const fn default_role_economics_profile_schema_version() -> u32 {
+    1
 }
 
 impl RoleModelSelection {
@@ -2340,6 +2428,7 @@ impl SupervisorPlan {
             role_models.insert(*role, selection.clone());
         }
         RoleEconomicsProfile {
+            schema_version: SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION,
             name: PROVISIONAL_DEFAULT_HYBRID_PROFILE_NAME.to_string(),
             evidence: PROVISIONAL_DEFAULT_HYBRID_PROFILE_EVIDENCE.to_string(),
             evidence_notice: PROVISIONAL_DEFAULT_HYBRID_PROFILE_NOTICE.to_string(),
@@ -2347,6 +2436,8 @@ impl SupervisorPlan {
             model_availability: RoleModelAvailability::Unknown,
             overridden_roles: self.role_models.keys().copied().collect(),
             role_models,
+            model_catalog_observation: RuntimeModelCatalogObservation::NotConsulted,
+            execution: None,
         }
     }
 
@@ -2357,6 +2448,12 @@ impl SupervisorPlan {
         let mut profile = self.effective_role_economics_profile();
         profile.model_availability =
             catalog.profile_availability(profile.role_models.values().cloned());
+        profile.model_catalog_observation = match catalog {
+            RuntimeModelCatalog::Codex(_) => RuntimeModelCatalogObservation::Consulted,
+            RuntimeModelCatalog::LocalDeterministicFake => {
+                RuntimeModelCatalogObservation::NotConsulted
+            }
+        };
         profile
     }
 }
