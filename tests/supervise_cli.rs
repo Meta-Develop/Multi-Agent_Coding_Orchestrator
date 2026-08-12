@@ -782,7 +782,7 @@ fn supervise_run_help_documents_auto_concurrency_default() -> Result<()> {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).context("UTF-8 supervise run help")?;
     assert!(stdout.contains("--max-concurrent-children <MAX_CONCURRENT_CHILDREN>"));
-    assert!(stdout.contains("auto` uses measured host capacity"));
+    assert!(stdout.contains("auto` uses the conservative network-bound default"));
     assert!(stdout.contains("[default: auto]"));
     Ok(())
 }

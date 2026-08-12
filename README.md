@@ -86,7 +86,8 @@ The current implementation covers a local-first command-line slice:
   non-publishable. `maco supervise plan/status/collect` remain available. The
   supervisor scheduler launches opt-in O1 child orchestrators through the
   Codex CLI in isolated child worktrees under an O2 supervisor, with
-  automatic resource-bounded fan-out as the default. It measures host capacity
+  conservative network-bound fan-out as the default. Admission composes that
+  ceiling with configured provider quota and measured/configured host capacity,
   and launches hierarchy-ready assignments concurrently only while their
   normalized claim scopes are disjoint; `--max-concurrent-children 1` is the
   explicit serial opt-out. Overlapping scopes are never admitted together. The
