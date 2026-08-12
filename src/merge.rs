@@ -7016,6 +7016,7 @@ fn reject_unsafe_lock_path(path: &Path) -> Result<()> {
 
 fn validate_open_lock_file(path: &Path, file: &fs::File) -> Result<()> {
     reject_unsafe_lock_path(path)?;
+    #[cfg(unix)]
     let path_metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to re-inspect repository lock {}", path.display()))?;
     let file_metadata = file
