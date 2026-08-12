@@ -28,8 +28,8 @@ The current implementation covers a local-first command-line slice:
 - `maco worktree create <agent-id>` is temporarily disabled at its public entry point pending capability-bound repository cleanliness input.
 - `maco worktree list` lists verified registered agent worktrees. `maco worktree pending` is a strict existing-only authenticated reader: absent state returns an empty list, while transitional or invalid state is refused without creating locks, migrating, scavenging, recovering, or writing.
 - `maco worktree remove <agent-id> --force` performs explicitly authorized cleanup of authenticated managed state; non-force removal is temporarily disabled.
-- `maco worktree gc` removes clean, inactive managed worktrees while retaining branch refs, protects dirty worktrees and active leases/claims, removes retained `target/` build artifacts by default, supports dry-run and max-age/max-count retention filters, and routes unregistered leftover directories through recoverable machine-global quarantine.
-- `maco worktree sweep --workspace <path>` enumerates every repository group under a workspace's `.maco/worktrees` root and aggregates the existing per-repository GC reports. It is dry-run by default; removal requires `--apply`, and an unresolved repository is reported as a typed per-repository failure without aborting the remaining groups.
+- `maco worktree gc` removes clean, inactive managed worktrees while retaining branch refs, protects tracked changes and unapproved untracked-only lanes plus active leases/claims, supports an exact repeatable untracked-path allowlist for reviewed full-lane cleanup, offers a liveness-checked target-only mode that retains lanes and branches, removes retained `target/` build artifacts by default, supports dry-run and max-age/max-count/apparent-byte retention filters, reports estimated reclaimable and reclaimed bytes, and routes unregistered leftover directories through recoverable machine-global quarantine.
+- `maco worktree sweep --workspace <path>` discovers both workspace-managed `.maco/worktrees/<repo>` roots and exact repository-local `<repo>/.worktrees` roots, then aggregates the existing per-root GC reports. It is dry-run by default; removal requires `--apply`, an unresolved repository is reported as a typed per-root failure without aborting later roots, and a total discovery miss is reported separately from an inspected root with nothing to reclaim.
 - `SyncCoordinator` provides an in-memory exclusive path-claim layer for local agent coordination.
 - `maco sync claim <agent-id> <path>...` records durable exclusive path claims.
 - `maco sync release <token>` releases one durable claim.
@@ -1271,11 +1271,15 @@ artifacts:
 
 ```bash
 cargo run -- worktree gc --repo . --dry-run --json
+cargo run -- worktree gc --repo . --dry-run \
+  --allow-untracked-path TASK.md --json
+cargo run -- worktree gc --repo . --targets-only --dry-run --json
+cargo run -- worktree gc --repo . --targets-only
 cargo run -- worktree gc --repo . \
   --machine-global-config /exact/path/to/machine-global.json \
   --machine-global-worktree-root-id worktrees \
   --machine-global-correlation scheduled-worktree-gc \
-  --max-count 10 --max-age-seconds 604800 --json
+  --max-count 10 --max-age-seconds 604800 --max-total-bytes 10737418240 --json
 cargo run -- worktree gc --repo . \
   --machine-global-config /exact/path/to/machine-global.json \
   --machine-global-worktree-root-id worktrees \
@@ -1283,16 +1287,111 @@ cargo run -- worktree gc --repo . \
   --keep-targets
 ```
 
-GC keeps worktrees with uncommitted changes, active MACO execution leases, or
-active path claims for the same agent id. Without retention filters, every clean
-inactive managed worktree is eligible for removal; with `--max-count` and/or
-`--max-age-seconds`, retained clean worktrees keep the checkout but lose their
-`target/` directory unless `--keep-targets` is set. A second pass prunes
+GC classifies tracked changes separately from untracked-only paths. Tracked
+changes always protect the lane. Untracked-only lanes are also protected by
+default and report their complete bounded path set; full-lane cleanup is
+eligible only when every such path exactly matches a repeatable
+`--allow-untracked-path <repo-relative-path>` value. This is an exact path list,
+not a glob or blanket ignore, and is bounded to 128 entries and 64 KiB in
+aggregate because a workspace sweep copies it into each per-root report.
+Repository-ignored files are included in this classification and need the same
+exact authorization. Only documented MACO runtime categories (`target/`,
+`.maco/`, `.maco-cache/`, and the `.agent[s]` temp/storage/live roots) remain
+separately disposable. An
+untracked file may be a worker's only copy of real output. Apply mode repeats
+the bounded status classification immediately before journaling full-lane
+removal and protects the lane if a new tracked or unapproved untracked path
+appeared. GC removal records the exact, platform-lossless clean or untracked-path
+classification and the target's absent/present filesystem identity in its
+authenticated recovery journal, then revalidates both immediately before
+quarantine. New explicit removals record a distinct origin. Explicit `--force`
+bypasses dirtiness but never target liveness; a legacy operation with no origin
+is always ambiguous in every unfinished recovery phase and cannot continue until
+the operator reruns the explicit force-removal command to reauthorize it. That
+command replaces the pending branch-deletion choice with its current explicit
+choice rather than inheriting a stale journal value. GC also keeps
+worktrees with
+active MACO execution leases or active path claims for the same agent id.
+Without retention filters, every eligible inactive managed worktree is selected
+for removal. `--max-total-bytes` adds a size dimension to `--max-count` and
+`--max-age-seconds`: after age/count exclusions, GC walks eligible lanes from
+newest to oldest and retains the newest prefix whose combined apparent size is
+within the byte budget. Protected or otherwise ineligible lanes are not charged
+to that retention budget, so it is not a global on-disk ceiling. Apparent size
+is filesystem metadata length, not allocated blocks or a promise about physical
+disk space, and sums descendants only rather than the lane root inode itself.
+The report exposes the
+apparent bytes considered and estimates for bytes reclaimable and actually
+reclaimed; full-lane estimates already include `target/`, while target-only
+estimates count only `target/`, so they are not double-counted. Sizing is a
+bounded, descriptor-relative, non-symlink-following walk; Linux additionally
+confines the walk to the lane's exact mount. A timeout, limit, unsupported
+platform, invalid target binding, or other sizing failure reports
+`size_measurement_failed` and protects that lane instead of guessing. Retained
+clean worktrees keep the checkout but lose their `target/` directory unless
+`--keep-targets` is set. A second pass prunes
 unregistered direct-child directories left under the managed worktree root. A
 destructive second pass requires the three-part machine-global binding above, treats
 all discovered orphans as one preflight set, and uses recoverable quarantine rather
 than direct deletion. Dry-run discovery remains non-mutating and does not require the
 binding.
+
+The byte counters cover authenticated managed lanes and managed `target/`
+cleanup only; orphan quarantine is reported by orphan counts and is not included
+in the byte estimates. Creation-time size retention reserves the newly created
+lane before considering older lanes. If that new lane alone exceeds the budget,
+it remains reserved and the effective byte allowance for older lanes is zero.
+
+`--targets-only` removes eligible `target/` directories while retaining every
+managed lane, branch, untracked file, and registered association. Because it is
+a separate operation, it rejects `--keep-targets`, every retention filter
+(including `--max-total-bytes`),
+untracked-path allowances, and machine-global orphan-cleanup bindings, and it
+does not run orphan pruning. Tracked changes, active claims, and active leases
+still protect the target; an untracked-only lane does not require an allowlist
+because the lane and its files remain. On Linux, every target deletion scans a
+bounded `/proc` snapshot for same-user processes. Explicit `CARGO_TARGET_DIR`
+values are resolved in the process's own view: absolute paths through
+`/proc/<pid>/root` and relative paths through `/proc/<pid>/cwd`. Canonical path
+containment and bounded ancestor identity checks in both directions detect
+aliases across mount namespaces without assuming textual path equality. Process
+paths retain their `/proc/<pid>/root` access path for identity checks. Observer
+canonical-path comparisons are used only when the process and observer mount
+namespace identities match; a different namespace relies on rooted filesystem
+identities and incomplete evidence is unknown. The
+detector also parses bounded process command lines for split and `--name=value`
+forms of Cargo's `--target-dir` and `--manifest-path` and rustc's `--out-dir`.
+An explicit output under the target is live; a manifest inside the lane with no
+explicit output protects the default Cargo target. The fallback association
+scan always runs, even after a readable environment or command line has no
+explicit target: a cargo/rustc/rustdoc/sccache-like process with a `cwd` inside
+the lane protects the default Cargo target, while a process `cwd`, executable,
+or readable file descriptor inside the target is live. File descriptors are
+read with `readlink`; recognized non-filesystem `pipe`, `socket`, `anon_inode`,
+and synthetic `memfd` or `dmabuf` targets are skipped, while deleted filesystem
+links under the target still protect it. Environment, command-line, cwd,
+executable, file-descriptor, bound, read, or timeout failures are unknown, not
+clear for a possible build process. Linux user-manager helpers, non-build
+systemd user services, and non-build processes with a readable command line but
+an unreadable mount namespace are skipped because they do not execute build
+work themselves; any cargo/rustc descendant remains a separately scanned
+process. A live match is reported as `live_target`; an incomplete,
+oversized, timed-out, or unreconciled scan is reported as
+`target_liveness_unknown`, and both refuse deletion. Reports include bounded
+typed PID, source, and cause evidence in JSON and human output.
+
+The target directory's filesystem identity is bound before the liveness probe.
+Target-only deletion passes that expected identity into the handle-relative tree
+remover, and full-lane deletion rechecks it immediately before recording the
+removal operation. Replacement is reported as `target_identity_changed` and the
+lane is retained. The same protections apply to a target included in full-lane
+removal. Recovery from a prepared removal rebinds the source, refuses any GC
+target absent/present or identity change, reruns the real liveness detector for
+every target including explicit-force removals, and revalidates the exact GC
+dirtiness state before quarantine. On non-Linux platforms the detector conservatively reports
+unknown, so target deletion remains disabled until a native detector is
+implemented. These checks run at the removal boundary to narrow the race, but a
+non-cooperating process can still start or create output after the final check.
 
 Sweep every repository group beneath one workspace. The first command is a
 dry-run because workspace sweeps never remove anything unless `--apply` is
@@ -1306,14 +1405,38 @@ cargo run -- worktree sweep --workspace /exact/path/to/workspace \
   --apply --keep-targets
 ```
 
-The aggregate report distinguishes repository groups that were inspected from
-groups skipped before GC and groups whose GC attempt failed. Each group includes
-its resolved repository when available, a typed failure when resolution or GC
-fails, and its nested GC summary. A failure in one group does not stop later
-groups from being inspected. Retention flags and `--keep-targets` are passed to
-the existing per-repository GC engine, so dirty worktrees and lanes with active
-leases or claims remain protected. Existing machine-global quarantine gates also
-remain in force; the sweep does not weaken them.
+The sweep discovers workspace-managed `.maco/worktrees/<repo>` roots through the
+same default-root function used by managed creation. It also recognizes the
+exact canonical `.worktrees` child of either the workspace repository itself or
+a direct repository child; custom per-creation roots have no persisted
+repository-level configuration to discover. The aggregate report identifies
+each root kind and distinguishes roots that were inspected from roots skipped
+before GC and roots whose GC attempt failed. `discovery_status` is
+`no_roots_discovered` for a total miss and `roots_discovered` even when every
+inspected root has zero actions; human output prints an explicit warning for the
+former. Each root includes its resolved repository when available, a typed
+failure when resolution or GC fails, and its nested GC summary. A failure in one
+root does not stop later roots from being inspected. Retention flags and
+`--keep-targets` are passed independently to each discovered root, so
+`--max-count` and `--max-total-bytes` are per-root limits and dirty worktrees or
+lanes with active leases or claims remain protected. Existing machine-global quarantine gates
+also remain in force; the sweep does not weaken them. A workspace-managed group
+is associated only when it is the exact result of the creation default-root
+function. In particular, `<repo>/.maco/worktrees` is not adopted as that
+repository's managed root because its creation default is
+`<repo-parent>/.maco/worktrees/<repo>`; sweep the parent workspace for that
+layout, or use the separately validated `<repo>/.worktrees` convention.
+
+Repository-local dry-runs also preview healthy Git-registered lanes that predate
+the authenticated MACO worktree registry. A stale linked-worktree child cannot
+override the exact primary-repository association used to discover that root.
+When the host cannot open legacy MACO state safely, the root remains a typed
+`failed` result, but the nested dry-run report still classifies registered lanes
+and exposes exact untracked paths, byte estimates, merge state, and target
+liveness. The fallback status probe is read-only and ignores ignored files, like
+ordinary `git status`; it exists only to make legacy lanes visible. It never
+grants apply-mode removal authority: destructive sweep still requires a valid
+authenticated MACO binding and safe private state.
 
 Perform explicitly authorized force cleanup and delete a MACO-owned branch:
 

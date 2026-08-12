@@ -54,10 +54,12 @@ use crate::{
         ClaimStatusReport, ClaimTelemetryOutcome, MegafileClaimWarning, OwnerReport, SyncStore,
     },
     worktree::{
-        sweep_workspace_worktrees, RepositoryInfo, WorktreeCreateOptions, WorktreeGcOptions,
-        WorktreeGcReason, WorktreeGcReport, WorktreeGcStatus, WorktreeManager, WorktreeRecord,
-        WorktreeRetentionPolicy, WorktreeSweepFailureKind, WorktreeSweepOptions,
-        WorktreeSweepReport, WorktreeSweepRepositoryStatus,
+        sweep_workspace_worktrees, worktree_report_path_text, RepositoryInfo,
+        WorktreeCreateOptions, WorktreeGcOptions, WorktreeGcReason, WorktreeGcReport,
+        WorktreeGcStatus, WorktreeManager, WorktreeRecord, WorktreeRetentionPolicy,
+        WorktreeSweepDiscoveryStatus, WorktreeSweepFailureKind, WorktreeSweepOptions,
+        WorktreeSweepReport, WorktreeSweepRepositoryStatus, WorktreeSweepRootKind,
+        WorktreeTargetLivenessCause, WorktreeTargetLivenessEvidence, WorktreeTargetLivenessSource,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -2152,6 +2154,7 @@ impl WorktreeCommand {
                 let retention = WorktreeRetentionPolicy {
                     max_age: args.gc_max_age_seconds.map(Duration::from_secs),
                     max_count: args.gc_max_count,
+                    max_total_bytes: args.gc_max_total_bytes,
                 };
                 let record = manager.create_with_retention(
                     WorktreeCreateOptions {
@@ -2189,10 +2192,13 @@ impl WorktreeCommand {
                     worktree_root: args.worktree_root,
                     dry_run: args.dry_run,
                     remove_targets: !args.keep_targets,
+                    targets_only: args.targets_only,
                     retention: WorktreeRetentionPolicy {
                         max_age: args.max_age_seconds.map(Duration::from_secs),
                         max_count: args.max_count,
+                        max_total_bytes: args.max_total_bytes,
                     },
+                    allowed_untracked_paths: args.allow_untracked_paths,
                     exclude_agent_id: None,
                     machine_global_retention,
                 })?;
@@ -2203,10 +2209,13 @@ impl WorktreeCommand {
                     workspace: args.workspace,
                     apply: args.apply,
                     remove_targets: !args.keep_targets,
+                    targets_only: args.targets_only,
                     retention: WorktreeRetentionPolicy {
                         max_age: args.max_age_seconds.map(Duration::from_secs),
                         max_count: args.max_count,
+                        max_total_bytes: args.max_total_bytes,
                     },
+                    allowed_untracked_paths: args.allow_untracked_paths,
                 })?;
                 print_worktree_sweep_report(&report, args.json)
             }
@@ -3176,6 +3185,9 @@ struct CreateWorktreeArgs {
     /// After creation, keep at most this many newest eligible clean worktrees.
     #[arg(long)]
     gc_max_count: Option<usize>,
+    /// After creation, retain at most this many apparent, not allocated, bytes in newest eligible lanes.
+    #[arg(long)]
+    gc_max_total_bytes: Option<u64>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -3195,12 +3207,21 @@ struct GcWorktreeArgs {
     /// Keep per-worktree target/ directories for retained worktrees.
     #[arg(long)]
     keep_targets: bool,
+    /// Reclaim eligible target/ directories while retaining every lane and branch; conflicts with retention filters.
+    #[arg(long)]
+    targets_only: bool,
     /// Remove only eligible clean worktrees older than this many seconds.
     #[arg(long)]
     max_age_seconds: Option<u64>,
     /// Keep at most this many newest eligible clean worktrees.
     #[arg(long)]
     max_count: Option<usize>,
+    /// Retain a newest eligible prefix within this many apparent, not allocated, bytes; sizing failure protects a lane.
+    #[arg(long)]
+    max_total_bytes: Option<u64>,
+    /// Exact repository-relative untracked path allowed during full-lane removal. Repeatable.
+    #[arg(long = "allow-untracked-path")]
+    allow_untracked_paths: Vec<PathBuf>,
     /// Exact reviewed config used to gate nonempty unregistered-directory cleanup.
     #[arg(long)]
     machine_global_config: Option<PathBuf>,
@@ -3226,12 +3247,21 @@ struct SweepWorktreeArgs {
     /// Keep per-worktree target/ directories for retained worktrees.
     #[arg(long)]
     keep_targets: bool,
+    /// Reclaim eligible target/ directories while retaining every lane and branch; conflicts with retention filters.
+    #[arg(long)]
+    targets_only: bool,
     /// Remove only eligible clean worktrees older than this many seconds.
     #[arg(long)]
     max_age_seconds: Option<u64>,
-    /// Keep at most this many newest eligible clean worktrees per repository.
+    /// Keep at most this many newest eligible clean worktrees per discovered root.
     #[arg(long)]
     max_count: Option<usize>,
+    /// Retain a newest eligible prefix within this many apparent, not allocated, bytes per discovered root.
+    #[arg(long)]
+    max_total_bytes: Option<u64>,
+    /// Exact repository-relative untracked path allowed during full-lane removal. Repeatable.
+    #[arg(long = "allow-untracked-path")]
+    allow_untracked_paths: Vec<PathBuf>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -4955,8 +4985,13 @@ fn print_worktree_gc_report(report: &WorktreeGcReport, json: bool) -> Result<()>
         return Ok(());
     }
     println!(
-        "Worktree GC: {}",
-        if report.dry_run { "dry-run" } else { "applied" }
+        "Worktree GC: {}{}",
+        if report.dry_run { "dry-run" } else { "applied" },
+        if report.targets_only {
+            " targets-only"
+        } else {
+            ""
+        }
     );
     println!("Considered: {}", report.considered_count);
     println!("Removed: {}", report.removed_count);
@@ -4964,6 +4999,24 @@ fn print_worktree_gc_report(report: &WorktreeGcReport, json: bool) -> Result<()>
     println!("Retained: {}", report.retained_count);
     println!("Targets cleaned: {}", report.target_removed_count);
     println!("Orphans pruned: {}", report.orphan_removed_count);
+    println!(
+        "Apparent bytes considered: {}",
+        report.apparent_considered_bytes
+    );
+    println!(
+        "Estimated bytes reclaimable: {}",
+        report.estimated_reclaimable_bytes
+    );
+    println!(
+        "Estimated bytes reclaimed: {}",
+        report.estimated_reclaimed_bytes
+    );
+    for path in &report.allowed_untracked_paths {
+        println!(
+            "Allowed untracked path: {}",
+            worktree_report_path_text(path)
+        );
+    }
     for entry in &report.entries {
         let branch = entry.branch.as_deref().unwrap_or("-");
         let target = entry
@@ -4980,8 +5033,10 @@ fn print_worktree_gc_report(report: &WorktreeGcReport, json: bool) -> Result<()>
             .retention_operation_id
             .map(|operation_id| format!(" retention-operation={}", operation_id.get()))
             .unwrap_or_default();
+        let untracked = worktree_gc_untracked_suffix(&entry.untracked_paths);
+        let liveness = worktree_target_liveness_suffix(entry.target_liveness.as_ref());
         println!(
-            "{}\t{}\t{}\t{}\t{}{}{}{}",
+            "{}\t{}\t{}\t{}\t{}{}{}{}{}{}",
             worktree_gc_status_label(entry.status),
             worktree_gc_reason_label(entry.reason),
             entry.name,
@@ -4989,7 +5044,9 @@ fn print_worktree_gc_report(report: &WorktreeGcReport, json: bool) -> Result<()>
             entry.path.display(),
             target,
             gate_denial,
-            retention
+            retention,
+            untracked,
+            liveness
         );
     }
     Ok(())
@@ -5027,12 +5084,31 @@ fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Resu
         "Orphans pruned"
     };
     println!(
-        "Workspace worktree sweep: {}",
-        if report.dry_run { "dry-run" } else { "applied" }
+        "Workspace worktree sweep: {}{}",
+        if report.dry_run { "dry-run" } else { "applied" },
+        if report.targets_only {
+            " targets-only"
+        } else {
+            ""
+        }
     );
     println!("Workspace: {}", report.workspace.display());
     println!(
-        "Repositories: discovered={} inspected={} skipped-before-gc={} gc-failed={} total-failures={}",
+        "Discovery: {} (roots={})",
+        worktree_sweep_discovery_status_label(report.discovery_status),
+        report.worktree_root_discovered_count
+    );
+    if let Some(warning) = worktree_sweep_discovery_warning(report.discovery_status) {
+        println!("{warning}");
+    }
+    for path in &report.allowed_untracked_paths {
+        println!(
+            "Allowed untracked path: {}",
+            worktree_report_path_text(path)
+        );
+    }
+    println!(
+        "Discovered roots: total={} inspected={} skipped-before-gc={} gc-failed={} total-failures={}",
         report.repository_discovered_count,
         report.repository_inspected_count,
         report.repository_pre_gc_skipped_count,
@@ -5045,6 +5121,18 @@ fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Resu
     println!("Retained: {}", report.retained_count);
     println!("{target_label}: {target_action_count}");
     println!("{orphan_label}: {}", report.orphan_removed_count);
+    println!(
+        "Apparent bytes considered: {}",
+        report.apparent_considered_bytes
+    );
+    println!(
+        "Estimated bytes reclaimable: {}",
+        report.estimated_reclaimable_bytes
+    );
+    println!(
+        "Estimated bytes reclaimed: {}",
+        report.estimated_reclaimed_bytes
+    );
 
     for repository in &report.repositories {
         let resolved_repository = repository
@@ -5053,8 +5141,9 @@ fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Resu
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "Repository group={} status={} repository={} worktree-root={} gc-attempted={} effects-may-have-occurred={}",
+            "Repository group={} root-kind={} status={} repository={} worktree-root={} gc-attempted={} effects-may-have-occurred={}",
             repository.group,
+            worktree_sweep_root_kind_label(repository.root_kind),
             worktree_sweep_repository_status_label(repository.status),
             resolved_repository,
             repository.worktree_root.display(),
@@ -5075,7 +5164,7 @@ fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Resu
                 "targets-cleaned"
             };
             println!(
-                "  GC: considered={} {}={} protected={} retained={} {}={} orphans={}",
+                "  GC: considered={} {}={} protected={} retained={} {}={} orphans={} apparent-bytes={} reclaimable-bytes={} reclaimed-bytes={}",
                 gc_report.considered_count,
                 if gc_report.dry_run {
                     "would-remove"
@@ -5087,22 +5176,112 @@ fn print_worktree_sweep_report(report: &WorktreeSweepReport, json: bool) -> Resu
                 gc_report.retained_count,
                 target_action_label,
                 worktree_gc_target_action_count(gc_report),
-                gc_report.orphan_removed_count
+                gc_report.orphan_removed_count,
+                gc_report.apparent_considered_bytes,
+                gc_report.estimated_reclaimable_bytes,
+                gc_report.estimated_reclaimed_bytes
             );
             for entry in &gc_report.entries {
                 let branch = entry.branch.as_deref().unwrap_or("-");
+                let untracked = worktree_gc_untracked_suffix(&entry.untracked_paths);
+                let liveness = worktree_target_liveness_suffix(entry.target_liveness.as_ref());
                 println!(
-                    "    {}\t{}\t{}\t{}\t{}",
+                    "    {}\t{}\t{}\t{}\t{}{}{}",
                     worktree_gc_status_label(entry.status),
                     worktree_gc_reason_label(entry.reason),
                     entry.name,
                     branch,
-                    entry.path.display()
+                    entry.path.display(),
+                    untracked,
+                    liveness
                 );
             }
         }
     }
     Ok(())
+}
+
+fn worktree_gc_untracked_suffix(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " untracked={}",
+            paths
+                .iter()
+                .map(|path| worktree_report_path_text(path))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+}
+
+fn worktree_target_liveness_suffix(evidence: Option<&WorktreeTargetLivenessEvidence>) -> String {
+    let Some(evidence) = evidence else {
+        return String::new();
+    };
+    format!(
+        " target-liveness-pid={} target-liveness-source={} target-liveness-cause={}",
+        evidence
+            .pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        worktree_target_liveness_source_label(evidence.source),
+        worktree_target_liveness_cause_label(evidence.cause),
+    )
+}
+
+fn worktree_target_liveness_source_label(source: WorktreeTargetLivenessSource) -> &'static str {
+    match source {
+        WorktreeTargetLivenessSource::CargoTargetDir => "cargo-target-dir",
+        WorktreeTargetLivenessSource::DefaultCargoTarget => "default-cargo-target",
+        WorktreeTargetLivenessSource::ProcessEnvironment => "process-environment",
+        WorktreeTargetLivenessSource::ProcessCommandLine => "process-command-line",
+        WorktreeTargetLivenessSource::ProcessCwd => "process-cwd",
+        WorktreeTargetLivenessSource::ProcessExecutable => "process-executable",
+        WorktreeTargetLivenessSource::ProcessFileDescriptor => "process-file-descriptor",
+        WorktreeTargetLivenessSource::ProcScan => "proc-scan",
+        WorktreeTargetLivenessSource::MountNamespace => "mount-namespace",
+        WorktreeTargetLivenessSource::Platform => "platform",
+        WorktreeTargetLivenessSource::TargetIdentity => "target-identity",
+    }
+}
+
+fn worktree_target_liveness_cause_label(cause: WorktreeTargetLivenessCause) -> &'static str {
+    match cause {
+        WorktreeTargetLivenessCause::PathOverlap => "path-overlap",
+        WorktreeTargetLivenessCause::CargoLikeProcessInLane => "cargo-like-process-in-lane",
+        WorktreeTargetLivenessCause::ReadFailed => "read-failed",
+        WorktreeTargetLivenessCause::InvalidValue => "invalid-value",
+        WorktreeTargetLivenessCause::LimitExceeded => "limit-exceeded",
+        WorktreeTargetLivenessCause::TimedOut => "timed-out",
+        WorktreeTargetLivenessCause::Unsupported => "unsupported",
+        WorktreeTargetLivenessCause::NamespaceUnresolved => "namespace-unresolved",
+        WorktreeTargetLivenessCause::IdentityChanged => "identity-changed",
+    }
+}
+
+fn worktree_sweep_discovery_status_label(status: WorktreeSweepDiscoveryStatus) -> &'static str {
+    match status {
+        WorktreeSweepDiscoveryStatus::NoRootsDiscovered => "no-roots-discovered",
+        WorktreeSweepDiscoveryStatus::RootsDiscovered => "roots-discovered",
+    }
+}
+
+fn worktree_sweep_discovery_warning(status: WorktreeSweepDiscoveryStatus) -> Option<&'static str> {
+    match status {
+        WorktreeSweepDiscoveryStatus::NoRootsDiscovered => {
+            Some("WARNING: no worktree roots were discovered; this is not a clean-sweep result.")
+        }
+        WorktreeSweepDiscoveryStatus::RootsDiscovered => None,
+    }
+}
+
+fn worktree_sweep_root_kind_label(kind: WorktreeSweepRootKind) -> &'static str {
+    match kind {
+        WorktreeSweepRootKind::WorkspaceManaged => "workspace-managed",
+        WorktreeSweepRootKind::RepositoryLocal => "repository-local",
+    }
 }
 
 fn worktree_gc_target_action_count(report: &WorktreeGcReport) -> usize {
@@ -5149,13 +5328,19 @@ fn worktree_gc_status_label(status: WorktreeGcStatus) -> &'static str {
 fn worktree_gc_reason_label(reason: WorktreeGcReason) -> &'static str {
     match reason {
         WorktreeGcReason::FinishedBranch => "finished-branch",
+        WorktreeGcReason::UnmergedBranch => "unmerged-branch",
         WorktreeGcReason::RetentionKeep => "retention-keep",
         WorktreeGcReason::ExcludedCurrentWorktree => "excluded-current-worktree",
         WorktreeGcReason::Dirty => "dirty",
+        WorktreeGcReason::UntrackedOnly => "untracked-only",
         WorktreeGcReason::ActiveLease => "active-lease",
         WorktreeGcReason::ActiveClaim => "active-claim",
         WorktreeGcReason::TargetRemoved => "target-removed",
         WorktreeGcReason::TargetWouldRemove => "target-would-remove",
+        WorktreeGcReason::LiveTarget => "live-target",
+        WorktreeGcReason::TargetLivenessUnknown => "target-liveness-unknown",
+        WorktreeGcReason::TargetIdentityChanged => "target-identity-changed",
+        WorktreeGcReason::SizeMeasurementFailed => "size-measurement-failed",
         WorktreeGcReason::NoTarget => "no-target",
         WorktreeGcReason::UnregisteredOrphan => "unregistered-orphan",
         WorktreeGcReason::MachineGlobalGate => "machine-global-gate",
@@ -5280,13 +5465,28 @@ mod tests {
         assert_eq!(args.workspace, PathBuf::from("/srv/workspace"));
         assert!(!args.apply, "workspace sweep must default to dry-run");
         assert!(!args.keep_targets);
+        assert!(!args.targets_only);
         assert_eq!(args.max_age_seconds, None);
         assert_eq!(args.max_count, None);
+        assert_eq!(args.max_total_bytes, None);
         assert!(!args.json);
 
         let error = Cli::try_parse_from(["maco", "worktree", "sweep"])
             .expect_err("workspace sweep must require --workspace");
         assert!(error.to_string().contains("--workspace"));
+    }
+
+    #[test]
+    fn worktree_sweep_zero_root_formatter_emits_prominent_warning() {
+        let warning =
+            worktree_sweep_discovery_warning(WorktreeSweepDiscoveryStatus::NoRootsDiscovered)
+                .expect("zero-root sweep warning");
+        assert!(warning.starts_with("WARNING:"));
+        assert!(warning.contains("not a clean-sweep result"));
+        assert_eq!(
+            worktree_sweep_discovery_warning(WorktreeSweepDiscoveryStatus::RootsDiscovered),
+            None
+        );
     }
 
     #[test]
@@ -5302,7 +5502,13 @@ mod tests {
             "86400",
             "--max-count",
             "12",
+            "--max-total-bytes",
+            "10737418240",
             "--keep-targets",
+            "--allow-untracked-path",
+            "TASK.md",
+            "--allow-untracked-path",
+            "notes/output.txt",
             "--json",
         ])
         .expect("fully configured workspace sweep should parse");
@@ -5316,7 +5522,13 @@ mod tests {
         assert!(args.apply);
         assert_eq!(args.max_age_seconds, Some(86_400));
         assert_eq!(args.max_count, Some(12));
+        assert_eq!(args.max_total_bytes, Some(10_737_418_240));
         assert!(args.keep_targets);
+        assert!(!args.targets_only);
+        assert_eq!(
+            args.allow_untracked_paths,
+            vec![PathBuf::from("TASK.md"), PathBuf::from("notes/output.txt")]
+        );
         assert!(args.json);
     }
 
@@ -5332,6 +5544,81 @@ mod tests {
         };
         assert_eq!(args.repo, PathBuf::from("repo"));
         assert!(!args.dry_run, "worktree gc must remain apply-by-default");
+        assert!(!args.targets_only);
+        assert_eq!(args.max_total_bytes, None);
+        assert!(args.allow_untracked_paths.is_empty());
+    }
+
+    #[test]
+    fn worktree_gc_parses_apparent_byte_retention() {
+        let parsed =
+            Cli::try_parse_from(["maco", "worktree", "gc", "--max-total-bytes", "2147483648"])
+                .expect("size retention should parse");
+        let Command::Worktree(WorktreeCommand {
+            command: WorktreeSubcommand::Gc(args),
+        }) = parsed.command
+        else {
+            panic!("expected worktree gc command");
+        };
+        assert_eq!(args.max_total_bytes, Some(2_147_483_648));
+    }
+
+    #[test]
+    fn worktree_gc_parses_repeatable_exact_untracked_allowlist() {
+        let parsed = Cli::try_parse_from([
+            "maco",
+            "worktree",
+            "gc",
+            "--allow-untracked-path",
+            "TASK.md",
+            "--allow-untracked-path",
+            "worker/output.json",
+        ])
+        .expect("repeatable untracked allowlist should parse");
+        let Command::Worktree(WorktreeCommand {
+            command: WorktreeSubcommand::Gc(args),
+        }) = parsed.command
+        else {
+            panic!("expected worktree gc command");
+        };
+        assert_eq!(
+            args.allow_untracked_paths,
+            vec![
+                PathBuf::from("TASK.md"),
+                PathBuf::from("worker/output.json")
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_gc_and_sweep_parse_targets_only_mode() {
+        let gc = Cli::try_parse_from(["maco", "worktree", "gc", "--targets-only"])
+            .expect("target-only GC should parse");
+        let Command::Worktree(WorktreeCommand {
+            command: WorktreeSubcommand::Gc(gc),
+        }) = gc.command
+        else {
+            panic!("expected worktree gc command");
+        };
+        assert!(gc.targets_only);
+
+        let sweep = Cli::try_parse_from([
+            "maco",
+            "worktree",
+            "sweep",
+            "--workspace",
+            "workspace",
+            "--targets-only",
+        ])
+        .expect("target-only sweep should parse");
+        let Command::Worktree(WorktreeCommand {
+            command: WorktreeSubcommand::Sweep(sweep),
+        }) = sweep.command
+        else {
+            panic!("expected worktree sweep command");
+        };
+        assert!(sweep.targets_only);
+        assert!(!sweep.apply);
     }
 
     #[test]
@@ -5339,14 +5626,20 @@ mod tests {
         let dry_run = WorktreeGcReport {
             dry_run: true,
             remove_targets: true,
+            targets_only: false,
             max_age_seconds: None,
             max_count: Some(1),
+            max_total_bytes: None,
+            allowed_untracked_paths: Vec::new(),
             considered_count: 1,
             removed_count: 0,
             protected_count: 0,
             retained_count: 1,
             target_removed_count: 0,
             orphan_removed_count: 0,
+            apparent_considered_bytes: 0,
+            estimated_reclaimable_bytes: 0,
+            estimated_reclaimed_bytes: 0,
             entries: vec![crate::worktree::WorktreeGcEntry {
                 name: "retained-lane".to_string(),
                 branch: Some("maco/retained-lane".to_string()),
@@ -5356,6 +5649,10 @@ mod tests {
                 target_path: Some(PathBuf::from(
                     "/workspace/.maco/worktrees/repo/retained-lane/target",
                 )),
+                target_liveness: None,
+                apparent_worktree_bytes: None,
+                apparent_target_bytes: None,
+                untracked_paths: Vec::new(),
                 gate_denial: None,
                 retention_operation_id: None,
             }],
@@ -5366,6 +5663,21 @@ mod tests {
         applied.dry_run = false;
         applied.target_removed_count = 2;
         assert_eq!(worktree_gc_target_action_count(&applied), 2);
+    }
+
+    #[test]
+    fn worktree_target_liveness_evidence_has_actionable_human_rendering() {
+        let evidence = WorktreeTargetLivenessEvidence {
+            pid: Some(1234),
+            source: WorktreeTargetLivenessSource::DefaultCargoTarget,
+            cause: WorktreeTargetLivenessCause::CargoLikeProcessInLane,
+        };
+        assert_eq!(
+            worktree_target_liveness_suffix(Some(&evidence)),
+            " target-liveness-pid=1234 target-liveness-source=default-cargo-target \
+             target-liveness-cause=cargo-like-process-in-lane"
+        );
+        assert_eq!(worktree_target_liveness_suffix(None), "");
     }
 
     #[test]
