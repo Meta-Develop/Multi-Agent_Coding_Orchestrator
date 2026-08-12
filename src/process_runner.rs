@@ -2833,6 +2833,9 @@ fn environment_failure_from_source(source: &std::io::Error) -> Option<(Environme
 
 #[cfg(test)]
 pub(crate) fn is_verified_backend_unavailable(error: &ProcessRunError) -> bool {
+    if missing_delegated_user_manager_failure(error).is_some() {
+        return true;
+    }
     match error {
         ProcessRunError::ProcessOwnership { .. } => {
             let message = error.to_string();
@@ -2845,6 +2848,25 @@ pub(crate) fn is_verified_backend_unavailable(error: &ProcessRunError) -> bool {
             .any(|diagnostic| message.contains(diagnostic))
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+fn missing_delegated_user_manager_failure(error: &ProcessRunError) -> Option<&EnvironmentFailure> {
+    match error {
+        ProcessRunError::EnvironmentFailure {
+            failure,
+            target_process_started: false,
+            ..
+        } if failure.category
+            == crate::external_agent::EnvironmentFailureCategory::SandboxUnavailable
+            && failure
+                .summary
+                .contains("is not inside a delegated systemd user manager") =>
+        {
+            Some(failure)
+        }
+        _ => None,
     }
 }
 
@@ -4077,7 +4099,11 @@ impl PreparedProcessTree {
                                 source.to_string(),
                             ))
                         }
-                        Err(source) => Err(unavailable(source)),
+                        Err(source) => Err(containment_setup_error(
+                            label.to_string(),
+                            command.to_string(),
+                            source,
+                        )),
                     }
                 }
                 #[cfg(target_os = "windows")]
@@ -8239,6 +8265,11 @@ impl Drop for SystemdUnit {
 #[cfg(target_os = "linux")]
 fn systemd_user_manager_cgroup() -> std::io::Result<PathBuf> {
     let contents = fs::read_to_string("/proc/self/cgroup")?;
+    delegated_systemd_user_manager_cgroup(&contents)
+}
+
+#[cfg(target_os = "linux")]
+fn delegated_systemd_user_manager_cgroup(contents: &str) -> std::io::Result<PathBuf> {
     let current = contents
         .lines()
         .find_map(|line| line.strip_prefix("0::"))
@@ -8259,9 +8290,11 @@ fn systemd_user_manager_cgroup() -> std::io::Result<PathBuf> {
             return Ok(manager);
         }
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        format!("current cgroup {current} is not inside a delegated systemd user manager"),
+    Err(environment_failure_io(
+        EnvironmentFailure::sandbox_unavailable(format!(
+            "current cgroup {current} is not inside a delegated systemd user manager"
+        )),
+        false,
     ))
 }
 
@@ -10399,6 +10432,51 @@ mod tests {
         assert!(!is_verified_backend_unavailable(&error));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_delegated_user_manager_is_a_typed_pre_spawn_environment_failure() {
+        let source = delegated_systemd_user_manager_cgroup(
+            "0::/system.slice/hosted-compute-agent.service\n",
+        )
+        .expect_err("hosted-runner system cgroup must not satisfy strict containment");
+        let error = containment_setup_error(
+            "hosted runner containment probe".to_string(),
+            "/usr/bin/true".to_string(),
+            source,
+        );
+
+        assert!(matches!(
+            &error,
+            ProcessRunError::EnvironmentFailure {
+                failure,
+                target_process_started: false,
+                ..
+            } if failure.category
+                == crate::external_agent::EnvironmentFailureCategory::SandboxUnavailable
+                && failure.summary
+                    == "current cgroup /system.slice/hosted-compute-agent.service is not inside a delegated systemd user manager"
+        ));
+        assert!(is_verified_backend_unavailable(&error));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn delegated_user_manager_cgroup_detection_remains_exact() {
+        assert_eq!(
+            delegated_systemd_user_manager_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/maco.scope\n",
+            )
+            .expect("delegated user manager"),
+            PathBuf::from("/user.slice/user-1000.slice/user@1000.service")
+        );
+        assert!(
+            delegated_systemd_user_manager_cgroup("1:name=systemd:/user.slice\n")
+                .expect_err("cgroup v1 must remain unsupported")
+                .to_string()
+                .contains("unified cgroup v2")
+        );
+    }
+
     #[cfg(unix)]
     fn assert_process_not_executable(pid: &str, context: &str) {
         let process_state = Command::new("ps")
@@ -10567,7 +10645,10 @@ mod tests {
             Ok((read, response))
         }) {
             Ok(result) => result,
-            Err(ProcessRunError::ContainmentUnavailable { .. }) => return,
+            Err(error) if is_verified_backend_unavailable(&error) => {
+                report_verified_backend_unavailable_skip(&error);
+                return;
+            }
             Err(error) => panic!("verified interactive runner failed: {error:?}"),
         };
 
@@ -11523,6 +11604,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn isolated_host_view_resolves_disjoint_required_mounts_and_root_tmpfs() {
+        if !Path::new("/nix/store").is_dir() {
+            eprintln!(
+                "skipping Nix-store-dependent isolated-host-view test: /nix/store is unavailable"
+            );
+            return;
+        }
+
         let temp = tempfile::tempdir().expect("tempdir");
         let view = temp.path().join("view");
         let materialized = temp.path().join("materialized");
@@ -12307,7 +12395,7 @@ mod tests {
         ) {
             Ok(output) => output,
             Err(error) if is_verified_backend_unavailable(&error) => {
-                assert_current_runner_has_no_systemd_residue();
+                report_verified_backend_unavailable_skip(&error);
                 return;
             }
             Err(error) => panic!("run normal contained command: {error:?}"),
@@ -12372,7 +12460,7 @@ mod tests {
             }
             Err(error) if is_verified_backend_unavailable(&error) => {
                 assert!(!marker.exists());
-                assert_current_runner_has_no_systemd_residue();
+                report_verified_backend_unavailable_skip(&error);
             }
             Err(error) => panic!("unexpected strict backend probe failure: {error:?}"),
         }
@@ -12497,11 +12585,12 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        if results
+        if let Some(error) = results
             .iter()
-            .any(|result| result.as_ref().is_err_and(is_verified_backend_unavailable))
+            .filter_map(|result| result.as_ref().err())
+            .find(|error| is_verified_backend_unavailable(error))
         {
-            assert_current_runner_has_no_systemd_residue();
+            report_verified_backend_unavailable_skip(error);
             return;
         }
         assert!(ready_paths.iter().all(|path| path.exists()));
@@ -12748,7 +12837,7 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
             }
             Err(error) if is_verified_backend_unavailable(&error) => {
                 assert!(!marker.exists());
-                assert_current_runner_has_no_systemd_residue();
+                report_verified_backend_unavailable_skip(&error);
             }
             Err(error) => panic!("unexpected denial probe failure: {error:?}"),
         }
@@ -13344,8 +13433,8 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
 
     #[cfg(target_os = "linux")]
     fn strict_backend_available_for_tests() -> bool {
-        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *AVAILABLE.get_or_init(|| {
+        static AVAILABILITY: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+        match AVAILABILITY.get_or_init(|| {
             let temp = tempfile::tempdir().expect("strict backend probe tempdir");
             let marker = temp.path().join("target-ran");
             match run_process(
@@ -13361,21 +13450,51 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
                 Ok(output) => {
                     assert!(output.safety_evidence_verified());
                     assert!(marker.exists());
-                    true
+                    Ok(())
+                }
+                Err(error) if missing_delegated_user_manager_failure(&error).is_some() => {
+                    assert!(!marker.exists());
+                    Err(missing_delegated_user_manager_failure(&error)
+                        .expect("matched delegated-manager failure")
+                        .summary
+                        .clone())
                 }
                 Err(error) if is_verified_backend_unavailable(&error) => {
                     assert!(!marker.exists());
                     assert_current_runner_has_no_systemd_residue();
-                    false
+                    Err(error.to_string())
                 }
                 Err(error) => panic!("unexpected strict backend capability failure: {error:?}"),
             }
-        })
+        }) {
+            Ok(()) => true,
+            Err(reason) => {
+                eprintln!(
+                    "skipping containment-dependent test: delegated systemd user manager unavailable: {reason}"
+                );
+                false
+            }
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
     fn strict_backend_available_for_tests() -> bool {
         false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn report_verified_backend_unavailable_skip(error: &ProcessRunError) {
+        if let Some(failure) = missing_delegated_user_manager_failure(error) {
+            eprintln!(
+                "skipping containment-dependent test: delegated systemd user manager unavailable: {}",
+                failure.summary
+            );
+            return;
+        }
+        assert_current_runner_has_no_systemd_residue();
+        eprintln!(
+            "skipping containment-dependent test: verified containment backend unavailable: {error}"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -14413,6 +14532,11 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
     #[cfg(unix)]
     #[test]
     fn agent_lifecycle_metadata_stamps_environment_and_registers_running_process() {
+        #[cfg(target_os = "linux")]
+        if !strict_backend_available_for_tests() {
+            return;
+        }
+
         let temp = tempfile::tempdir().expect("tempdir");
         git2::Repository::init(temp.path()).expect("init repository");
         let metadata = AgentLaunchMetadata::new(temp.path(), "worker", "runner-run", "runner-task")
