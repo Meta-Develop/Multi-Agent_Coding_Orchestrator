@@ -138,6 +138,23 @@ fn append_assignment_coverage_gap(
     );
 }
 
+pub(super) fn supervisor_plan_fan_out_width_warning(
+    plan: &SupervisorPlan,
+) -> Option<planning::FanOutWidthWarning> {
+    let independent_scope_count = plan
+        .assignments
+        .iter()
+        .map(|assignment| {
+            assignment
+                .assigned_paths
+                .len()
+                .max(assignment.worker_assignments.len())
+                .max(1)
+        })
+        .sum();
+    planning::fan_out_width_warning(plan.max_child_assignments, independent_scope_count)
+}
+
 pub(super) fn validate_supervisor_plan(
     mut plan: SupervisorPlan,
     mut metadata: SupervisorPlanMetadata,
@@ -319,6 +336,15 @@ pub(super) fn validate_supervisor_plan(
                 plan.max_depth
             );
         }
+    }
+    if let Some(warning) = supervisor_plan_fan_out_width_warning(&plan) {
+        tracing::warn!(
+            code = warning.code,
+            configured_max_child_assignments = warning.configured_max_child_assignments,
+            independent_scope_count = warning.independent_scope_count,
+            "{}",
+            warning.message
+        );
     }
     if let Some(operation) = metadata.evidence_only_reaudit.as_mut() {
         if plan.assignments.len() != 1 {

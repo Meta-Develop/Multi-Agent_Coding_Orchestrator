@@ -2174,6 +2174,17 @@ runtime claims. Fragments whose scopes overlap are coalesced, and the complete
 proposal is checked for cross-subtree path, module, and symbol disjointness
 before the validated plan is emitted or any child can launch.
 
+Exact Rust symbol matches take precedence over broader module-file and module
+declaration matches. This keeps a shared module root or other large declaration
+file from transitively coalescing otherwise independent implementation files.
+Assignments that genuinely edit different symbols in the same file still
+coalesce: writable ownership and merge validation are file-granular, so
+sub-file ownership would not be a sound concurrency boundary. Authored plans
+that set `max_child_assignments` to `1` while one assignment contains multiple
+independent path or worker scopes emit a
+`planning_width_pinned_to_one` validation warning; the structured warning is
+also available from the planning API for run-report telemetry.
+
 The emitted document is directly usable as a supervisor plan and preserves
 lowering traceability through top-level `spec_fragment_ids`, per-assignment
 `spec_fragment_ids`, and `assignment_schedule`. Unmatched fragments appear as

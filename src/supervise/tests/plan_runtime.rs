@@ -1,6 +1,25 @@
 use super::*;
 
 #[test]
+fn authored_serial_plan_reports_independent_scope_width_warning() {
+    let mut assignment = injected_assignment(false);
+    assignment.assigned_paths = vec![PathBuf::from("README.md"), PathBuf::from("src/planning.rs")];
+    let plan = injected_plan(assignment, 0);
+
+    let warning =
+        supervisor_plan_fan_out_width_warning(&plan).expect("serial fan-out width warning");
+
+    assert_eq!(warning.code, "planning_width_pinned_to_one");
+    assert_eq!(warning.independent_scope_count, 2);
+    assert!(warning.message.contains("serializes work that can fan out"));
+    println!(
+        "width_warning_demo {}",
+        serde_json::to_string(&warning).expect("serialize warning")
+    );
+    validate_legacy_supervisor_plan(plan).expect("warning does not invalidate authored plan");
+}
+
+#[test]
 fn old_and_new_supervisor_model_economics_schema_round_trip() {
     let old_json = serde_json::from_slice::<Value>(&bounded_loader_plan_json())
         .expect("parse old plan fixture");

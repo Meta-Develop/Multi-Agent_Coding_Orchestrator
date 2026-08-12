@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
+    fmt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -115,6 +116,36 @@ pub struct TaskDecompositionProposal {
     pub coverage_gaps: Vec<TaskCoverageGap>,
     pub diagnostics: TaskPathProposalDiagnostics,
     pub disjointness: TaskDisjointnessReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct FanOutWidthWarning {
+    pub code: String,
+    pub configured_max_child_assignments: usize,
+    pub independent_scope_count: usize,
+    pub message: String,
+}
+
+impl fmt::Display for FanOutWidthWarning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+pub fn fan_out_width_warning(
+    max_child_assignments: usize,
+    independent_scope_count: usize,
+) -> Option<FanOutWidthWarning> {
+    (max_child_assignments == 1 && independent_scope_count > 1).then(|| {
+        FanOutWidthWarning {
+            code: "planning_width_pinned_to_one".to_string(),
+            configured_max_child_assignments: max_child_assignments,
+            independent_scope_count,
+            message: format!(
+                "max_child_assignments is pinned to 1 despite {independent_scope_count} independent scopes; this plan serializes work that can fan out"
+            ),
+        }
+    })
 }
 
 struct NormalizedTaskScope {
@@ -410,7 +441,14 @@ pub fn propose_task_decomposition(
     let mut candidates = Vec::new();
     let mut coverage_gaps = Vec::new();
     for fragment in &fragments {
-        let candidate = propose_fragment_scope(fragment, &files, &file_set, semantic_map.as_ref());
+        let proposed = propose_fragment_scope(fragment, &files, &file_set, semantic_map.as_ref());
+        let candidate = proposed.assignment;
+        if proposed.suppressed_broad_paths > 0 {
+            diagnostics.notes.push(format!(
+                "{} preferred exact symbol implementation scope and suppressed {} broader module/declaration path match(es)",
+                fragment.id, proposed.suppressed_broad_paths
+            ));
+        }
         if candidate.assigned_paths.is_empty()
             && candidate.semantic_symbols.is_empty()
             && candidate.semantic_modules.is_empty()
@@ -466,20 +504,22 @@ fn propose_fragment_scope(
     files: &[PathBuf],
     file_set: &BTreeSet<PathBuf>,
     semantic_map: Option<&repo_semantic::SemanticRepoMap>,
-) -> TaskAssignmentProposal {
+) -> ProposedFragmentScope {
     let lowered = fragment.text.to_ascii_lowercase();
     let normalized_text = normalize_text(&fragment.text);
-    let mut assigned_paths = BTreeSet::new();
+    let mut explicit_paths = BTreeSet::new();
+    let mut broad_semantic_paths = BTreeSet::new();
+    let mut exact_symbol_paths = BTreeSet::new();
     let mut semantic_symbols = BTreeSet::new();
     let mut semantic_modules = BTreeSet::new();
 
     for file in files {
         let display = file.to_string_lossy().to_ascii_lowercase();
         if contains_path_mention(&lowered, &display) {
-            assigned_paths.insert(file.clone());
+            explicit_paths.insert(file.clone());
         }
     }
-    propose_docs_paths(&normalized_text, file_set, &mut assigned_paths);
+    propose_docs_paths(&normalized_text, file_set, &mut explicit_paths);
 
     if let Some(map) = semantic_map {
         for file in &map.files {
@@ -487,10 +527,10 @@ fn propose_fragment_scope(
                 continue;
             }
             if identifier_matches(&normalized_text, &file.path) {
-                assigned_paths.insert(file.path.clone());
+                broad_semantic_paths.insert(file.path.clone());
             }
             if module_matches(&normalized_text, &file.module_path) {
-                assigned_paths.insert(file.path.clone());
+                broad_semantic_paths.insert(file.path.clone());
                 semantic_modules.insert(file.module_path.join("::"));
             }
         }
@@ -501,11 +541,12 @@ fn propose_fragment_scope(
             {
                 continue;
             }
-            assigned_paths.insert(symbol.file.clone());
             let qualified = symbol.qualified_path.join("::");
             if symbol.kind == repo_semantic::SemanticSymbolKind::Module {
+                broad_semantic_paths.insert(symbol.file.clone());
                 semantic_modules.insert(qualified);
             } else {
+                exact_symbol_paths.insert(symbol.file.clone());
                 semantic_symbols.insert(qualified);
             }
         }
@@ -517,19 +558,40 @@ fn propose_fragment_scope(
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
                 && identifier_matches(&normalized_text, file)
             {
-                assigned_paths.insert(file.clone());
+                broad_semantic_paths.insert(file.clone());
             }
         }
     }
 
-    TaskAssignmentProposal {
-        id: fragment.id.clone(),
-        task: fragment.text.clone(),
-        fragment_ids: vec![fragment.id.clone()],
-        assigned_paths: collapse_covered_paths(assigned_paths),
-        semantic_symbols: semantic_symbols.into_iter().collect(),
-        semantic_modules: semantic_modules.into_iter().collect(),
+    let suppressed_broad_paths = if exact_symbol_paths.is_empty() {
+        explicit_paths.extend(broad_semantic_paths);
+        0
+    } else {
+        let suppressed = broad_semantic_paths
+            .difference(&exact_symbol_paths)
+            .filter(|path| !explicit_paths.contains(*path))
+            .count();
+        explicit_paths.extend(exact_symbol_paths);
+        semantic_modules.clear();
+        suppressed
+    };
+
+    ProposedFragmentScope {
+        assignment: TaskAssignmentProposal {
+            id: fragment.id.clone(),
+            task: fragment.text.clone(),
+            fragment_ids: vec![fragment.id.clone()],
+            assigned_paths: collapse_covered_paths(explicit_paths),
+            semantic_symbols: semantic_symbols.into_iter().collect(),
+            semantic_modules: semantic_modules.into_iter().collect(),
+        },
+        suppressed_broad_paths,
     }
+}
+
+struct ProposedFragmentScope {
+    assignment: TaskAssignmentProposal,
+    suppressed_broad_paths: usize,
 }
 
 fn module_matches(normalized_text: &str, module_path: &[String]) -> bool {
@@ -1405,6 +1467,21 @@ mod tests {
     }
 
     #[test]
+    fn fan_out_width_warning_is_loud_only_for_a_serialized_independent_plan() {
+        let warning = fan_out_width_warning(1, 3).expect("width warning");
+
+        assert_eq!(warning.code, "planning_width_pinned_to_one");
+        assert_eq!(warning.configured_max_child_assignments, 1);
+        assert_eq!(warning.independent_scope_count, 3);
+        assert_eq!(
+            warning.to_string(),
+            "max_child_assignments is pinned to 1 despite 3 independent scopes; this plan serializes work that can fan out"
+        );
+        assert!(fan_out_width_warning(4, 3).is_none());
+        assert!(fan_out_width_warning(1, 1).is_none());
+    }
+
+    #[test]
     fn propose_task_decomposition_is_deterministic_and_exposes_coverage_and_intents() {
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
@@ -1447,17 +1524,12 @@ mod tests {
             assert_eq!(proposal.assignments[0].fragment_ids, vec!["fragment-002"]);
             assert_eq!(
                 proposal.assignments[0].assigned_paths,
-                vec![
-                    PathBuf::from("src/lib.rs"),
-                    PathBuf::from("src/planning.rs")
-                ]
+                vec![PathBuf::from("src/planning.rs")]
             );
             assert!(proposal.assignments[0]
                 .semantic_symbols
                 .contains(&"crate::planning::propose_task_paths".to_string()));
-            assert!(proposal.assignments[0]
-                .semantic_modules
-                .contains(&"crate::planning".to_string()));
+            assert!(proposal.assignments[0].semantic_modules.is_empty());
             assert_eq!(proposal.assignments[1].id, "assignment-002");
             assert_eq!(
                 proposal.assignments[1].assigned_paths,
@@ -1476,6 +1548,66 @@ mod tests {
             );
             assert!(proposal.disjointness.disjoint);
             assert!(proposal.disjointness.conflicts.is_empty());
+            assert!(proposal.diagnostics.notes.iter().any(|note| {
+                note.contains("fragment-002 preferred exact symbol implementation scope")
+            }));
+        });
+    }
+
+    #[test]
+    fn exact_symbol_scope_avoids_a_shared_megafile_module_attractor() {
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "src/lib.rs", "pub mod giant;\n");
+            write_file(
+                repo,
+                "src/giant.rs",
+                "pub mod alpha;\npub mod beta;\n// large shared module root\n",
+            );
+            write_file(repo, "src/giant/alpha.rs", "pub fn alpha_task() {}\n");
+            write_file(repo, "src/giant/beta.rs", "pub fn beta_task() {}\n");
+
+            let proposal = propose_task_decomposition(
+                repo,
+                "",
+                "- Update alpha_task in giant alpha.\n- Repair beta_task in giant beta.",
+            )
+            .expect("propose decomposition");
+
+            assert_eq!(proposal.assignments.len(), 2);
+            assert_eq!(
+                proposal.assignments[0].assigned_paths,
+                vec![PathBuf::from("src/giant/alpha.rs")]
+            );
+            assert_eq!(
+                proposal.assignments[1].assigned_paths,
+                vec![PathBuf::from("src/giant/beta.rs")]
+            );
+            assert!(proposal.assignments.iter().all(|assignment| !assignment
+                .assigned_paths
+                .contains(&PathBuf::from("src/giant.rs"))));
+            assert!(proposal.disjointness.disjoint);
+            assert_eq!(
+                proposal
+                    .diagnostics
+                    .notes
+                    .iter()
+                    .filter(|note| note.contains("preferred exact symbol implementation scope"))
+                    .count(),
+                2
+            );
+            println!(
+                "megafile_attractor_demo assignments={} paths={:?} disjoint={}",
+                proposal.assignments.len(),
+                proposal
+                    .assignments
+                    .iter()
+                    .map(|assignment| assignment.assigned_paths.clone())
+                    .collect::<Vec<_>>(),
+                proposal.disjointness.disjoint
+            );
         });
     }
 
