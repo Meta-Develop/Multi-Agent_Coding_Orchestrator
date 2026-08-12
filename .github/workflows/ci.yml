@@ -106,6 +106,7 @@ jobs:
           autopilot::tests::validate_autopilot_plan_refuses_empty_path_proposal
           autopilot::tests::write_lease_excludes_competing_access_through_review_and_releases_on_error
           cli::tests::merge_apply_json_delivers_unclaimed_edits_denial_to_integration_controller
+          external_agent::tests::verified_contained_fake_app_server_proves_duplex_ordering_and_confinement
           merge::tests::authenticated_megafile_failure_refuses_merge_before_primary_mutation
           merge::tests::candidate_collection_holds_read_lease_until_snapshot_finishes
           merge::tests::candidate_validation_clears_shell_startup_and_private_network_environment
@@ -123,6 +124,10 @@ jobs:
           planning::tests::collect_repo_files_excludes_git_ignored_directory
           planning::tests::collect_repo_files_excludes_local_agent_runtime_state
           planning::tests::collect_repo_files_never_follows_links_or_accepts_unsafe_files
+          planning::tests::exact_symbol_scope_avoids_a_shared_megafile_module_attractor
+          planning::tests::fake_provider_proposes_a_validated_disjoint_plan
+          planning::tests::fake_provider_replans_from_feedback_with_a_hard_attempt_limit
+          planning::tests::optional_provider_uses_heuristic_fallback_when_unconfigured
           planning::tests::propose_task_decomposition_coalesces_transitive_scope_overlap
           planning::tests::propose_task_decomposition_is_deterministic_and_exposes_coverage_and_intents
           planning::tests::propose_task_path_proposal_keeps_empty_result_without_readme
@@ -131,6 +136,7 @@ jobs:
           planning::tests::propose_task_paths_matches_real_symbol_mentions
           planning::tests::propose_task_paths_requires_standalone_short_identifier_tokens
           planning::tests::propose_task_paths_routes_docs_and_rust_tasks_separately
+          planning::tests::provider_plan_rejects_overlapping_assignments
           process_runner::tests::agent_lifecycle_metadata_stamps_environment_and_registers_running_process
           process_runner::tests::external_codex_outer_sandbox_enforces_control_and_report_write_boundaries
           process_runner::tests::required_containment_kills_setsid_delayed_mutation_with_closed_stdio
@@ -209,15 +215,43 @@ jobs:
           worktree::tests::bounded_status_refuses_entry_output_and_time_budget_exhaustion
           worktree::tests::bounded_status_scavenges_prior_crash_index_and_symlink_tree
           worktree::tests::create_retention_applies_after_new_worktree_creation
+          worktree::tests::create_size_retention_reserves_the_new_lane_before_reclaiming_older_lanes
+          worktree::tests::gc_boundary_protection_does_not_consume_count_or_size_retention
+          worktree::tests::gc_classifies_untracked_only_and_requires_exact_allowlist_for_lane_removal
+          worktree::tests::gc_dirtiness_snapshot_preserves_non_utf8_paths_and_detects_exact_change
           worktree::tests::gc_dry_run_reports_without_removing_worktree_or_target
+          worktree::tests::gc_full_removal_reports_final_approved_untracked_paths
+          worktree::tests::gc_ignored_inventory_excludes_large_runtime_categories_before_bounds
+          worktree::tests::gc_late_protection_does_not_consume_count_or_size_retention
           worktree::tests::gc_protects_dirty_worktree
+          worktree::tests::gc_protects_ignored_only_output_until_its_exact_path_is_allowed
+          worktree::tests::gc_refuses_late_ignored_output_after_reviewed_snapshot
+          worktree::tests::gc_refuses_live_nested_cargo_target_for_full_and_target_only_reclaim
+          worktree::tests::gc_refuses_target_replacement_between_probe_and_removal
           worktree::tests::gc_removes_finished_clean_worktree_and_keeps_branch
+          worktree::tests::gc_report_serializes_non_utf8_untracked_paths_losslessly_and_escapes_human_text
           worktree::tests::gc_retention_keeps_newest_and_removes_retained_target
+          worktree::tests::gc_revalidates_tracked_and_unapproved_output_after_liveness
+          worktree::tests::gc_scopes_managed_bindings_to_the_exact_requested_root
+          worktree::tests::gc_size_retention_keeps_the_newest_prefix_and_counts_lane_bytes_once
+          worktree::tests::gc_target_cleanup_rechecks_dirtiness_after_boundary_liveness
+          worktree::tests::gc_targets_only_reclaims_untracked_lane_target_and_keeps_lane_branch_and_orphan
+          worktree::tests::gc_unknown_and_live_evidence_protects_every_target_reclaim_path
+          worktree::tests::gc_without_requested_root_preserves_all_authenticated_root_scope
           worktree::tests::neutral_worktree_production_cleanliness_seam_uses_exact_base_without_claim
+          worktree::tests::remove_prepared_gc_recovery_refuses_changed_dirtiness_snapshot
           worktree::tests::repository_cleanliness_capability_creates_clean_managed_worktree
           worktree::tests::repository_cleanliness_capability_refuses_dirty_primary_before_create
           worktree::tests::repository_cleanliness_capability_rejects_binding_drift
           worktree::tests::repository_cleanliness_capability_rejects_cross_repository_use
+          worktree::tests::repository_local_sweep_uses_primary_hint_despite_stale_lane_metadata
+          worktree::tests::workspace_sweep_continues_after_typed_repository_open_failure
+          worktree::tests::workspace_sweep_defaults_to_dry_run_and_requires_apply_for_removal
+          worktree::tests::workspace_sweep_discovers_direct_child_repo_local_and_managed_roots_once_each
+          worktree::tests::workspace_sweep_discovers_repository_local_worktree_root
+          worktree::tests::workspace_sweep_inspects_repository_and_group_with_maco_prefix
+          worktree::tests::workspace_sweep_passes_retention_and_keep_target_options_to_gc
+          worktree::tests::workspace_sweep_reports_symlinked_group_and_continues_valid_group
           CONTAINMENT_DEPENDENT_TESTS
           fi
 
