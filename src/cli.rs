@@ -4,7 +4,9 @@ use crate::{
         ProviderCommandPolicy,
     },
     agent_lifecycle::{AgentListFilter, AgentProcessRecord, AgentRegistry, AgentStopReport},
-    artifacts::{self, ResolvedRunId, RunArtifactFamily},
+    artifacts::{
+        self, ArtifactRetentionFamily, ArtifactRetentionPolicy, ResolvedRunId, RunArtifactFamily,
+    },
     autopilot::{self, AutopilotRunOptions},
     consult::{self, ConsultAskOptions, ConsultantRuntime, DEFAULT_CONSULT_TIMEOUT_SECONDS},
     inbox::{self, InboxPermissionMode, InboxScanOptions, InboxWorkspaceScanOptions},
@@ -127,6 +129,7 @@ impl Cli {
             Command::Inbox(command) => command.run(),
             Command::Scope(command) => command.run(),
             Command::Autopilot(command) => command.run(),
+            Command::Artifacts(command) => command.run(),
             Command::Review(command) => command.run(),
             Command::Agent(command) => command.run(),
             Command::Agents(command) => command.run(),
@@ -172,6 +175,8 @@ enum Command {
     Scope(ScopeCommand),
     /// Run local-first autopilot workflow phases.
     Autopilot(AutopilotCommand),
+    /// Apply retention to every repository-local bulk artifact family.
+    Artifacts(RepositoryArtifactsCommand),
     /// Run independent review adapters.
     Review(ReviewCommand),
     /// Run a provider-backed agent in an isolated worktree.
@@ -1796,7 +1801,9 @@ impl ArtifactsCommand {
                 print_query_report(&report, args.json)
             }
             ArtifactsSubcommand::Prune(args) => {
-                let report = artifacts::prune_runs(args.repo, family, args.keep, args.dry_run)?;
+                let policy = args.retention_policy();
+                let report =
+                    artifacts::prune_runs_with_policy(args.repo, family, &policy, args.dry_run)?;
                 print_query_report(&report, args.json)
             }
         }
@@ -1831,12 +1838,95 @@ struct PruneArtifactsArgs {
     /// Keep the latest N run directories.
     #[arg(long, default_value_t = 10)]
     keep: usize,
+    /// Reclaim artifacts at least this old even when they are within --keep.
+    #[arg(long, value_name = "SECONDS")]
+    max_age_seconds: Option<u64>,
+    /// Retain at most this many apparent regular-file bytes, newest first.
+    #[arg(long, value_name = "BYTES")]
+    max_total_bytes: Option<u64>,
+    /// Allow idle marker-missing or external artifacts to expire after this grace.
+    #[arg(long, value_name = "SECONDS", default_value_t = 7 * 24 * 60 * 60)]
+    unfinalized_grace_seconds: u64,
     /// Report deletions without deleting.
     #[arg(long)]
     dry_run: bool,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+impl PruneArtifactsArgs {
+    fn retention_policy(&self) -> ArtifactRetentionPolicy {
+        ArtifactRetentionPolicy {
+            max_count: self.keep,
+            max_age: self.max_age_seconds.map(Duration::from_secs),
+            max_total_bytes: self.max_total_bytes,
+            unfinalized_grace: Some(Duration::from_secs(self.unfinalized_grace_seconds)),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct RepositoryArtifactsCommand {
+    #[command(subcommand)]
+    command: RepositoryArtifactsSubcommand,
+}
+
+impl RepositoryArtifactsCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            RepositoryArtifactsSubcommand::Prune(args) => {
+                let policy = args.policy.retention_policy();
+                let report = artifacts::prune_artifacts_with_policy(
+                    args.policy.repo,
+                    args.family.into(),
+                    &policy,
+                    args.policy.dry_run,
+                )?;
+                print_query_report(&report, args.policy.json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum RepositoryArtifactsSubcommand {
+    /// Reclaim one authenticated, external-driver, legacy, or program-log family.
+    Prune(RepositoryPruneArtifactsArgs),
+}
+
+#[derive(Debug, Args)]
+struct RepositoryPruneArtifactsArgs {
+    /// Artifact family to inspect and prune.
+    #[arg(long, value_enum)]
+    family: ArtifactRetentionFamilyArg,
+    #[command(flatten)]
+    policy: PruneArtifactsArgs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ArtifactRetentionFamilyArg {
+    Autopilot,
+    Consult,
+    Inbox,
+    Supervise,
+    O2Autopilot,
+    InboxWorkspace,
+    Program,
+}
+
+impl From<ArtifactRetentionFamilyArg> for ArtifactRetentionFamily {
+    fn from(family: ArtifactRetentionFamilyArg) -> Self {
+        match family {
+            ArtifactRetentionFamilyArg::Autopilot => Self::Autopilot,
+            ArtifactRetentionFamilyArg::Consult => Self::Consult,
+            ArtifactRetentionFamilyArg::Inbox => Self::Inbox,
+            ArtifactRetentionFamilyArg::Supervise => Self::Supervise,
+            ArtifactRetentionFamilyArg::O2Autopilot => Self::O2Autopilot,
+            ArtifactRetentionFamilyArg::InboxWorkspace => Self::InboxWorkspace,
+            ArtifactRetentionFamilyArg::Program => Self::Program,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -5265,6 +5355,57 @@ mod tests {
     use git2::Signature;
 
     use super::*;
+
+    #[test]
+    fn artifact_prune_parses_family_age_size_and_unfinalized_grace() {
+        let parsed = Cli::try_parse_from([
+            "maco",
+            "artifacts",
+            "prune",
+            "--family",
+            "program",
+            "--repo",
+            "repo",
+            "--keep",
+            "3",
+            "--max-age-seconds",
+            "86400",
+            "--max-total-bytes",
+            "1048576",
+            "--unfinalized-grace-seconds",
+            "3600",
+            "--dry-run",
+            "--json",
+        ])
+        .expect("artifact retention flags should parse");
+        let Command::Artifacts(RepositoryArtifactsCommand {
+            command: RepositoryArtifactsSubcommand::Prune(args),
+        }) = parsed.command
+        else {
+            panic!("expected repository artifact prune command");
+        };
+        assert_eq!(args.family, ArtifactRetentionFamilyArg::Program);
+        assert_eq!(args.policy.repo, PathBuf::from("repo"));
+        assert_eq!(args.policy.keep, 3);
+        assert_eq!(args.policy.max_age_seconds, Some(86_400));
+        assert_eq!(args.policy.max_total_bytes, Some(1_048_576));
+        assert_eq!(args.policy.unfinalized_grace_seconds, 3_600);
+        assert!(args.policy.dry_run);
+        assert!(args.policy.json);
+
+        for family in [
+            "autopilot",
+            "consult",
+            "inbox",
+            "supervise",
+            "o2-autopilot",
+            "inbox-workspace",
+            "program",
+        ] {
+            Cli::try_parse_from(["maco", "artifacts", "prune", "--family", family])
+                .unwrap_or_else(|error| panic!("retention family {family} must parse: {error}"));
+        }
+    }
 
     #[test]
     fn worktree_sweep_defaults_to_dry_run_and_requires_workspace() {

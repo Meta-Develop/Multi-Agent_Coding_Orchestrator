@@ -10,8 +10,9 @@ use crate::{
     orchestrator::RunId,
     safe_state::{
         identity_for_path, remove_direct_child_tree, stable_checksum, unsigned_to_u64,
-        AtomicStateWriter, BoundedRegularReader, FileIdentity, KernelStateLock, ReservedDirectory,
-        SafeRoot, TreeLinkPolicy,
+        AtomicStateWriter, BoundedRegularReader, BoundedTreeEntryKind, BoundedTreeWalkAction,
+        BoundedTreeWalkLimits, BoundedTreeWalker, ExistingExclusiveLock, FileIdentity,
+        KernelStateLock, ReservedDirectory, SafeRoot, TreeLinkPolicy,
     },
 };
 
@@ -33,7 +34,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -52,6 +53,8 @@ const FINALIZATION_MARKER: &str = ".maco-artifact-final.json";
 const RUN_LOCK_FILE: &str = ".artifact.lock";
 const ROOT_LOCK_FILE: &str = ".runs.lock";
 const QUARANTINE_DIRECTORY: &str = ".quarantine";
+const RETENTION_LOCK_FILE: &str = ".artifact-retention.lock";
+const RETENTION_QUARANTINE_DIRECTORY: &str = ".artifact-retention-quarantine";
 const MAX_FINALIZATION_BYTES: u64 = 512 * 1024;
 const MAX_ARTIFACT_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ARTIFACT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
@@ -101,6 +104,14 @@ const MAX_REGISTERED_WORKTREE_NAME_BYTES: usize = 1_024;
 const MAX_REGISTERED_WORKTREE_PATH_BYTES: usize = 32 * 1_024;
 const MAX_REGISTERED_WORKTREE_PATH_COMPONENTS: usize = 256;
 const MAX_MARKER_SCAN_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(test)]
+const MAX_RETENTION_TREE_ENTRIES: usize = 1_024;
+#[cfg(not(test))]
+const MAX_RETENTION_TREE_ENTRIES: usize = 131_072;
+const MAX_RETENTION_TREE_DEPTH: usize = 64;
+const MAX_RETENTION_TREE_PATH_BYTES: usize = 8 * 1024;
+const MAX_RETENTION_TREE_TOTAL_PATH_BYTES: usize = 64 * 1024 * 1024;
+const RETENTION_TREE_MAX_DURATION: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -144,6 +155,103 @@ impl RunArtifactFamily {
             Self::Autopilot | Self::Inbox => PathBuf::from("final-report.json"),
             Self::Consult => PathBuf::from("trusted").join("consultant-report.json"),
             Self::Supervise => PathBuf::from("reports").join("supervisor-final.json"),
+        }
+    }
+}
+
+/// Every repository-local bulk artifact store covered by retention.
+///
+/// The first four variants are authenticated [`ArtifactRunWriter`] stores.
+/// The remaining variants are produced by external or legacy drivers and do
+/// not have a finalization MAC, so their reclamation always requires the
+/// unfinalized grace policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactRetentionFamily {
+    Autopilot,
+    Consult,
+    Inbox,
+    Supervise,
+    O2Autopilot,
+    InboxWorkspace,
+    Program,
+}
+
+impl ArtifactRetentionFamily {
+    pub const ALL: [Self; 7] = [
+        Self::Autopilot,
+        Self::Consult,
+        Self::Inbox,
+        Self::Supervise,
+        Self::O2Autopilot,
+        Self::InboxWorkspace,
+        Self::Program,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Autopilot => "autopilot",
+            Self::Consult => "consult",
+            Self::Inbox => "inbox",
+            Self::Supervise => "supervise",
+            Self::O2Autopilot => "o2_autopilot",
+            Self::InboxWorkspace => "inbox_workspace",
+            Self::Program => "program",
+        }
+    }
+
+    pub fn run_root(self) -> PathBuf {
+        match self {
+            Self::Autopilot => RunArtifactFamily::Autopilot.run_root(),
+            Self::Consult => RunArtifactFamily::Consult.run_root(),
+            Self::Inbox => RunArtifactFamily::Inbox.run_root(),
+            Self::Supervise => RunArtifactFamily::Supervise.run_root(),
+            Self::O2Autopilot => PathBuf::from(".maco").join("o2-autopilot").join("runs"),
+            Self::InboxWorkspace => PathBuf::from(".maco").join("inbox-workspace").join("runs"),
+            // Program artifacts are direct `program-*` children of this root.
+            Self::Program => PathBuf::from(".maco"),
+        }
+    }
+
+    fn authenticated(self) -> Option<RunArtifactFamily> {
+        match self {
+            Self::Autopilot => Some(RunArtifactFamily::Autopilot),
+            Self::Consult => Some(RunArtifactFamily::Consult),
+            Self::Inbox => Some(RunArtifactFamily::Inbox),
+            Self::Supervise => Some(RunArtifactFamily::Supervise),
+            Self::O2Autopilot | Self::InboxWorkspace | Self::Program => None,
+        }
+    }
+}
+
+impl From<RunArtifactFamily> for ArtifactRetentionFamily {
+    fn from(family: RunArtifactFamily) -> Self {
+        match family {
+            RunArtifactFamily::Autopilot => Self::Autopilot,
+            RunArtifactFamily::Consult => Self::Consult,
+            RunArtifactFamily::Inbox => Self::Inbox,
+            RunArtifactFamily::Supervise => Self::Supervise,
+        }
+    }
+}
+
+/// Policy input kept independent from CLI parsing so #65's scheduler can call
+/// the same retention engine without reproducing selection or safety logic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactRetentionPolicy {
+    pub max_count: usize,
+    pub max_age: Option<Duration>,
+    pub max_total_bytes: Option<u64>,
+    pub unfinalized_grace: Option<Duration>,
+}
+
+impl ArtifactRetentionPolicy {
+    pub fn count_only(max_count: usize) -> Self {
+        Self {
+            max_count,
+            max_age: None,
+            max_total_bytes: None,
+            unfinalized_grace: None,
         }
     }
 }
@@ -199,15 +307,33 @@ pub struct RunArtifactSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunArtifactPruneReport {
-    pub family: RunArtifactFamily,
+    pub family: ArtifactRetentionFamily,
     pub run_root: PathBuf,
     pub ordering: &'static str,
     pub keep: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unfinalized_grace_seconds: Option<u64>,
     pub dry_run: bool,
     pub kept_count: usize,
     pub deleted_count: usize,
     pub refused_unfinalized_count: usize,
     pub delete_candidate_count: usize,
+    pub scanned_bytes: u64,
+    /// Bytes physically present after this invocation. In dry-run this equals
+    /// `scanned_bytes`; use `projected_retained_bytes` for the planned result.
+    pub retained_bytes: u64,
+    pub projected_retained_bytes: u64,
+    pub reclaimed_bytes: u64,
+    pub would_reclaim_bytes: u64,
+    pub refused_bytes: u64,
+    pub unfinalized_bytes: u64,
+    pub compression_strategy: ArtifactCompressionStrategy,
+    pub compressible_log_bytes: u64,
+    pub compressed_bytes: u64,
     pub entries: Vec<RunArtifactPruneEntry>,
 }
 
@@ -215,9 +341,30 @@ pub struct RunArtifactPruneReport {
 pub struct RunArtifactPruneEntry {
     pub run_id: String,
     pub run_dir: PathBuf,
+    pub bytes: u64,
+    pub age_seconds: u64,
     pub action: RunArtifactPruneAction,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_by: Vec<ArtifactRetentionLimit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactRetentionLimit {
+    MaxCount,
+    MaxAge,
+    MaxTotalBytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactCompressionStrategy {
+    /// Retention never rewrites transcripts. Authenticated artifacts are
+    /// immutable after finalization, while external logs can still be active;
+    /// compression therefore requires a writer-side format migration.
+    NoneRequiresWriterMigration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1568,142 +1715,441 @@ pub fn prune_runs(
     keep: usize,
     dry_run: bool,
 ) -> Result<RunArtifactPruneReport> {
-    let repository = discover_artifact_repository(repo.as_ref())?;
-    let Some(root) = open_optional_run_root(&repository, family)? else {
-        return Ok(empty_prune_report(family, keep, dry_run));
+    prune_runs_with_policy(
+        repo,
+        family,
+        &ArtifactRetentionPolicy::count_only(keep),
+        dry_run,
+    )
+}
+
+pub fn prune_runs_with_policy(
+    repo: impl AsRef<Path>,
+    family: RunArtifactFamily,
+    policy: &ArtifactRetentionPolicy,
+    dry_run: bool,
+) -> Result<RunArtifactPruneReport> {
+    prune_artifacts_with_policy(repo, family.into(), policy, dry_run)
+}
+
+pub fn prune_artifacts_with_policy(
+    repo: impl AsRef<Path>,
+    family: ArtifactRetentionFamily,
+    policy: &ArtifactRetentionPolicy,
+    dry_run: bool,
+) -> Result<RunArtifactPruneReport> {
+    prune_artifacts_at(repo.as_ref(), family, policy, dry_run, SystemTime::now())
+}
+
+fn prune_artifacts_at(
+    repo: &Path,
+    family: ArtifactRetentionFamily,
+    policy: &ArtifactRetentionPolicy,
+    dry_run: bool,
+    now: SystemTime,
+) -> Result<RunArtifactPruneReport> {
+    let repository = discover_artifact_repository(repo)?;
+    let Some(root) = open_optional_retention_root(&repository, family)? else {
+        return Ok(empty_prune_report(family, policy, dry_run));
     };
-    let root_lock = BoundArtifactLock::acquire(&root, ROOT_LOCK_FILE)?;
+    let lock_name = if family == ArtifactRetentionFamily::Program {
+        RETENTION_LOCK_FILE
+    } else {
+        ROOT_LOCK_FILE
+    };
+    let root_lock = BoundArtifactLock::acquire(&root, lock_name)?;
     root_lock.verify(&root)?;
     let result = (|| -> Result<RunArtifactPruneReport> {
-        let runs = sorted_run_summaries(&repository, &root, family)?;
+        let items = retention_items(&repository, &root, family)?;
+        let scanned_bytes = items.iter().try_fold(0u64, |total, item| {
+            total
+                .checked_add(item.bytes)
+                .context("artifact retention byte total overflow")
+        })?;
+        let compressible_log_bytes = items.iter().try_fold(0u64, |total, item| {
+            total
+                .checked_add(item.compressible_log_bytes)
+                .context("artifact compressible-log byte total overflow")
+        })?;
+        let unfinalized_bytes = items
+            .iter()
+            .filter(|item| item.state != RetentionItemState::Finalized)
+            .try_fold(0u64, |total, item| {
+                total
+                    .checked_add(item.bytes)
+                    .context("unfinalized artifact byte total overflow")
+            })?;
+
         let mut quarantine = None;
-        let mut entries = Vec::new();
+        let mut entries = Vec::with_capacity(items.len());
+        let mut cumulative_bytes = 0u64;
         let mut kept_count = 0usize;
         let mut deleted_count = 0usize;
         let mut refused_unfinalized_count = 0usize;
         let mut delete_candidate_count = 0usize;
+        let mut reclaimed_bytes = 0u64;
+        let mut would_reclaim_bytes = 0u64;
+        let mut refused_bytes = 0u64;
 
-        for (index, run) in runs.into_iter().enumerate() {
-            if index < keep {
+        for (index, item) in items.into_iter().enumerate() {
+            cumulative_bytes = cumulative_bytes
+                .checked_add(item.bytes)
+                .context("artifact retention cumulative byte total overflow")?;
+            let age_seconds = artifact_age_seconds(now, item.modified);
+            let mut selected_by = Vec::new();
+            if index >= policy.max_count {
+                selected_by.push(ArtifactRetentionLimit::MaxCount);
+            }
+            if policy
+                .max_age
+                .is_some_and(|max_age| age_seconds >= max_age.as_secs())
+            {
+                selected_by.push(ArtifactRetentionLimit::MaxAge);
+            }
+            if policy
+                .max_total_bytes
+                .is_some_and(|max_bytes| cumulative_bytes > max_bytes)
+            {
+                selected_by.push(ArtifactRetentionLimit::MaxTotalBytes);
+            }
+
+            if selected_by.is_empty() {
                 kept_count = kept_count.saturating_add(1);
-                entries.push(RunArtifactPruneEntry {
-                    run_id: run.run_id,
-                    run_dir: run.run_dir,
-                    action: RunArtifactPruneAction::Keep,
-                    reason: None,
-                });
+                entries.push(retention_entry(
+                    item,
+                    age_seconds,
+                    RunArtifactPruneAction::Keep,
+                    selected_by,
+                    None,
+                ));
                 continue;
             }
             delete_candidate_count = delete_candidate_count.saturating_add(1);
-            let run_id = RunId::new(&run.run_id)?;
-            if let Err(error) = ArtifactRunReader::open(&repository.worktree, family, &run_id) {
-                kept_count = kept_count.saturating_add(1);
-                refused_unfinalized_count = refused_unfinalized_count.saturating_add(1);
-                entries.push(RunArtifactPruneEntry {
-                    run_id: run.run_id,
-                    run_dir: run.run_dir,
-                    action: RunArtifactPruneAction::RefuseUnfinalized,
-                    reason: Some(format!(
-                        "refusing to prune artifact run without a valid finalization MAC: {error:#}"
-                    )),
-                });
-                continue;
-            }
-            if dry_run {
-                entries.push(RunArtifactPruneEntry {
-                    run_id: run.run_id,
-                    run_dir: run.run_dir,
-                    action: RunArtifactPruneAction::WouldDelete,
-                    reason: None,
-                });
-                continue;
-            }
 
-            root_lock.verify(&root)?;
-            let rebound = root.bind_existing_managed_direct_child_directory(&run.run_id)?;
-            if rebound.identity() != &run.identity {
-                bail!(
-                    "artifact run identity changed before quarantine: {}",
-                    run.run_id
-                );
+            match item.state {
+                RetentionItemState::InvalidFinalization => {
+                    kept_count = kept_count.saturating_add(1);
+                    refused_unfinalized_count = refused_unfinalized_count.saturating_add(1);
+                    refused_bytes = refused_bytes
+                        .checked_add(item.bytes)
+                        .context("refused artifact byte total overflow")?;
+                    entries.push(retention_entry(
+                        item,
+                        age_seconds,
+                        RunArtifactPruneAction::RefuseUnfinalized,
+                        selected_by,
+                        Some(
+                            "refusing to reclaim an artifact with a present but unverifiable finalization marker"
+                                .to_string(),
+                        ),
+                    ));
+                }
+                RetentionItemState::MissingFinalization | RetentionItemState::External => {
+                    let Some(grace) = policy.unfinalized_grace else {
+                        kept_count = kept_count.saturating_add(1);
+                        refused_unfinalized_count = refused_unfinalized_count.saturating_add(1);
+                        refused_bytes = refused_bytes
+                            .checked_add(item.bytes)
+                            .context("refused artifact byte total overflow")?;
+                        entries.push(retention_entry(
+                            item,
+                            age_seconds,
+                            RunArtifactPruneAction::RefuseUnfinalized,
+                            selected_by,
+                            Some(
+                                "refusing to reclaim an unfinalized artifact because no expiry grace was configured"
+                                    .to_string(),
+                            ),
+                        ));
+                        continue;
+                    };
+                    if age_seconds < grace.as_secs() {
+                        kept_count = kept_count.saturating_add(1);
+                        refused_unfinalized_count = refused_unfinalized_count.saturating_add(1);
+                        refused_bytes = refused_bytes
+                            .checked_add(item.bytes)
+                            .context("refused artifact byte total overflow")?;
+                        entries.push(retention_entry(
+                            item,
+                            age_seconds,
+                            RunArtifactPruneAction::RefuseUnfinalized,
+                            selected_by,
+                            Some(format!(
+                                "refusing to reclaim a fresh unfinalized artifact before its {} second grace expires",
+                                grace.as_secs()
+                            )),
+                        ));
+                        continue;
+                    }
+                    if let Some(reason) = item.unsafe_reason.clone() {
+                        kept_count = kept_count.saturating_add(1);
+                        refused_unfinalized_count = refused_unfinalized_count.saturating_add(1);
+                        refused_bytes = refused_bytes
+                            .checked_add(item.bytes)
+                            .context("refused artifact byte total overflow")?;
+                        entries.push(retention_entry(
+                            item,
+                            age_seconds,
+                            RunArtifactPruneAction::RefuseUnfinalized,
+                            selected_by,
+                            Some(format!(
+                                "refusing to reclaim an unsafe unfinalized artifact: {reason}"
+                            )),
+                        ));
+                        continue;
+                    }
+
+                    let mut held_unfinalized_lock = None;
+                    if item.state == RetentionItemState::MissingFinalization {
+                        let run = SafeRoot::open_existing(&item.absolute_path)?;
+                        match KernelStateLock::try_acquire_existing_exclusive_direct(
+                            &run,
+                            RUN_LOCK_FILE,
+                        )? {
+                            ExistingExclusiveLock::Busy => {
+                                kept_count = kept_count.saturating_add(1);
+                                refused_unfinalized_count =
+                                    refused_unfinalized_count.saturating_add(1);
+                                refused_bytes = refused_bytes
+                                    .checked_add(item.bytes)
+                                    .context("refused artifact byte total overflow")?;
+                                entries.push(retention_entry(
+                                    item,
+                                    age_seconds,
+                                    RunArtifactPruneAction::RefuseUnfinalized,
+                                    selected_by,
+                                    Some(
+                                        "refusing to reclaim an active unfinalized artifact whose writer lock is held"
+                                            .to_string(),
+                                    ),
+                                ));
+                                continue;
+                            }
+                            ExistingExclusiveLock::Missing => {}
+                            ExistingExclusiveLock::Acquired(lock) => {
+                                held_unfinalized_lock = Some(lock);
+                            }
+                        }
+                    }
+
+                    if dry_run {
+                        would_reclaim_bytes = would_reclaim_bytes
+                            .checked_add(item.bytes)
+                            .context("would-reclaim artifact byte total overflow")?;
+                        entries.push(retention_entry(
+                            item,
+                            age_seconds,
+                            RunArtifactPruneAction::WouldDelete,
+                            selected_by,
+                            Some(format!(
+                                "unfinalized artifact is idle and older than its {} second grace",
+                                grace.as_secs()
+                            )),
+                        ));
+                        continue;
+                    }
+
+                    root_lock.verify(&root)?;
+                    let rebound =
+                        root.bind_existing_managed_direct_child_directory(&item.run_id)?;
+                    if rebound.identity() != &item.identity {
+                        bail!(
+                            "artifact identity changed before unfinalized quarantine: {}",
+                            item.run_id
+                        );
+                    }
+                    let rebound_root = SafeRoot::open_existing(rebound.path())?;
+                    if let Some(lock) = &held_unfinalized_lock {
+                        lock.verify_direct_binding(&rebound_root)?;
+                    }
+                    if item.state == RetentionItemState::MissingFinalization
+                        && rebound_root.direct_child_exists(FINALIZATION_MARKER)?
+                    {
+                        kept_count = kept_count.saturating_add(1);
+                        refused_unfinalized_count = refused_unfinalized_count.saturating_add(1);
+                        refused_bytes = refused_bytes
+                            .checked_add(item.bytes)
+                            .context("refused artifact byte total overflow")?;
+                        entries.push(retention_entry(
+                            item,
+                            age_seconds,
+                            RunArtifactPruneAction::RefuseUnfinalized,
+                            selected_by,
+                            Some(
+                                "refusing to reclaim an unfinalized artifact whose finalization state changed during pruning"
+                                    .to_string(),
+                            ),
+                        ));
+                        continue;
+                    }
+                    let refreshed = retention_inventory(&rebound_root)?;
+                    let refreshed_age = artifact_age_seconds(now, refreshed.modified);
+                    if refreshed_age < grace.as_secs() || refreshed.bytes != item.bytes {
+                        kept_count = kept_count.saturating_add(1);
+                        refused_unfinalized_count = refused_unfinalized_count.saturating_add(1);
+                        refused_bytes = refused_bytes
+                            .checked_add(item.bytes)
+                            .context("refused artifact byte total overflow")?;
+                        entries.push(retention_entry(
+                            item,
+                            refreshed_age,
+                            RunArtifactPruneAction::RefuseUnfinalized,
+                            selected_by,
+                            Some(
+                                "refusing to reclaim an unfinalized artifact that changed during pruning"
+                                    .to_string(),
+                            ),
+                        ));
+                        continue;
+                    }
+                    delete_retention_item(
+                        &root,
+                        &root_lock,
+                        &mut quarantine,
+                        retention_quarantine_name(family),
+                        &item,
+                        held_unfinalized_lock.as_ref(),
+                    )?;
+                    reclaimed_bytes = reclaimed_bytes
+                        .checked_add(item.bytes)
+                        .context("reclaimed artifact byte total overflow")?;
+                    deleted_count = deleted_count.saturating_add(1);
+                    entries.push(retention_entry(
+                        item,
+                        refreshed_age,
+                        RunArtifactPruneAction::Delete,
+                        selected_by,
+                        Some(format!(
+                            "expired unfinalized artifact exceeded its {} second grace",
+                            grace.as_secs()
+                        )),
+                    ));
+                }
+                RetentionItemState::Finalized => {
+                    let authenticated = family
+                        .authenticated()
+                        .context("finalized retention item lacks an authenticated family")?;
+                    let run_id = RunId::new(&item.run_id)?;
+                    if let Err(error) =
+                        ArtifactRunReader::open(&repository.worktree, authenticated, &run_id)
+                    {
+                        kept_count = kept_count.saturating_add(1);
+                        refused_unfinalized_count = refused_unfinalized_count.saturating_add(1);
+                        refused_bytes = refused_bytes
+                            .checked_add(item.bytes)
+                            .context("refused artifact byte total overflow")?;
+                        entries.push(retention_entry(
+                            item,
+                            age_seconds,
+                            RunArtifactPruneAction::RefuseUnfinalized,
+                            selected_by,
+                            Some(format!(
+                                "refusing to reclaim an artifact that lost valid finalization: {error:#}"
+                            )),
+                        ));
+                        continue;
+                    }
+                    if dry_run {
+                        would_reclaim_bytes = would_reclaim_bytes
+                            .checked_add(item.bytes)
+                            .context("would-reclaim artifact byte total overflow")?;
+                        entries.push(retention_entry(
+                            item,
+                            age_seconds,
+                            RunArtifactPruneAction::WouldDelete,
+                            selected_by,
+                            None,
+                        ));
+                        continue;
+                    }
+
+                    root_lock.verify(&root)?;
+                    let rebound =
+                        root.bind_existing_managed_direct_child_directory(&item.run_id)?;
+                    if rebound.identity() != &item.identity {
+                        bail!(
+                            "artifact run identity changed before quarantine: {}",
+                            item.run_id
+                        );
+                    }
+                    let rebound_root = SafeRoot::open_existing(rebound.path())?;
+                    let run_lock = BoundArtifactLock::acquire(&rebound_root, RUN_LOCK_FILE)?;
+                    run_lock.verify(&rebound_root)?;
+                    let validation =
+                        ArtifactRunReader::open(&repository.worktree, authenticated, &run_id);
+                    let validation = finish_with_artifact_lock_verification(
+                        validation,
+                        run_lock.verify(&rebound_root),
+                    );
+                    if let Err(error) = validation {
+                        kept_count = kept_count.saturating_add(1);
+                        refused_unfinalized_count = refused_unfinalized_count.saturating_add(1);
+                        refused_bytes = refused_bytes
+                            .checked_add(item.bytes)
+                            .context("refused artifact byte total overflow")?;
+                        entries.push(retention_entry(
+                            item,
+                            age_seconds,
+                            RunArtifactPruneAction::RefuseUnfinalized,
+                            selected_by,
+                            Some(format!(
+                                "refusing to reclaim an artifact that lost valid finalization while waiting for its writer lock: {error:#}"
+                            )),
+                        ));
+                        continue;
+                    }
+                    delete_retention_item(
+                        &root,
+                        &root_lock,
+                        &mut quarantine,
+                        retention_quarantine_name(family),
+                        &item,
+                        Some(&run_lock.lock),
+                    )?;
+                    reclaimed_bytes = reclaimed_bytes
+                        .checked_add(item.bytes)
+                        .context("reclaimed artifact byte total overflow")?;
+                    deleted_count = deleted_count.saturating_add(1);
+                    entries.push(retention_entry(
+                        item,
+                        age_seconds,
+                        RunArtifactPruneAction::Delete,
+                        selected_by,
+                        None,
+                    ));
+                }
             }
-            let rebound_root = SafeRoot::open_existing(rebound.path())?;
-            let run_lock = BoundArtifactLock::acquire(&rebound_root, RUN_LOCK_FILE)?;
-            run_lock.verify(&rebound_root)?;
-            let validation = ArtifactRunReader::open(&repository.worktree, family, &run_id);
-            let validation =
-                finish_with_artifact_lock_verification(validation, run_lock.verify(&rebound_root));
-            if let Err(error) = validation {
-                kept_count = kept_count.saturating_add(1);
-                refused_unfinalized_count = refused_unfinalized_count.saturating_add(1);
-                entries.push(RunArtifactPruneEntry {
-                    run_id: run.run_id,
-                    run_dir: run.run_dir,
-                    action: RunArtifactPruneAction::RefuseUnfinalized,
-                    reason: Some(format!(
-                        "refusing to prune artifact run that lost valid finalization while waiting for its writer lock: {error:#}"
-                    )),
-                });
-                continue;
-            }
-            root_lock.verify(&root)?;
-            if quarantine.is_none() {
-                let created = open_or_create_quarantine(&root)?;
-                ensure_quarantine_empty(&created)?;
-                quarantine = Some(created);
-            }
-            let quarantine = quarantine
-                .as_ref()
-                .context("artifact quarantine unavailable")?;
-            let quarantine_name = quarantine.random_direct_child_name(&run.run_id)?;
-            rename_bound_directory(
-                &root,
-                run.run_id.as_ref(),
-                &run.identity,
-                quarantine,
-                &quarantine_name,
-            )?;
-            let quarantined_run =
-                SafeRoot::open_existing(quarantine.path().join(&quarantine_name))?;
-            run_lock.verify(&quarantined_run)?;
-            // The acquired run-lock inode is deliberately removed with the now
-            // quarantined run. Its pathname identity is therefore revalidated
-            // after the rename and immediately before the bounded tree deletion;
-            // the root lock continues to protect the family namespace afterward.
-            remove_direct_child_tree(
-                quarantine,
-                &quarantine_name,
-                Some(&run.identity),
-                TreeLinkPolicy::RejectLinksAndSpecialFiles,
-            )
-            .with_context(|| {
-                format!(
-                    "artifact run '{}' was quarantined but could not be safely deleted; inspect {}",
-                    run.run_id,
-                    quarantine.path().join(&quarantine_name).display()
-                )
-            })?;
-            root_lock.verify(&root)?;
-            deleted_count = deleted_count.saturating_add(1);
-            entries.push(RunArtifactPruneEntry {
-                run_id: run.run_id,
-                run_dir: run.run_dir,
-                action: RunArtifactPruneAction::Delete,
-                reason: None,
-            });
         }
 
         root_lock.verify(&root)?;
+        let planned_reclaimed_bytes = if dry_run {
+            would_reclaim_bytes
+        } else {
+            reclaimed_bytes
+        };
         Ok(RunArtifactPruneReport {
             family,
             run_root: family.run_root(),
-            ordering: artifact_ordering(),
-            keep,
+            ordering: retention_ordering(),
+            keep: policy.max_count,
+            max_age_seconds: policy.max_age.map(|age| age.as_secs()),
+            max_total_bytes: policy.max_total_bytes,
+            unfinalized_grace_seconds: policy.unfinalized_grace.map(|grace| grace.as_secs()),
             dry_run,
             kept_count,
             deleted_count,
             refused_unfinalized_count,
             delete_candidate_count,
+            scanned_bytes,
+            retained_bytes: scanned_bytes.saturating_sub(reclaimed_bytes),
+            projected_retained_bytes: scanned_bytes.saturating_sub(planned_reclaimed_bytes),
+            reclaimed_bytes,
+            would_reclaim_bytes,
+            refused_bytes,
+            unfinalized_bytes,
+            compression_strategy: ArtifactCompressionStrategy::NoneRequiresWriterMigration,
+            compressible_log_bytes,
+            compressed_bytes: 0,
             entries,
         })
     })();
@@ -1712,6 +2158,358 @@ pub fn prune_runs(
 
 pub fn artifact_ordering() -> &'static str {
     "newest first by final-report modification time, then run directory modification time, ties by descending run id"
+}
+
+fn retention_ordering() -> &'static str {
+    "newest first by latest bounded descendant activity, ties by descending artifact id"
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetentionItemState {
+    Finalized,
+    MissingFinalization,
+    InvalidFinalization,
+    External,
+}
+
+struct RetentionItem {
+    run_id: String,
+    run_dir: PathBuf,
+    absolute_path: PathBuf,
+    identity: FileIdentity,
+    bytes: u64,
+    compressible_log_bytes: u64,
+    modified: SystemTime,
+    unsafe_reason: Option<String>,
+    state: RetentionItemState,
+}
+
+struct RetentionInventory {
+    bytes: u64,
+    compressible_log_bytes: u64,
+    modified: SystemTime,
+    unsafe_reason: Option<String>,
+}
+
+fn open_optional_retention_root(
+    repository: &ArtifactRepository,
+    family: ArtifactRetentionFamily,
+) -> Result<Option<SafeRoot>> {
+    if let Some(authenticated) = family.authenticated() {
+        return open_optional_run_root(repository, authenticated);
+    }
+    let path = repository.worktree.join(family.run_root());
+    match fs::symlink_metadata(&path) {
+        Ok(_) => SafeRoot::open_existing(&path).map(Some).with_context(|| {
+            format!(
+                "existing {} retention root is unsafe: {}",
+                family.label(),
+                path.display()
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect retention root {}", path.display())),
+    }
+}
+
+fn retention_items(
+    repository: &ArtifactRepository,
+    root: &SafeRoot,
+    family: ArtifactRetentionFamily,
+) -> Result<Vec<RetentionItem>> {
+    let mut items = if let Some(authenticated) = family.authenticated() {
+        authenticated_retention_items(repository, root, authenticated)?
+    } else {
+        external_retention_items(root, family)?
+    };
+    items.sort_by(|left, right| {
+        right
+            .modified
+            .cmp(&left.modified)
+            .then_with(|| right.run_id.cmp(&left.run_id))
+    });
+    Ok(items)
+}
+
+fn authenticated_retention_items(
+    repository: &ArtifactRepository,
+    root: &SafeRoot,
+    family: RunArtifactFamily,
+) -> Result<Vec<RetentionItem>> {
+    let mut items = Vec::new();
+    for summary in sorted_run_summaries(repository, root, family)? {
+        let binding = root.bind_existing_managed_direct_child_directory(&summary.run_id)?;
+        if binding.identity() != &summary.identity {
+            bail!(
+                "artifact run identity changed during retention inventory: {}",
+                summary.run_id
+            );
+        }
+        let run = SafeRoot::open_existing(binding.path())?;
+        let marker_exists = run.direct_child_exists(FINALIZATION_MARKER)?;
+        let inventory = retention_inventory(&run)?;
+        let state = if summary.finalized {
+            RetentionItemState::Finalized
+        } else if marker_exists {
+            RetentionItemState::InvalidFinalization
+        } else {
+            RetentionItemState::MissingFinalization
+        };
+        items.push(RetentionItem {
+            run_id: summary.run_id,
+            run_dir: summary.run_dir,
+            absolute_path: binding.path().to_path_buf(),
+            identity: binding.identity().clone(),
+            bytes: inventory.bytes,
+            compressible_log_bytes: inventory.compressible_log_bytes,
+            modified: inventory.modified,
+            unsafe_reason: inventory.unsafe_reason,
+            state,
+        });
+    }
+    Ok(items)
+}
+
+fn external_retention_items(
+    root: &SafeRoot,
+    family: ArtifactRetentionFamily,
+) -> Result<Vec<RetentionItem>> {
+    root.verify()?;
+    let mut items = Vec::new();
+    let mut entry_count = 0usize;
+    for entry in fs::read_dir(root.path())
+        .with_context(|| format!("failed to read retention root {}", root.path().display()))?
+    {
+        entry_count = entry_count
+            .checked_add(1)
+            .context("retention root entry count overflow")?;
+        if entry_count > MAX_RETENTION_TREE_ENTRIES {
+            bail!(
+                "retention root exceeds its {} entry budget",
+                MAX_RETENTION_TREE_ENTRIES
+            );
+        }
+        let entry = entry.context("failed to inspect retention root entry")?;
+        let name = entry.file_name();
+        if name == ROOT_LOCK_FILE
+            || name == RETENTION_LOCK_FILE
+            || name == QUARANTINE_DIRECTORY
+            || name == RETENTION_QUARANTINE_DIRECTORY
+        {
+            continue;
+        }
+        let run_id = name
+            .to_str()
+            .context("retention artifact id is not valid UTF-8")?
+            .to_string();
+        if family == ArtifactRetentionFamily::Program
+            && (!run_id.starts_with("program-") || run_id == "program-")
+        {
+            continue;
+        }
+        let binding = root
+            .bind_existing_managed_direct_child_directory(&name)
+            .with_context(|| format!("unsafe {} artifact: {run_id}", family.label()))?;
+        let item_root = SafeRoot::open_existing(binding.path())?;
+        let inventory = retention_inventory(&item_root)?;
+        items.push(RetentionItem {
+            run_dir: family.run_root().join(&run_id),
+            run_id,
+            absolute_path: binding.path().to_path_buf(),
+            identity: binding.identity().clone(),
+            bytes: inventory.bytes,
+            compressible_log_bytes: inventory.compressible_log_bytes,
+            modified: inventory.modified,
+            unsafe_reason: inventory.unsafe_reason,
+            state: RetentionItemState::External,
+        });
+    }
+    root.verify()?;
+    Ok(items)
+}
+
+fn retention_inventory(root: &SafeRoot) -> Result<RetentionInventory> {
+    root.verify()?;
+    let mut bytes = 0u64;
+    let mut compressible_log_bytes = 0u64;
+    let mut modified = fs::symlink_metadata(root.path())
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(UNIX_EPOCH);
+    let mut unsafe_reason = None;
+    let entries = BoundedTreeWalker::walk_with(
+        root.path(),
+        BoundedTreeWalkLimits {
+            max_depth: MAX_RETENTION_TREE_DEPTH,
+            max_entries: MAX_RETENTION_TREE_ENTRIES,
+            max_path_bytes: MAX_RETENTION_TREE_PATH_BYTES,
+            max_total_path_bytes: MAX_RETENTION_TREE_TOTAL_PATH_BYTES,
+            max_duration: RETENTION_TREE_MAX_DURATION,
+            same_device: true,
+        },
+        |entry| {
+            Ok(if entry.kind == BoundedTreeEntryKind::Directory {
+                BoundedTreeWalkAction::RecordAndDescend
+            } else {
+                BoundedTreeWalkAction::Record
+            })
+        },
+    )?;
+    for entry in entries {
+        modified = modified.max(retention_entry_modified(&entry));
+        match entry.kind {
+            BoundedTreeEntryKind::Directory => {}
+            BoundedTreeEntryKind::RegularFile => {
+                bytes = bytes
+                    .checked_add(entry.size_bytes)
+                    .context("artifact retention item byte total overflow")?;
+                if is_compressible_log(&entry.relative_path) {
+                    compressible_log_bytes =
+                        compressible_log_bytes
+                            .checked_add(entry.size_bytes)
+                            .context("compressible artifact log byte total overflow")?;
+                }
+                if !entry.is_safe_regular_file() && unsafe_reason.is_none() {
+                    unsafe_reason = Some(format!(
+                        "regular file is multiply linked or has privileged mode bits: {}",
+                        entry.relative_path.display()
+                    ));
+                }
+            }
+            BoundedTreeEntryKind::Symlink => {
+                if unsafe_reason.is_none() {
+                    unsafe_reason = Some(format!(
+                        "symbolic link is present: {}",
+                        entry.relative_path.display()
+                    ));
+                }
+            }
+            BoundedTreeEntryKind::Special => {
+                if unsafe_reason.is_none() {
+                    unsafe_reason = Some(format!(
+                        "special file is present: {}",
+                        entry.relative_path.display()
+                    ));
+                }
+            }
+        }
+    }
+    root.verify()?;
+    Ok(RetentionInventory {
+        bytes,
+        compressible_log_bytes,
+        modified,
+        unsafe_reason,
+    })
+}
+
+fn retention_entry_modified(entry: &crate::safe_state::BoundedTreeEntry) -> SystemTime {
+    let nanoseconds = u32::try_from(entry.modified_nanoseconds)
+        .ok()
+        .filter(|value| *value < 1_000_000_000)
+        .unwrap_or(0);
+    if entry.modified_seconds >= 0 {
+        UNIX_EPOCH
+            .checked_add(Duration::new(entry.modified_seconds as u64, nanoseconds))
+            .unwrap_or(UNIX_EPOCH)
+    } else {
+        UNIX_EPOCH
+            .checked_sub(Duration::new(
+                entry.modified_seconds.unsigned_abs(),
+                nanoseconds,
+            ))
+            .unwrap_or(UNIX_EPOCH)
+    }
+}
+
+fn is_compressible_log(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| matches!(extension, "jsonl" | "log"))
+}
+
+fn artifact_age_seconds(now: SystemTime, modified: SystemTime) -> u64 {
+    now.duration_since(modified).unwrap_or_default().as_secs()
+}
+
+fn retention_entry(
+    item: RetentionItem,
+    age_seconds: u64,
+    action: RunArtifactPruneAction,
+    selected_by: Vec<ArtifactRetentionLimit>,
+    reason: Option<String>,
+) -> RunArtifactPruneEntry {
+    RunArtifactPruneEntry {
+        run_id: item.run_id,
+        run_dir: item.run_dir,
+        bytes: item.bytes,
+        age_seconds,
+        action,
+        selected_by,
+        reason,
+    }
+}
+
+fn retention_quarantine_name(family: ArtifactRetentionFamily) -> &'static str {
+    if family.authenticated().is_some() {
+        QUARANTINE_DIRECTORY
+    } else {
+        RETENTION_QUARANTINE_DIRECTORY
+    }
+}
+
+fn open_or_create_named_quarantine(root: &SafeRoot, name: &str) -> Result<SafeRoot> {
+    let binding = if root.direct_child_exists(name)? {
+        root.bind_existing_direct_child_directory(name)?
+    } else {
+        root.reserve_direct_child_directory(name)?
+    };
+    SafeRoot::open_or_create(binding.path())
+}
+
+fn delete_retention_item(
+    root: &SafeRoot,
+    root_lock: &BoundArtifactLock,
+    quarantine: &mut Option<SafeRoot>,
+    quarantine_directory: &str,
+    item: &RetentionItem,
+    run_lock: Option<&KernelStateLock>,
+) -> Result<()> {
+    root_lock.verify(root)?;
+    if quarantine.is_none() {
+        let created = open_or_create_named_quarantine(root, quarantine_directory)?;
+        ensure_quarantine_empty(&created)?;
+        *quarantine = Some(created);
+    }
+    let quarantine = quarantine
+        .as_ref()
+        .context("artifact quarantine unavailable")?;
+    let quarantine_name = quarantine.random_direct_child_name(&item.run_id)?;
+    rename_bound_directory(
+        root,
+        item.run_id.as_ref(),
+        &item.identity,
+        quarantine,
+        &quarantine_name,
+    )?;
+    let quarantined_item = SafeRoot::open_existing(quarantine.path().join(&quarantine_name))?;
+    if let Some(lock) = run_lock {
+        lock.verify_direct_binding(&quarantined_item)?;
+    }
+    remove_direct_child_tree(
+        quarantine,
+        &quarantine_name,
+        Some(&item.identity),
+        TreeLinkPolicy::RejectLinksAndSpecialFiles,
+    )
+    .with_context(|| {
+        format!(
+            "artifact '{}' was quarantined but could not be safely deleted; inspect {}",
+            item.run_id,
+            quarantine.path().join(&quarantine_name).display()
+        )
+    })?;
+    root_lock.verify(root)
 }
 
 fn check_run_dir_available(repo: &Path, family: RunArtifactFamily, run_id: &RunId) -> Result<()> {
@@ -2295,24 +3093,38 @@ fn parse_report(contents: &[u8]) -> (String, Option<bool>, bool, bool, Option<St
 }
 
 fn empty_prune_report(
-    family: RunArtifactFamily,
-    keep: usize,
+    family: ArtifactRetentionFamily,
+    policy: &ArtifactRetentionPolicy,
     dry_run: bool,
 ) -> RunArtifactPruneReport {
     RunArtifactPruneReport {
         family,
         run_root: family.run_root(),
-        ordering: artifact_ordering(),
-        keep,
+        ordering: retention_ordering(),
+        keep: policy.max_count,
+        max_age_seconds: policy.max_age.map(|age| age.as_secs()),
+        max_total_bytes: policy.max_total_bytes,
+        unfinalized_grace_seconds: policy.unfinalized_grace.map(|grace| grace.as_secs()),
         dry_run,
         kept_count: 0,
         deleted_count: 0,
         refused_unfinalized_count: 0,
         delete_candidate_count: 0,
+        scanned_bytes: 0,
+        retained_bytes: 0,
+        projected_retained_bytes: 0,
+        reclaimed_bytes: 0,
+        would_reclaim_bytes: 0,
+        refused_bytes: 0,
+        unfinalized_bytes: 0,
+        compression_strategy: ArtifactCompressionStrategy::NoneRequiresWriterMigration,
+        compressible_log_bytes: 0,
+        compressed_bytes: 0,
         entries: Vec::new(),
     }
 }
 
+#[cfg(test)]
 fn open_or_create_quarantine(root: &SafeRoot) -> Result<SafeRoot> {
     let binding = if root.direct_child_exists(QUARANTINE_DIRECTORY)? {
         root.bind_existing_direct_child_directory(QUARANTINE_DIRECTORY)?
@@ -4178,6 +4990,259 @@ mod tests {
     }
 
     #[test]
+    fn retention_count_age_and_size_limits_report_exact_dry_run_bytes() {
+        let (_temp, repo) = committed_repo();
+        for (run_id, transcript) in [
+            ("retention-a", b"aaa\n".as_slice()),
+            ("retention-b", b"bbbbbb\n".as_slice()),
+            ("retention-c", b"ccccccccc\n".as_slice()),
+        ] {
+            finalize_test_run_with_log(
+                &repo,
+                RunArtifactFamily::Consult,
+                &RunId::new(run_id).expect("run id"),
+                transcript,
+            );
+        }
+        let repository = discover_artifact_repository(&repo).expect("repository");
+        let root = open_existing_run_root(&repository, RunArtifactFamily::Consult).expect("root");
+        let items = retention_items(&repository, &root, ArtifactRetentionFamily::Consult)
+            .expect("retention inventory");
+        let scanned_bytes = items.iter().map(|item| item.bytes).sum::<u64>();
+        let compressible_log_bytes = items
+            .iter()
+            .map(|item| item.compressible_log_bytes)
+            .sum::<u64>();
+        let newest_bytes = items[0].bytes;
+        let newest_log = fs::read(items[0].absolute_path.join("events.jsonl"))
+            .expect("newest transcript before prune");
+        let policy = ArtifactRetentionPolicy {
+            max_count: 2,
+            max_age: None,
+            max_total_bytes: Some(newest_bytes),
+            unfinalized_grace: Some(Duration::from_secs(60)),
+        };
+
+        let dry = prune_artifacts_at(
+            &repo,
+            ArtifactRetentionFamily::Consult,
+            &policy,
+            true,
+            SystemTime::now(),
+        )
+        .expect("dry-run retention");
+        assert_eq!(dry.scanned_bytes, scanned_bytes);
+        assert_eq!(dry.retained_bytes, scanned_bytes);
+        assert_eq!(dry.reclaimed_bytes, 0);
+        assert_eq!(
+            dry.compression_strategy,
+            ArtifactCompressionStrategy::NoneRequiresWriterMigration
+        );
+        assert_eq!(dry.compressible_log_bytes, compressible_log_bytes);
+        assert_eq!(dry.compressed_bytes, 0);
+        assert_eq!(dry.entries[0].action, RunArtifactPruneAction::Keep);
+        assert!(dry.entries[1]
+            .selected_by
+            .contains(&ArtifactRetentionLimit::MaxTotalBytes));
+        assert!(dry.entries[2]
+            .selected_by
+            .contains(&ArtifactRetentionLimit::MaxCount));
+        let would_reclaim = dry
+            .entries
+            .iter()
+            .filter(|entry| entry.action == RunArtifactPruneAction::WouldDelete)
+            .map(|entry| entry.bytes)
+            .sum::<u64>();
+        assert_eq!(dry.would_reclaim_bytes, would_reclaim);
+        assert_eq!(dry.projected_retained_bytes, scanned_bytes - would_reclaim);
+        for item in &items {
+            assert!(item.absolute_path.exists(), "dry-run removed an artifact");
+        }
+        assert_eq!(
+            fs::read(items[0].absolute_path.join("events.jsonl")).expect("newest transcript"),
+            newest_log,
+            "the explicit no-compression policy must not rewrite retained logs"
+        );
+
+        let applied = prune_artifacts_at(
+            &repo,
+            ArtifactRetentionFamily::Consult,
+            &policy,
+            false,
+            SystemTime::now(),
+        )
+        .expect("apply retention");
+        assert_eq!(applied.reclaimed_bytes, dry.would_reclaim_bytes);
+        assert_eq!(applied.retained_bytes, dry.projected_retained_bytes);
+        assert_eq!(applied.projected_retained_bytes, applied.retained_bytes);
+        assert_eq!(applied.deleted_count, 2);
+        assert_eq!(
+            fs::read(items[0].absolute_path.join("events.jsonl")).expect("retained transcript"),
+            newest_log,
+            "apply must not rewrite retained logs"
+        );
+    }
+
+    #[test]
+    fn max_age_reclaims_a_finalized_run_inside_the_count_limit() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("age-limited").expect("run id");
+        finalize_private_test_run(&repo, RunArtifactFamily::Inbox, &run_id, "inbox");
+        let policy = ArtifactRetentionPolicy {
+            max_count: 10,
+            max_age: Some(Duration::from_secs(24 * 60 * 60)),
+            max_total_bytes: None,
+            unfinalized_grace: Some(Duration::from_secs(7 * 24 * 60 * 60)),
+        };
+        let report = prune_artifacts_at(
+            &repo,
+            ArtifactRetentionFamily::Inbox,
+            &policy,
+            true,
+            SystemTime::now() + Duration::from_secs(2 * 24 * 60 * 60),
+        )
+        .expect("age dry-run");
+        assert_eq!(
+            report.entries[0].action,
+            RunArtifactPruneAction::WouldDelete
+        );
+        assert_eq!(
+            report.entries[0].selected_by,
+            vec![ArtifactRetentionLimit::MaxAge]
+        );
+        assert!(run_dir(&repo, RunArtifactFamily::Inbox, &run_id).exists());
+    }
+
+    #[test]
+    fn expired_unfinalized_runs_are_reclaimed_but_fresh_and_active_runs_are_pinned() {
+        let (_temp, repo) = committed_repo();
+        let active_id = RunId::new("active-unfinalized").expect("run id");
+        let mut active = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Autopilot,
+            active_id.clone(),
+            "autopilot",
+        )
+        .expect("active writer");
+        active
+            .write_bytes(
+                "events.jsonl",
+                b"active\n",
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("active transcript");
+        let policy = ArtifactRetentionPolicy {
+            max_count: 0,
+            max_age: None,
+            max_total_bytes: None,
+            unfinalized_grace: Some(Duration::from_secs(7 * 24 * 60 * 60)),
+        };
+
+        let fresh = prune_artifacts_at(
+            &repo,
+            ArtifactRetentionFamily::Autopilot,
+            &policy,
+            false,
+            SystemTime::now(),
+        )
+        .expect("fresh refusal");
+        assert_eq!(fresh.deleted_count, 0);
+        assert_eq!(
+            fresh.entries[0].action,
+            RunArtifactPruneAction::RefuseUnfinalized
+        );
+        assert!(fresh.entries[0]
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("fresh")));
+
+        let active_report = prune_artifacts_at(
+            &repo,
+            ArtifactRetentionFamily::Autopilot,
+            &policy,
+            false,
+            SystemTime::now() + Duration::from_secs(8 * 24 * 60 * 60),
+        )
+        .expect("active refusal");
+        assert_eq!(active_report.deleted_count, 0);
+        assert!(active_report.entries[0]
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("writer lock is held")));
+        drop(active);
+
+        let expired = prune_artifacts_at(
+            &repo,
+            ArtifactRetentionFamily::Autopilot,
+            &policy,
+            false,
+            SystemTime::now() + Duration::from_secs(8 * 24 * 60 * 60),
+        )
+        .expect("expired reclamation");
+        assert_eq!(expired.deleted_count, 1);
+        assert_eq!(expired.reclaimed_bytes, active_report.scanned_bytes);
+        assert!(!run_dir(&repo, RunArtifactFamily::Autopilot, &active_id).exists());
+    }
+
+    #[test]
+    fn program_logs_are_covered_and_dry_run_bytes_match_apply() {
+        let (_temp, repo) = committed_repo();
+        let maco = repo.join(".maco");
+        let old = maco.join("program-a");
+        let newest = maco.join("program-z");
+        fs::create_dir_all(old.join("logs")).expect("old program logs");
+        fs::write(old.join("logs/old.jsonl"), b"old-log\n").expect("old log");
+        fs::create_dir_all(newest.join("logs")).expect("new program logs");
+        fs::write(newest.join("logs/new.jsonl"), b"new-log-longer\n").expect("new log");
+        fs::write(maco.join("unrelated-sentinel"), b"keep\n").expect("sentinel");
+        let policy = ArtifactRetentionPolicy {
+            max_count: 1,
+            max_age: None,
+            max_total_bytes: None,
+            unfinalized_grace: Some(Duration::ZERO),
+        };
+
+        let dry = prune_artifacts_at(
+            &repo,
+            ArtifactRetentionFamily::Program,
+            &policy,
+            true,
+            SystemTime::now(),
+        )
+        .expect("program dry-run");
+        assert_eq!(dry.family, ArtifactRetentionFamily::Program);
+        assert_eq!(dry.run_root, PathBuf::from(".maco"));
+        assert_eq!(
+            dry.scanned_bytes,
+            b"old-log\n".len() as u64 + b"new-log-longer\n".len() as u64
+        );
+        assert_eq!(dry.compressible_log_bytes, dry.scanned_bytes);
+        assert_eq!(dry.would_reclaim_bytes, b"old-log\n".len() as u64);
+        assert!(old.exists());
+        assert!(newest.exists());
+
+        let applied = prune_artifacts_at(
+            &repo,
+            ArtifactRetentionFamily::Program,
+            &policy,
+            false,
+            SystemTime::now(),
+        )
+        .expect("program apply");
+        assert_eq!(applied.reclaimed_bytes, dry.would_reclaim_bytes);
+        assert!(!old.exists());
+        assert!(newest.exists());
+        assert_eq!(
+            fs::read(newest.join("logs/new.jsonl")).expect("new log"),
+            b"new-log-longer\n"
+        );
+        assert_eq!(
+            fs::read(maco.join("unrelated-sentinel")).expect("sentinel"),
+            b"keep\n"
+        );
+    }
+
+    #[test]
     fn legacy_direct_writer_is_visible_but_never_finalized_or_publishable() {
         let (_temp, repo) = committed_repo();
         let run_id = RunId::new("legacy-run").expect("run id");
@@ -4753,6 +5818,33 @@ mod tests {
         writer
             .finalize(family.final_report_relative_path(), false)
             .expect("finalize test run");
+    }
+
+    fn finalize_test_run_with_log(
+        repo: &Path,
+        family: RunArtifactFamily,
+        run_id: &RunId,
+        transcript: &[u8],
+    ) {
+        let mut writer = ArtifactRunWriter::reserve(repo, family, run_id.clone(), family.label())
+            .expect("reserve logged test writer");
+        writer
+            .write_bytes(
+                "events.jsonl",
+                transcript,
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write test transcript");
+        writer
+            .write_json(
+                family.final_report_relative_path(),
+                &serde_json::json!({"status":"done"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write test report");
+        writer
+            .finalize(family.final_report_relative_path(), false)
+            .expect("finalize logged test run");
     }
 
     fn committed_repo() -> (TempDir, PathBuf) {
