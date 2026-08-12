@@ -2,8 +2,9 @@
 use crate::safe_state::scavenge_private_random_directories;
 use crate::{
     artifacts::{
-        repository_authenticator_key_only,
+        prune_artifacts_with_policy, repository_authenticator_key_only,
         state_auth::{random_identifier, AuthenticationDomain, RepositoryAuthBinding},
+        ArtifactRetentionFamily, ArtifactRetentionPolicy, RunArtifactPruneReport,
     },
     authenticated_snapshot::{AuthenticatedSnapshot, AuthenticatedSnapshotStore, SnapshotSpec},
     gate_denial::GateDenial,
@@ -34,7 +35,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use git2::{
     Branch, BranchType, ErrorCode, ObjectType, Oid, Repository, RepositoryInitOptions, Status,
-    StatusOptions, Transaction, WorktreeAddOptions, WorktreeLockStatus,
+    StatusOptions, Transaction, WorktreeAddOptions, WorktreeLockStatus, WorktreePruneOptions,
 };
 use serde::{Deserialize, Serialize, Serializer};
 use std::{
@@ -125,6 +126,10 @@ const WORKTREE_STATUS_TIMEOUT: Duration = Duration::from_secs(60);
 const REMOVAL_LOCK_REASON: &str = "MACO removal quarantine; child process must be stopped";
 const MANAGED_LOGICAL_ID: &str = "managed-worktrees";
 
+pub const O2_LAUNCH_WORKTREE_MAX_COUNT: usize = 10;
+pub const O2_LAUNCH_ARTIFACT_KEEP_COUNT: usize = 10;
+pub const O2_LAUNCH_UNFINALIZED_GRACE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 static BOUNDED_STATUS_PROCESS_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
     std::sync::OnceLock::new();
 
@@ -211,7 +216,162 @@ pub struct WorktreeGcOptions {
     pub retention: WorktreeRetentionPolicy,
     pub allowed_untracked_paths: Vec<PathBuf>,
     pub exclude_agent_id: Option<String>,
+    /// Restrict authenticated candidates to these exact canonical agent IDs.
+    /// A configured selector also disables pathname-only orphan pruning.
+    pub candidate_agent_ids: Option<BTreeSet<String>>,
+    /// Require full-lane candidates to be reachable from this exact local
+    /// trunk reference. `None` preserves the pre-lifecycle manual GC policy.
+    pub merged_into_reference: Option<String>,
+    /// Exact authenticated candidates whose retry successor makes them
+    /// lifecycle-complete even when their branch is not merged into HEAD.
+    pub superseded_by_agent_id: BTreeMap<String, String>,
     pub machine_global_retention: Option<MachineGlobalRetentionBinding>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WorktreeLifecycleOptions {
+    pub apply: bool,
+    pub auto_reap_merged: bool,
+    pub retry_successor_agent_id: Option<String>,
+    pub startup_reconcile: bool,
+    pub destructive_reconciliation: bool,
+    pub candidate_agent_ids: Option<BTreeSet<String>>,
+    pub merged_into_reference: Option<String>,
+    pub worktree_root: Option<PathBuf>,
+    pub remove_targets: bool,
+    pub worktree_retention: WorktreeRetentionPolicy,
+    pub allowed_untracked_paths: Vec<PathBuf>,
+    pub artifact_retention: Option<ArtifactRetentionPolicy>,
+    pub machine_global_retention: Option<MachineGlobalRetentionBinding>,
+}
+
+impl WorktreeLifecycleOptions {
+    pub fn o2_launch_defaults() -> Self {
+        Self {
+            artifact_retention: Some(o2_launch_artifact_retention_defaults()),
+            ..Self::default()
+        }
+    }
+}
+
+pub fn o2_launch_worktree_retention_defaults() -> WorktreeRetentionPolicy {
+    WorktreeRetentionPolicy {
+        max_age: None,
+        max_count: Some(O2_LAUNCH_WORKTREE_MAX_COUNT),
+        max_total_bytes: None,
+    }
+}
+
+pub fn o2_launch_artifact_retention_defaults() -> ArtifactRetentionPolicy {
+    ArtifactRetentionPolicy {
+        max_count: O2_LAUNCH_ARTIFACT_KEEP_COUNT,
+        max_age: None,
+        max_total_bytes: None,
+        unfinalized_grace: Some(O2_LAUNCH_UNFINALIZED_GRACE),
+        reclaim_unverifiable: false,
+        external_writers_stopped: false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrySupersessionStatus {
+    Disabled,
+    NotRetryLane,
+    PredecessorNotFound,
+    Selected,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RetrySupersessionReport {
+    pub successor_agent_id: Option<String>,
+    pub predecessor_agent_id: Option<String>,
+    pub status: RetrySupersessionStatus,
+    pub authenticated_matches: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeReconciliationState {
+    Consistent,
+    PendingOperation,
+    RegisteredMissingPath,
+    PresentDeregistered,
+    AuthenticatedMissingBoth,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeReconciliationAction {
+    None,
+    ReportOnly,
+    ForgotAuthenticatedRecord,
+    PrunedRegistrationAndForgotRecord,
+    QuarantinedDirectory,
+    QuarantinedDirectoryAndForgotRecord,
+    Protected,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorktreeReconciliationEntry {
+    pub name: String,
+    pub branch: Option<String>,
+    pub path: PathBuf,
+    pub state: WorktreeReconciliationState,
+    pub action: WorktreeReconciliationAction,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorktreeReconciliationReport {
+    pub enabled: bool,
+    pub apply: bool,
+    pub destructive_reconciliation: bool,
+    pub forgotten_record_count: usize,
+    pub pruned_registration_count: usize,
+    pub quarantined_directory_count: usize,
+    pub entries: Vec<WorktreeReconciliationEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorktreeLifecycleReport {
+    pub enabled: bool,
+    pub apply: bool,
+    pub dry_run: bool,
+    pub auto_reap_merged: bool,
+    pub retry: RetrySupersessionReport,
+    pub reconciliation: WorktreeReconciliationReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_gc: Option<WorktreeGcReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_prune: Option<RunArtifactPruneReport<ArtifactRetentionFamily>>,
+    pub artifact_reclaim_unverifiable: Option<bool>,
+    pub artifact_external_writers_stopped: Option<bool>,
+    pub apparent_checked_bytes: u64,
+    pub projected_reclaimable_bytes: u64,
+    pub actual_reclaimed_bytes: u64,
+    pub repository_prune: WorktreeRepositoryPruneReport,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeRepositoryPruneStatus {
+    Disabled,
+    DryRun,
+    NotNeeded,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorktreeRepositoryPruneReport {
+    pub status: WorktreeRepositoryPruneStatus,
+    pub stale_registration_count: usize,
+    pub pruned_registration_count: usize,
+    pub protected_registration_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -370,6 +530,7 @@ pub enum WorktreeGcStatus {
 #[serde(rename_all = "snake_case")]
 pub enum WorktreeGcReason {
     FinishedBranch,
+    SupersededLane,
     UnmergedBranch,
     RetentionKeep,
     ExcludedCurrentWorktree,
@@ -1395,6 +1556,9 @@ impl WorktreeManager {
                 retention,
                 allowed_untracked_paths: Vec::new(),
                 exclude_agent_id,
+                candidate_agent_ids: None,
+                merged_into_reference: None,
+                superseded_by_agent_id: BTreeMap::new(),
                 machine_global_retention: None,
             })?;
             cleanliness.require_clean_for_manager(self)?;
@@ -1474,6 +1638,9 @@ impl WorktreeManager {
                 retention,
                 allowed_untracked_paths: Vec::new(),
                 exclude_agent_id,
+                candidate_agent_ids: None,
+                merged_into_reference: None,
+                superseded_by_agent_id: BTreeMap::new(),
                 machine_global_retention: None,
             })?;
         }
@@ -2009,6 +2176,194 @@ impl WorktreeManager {
         self.gc_with_target_liveness(options, worktree_target_liveness)
     }
 
+    /// Runs explicitly enabled lifecycle automation. The default options are
+    /// read/write inert: no registry, worktree, Git metadata, or artifact
+    /// store is opened until at least one lifecycle feature is enabled.
+    pub fn lifecycle(&self, options: WorktreeLifecycleOptions) -> Result<WorktreeLifecycleReport> {
+        let enabled = options.auto_reap_merged
+            || options.retry_successor_agent_id.is_some()
+            || options.startup_reconcile
+            || options.artifact_retention.is_some();
+        let mut report = WorktreeLifecycleReport {
+            enabled,
+            apply: options.apply,
+            dry_run: !options.apply,
+            auto_reap_merged: options.auto_reap_merged,
+            retry: RetrySupersessionReport {
+                successor_agent_id: options.retry_successor_agent_id.clone(),
+                predecessor_agent_id: None,
+                status: RetrySupersessionStatus::Disabled,
+                authenticated_matches: Vec::new(),
+                detail: None,
+            },
+            reconciliation: WorktreeReconciliationReport {
+                enabled: options.startup_reconcile,
+                apply: options.apply,
+                destructive_reconciliation: options.destructive_reconciliation,
+                forgotten_record_count: 0,
+                pruned_registration_count: 0,
+                quarantined_directory_count: 0,
+                entries: Vec::new(),
+            },
+            worktree_gc: None,
+            artifact_prune: None,
+            artifact_reclaim_unverifiable: options
+                .artifact_retention
+                .as_ref()
+                .map(|policy| policy.reclaim_unverifiable),
+            artifact_external_writers_stopped: options
+                .artifact_retention
+                .as_ref()
+                .map(|policy| policy.external_writers_stopped),
+            apparent_checked_bytes: 0,
+            projected_reclaimable_bytes: 0,
+            actual_reclaimed_bytes: 0,
+            repository_prune: WorktreeRepositoryPruneReport {
+                status: WorktreeRepositoryPruneStatus::Disabled,
+                stale_registration_count: 0,
+                pruned_registration_count: 0,
+                protected_registration_count: 0,
+            },
+        };
+        if !enabled {
+            return Ok(report);
+        }
+        if options.auto_reap_merged && options.merged_into_reference.is_none() {
+            bail!("merged-lane lifecycle automation requires an explicit local trunk reference");
+        }
+
+        let repo = self.open_repository()?;
+        if options.startup_reconcile {
+            report.reconciliation = reconcile_managed_worktree_lifecycle(
+                &repo,
+                options.worktree_root.clone(),
+                options.apply,
+                options.destructive_reconciliation,
+                options.machine_global_retention.as_ref(),
+            )?;
+        }
+
+        let mut superseded_by_agent_id = BTreeMap::new();
+        if let Some(successor) = options.retry_successor_agent_id.as_deref() {
+            report.retry = resolve_retry_supersession(&repo, successor)?;
+            if report.retry.status == RetrySupersessionStatus::Selected {
+                let predecessor = report
+                    .retry
+                    .predecessor_agent_id
+                    .clone()
+                    .context("selected retry predecessor is missing from its report")?;
+                superseded_by_agent_id.insert(predecessor, successor.to_string());
+            }
+        }
+
+        let gc_enabled = options.auto_reap_merged || !superseded_by_agent_id.is_empty();
+        if gc_enabled {
+            let candidate_agent_ids = if options.auto_reap_merged {
+                let mut selectors = options.candidate_agent_ids.clone();
+                if !superseded_by_agent_id.is_empty() {
+                    selectors
+                        .get_or_insert_with(BTreeSet::new)
+                        .extend(superseded_by_agent_id.keys().cloned());
+                }
+                selectors
+            } else {
+                Some(superseded_by_agent_id.keys().cloned().collect())
+            };
+            let gc = self.gc(WorktreeGcOptions {
+                worktree_root: options.worktree_root,
+                dry_run: !options.apply,
+                remove_targets: options.remove_targets,
+                targets_only: false,
+                retention: options.worktree_retention,
+                allowed_untracked_paths: options.allowed_untracked_paths,
+                exclude_agent_id: None,
+                candidate_agent_ids,
+                merged_into_reference: options.merged_into_reference,
+                superseded_by_agent_id,
+                machine_global_retention: options.machine_global_retention,
+            })?;
+            report.apparent_checked_bytes = report
+                .apparent_checked_bytes
+                .checked_add(gc.apparent_considered_bytes)
+                .context("lifecycle apparent checked bytes overflowed")?;
+            report.projected_reclaimable_bytes = report
+                .projected_reclaimable_bytes
+                .checked_add(gc.estimated_reclaimable_bytes)
+                .context("lifecycle projected reclaimable bytes overflowed")?;
+            report.actual_reclaimed_bytes = report
+                .actual_reclaimed_bytes
+                .checked_add(gc.estimated_reclaimed_bytes)
+                .context("lifecycle actual reclaimed bytes overflowed")?;
+            if gc.removed_count > 0 {
+                let selected_names = gc
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry.status,
+                            WorktreeGcStatus::WouldRemove | WorktreeGcStatus::Removed
+                        )
+                    })
+                    .map(|entry| entry.name.clone())
+                    .collect::<BTreeSet<_>>();
+                report.repository_prune = prune_stale_worktree_registrations(
+                    &repo,
+                    &selected_names,
+                    options.apply,
+                )
+                .with_context(
+                    || {
+                        format!(
+                            "{} managed worktree removal(s) completed, but post-removal Git worktree prune failed; effects occurred and the lifecycle pass must not be blindly retried",
+                            gc.removed_count
+                        )
+                    },
+                )?;
+            } else {
+                report.repository_prune.status = if options.apply {
+                    WorktreeRepositoryPruneStatus::NotNeeded
+                } else {
+                    WorktreeRepositoryPruneStatus::DryRun
+                };
+            }
+            report.worktree_gc = Some(gc);
+        }
+
+        if let Some(policy) = options.artifact_retention {
+            let artifacts = prune_artifacts_with_policy(
+                &self.repo_path,
+                ArtifactRetentionFamily::O2Autopilot,
+                &policy,
+                !options.apply,
+            )
+            .with_context(|| {
+                if report
+                    .worktree_gc
+                    .as_ref()
+                    .is_some_and(|gc| gc.estimated_reclaimed_bytes > 0)
+                {
+                    "worktree reclamation completed before artifact pruning failed; effects occurred and the lifecycle pass must not be blindly retried"
+                } else {
+                    "lifecycle artifact pruning failed before any reported worktree reclamation"
+                }
+            })?;
+            report.apparent_checked_bytes = report
+                .apparent_checked_bytes
+                .checked_add(artifacts.scanned_bytes)
+                .context("lifecycle apparent checked bytes overflowed")?;
+            report.projected_reclaimable_bytes = report
+                .projected_reclaimable_bytes
+                .checked_add(artifacts.would_reclaim_bytes)
+                .context("lifecycle projected reclaimable bytes overflowed")?;
+            report.actual_reclaimed_bytes = report
+                .actual_reclaimed_bytes
+                .checked_add(artifacts.reclaimed_bytes)
+                .context("lifecycle actual reclaimed bytes overflowed")?;
+            report.artifact_prune = Some(artifacts);
+        }
+        Ok(report)
+    }
+
     fn gc_with_target_liveness<F>(
         &self,
         options: WorktreeGcOptions,
@@ -2025,6 +2380,11 @@ impl WorktreeManager {
             options.machine_global_retention.is_some(),
         )?;
         let repo = self.open_repository()?;
+        let merge_target = options
+            .merged_into_reference
+            .as_deref()
+            .map(|reference| resolve_lifecycle_trunk_tip(&repo, reference))
+            .transpose()?;
         let restrict_to_requested_root = options.worktree_root.is_some();
         let worktree_root = resolve_worktree_root(&repo, options.worktree_root.clone())?;
         let allowed_untracked_paths =
@@ -2035,6 +2395,21 @@ impl WorktreeManager {
             .as_deref()
             .map(normalize_agent_id)
             .transpose()?;
+        let candidate_agent_ids = options
+            .candidate_agent_ids
+            .as_ref()
+            .map(|ids| normalize_gc_agent_id_set(ids, "candidate"))
+            .transpose()?;
+        let superseded_by_agent_id =
+            normalize_gc_supersession_map(&options.superseded_by_agent_id)?;
+        if let Some(candidate_agent_ids) = &candidate_agent_ids {
+            if !superseded_by_agent_id
+                .keys()
+                .all(|predecessor| candidate_agent_ids.contains(predecessor))
+            {
+                bail!("superseded worktree selectors must be included in candidate selectors");
+            }
+        }
         let mut report = WorktreeGcReport {
             dry_run: options.dry_run,
             remove_targets: options.remove_targets,
@@ -2060,6 +2435,12 @@ impl WorktreeManager {
         let registry_lock = registry_store.lock()?;
         let mut registry = registry_store.load(&registry_lock)?;
         recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry)?;
+        validate_retry_supersession_authorities(
+            &repo,
+            &registry_store.repository,
+            &registry,
+            &superseded_by_agent_id,
+        )?;
         for name in registry.records.keys() {
             registered_names.insert(name.clone());
         }
@@ -2068,6 +2449,12 @@ impl WorktreeManager {
         let bindings = registry.records.values().cloned().collect::<Vec<_>>();
         for binding in bindings {
             if registry.operations.contains_key(&binding.name) {
+                continue;
+            }
+            if candidate_agent_ids
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(&binding.name))
+            {
                 continue;
             }
             if restrict_to_requested_root && binding.root != worktree_root {
@@ -2125,6 +2512,15 @@ impl WorktreeManager {
                 &binding,
                 false,
             )?;
+            let branch_merged = match merge_target.as_ref() {
+                Some((_, trunk_oid)) => {
+                    verified.branch_oid == *trunk_oid
+                        || repo
+                            .graph_descendant_of(*trunk_oid, verified.branch_oid)
+                            .context("failed to inspect managed branch ancestry from trunk")?
+                }
+                None => true,
+            };
             let removal_lease = if options.dry_run {
                 if registry_store
                     .worktree_has_active_execution_lease(&registry_lock, &binding.name)?
@@ -2261,9 +2657,15 @@ impl WorktreeManager {
                     paths
                 }
             };
+            let superseded = superseded_by_agent_id.contains_key(&binding.name);
             candidates.push(WorktreeGcCandidate {
                 binding,
                 branch_oid: verified.branch_oid,
+                branch_merged,
+                superseded,
+                merged_into_reference: merge_target
+                    .as_ref()
+                    .map(|(reference, _)| reference.clone()),
                 removal_lease,
                 untracked_paths,
                 apparent_worktree_bytes: size.worktree_bytes,
@@ -2343,6 +2745,7 @@ impl WorktreeManager {
             }
 
             if decision.should_remove {
+                let completion_reason = worktree_gc_completion_reason(&candidate);
                 if options.dry_run {
                     report.estimated_reclaimable_bytes = report
                         .estimated_reclaimable_bytes
@@ -2357,7 +2760,7 @@ impl WorktreeManager {
                         branch: Some(candidate.binding.branch),
                         path: candidate.binding.path,
                         status: WorktreeGcStatus::WouldRemove,
-                        reason: WorktreeGcReason::FinishedBranch,
+                        reason: completion_reason,
                         target_path: preflight_target.as_ref().map(|target| target.path.clone()),
                         target_liveness: None,
                         apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
@@ -2401,6 +2804,19 @@ impl WorktreeManager {
                         reason,
                         boundary_target.as_ref().map(|target| target.path.clone()),
                         Some(evidence),
+                        candidate.untracked_paths.clone(),
+                    )?;
+                    continue;
+                }
+                if !candidate.superseded
+                    && !worktree_gc_candidate_remains_merged(&repo, &candidate)?
+                {
+                    add_gc_candidate_protection(
+                        &mut report,
+                        &candidate,
+                        WorktreeGcReason::UnmergedBranch,
+                        boundary_target.as_ref().map(|target| target.path.clone()),
+                        None,
                         candidate.untracked_paths.clone(),
                     )?;
                     continue;
@@ -2463,7 +2879,7 @@ impl WorktreeManager {
                     branch: Some(candidate.binding.branch),
                     path: candidate.binding.path,
                     status: WorktreeGcStatus::Removed,
-                    reason: WorktreeGcReason::FinishedBranch,
+                    reason: completion_reason,
                     target_path: boundary_target.as_ref().map(|target| target.path.clone()),
                     target_liveness: None,
                     apparent_worktree_bytes: Some(candidate.apparent_worktree_bytes),
@@ -2624,7 +3040,12 @@ impl WorktreeManager {
                 branch: Some(candidate.binding.branch),
                 path: candidate.binding.path,
                 status: WorktreeGcStatus::Retained,
-                reason: if options.remove_targets {
+                reason: if !candidate.branch_merged
+                    && !candidate.superseded
+                    && !options.targets_only
+                {
+                    WorktreeGcReason::UnmergedBranch
+                } else if options.remove_targets {
                     WorktreeGcReason::NoTarget
                 } else {
                     WorktreeGcReason::RetentionKeep
@@ -2640,7 +3061,7 @@ impl WorktreeManager {
             retention_state = decision.committed_state;
         }
 
-        if !options.targets_only {
+        if !options.targets_only && candidate_agent_ids.is_none() {
             prune_unregistered_worktree_directories(
                 &repo,
                 &worktree_root,
@@ -2894,6 +3315,9 @@ pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<Worktr
             retention: options.retention,
             allowed_untracked_paths: allowed_untracked_paths.iter().cloned().collect(),
             exclude_agent_id: None,
+            candidate_agent_ids: None,
+            merged_into_reference: None,
+            superseded_by_agent_id: BTreeMap::new(),
             machine_global_retention: None,
         });
         match gc_result {
@@ -3007,6 +3431,897 @@ pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<Worktr
         }
     }
 
+    Ok(report)
+}
+
+fn parse_retry_predecessor(successor: &str) -> std::result::Result<Option<String>, String> {
+    let Some((stem, suffix)) = successor.rsplit_once('-') else {
+        return Ok(None);
+    };
+    if stem.is_empty() {
+        return Err("retry successor has an empty predecessor stem".to_string());
+    }
+    if suffix == "round2" {
+        return Ok(Some(stem.to_string()));
+    }
+    if let Some(generation) = suffix.strip_prefix('r') {
+        if generation.is_empty() || !generation.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("retry suffix is malformed".to_string());
+        }
+        if generation.len() > 1 && generation.starts_with('0') {
+            return Err("retry generation is noncanonical".to_string());
+        }
+        let generation = generation
+            .parse::<u32>()
+            .map_err(|_| "retry generation is outside the supported range".to_string())?;
+        if generation < 2 {
+            return Err("retry generation must be at least 2".to_string());
+        }
+        return Ok(Some(if generation == 2 {
+            stem.to_string()
+        } else {
+            format!("{stem}-r{}", generation - 1)
+        }));
+    }
+    if suffix.starts_with("round") {
+        return Err("only the canonical '-round2' long retry suffix is supported".to_string());
+    }
+    Ok(None)
+}
+
+fn resolve_retry_supersession(
+    repo: &Repository,
+    successor: &str,
+) -> Result<RetrySupersessionReport> {
+    let successor = normalize_agent_id(successor).context("retry successor agent id is invalid")?;
+    let predecessor = match parse_retry_predecessor(&successor) {
+        Ok(Some(predecessor)) => predecessor,
+        Ok(None) => {
+            return Ok(RetrySupersessionReport {
+                successor_agent_id: Some(successor),
+                predecessor_agent_id: None,
+                status: RetrySupersessionStatus::NotRetryLane,
+                authenticated_matches: Vec::new(),
+                detail: Some("agent id has no canonical retry suffix".to_string()),
+            })
+        }
+        Err(detail) => {
+            return Ok(RetrySupersessionReport {
+                successor_agent_id: Some(successor),
+                predecessor_agent_id: None,
+                status: RetrySupersessionStatus::Ambiguous,
+                authenticated_matches: Vec::new(),
+                detail: Some(detail),
+            })
+        }
+    };
+    let Some(store) = ManagedWorktreeRegistryStore::open_existing(repo)? else {
+        return Ok(RetrySupersessionReport {
+            successor_agent_id: Some(successor),
+            predecessor_agent_id: Some(predecessor),
+            status: RetrySupersessionStatus::PredecessorNotFound,
+            authenticated_matches: Vec::new(),
+            detail: Some("authenticated managed worktree state is absent".to_string()),
+        });
+    };
+    let Some(registry) = store.load_existing_read_only()? else {
+        return Ok(RetrySupersessionReport {
+            successor_agent_id: Some(successor),
+            predecessor_agent_id: Some(predecessor),
+            status: RetrySupersessionStatus::PredecessorNotFound,
+            authenticated_matches: Vec::new(),
+            detail: Some("authenticated managed worktree registry is absent".to_string()),
+        });
+    };
+    let Some(successor_binding) = registry.records.get(&successor) else {
+        return Ok(RetrySupersessionReport {
+            successor_agent_id: Some(successor),
+            predecessor_agent_id: Some(predecessor),
+            status: RetrySupersessionStatus::Ambiguous,
+            authenticated_matches: Vec::new(),
+            detail: Some("retry successor lacks an exact authenticated lane identity".to_string()),
+        });
+    };
+    if registry.operations.contains_key(&successor_binding.name) {
+        return Ok(RetrySupersessionReport {
+            successor_agent_id: Some(successor),
+            predecessor_agent_id: Some(predecessor),
+            status: RetrySupersessionStatus::Ambiguous,
+            authenticated_matches: Vec::new(),
+            detail: Some("retry successor has a pending authenticated operation".to_string()),
+        });
+    }
+    if let Err(error) =
+        verify_managed_worktree_binding(repo, &store.repository, successor_binding, false)
+    {
+        return Ok(RetrySupersessionReport {
+            successor_agent_id: Some(successor),
+            predecessor_agent_id: Some(predecessor),
+            status: RetrySupersessionStatus::Ambiguous,
+            authenticated_matches: Vec::new(),
+            detail: Some(format!(
+                "retry successor binding is not live and verified: {error:#}"
+            )),
+        });
+    }
+    let mut matches = registry
+        .records
+        .values()
+        .filter(|binding| {
+            binding.root == successor_binding.root
+                && (binding.name == predecessor
+                    || binding.branch == predecessor
+                    || binding.branch.rsplit('/').next() == Some(predecessor.as_str()))
+        })
+        .map(|binding| binding.name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    matches.sort();
+    let (status, selected, detail) = match matches.as_slice() {
+        [] => (
+            RetrySupersessionStatus::PredecessorNotFound,
+            None,
+            Some("no exact authenticated predecessor identity matched".to_string()),
+        ),
+        [only] if only == &predecessor => {
+            let predecessor_binding = registry
+                .records
+                .get(only)
+                .context("authenticated retry predecessor disappeared during classification")?;
+            if let Err(error) = verify_managed_worktree_binding(
+                repo,
+                &store.repository,
+                predecessor_binding,
+                false,
+            ) {
+                return Ok(RetrySupersessionReport {
+                    successor_agent_id: Some(successor),
+                    predecessor_agent_id: Some(predecessor),
+                    status: RetrySupersessionStatus::Ambiguous,
+                    authenticated_matches: matches,
+                    detail: Some(format!(
+                        "retry predecessor binding is not live and verified: {error:#}"
+                    )),
+                });
+            }
+            let successor_branch_predecessor = parse_retry_predecessor(&successor_binding.branch)
+                .ok()
+                .flatten();
+            if successor_branch_predecessor.as_deref() == Some(predecessor_binding.branch.as_str())
+                || successor_branch_predecessor
+                    .as_deref()
+                    .and_then(|branch| branch.rsplit('/').next())
+                    == predecessor_binding.branch.rsplit('/').next()
+            {
+                (
+                    RetrySupersessionStatus::Selected,
+                    Some(only.clone()),
+                    None,
+                )
+            } else {
+                (
+                    RetrySupersessionStatus::Ambiguous,
+                    None,
+                    Some(
+                        "retry successor and predecessor do not share one canonical branch family"
+                            .to_string(),
+                    ),
+                )
+            }
+        }
+        [only] => (
+            RetrySupersessionStatus::Ambiguous,
+            None,
+            Some(format!(
+                "branch-derived predecessor matched authenticated lane '{only}', not exact agent id '{predecessor}'"
+            )),
+        ),
+        _ => (
+            RetrySupersessionStatus::Ambiguous,
+            None,
+            Some("multiple authenticated predecessor identities matched".to_string()),
+        ),
+    };
+    Ok(RetrySupersessionReport {
+        successor_agent_id: Some(successor),
+        predecessor_agent_id: selected.or(Some(predecessor)),
+        status,
+        authenticated_matches: matches,
+        detail,
+    })
+}
+
+fn validate_retry_supersession_authorities(
+    repo: &Repository,
+    repository: &ManagedRepositoryBinding,
+    registry: &ManagedWorktreeRegistry,
+    superseded_by: &BTreeMap<String, String>,
+) -> Result<()> {
+    for (predecessor, successor) in superseded_by {
+        if parse_retry_predecessor(successor)
+            .map_err(anyhow::Error::msg)?
+            .as_deref()
+            != Some(predecessor.as_str())
+        {
+            bail!(
+                "retry supersession authority '{predecessor}' -> '{successor}' is not a canonical adjacent generation"
+            );
+        }
+        if registry.operations.contains_key(predecessor)
+            || registry.operations.contains_key(successor)
+        {
+            bail!("retry supersession authority changed to a pending lifecycle operation");
+        }
+        let predecessor_binding = registry
+            .records
+            .get(predecessor)
+            .with_context(|| format!("retry predecessor '{predecessor}' disappeared before GC"))?;
+        let successor_binding = registry
+            .records
+            .get(successor)
+            .with_context(|| format!("retry successor '{successor}' disappeared before GC"))?;
+        verify_managed_worktree_binding(repo, repository, predecessor_binding, false)
+            .context("retry predecessor binding changed before GC")?;
+        verify_managed_worktree_binding(repo, repository, successor_binding, false)
+            .context("retry successor binding changed before GC")?;
+        if predecessor_binding.root != successor_binding.root {
+            bail!("retry generations no longer share one authenticated worktree root");
+        }
+        let successor_branch_predecessor = parse_retry_predecessor(&successor_binding.branch)
+            .ok()
+            .flatten();
+        if successor_branch_predecessor.as_deref() != Some(predecessor_binding.branch.as_str())
+            && successor_branch_predecessor
+                .as_deref()
+                .and_then(|branch| branch.rsplit('/').next())
+                != predecessor_binding.branch.rsplit('/').next()
+        {
+            bail!("retry generations no longer share one canonical branch family");
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_managed_worktree_lifecycle(
+    repo: &Repository,
+    requested_root: Option<PathBuf>,
+    apply: bool,
+    destructive_reconciliation: bool,
+    machine_global_retention: Option<&MachineGlobalRetentionBinding>,
+) -> Result<WorktreeReconciliationReport> {
+    let mut report = WorktreeReconciliationReport {
+        enabled: true,
+        apply,
+        destructive_reconciliation,
+        forgotten_record_count: 0,
+        pruned_registration_count: 0,
+        quarantined_directory_count: 0,
+        entries: Vec::new(),
+    };
+    let active_claims = active_claim_agent_ids(repo)?;
+    let managed_store = ManagedWorktreeRegistryStore::open_existing(repo)?;
+    let snapshot = match managed_store.as_ref() {
+        Some(store) => store.load_existing_read_only()?,
+        None => None,
+    };
+    let mut resolutions = Vec::new();
+    let mut authenticated_names = BTreeSet::new();
+    let mut roots = BTreeSet::from([resolve_worktree_root(repo, requested_root)?]);
+
+    if let (Some(store), Some(snapshot)) = (managed_store.as_ref(), snapshot.as_ref()) {
+        for binding in snapshot.records.values() {
+            authenticated_names.insert(binding.name.clone());
+            roots.insert(binding.root.clone());
+            let mut entry =
+                classify_worktree_reconciliation(repo, &store.repository, snapshot, binding);
+            let state = entry.state;
+            let claimed = active_claims.contains(&binding.name);
+            if claimed && state != WorktreeReconciliationState::Consistent {
+                entry.action = WorktreeReconciliationAction::Protected;
+                entry
+                    .detail
+                    .push_str("; an active durable claim protects this lane");
+            } else if matches!(
+                state,
+                WorktreeReconciliationState::AuthenticatedMissingBoth
+                    | WorktreeReconciliationState::RegisteredMissingPath
+                    | WorktreeReconciliationState::PresentDeregistered
+            ) {
+                if apply && destructive_reconciliation {
+                    resolutions.push(WorktreeReconciliationResolution::Authenticated {
+                        entry_index: report.entries.len(),
+                        state,
+                        binding: Box::new(binding.clone()),
+                    });
+                } else {
+                    entry.action = WorktreeReconciliationAction::ReportOnly;
+                    entry.detail.push_str(
+                        "; resolution requires both apply and destructive reconciliation",
+                    );
+                }
+            }
+            report.entries.push(entry);
+        }
+        for operation in snapshot.operations.values() {
+            if snapshot.records.contains_key(&operation.name) {
+                continue;
+            }
+            report.entries.push(WorktreeReconciliationEntry {
+                name: operation.name.clone(),
+                branch: Some(operation.branch.clone()),
+                path: operation.path.clone(),
+                state: WorktreeReconciliationState::PendingOperation,
+                action: WorktreeReconciliationAction::Protected,
+                detail: format!(
+                    "authenticated {} operation remains in phase {}; startup reconciliation reports it without bypassing recovery",
+                    managed_operation_kind_label(operation.kind),
+                    managed_operation_phase_label(operation.phase),
+                ),
+            });
+        }
+    }
+
+    let mut unregistered_name_paths = BTreeMap::<String, Vec<(usize, FileIdentity)>>::new();
+    for root_path in roots {
+        if !path_entry_exists(&root_path)? {
+            continue;
+        }
+        let root = SafeRoot::open_existing(&root_path)?;
+        let git_registered = git_registered_worktree_names_for_reconciliation(repo, root.path())?;
+        for child_name in root.direct_child_names_bounded(MAX_MANAGED_RECORDS)? {
+            if child_name.to_string_lossy().starts_with(".maco-") {
+                continue;
+            }
+            let Some(name) = child_name.to_str() else {
+                bail!("managed worktree root contains a non-UTF-8 child name");
+            };
+            if normalize_agent_id(name)? != name || authenticated_names.contains(name) {
+                continue;
+            }
+            let path = root.direct_child(&child_name)?;
+            let identity = identity_for_path(&path)?;
+            let registered = git_registered.contains(name);
+            let claimed = active_claims.contains(name);
+            let entry_index = report.entries.len();
+            report.entries.push(WorktreeReconciliationEntry {
+                name: name.to_string(),
+                branch: None,
+                path: path.clone(),
+                state: if registered {
+                    WorktreeReconciliationState::Ambiguous
+                } else {
+                    WorktreeReconciliationState::PresentDeregistered
+                },
+                action: if claimed || registered {
+                    WorktreeReconciliationAction::Protected
+                } else {
+                    WorktreeReconciliationAction::ReportOnly
+                },
+                detail: if claimed {
+                    "unregistered on-disk lane is protected by an active durable claim".to_string()
+                } else if registered {
+                    "Git-registered lane lacks authenticated MACO ownership; startup reconciliation will not adopt or remove it".to_string()
+                } else if apply && destructive_reconciliation {
+                    "unregistered on-disk lane is eligible only for machine-global quarantine".to_string()
+                } else {
+                    "unregistered on-disk lane detected; quarantine requires apply plus destructive reconciliation and a reviewed machine-global binding".to_string()
+                },
+            });
+            if !claimed && !registered && apply && destructive_reconciliation {
+                unregistered_name_paths
+                    .entry(name.to_string())
+                    .or_default()
+                    .push((entry_index, identity));
+            }
+        }
+    }
+    for (name, candidates) in unregistered_name_paths {
+        if candidates.len() != 1 {
+            for (entry_index, _) in candidates {
+                mark_reconciliation_index_protected(
+                    &mut report.entries,
+                    entry_index,
+                    "same unregistered lane name appears under multiple managed roots",
+                );
+            }
+            continue;
+        }
+        let (entry_index, identity) = candidates
+            .into_iter()
+            .next()
+            .context("one reconciliation candidate disappeared")?;
+        let path = report.entries[entry_index].path.clone();
+        resolutions.push(WorktreeReconciliationResolution::UnregisteredDirectory {
+            entry_index,
+            name,
+            path,
+            identity,
+        });
+    }
+
+    if apply && destructive_reconciliation {
+        apply_worktree_reconciliation_resolutions(
+            repo,
+            managed_store.as_ref(),
+            &active_claims,
+            machine_global_retention,
+            resolutions,
+            &mut report,
+        )?;
+    }
+    report.entries.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(report)
+}
+
+enum WorktreeReconciliationResolution {
+    Authenticated {
+        entry_index: usize,
+        state: WorktreeReconciliationState,
+        binding: Box<ManagedWorktreeBinding>,
+    },
+    UnregisteredDirectory {
+        entry_index: usize,
+        name: String,
+        path: PathBuf,
+        identity: FileIdentity,
+    },
+}
+
+struct WorktreeReconciliationQuarantine {
+    entry_index: usize,
+    name: String,
+    path: PathBuf,
+    identity: FileIdentity,
+    authenticated_binding: Option<ManagedWorktreeBinding>,
+}
+
+fn apply_worktree_reconciliation_resolutions(
+    repo: &Repository,
+    managed_store: Option<&ManagedWorktreeRegistryStore>,
+    observed_claims: &BTreeSet<String>,
+    machine_global_retention: Option<&MachineGlobalRetentionBinding>,
+    resolutions: Vec<WorktreeReconciliationResolution>,
+    report: &mut WorktreeReconciliationReport,
+) -> Result<()> {
+    let current_claims = active_claim_agent_ids(repo)?;
+    let mut authenticated = Vec::new();
+    let mut quarantine = Vec::new();
+    for resolution in resolutions {
+        match resolution {
+            WorktreeReconciliationResolution::Authenticated {
+                entry_index,
+                state,
+                binding,
+            } => authenticated.push((entry_index, state, *binding)),
+            WorktreeReconciliationResolution::UnregisteredDirectory {
+                entry_index,
+                name,
+                path,
+                identity,
+            } => quarantine.push(WorktreeReconciliationQuarantine {
+                entry_index,
+                name,
+                path,
+                identity,
+                authenticated_binding: None,
+            }),
+        }
+    }
+
+    let mut managed_state = None;
+    if !authenticated.is_empty() {
+        let store = managed_store
+            .context("authenticated reconciliation candidates lost their managed registry store")?;
+        let lock = store.lock_existing()?;
+        let current = store.load(&lock)?;
+        managed_state = Some((store, lock, current));
+    }
+
+    if let Some((store, lock, current)) = managed_state.as_mut() {
+        for (entry_index, state, expected) in authenticated {
+            if observed_claims.contains(&expected.name) || current_claims.contains(&expected.name) {
+                mark_reconciliation_index_protected(
+                    &mut report.entries,
+                    entry_index,
+                    "an active durable claim appeared before destructive reconciliation",
+                );
+                continue;
+            }
+            let Some(observed) = current.records.get(&expected.name) else {
+                mark_reconciliation_index_protected(
+                    &mut report.entries,
+                    entry_index,
+                    "authenticated record disappeared before destructive reconciliation",
+                );
+                continue;
+            };
+            if observed != &expected
+                || current.operations.contains_key(&expected.name)
+                || store.worktree_has_active_execution_lease(lock, &expected.name)?
+            {
+                mark_reconciliation_index_protected(
+                    &mut report.entries,
+                    entry_index,
+                    "authenticated identity, operation state, or execution lease changed before apply",
+                );
+                continue;
+            }
+            match state {
+                WorktreeReconciliationState::AuthenticatedMissingBoth => {
+                    if path_entry_exists(&expected.path)?
+                        || path_entry_exists(&expected.metadata_dir)?
+                        || repo.find_worktree(&expected.name).is_ok()
+                    {
+                        mark_reconciliation_index_protected(
+                            &mut report.entries,
+                            entry_index,
+                            "missing-both state changed before apply",
+                        );
+                        continue;
+                    }
+                    current.records.remove(&expected.name);
+                    let entry = &mut report.entries[entry_index];
+                    entry.action = WorktreeReconciliationAction::ForgotAuthenticatedRecord;
+                    entry.detail = "forgot exact authenticated missing-both record; branch and claims were preserved".to_string();
+                    report.forgotten_record_count = report
+                        .forgotten_record_count
+                        .checked_add(1)
+                        .context("forgotten reconciliation record count overflowed")?;
+                }
+                WorktreeReconciliationState::RegisteredMissingPath => {
+                    if path_entry_exists(&expected.path)?
+                        || identity_for_path(&expected.metadata_dir).ok().as_ref()
+                            != Some(&expected.metadata_dir_identity)
+                        || BoundedRegularReader::identity(expected.metadata_dir.join("gitdir"))
+                            .ok()
+                            .as_ref()
+                            != Some(&expected.metadata_gitdir_file_identity)
+                        || BoundedRegularReader::identity(expected.metadata_dir.join("HEAD"))
+                            .ok()
+                            .as_ref()
+                            != Some(&expected.metadata_head_file_identity)
+                    {
+                        mark_reconciliation_index_protected(
+                            &mut report.entries,
+                            entry_index,
+                            "registered-missing-path metadata identity changed before apply",
+                        );
+                        continue;
+                    }
+                    let worktree = match repo.find_worktree(&expected.name) {
+                        Ok(worktree) => worktree,
+                        Err(_) => {
+                            mark_reconciliation_index_protected(
+                                &mut report.entries,
+                                entry_index,
+                                "Git registration disappeared before exact prune",
+                            );
+                            continue;
+                        }
+                    };
+                    if worktree.path() != expected.path {
+                        mark_reconciliation_index_protected(
+                            &mut report.entries,
+                            entry_index,
+                            "Git registration no longer names the authenticated path",
+                        );
+                        continue;
+                    }
+                    let mut options = WorktreePruneOptions::new();
+                    if !worktree
+                        .is_prunable(Some(&mut options))
+                        .context("failed to classify exact stale worktree registration")?
+                    {
+                        mark_reconciliation_index_protected(
+                            &mut report.entries,
+                            entry_index,
+                            "Git refused to classify the missing-path registration as prunable",
+                        );
+                        continue;
+                    }
+                    let mut options = WorktreePruneOptions::new();
+                    worktree
+                        .prune(Some(&mut options))
+                        .context("failed to prune exact authenticated stale registration")?;
+                    current.records.remove(&expected.name);
+                    let entry = &mut report.entries[entry_index];
+                    entry.action = WorktreeReconciliationAction::PrunedRegistrationAndForgotRecord;
+                    entry.detail = "pruned the exact authenticated stale Git registration and forgot its record; branch and claims were preserved".to_string();
+                    report.pruned_registration_count = report
+                        .pruned_registration_count
+                        .checked_add(1)
+                        .context("reconciliation pruned registration count overflowed")?;
+                    report.forgotten_record_count = report
+                        .forgotten_record_count
+                        .checked_add(1)
+                        .context("forgotten reconciliation record count overflowed")?;
+                }
+                WorktreeReconciliationState::PresentDeregistered => {
+                    if identity_for_path(&expected.path).ok().as_ref()
+                        != Some(&expected.path_identity)
+                        || path_entry_exists(&expected.metadata_dir)?
+                        || repo.find_worktree(&expected.name).is_ok()
+                    {
+                        mark_reconciliation_index_protected(
+                            &mut report.entries,
+                            entry_index,
+                            "present-deregistered identity or registration state changed before quarantine",
+                        );
+                        continue;
+                    }
+                    quarantine.push(WorktreeReconciliationQuarantine {
+                        entry_index,
+                        name: expected.name.clone(),
+                        path: expected.path.clone(),
+                        identity: expected.path_identity.clone(),
+                        authenticated_binding: Some(expected),
+                    });
+                }
+                _ => mark_reconciliation_index_protected(
+                    &mut report.entries,
+                    entry_index,
+                    "reconciliation resolution no longer has a destructive action",
+                ),
+            }
+        }
+        store.save(lock, current)?;
+    }
+
+    if quarantine.is_empty() {
+        return Ok(());
+    }
+    let Some(binding) = machine_global_retention else {
+        for candidate in quarantine {
+            mark_reconciliation_index_protected(
+                &mut report.entries,
+                candidate.entry_index,
+                "destructive reconciliation of an on-disk directory requires an explicit machine-global config/root binding",
+            );
+        }
+        return Ok(());
+    };
+    for candidate in &quarantine {
+        if current_claims.contains(&candidate.name)
+            || identity_for_path(&candidate.path).ok().as_ref() != Some(&candidate.identity)
+        {
+            mark_reconciliation_index_protected(
+                &mut report.entries,
+                candidate.entry_index,
+                "claim or directory identity changed before machine-global quarantine",
+            );
+        }
+    }
+    quarantine.retain(|candidate| {
+        report.entries[candidate.entry_index].action != WorktreeReconciliationAction::Protected
+    });
+    if quarantine.is_empty() {
+        return Ok(());
+    }
+    let machine_store = MachineGlobalStore::open_config(&binding.config)
+        .context("failed to open machine-global binding for startup reconciliation")?;
+    let targets = quarantine
+        .iter()
+        .map(|candidate| {
+            machine_store
+                .coordinate_for_existing_directory(&binding.root_id, &candidate.path)
+                .map(DestructiveTargetInput::Declared)
+        })
+        .collect::<Result<Vec<_>>>()
+        .context("startup reconciliation target is outside the reviewed machine-global root")?;
+    match machine_store.quarantine(&binding.owner, &binding.correction_correlation_id, targets)? {
+        GateOutcome::Denied(denial) => {
+            for candidate in quarantine {
+                mark_reconciliation_index_protected(
+                    &mut report.entries,
+                    candidate.entry_index,
+                    &format!("machine-global quarantine was denied: {denial:?}"),
+                );
+            }
+        }
+        GateOutcome::Allowed(operation) => {
+            if quarantine
+                .iter()
+                .any(|candidate| candidate.authenticated_binding.is_some())
+            {
+                let (store, lock, current) = managed_state
+                    .as_mut()
+                    .context("authenticated quarantines lost their locked managed registry")?;
+                for candidate in &quarantine {
+                    if let Some(expected) = candidate.authenticated_binding.as_ref() {
+                        if current.records.get(&expected.name) != Some(expected) {
+                            bail!(
+                                "authenticated reconciliation record changed after its directory was quarantined; manual recovery is required"
+                            );
+                        }
+                        current.records.remove(&expected.name);
+                        report.forgotten_record_count = report
+                            .forgotten_record_count
+                            .checked_add(1)
+                            .context("forgotten reconciliation record count overflowed")?;
+                    }
+                }
+                store.save(lock, current)?;
+            }
+            for candidate in quarantine {
+                let entry = &mut report.entries[candidate.entry_index];
+                entry.action = if candidate.authenticated_binding.is_some() {
+                    WorktreeReconciliationAction::QuarantinedDirectoryAndForgotRecord
+                } else {
+                    WorktreeReconciliationAction::QuarantinedDirectory
+                };
+                entry.detail = format!(
+                    "moved exact crash-orphan directory into recoverable machine-global quarantine operation {}",
+                    operation.id.get()
+                );
+                report.quarantined_directory_count = report
+                    .quarantined_directory_count
+                    .checked_add(1)
+                    .context("reconciliation quarantined directory count overflowed")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn classify_worktree_reconciliation(
+    repo: &Repository,
+    repository: &ManagedRepositoryBinding,
+    registry: &ManagedWorktreeRegistry,
+    binding: &ManagedWorktreeBinding,
+) -> WorktreeReconciliationEntry {
+    let base = |state, action, detail: String| WorktreeReconciliationEntry {
+        name: binding.name.clone(),
+        branch: Some(binding.branch.clone()),
+        path: binding.path.clone(),
+        state,
+        action,
+        detail,
+    };
+    if registry.operations.contains_key(&binding.name) {
+        return base(
+            WorktreeReconciliationState::PendingOperation,
+            WorktreeReconciliationAction::Protected,
+            "authenticated lifecycle operation is pending; startup reconciliation does not bypass operation recovery".to_string(),
+        );
+    }
+    let path = fs::symlink_metadata(&binding.path);
+    let metadata = fs::symlink_metadata(&binding.metadata_dir);
+    let registered = repo.find_worktree(&binding.name).is_ok();
+    match (path, metadata, registered) {
+        (Err(path_error), Err(metadata_error), false)
+            if path_error.kind() == ErrorKind::NotFound
+                && metadata_error.kind() == ErrorKind::NotFound =>
+        {
+            base(
+                WorktreeReconciliationState::AuthenticatedMissingBoth,
+                WorktreeReconciliationAction::ReportOnly,
+                "authenticated record remains but its worktree and Git registration metadata are absent".to_string(),
+            )
+        }
+        (Err(path_error), Ok(_), true) if path_error.kind() == ErrorKind::NotFound => base(
+            WorktreeReconciliationState::RegisteredMissingPath,
+            WorktreeReconciliationAction::Protected,
+            "Git registration remains but the authenticated worktree path is missing".to_string(),
+        ),
+        (Ok(path_metadata), Err(metadata_error), false)
+            if path_metadata.is_dir()
+                && !path_metadata.file_type().is_symlink()
+                && metadata_error.kind() == ErrorKind::NotFound =>
+        {
+            base(
+                WorktreeReconciliationState::PresentDeregistered,
+                WorktreeReconciliationAction::Protected,
+                "authenticated path is present but deregistered; dirtiness and metadata cleanup are not inferred"
+                    .to_string(),
+            )
+        }
+        (Ok(_), Ok(_), true) => match verify_managed_worktree_binding(
+            repo,
+            repository,
+            binding,
+            false,
+        ) {
+            Ok(_) => base(
+                WorktreeReconciliationState::Consistent,
+                WorktreeReconciliationAction::None,
+                "authenticated path and Git registration are consistent".to_string(),
+            ),
+            Err(error) => base(
+                WorktreeReconciliationState::Ambiguous,
+                WorktreeReconciliationAction::Protected,
+                format!("authenticated binding could not be verified: {error:#}"),
+            ),
+        },
+        (path, metadata, registered) => base(
+            WorktreeReconciliationState::Ambiguous,
+            WorktreeReconciliationAction::Protected,
+            format!(
+                "path/metadata/registration state is not safely reconcilable (path={}, metadata={}, registered={registered})",
+                path.is_ok(),
+                metadata.is_ok(),
+            ),
+        ),
+    }
+}
+
+fn mark_reconciliation_index_protected(
+    entries: &mut [WorktreeReconciliationEntry],
+    entry_index: usize,
+    detail: &str,
+) {
+    if let Some(entry) = entries.get_mut(entry_index) {
+        entry.state = WorktreeReconciliationState::Ambiguous;
+        entry.action = WorktreeReconciliationAction::Protected;
+        entry.detail = detail.to_string();
+    }
+}
+
+fn prune_stale_worktree_registrations(
+    repo: &Repository,
+    allowed_names: &BTreeSet<String>,
+    apply: bool,
+) -> Result<WorktreeRepositoryPruneReport> {
+    let names = repo
+        .worktrees()
+        .context("failed to enumerate stale Git worktree registrations")?;
+    if names.len() > MAX_MANAGED_RECORDS {
+        bail!("Git worktree prune exceeds its bounded registration limit");
+    }
+    let mut report = WorktreeRepositoryPruneReport {
+        status: if apply {
+            WorktreeRepositoryPruneStatus::Completed
+        } else {
+            WorktreeRepositoryPruneStatus::DryRun
+        },
+        stale_registration_count: 0,
+        pruned_registration_count: 0,
+        protected_registration_count: 0,
+    };
+    for index in 0..names.len() {
+        let Some(name) = names
+            .get(index)
+            .context("failed to read Git worktree registration during prune")?
+        else {
+            continue;
+        };
+        let worktree = repo
+            .find_worktree(name)
+            .with_context(|| format!("failed to inspect Git worktree '{name}' during prune"))?;
+        let mut options = WorktreePruneOptions::new();
+        if !worktree
+            .is_prunable(Some(&mut options))
+            .with_context(|| format!("failed to classify Git worktree '{name}' for prune"))?
+        {
+            continue;
+        }
+        report.stale_registration_count = report
+            .stale_registration_count
+            .checked_add(1)
+            .context("stale Git worktree count overflowed")?;
+        if !allowed_names.contains(name) {
+            report.protected_registration_count = report
+                .protected_registration_count
+                .checked_add(1)
+                .context("protected stale Git worktree count overflowed")?;
+            continue;
+        }
+        if !apply {
+            continue;
+        }
+        let mut options = WorktreePruneOptions::new();
+        worktree
+            .prune(Some(&mut options))
+            .with_context(|| format!("failed to prune stale Git worktree '{name}'"))?;
+        report.pruned_registration_count = report
+            .pruned_registration_count
+            .checked_add(1)
+            .context("pruned Git worktree count overflowed")?;
+    }
     Ok(report)
 }
 
@@ -4068,6 +5383,9 @@ fn bounded_plain_direct_child_names(
 struct WorktreeGcCandidate {
     binding: ManagedWorktreeBinding,
     branch_oid: Oid,
+    branch_merged: bool,
+    superseded: bool,
+    merged_into_reference: Option<String>,
     removal_lease: Option<ManagedWorktreeRemovalLease>,
     untracked_paths: Vec<PathBuf>,
     apparent_worktree_bytes: u64,
@@ -4496,6 +5814,18 @@ fn worktree_gc_retention_decision(
     retention: WorktreeRetentionPolicy,
     state: WorktreeGcRetentionState,
 ) -> Result<WorktreeGcRetentionDecision> {
+    if candidate.superseded && !targets_only {
+        return Ok(WorktreeGcRetentionDecision {
+            should_remove: true,
+            committed_state: state,
+        });
+    }
+    if !candidate.branch_merged && !candidate.superseded && !targets_only {
+        return Ok(WorktreeGcRetentionDecision {
+            should_remove: false,
+            committed_state: state,
+        });
+    }
     let age_or_count_selects = retention_age_or_count_selects_gc_candidate(
         &candidate.binding,
         state.eligible_count,
@@ -4535,6 +5865,84 @@ fn worktree_gc_retention_decision(
                 || size_selects),
         committed_state,
     })
+}
+
+fn worktree_gc_completion_reason(candidate: &WorktreeGcCandidate) -> WorktreeGcReason {
+    if candidate.superseded {
+        WorktreeGcReason::SupersededLane
+    } else {
+        WorktreeGcReason::FinishedBranch
+    }
+}
+
+fn normalize_gc_agent_id_set(ids: &BTreeSet<String>, label: &str) -> Result<BTreeSet<String>> {
+    ids.iter()
+        .map(|id| {
+            let normalized = normalize_agent_id(id)?;
+            if normalized != *id {
+                bail!("{label} worktree selector '{id}' is not canonical");
+            }
+            Ok(normalized)
+        })
+        .collect()
+}
+
+fn normalize_gc_supersession_map(
+    superseded_by: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    superseded_by
+        .iter()
+        .map(|(predecessor, successor)| {
+            let normalized_predecessor = normalize_agent_id(predecessor)?;
+            let normalized_successor = normalize_agent_id(successor)?;
+            if normalized_predecessor != *predecessor || normalized_successor != *successor {
+                bail!(
+                    "retry supersession selectors '{predecessor}' -> '{successor}' are not canonical"
+                );
+            }
+            Ok((normalized_predecessor, normalized_successor))
+        })
+        .collect()
+}
+
+fn resolve_lifecycle_trunk_tip(repo: &Repository, reference: &str) -> Result<(String, Oid)> {
+    if !reference.starts_with("refs/heads/")
+        || reference.trim() != reference
+        || reference.contains("..")
+    {
+        bail!("lifecycle trunk reference must be an exact local reference such as refs/heads/main");
+    }
+    let reference_name =
+        git2::Reference::normalize_name(reference, git2::ReferenceFormat::ALLOW_ONELEVEL)
+            .context("lifecycle trunk reference is invalid")?;
+    if reference_name != reference {
+        bail!("lifecycle trunk reference is not canonical");
+    }
+    let trunk = repo
+        .find_reference(reference)
+        .with_context(|| format!("lifecycle trunk reference '{reference}' was not found"))?;
+    if !trunk.is_branch() {
+        bail!("lifecycle trunk reference is not a local branch");
+    }
+    let oid = trunk
+        .peel_to_commit()
+        .with_context(|| format!("lifecycle trunk reference '{reference}' is not a commit"))?
+        .id();
+    Ok((reference.to_string(), oid))
+}
+
+fn worktree_gc_candidate_remains_merged(
+    repo: &Repository,
+    candidate: &WorktreeGcCandidate,
+) -> Result<bool> {
+    let Some(reference) = candidate.merged_into_reference.as_deref() else {
+        return Ok(true);
+    };
+    let (_, trunk_oid) = resolve_lifecycle_trunk_tip(repo, reference)?;
+    Ok(candidate.branch_oid == trunk_oid
+        || repo
+            .graph_descendant_of(trunk_oid, candidate.branch_oid)
+            .context("failed to recheck managed branch ancestry from trunk at apply boundary")?)
 }
 
 fn worktree_gc_dirtiness_disposition(
@@ -5979,6 +7387,39 @@ fn git_registered_worktree_names(
             )
         })?;
         if path.parent() == Some(worktree_root) {
+            names.insert(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+fn git_registered_worktree_names_for_reconciliation(
+    repo: &Repository,
+    worktree_root: &Path,
+) -> Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    let list = repo
+        .worktrees()
+        .context("failed to list Git worktrees during startup reconciliation")?;
+    if list.len() > MAX_MANAGED_RECORDS {
+        bail!("startup reconciliation exceeds its bounded Git registration limit");
+    }
+    for index in 0..list.len() {
+        let Some(name) = list
+            .get(index)
+            .context("failed to read a Git worktree name during startup reconciliation")?
+        else {
+            continue;
+        };
+        let worktree = repo.find_worktree(name).with_context(|| {
+            format!("failed to inspect Git worktree '{name}' during startup reconciliation")
+        })?;
+        let path = worktree.path();
+        let belongs_to_root = path.parent() == Some(worktree_root)
+            || fs::canonicalize(path)
+                .ok()
+                .is_some_and(|canonical| canonical.parent() == Some(worktree_root));
+        if belongs_to_root {
             names.insert(name.to_string());
         }
     }
@@ -12547,6 +13988,9 @@ mod tests {
                     },
                     allowed_untracked_paths: Vec::new(),
                     exclude_agent_id: None,
+                    candidate_agent_ids: None,
+                    merged_into_reference: None,
+                    superseded_by_agent_id: BTreeMap::new(),
                     machine_global_retention: None,
                 },
                 |_| WorktreeTargetLiveness::Clear,
@@ -16971,6 +18415,9 @@ mod tests {
             retention: WorktreeRetentionPolicy::default(),
             allowed_untracked_paths: Vec::new(),
             exclude_agent_id: None,
+            candidate_agent_ids: None,
+            merged_into_reference: None,
+            superseded_by_agent_id: BTreeMap::new(),
             machine_global_retention: None,
         }
     }
@@ -17044,6 +18491,513 @@ mod tests {
             owner: "maco-worktree-gc".to_string(),
             correction_correlation_id: correlation.to_string(),
         }
+    }
+
+    #[test]
+    fn lifecycle_defaults_are_inert_and_o2_defaults_are_bounded_and_conservative() {
+        let missing = WorktreeManager::new("/definitely/missing/lifecycle-default-off");
+        let report = missing
+            .lifecycle(WorktreeLifecycleOptions::default())
+            .expect("disabled lifecycle must not inspect repository state");
+        assert!(!report.enabled);
+        assert!(report.worktree_gc.is_none());
+        assert!(report.artifact_prune.is_none());
+        assert_eq!(report.actual_reclaimed_bytes, 0);
+
+        let defaults = WorktreeLifecycleOptions::o2_launch_defaults();
+        assert!(!defaults.auto_reap_merged);
+        assert!(!defaults.apply);
+        assert!(!defaults.remove_targets);
+        assert_eq!(
+            defaults.worktree_retention,
+            WorktreeRetentionPolicy::default()
+        );
+        assert_eq!(O2_LAUNCH_WORKTREE_MAX_COUNT, 10);
+        let policy = defaults.artifact_retention.expect("O2 artifact policy");
+        assert_eq!(policy.max_count, O2_LAUNCH_ARTIFACT_KEEP_COUNT);
+        assert_eq!(policy.unfinalized_grace, Some(O2_LAUNCH_UNFINALIZED_GRACE));
+        assert!(!policy.reclaim_unverifiable);
+        assert!(!policy.external_writers_stopped);
+    }
+
+    #[test]
+    fn retry_suffix_parser_accepts_only_canonical_generations() {
+        assert_eq!(parse_retry_predecessor("foo-r2"), Ok(Some("foo".into())));
+        assert_eq!(parse_retry_predecessor("foo-r3"), Ok(Some("foo-r2".into())));
+        assert_eq!(
+            parse_retry_predecessor("foo-round2"),
+            Ok(Some("foo".into()))
+        );
+        assert_eq!(parse_retry_predecessor("foo"), Ok(None));
+        for malformed in ["foo-r0", "foo-r1", "foo-r02", "foo-rx", "foo-round3"] {
+            assert!(parse_retry_predecessor(malformed).is_err(), "{malformed}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lifecycle_requires_explicit_trunk_containment_without_changing_manual_gc() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let lane = create_gc_worktree(&manager, "merge-lane", &root);
+        let lane_repo = Repository::open(&lane.path).expect("open lane");
+        let lane_oid =
+            commit_descendant(&lane_repo, "lane.txt", "unmerged\n").expect("lane descendant");
+
+        let manual = manager
+            .gc_with_target_liveness(gc_options(Some(root.clone()), true), |_| {
+                WorktreeTargetLiveness::Clear
+            })
+            .expect("manual preview");
+        assert_eq!(
+            manual.removed_count, 1,
+            "manual GC behavior changed: {manual:#?}"
+        );
+
+        let mut lifecycle_options = gc_options(Some(root.clone()), true);
+        lifecycle_options.merged_into_reference = Some("refs/heads/main".to_string());
+        let retained = manager
+            .gc_with_target_liveness(lifecycle_options, |_| WorktreeTargetLiveness::Clear)
+            .expect("unmerged lifecycle preview");
+        assert_eq!(retained.removed_count, 0, "{retained:#?}");
+        assert_eq!(retained.entries[0].status, WorktreeGcStatus::Retained);
+        assert_eq!(retained.entries[0].reason, WorktreeGcReason::UnmergedBranch);
+        assert!(lane.path.exists());
+
+        repo.reference("refs/heads/main", lane_oid, true, "test fast-forward")
+            .expect("advance primary HEAD");
+        let mut lifecycle_options = gc_options(Some(root.clone()), true);
+        lifecycle_options.merged_into_reference = Some("refs/heads/main".to_string());
+        let preview = manager
+            .gc_with_target_liveness(lifecycle_options, |_| WorktreeTargetLiveness::Clear)
+            .expect("merged preview");
+        assert_eq!(preview.removed_count, 1, "{preview:#?}");
+        assert_eq!(preview.entries[0].status, WorktreeGcStatus::WouldRemove);
+        assert_eq!(preview.entries[0].reason, WorktreeGcReason::FinishedBranch);
+        assert!(lane.path.exists(), "dry-run must preserve the lane");
+
+        let mut lifecycle_options = gc_options(Some(root), false);
+        lifecycle_options.merged_into_reference = Some("refs/heads/main".to_string());
+        let applied = manager
+            .gc_with_target_liveness(lifecycle_options, |_| WorktreeTargetLiveness::Clear)
+            .expect("merged apply");
+        assert_eq!(applied.removed_count, 1, "{applied:#?}");
+        assert_eq!(applied.entries[0].status, WorktreeGcStatus::Removed);
+        assert!(!lane.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lifecycle_retry_supersedes_exact_authenticated_predecessor_despite_retention() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let predecessor = create_gc_worktree(&manager, "retry-task", &root);
+        let successor = create_gc_worktree(&manager, "retry-task-r2", &root);
+        let predecessor_repo = Repository::open(&predecessor.path).expect("predecessor repo");
+        commit_descendant(&predecessor_repo, "attempt.txt", "unmerged attempt\n")
+            .expect("unmerged predecessor commit");
+
+        let mut options = WorktreeLifecycleOptions {
+            retry_successor_agent_id: Some(successor.name.clone()),
+            worktree_root: Some(root.clone()),
+            worktree_retention: WorktreeRetentionPolicy {
+                max_count: Some(10),
+                ..WorktreeRetentionPolicy::default()
+            },
+            ..WorktreeLifecycleOptions::default()
+        };
+        let preview = manager.lifecycle(options.clone()).expect("retry preview");
+        assert_eq!(preview.retry.status, RetrySupersessionStatus::Selected);
+        let gc = preview.worktree_gc.as_ref().expect("retry GC");
+        assert_eq!(gc.considered_count, 1, "{gc:#?}");
+        assert_eq!(gc.removed_count, 1, "{gc:#?}");
+        assert_eq!(gc.entries[0].reason, WorktreeGcReason::SupersededLane);
+        assert!(predecessor.path.exists());
+        assert!(successor.path.exists());
+
+        options.apply = true;
+        let applied = manager.lifecycle(options).expect("retry apply");
+        assert_eq!(applied.worktree_gc.expect("GC").removed_count, 1);
+        assert!(!predecessor.path.exists());
+        assert!(successor.path.exists());
+        assert!(repo
+            .find_branch("maco/retry-task-r2", BranchType::Local)
+            .is_ok());
+    }
+
+    #[test]
+    fn retry_supersession_requires_exact_authenticated_successor_and_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        create_gc_worktree(&manager, "isolated", &temp.path().join("root-a"));
+
+        let missing = resolve_retry_supersession(&repo, "isolated-r2").expect("classification");
+        assert_eq!(missing.status, RetrySupersessionStatus::Ambiguous);
+        assert!(missing
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("successor")));
+
+        create_gc_worktree(&manager, "isolated-r2", &temp.path().join("root-b"));
+        let different_root =
+            resolve_retry_supersession(&repo, "isolated-r2").expect("classification");
+        assert_eq!(
+            different_root.status,
+            RetrySupersessionStatus::PredecessorNotFound
+        );
+    }
+
+    #[test]
+    fn retry_supersession_refuses_a_crash_orphaned_successor_binding() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let predecessor = create_gc_worktree(&manager, "stale-retry", &root);
+        let successor = create_gc_worktree(&manager, "stale-retry-r2", &root);
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
+        let lock = store.lock().expect("lock");
+        let registry = store.load(&lock).expect("registry");
+        let successor_binding = registry
+            .records
+            .get(&successor.name)
+            .cloned()
+            .expect("successor binding");
+        drop(lock);
+        fs::remove_dir_all(&successor_binding.path).expect("remove successor path");
+        fs::remove_dir_all(&successor_binding.metadata_dir).expect("remove successor metadata");
+
+        let classification =
+            resolve_retry_supersession(&repo, &successor.name).expect("classification");
+        assert_eq!(classification.status, RetrySupersessionStatus::Ambiguous);
+        assert!(classification
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("not live and verified")));
+        let report = manager
+            .lifecycle(WorktreeLifecycleOptions {
+                apply: true,
+                retry_successor_agent_id: Some(successor.name),
+                worktree_root: Some(root),
+                ..WorktreeLifecycleOptions::default()
+            })
+            .expect("fail-closed retry lifecycle report");
+        assert!(report.worktree_gc.is_none());
+        assert!(predecessor.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lifecycle_dry_run_aggregates_worktree_and_explicit_o2_artifact_policy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let lane = create_gc_worktree(&manager, "aggregate-lane", &root);
+        let run = repo_path.join(".maco/o2-autopilot/runs/run-a");
+        fs::create_dir_all(&run).expect("O2 run");
+        fs::set_permissions(
+            repo_path.join(".maco/o2-autopilot/runs"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("private O2 root");
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).expect("private O2 run");
+        fs::write(run.join("events.jsonl"), b"events\n").expect("O2 artifact");
+        let mut policy = ArtifactRetentionPolicy {
+            max_count: 0,
+            max_age: None,
+            max_total_bytes: None,
+            unfinalized_grace: Some(Duration::ZERO),
+            reclaim_unverifiable: false,
+            external_writers_stopped: false,
+        };
+        let mut options = WorktreeLifecycleOptions {
+            auto_reap_merged: true,
+            candidate_agent_ids: Some(BTreeSet::from([lane.name.clone()])),
+            merged_into_reference: Some("refs/heads/main".to_string()),
+            worktree_root: Some(root),
+            artifact_retention: Some(policy.clone()),
+            ..WorktreeLifecycleOptions::default()
+        };
+        let refused = manager.lifecycle(options.clone()).expect("refused preview");
+        assert_eq!(refused.worktree_gc.as_ref().expect("GC").removed_count, 1);
+        let refused_artifact = refused.artifact_prune.as_ref().expect("artifact report");
+        assert_eq!(refused_artifact.refused_unfinalized_count, 1);
+        assert_eq!(refused_artifact.would_reclaim_bytes, 0);
+        assert!(lane.path.exists());
+        assert!(run.exists());
+
+        policy.external_writers_stopped = true;
+        options.artifact_retention = Some(policy);
+        let aggregate = manager.lifecycle(options).expect("explicit preview");
+        let gc = aggregate.worktree_gc.as_ref().expect("GC");
+        let artifacts = aggregate.artifact_prune.as_ref().expect("artifacts");
+        assert_eq!(
+            aggregate.apparent_checked_bytes,
+            gc.apparent_considered_bytes + artifacts.scanned_bytes
+        );
+        assert_eq!(
+            aggregate.projected_reclaimable_bytes,
+            gc.estimated_reclaimable_bytes + artifacts.would_reclaim_bytes
+        );
+        assert_eq!(aggregate.actual_reclaimed_bytes, 0);
+        assert!(aggregate.projected_reclaimable_bytes > gc.estimated_reclaimable_bytes);
+        let output = serde_json::to_string_pretty(&aggregate).expect("serialize lifecycle report");
+        println!("LIFECYCLE_DRY_RUN_REPORT={output}");
+        assert!(lane.path.exists());
+        assert!(run.exists());
+    }
+
+    #[test]
+    fn startup_reconciliation_is_report_only_then_forgets_exact_missing_both_record() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let lane = create_gc_worktree(&manager, "crash-orphan", &root);
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
+        let lock = store.lock().expect("lock");
+        let registry = store.load(&lock).expect("registry");
+        let binding = registry.records.get(&lane.name).cloned().expect("binding");
+        drop(lock);
+        fs::remove_dir_all(&binding.path).expect("simulate missing worktree path");
+        fs::remove_dir_all(&binding.metadata_dir).expect("simulate missing Git metadata");
+
+        let mut options = WorktreeLifecycleOptions {
+            startup_reconcile: true,
+            ..WorktreeLifecycleOptions::default()
+        };
+        let preview = manager
+            .lifecycle(options.clone())
+            .expect("reconciliation preview");
+        assert_eq!(preview.reconciliation.forgotten_record_count, 0);
+        assert_eq!(
+            preview.reconciliation.entries[0].state,
+            WorktreeReconciliationState::AuthenticatedMissingBoth
+        );
+        assert_eq!(
+            preview.reconciliation.entries[0].action,
+            WorktreeReconciliationAction::ReportOnly
+        );
+        assert!(ManagedWorktreeRegistryStore::open(&repo)
+            .expect("store")
+            .load(
+                &ManagedWorktreeRegistryStore::open(&repo)
+                    .expect("store")
+                    .lock()
+                    .expect("lock")
+            )
+            .expect("registry")
+            .records
+            .contains_key(&lane.name));
+
+        options.apply = true;
+        options.destructive_reconciliation = true;
+        let applied = manager.lifecycle(options).expect("reconciliation apply");
+        assert_eq!(applied.reconciliation.forgotten_record_count, 1);
+        assert_eq!(
+            applied.reconciliation.entries[0].action,
+            WorktreeReconciliationAction::ForgotAuthenticatedRecord
+        );
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
+        let lock = store.lock().expect("lock");
+        assert!(!store
+            .load(&lock)
+            .expect("registry")
+            .records
+            .contains_key(&lane.name));
+        assert!(repo.find_branch(&lane.branch, BranchType::Local).is_ok());
+    }
+
+    #[test]
+    fn startup_reconciliation_active_claim_protects_missing_both_record() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let lane = create_gc_worktree(&manager, "claimed-crash-orphan", &root);
+        SyncStore::open(&repo_path)
+            .expect("claims")
+            .claim_paths(&lane.name, ["src"])
+            .expect("claim lane");
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
+        let lock = store.lock().expect("lock");
+        let binding = store
+            .load(&lock)
+            .expect("registry")
+            .records
+            .get(&lane.name)
+            .cloned()
+            .expect("binding");
+        drop(lock);
+        fs::remove_dir_all(&binding.path).expect("remove path");
+        fs::remove_dir_all(&binding.metadata_dir).expect("remove metadata");
+
+        let report = manager
+            .lifecycle(WorktreeLifecycleOptions {
+                apply: true,
+                startup_reconcile: true,
+                destructive_reconciliation: true,
+                worktree_root: Some(root),
+                ..WorktreeLifecycleOptions::default()
+            })
+            .expect("claimed reconciliation report");
+        let entry = report
+            .reconciliation
+            .entries
+            .iter()
+            .find(|entry| entry.name == lane.name)
+            .expect("claimed entry");
+        assert_eq!(entry.action, WorktreeReconciliationAction::Protected);
+        assert!(entry.detail.contains("active durable claim"));
+        let lock = store.lock().expect("lock");
+        assert!(store
+            .load(&lock)
+            .expect("registry")
+            .records
+            .contains_key(&lane.name));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_reconciliation_quarantines_unregistered_on_disk_lane_with_explicit_binding() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let orphan = root.join("deregistered-lane");
+        fs::create_dir_all(orphan.join("target/debug")).expect("orphan tree");
+        fs::write(orphan.join("sentinel"), b"crash residue").expect("orphan sentinel");
+        let binding = machine_global_gc_binding(temp.path(), &root, "startup-orphan");
+        let manager = WorktreeManager::new(&repo_path);
+
+        let preview = manager
+            .lifecycle(WorktreeLifecycleOptions {
+                startup_reconcile: true,
+                worktree_root: Some(root.clone()),
+                ..WorktreeLifecycleOptions::default()
+            })
+            .expect("startup preview");
+        let preview_entry = preview
+            .reconciliation
+            .entries
+            .iter()
+            .find(|entry| entry.name == "deregistered-lane")
+            .expect("orphan preview");
+        assert_eq!(
+            preview_entry.state,
+            WorktreeReconciliationState::PresentDeregistered
+        );
+        assert_eq!(
+            preview_entry.action,
+            WorktreeReconciliationAction::ReportOnly
+        );
+        assert!(orphan.exists());
+
+        let applied = manager
+            .lifecycle(WorktreeLifecycleOptions {
+                apply: true,
+                startup_reconcile: true,
+                destructive_reconciliation: true,
+                worktree_root: Some(root),
+                machine_global_retention: Some(binding),
+                ..WorktreeLifecycleOptions::default()
+            })
+            .expect("startup quarantine");
+        assert_eq!(applied.reconciliation.quarantined_directory_count, 1);
+        assert_eq!(
+            applied.reconciliation.entries[0].action,
+            WorktreeReconciliationAction::QuarantinedDirectory
+        );
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn startup_reconciliation_prunes_only_exact_authenticated_missing_path_registration() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let lane = create_gc_worktree(&manager, "registered-missing", &root);
+        fs::remove_dir_all(&lane.path).expect("remove registered path");
+
+        let report = manager
+            .lifecycle(WorktreeLifecycleOptions {
+                apply: true,
+                startup_reconcile: true,
+                destructive_reconciliation: true,
+                worktree_root: Some(root),
+                ..WorktreeLifecycleOptions::default()
+            })
+            .expect("exact stale registration reconciliation");
+        assert_eq!(report.reconciliation.pruned_registration_count, 1);
+        assert_eq!(report.reconciliation.forgotten_record_count, 1);
+        assert_eq!(
+            report.reconciliation.entries[0].action,
+            WorktreeReconciliationAction::PrunedRegistrationAndForgotRecord
+        );
+        assert!(repo.find_worktree(&lane.name).is_err());
+        assert!(repo.find_branch(&lane.branch, BranchType::Local).is_ok());
+    }
+
+    #[test]
+    fn post_reap_prune_preserves_unrelated_stale_registration() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let selected = create_gc_worktree(&manager, "selected-stale", &root);
+        let unrelated = create_gc_worktree(&manager, "unrelated-stale", &root);
+        fs::remove_dir_all(&selected.path).expect("remove selected path");
+        fs::remove_dir_all(&unrelated.path).expect("remove unrelated path");
+
+        let report = prune_stale_worktree_registrations(
+            &repo,
+            &BTreeSet::from([selected.name.clone()]),
+            true,
+        )
+        .expect("scoped prune");
+        assert_eq!(report.stale_registration_count, 2);
+        assert_eq!(report.pruned_registration_count, 1);
+        assert_eq!(report.protected_registration_count, 1);
+        assert!(repo.find_worktree(&selected.name).is_err());
+        assert!(repo.find_worktree(&unrelated.name).is_ok());
     }
 
     fn commit_readme(repo: &Repository) -> Result<Oid> {

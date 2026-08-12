@@ -957,8 +957,9 @@ no common rotation handshake. The report therefore records
 `compressible_log_bytes`, and reports `compressed_bytes: 0`. Compression needs
 a writer-side, crash-safe format migration rather than an in-place prune
 rewrite. The reusable `ArtifactRetentionPolicy`, `prune_runs_with_policy`, and
-`prune_artifacts_with_policy` APIs are the policy hooks for #65 item 4; invoking
-them automatically from a workspace scheduler remains separate work.
+`prune_artifacts_with_policy` APIs are consumed by the opt-in worktree lifecycle
+scheduler described below. Its aggregate dry-run reports artifact and worktree
+reclamation together before either store is changed.
 
 ## Cross-runtime consultant
 
@@ -1354,6 +1355,9 @@ Managed worktree creation currently returns `Unsupported` before repository acce
 ```bash
 cargo run -- worktree create agent-a --repo . --json
 cargo run -- worktree create agent-b --repo . --gc-max-count 10 --gc-max-age-seconds 604800 --json
+cargo run -- worktree create task-r2 --repo . \
+  --supersede-retry-predecessor --apply-retry-supersession \
+  --o2-launch-retention-defaults --json
 ```
 
 List worktrees:
@@ -1534,6 +1538,81 @@ ordinary `git status`; it exists only to make legacy lanes visible. It never
 grants apply-mode removal authority: destructive sweep still requires a valid
 authenticated MACO binding and safe private state.
 
+Run the repository-local lifecycle scheduler only with the automation features
+that the operator intends to inspect. The scheduler is dry-run by default, and
+every feature is off by default, so the bare command preserves the existing
+manual `worktree gc` and artifact-prune behavior:
+
+```bash
+cargo run -- worktree lifecycle --repo . --json
+cargo run -- worktree lifecycle --repo . \
+  --auto-reap-merged --trunk-ref refs/heads/main \
+  --retry-successor issue-65-r2 \
+  --startup-reconciliation --o2-launch-retention --json
+cargo run -- worktree lifecycle --repo . --apply \
+  --auto-reap-merged --trunk-ref refs/heads/main \
+  --startup-reconciliation \
+  --destructive-reconciliation \
+  --machine-global-config /exact/path/to/machine-global.json \
+  --machine-global-worktree-root-id worktrees \
+  --machine-global-correlation lifecycle-2026-08-12 --json
+```
+
+The report aggregates worktree classification/reclamation, startup
+reconciliation, and scheduled artifact retention into one human summary or one
+JSON document. `--apply` is required before any enabled lifecycle action can
+mutate state. Merged and retry-predecessor lanes still pass through the ordinary
+GC cleanliness, exact untracked-path allowlist, size, target-liveness, active
+lease, active claim, and machine-global quarantine guards. Retry derivation is
+from the exact `--retry-successor <AGENT_ID>`; both generations must have live,
+verified authenticated bindings under one root and one canonical branch
+family. A missing, stale, or ambiguous generation is reported and retained.
+Worktree creation can invoke that same classifier with
+`--supersede-retry-predecessor`; destructive reaping remains a separate
+`--apply-retry-supersession` opt-in once capability-bound production creation
+is available.
+
+Merged-lane automation requires an exact local reference such as
+`--trunk-ref refs/heads/main`. It never treats an arbitrary current or detached
+`HEAD` as trunk, and it re-resolves ancestry at the deletion boundary. A merge
+apply only applies a patch to the primary checkout and does not advance the
+trunk reference, so `merge apply --auto-reap-merged --trunk-ref ...` reports a
+just-applied lane as unmerged. After the integration commit or fast-forward, a
+finalization rerun classifies and, with `--apply-auto-reap`, reaps the fully
+merged lane. The post-reap Git prune pass is limited to the exact selected
+lane; unrelated stale registrations are counted as protected and left intact.
+
+The `--o2-launch-retention` profile schedules only the actual O2-launch run
+store: it keeps the newest 10 runs and gives idle unfinalized artifacts a
+seven-day grace. Managed worktree metadata has no trustworthy O2-origin tag, so
+this flag deliberately does not broaden worktree deletion to every managed
+lane. Merged-lane retention is independently explicit through
+`--auto-reap-merged`, `--trunk-ref`, and the worktree age/count/apparent-byte
+limits. Artifact count/grace can be overridden with `--artifact-keep` and
+`--artifact-unfinalized-grace-seconds`; artifact age and apparent-byte ceilings
+are also available. Artifact safety decisions are
+never inferred: `--reclaim-unverifiable` and
+`--acknowledge-external-writers-stopped` are separately named opt-ins and are
+rejected unless `--o2-launch-retention` schedules artifact pruning. Do not
+acknowledge stopped external writers while any same-UID writer may still append
+to that store.
+
+Startup reconciliation distinguishes authenticated records whose expected
+directory or Git registration is missing, exact authenticated stale Git
+registrations, and direct on-disk lane directories that are present under a
+known or explicitly selected managed root but deregistered. Detection and reporting require
+`--startup-reconciliation`. Destructive resolution requires all three of
+`--startup-reconciliation`, `--destructive-reconciliation`, and `--apply`, and
+then remains subject to authenticated identity, pending-operation recovery,
+active claims, active execution leases, and apply-boundary state rechecks.
+Missing-both records are forgotten without deleting their preserved branch;
+an exact missing-path Git registration is pruned individually. Present
+deregistered directories are never deleted directly: they require the reviewed
+machine-global config/root/correlation binding and move into recoverable
+quarantine. Unauthenticated Git registrations, duplicate names across roots,
+and other unverifiable findings fail closed and remain visible in the aggregate
+report.
+
 Perform explicitly authorized force cleanup and delete a MACO-owned branch:
 
 ```bash
@@ -1703,6 +1782,8 @@ cargo run -- merge preview agent-a --repo . --claim src --require-validation --v
 cargo run -- merge preview agent-a --repo . --claim src/large.c --block-megafiles --json
 cargo run -- merge apply agent-a --repo . --claim src --validation-report validation.json
 cargo run -- merge apply agent-a --repo . --claim src --require-validation --validation-command "cargo test" --json
+cargo run -- merge apply agent-a --repo . --claim src \
+  --auto-reap-merged --trunk-ref refs/heads/main --apply-auto-reap --json
 cargo run -- merge apply split-large-c --repo . --claim src/large.c --claim src/large/ --block-megafiles --decomposition-target src/large.c --decomposition-run-id issue19-split-large-c --json
 cargo run -- merge apply agent-a --repo . --claim src --force-dirty-primary --force-stale-base --force-unclaimed-edits
 ```
