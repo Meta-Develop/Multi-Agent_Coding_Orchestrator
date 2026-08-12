@@ -175,7 +175,7 @@ enum Command {
     Scope(ScopeCommand),
     /// Run local-first autopilot workflow phases.
     Autopilot(AutopilotCommand),
-    /// Apply retention to every repository-local bulk artifact family.
+    /// Apply retention to one repository-local bulk artifact family.
     Artifacts(RepositoryArtifactsCommand),
     /// Run independent review adapters.
     Review(ReviewCommand),
@@ -1847,6 +1847,12 @@ struct PruneArtifactsArgs {
     /// Allow idle marker-missing or external artifacts to expire after this grace.
     #[arg(long, value_name = "SECONDS", default_value_t = 7 * 24 * 60 * 60)]
     unfinalized_grace_seconds: u64,
+    /// Allow grace-based expiry when a present finalization marker is unverifiable.
+    #[arg(long)]
+    reclaim_unverifiable: bool,
+    /// Confirm that non-cooperating program and legacy artifact writers are stopped.
+    #[arg(long)]
+    acknowledge_external_writers_stopped: bool,
     /// Report deletions without deleting.
     #[arg(long)]
     dry_run: bool,
@@ -1862,6 +1868,8 @@ impl PruneArtifactsArgs {
             max_age: self.max_age_seconds.map(Duration::from_secs),
             max_total_bytes: self.max_total_bytes,
             unfinalized_grace: Some(Duration::from_secs(self.unfinalized_grace_seconds)),
+            reclaim_unverifiable: self.reclaim_unverifiable,
+            external_writers_stopped: self.acknowledge_external_writers_stopped,
         }
     }
 }
@@ -5374,6 +5382,8 @@ mod tests {
             "1048576",
             "--unfinalized-grace-seconds",
             "3600",
+            "--reclaim-unverifiable",
+            "--acknowledge-external-writers-stopped",
             "--dry-run",
             "--json",
         ])
@@ -5390,6 +5400,8 @@ mod tests {
         assert_eq!(args.policy.max_age_seconds, Some(86_400));
         assert_eq!(args.policy.max_total_bytes, Some(1_048_576));
         assert_eq!(args.policy.unfinalized_grace_seconds, 3_600);
+        assert!(args.policy.reclaim_unverifiable);
+        assert!(args.policy.acknowledge_external_writers_stopped);
         assert!(args.policy.dry_run);
         assert!(args.policy.json);
 

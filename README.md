@@ -914,29 +914,39 @@ For example, preview program-log retention without touching the real store:
 ```bash
 cargo run -- artifacts prune --family program --repo . --keep 3 \
   --max-age-seconds 2592000 --max-total-bytes 1073741824 \
-  --unfinalized-grace-seconds 604800 --dry-run --json
+  --unfinalized-grace-seconds 604800 \
+  --acknowledge-external-writers-stopped --dry-run --json
 ```
 
-Count, age, and total-byte ceilings are independent maximums: an item is a
-candidate when any configured ceiling is exceeded. Ordering uses the newest
-bounded descendant activity time, so appends to an active transcript refresh
-its age. `--max-total-bytes` counts apparent regular-file bytes; the JSON report
+Count, age, total-byte, and unfinalized-grace ceilings are independent
+maximums: an item is a candidate when any applicable ceiling is exceeded.
+Thus an abandoned unfinalized run expires after its grace even when fewer than
+`--keep` runs exist. Ordering uses the newest bounded descendant activity time,
+so appends to an active transcript refresh its age. `--max-total-bytes` counts
+apparent regular-file bytes; the JSON report
 includes per-item `bytes`, `age_seconds`, and `selected_by`, plus
-`scanned_bytes`, physical `retained_bytes`, planned
+`scanned_bytes`, inventory-snapshot `retained_bytes`, planned
 `projected_retained_bytes`, `would_reclaim_bytes` for dry-run, and actual
-`reclaimed_bytes` for apply. A dry-run never counts planned deletion as actual
-reclamation.
+`reclaimed_bytes` for apply. Refused trees may change concurrently after their
+snapshot, so these are not filesystem quota measurements. A dry-run never
+counts planned deletion as actual reclamation.
 
 Fresh marker-missing runs are pinned for `--unfinalized-grace-seconds` (seven
 days by default). A held authenticated writer lock also pins a run regardless
 of age. Once a marker-missing run is both selected, older than the grace, and
 idle, retention rechecks its identity, byte count, activity, and finalization
 state before using the same identity-bound quarantine and no-follow deletion
-path as finalized runs. A present but invalid finalization marker is never
-treated as an expired crash: it remains refused, and `refused_bytes` makes that
-space visible. External and legacy stores have no cooperative writer lock, so
-their grace and refreshed descendant activity are the active-run boundary;
-operators must not run apply concurrently with an untrusted same-UID mutator.
+path as finalized runs. A present but invalid finalization marker remains
+refused unless `--reclaim-unverifiable` explicitly puts it under the same
+grace, idle-lock, identity, activity, and state rechecks. This opt-in bounds
+abandoned corrupt runs without silently treating damaged evidence as a normal
+crash. External and legacy stores have no cooperative writer lock, so both
+dry-run and apply refuse their candidates unless
+`--acknowledge-external-writers-stopped` is supplied. That acknowledgement,
+the grace, and refreshed descendant activity form the active-run boundary;
+the acknowledgement must not be supplied while a same-UID writer can mutate
+the store. Marker-missing legacy runs inside authenticated roots also require
+this acknowledgement when their cooperative writer lock file is absent.
 
 Retention deliberately does not compress transcripts in this version. A
 finalized authenticated file is immutable because its exact path, length, and
