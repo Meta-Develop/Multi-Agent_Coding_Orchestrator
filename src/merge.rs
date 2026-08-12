@@ -3968,8 +3968,8 @@ impl PrivateRuntimeRootLock {
                 path.display()
             );
         }
-        validate_private_runtime_owner_file_metadata(&path, &path_metadata)?;
-        validate_private_runtime_owner_file_metadata(&path, &file_metadata)?;
+        validate_private_runtime_owner_file_metadata(&path, &path_metadata, None)?;
+        validate_private_runtime_owner_file_metadata(&path, &file_metadata, Some(&file))?;
         Ok(Self { file })
     }
 }
@@ -4305,7 +4305,7 @@ fn read_private_runtime_owner(
             path.display()
         );
     }
-    validate_private_runtime_owner_file_metadata(&path, &path_metadata)?;
+    validate_private_runtime_owner_file_metadata(&path, &path_metadata, None)?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -4319,7 +4319,7 @@ fn read_private_runtime_owner(
     let file_metadata = file
         .metadata()
         .with_context(|| format!("failed to inspect private runtime owner {}", path.display()))?;
-    validate_private_runtime_owner_file_metadata(&path, &file_metadata)?;
+    validate_private_runtime_owner_file_metadata(&path, &file_metadata, Some(&file))?;
     if !same_filesystem_identity(&path_metadata, &file_metadata) {
         bail!(
             "private runtime owner {} changed while it was opened",
@@ -4350,6 +4350,7 @@ fn read_private_runtime_owner(
 fn validate_private_runtime_owner_file_metadata(
     path: &Path,
     metadata: &fs::Metadata,
+    opened_file: Option<&fs::File>,
 ) -> Result<()> {
     #[cfg(unix)]
     {
@@ -4369,13 +4370,26 @@ fn validate_private_runtime_owner_file_metadata(
     #[cfg(target_os = "windows")]
     {
         let _ = metadata;
-        if windows_path_link_count(path)? != 1 {
+        let number_of_links = match opened_file {
+            Some(file) => {
+                crate::file_identity::windows_file_link_count(file).with_context(|| {
+                    format!(
+                        "failed to inspect open Windows link count for {}",
+                        path.display()
+                    )
+                })?
+            }
+            None => windows_path_link_count(path)?,
+        };
+        if number_of_links != 1 {
             bail!(
                 "private runtime owner {} has multiple links",
                 path.display()
             );
         }
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = opened_file;
     Ok(())
 }
 
@@ -5053,7 +5067,7 @@ fn hash_optional_file(path: &Path) -> Result<Option<Oid>> {
             return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
         }
     };
-    validate_repository_index_metadata(path, &path_metadata)?;
+    validate_repository_index_metadata(path, &path_metadata, None)?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -5067,7 +5081,7 @@ fn hash_optional_file(path: &Path) -> Result<Option<Oid>> {
     let file_metadata = file
         .metadata()
         .with_context(|| format!("failed to inspect opened {}", path.display()))?;
-    validate_repository_index_metadata(path, &file_metadata)?;
+    validate_repository_index_metadata(path, &file_metadata, Some(&file))?;
     #[cfg(windows)]
     let file_identity = crate::file_identity::windows_file_identity(&file)
         .with_context(|| format!("failed to inspect opened file identity {}", path.display()))?;
@@ -5106,7 +5120,7 @@ fn hash_optional_file(path: &Path) -> Result<Option<Oid>> {
     #[cfg(not(windows))]
     let after = fs::symlink_metadata(path)
         .with_context(|| format!("failed to recheck {}", path.display()))?;
-    validate_repository_index_metadata(path, &after)?;
+    validate_repository_index_metadata(path, &after, None)?;
     #[cfg(windows)]
     let identity_matches = file_identity == after_snapshot.identity;
     #[cfg(not(windows))]
@@ -5122,7 +5136,11 @@ fn hash_optional_file(path: &Path) -> Result<Option<Oid>> {
         .map(Some)
 }
 
-fn validate_repository_index_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+fn validate_repository_index_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    opened_file: Option<&fs::File>,
+) -> Result<()> {
     if metadata.file_type().is_symlink()
         || metadata_is_windows_reparse_point(metadata)
         || !metadata.file_type().is_file()
@@ -5150,10 +5168,23 @@ fn validate_repository_index_metadata(path: &Path, metadata: &fs::Metadata) -> R
     }
     #[cfg(target_os = "windows")]
     {
-        if windows_path_link_count(path)? != 1 {
+        let number_of_links = match opened_file {
+            Some(file) => {
+                crate::file_identity::windows_file_link_count(file).with_context(|| {
+                    format!(
+                        "failed to inspect open Windows link count for {}",
+                        path.display()
+                    )
+                })?
+            }
+            None => windows_path_link_count(path)?,
+        };
+        if number_of_links != 1 {
             bail!("repository index {} has multiple links", path.display());
         }
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = opened_file;
     Ok(())
 }
 

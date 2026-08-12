@@ -3957,13 +3957,13 @@ fn read_remote_binding_secret(path: &Path) -> Result<ZeroizingBytes> {
             path.display()
         )
     })?;
-    validate_remote_binding_secret_metadata(path, &path_metadata)?;
+    validate_remote_binding_secret_metadata(path, &path_metadata, None)?;
     let mut file = open_remote_binding_secret_file(path)
         .with_context(|| format!("failed to open publication binding key {}", path.display()))?;
     let file_metadata = file
         .metadata()
         .with_context(|| format!("failed to inspect open binding key {}", path.display()))?;
-    validate_remote_binding_secret_metadata(path, &file_metadata)?;
+    validate_remote_binding_secret_metadata(path, &file_metadata, Some(&file))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -3984,7 +3984,7 @@ fn read_remote_binding_secret(path: &Path) -> Result<ZeroizingBytes> {
                     path.display()
                 )
             })?;
-        validate_remote_binding_secret_metadata(path, &path_snapshot.metadata)?;
+        validate_remote_binding_secret_metadata(path, &path_snapshot.metadata, None)?;
         let file_identity = crate::file_identity::windows_file_identity(&file)
             .context("failed to inspect open publication binding key identity")?;
         if path_snapshot.identity != file_identity {
@@ -4156,7 +4156,11 @@ fn is_remote_binding_secret_temp_name(name: &str) -> bool {
 }
 
 #[cfg(test)]
-fn validate_remote_binding_secret_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+fn validate_remote_binding_secret_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    opened_file: Option<&fs::File>,
+) -> Result<()> {
     if metadata.file_type().is_symlink()
         || publication_metadata_is_windows_reparse_point(metadata)
         || !metadata.file_type().is_file()
@@ -4196,13 +4200,26 @@ fn validate_remote_binding_secret_metadata(path: &Path, metadata: &fs::Metadata)
     }
     #[cfg(target_os = "windows")]
     {
-        if publication_windows_path_link_count(path)? != 1 {
+        let number_of_links = match opened_file {
+            Some(file) => {
+                crate::file_identity::windows_file_link_count(file).with_context(|| {
+                    format!(
+                        "failed to inspect open Windows link count for {}",
+                        path.display()
+                    )
+                })?
+            }
+            None => publication_windows_path_link_count(path)?,
+        };
+        if number_of_links != 1 {
             bail!(
                 "publication remote binding key {} must have exactly one hard link",
                 path.display()
             );
         }
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = opened_file;
     Ok(())
 }
 
@@ -4671,7 +4688,7 @@ fn publication_journal_records(directory: &Path) -> Result<Vec<(u64, PathBuf)>> 
     for path in paths {
         let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("failed to inspect journal record {}", path.display()))?;
-        validate_publication_journal_record_metadata(&path, &metadata)?;
+        validate_publication_journal_record_metadata(&path, &metadata, None)?;
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -4790,6 +4807,7 @@ fn windows_publication_journal_directory_identity(
 fn validate_publication_journal_record_metadata(
     path: &Path,
     metadata: &fs::Metadata,
+    opened_file: Option<&fs::File>,
 ) -> Result<()> {
     if metadata.file_type().is_symlink()
         || publication_metadata_is_windows_reparse_point(metadata)
@@ -4823,13 +4841,26 @@ fn validate_publication_journal_record_metadata(
     }
     #[cfg(target_os = "windows")]
     {
-        if publication_windows_path_link_count(path)? != 1 {
+        let number_of_links = match opened_file {
+            Some(file) => {
+                crate::file_identity::windows_file_link_count(file).with_context(|| {
+                    format!(
+                        "failed to inspect open Windows link count for {}",
+                        path.display()
+                    )
+                })?
+            }
+            None => publication_windows_path_link_count(path)?,
+        };
+        if number_of_links != 1 {
             bail!(
                 "publication journal record {} has multiple links",
                 path.display()
             );
         }
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = opened_file;
     Ok(())
 }
 
@@ -4843,7 +4874,7 @@ fn read_publication_journal_record(path: &Path) -> Result<Vec<u8>> {
     #[cfg(not(windows))]
     let path_metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect journal record {}", path.display()))?;
-    validate_publication_journal_record_metadata(path, &path_metadata)?;
+    validate_publication_journal_record_metadata(path, &path_metadata, None)?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -4857,7 +4888,7 @@ fn read_publication_journal_record(path: &Path) -> Result<Vec<u8>> {
     let file_metadata = file
         .metadata()
         .with_context(|| format!("failed to inspect opened journal record {}", path.display()))?;
-    validate_publication_journal_record_metadata(path, &file_metadata)?;
+    validate_publication_journal_record_metadata(path, &file_metadata, Some(&file))?;
     #[cfg(windows)]
     let file_identity = crate::file_identity::windows_file_identity(&file).with_context(|| {
         format!(
@@ -4902,7 +4933,7 @@ fn read_publication_journal_record(path: &Path) -> Result<Vec<u8>> {
     #[cfg(not(windows))]
     let after = fs::symlink_metadata(path)
         .with_context(|| format!("failed to recheck journal record {}", path.display()))?;
-    validate_publication_journal_record_metadata(path, &after)?;
+    validate_publication_journal_record_metadata(path, &after, None)?;
     #[cfg(windows)]
     let identity_matches = file_identity == after_snapshot.identity;
     #[cfg(not(windows))]
