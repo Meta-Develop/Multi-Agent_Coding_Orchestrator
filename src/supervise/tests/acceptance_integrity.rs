@@ -419,8 +419,8 @@ fn typed_decomposition_prompt_report_and_final_evidence_remain_gated() {
         kind: AssignmentKind::MegafileDecomposition,
         target_path: Some(PathBuf::from("README.md")),
     };
-    let assignment_metadata =
-        BTreeMap::from([((assignment.id.clone(), worker.id.clone()), metadata.clone())]);
+    let assignment_metadata: AssignmentMetadata =
+        BTreeMap::from([((assignment.id.clone(), worker.id.clone()), metadata.clone())]).into();
 
     let worker_value =
         worker_assignment_value(worker, &metadata).expect("serialize typed worker assignment");
@@ -553,8 +553,8 @@ fn typed_decomposition_rejects_missing_target_replacements_and_ordinary_pseudo_e
         kind: AssignmentKind::MegafileDecomposition,
         target_path: Some(PathBuf::from("README.md")),
     };
-    let assignment_metadata =
-        BTreeMap::from([((assignment.id.clone(), worker.id.clone()), metadata)]);
+    let assignment_metadata: AssignmentMetadata =
+        BTreeMap::from([((assignment.id.clone(), worker.id.clone()), metadata)]).into();
 
     let mut no_replacements = injected_child_report(&assignment);
     no_replacements.files_changed = vec![
@@ -748,13 +748,14 @@ fn supervisor_injects_binding_from_stable_candidate_and_detects_later_bytes() {
         kind: AssignmentKind::MegafileDecomposition,
         target_path: Some(PathBuf::from("README.md")),
     };
-    let assignment_metadata = BTreeMap::from([(
+    let assignment_metadata: AssignmentMetadata = BTreeMap::from([(
         (
             assignment.id.clone(),
             assignment.worker_assignments[0].id.clone(),
         ),
         metadata,
-    )]);
+    )])
+    .into();
 
     let manager = WorktreeManager::new(&repo_path);
     let agent = manager

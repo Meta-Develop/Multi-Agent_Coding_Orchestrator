@@ -646,6 +646,13 @@ fn collect_assignment_metadata(
         .trim();
     let assignment = assignments_by_id.get(raw_id).copied();
     if let Some(assignment) = assignment {
+        if let Some(effort) = raw_assignment.get("reasoning_effort") {
+            let effort =
+                serde_json::from_value::<ReasoningEffort>(effort.clone()).with_context(|| {
+                    format!("assignment '{}' reasoning_effort is invalid", assignment.id)
+                })?;
+            metadata_by_worker.insert_reasoning_effort(assignment.id.clone(), effort);
+        }
         let workers_by_id = assignment
             .worker_assignments
             .iter()
@@ -741,6 +748,16 @@ pub(super) fn supervisor_plan_value(
         .and_then(Value::as_array_mut)
         .context("normalized supervisor plan assignments did not serialize to an array")?;
     for (assignment_value, assignment) in assignments.iter_mut().zip(&plan.assignments) {
+        if let Some(effort) = assignment_metadata.reasoning_effort(&assignment.id) {
+            assignment_value
+                .as_object_mut()
+                .context("normalized assignment did not serialize to an object")?
+                .insert(
+                    "reasoning_effort".to_string(),
+                    serde_json::to_value(effort)
+                        .context("failed to serialize assignment reasoning effort")?,
+                );
+        }
         let workers = assignment_value
             .get_mut("worker_assignments")
             .and_then(Value::as_array_mut)
@@ -1360,7 +1377,7 @@ pub(super) fn evidence_only_reaudit_plan_from_source(
     plan.max_gate_corrections = 0;
     plan.assignments = vec![source_assignment.clone()];
     let mut assignment_metadata = source_loaded.assignment_metadata;
-    assignment_metadata.retain(|(owner, _), _| owner == &assignment_id);
+    assignment_metadata.retain_assignment(&assignment_id);
     let fragments = source_loaded
         .plan_metadata
         .spec_fragment_ids_by_assignment

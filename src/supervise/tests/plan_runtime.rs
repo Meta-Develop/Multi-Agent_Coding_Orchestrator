@@ -143,6 +143,39 @@ fn old_and_new_supervisor_model_economics_schema_round_trip() {
 }
 
 #[test]
+fn assignment_reasoning_effort_round_trips_and_rejects_unknown_values() {
+    let mut document = serde_json::from_slice::<Value>(&bounded_loader_plan_json())
+        .expect("parse supervisor plan fixture");
+    document["assignments"][0]["reasoning_effort"] = json!("low");
+    let loaded = parse_supervisor_plan_with_consultant(&document.to_string())
+        .expect("typed assignment effort");
+    let assignment_id = loaded.plan.assignments[0].id.clone();
+    assert_eq!(
+        loaded.assignment_metadata.reasoning_effort(&assignment_id),
+        Some(ReasoningEffort::Low)
+    );
+    let normalized = supervisor_plan_value(
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )
+    .expect("serialize assignment effort");
+    assert_eq!(normalized["assignments"][0]["reasoning_effort"], "low");
+    let reparsed = parse_supervisor_plan_with_consultant(&normalized.to_string())
+        .expect("reparse assignment effort");
+    assert_eq!(reparsed, loaded);
+
+    document["assignments"][0]["reasoning_effort"] = json!("turbo");
+    let error = parse_supervisor_plan_with_consultant(&document.to_string())
+        .expect_err("unknown assignment effort must be typed-rejected");
+    assert!(
+        format!("{error:#}").contains("reasoning_effort is invalid"),
+        "unexpected rejection: {error:#}"
+    );
+}
+
+#[test]
 fn supervisor_plan_loads_executable_stacked_review_lens_configuration() {
     let mut value =
         serde_json::from_slice::<Value>(&bounded_loader_plan_json()).expect("parse base plan");
@@ -1276,7 +1309,7 @@ fn role_selection_produces_distinct_launched_role_argv() {
 }
 
 #[test]
-fn no_override_selects_named_provisional_hybrid_profile_in_launched_argv() {
+fn no_override_selects_single_slug_effort_profile_for_every_role() {
     let plan = parse_supervisor_plan_with_consultant(
         std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
     )
@@ -1293,20 +1326,37 @@ fn no_override_selects_named_provisional_hybrid_profile_in_launched_argv() {
     assert_eq!(profile.model_availability, RoleModelAvailability::Unknown);
     assert!(profile.overridden_roles.is_empty());
     assert_eq!(profile.role_models.len(), 5);
-    assert_eq!(
-        profile.role_models[&AgentRole::Supervisor].model.as_deref(),
-        Some(FRONTIER_PROFILE_MODEL)
-    );
-    assert_eq!(
-        profile.role_models[&AgentRole::ChildOrchestrator]
-            .model
-            .as_deref(),
-        Some(BALANCED_PROFILE_MODEL)
-    );
-    assert_eq!(
-        profile.role_models[&AgentRole::Worker].model.as_deref(),
-        Some(ECONOMY_PROFILE_MODEL)
-    );
+    let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
+    for role in [
+        AgentRole::Supervisor,
+        AgentRole::ChildOrchestrator,
+        AgentRole::Worker,
+        AgentRole::GateClassifier,
+        AgentRole::Auditor,
+    ] {
+        assert_eq!(
+            profile.role_models[&role].model.as_deref(),
+            Some(FRONTIER_PROFILE_MODEL),
+            "default {role:?} binding diverged from the standard slug"
+        );
+        let UnavailableModelFallback::OrderedCatalogChain(chain) =
+            &profile.role_models[&role].unavailable_model_fallback
+        else {
+            panic!("default {role:?} binding lost catalog-chain data");
+        };
+        assert!(
+            chain.models.is_empty(),
+            "default {role:?} availability chain names a nonstandard slug"
+        );
+        let resolved = catalog
+            .resolve_role_model_selection(&profile.role_models[&role], SupervisorRuntime::Codex)
+            .unwrap_or_else(|error| panic!("default {role:?} binding did not resolve: {error:#}"));
+        assert_eq!(
+            resolved.selection.model.as_deref(),
+            Some(FRONTIER_PROFILE_MODEL),
+            "default {role:?} binding resolved away from the standard slug"
+        );
+    }
     assert_eq!(
         profile.role_models[&AgentRole::ChildOrchestrator]
             .reasoning_effort
@@ -1369,7 +1419,7 @@ fn no_override_selects_named_provisional_hybrid_profile_in_launched_argv() {
     assert!(
         child_argv
             .windows(2)
-            .any(|arguments| arguments == ["-c", "model=\"gpt-5.6-terra\""]),
+            .any(|arguments| arguments == ["-c", "model=\"gpt-5.6-sol\""]),
         "writable child app-server argv did not select the provisional model: {child_argv:?}"
     );
     assert!(child_argv
@@ -1390,14 +1440,14 @@ fn no_override_selects_named_provisional_hybrid_profile_in_launched_argv() {
         .collect::<Vec<_>>();
     assert!(auditor_argv
         .windows(2)
-        .any(|arguments| arguments == ["-m", BALANCED_PROFILE_MODEL]));
+        .any(|arguments| arguments == ["-m", FRONTIER_PROFILE_MODEL]));
     assert!(auditor_argv
         .windows(2)
         .any(|arguments| arguments == ["-c", "model_reasoning_effort=\"xhigh\""]));
 }
 
 #[test]
-fn ordered_role_tiers_and_all_frontier_profile_round_trip_through_plan_json() {
+fn single_slug_profile_with_budget_chains_round_trips_through_plan_json() {
     let mut plan = parse_supervisor_plan_with_consultant(
         std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
     )
@@ -1426,11 +1476,21 @@ fn ordered_role_tiers_and_all_frontier_profile_round_trip_through_plan_json() {
     assert!(loaded.plan.role_models.values().all(|selection| matches!(
         &selection.unavailable_model_fallback,
         UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
-            budget_degrade_models,
-            on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
+            models,
             ..
-        }) if budget_degrade_models == &vec![BALANCED_PROFILE_MODEL.to_string(), ECONOMY_PROFILE_MODEL.to_string()]
+        }) if models.is_empty()
     )));
+    assert_eq!(
+        loaded.plan.role_models[&AgentRole::ChildOrchestrator].unavailable_model_fallback,
+        UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
+            models: Vec::new(),
+            budget_degrade_models: vec![
+                BALANCED_PROFILE_MODEL.to_string(),
+                ECONOMY_PROFILE_MODEL.to_string(),
+            ],
+            on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
+        })
+    );
 }
 
 #[test]
@@ -1483,7 +1543,20 @@ fn admission_policy_inputs_round_trip_through_plan_json_and_reject_zero() {
 
 #[test]
 fn ordered_catalog_chain_selects_first_available_model_with_typed_observation() {
-    let configured = provisional_default_role_model_selection(AgentRole::ChildOrchestrator);
+    let configured = RoleModelSelection {
+        model: Some(BALANCED_PROFILE_MODEL.to_string()),
+        reasoning_effort: Some("xhigh".to_string()),
+        unavailable_model_fallback: UnavailableModelFallback::OrderedCatalogChain(
+            OrderedCatalogFallback {
+                models: vec![
+                    FRONTIER_PROFILE_MODEL.to_string(),
+                    ECONOMY_PROFILE_MODEL.to_string(),
+                ],
+                budget_degrade_models: vec![ECONOMY_PROFILE_MODEL.to_string()],
+                on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
+            },
+        ),
+    };
     let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
     let resolved = catalog
         .resolve_role_model_selection(&configured, SupervisorRuntime::Codex)
@@ -1531,11 +1604,6 @@ fn ordered_catalog_chain_selects_first_available_model_with_typed_observation() 
 #[test]
 fn ordered_catalog_chain_rejects_invalid_profile_data_during_plan_load() {
     for (label, chain, expected) in [
-        (
-            "empty",
-            json!({"models": [], "on_exhausted": "runtime_default"}),
-            "must contain at least one model",
-        ),
         (
             "whitespace",
             json!({"models": [" gpt-5.6-sol"], "on_exhausted": "runtime_default"}),
@@ -1592,7 +1660,7 @@ fn gate_classifier_override_and_unavailable_fallback_are_independent() {
     );
     assert_eq!(
         profile.role_models[&AgentRole::Auditor].model.as_deref(),
-        Some(BALANCED_PROFILE_MODEL)
+        Some(FRONTIER_PROFILE_MODEL)
     );
     assert_eq!(profile.overridden_roles, vec![AgentRole::GateClassifier]);
 
@@ -1821,7 +1889,7 @@ fn known_unavailable_child_runtime_default_reaches_production_app_server_argv_be
 }
 
 #[test]
-fn configured_lens_selection_supersedes_role_wide_auditor_fallback_at_dispatch() {
+fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor() {
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
@@ -1850,7 +1918,7 @@ fn configured_lens_selection_supersedes_role_wide_auditor_fallback_at_dispatch()
         panic!("default supervisor lens must be model-backed");
     };
     *model = "available-child-model".to_string();
-    *reasoning_effort = Some("xhigh".to_string());
+    *reasoning_effort = Some("low".to_string());
     let options = injected_options(
         &repo_path,
         temp.path(),
@@ -1870,6 +1938,9 @@ fn configured_lens_selection_supersedes_role_wide_auditor_fallback_at_dispatch()
             assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
             assert_eq!(command.model.as_deref(), Some("available-child-model"));
             assert_eq!(command.model_provider.as_deref(), Some("openai"));
+            assert!(fs::read_to_string(&command.prompt)
+                .expect("read resolved auditor prompt")
+                .contains("Reasoning effort: xhigh"));
             let argv = crate::external_agent::command_argv(command)
                 .into_iter()
                 .map(|argument| argument.to_string_lossy().into_owned())
@@ -2429,7 +2500,7 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
         Some("provider-alpha")
     );
     assert_eq!(lens_commands[0].model.as_deref(), Some("model-alpha"));
-    assert_eq!(lens_commands[0].reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(lens_commands[0].reasoning_effort.as_deref(), Some("xhigh"));
     assert_eq!(
         lens_commands[1].model_provider.as_deref(),
         Some("provider-beta")

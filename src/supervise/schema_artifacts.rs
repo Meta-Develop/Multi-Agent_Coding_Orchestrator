@@ -154,7 +154,6 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                                 "properties": {
                                     "models": {
                                         "type": "array",
-                                        "minItems": 1,
                                         "items": {"type": "string"},
                                         "uniqueItems": true
                                     },
@@ -214,7 +213,8 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                 "additionalProperties": false,
                 "required": [
                     "assignment_count", "started_assignment_count", "completed_assignment_count",
-                    "concurrency", "role_bindings", "budget_degradations", "usage"
+                    "concurrency", "role_bindings", "assignment_effort_bindings",
+                    "budget_degradations", "usage"
                 ],
                 "properties": {
                     "assignment_count": {"type": "integer", "minimum": 0},
@@ -222,11 +222,50 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                     "completed_assignment_count": {"type": "integer", "minimum": 0},
                     "concurrency": concurrency_report_schema_value(),
                     "role_bindings": role_map_schema_value(role_binding),
+                    "assignment_effort_bindings": assignment_effort_bindings_schema_value(),
                     "budget_degradations": budget_degradation_records_schema_value(),
                     "usage": execution_usage_schema_value()
                 }
             }
         }
+    })
+}
+
+fn assignment_effort_bindings_schema_value() -> serde_json::Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "assignment_id", "duty_id", "role", "fallback_reasoning_effort",
+                "resolved_reasoning_effort", "resolution_observation", "process_observation"
+            ],
+            "properties": {
+                "assignment_id": {"type": "string", "minLength": 1},
+                "duty_id": {"type": "string", "minLength": 1},
+                "role": agent_role_schema_value(),
+                "requested_reasoning_effort": reasoning_effort_schema_value(),
+                "fallback_reasoning_effort": {"type": "string", "minLength": 1},
+                "resolved_reasoning_effort": {"type": "string", "minLength": 1},
+                "resolution_observation": {
+                    "type": "string",
+                    "enum": [
+                        "role_fallback", "assignment_override", "hard_floor_clamped",
+                        "budget_degraded"
+                    ]
+                },
+                "process_observation": process_observation_schema_value(),
+                "unavailable_reason": {"type": "string", "minLength": 1}
+            }
+        }
+    })
+}
+
+fn reasoning_effort_schema_value() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "enum": ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
     })
 }
 

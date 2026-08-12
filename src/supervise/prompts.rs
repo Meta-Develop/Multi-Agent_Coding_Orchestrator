@@ -1024,6 +1024,7 @@ pub(super) fn render_review_lens_auditor_prompt(
     let ReviewLensAuditorPromptContext {
         assignment,
         lens,
+        resolved_reasoning_effort,
         request,
         required_coverage,
     } = context;
@@ -1056,9 +1057,8 @@ REVIEW_LENS_REQUEST_JSON:
         lens_id = lens.id,
         backend_id = lens.backend.backend_id(),
         model = lens.backend.model(),
-        reasoning_effort = lens
-            .backend
-            .reasoning_effort()
+        reasoning_effort = resolved_reasoning_effort
+            .or_else(|| lens.backend.reasoning_effort())
             .unwrap_or("<runtime-default>"),
     );
     enforce_rendered_prompt_ceiling(
@@ -1107,42 +1107,34 @@ fn role_model_selection(
 }
 
 pub(super) fn provisional_default_role_model_selection(role: AgentRole) -> RoleModelSelection {
-    let (model, reasoning_effort, fallbacks, budget_degrade_models, on_exhausted) = match role {
+    let (reasoning_effort, budget_degrade_models, on_exhausted) = match role {
         AgentRole::Supervisor => (
-            FRONTIER_PROFILE_MODEL,
             "xhigh",
-            vec![BALANCED_PROFILE_MODEL, ECONOMY_PROFILE_MODEL],
             vec![BALANCED_PROFILE_MODEL, ECONOMY_PROFILE_MODEL],
             TerminalUnavailableModelFallback::RuntimeDefault,
         ),
         AgentRole::ChildOrchestrator | AgentRole::Auditor => (
-            BALANCED_PROFILE_MODEL,
             "xhigh",
-            vec![FRONTIER_PROFILE_MODEL, ECONOMY_PROFILE_MODEL],
-            vec![ECONOMY_PROFILE_MODEL],
+            vec![BALANCED_PROFILE_MODEL, ECONOMY_PROFILE_MODEL],
             TerminalUnavailableModelFallback::RuntimeDefault,
         ),
         AgentRole::Worker => (
-            ECONOMY_PROFILE_MODEL,
             "medium",
-            vec![BALANCED_PROFILE_MODEL, FRONTIER_PROFILE_MODEL],
             Vec::new(),
             TerminalUnavailableModelFallback::RuntimeDefault,
         ),
         AgentRole::GateClassifier => (
-            BALANCED_PROFILE_MODEL,
             "high",
-            vec![FRONTIER_PROFILE_MODEL, ECONOMY_PROFILE_MODEL],
             Vec::new(),
             TerminalUnavailableModelFallback::LocalDeterministicFake,
         ),
     };
     RoleModelSelection {
-        model: Some(model.to_string()),
+        model: Some(FRONTIER_PROFILE_MODEL.to_string()),
         reasoning_effort: Some(reasoning_effort.to_string()),
         unavailable_model_fallback: UnavailableModelFallback::OrderedCatalogChain(
             OrderedCatalogFallback {
-                models: fallbacks.into_iter().map(str::to_string).collect(),
+                models: Vec::new(),
                 budget_degrade_models: budget_degrade_models
                     .into_iter()
                     .map(str::to_string)
@@ -1168,27 +1160,9 @@ pub(super) fn provisional_default_role_models() -> BTreeMap<AgentRole, RoleModel
 
 pub fn all_frontier_role_models() -> BTreeMap<AgentRole, RoleModelSelection> {
     provisional_default_role_models()
-        .into_iter()
-        .map(|(role, mut selection)| {
-            selection.model = Some(FRONTIER_PROFILE_MODEL.to_string());
-            selection.unavailable_model_fallback =
-                UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
-                    models: vec![
-                        BALANCED_PROFILE_MODEL.to_string(),
-                        ECONOMY_PROFILE_MODEL.to_string(),
-                    ],
-                    budget_degrade_models: vec![
-                        BALANCED_PROFILE_MODEL.to_string(),
-                        ECONOMY_PROFILE_MODEL.to_string(),
-                    ],
-                    on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
-                });
-            (role, selection)
-        })
-        .collect()
 }
 
-pub(super) fn effective_role_model_selection(
+pub(super) fn configured_role_model_selection(
     plan: &SupervisorPlan,
     role: AgentRole,
 ) -> RoleModelSelection {
@@ -1196,6 +1170,16 @@ pub(super) fn effective_role_model_selection(
         .get(&role)
         .cloned()
         .unwrap_or_else(|| provisional_default_role_model_selection(role))
+}
+
+pub(super) fn effective_role_model_selection(
+    plan: &SupervisorPlan,
+    role: AgentRole,
+) -> RoleModelSelection {
+    let mut selection = configured_role_model_selection(plan, role);
+    selection.reasoning_effort =
+        enforce_role_reasoning_effort_floor(role, selection.reasoning_effort);
+    selection
 }
 
 pub(super) fn apply_role_model_selection(
@@ -1231,6 +1215,7 @@ pub(super) fn runtime_resolved_prompt_plan(
 pub(super) fn apply_review_lens_model_selection(
     command: ExternalAgentCommand,
     lens: &ReviewLensConfig,
+    assignment_reasoning_effort: Option<ReasoningEffort>,
     runtime: SupervisorRuntime,
     catalog: &RuntimeModelCatalog,
 ) -> Result<ExternalAgentCommand> {
@@ -1249,9 +1234,15 @@ pub(super) fn apply_review_lens_model_selection(
             .with_model_provider(None)
             .with_model_selection(None, None));
     }
+    let resolved_effort = resolve_reasoning_effort(
+        AgentRole::Auditor,
+        assignment_reasoning_effort,
+        reasoning_effort.as_deref(),
+        0,
+    );
     Ok(command
         .with_model_provider(Some(backend_id.clone()))
-        .with_model_selection(Some(model.clone()), reasoning_effort.clone()))
+        .with_model_selection(Some(model.clone()), Some(resolved_effort.resolved)))
 }
 
 pub(super) fn validate_review_lens_runtime_selection(
@@ -1750,6 +1741,7 @@ mod regression_tests {
             ReviewLensAuditorPromptContext {
                 assignment: &assignment,
                 lens: &diff_lens,
+                resolved_reasoning_effort: None,
                 request: &diff_request,
                 required_coverage: &coverage,
             },
@@ -1760,6 +1752,7 @@ mod regression_tests {
             ReviewLensAuditorPromptContext {
                 assignment: &assignment,
                 lens: &report_lens,
+                resolved_reasoning_effort: None,
                 request: &report_request,
                 required_coverage: &coverage,
             },
@@ -1779,7 +1772,10 @@ mod regression_tests {
         ])?);
         let primary = tempfile::tempdir()?;
         let child_worktree = tempfile::tempdir()?;
-        let make_command = |lens: &ReviewLensConfig, prompt_name: &str| -> Result<_> {
+        let make_command = |lens: &ReviewLensConfig,
+                            prompt_name: &str,
+                            assignment_effort: Option<ReasoningEffort>|
+         -> Result<_> {
             let workspace = create_review_lens_scope_workspace()?;
             let command = ExternalAgentCommand::codex(
                 "codex",
@@ -1792,6 +1788,7 @@ mod regression_tests {
             let command = apply_review_lens_model_selection(
                 command,
                 lens,
+                assignment_effort,
                 SupervisorRuntime::Codex,
                 &catalog,
             )?;
@@ -1802,8 +1799,9 @@ mod regression_tests {
             )?;
             Ok((workspace, command))
         };
-        let (diff_workspace, diff_command) = make_command(&diff_lens, "diff-prompt.md")?;
-        let (report_workspace, report_command) = make_command(&report_lens, "report-prompt.md")?;
+        let (diff_workspace, diff_command) = make_command(&diff_lens, "diff-prompt.md", None)?;
+        let (report_workspace, report_command) =
+            make_command(&report_lens, "report-prompt.md", Some(ReasoningEffort::Max))?;
         assert_ne!(diff_workspace.path(), report_workspace.path());
         assert_eq!(diff_command.cwd, diff_workspace.path());
         assert_eq!(report_command.cwd, report_workspace.path());
@@ -1819,13 +1817,13 @@ mod regression_tests {
             Some("provider-alpha")
         );
         assert_eq!(diff_command.model.as_deref(), Some("model-alpha"));
-        assert_eq!(diff_command.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(diff_command.reasoning_effort.as_deref(), Some("xhigh"));
         assert_eq!(
             report_command.model_provider.as_deref(),
             Some("provider-beta")
         );
         assert_eq!(report_command.model.as_deref(), Some("model-beta"));
-        assert_eq!(report_command.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(report_command.reasoning_effort.as_deref(), Some("max"));
         let diff_argv = crate::external_agent::command_argv(&diff_command)
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -1842,7 +1840,7 @@ mod regression_tests {
             .any(|argument| argument == "model_provider=\"provider-alpha\""));
         assert!(diff_argv
             .iter()
-            .any(|argument| argument == "model_reasoning_effort=\"high\""));
+            .any(|argument| argument == "model_reasoning_effort=\"xhigh\""));
         assert!(report_argv
             .windows(2)
             .any(|pair| pair == ["-m", "model-beta"]));
@@ -1851,7 +1849,7 @@ mod regression_tests {
             .any(|argument| argument == "model_provider=\"provider-beta\""));
         assert!(report_argv
             .iter()
-            .any(|argument| argument == "model_reasoning_effort=\"xhigh\""));
+            .any(|argument| argument == "model_reasoning_effort=\"max\""));
         Ok(())
     }
 
@@ -1891,6 +1889,7 @@ mod regression_tests {
             ReviewLensAuditorPromptContext {
                 assignment: &assignment,
                 lens: &lens,
+                resolved_reasoning_effort: None,
                 request: &request,
                 required_coverage: &ReviewCoverageRequirement::default(),
             },

@@ -544,15 +544,15 @@ fn budget_integration_scheduler_applies_and_persists_degrade_ladder_before_halt(
     assert_eq!(child_bindings.len(), 6);
     assert_eq!(
         child_bindings["degrade-child-0"],
-        (BALANCED_PROFILE_MODEL.to_string(), "xhigh".to_string())
+        (FRONTIER_PROFILE_MODEL.to_string(), "xhigh".to_string())
     );
     assert_eq!(
         child_bindings["degrade-child-1"],
-        (BALANCED_PROFILE_MODEL.to_string(), "high".to_string())
+        (FRONTIER_PROFILE_MODEL.to_string(), "high".to_string())
     );
     assert_eq!(
         child_bindings["degrade-child-2"],
-        (ECONOMY_PROFILE_MODEL.to_string(), "high".to_string())
+        (BALANCED_PROFILE_MODEL.to_string(), "high".to_string())
     );
     assert!(!child_bindings.contains_key("degrade-child-6"));
 
@@ -584,6 +584,25 @@ fn budget_integration_scheduler_applies_and_persists_degrade_ladder_before_halt(
     assert_eq!(
         execution.role_bindings[&AgentRole::ChildOrchestrator].observation,
         RoleBindingObservation::AssignmentSpecific
+    );
+    assert_eq!(
+        execution
+            .assignment_effort_bindings
+            .iter()
+            .filter(|binding| binding.role == AgentRole::ChildOrchestrator)
+            .map(|binding| {
+                (
+                    binding.assignment_id.as_str(),
+                    binding.resolved_reasoning_effort.as_str(),
+                )
+            })
+            .take(3)
+            .collect::<Vec<_>>(),
+        vec![
+            ("degrade-child-0", "xhigh"),
+            ("degrade-child-1", "high"),
+            ("degrade-child-2", "high"),
+        ]
     );
 
     let persisted: serde_json::Value = serde_json::from_slice(
