@@ -9,8 +9,9 @@ use crate::{
     autopilot::{AutopilotProfileBindingReport, AutopilotProfileBindingStatus},
     llm::provider::Usage,
     supervise::{
-        AgentRole, Finding, FindingSeverity, RoleModelSelection, RoleUsageObservation,
-        RoleUsageReport, UnavailableModelFallback,
+        AgentRole, Finding, FindingSeverity, ProcessObservation, RoleBindingObservation,
+        RoleEconomicsProfile, RoleModelSelection, RoleUsageObservation, RoleUsageReport,
+        RuntimeModelCatalogObservation, UnavailableModelFallback,
     },
 };
 use serde::{Deserialize, Deserializer, Serialize};
@@ -23,7 +24,9 @@ use std::{
 use thiserror::Error;
 
 pub const EVALUATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const EVALUATION_RESULTS_SCHEMA_VERSION: u32 = 2;
+pub const EVALUATION_RESULTS_SCHEMA_VERSION: u32 = 3;
+pub const LEGACY_EVALUATION_RESULTS_SCHEMA_VERSION: u32 = 2;
+pub const CONSUMED_SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION: u32 = 2;
 pub const MAX_EVALUATION_HELD_OUT_VALIDATIONS: usize = 32;
 pub const MAX_EVALUATION_PROFILES: usize = 32;
 pub const MAX_EVALUATION_REPETITIONS: u32 = 100;
@@ -382,6 +385,8 @@ pub struct SyntheticRunIdentity {
 pub struct ObservedRoleDispatch {
     pub role: AgentRole,
     pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// A dispatch-observed review-lens selection copied from parent-recorded argv evidence.
@@ -396,14 +401,82 @@ pub struct ObservedReviewLensDispatch {
     pub dispatch_count: usize,
 }
 
+/// Canonical role binding retained from supervisor execution telemetry.
+///
+/// Configured selections are deliberately excluded: an unresolved runtime selection must remain
+/// unresolved rather than being reconstructed from the plan.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedSupervisorRoleBinding {
+    pub role: AgentRole,
+    pub resolved_model: Option<String>,
+    pub resolved_reasoning_effort: Option<String>,
+    pub observation: RoleBindingObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+/// Scheduler-observed fan-out for one supervisor run.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedSupervisorConcurrency {
+    pub configured_max_concurrent_children: usize,
+    pub policy_input_observation: ProcessObservation,
+    pub policy_input: Option<String>,
+    pub policy_input_unavailable_reason: Option<String>,
+    pub achieved_max_concurrent_children: usize,
+    pub achieved_mean_concurrent_children: Option<f64>,
+    pub achieved_mean_observation: ProcessObservation,
+    pub achieved_mean_unavailable_reason: Option<String>,
+}
+
+/// Aggregate process usage retained by the supervisor.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedSupervisorUsage {
+    #[serde(default, deserialize_with = "deserialize_optional_usage")]
+    pub total_usage: Option<Usage>,
+    pub total_cost_usd: Option<f64>,
+    pub usage_complete: bool,
+    pub observation: RoleUsageObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+/// Normalized execution metadata consumed from `supervisor-final.json` economics schema v2.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedSupervisorExecution {
+    pub schema_version: u32,
+    pub model_catalog_observation: RuntimeModelCatalogObservation,
+    pub assignment_count: usize,
+    pub started_assignment_count: usize,
+    pub completed_assignment_count: usize,
+    pub concurrency: ObservedSupervisorConcurrency,
+    pub role_bindings: Vec<ObservedSupervisorRoleBinding>,
+    pub usage: ObservedSupervisorUsage,
+}
+
+/// Comparison of the supervisor-recorded execution/economics axis.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionTelemetryComparability {
+    Equivalent,
+    Different,
+    #[default]
+    Incomparable,
+}
+
 /// Normalized observed dispatch record for one profile repetition.
 ///
 /// No requested, effective, or manifest selection is copied into this record.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservedDispatchRecord {
     pub roles: Vec<ObservedRoleDispatch>,
     pub review_lenses: Vec<ObservedReviewLensDispatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_execution: Option<ObservedSupervisorExecution>,
 }
 
 /// Same-repetition comparison between two profile runs.
@@ -414,6 +487,22 @@ pub struct DispatchComparison {
     pub right_profile_id: String,
     pub repetition: u32,
     pub comparability: RequirementFourComparability,
+    #[serde(default)]
+    pub execution_telemetry_comparability: ExecutionTelemetryComparability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+/// Direct Phase-A comparison of two supervisor run artifacts.
+///
+/// This is execution-provenance plumbing only. It carries the existing dispatch-only claim
+/// boundary and does not make a real-provider or isolated-repository evidence claim.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorArtifactComparison {
+    pub dispatch_comparability_claim: DispatchComparabilityClaim,
+    pub comparability: RequirementFourComparability,
+    pub execution_telemetry_comparability: ExecutionTelemetryComparability,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
 }
@@ -794,6 +883,13 @@ where
     StrictUsage::deserialize(deserializer).map(Usage::from)
 }
 
+fn deserialize_optional_usage<'de, D>(deserializer: D) -> Result<Option<Usage>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<StrictUsage>::deserialize(deserializer).map(|usage| usage.map(Usage::from))
+}
+
 fn deserialize_role_usage<'de, D>(
     deserializer: D,
 ) -> Result<BTreeMap<AgentRole, RoleUsageReport>, D::Error>
@@ -977,6 +1073,7 @@ pub fn observed_dispatch_record_from_profile_binding(
         roles.push(ObservedRoleDispatch {
             role: observed.role,
             models,
+            reasoning_effort: None,
         });
     }
     roles.sort();
@@ -1024,7 +1121,409 @@ pub fn observed_dispatch_record_from_profile_binding(
     Ok(ObservedDispatchRecord {
         roles,
         review_lenses,
+        supervisor_execution: None,
     })
+}
+
+/// Consume the execution/economics block from a serialized `supervisor-final.json` artifact.
+///
+/// The outer supervisor report has a much broader schema. This adapter deliberately reads only
+/// its version and `role_economics_profile`, then applies the same fail-closed normalization used
+/// by the typed adapter below.
+pub fn observed_dispatch_record_from_supervisor_final_json(
+    artifact: &[u8],
+) -> Result<ObservedDispatchRecord, String> {
+    let document = serde_json::from_slice::<Value>(artifact)
+        .map_err(|error| format!("invalid_supervisor_artifact: {error}"))?;
+    let object = document.as_object().ok_or_else(|| {
+        "invalid_supervisor_artifact: supervisor-final.json must be an object".to_string()
+    })?;
+    let report_version = object
+        .get("version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            "not_process_observable: supervisor-final.json lacks an integer version".to_string()
+        })?;
+    if report_version != 1 {
+        return Err(format!(
+            "not_process_observable: unsupported supervisor-final.json version {report_version}"
+        ));
+    }
+    let profile_value = object.get("role_economics_profile").ok_or_else(|| {
+        "not_process_observable: supervisor-final.json lacks role_economics_profile".to_string()
+    })?;
+    let profile =
+        serde_json::from_value::<RoleEconomicsProfile>(profile_value.clone()).map_err(|error| {
+            format!("invalid_supervisor_artifact: invalid role_economics_profile: {error}")
+        })?;
+    observed_dispatch_record_from_role_economics_profile(&profile)
+}
+
+/// Normalize supervisor execution telemetry without substituting configured values for
+/// unresolved runtime observations.
+pub fn observed_dispatch_record_from_role_economics_profile(
+    profile: &RoleEconomicsProfile,
+) -> Result<ObservedDispatchRecord, String> {
+    if profile.schema_version != CONSUMED_SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION {
+        return Err(format!(
+            "not_process_observable: unsupported supervisor execution telemetry schema {}; expected {}",
+            profile.schema_version, CONSUMED_SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION
+        ));
+    }
+    let execution = profile.execution.as_ref().ok_or_else(|| {
+        "not_process_observable: supervisor execution telemetry schema v2 is absent".to_string()
+    })?;
+    validate_supervisor_execution_metadata(execution)?;
+
+    let mut role_bindings = execution
+        .role_bindings
+        .iter()
+        .map(|(role, binding)| ObservedSupervisorRoleBinding {
+            role: *role,
+            resolved_model: binding.resolved_model.clone(),
+            resolved_reasoning_effort: binding.resolved_reasoning_effort.clone(),
+            observation: binding.observation,
+            unavailable_reason: binding.unavailable_reason.clone(),
+        })
+        .collect::<Vec<_>>();
+    role_bindings.sort_by_key(|binding| binding.role);
+
+    let roles = role_bindings
+        .iter()
+        .filter_map(|binding| {
+            if binding.observation == RoleBindingObservation::RuntimeCatalogResolved {
+                binding
+                    .resolved_model
+                    .as_ref()
+                    .map(|model| ObservedRoleDispatch {
+                        role: binding.role,
+                        models: vec![model.clone()],
+                        reasoning_effort: binding.resolved_reasoning_effort.clone(),
+                    })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(ObservedDispatchRecord {
+        roles,
+        review_lenses: Vec::new(),
+        supervisor_execution: Some(ObservedSupervisorExecution {
+            schema_version: profile.schema_version,
+            model_catalog_observation: profile.model_catalog_observation,
+            assignment_count: execution.assignment_count,
+            started_assignment_count: execution.started_assignment_count,
+            completed_assignment_count: execution.completed_assignment_count,
+            concurrency: ObservedSupervisorConcurrency {
+                configured_max_concurrent_children: execution
+                    .concurrency
+                    .configured_max_concurrent_children,
+                policy_input_observation: execution.concurrency.policy_input_observation,
+                policy_input: execution.concurrency.policy_input.clone(),
+                policy_input_unavailable_reason: execution
+                    .concurrency
+                    .policy_input_unavailable_reason
+                    .clone(),
+                achieved_max_concurrent_children: execution
+                    .concurrency
+                    .achieved_max_concurrent_children,
+                achieved_mean_concurrent_children: execution
+                    .concurrency
+                    .achieved_mean_concurrent_children,
+                achieved_mean_observation: execution.concurrency.achieved_mean_observation,
+                achieved_mean_unavailable_reason: execution
+                    .concurrency
+                    .achieved_mean_unavailable_reason
+                    .clone(),
+            },
+            role_bindings,
+            usage: ObservedSupervisorUsage {
+                total_usage: execution.usage.total_usage,
+                total_cost_usd: execution.usage.total_cost_usd,
+                usage_complete: execution.usage.usage_complete,
+                observation: execution.usage.observation,
+                unavailable_reason: execution.usage.unavailable_reason.clone(),
+            },
+        }),
+    })
+}
+
+fn validate_supervisor_execution_metadata(
+    execution: &crate::supervise::SupervisorExecutionMetadata,
+) -> Result<(), String> {
+    if execution.started_assignment_count > execution.assignment_count {
+        return Err(
+            "invalid_supervisor_artifact: started_assignment_count exceeds assignment_count"
+                .to_string(),
+        );
+    }
+    if execution.completed_assignment_count > execution.started_assignment_count {
+        return Err(
+            "invalid_supervisor_artifact: completed_assignment_count exceeds started_assignment_count"
+                .to_string(),
+        );
+    }
+    let concurrency = &execution.concurrency;
+    if concurrency.configured_max_concurrent_children == 0 {
+        return Err(
+            "invalid_supervisor_artifact: configured_max_concurrent_children must be positive"
+                .to_string(),
+        );
+    }
+    if concurrency.achieved_max_concurrent_children > concurrency.configured_max_concurrent_children
+        || concurrency.achieved_max_concurrent_children > execution.started_assignment_count
+    {
+        return Err(
+            "invalid_supervisor_artifact: achieved concurrency exceeds the configured or started assignment bound"
+                .to_string(),
+        );
+    }
+    if (execution.started_assignment_count == 0)
+        != (concurrency.achieved_max_concurrent_children == 0)
+    {
+        return Err(
+            "invalid_supervisor_artifact: achieved concurrency is inconsistent with started assignments"
+                .to_string(),
+        );
+    }
+    validate_observed_value_marker(
+        "policy_input",
+        concurrency.policy_input_observation,
+        concurrency.policy_input.as_deref(),
+        concurrency.policy_input_unavailable_reason.as_deref(),
+    )?;
+    match (
+        concurrency.achieved_mean_observation,
+        concurrency.achieved_mean_concurrent_children,
+        concurrency.achieved_mean_unavailable_reason.as_deref(),
+    ) {
+        (ProcessObservation::SchedulerObserved, Some(mean), None)
+            if mean.is_finite()
+                && mean > 0.0
+                && mean <= concurrency.achieved_max_concurrent_children as f64 => {}
+        (
+            ProcessObservation::NotRetained | ProcessObservation::NotProcessObservable,
+            None,
+            Some(reason),
+        ) if !reason.trim().is_empty() => {}
+        _ => {
+            return Err(
+                "invalid_supervisor_artifact: achieved mean value, observation, and unavailable reason are inconsistent"
+                    .to_string(),
+            );
+        }
+    }
+
+    let expected_roles = [
+        AgentRole::Supervisor,
+        AgentRole::ChildOrchestrator,
+        AgentRole::Worker,
+        AgentRole::GateClassifier,
+        AgentRole::Auditor,
+    ];
+    if execution.role_bindings.len() != expected_roles.len()
+        || expected_roles
+            .iter()
+            .any(|role| !execution.role_bindings.contains_key(role))
+    {
+        return Err(
+            "invalid_supervisor_artifact: role_bindings must explicitly cover every supervisor role"
+                .to_string(),
+        );
+    }
+    for (role, binding) in &execution.role_bindings {
+        validate_optional_observed_text(
+            &format!("role_bindings.{}.resolved_model", role_name(*role)),
+            binding.resolved_model.as_deref(),
+        )?;
+        validate_optional_observed_text(
+            &format!(
+                "role_bindings.{}.resolved_reasoning_effort",
+                role_name(*role)
+            ),
+            binding.resolved_reasoning_effort.as_deref(),
+        )?;
+        match binding.observation {
+            RoleBindingObservation::RuntimeCatalogResolved if binding.resolved_model.is_none() => {
+                return Err(format!(
+                    "invalid_supervisor_artifact: role '{}' is marked runtime_catalog_resolved without a resolved model",
+                    role_name(*role)
+                ));
+            }
+            RoleBindingObservation::RuntimeCatalogResolved => {}
+            _ if binding.resolved_model.is_none()
+                && binding
+                    .unavailable_reason
+                    .as_deref()
+                    .is_none_or(|reason| reason.trim().is_empty()) =>
+            {
+                return Err(format!(
+                    "invalid_supervisor_artifact: unresolved role '{}' lacks an explicit unavailable reason",
+                    role_name(*role)
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(usage) = execution.usage.total_usage {
+        if usage.input_tokens.checked_add(usage.output_tokens) != Some(usage.total_tokens) {
+            return Err(
+                "invalid_supervisor_artifact: total_usage does not equal input plus output tokens"
+                    .to_string(),
+            );
+        }
+    }
+    if execution
+        .usage
+        .total_cost_usd
+        .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
+    {
+        return Err(
+            "invalid_supervisor_artifact: total_cost_usd must be finite and nonnegative"
+                .to_string(),
+        );
+    }
+    if execution.usage.total_usage.is_none()
+        && execution
+            .usage
+            .unavailable_reason
+            .as_deref()
+            .is_none_or(|reason| reason.trim().is_empty())
+    {
+        return Err(
+            "invalid_supervisor_artifact: unobserved aggregate usage lacks an explicit unavailable reason"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_observed_value_marker(
+    field: &str,
+    observation: ProcessObservation,
+    value: Option<&str>,
+    unavailable_reason: Option<&str>,
+) -> Result<(), String> {
+    match (observation, value, unavailable_reason) {
+        (ProcessObservation::SchedulerObserved, Some(value), None) if !value.trim().is_empty() => {
+            Ok(())
+        }
+        (
+            ProcessObservation::NotRetained | ProcessObservation::NotProcessObservable,
+            None,
+            Some(reason),
+        ) if !reason.trim().is_empty() => Ok(()),
+        _ => Err(format!(
+            "invalid_supervisor_artifact: {field} value, observation, and unavailable reason are inconsistent"
+        )),
+    }
+}
+
+fn validate_optional_observed_text(field: &str, value: Option<&str>) -> Result<(), String> {
+    if value.is_some_and(|value| value.trim().is_empty()) {
+        return Err(format!(
+            "invalid_supervisor_artifact: {field} must not be empty when present"
+        ));
+    }
+    Ok(())
+}
+
+fn has_complete_resolved_role_bindings(execution: &ObservedSupervisorExecution) -> bool {
+    let expected_roles = [
+        AgentRole::Supervisor,
+        AgentRole::ChildOrchestrator,
+        AgentRole::Worker,
+        AgentRole::GateClassifier,
+        AgentRole::Auditor,
+    ];
+    execution.model_catalog_observation == RuntimeModelCatalogObservation::Consulted
+        && validate_normalized_supervisor_execution(execution, "comparison").is_ok()
+        && execution
+            .role_bindings
+            .iter()
+            .zip(expected_roles)
+            .all(|(binding, role)| {
+                binding.role == role
+                    && binding.observation == RoleBindingObservation::RuntimeCatalogResolved
+                    && binding
+                        .resolved_model
+                        .as_deref()
+                        .is_some_and(|model| !model.trim().is_empty())
+                    && binding
+                        .resolved_reasoning_effort
+                        .as_deref()
+                        .is_some_and(|effort| !effort.trim().is_empty())
+            })
+}
+
+fn has_complete_execution_economics(execution: &ObservedSupervisorExecution) -> bool {
+    has_complete_resolved_role_bindings(execution)
+        && execution.concurrency.achieved_mean_observation == ProcessObservation::SchedulerObserved
+        && execution
+            .concurrency
+            .achieved_mean_concurrent_children
+            .is_some()
+        && execution.usage.usage_complete
+        && execution.usage.total_usage.is_some()
+        && execution.usage.total_cost_usd.is_some()
+        && execution.usage.observation == RoleUsageObservation::SupervisorAggregate
+}
+
+fn optional_float_equal(left: Option<f64>, right: Option<f64>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => approximately_equal(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn supervisor_execution_equivalent(
+    left: &ObservedSupervisorExecution,
+    right: &ObservedSupervisorExecution,
+) -> bool {
+    left.schema_version == right.schema_version
+        && left.model_catalog_observation == right.model_catalog_observation
+        && left.assignment_count == right.assignment_count
+        && left.started_assignment_count == right.started_assignment_count
+        && left.completed_assignment_count == right.completed_assignment_count
+        && left.concurrency.configured_max_concurrent_children
+            == right.concurrency.configured_max_concurrent_children
+        && left.concurrency.policy_input_observation == right.concurrency.policy_input_observation
+        && left.concurrency.policy_input == right.concurrency.policy_input
+        && left.concurrency.achieved_max_concurrent_children
+            == right.concurrency.achieved_max_concurrent_children
+        && optional_float_equal(
+            left.concurrency.achieved_mean_concurrent_children,
+            right.concurrency.achieved_mean_concurrent_children,
+        )
+        && left.concurrency.achieved_mean_observation == right.concurrency.achieved_mean_observation
+        && left.role_bindings == right.role_bindings
+        && left.usage.total_usage == right.usage.total_usage
+        && optional_float_equal(left.usage.total_cost_usd, right.usage.total_cost_usd)
+        && left.usage.usage_complete == right.usage.usage_complete
+        && left.usage.observation == right.usage.observation
+}
+
+/// Compare the execution/economics axis without claiming provider execution identity.
+pub fn compare_observed_supervisor_execution(
+    left: Option<&ObservedSupervisorExecution>,
+    right: Option<&ObservedSupervisorExecution>,
+) -> ExecutionTelemetryComparability {
+    match (left, right) {
+        (Some(left), Some(right))
+            if has_complete_execution_economics(left)
+                && has_complete_execution_economics(right) =>
+        {
+            if supervisor_execution_equivalent(left, right) {
+                ExecutionTelemetryComparability::Equivalent
+            } else {
+                ExecutionTelemetryComparability::Different
+            }
+        }
+        _ => ExecutionTelemetryComparability::Incomparable,
+    }
 }
 
 /// Comparator seam used by Phase-B fail-capability tests and source-neuter checks.
@@ -1033,11 +1532,68 @@ pub fn compare_observed_dispatch_records(
     right: Option<&ObservedDispatchRecord>,
 ) -> RequirementFourComparability {
     match (left, right) {
-        (Some(left), Some(right)) if left != right => {
+        (Some(left), Some(right))
+            if has_complete_dispatch_record(left)
+                && has_complete_dispatch_record(right)
+                && (left.roles != right.roles || left.review_lenses != right.review_lenses) =>
+        {
             RequirementFourComparability::DispatchGroundedSelectionsDiffer
         }
-        (Some(_), Some(_)) => RequirementFourComparability::DispatchGroundedSelectionsEquivalent,
+        (Some(left), Some(right))
+            if has_complete_dispatch_record(left) && has_complete_dispatch_record(right) =>
+        {
+            RequirementFourComparability::DispatchGroundedSelectionsEquivalent
+        }
         _ => RequirementFourComparability::Incomparable,
+    }
+}
+
+fn has_complete_dispatch_record(record: &ObservedDispatchRecord) -> bool {
+    record
+        .supervisor_execution
+        .as_ref()
+        .is_some_and(has_complete_resolved_role_bindings)
+        && validate_observed_dispatch_record(record, 0).is_ok()
+}
+
+/// Ingest and compare two `supervisor-final.json` artifacts in one fail-closed operation.
+pub fn compare_supervisor_final_artifacts(
+    left_artifact: &[u8],
+    right_artifact: &[u8],
+) -> SupervisorArtifactComparison {
+    let left = observed_dispatch_record_from_supervisor_final_json(left_artifact);
+    let right = observed_dispatch_record_from_supervisor_final_json(right_artifact);
+    let comparability = compare_observed_dispatch_records(left.as_ref().ok(), right.as_ref().ok());
+    let execution_telemetry_comparability = compare_observed_supervisor_execution(
+        left.as_ref()
+            .ok()
+            .and_then(|record| record.supervisor_execution.as_ref()),
+        right
+            .as_ref()
+            .ok()
+            .and_then(|record| record.supervisor_execution.as_ref()),
+    );
+    let mut reasons = Vec::new();
+    if let Err(reason) = &left {
+        reasons.push(format!("left: {reason}"));
+    }
+    if let Err(reason) = &right {
+        reasons.push(format!("right: {reason}"));
+    }
+    if reasons.is_empty()
+        && (comparability == RequirementFourComparability::Incomparable
+            || execution_telemetry_comparability == ExecutionTelemetryComparability::Incomparable)
+    {
+        reasons.push(
+            "one or both runs contain explicit unavailable role, concurrency, or usage observations"
+                .to_string(),
+        );
+    }
+    SupervisorArtifactComparison {
+        dispatch_comparability_claim: DispatchComparabilityClaim::dispatch_only(),
+        comparability,
+        execution_telemetry_comparability,
+        unavailable_reason: (!reasons.is_empty()).then(|| reasons.join("; ")),
     }
 }
 
@@ -1063,15 +1619,27 @@ fn compare_same_repetition_dispatches(
                     left.observed_dispatch.as_ref(),
                     right.observed_dispatch.as_ref(),
                 );
+                let execution_telemetry_comparability = compare_observed_supervisor_execution(
+                    left.observed_dispatch
+                        .as_ref()
+                        .and_then(|record| record.supervisor_execution.as_ref()),
+                    right
+                        .observed_dispatch
+                        .as_ref()
+                        .and_then(|record| record.supervisor_execution.as_ref()),
+                );
                 comparisons.push(DispatchComparison {
                     left_profile_id: left_profile.id.clone(),
                     right_profile_id: right_profile.id.clone(),
                     repetition,
                     comparability,
+                    execution_telemetry_comparability,
                     unavailable_reason: (comparability
-                        == RequirementFourComparability::Incomparable)
+                        == RequirementFourComparability::Incomparable
+                        || execution_telemetry_comparability
+                            == ExecutionTelemetryComparability::Incomparable)
                         .then(|| {
-                            "not_process_observable: one or both runs lack a complete observed dispatch record"
+                            "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
                                 .to_string()
                         }),
                 });
@@ -1085,6 +1653,8 @@ fn pareto_conclusion(comparisons: &[DispatchComparison]) -> ParetoConclusion {
     let status = if comparisons.is_empty()
         || comparisons.iter().any(|comparison| {
             comparison.comparability == RequirementFourComparability::Incomparable
+                || comparison.execution_telemetry_comparability
+                    == ExecutionTelemetryComparability::Incomparable
         }) {
         ParetoConclusionStatus::RefusedIncomparableDispatchEvidence
     } else if !comparisons.iter().any(|comparison| {
@@ -1110,7 +1680,12 @@ pub fn validate_results_against_manifest(
     results: &EvaluationResults,
 ) -> Result<(), EvaluationError> {
     manifest.validate()?;
-    if results.version != EVALUATION_RESULTS_SCHEMA_VERSION {
+    if ![
+        LEGACY_EVALUATION_RESULTS_SCHEMA_VERSION,
+        EVALUATION_RESULTS_SCHEMA_VERSION,
+    ]
+    .contains(&results.version)
+    {
         return Err(EvaluationError::UnsupportedResultsVersion {
             found: results.version,
             supported: EVALUATION_RESULTS_SCHEMA_VERSION,
@@ -1249,7 +1824,12 @@ pub fn validate_results_against_manifest(
     }
 
     let expected_comparisons = compare_same_repetition_dispatches(manifest, &results.runs)?;
-    if results.dispatch_comparisons != expected_comparisons {
+    let comparisons_match = if results.version == LEGACY_EVALUATION_RESULTS_SCHEMA_VERSION {
+        legacy_dispatch_comparisons_equivalent(&results.dispatch_comparisons, &expected_comparisons)
+    } else {
+        results.dispatch_comparisons == expected_comparisons
+    };
+    if !comparisons_match {
         return Err(invalid_results(
             "dispatch_comparisons",
             "comparisons do not match same-repetition observed dispatch records",
@@ -1280,15 +1860,37 @@ pub fn validate_results_against_manifest(
     Ok(())
 }
 
+fn legacy_dispatch_comparisons_equivalent(
+    observed: &[DispatchComparison],
+    expected: &[DispatchComparison],
+) -> bool {
+    observed.len() == expected.len()
+        && observed.iter().zip(expected).all(|(observed, expected)| {
+            observed.left_profile_id == expected.left_profile_id
+                && observed.right_profile_id == expected.right_profile_id
+                && observed.repetition == expected.repetition
+                && observed.comparability == expected.comparability
+                && observed.execution_telemetry_comparability
+                    == ExecutionTelemetryComparability::Incomparable
+                && observed
+                    .unavailable_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("not_process_observable:"))
+        })
+}
+
 fn validate_observed_dispatch_record(
     record: &ObservedDispatchRecord,
     run_index: usize,
 ) -> Result<(), EvaluationError> {
     let field = format!("runs[{run_index}].observed_dispatch");
-    if record.roles.is_empty() && record.review_lenses.is_empty() {
+    if record.roles.is_empty()
+        && record.review_lenses.is_empty()
+        && record.supervisor_execution.is_none()
+    {
         return Err(invalid_results(
             field,
-            "must contain at least one observed role or review-lens selection",
+            "must contain at least one observed role, review-lens selection, or supervisor execution record",
         ));
     }
     if !is_strictly_sorted(&record.roles) {
@@ -1320,6 +1922,9 @@ fn validate_observed_dispatch_record(
         for model in &role.models {
             require_result_nonempty(&format!("{field}.roles.models"), model)?;
         }
+        if let Some(reasoning_effort) = &role.reasoning_effort {
+            require_result_nonempty(&format!("{field}.roles.reasoning_effort"), reasoning_effort)?;
+        }
     }
     let mut lens_ids = BTreeSet::new();
     for lens in &record.review_lenses {
@@ -1335,6 +1940,157 @@ fn validate_observed_dispatch_record(
             &lens.backend_id,
         )?;
         require_result_nonempty(&format!("{field}.review_lenses.model"), &lens.model)?;
+    }
+    if let Some(execution) = &record.supervisor_execution {
+        validate_normalized_supervisor_execution(execution, &field)?;
+        let expected_roles = execution
+            .role_bindings
+            .iter()
+            .filter_map(|binding| {
+                if binding.observation == RoleBindingObservation::RuntimeCatalogResolved {
+                    binding
+                        .resolved_model
+                        .as_ref()
+                        .map(|model| ObservedRoleDispatch {
+                            role: binding.role,
+                            models: vec![model.clone()],
+                            reasoning_effort: binding.resolved_reasoning_effort.clone(),
+                        })
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if record.roles != expected_roles {
+            return Err(invalid_results(
+                format!("{field}.roles"),
+                "must exactly project runtime_catalog_resolved supervisor role bindings",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_normalized_supervisor_execution(
+    execution: &ObservedSupervisorExecution,
+    field: &str,
+) -> Result<(), EvaluationError> {
+    if execution.schema_version != CONSUMED_SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION {
+        return Err(invalid_results(
+            format!("{field}.supervisor_execution.schema_version"),
+            format!(
+                "expected {}, got {}",
+                CONSUMED_SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION, execution.schema_version
+            ),
+        ));
+    }
+    if execution.started_assignment_count > execution.assignment_count
+        || execution.completed_assignment_count > execution.started_assignment_count
+    {
+        return Err(invalid_results(
+            format!("{field}.supervisor_execution"),
+            "assignment lifecycle counts are inconsistent",
+        ));
+    }
+    let concurrency = &execution.concurrency;
+    if concurrency.configured_max_concurrent_children == 0
+        || concurrency.achieved_max_concurrent_children
+            > concurrency.configured_max_concurrent_children
+        || concurrency.achieved_max_concurrent_children > execution.started_assignment_count
+        || (execution.started_assignment_count == 0)
+            != (concurrency.achieved_max_concurrent_children == 0)
+    {
+        return Err(invalid_results(
+            format!("{field}.supervisor_execution.concurrency"),
+            "configured, achieved, and started concurrency counts are inconsistent",
+        ));
+    }
+    validate_observed_value_marker(
+        "policy_input",
+        concurrency.policy_input_observation,
+        concurrency.policy_input.as_deref(),
+        concurrency.policy_input_unavailable_reason.as_deref(),
+    )
+    .map_err(|message| {
+        invalid_results(format!("{field}.supervisor_execution.concurrency"), message)
+    })?;
+    match (
+        concurrency.achieved_mean_observation,
+        concurrency.achieved_mean_concurrent_children,
+        concurrency.achieved_mean_unavailable_reason.as_deref(),
+    ) {
+        (ProcessObservation::SchedulerObserved, Some(mean), None)
+            if mean.is_finite()
+                && mean > 0.0
+                && mean <= concurrency.achieved_max_concurrent_children as f64 => {}
+        (
+            ProcessObservation::NotRetained | ProcessObservation::NotProcessObservable,
+            None,
+            Some(reason),
+        ) if !reason.trim().is_empty() => {}
+        _ => {
+            return Err(invalid_results(
+                format!("{field}.supervisor_execution.concurrency"),
+                "achieved mean value, observation, and unavailable reason are inconsistent",
+            ));
+        }
+    }
+    let expected_roles = [
+        AgentRole::Supervisor,
+        AgentRole::ChildOrchestrator,
+        AgentRole::Worker,
+        AgentRole::GateClassifier,
+        AgentRole::Auditor,
+    ];
+    if execution.role_bindings.len() != expected_roles.len()
+        || execution
+            .role_bindings
+            .iter()
+            .zip(expected_roles)
+            .any(|(binding, role)| binding.role != role)
+    {
+        return Err(invalid_results(
+            format!("{field}.supervisor_execution.role_bindings"),
+            "must cover every role once in canonical order",
+        ));
+    }
+    for binding in &execution.role_bindings {
+        if binding
+            .resolved_model
+            .as_deref()
+            .is_some_and(|model| model.trim().is_empty())
+            || binding
+                .resolved_reasoning_effort
+                .as_deref()
+                .is_some_and(|effort| effort.trim().is_empty())
+        {
+            return Err(invalid_results(
+                format!("{field}.supervisor_execution.role_bindings"),
+                "resolved model and reasoning effort must not be empty when present",
+            ));
+        }
+        if binding.observation == RoleBindingObservation::RuntimeCatalogResolved
+            && binding.resolved_model.is_none()
+        {
+            return Err(invalid_results(
+                format!("{field}.supervisor_execution.role_bindings"),
+                "runtime_catalog_resolved bindings require a resolved model",
+            ));
+        }
+    }
+    if let Some(usage) = execution.usage.total_usage {
+        if usage.input_tokens.checked_add(usage.output_tokens) != Some(usage.total_tokens) {
+            return Err(invalid_results(
+                format!("{field}.supervisor_execution.usage.total_usage"),
+                "total tokens must equal input plus output tokens",
+            ));
+        }
+    }
+    if let Some(cost) = execution.usage.total_cost_usd {
+        require_finite_nonnegative(
+            &format!("{field}.supervisor_execution.usage.total_cost_usd"),
+            cost,
+        )?;
     }
     Ok(())
 }
@@ -2459,6 +3215,11 @@ mod tests {
         include_str!("../tests/fixtures/model_mix_evaluation/runs-v1.json");
     const FIXTURE_SUMMARY: &str =
         include_str!("../tests/fixtures/model_mix_evaluation/summary-v1.json");
+    const SUPERVISOR_EXECUTION_V2: &[u8] =
+        include_bytes!("../tests/fixtures/model_mix_evaluation/supervisor-final-execution-v2.json");
+    const SUPERVISOR_EXECUTION_V1_LEGACY: &[u8] = include_bytes!(
+        "../tests/fixtures/model_mix_evaluation/supervisor-final-execution-v1-legacy.json"
+    );
 
     fn model(model: &str, reasoning_effort: &str) -> RoleModelSelection {
         RoleModelSelection {
@@ -2620,8 +3381,29 @@ mod tests {
         }
     }
 
+    fn complete_supervisor_execution_record() -> ObservedDispatchRecord {
+        observed_dispatch_record_from_supervisor_final_json(SUPERVISOR_EXECUTION_V2)
+            .expect("consume supervisor execution telemetry fixture")
+    }
+
+    fn supervisor_execution_record_with_model(model: &str) -> ObservedDispatchRecord {
+        let mut record = complete_supervisor_execution_record();
+        for role in &mut record.roles {
+            role.models = vec![model.to_string()];
+        }
+        for binding in &mut record
+            .supervisor_execution
+            .as_mut()
+            .expect("fixture execution")
+            .role_bindings
+        {
+            binding.resolved_model = Some(model.to_string());
+        }
+        record
+    }
+
     #[test]
-    fn different_complete_a4_observations_ground_only_a_dispatch_difference() {
+    fn legacy_a4_observations_are_incomparable_without_execution_v2() {
         let left = observed_dispatch_record_from_profile_binding(&complete_observed_binding(
             "observed-worker-a",
             "observed-review-a",
@@ -2635,12 +3417,265 @@ mod tests {
 
         assert_eq!(
             compare_observed_dispatch_records(Some(&left), Some(&right)),
-            RequirementFourComparability::DispatchGroundedSelectionsDiffer
+            RequirementFourComparability::Incomparable
         );
         let claim = DispatchComparabilityClaim::dispatch_only();
         assert_eq!(claim.scope, EvaluationComparabilityScope::Dispatch);
         assert!(!claim.provider_execution_difference_established);
         assert!(claim.notice.contains("does not establish"));
+    }
+
+    #[test]
+    fn supervisor_final_v2_is_consumed_without_configured_value_substitution() {
+        let record = complete_supervisor_execution_record();
+        let execution = record
+            .supervisor_execution
+            .as_ref()
+            .expect("normalized supervisor execution");
+
+        assert_eq!(execution.schema_version, 2);
+        assert_eq!(execution.assignment_count, 2);
+        assert_eq!(execution.started_assignment_count, 2);
+        assert_eq!(execution.completed_assignment_count, 2);
+        assert_eq!(execution.concurrency.configured_max_concurrent_children, 2);
+        assert_eq!(execution.concurrency.achieved_max_concurrent_children, 2);
+        assert_eq!(
+            execution.concurrency.achieved_mean_concurrent_children,
+            Some(1.75)
+        );
+        assert_eq!(execution.role_bindings.len(), 5);
+        let worker = execution
+            .role_bindings
+            .iter()
+            .find(|binding| binding.role == AgentRole::Worker)
+            .expect("worker binding");
+        assert_eq!(worker.resolved_model.as_deref(), Some("gpt-fixture"));
+        assert_eq!(worker.resolved_reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(
+            execution.usage.total_usage,
+            Some(Usage {
+                input_tokens: 1_200,
+                output_tokens: 300,
+                total_tokens: 1_500,
+            })
+        );
+        assert_eq!(execution.usage.total_cost_usd, Some(0.0125));
+        assert!(execution.usage.usage_complete);
+    }
+
+    #[test]
+    fn execution_and_resolved_selection_axes_compare_separately() {
+        let left = complete_supervisor_execution_record();
+        let mut usage_difference = left.clone();
+        usage_difference
+            .supervisor_execution
+            .as_mut()
+            .expect("execution")
+            .usage
+            .total_cost_usd = Some(0.02);
+        assert_eq!(
+            compare_observed_dispatch_records(Some(&left), Some(&usage_difference)),
+            RequirementFourComparability::DispatchGroundedSelectionsEquivalent
+        );
+        assert_eq!(
+            compare_observed_supervisor_execution(
+                left.supervisor_execution.as_ref(),
+                usage_difference.supervisor_execution.as_ref(),
+            ),
+            ExecutionTelemetryComparability::Different
+        );
+
+        let different_selection = supervisor_execution_record_with_model("other-resolved-model");
+        assert_eq!(
+            compare_observed_dispatch_records(Some(&left), Some(&different_selection)),
+            RequirementFourComparability::DispatchGroundedSelectionsDiffer
+        );
+        assert_eq!(
+            compare_observed_supervisor_execution(
+                left.supervisor_execution.as_ref(),
+                different_selection.supervisor_execution.as_ref(),
+            ),
+            ExecutionTelemetryComparability::Different
+        );
+    }
+
+    #[test]
+    fn legacy_or_incomplete_execution_metadata_is_incomparable() {
+        let valid = complete_supervisor_execution_record();
+        let identical_artifacts =
+            compare_supervisor_final_artifacts(SUPERVISOR_EXECUTION_V2, SUPERVISOR_EXECUTION_V2);
+        assert_eq!(
+            identical_artifacts.comparability,
+            RequirementFourComparability::DispatchGroundedSelectionsEquivalent
+        );
+        assert_eq!(
+            identical_artifacts.execution_telemetry_comparability,
+            ExecutionTelemetryComparability::Equivalent
+        );
+        let legacy_error =
+            observed_dispatch_record_from_supervisor_final_json(SUPERVISOR_EXECUTION_V1_LEGACY)
+                .expect_err("legacy profile must not acquire configured-value observations");
+        assert!(legacy_error.contains("unsupported supervisor execution telemetry schema 1"));
+        let legacy_comparison = compare_supervisor_final_artifacts(
+            SUPERVISOR_EXECUTION_V1_LEGACY,
+            SUPERVISOR_EXECUTION_V2,
+        );
+        assert_eq!(
+            legacy_comparison.comparability,
+            RequirementFourComparability::Incomparable
+        );
+        assert_eq!(
+            legacy_comparison.execution_telemetry_comparability,
+            ExecutionTelemetryComparability::Incomparable
+        );
+        assert!(legacy_comparison
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("schema 1")));
+        assert_eq!(
+            compare_observed_dispatch_records(None, Some(&valid)),
+            RequirementFourComparability::Incomparable
+        );
+
+        let mut incomplete_usage = valid.clone();
+        let usage = &mut incomplete_usage
+            .supervisor_execution
+            .as_mut()
+            .expect("execution")
+            .usage;
+        usage.usage_complete = false;
+        usage.total_cost_usd = None;
+        usage.unavailable_reason = Some("pricing was not process-observable".to_string());
+        assert_eq!(
+            compare_observed_dispatch_records(Some(&valid), Some(&incomplete_usage)),
+            RequirementFourComparability::DispatchGroundedSelectionsEquivalent
+        );
+        assert_eq!(
+            compare_observed_supervisor_execution(
+                valid.supervisor_execution.as_ref(),
+                incomplete_usage.supervisor_execution.as_ref(),
+            ),
+            ExecutionTelemetryComparability::Incomparable
+        );
+    }
+
+    #[test]
+    fn unresolved_runtime_binding_remains_explicit_and_incomparable() {
+        let valid = complete_supervisor_execution_record();
+        let mut document: Value =
+            serde_json::from_slice(SUPERVISOR_EXECUTION_V2).expect("parse v2 fixture");
+        let worker =
+            &mut document["role_economics_profile"]["execution"]["role_bindings"]["worker"];
+        worker["resolved_model"] = Value::Null;
+        worker["observation"] = json!("runtime_default_resolved");
+        worker["unavailable_reason"] = json!("concrete model slug was not process-observable");
+        let bytes = serde_json::to_vec(&document).expect("serialize unresolved fixture");
+        let unresolved = observed_dispatch_record_from_supervisor_final_json(&bytes)
+            .expect("explicit unresolved markers remain consumable");
+
+        assert!(!unresolved
+            .roles
+            .iter()
+            .any(|role| role.role == AgentRole::Worker));
+        let worker_binding = unresolved
+            .supervisor_execution
+            .as_ref()
+            .expect("execution")
+            .role_bindings
+            .iter()
+            .find(|binding| binding.role == AgentRole::Worker)
+            .expect("worker marker");
+        assert_eq!(worker_binding.resolved_model, None);
+        assert_eq!(
+            worker_binding.observation,
+            RoleBindingObservation::RuntimeDefaultResolved
+        );
+        assert_eq!(
+            compare_observed_dispatch_records(Some(&valid), Some(&unresolved)),
+            RequirementFourComparability::Incomparable
+        );
+
+        let mut missing_effort_document: Value =
+            serde_json::from_slice(SUPERVISOR_EXECUTION_V2).expect("parse v2 fixture");
+        missing_effort_document["role_economics_profile"]["execution"]["role_bindings"]["worker"]
+            ["resolved_reasoning_effort"] = Value::Null;
+        let missing_effort_bytes =
+            serde_json::to_vec(&missing_effort_document).expect("serialize missing effort fixture");
+        let missing_effort =
+            observed_dispatch_record_from_supervisor_final_json(&missing_effort_bytes)
+                .expect("explicit null effort remains retained");
+        assert_eq!(
+            missing_effort
+                .supervisor_execution
+                .as_ref()
+                .expect("execution")
+                .role_bindings
+                .iter()
+                .find(|binding| binding.role == AgentRole::Worker)
+                .expect("worker binding")
+                .resolved_reasoning_effort,
+            None
+        );
+        assert_eq!(
+            compare_observed_dispatch_records(Some(&valid), Some(&missing_effort)),
+            RequirementFourComparability::Incomparable
+        );
+        assert_eq!(
+            compare_observed_supervisor_execution(
+                valid.supervisor_execution.as_ref(),
+                missing_effort.supervisor_execution.as_ref(),
+            ),
+            ExecutionTelemetryComparability::Incomparable
+        );
+    }
+
+    #[test]
+    fn public_comparators_reject_malformed_normalized_records() {
+        let valid = complete_supervisor_execution_record();
+        let mut malformed = valid.clone();
+        let execution = malformed
+            .supervisor_execution
+            .as_mut()
+            .expect("fixture execution");
+        execution.schema_version = 1;
+        assert_eq!(
+            compare_observed_dispatch_records(Some(&malformed), Some(&malformed)),
+            RequirementFourComparability::Incomparable
+        );
+        assert_eq!(
+            compare_observed_supervisor_execution(
+                malformed.supervisor_execution.as_ref(),
+                malformed.supervisor_execution.as_ref(),
+            ),
+            ExecutionTelemetryComparability::Incomparable
+        );
+
+        let mut duplicate_roles = valid.clone();
+        let bindings = &mut duplicate_roles
+            .supervisor_execution
+            .as_mut()
+            .expect("fixture execution")
+            .role_bindings;
+        bindings[0].role = AgentRole::Worker;
+        assert_eq!(
+            compare_observed_dispatch_records(Some(&duplicate_roles), Some(&duplicate_roles)),
+            RequirementFourComparability::Incomparable
+        );
+
+        let mut invalid_cost = valid;
+        invalid_cost
+            .supervisor_execution
+            .as_mut()
+            .expect("fixture execution")
+            .usage
+            .total_cost_usd = Some(f64::NAN);
+        assert_eq!(
+            compare_observed_supervisor_execution(
+                invalid_cost.supervisor_execution.as_ref(),
+                invalid_cost.supervisor_execution.as_ref(),
+            ),
+            ExecutionTelemetryComparability::Incomparable
+        );
     }
 
     #[test]
@@ -2650,6 +3685,7 @@ mod tests {
             right_profile_id: "right".to_string(),
             repetition: 0,
             comparability: RequirementFourComparability::DispatchGroundedSelectionsEquivalent,
+            execution_telemetry_comparability: ExecutionTelemetryComparability::Equivalent,
             unavailable_reason: None,
         }];
 
@@ -2677,6 +3713,7 @@ mod tests {
         unsorted_roles.roles.push(ObservedRoleDispatch {
             role: AgentRole::ChildOrchestrator,
             models: vec!["observed-orchestrator".to_string()],
+            reasoning_effort: None,
         });
         unsorted_roles.roles.sort();
         unsorted_roles.roles.reverse();
@@ -2722,12 +3759,7 @@ mod tests {
             } else {
                 "observed-b"
             };
-            run.observed_dispatch = Some(
-                observed_dispatch_record_from_profile_binding(&complete_observed_binding(
-                    model, model,
-                ))
-                .expect("complete observed dispatch"),
-            );
+            run.observed_dispatch = Some(supervisor_execution_record_with_model(model));
         }
         results.runs[0].observed_dispatch = None;
 
@@ -2761,13 +3793,7 @@ mod tests {
             } else {
                 "observed-b"
             };
-            run.observed_dispatch = Some(
-                observed_dispatch_record_from_profile_binding(&complete_observed_binding(
-                    observed_model,
-                    observed_model,
-                ))
-                .expect("complete forged dispatch record"),
-            );
+            run.observed_dispatch = Some(supervisor_execution_record_with_model(observed_model));
         }
 
         results.dispatch_comparisons =
@@ -3383,6 +4409,43 @@ mod tests {
         let error = serde_json::from_value::<EvaluationResults>(invalid_finding)
             .expect_err("unknown Finding fields fail closed");
         assert!(error.to_string().contains("unknown field"));
+
+        let mut supervisor_record = serde_json::to_value(complete_supervisor_execution_record())
+            .expect("serialize supervisor execution record");
+        supervisor_record["supervisor_execution"]["usage"]["total_usage"]
+            ["unexpected_usage_field"] = json!(true);
+        let error = serde_json::from_value::<ObservedDispatchRecord>(supervisor_record)
+            .expect_err("unknown supervisor execution usage fields fail closed");
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn legacy_results_without_execution_telemetry_read_as_incomparable() {
+        let manifest = manifest();
+        let results = run_fake(&manifest, 7).expect("current fake results");
+        let mut legacy_json = serde_json::to_value(&results).expect("serialize results");
+        legacy_json["version"] = json!(LEGACY_EVALUATION_RESULTS_SCHEMA_VERSION);
+        for comparison in legacy_json["dispatch_comparisons"]
+            .as_array_mut()
+            .expect("comparison array")
+        {
+            comparison
+                .as_object_mut()
+                .expect("comparison object")
+                .remove("execution_telemetry_comparability");
+            comparison["unavailable_reason"] = json!(
+                "not_process_observable: one or both runs lack a complete observed dispatch record"
+            );
+        }
+        let legacy = serde_json::from_value::<EvaluationResults>(legacy_json)
+            .expect("read legacy v2 results");
+        assert!(legacy.dispatch_comparisons.iter().all(|comparison| {
+            comparison.execution_telemetry_comparability
+                == ExecutionTelemetryComparability::Incomparable
+        }));
+        legacy
+            .validate_against(&manifest)
+            .expect("legacy v2 results remain readable and explicitly incomparable");
     }
 
     #[test]

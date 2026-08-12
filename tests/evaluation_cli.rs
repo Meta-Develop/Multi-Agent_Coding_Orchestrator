@@ -51,7 +51,15 @@ fn evaluation_cli_runs_committed_fake_manifest_as_json_without_cwd_writes() -> R
         .as_array()
         .context("dispatch comparisons array")?
         .iter()
-        .all(|comparison| comparison["comparability"] == "incomparable"));
+        .all(|comparison| {
+            comparison["comparability"] == "incomparable"
+                && comparison["execution_telemetry_comparability"] == "incomparable"
+                && comparison["unavailable_reason"]
+                    .as_str()
+                    .is_some_and(|reason| {
+                        reason.contains("supervisor execution telemetry schema v2")
+                    })
+        }));
     assert!(results["pareto_frontier"]
         .as_array()
         .context("Pareto frontier array")?
