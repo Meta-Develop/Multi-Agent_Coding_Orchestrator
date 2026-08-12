@@ -3,7 +3,8 @@ use super::*;
 /// Admission policy for concurrently runnable supervisor children.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SupervisorConcurrencyPolicy {
-    /// Use the same measured, cgroup-aware process capacity as strict systemd containment.
+    /// Use the conservative network-bound child default before quota and host-resource inputs
+    /// are composed by admission preflight.
     ///
     /// The issue #24 swarm-health circuit breaker remains the admission safety backstop: higher
     /// default fan-out never bypasses its pre-dispatch check or active-child drain behavior.
