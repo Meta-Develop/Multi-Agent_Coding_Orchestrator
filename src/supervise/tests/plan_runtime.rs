@@ -1470,6 +1470,46 @@ fn ordered_catalog_chain_selects_first_available_model_with_typed_observation() 
 }
 
 #[test]
+fn ordered_catalog_chain_rejects_invalid_profile_data_during_plan_load() {
+    for (label, chain, expected) in [
+        (
+            "empty",
+            json!({"models": [], "on_exhausted": "runtime_default"}),
+            "must contain at least one model",
+        ),
+        (
+            "whitespace",
+            json!({"models": [" gpt-5.6-sol"], "on_exhausted": "runtime_default"}),
+            "must be non-empty and trimmed",
+        ),
+        (
+            "duplicate fallback",
+            json!({"models": ["gpt-5.6-terra", "gpt-5.6-terra"], "on_exhausted": "runtime_default"}),
+            "contains duplicate model",
+        ),
+        (
+            "repeated primary",
+            json!({"models": ["gpt-5.6-luna"], "on_exhausted": "runtime_default"}),
+            "repeats configured model",
+        ),
+    ] {
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&bounded_loader_plan_json()).expect("base plan JSON");
+        document["role_models"] = json!({
+            "worker": {
+                "model": "gpt-5.6-luna",
+                "unavailable_model_fallback": {"ordered_catalog_chain": chain}
+            }
+        });
+        let error = format!(
+            "{:#}",
+            parse_supervisor_plan_with_consultant(&document.to_string()).expect_err(label)
+        );
+        assert!(error.contains(expected), "{label}: {error}");
+    }
+}
+
+#[test]
 fn gate_classifier_override_and_unavailable_fallback_are_independent() {
     let mut plan = parse_supervisor_plan_with_consultant(
         std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),

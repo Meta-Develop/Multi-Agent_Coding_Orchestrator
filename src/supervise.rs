@@ -483,7 +483,7 @@ pub struct OrderedCatalogFallback {
 }
 
 impl OrderedCatalogFallback {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, configured_model: Option<&str>) -> Result<()> {
         if self.models.is_empty() {
             bail!("ordered model fallback chain must contain at least one model");
         }
@@ -494,6 +494,9 @@ impl OrderedCatalogFallback {
             }
             if !models.insert(model) {
                 bail!("ordered model fallback chain contains duplicate model '{model}'");
+            }
+            if configured_model == Some(model.as_str()) {
+                bail!("ordered model fallback chain repeats configured model '{model}'");
             }
         }
         Ok(())
@@ -602,11 +605,8 @@ impl RuntimeModelCatalog {
         let mut candidates = configured.model.iter().cloned().collect::<Vec<_>>();
         let terminal = match &configured.unavailable_model_fallback {
             UnavailableModelFallback::OrderedCatalogChain(chain) => {
-                chain.validate()?;
+                chain.validate(configured.model.as_deref())?;
                 for model in &chain.models {
-                    if candidates.contains(model) {
-                        bail!("ordered model fallback chain repeats configured model '{model}'");
-                    }
                     candidates.push(model.clone());
                 }
                 chain.on_exhausted
@@ -681,7 +681,7 @@ impl RuntimeModelCatalog {
     }
 }
 
-const SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION: u32 = 2;
+const SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct RoleEconomicsProfile {
@@ -800,6 +800,15 @@ const fn default_role_economics_profile_schema_version() -> u32 {
 }
 
 impl RoleModelSelection {
+    fn validate_model_fallback(&self) -> Result<()> {
+        if let UnavailableModelFallback::OrderedCatalogChain(chain) =
+            &self.unavailable_model_fallback
+        {
+            chain.validate(self.model.as_deref())?;
+        }
+        Ok(())
+    }
+
     fn configured_model_chain(&self) -> Vec<String> {
         let mut models = self.model.iter().cloned().collect::<Vec<_>>();
         if let UnavailableModelFallback::OrderedCatalogChain(chain) =

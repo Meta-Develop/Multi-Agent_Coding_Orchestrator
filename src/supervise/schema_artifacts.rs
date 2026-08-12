@@ -99,7 +99,8 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
         "type": "object",
         "additionalProperties": false,
         "required": [
-            "resolved_model", "resolved_reasoning_effort", "observation"
+            "resolved_model", "resolved_reasoning_effort", "observation",
+            "resolution_observation"
         ],
         "properties": {
             "configured_model": {"type": "string"},

@@ -244,6 +244,11 @@ pub(super) fn parse_supervisor_plan_with_consultant(
     let consultant = consultant_from_plan_value(&value)?;
     let mut plan: SupervisorPlan =
         serde_json::from_value(value.clone()).context("supervisor plan fields are invalid")?;
+    for (role, selection) in &plan.role_models {
+        selection
+            .validate_model_fallback()
+            .with_context(|| format!("role_models.{} fallback is invalid", role.as_str()))?;
+    }
     let plan_metadata = supervisor_plan_metadata_from_value(&value, plan.max_depth)?;
     plan.assignments = assignments_from_plan_value(&value)?;
     let (plan, plan_metadata) = validate_supervisor_plan(plan, plan_metadata)?;
