@@ -1,4 +1,5 @@
 use crate::{
+    llm::{LlmProvider, LlmRequest, LlmResponse, PromptContext, Redactor, RequestBudget, Usage},
     repo_semantic,
     safe_state::{
         BoundedTreeEntry, BoundedTreeEntryKind, BoundedTreeWalkAction, BoundedTreeWalkLimits,
@@ -10,6 +11,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
+    fmt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -25,6 +27,10 @@ const TASK_PROPOSAL_MAX_ASSIGNMENTS: usize = 128;
 const TASK_PROPOSAL_MAX_SCOPE_ITEMS_PER_ASSIGNMENT: usize = 4096;
 const TASK_PROPOSAL_MAX_TOTAL_SCOPE_ITEMS: usize = 16_384;
 const TASK_PROPOSAL_MAX_REPORTED_CONFLICTS: usize = 4096;
+const PROVIDER_PLANNING_MAX_FEEDBACK_ITEMS: usize = 128;
+const PROVIDER_PLANNING_MAX_FEEDBACK_ITEM_BYTES: usize = 16 * 1024;
+const PROVIDER_PLANNING_MAX_TOTAL_FEEDBACK_BYTES: usize = 256 * 1024;
+pub const MAX_PROVIDER_REPLANS: usize = 2;
 #[cfg(not(test))]
 const REPOSITORY_INVENTORY_MAX_DURATION: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -115,6 +121,116 @@ pub struct TaskDecompositionProposal {
     pub coverage_gaps: Vec<TaskCoverageGap>,
     pub diagnostics: TaskPathProposalDiagnostics,
     pub disjointness: TaskDisjointnessReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ProviderTaskPlan {
+    pub assignments: Vec<TaskAssignmentProposal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ProviderPlanningConfig {
+    pub request_id_prefix: String,
+    pub model: String,
+}
+
+impl ProviderPlanningConfig {
+    pub fn new(request_id_prefix: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            request_id_prefix: request_id_prefix.into(),
+            model: model.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TaskExecutionFeedback {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_assignment_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_assignment_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage_gap_fragment_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPlanningSource {
+    Heuristic,
+    Provider,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskPlanningSession {
+    proposal: TaskDecompositionProposal,
+    source: TaskPlanningSource,
+    provider_id: Option<String>,
+    model: Option<String>,
+    provider_usage: Usage,
+    replans_used: usize,
+    completed_fragment_ids: BTreeSet<String>,
+}
+
+impl TaskPlanningSession {
+    pub fn proposal(&self) -> &TaskDecompositionProposal {
+        &self.proposal
+    }
+
+    pub fn into_proposal(self) -> TaskDecompositionProposal {
+        self.proposal
+    }
+
+    pub fn source(&self) -> TaskPlanningSource {
+        self.source
+    }
+
+    pub fn provider_id(&self) -> Option<&str> {
+        self.provider_id.as_deref()
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    pub fn provider_usage(&self) -> Usage {
+        self.provider_usage
+    }
+
+    pub fn replans_used(&self) -> usize {
+        self.replans_used
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct FanOutWidthWarning {
+    pub code: String,
+    pub configured_max_child_assignments: usize,
+    pub independent_scope_count: usize,
+    pub message: String,
+}
+
+impl fmt::Display for FanOutWidthWarning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+pub fn fan_out_width_warning(
+    max_child_assignments: usize,
+    independent_scope_count: usize,
+) -> Option<FanOutWidthWarning> {
+    (max_child_assignments == 1 && independent_scope_count > 1).then(|| {
+        FanOutWidthWarning {
+            code: "planning_width_pinned_to_one".to_string(),
+            configured_max_child_assignments: max_child_assignments,
+            independent_scope_count,
+            message: format!(
+                "max_child_assignments is pinned to 1 despite {independent_scope_count} independent scopes; this plan serializes work that can fan out"
+            ),
+        }
+    })
 }
 
 struct NormalizedTaskScope {
@@ -410,7 +526,14 @@ pub fn propose_task_decomposition(
     let mut candidates = Vec::new();
     let mut coverage_gaps = Vec::new();
     for fragment in &fragments {
-        let candidate = propose_fragment_scope(fragment, &files, &file_set, semantic_map.as_ref());
+        let proposed = propose_fragment_scope(fragment, &files, &file_set, semantic_map.as_ref());
+        let candidate = proposed.assignment;
+        if proposed.suppressed_broad_paths > 0 {
+            diagnostics.notes.push(format!(
+                "{} preferred exact symbol implementation scope and suppressed {} broader module/declaration path match(es)",
+                fragment.id, proposed.suppressed_broad_paths
+            ));
+        }
         if candidate.assigned_paths.is_empty()
             && candidate.semantic_symbols.is_empty()
             && candidate.semantic_modules.is_empty()
@@ -461,25 +584,564 @@ pub fn propose_task_decomposition(
     })
 }
 
+pub fn propose_task_decomposition_with_optional_provider(
+    repo: &Path,
+    title: &str,
+    body: &str,
+    provider: Option<&mut dyn LlmProvider>,
+    config: &ProviderPlanningConfig,
+) -> Result<TaskPlanningSession> {
+    match provider {
+        Some(provider) => {
+            propose_task_decomposition_with_provider(repo, title, body, provider, config)
+        }
+        None => Ok(TaskPlanningSession {
+            proposal: propose_task_decomposition(repo, title, body)?,
+            source: TaskPlanningSource::Heuristic,
+            provider_id: None,
+            model: None,
+            provider_usage: Usage::default(),
+            replans_used: 0,
+            completed_fragment_ids: BTreeSet::new(),
+        }),
+    }
+}
+
+pub fn propose_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
+    repo: &Path,
+    title: &str,
+    body: &str,
+    provider: &mut P,
+    config: &ProviderPlanningConfig,
+) -> Result<TaskPlanningSession> {
+    validate_provider_planning_config(config)?;
+    let fragments = task_spec_fragments(title, body)?;
+    let files = collect_repo_files(repo)?;
+    let allowed_fragment_ids = fragments
+        .iter()
+        .map(|fragment| fragment.id.clone())
+        .collect::<BTreeSet<_>>();
+    let payload = serde_json::json!({
+        "operation": "propose",
+        "response_schema": {
+            "assignments": [{
+                "id": "non-empty unique string",
+                "task": "bounded implementation task",
+                "fragment_ids": ["fragment-001"],
+                "assigned_paths": ["repository/relative/file"],
+                "semantic_symbols": ["crate::module::symbol"],
+                "semantic_modules": ["crate::module"]
+            }]
+        },
+        "requirements": [
+            "Return only the JSON object in WorkProposal.summary.",
+            "Use only supplied fragment ids and repository file paths.",
+            "Every assignment must own at least one file.",
+            "Assignment paths and semantic scopes must be pairwise disjoint."
+        ],
+        "fragments": fragments,
+        "repository_paths": files,
+    });
+    let request_id = format!("{}-proposal", config.request_id_prefix.trim());
+    let response = complete_provider_planning_request(
+        provider,
+        config,
+        request_id,
+        "provider task decomposition",
+        payload,
+    )?;
+    let provider_plan = parse_provider_task_plan(&response, "provider task decomposition")?;
+    let mut proposal = validated_provider_proposal(
+        fragments,
+        provider_plan,
+        &allowed_fragment_ids,
+        &files,
+        "provider task decomposition",
+    )?;
+    append_provider_diagnostics(&mut proposal.diagnostics, &response, "initial proposal");
+
+    Ok(TaskPlanningSession {
+        proposal,
+        source: TaskPlanningSource::Provider,
+        provider_id: Some(response.provider_id),
+        model: Some(response.model),
+        provider_usage: response.usage,
+        replans_used: 0,
+        completed_fragment_ids: BTreeSet::new(),
+    })
+}
+
+pub fn replan_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
+    repo: &Path,
+    session: &mut TaskPlanningSession,
+    feedback: &TaskExecutionFeedback,
+    provider: &mut P,
+    config: &ProviderPlanningConfig,
+) -> Result<()> {
+    validate_provider_planning_config(config)?;
+    if session.replans_used >= MAX_PROVIDER_REPLANS {
+        anyhow::bail!(
+            "provider re-planning limit of {MAX_PROVIDER_REPLANS} attempt(s) has been exhausted"
+        );
+    }
+    let normalized_feedback =
+        normalize_execution_feedback(feedback, &session.proposal, &session.completed_fragment_ids)?;
+    let newly_completed_fragment_ids = session
+        .proposal
+        .assignments
+        .iter()
+        .filter(|assignment| {
+            normalized_feedback
+                .completed_assignment_ids
+                .contains(&assignment.id)
+        })
+        .flat_map(|assignment| assignment.fragment_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if let Some(overlap) = newly_completed_fragment_ids
+        .intersection(&normalized_feedback.coverage_gap_fragment_ids)
+        .next()
+    {
+        anyhow::bail!(
+            "execution feedback marks newly completed fragment '{overlap}' as a coverage gap"
+        );
+    }
+    session
+        .completed_fragment_ids
+        .extend(newly_completed_fragment_ids);
+    let allowed_fragment_ids = session
+        .proposal
+        .fragments
+        .iter()
+        .map(|fragment| fragment.id.clone())
+        .filter(|fragment_id| !session.completed_fragment_ids.contains(fragment_id))
+        .collect::<BTreeSet<_>>();
+    if allowed_fragment_ids.is_empty() {
+        anyhow::bail!("provider re-planning has no remaining incomplete fragments");
+    }
+
+    let files = collect_repo_files(repo)?;
+    let next_attempt = session.replans_used.saturating_add(1);
+    let request_id = format!(
+        "{}-replan-{next_attempt:02}",
+        config.request_id_prefix.trim()
+    );
+    let payload = serde_json::json!({
+        "operation": "replan",
+        "attempt": next_attempt,
+        "max_attempts": MAX_PROVIDER_REPLANS,
+        "requirements": [
+            "Revise only incomplete fragments using the execution feedback.",
+            "Return only a ProviderTaskPlan JSON object in WorkProposal.summary.",
+            "Every assignment must own at least one supplied repository file.",
+            "Assignment paths and semantic scopes must be pairwise disjoint."
+        ],
+        "fragments": session.proposal.fragments,
+        "remaining_fragment_ids": allowed_fragment_ids,
+        "completed_fragment_ids": session.completed_fragment_ids,
+        "current_proposal": session.proposal,
+        "execution_feedback": normalized_feedback,
+        "repository_paths": files,
+    });
+
+    session.replans_used = next_attempt;
+    let response = complete_provider_planning_request(
+        provider,
+        config,
+        request_id,
+        "provider task re-planning",
+        payload,
+    )?;
+    let provider_plan = parse_provider_task_plan(&response, "provider task re-planning")?;
+    let mut proposal = validated_provider_proposal(
+        session.proposal.fragments.clone(),
+        provider_plan,
+        &allowed_fragment_ids,
+        &files,
+        "provider task re-planning",
+    )?;
+    append_provider_diagnostics(
+        &mut proposal.diagnostics,
+        &response,
+        &format!("re-plan attempt {next_attempt}"),
+    );
+    session.source = TaskPlanningSource::Provider;
+    session.provider_id = Some(response.provider_id);
+    session.model = Some(response.model);
+    session.provider_usage = session.provider_usage.saturating_add(response.usage);
+    session.proposal = proposal;
+    Ok(())
+}
+
+fn validate_provider_planning_config(config: &ProviderPlanningConfig) -> Result<()> {
+    if config.request_id_prefix.trim().is_empty() {
+        anyhow::bail!("provider planning request_id_prefix cannot be empty");
+    }
+    if config.model.trim().is_empty() {
+        anyhow::bail!("provider planning model cannot be empty");
+    }
+    Ok(())
+}
+
+fn complete_provider_planning_request<P: LlmProvider + ?Sized>(
+    provider: &mut P,
+    config: &ProviderPlanningConfig,
+    request_id: String,
+    operation: &str,
+    payload: serde_json::Value,
+) -> Result<LlmResponse> {
+    let task = format!(
+        "{operation}. Deterministic MACO validation is authoritative; do not propose commands or patches.\n{}",
+        serde_json::to_string(&payload).context("failed to serialize provider planning input")?
+    );
+    let budget = RequestBudget::default();
+    let mut context = PromptContext::new(task, "supervisor-planner");
+    context.budget = budget;
+    context.provider_capabilities = provider.capabilities();
+    let prompt = context.assemble_prompt(&Redactor::new());
+    if prompt.render().len() > budget.max_input_chars {
+        anyhow::bail!(
+            "{operation} prompt exceeds its {} character provider boundary",
+            budget.max_input_chars
+        );
+    }
+    let mut request =
+        LlmRequest::new(request_id.clone(), config.model.trim(), prompt).with_budget(budget);
+    request
+        .metadata
+        .insert("planning_operation".to_string(), operation.to_string());
+    let response = provider.complete(request).with_context(|| {
+        format!(
+            "provider '{}' failed during {operation}",
+            provider.provider_id()
+        )
+    })?;
+    if response.request_id != request_id {
+        anyhow::bail!(
+            "{operation} response request id '{}' does not match '{}'",
+            response.request_id,
+            request_id
+        );
+    }
+    if !response.proposal.commands.is_empty() || !response.proposal.patches.is_empty() {
+        anyhow::bail!("{operation} response must not contain commands or patches");
+    }
+    Ok(response)
+}
+
+fn parse_provider_task_plan(response: &LlmResponse, operation: &str) -> Result<ProviderTaskPlan> {
+    serde_json::from_str(&response.proposal.summary).with_context(|| {
+        format!("{operation} response summary is not a ProviderTaskPlan JSON object")
+    })
+}
+
+fn validated_provider_proposal(
+    fragments: Vec<TaskSpecFragment>,
+    provider_plan: ProviderTaskPlan,
+    allowed_fragment_ids: &BTreeSet<String>,
+    files: &[PathBuf],
+    operation: &str,
+) -> Result<TaskDecompositionProposal> {
+    if provider_plan.assignments.is_empty() {
+        anyhow::bail!("{operation} returned no actionable assignments");
+    }
+    let file_set = files.iter().cloned().collect::<BTreeSet<_>>();
+    let mut referenced_fragment_ids = BTreeSet::new();
+    let mut total_task_bytes = 0usize;
+    let mut assignments = Vec::with_capacity(provider_plan.assignments.len());
+    for mut assignment in provider_plan.assignments {
+        assignment.id = assignment.id.trim().to_string();
+        assignment.task = assignment.task.trim().to_string();
+        if assignment.task.is_empty() {
+            anyhow::bail!(
+                "{operation} assignment '{}' has an empty task",
+                assignment.id
+            );
+        }
+        if assignment.task.len() > TASK_SPEC_MAX_FRAGMENT_BYTES {
+            anyhow::bail!(
+                "{operation} assignment '{}' task contains {} bytes but at most {} are allowed",
+                assignment.id,
+                assignment.task.len(),
+                TASK_SPEC_MAX_FRAGMENT_BYTES
+            );
+        }
+        total_task_bytes = total_task_bytes
+            .checked_add(assignment.task.len())
+            .context("provider planning task byte count overflowed")?;
+        if total_task_bytes > TASK_SPEC_MAX_TOTAL_BYTES {
+            anyhow::bail!(
+                "{operation} assignment tasks exceed their {TASK_SPEC_MAX_TOTAL_BYTES}-byte aggregate limit"
+            );
+        }
+        if assignment.fragment_ids.is_empty() {
+            anyhow::bail!(
+                "{operation} assignment '{}' must reference at least one fragment",
+                assignment.id
+            );
+        }
+        let mut assignment_fragment_ids = BTreeSet::new();
+        for fragment_id in assignment.fragment_ids {
+            let fragment_id = fragment_id.trim().to_string();
+            if !allowed_fragment_ids.contains(&fragment_id) {
+                anyhow::bail!(
+                    "{operation} assignment '{}' references unavailable fragment '{}'",
+                    assignment.id,
+                    fragment_id
+                );
+            }
+            if !assignment_fragment_ids.insert(fragment_id.clone()) {
+                anyhow::bail!(
+                    "{operation} assignment '{}' repeats fragment '{}'",
+                    assignment.id,
+                    fragment_id
+                );
+            }
+            if !referenced_fragment_ids.insert(fragment_id.clone()) {
+                anyhow::bail!(
+                    "{operation} maps fragment '{}' to more than one assignment",
+                    fragment_id
+                );
+            }
+        }
+        assignment.fragment_ids = assignment_fragment_ids.into_iter().collect();
+        let assigned_paths = assignment
+            .assigned_paths
+            .iter()
+            .map(normalize_repo_relative_path)
+            .collect::<std::result::Result<BTreeSet<_>, _>>()
+            .with_context(|| {
+                format!(
+                    "{operation} assignment '{}' has an invalid path",
+                    assignment.id
+                )
+            })?;
+        if assigned_paths.is_empty() {
+            anyhow::bail!(
+                "{operation} assignment '{}' must own at least one repository file",
+                assignment.id
+            );
+        }
+        if let Some(unknown) = assigned_paths.iter().find(|path| !file_set.contains(*path)) {
+            anyhow::bail!(
+                "{operation} assignment '{}' references repository path '{}' that is not an inventoried file",
+                assignment.id,
+                unknown.display()
+            );
+        }
+        assignment.assigned_paths = collapse_covered_paths(assigned_paths);
+        assignment.semantic_symbols = assignment
+            .semantic_symbols
+            .iter()
+            .map(|value| normalize_semantic_value(value))
+            .collect::<Result<BTreeSet<_>>>()?
+            .into_iter()
+            .collect();
+        assignment.semantic_modules = assignment
+            .semantic_modules
+            .iter()
+            .map(|value| normalize_semantic_value(value))
+            .collect::<Result<BTreeSet<_>>>()?
+            .into_iter()
+            .collect();
+        assignments.push(assignment);
+    }
+    validate_task_assignment_disjointness(&assignments)
+        .with_context(|| format!("{operation} assignments failed disjointness validation"))?;
+    let disjointness = task_assignment_disjointness(&assignments)?;
+    let coverage_gaps = fragments
+        .iter()
+        .filter(|fragment| {
+            allowed_fragment_ids.contains(&fragment.id)
+                && !referenced_fragment_ids.contains(&fragment.id)
+        })
+        .map(|fragment| TaskCoverageGap {
+            fragment_id: fragment.id.clone(),
+            kind: TaskCoverageGapKind::UnmatchedScope,
+            message: format!("{operation} did not assign this incomplete fragment"),
+        })
+        .collect();
+    Ok(TaskDecompositionProposal {
+        fragments,
+        assignments,
+        coverage_gaps,
+        diagnostics: TaskPathProposalDiagnostics::default(),
+        disjointness,
+    })
+}
+
+fn append_provider_diagnostics(
+    diagnostics: &mut TaskPathProposalDiagnostics,
+    response: &LlmResponse,
+    phase: &str,
+) {
+    diagnostics.notes.push(format!(
+        "provider '{}' model '{}' supplied {phase} using {} token(s)",
+        response.provider_id, response.model, response.usage.total_tokens
+    ));
+    diagnostics.notes.extend(
+        response
+            .proposal
+            .notes
+            .iter()
+            .map(|note| format!("provider note: {note}")),
+    );
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct NormalizedTaskExecutionFeedback {
+    completed_assignment_ids: BTreeSet<String>,
+    failed_assignment_ids: BTreeSet<String>,
+    coverage_gap_fragment_ids: BTreeSet<String>,
+    notes: Vec<String>,
+}
+
+fn normalize_execution_feedback(
+    feedback: &TaskExecutionFeedback,
+    proposal: &TaskDecompositionProposal,
+    completed_fragment_ids: &BTreeSet<String>,
+) -> Result<NormalizedTaskExecutionFeedback> {
+    let item_count = feedback
+        .completed_assignment_ids
+        .len()
+        .checked_add(feedback.failed_assignment_ids.len())
+        .and_then(|count| count.checked_add(feedback.coverage_gap_fragment_ids.len()))
+        .and_then(|count| count.checked_add(feedback.notes.len()))
+        .context("execution feedback item count overflowed")?;
+    if item_count == 0 {
+        anyhow::bail!("provider re-planning requires at least one execution feedback item");
+    }
+    if item_count > PROVIDER_PLANNING_MAX_FEEDBACK_ITEMS {
+        anyhow::bail!(
+            "execution feedback contains {item_count} items but at most {PROVIDER_PLANNING_MAX_FEEDBACK_ITEMS} are allowed"
+        );
+    }
+    let mut total_bytes = 0usize;
+    for item in feedback
+        .completed_assignment_ids
+        .iter()
+        .chain(&feedback.failed_assignment_ids)
+        .chain(&feedback.coverage_gap_fragment_ids)
+        .chain(&feedback.notes)
+    {
+        if item.len() > PROVIDER_PLANNING_MAX_FEEDBACK_ITEM_BYTES {
+            anyhow::bail!(
+                "execution feedback item contains {} bytes but at most {} are allowed",
+                item.len(),
+                PROVIDER_PLANNING_MAX_FEEDBACK_ITEM_BYTES
+            );
+        }
+        total_bytes = total_bytes
+            .checked_add(item.len())
+            .context("execution feedback byte count overflowed")?;
+        if total_bytes > PROVIDER_PLANNING_MAX_TOTAL_FEEDBACK_BYTES {
+            anyhow::bail!(
+                "execution feedback exceeds its {PROVIDER_PLANNING_MAX_TOTAL_FEEDBACK_BYTES}-byte aggregate limit"
+            );
+        }
+    }
+    let known_assignment_ids = proposal
+        .assignments
+        .iter()
+        .map(|assignment| assignment.id.clone())
+        .collect::<BTreeSet<_>>();
+    let declared_fragment_ids = proposal
+        .fragments
+        .iter()
+        .map(|fragment| fragment.id.clone())
+        .collect::<BTreeSet<_>>();
+    let completed_assignment_ids = normalize_feedback_ids(
+        &feedback.completed_assignment_ids,
+        &known_assignment_ids,
+        "completed assignment",
+    )?;
+    let failed_assignment_ids = normalize_feedback_ids(
+        &feedback.failed_assignment_ids,
+        &known_assignment_ids,
+        "failed assignment",
+    )?;
+    if let Some(overlap) = completed_assignment_ids
+        .intersection(&failed_assignment_ids)
+        .next()
+    {
+        anyhow::bail!("execution feedback marks assignment '{overlap}' both completed and failed");
+    }
+    let coverage_gap_fragment_ids = normalize_feedback_ids(
+        &feedback.coverage_gap_fragment_ids,
+        &declared_fragment_ids,
+        "coverage gap fragment",
+    )?;
+    if let Some(completed) = coverage_gap_fragment_ids
+        .iter()
+        .find(|fragment_id| completed_fragment_ids.contains(*fragment_id))
+    {
+        anyhow::bail!(
+            "execution feedback reports completed fragment '{completed}' as a coverage gap"
+        );
+    }
+    let notes = feedback
+        .notes
+        .iter()
+        .map(|note| note.trim())
+        .filter(|note| !note.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if completed_assignment_ids.is_empty()
+        && failed_assignment_ids.is_empty()
+        && coverage_gap_fragment_ids.is_empty()
+        && notes.is_empty()
+    {
+        anyhow::bail!("provider re-planning requires non-empty normalized execution feedback");
+    }
+    Ok(NormalizedTaskExecutionFeedback {
+        completed_assignment_ids,
+        failed_assignment_ids,
+        coverage_gap_fragment_ids,
+        notes,
+    })
+}
+
+fn normalize_feedback_ids(
+    values: &[String],
+    known_values: &BTreeSet<String>,
+    label: &str,
+) -> Result<BTreeSet<String>> {
+    let mut normalized = BTreeSet::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            anyhow::bail!("execution feedback {label} id cannot be empty");
+        }
+        if !known_values.contains(value) {
+            anyhow::bail!("execution feedback names unknown {label} '{value}'");
+        }
+        if !normalized.insert(value.to_string()) {
+            anyhow::bail!("execution feedback repeats {label} '{value}'");
+        }
+    }
+    Ok(normalized)
+}
+
 fn propose_fragment_scope(
     fragment: &TaskSpecFragment,
     files: &[PathBuf],
     file_set: &BTreeSet<PathBuf>,
     semantic_map: Option<&repo_semantic::SemanticRepoMap>,
-) -> TaskAssignmentProposal {
+) -> ProposedFragmentScope {
     let lowered = fragment.text.to_ascii_lowercase();
     let normalized_text = normalize_text(&fragment.text);
-    let mut assigned_paths = BTreeSet::new();
+    let mut explicit_paths = BTreeSet::new();
+    let mut broad_semantic_paths = BTreeSet::new();
+    let mut exact_symbol_paths = BTreeSet::new();
     let mut semantic_symbols = BTreeSet::new();
     let mut semantic_modules = BTreeSet::new();
 
     for file in files {
         let display = file.to_string_lossy().to_ascii_lowercase();
         if contains_path_mention(&lowered, &display) {
-            assigned_paths.insert(file.clone());
+            explicit_paths.insert(file.clone());
         }
     }
-    propose_docs_paths(&normalized_text, file_set, &mut assigned_paths);
+    propose_docs_paths(&normalized_text, file_set, &mut explicit_paths);
 
     if let Some(map) = semantic_map {
         for file in &map.files {
@@ -487,10 +1149,10 @@ fn propose_fragment_scope(
                 continue;
             }
             if identifier_matches(&normalized_text, &file.path) {
-                assigned_paths.insert(file.path.clone());
+                broad_semantic_paths.insert(file.path.clone());
             }
             if module_matches(&normalized_text, &file.module_path) {
-                assigned_paths.insert(file.path.clone());
+                broad_semantic_paths.insert(file.path.clone());
                 semantic_modules.insert(file.module_path.join("::"));
             }
         }
@@ -501,11 +1163,12 @@ fn propose_fragment_scope(
             {
                 continue;
             }
-            assigned_paths.insert(symbol.file.clone());
             let qualified = symbol.qualified_path.join("::");
             if symbol.kind == repo_semantic::SemanticSymbolKind::Module {
+                broad_semantic_paths.insert(symbol.file.clone());
                 semantic_modules.insert(qualified);
             } else {
+                exact_symbol_paths.insert(symbol.file.clone());
                 semantic_symbols.insert(qualified);
             }
         }
@@ -517,19 +1180,40 @@ fn propose_fragment_scope(
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
                 && identifier_matches(&normalized_text, file)
             {
-                assigned_paths.insert(file.clone());
+                broad_semantic_paths.insert(file.clone());
             }
         }
     }
 
-    TaskAssignmentProposal {
-        id: fragment.id.clone(),
-        task: fragment.text.clone(),
-        fragment_ids: vec![fragment.id.clone()],
-        assigned_paths: collapse_covered_paths(assigned_paths),
-        semantic_symbols: semantic_symbols.into_iter().collect(),
-        semantic_modules: semantic_modules.into_iter().collect(),
+    let suppressed_broad_paths = if exact_symbol_paths.is_empty() {
+        explicit_paths.extend(broad_semantic_paths);
+        0
+    } else {
+        let suppressed = broad_semantic_paths
+            .difference(&exact_symbol_paths)
+            .filter(|path| !explicit_paths.contains(*path))
+            .count();
+        explicit_paths.extend(exact_symbol_paths);
+        semantic_modules.clear();
+        suppressed
+    };
+
+    ProposedFragmentScope {
+        assignment: TaskAssignmentProposal {
+            id: fragment.id.clone(),
+            task: fragment.text.clone(),
+            fragment_ids: vec![fragment.id.clone()],
+            assigned_paths: collapse_covered_paths(explicit_paths),
+            semantic_symbols: semantic_symbols.into_iter().collect(),
+            semantic_modules: semantic_modules.into_iter().collect(),
+        },
+        suppressed_broad_paths,
     }
+}
+
+struct ProposedFragmentScope {
+    assignment: TaskAssignmentProposal,
+    suppressed_broad_paths: usize,
 }
 
 fn module_matches(normalized_text: &str, module_path: &[String]) -> bool {
@@ -1120,6 +1804,7 @@ fn collapse_covered_paths(paths: BTreeSet<PathBuf>) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::FakeProvider;
     use std::fs;
 
     const CONTENTION_RESILIENT_INVENTORY_DURATION: Duration = Duration::from_secs(600);
@@ -1305,6 +1990,22 @@ mod tests {
         }
     }
 
+    fn provider_assignment(
+        id: &str,
+        task: &str,
+        fragment_id: &str,
+        path: &str,
+    ) -> TaskAssignmentProposal {
+        TaskAssignmentProposal {
+            id: id.to_string(),
+            task: task.to_string(),
+            fragment_ids: vec![fragment_id.to_string()],
+            assigned_paths: vec![PathBuf::from(path)],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+        }
+    }
+
     #[test]
     fn task_assignment_disjointness_detects_equal_and_hierarchical_paths() {
         let assignments = vec![
@@ -1405,6 +2106,264 @@ mod tests {
     }
 
     #[test]
+    fn fan_out_width_warning_is_loud_only_for_a_serialized_independent_plan() {
+        let warning = fan_out_width_warning(1, 3).expect("width warning");
+
+        assert_eq!(warning.code, "planning_width_pinned_to_one");
+        assert_eq!(warning.configured_max_child_assignments, 1);
+        assert_eq!(warning.independent_scope_count, 3);
+        assert_eq!(
+            warning.to_string(),
+            "max_child_assignments is pinned to 1 despite 3 independent scopes; this plan serializes work that can fan out"
+        );
+        assert!(fan_out_width_warning(4, 3).is_none());
+        assert!(fan_out_width_warning(1, 1).is_none());
+    }
+
+    #[test]
+    fn optional_provider_uses_heuristic_fallback_when_unconfigured() {
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "src/alpha.rs", "pub fn alpha_task() {}\n");
+            write_file(repo, "src/beta.rs", "pub fn beta_task() {}\n");
+            let config = ProviderPlanningConfig::new("fallback", "unused-model");
+
+            let fallback = propose_task_decomposition_with_optional_provider(
+                repo,
+                "",
+                "- Update alpha_task.\n- Update beta_task.",
+                None,
+                &config,
+            )
+            .expect("heuristic fallback");
+            let heuristic =
+                propose_task_decomposition(repo, "", "- Update alpha_task.\n- Update beta_task.")
+                    .expect("heuristic proposal");
+
+            assert_eq!(fallback.source(), TaskPlanningSource::Heuristic);
+            assert_eq!(fallback.proposal(), &heuristic);
+            assert_eq!(fallback.provider_usage(), Usage::default());
+            assert_eq!(fallback.replans_used(), 0);
+        });
+    }
+
+    #[test]
+    fn fake_provider_proposes_a_validated_disjoint_plan() {
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "src/alpha.rs", "pub fn alpha_task() {}\n");
+            write_file(repo, "src/beta.rs", "pub fn beta_task() {}\n");
+            let config = ProviderPlanningConfig::new("fake-planning", "planner-model");
+            let provider_plan = ProviderTaskPlan {
+                assignments: vec![
+                    provider_assignment(
+                        "provider-alpha",
+                        "Update alpha implementation",
+                        "fragment-001",
+                        "src/alpha.rs",
+                    ),
+                    provider_assignment(
+                        "provider-beta",
+                        "Update beta implementation",
+                        "fragment-002",
+                        "src/beta.rs",
+                    ),
+                ],
+            };
+            let mut provider = FakeProvider::new("fake-planner", "planner-model");
+            provider
+                .push_json_response("fake-planning-proposal", &provider_plan)
+                .expect("script provider plan");
+
+            let session = propose_task_decomposition_with_optional_provider(
+                repo,
+                "",
+                "- Update alpha behavior.\n- Update beta behavior.",
+                Some(&mut provider),
+                &config,
+            )
+            .expect("provider proposal");
+
+            assert_eq!(session.source(), TaskPlanningSource::Provider);
+            assert_eq!(session.provider_id(), Some("fake-planner"));
+            assert_eq!(session.model(), Some("planner-model"));
+            assert_eq!(session.proposal().assignments, provider_plan.assignments);
+            assert!(session.proposal().disjointness.disjoint);
+            validate_task_assignment_disjointness(&session.proposal().assignments)
+                .expect("same deterministic disjointness authority");
+            assert_eq!(provider.calls().len(), 1);
+            assert_eq!(
+                provider.calls()[0].metadata["planning_operation"],
+                "provider task decomposition"
+            );
+            let rendered_prompt = provider.calls()[0].prompt.render();
+            assert!(rendered_prompt.contains("src/alpha.rs"));
+            assert!(rendered_prompt.contains("fragment-002"));
+            println!(
+                "provider_plan_demo assignments={} disjoint={} calls={} tokens={}",
+                session.proposal().assignments.len(),
+                session.proposal().disjointness.disjoint,
+                provider.calls().len(),
+                session.provider_usage().total_tokens
+            );
+        });
+    }
+
+    #[test]
+    fn provider_plan_rejects_overlapping_assignments() {
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "src/shared.rs", "pub fn shared() {}\n");
+            let config = ProviderPlanningConfig::new("overlap", "planner-model");
+            let provider_plan = ProviderTaskPlan {
+                assignments: vec![
+                    provider_assignment(
+                        "left",
+                        "Update left behavior",
+                        "fragment-001",
+                        "src/shared.rs",
+                    ),
+                    provider_assignment(
+                        "right",
+                        "Update right behavior",
+                        "fragment-002",
+                        "src/shared.rs",
+                    ),
+                ],
+            };
+            let mut provider = FakeProvider::new("fake-planner", "planner-model");
+            provider
+                .push_json_response("overlap-proposal", &provider_plan)
+                .expect("script provider plan");
+
+            let error = propose_task_decomposition_with_provider(
+                repo,
+                "",
+                "- Update left behavior.\n- Update right behavior.",
+                &mut provider,
+                &config,
+            )
+            .expect_err("overlapping provider assignments must fail");
+
+            assert!(error.to_string().contains("failed disjointness validation"));
+        });
+    }
+
+    #[test]
+    fn fake_provider_replans_from_feedback_with_a_hard_attempt_limit() {
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "src/alpha.rs", "pub fn alpha_task() {}\n");
+            write_file(repo, "src/beta.rs", "pub fn beta_task() {}\n");
+            write_file(repo, "src/gamma.rs", "pub fn gamma_task() {}\n");
+            let config = ProviderPlanningConfig::new("feedback", "planner-model");
+            let initial = ProviderTaskPlan {
+                assignments: vec![
+                    provider_assignment("alpha", "Update alpha", "fragment-001", "src/alpha.rs"),
+                    provider_assignment("beta", "Update beta", "fragment-002", "src/beta.rs"),
+                ],
+            };
+            let first_replan = ProviderTaskPlan {
+                assignments: vec![provider_assignment(
+                    "beta-revised",
+                    "Move the failing beta work to the discovered implementation",
+                    "fragment-002",
+                    "src/gamma.rs",
+                )],
+            };
+            let second_replan = ProviderTaskPlan {
+                assignments: vec![provider_assignment(
+                    "beta-final",
+                    "Retry beta with the corrected scope",
+                    "fragment-002",
+                    "src/beta.rs",
+                )],
+            };
+            let mut provider = FakeProvider::new("fake-planner", "planner-model");
+            provider
+                .push_json_response("feedback-proposal", &initial)
+                .expect("script initial plan")
+                .push_json_response("feedback-replan-01", &first_replan)
+                .expect("script first re-plan")
+                .push_json_response("feedback-replan-02", &second_replan)
+                .expect("script second re-plan");
+            let mut session = propose_task_decomposition_with_provider(
+                repo,
+                "",
+                "- Update alpha behavior.\n- Update beta behavior.",
+                &mut provider,
+                &config,
+            )
+            .expect("initial provider plan");
+            let first_feedback = TaskExecutionFeedback {
+                completed_assignment_ids: vec!["alpha".to_string()],
+                failed_assignment_ids: vec!["beta".to_string()],
+                coverage_gap_fragment_ids: vec!["fragment-002".to_string()],
+                notes: vec!["execution found the implementation in gamma".to_string()],
+            };
+
+            replan_task_decomposition_with_provider(
+                repo,
+                &mut session,
+                &first_feedback,
+                &mut provider,
+                &config,
+            )
+            .expect("first feedback re-plan");
+
+            assert_eq!(session.replans_used(), 1);
+            assert_eq!(session.proposal().assignments, first_replan.assignments);
+            assert!(session.proposal().disjointness.disjoint);
+            let first_replan_prompt = provider.calls()[1].prompt.render();
+            assert!(first_replan_prompt.contains("execution found the implementation in gamma"));
+            assert!(first_replan_prompt.contains("fragment-001"));
+            assert!(first_replan_prompt.contains("completed_assignment_ids"));
+
+            let second_feedback = TaskExecutionFeedback {
+                failed_assignment_ids: vec!["beta-revised".to_string()],
+                notes: vec!["validation still fails".to_string()],
+                ..TaskExecutionFeedback::default()
+            };
+            replan_task_decomposition_with_provider(
+                repo,
+                &mut session,
+                &second_feedback,
+                &mut provider,
+                &config,
+            )
+            .expect("second feedback re-plan");
+            assert_eq!(session.replans_used(), MAX_PROVIDER_REPLANS);
+            assert_eq!(session.proposal().assignments, second_replan.assignments);
+
+            let limit_error = replan_task_decomposition_with_provider(
+                repo,
+                &mut session,
+                &second_feedback,
+                &mut provider,
+                &config,
+            )
+            .expect_err("third re-plan must be rejected");
+            assert!(limit_error.to_string().contains("limit of 2 attempt"));
+            assert_eq!(provider.calls().len(), 3);
+            println!(
+                "provider_replan_demo replans={} final_paths={:?} calls={} limit={}",
+                session.replans_used(),
+                session.proposal().assignments[0].assigned_paths,
+                provider.calls().len(),
+                MAX_PROVIDER_REPLANS
+            );
+        });
+    }
+
+    #[test]
     fn propose_task_decomposition_is_deterministic_and_exposes_coverage_and_intents() {
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
@@ -1447,17 +2406,12 @@ mod tests {
             assert_eq!(proposal.assignments[0].fragment_ids, vec!["fragment-002"]);
             assert_eq!(
                 proposal.assignments[0].assigned_paths,
-                vec![
-                    PathBuf::from("src/lib.rs"),
-                    PathBuf::from("src/planning.rs")
-                ]
+                vec![PathBuf::from("src/planning.rs")]
             );
             assert!(proposal.assignments[0]
                 .semantic_symbols
                 .contains(&"crate::planning::propose_task_paths".to_string()));
-            assert!(proposal.assignments[0]
-                .semantic_modules
-                .contains(&"crate::planning".to_string()));
+            assert!(proposal.assignments[0].semantic_modules.is_empty());
             assert_eq!(proposal.assignments[1].id, "assignment-002");
             assert_eq!(
                 proposal.assignments[1].assigned_paths,
@@ -1476,6 +2430,66 @@ mod tests {
             );
             assert!(proposal.disjointness.disjoint);
             assert!(proposal.disjointness.conflicts.is_empty());
+            assert!(proposal.diagnostics.notes.iter().any(|note| {
+                note.contains("fragment-002 preferred exact symbol implementation scope")
+            }));
+        });
+    }
+
+    #[test]
+    fn exact_symbol_scope_avoids_a_shared_megafile_module_attractor() {
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "src/lib.rs", "pub mod giant;\n");
+            write_file(
+                repo,
+                "src/giant.rs",
+                "pub mod alpha;\npub mod beta;\n// large shared module root\n",
+            );
+            write_file(repo, "src/giant/alpha.rs", "pub fn alpha_task() {}\n");
+            write_file(repo, "src/giant/beta.rs", "pub fn beta_task() {}\n");
+
+            let proposal = propose_task_decomposition(
+                repo,
+                "",
+                "- Update alpha_task in giant alpha.\n- Repair beta_task in giant beta.",
+            )
+            .expect("propose decomposition");
+
+            assert_eq!(proposal.assignments.len(), 2);
+            assert_eq!(
+                proposal.assignments[0].assigned_paths,
+                vec![PathBuf::from("src/giant/alpha.rs")]
+            );
+            assert_eq!(
+                proposal.assignments[1].assigned_paths,
+                vec![PathBuf::from("src/giant/beta.rs")]
+            );
+            assert!(proposal.assignments.iter().all(|assignment| !assignment
+                .assigned_paths
+                .contains(&PathBuf::from("src/giant.rs"))));
+            assert!(proposal.disjointness.disjoint);
+            assert_eq!(
+                proposal
+                    .diagnostics
+                    .notes
+                    .iter()
+                    .filter(|note| note.contains("preferred exact symbol implementation scope"))
+                    .count(),
+                2
+            );
+            println!(
+                "megafile_attractor_demo assignments={} paths={:?} disjoint={}",
+                proposal.assignments.len(),
+                proposal
+                    .assignments
+                    .iter()
+                    .map(|assignment| assignment.assigned_paths.clone())
+                    .collect::<Vec<_>>(),
+                proposal.disjointness.disjoint
+            );
         });
     }
 
