@@ -413,6 +413,7 @@ fn assert_issue33_dev_unanchored_failure<const N: usize>(
 ) -> Result<()> {
     let blocked = Command::new(BIN)
         .args(args)
+        .env("RUST_BACKTRACE", "0")
         .output()
         .with_context(|| context.to_string())?;
     assert!(!blocked.status.success());
