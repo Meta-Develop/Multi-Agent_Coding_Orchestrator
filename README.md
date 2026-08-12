@@ -1029,6 +1029,7 @@ parity.
 Run the CI-equivalent Linux and repository-portability gates with:
 
 ```bash
+export CARGO_INCREMENTAL=0
 nix develop path:$PWD -c rustc --version --verbose
 nix develop path:$PWD -c cargo --version --verbose
 nix develop path:$PWD -c cargo clippy --version
@@ -1040,11 +1041,19 @@ nix develop path:$PWD -c cargo clippy --locked --all-targets -- -D warnings
 nix develop path:$PWD -c cargo test --locked --all-targets
 ```
 
-This reproduces the Linux CI toolchain and tracked-path portability gate. It
-cannot compile or link target-specific code on actual macOS or Windows runners.
+Full verification is a one-shot sweep, so CI and this recipe disable Cargo's
+incremental cache; ordinary edit/build cycles retain Cargo's default incremental
+behavior. This reproduces the Linux CI toolchain and tracked-path portability
+gate. It cannot compile or link target-specific code on actual macOS or Windows runners.
 Before treating a branch as fully CI-green, push it or open a draft pull request
 and wait for both the `macos-latest` and `windows-latest` `portable-build` jobs;
 a draft pull request is the cheapest honest way to close that residual gap.
+
+GitHub-hosted Linux runners do not provide the delegated systemd user manager
+required by strict containment. On such a runner, CI prints one `SKIP <test>:
+<reason>` line and job notice for every exact containment-dependent test listed
+in the workflow, then runs every other test normally. A Linux runner inside a
+delegated user manager receives no filters and runs the complete suite.
 
 The Nix development shell also pins the supply-chain tools through
 `flake.lock`. Audit the exact Cargo lockfile and enforce the repository policy
