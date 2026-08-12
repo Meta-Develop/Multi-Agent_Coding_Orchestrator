@@ -966,6 +966,7 @@ parity.
 Run the CI-equivalent Linux and repository-portability gates with:
 
 ```bash
+export CARGO_INCREMENTAL=0
 nix develop path:$PWD -c rustc --version --verbose
 nix develop path:$PWD -c cargo --version --verbose
 nix develop path:$PWD -c cargo clippy --version
@@ -977,8 +978,10 @@ nix develop path:$PWD -c cargo clippy --locked --all-targets -- -D warnings
 nix develop path:$PWD -c cargo test --locked --all-targets
 ```
 
-This reproduces the Linux CI toolchain and tracked-path portability gate. It
-cannot compile or link target-specific code on actual macOS or Windows runners.
+Full verification is a one-shot sweep, so CI and this recipe disable Cargo's
+incremental cache; ordinary edit/build cycles retain Cargo's default incremental
+behavior. This reproduces the Linux CI toolchain and tracked-path portability
+gate. It cannot compile or link target-specific code on actual macOS or Windows runners.
 Before treating a branch as fully CI-green, push it or open a draft pull request
 and wait for both the `macos-latest` and `windows-latest` `portable-build` jobs;
 a draft pull request is the cheapest honest way to close that residual gap.

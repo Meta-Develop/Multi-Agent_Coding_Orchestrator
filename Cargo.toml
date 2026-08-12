@@ -65,3 +65,9 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 criterion = "0.8.2"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
