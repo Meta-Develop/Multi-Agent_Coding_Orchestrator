@@ -1368,10 +1368,14 @@ explicit target: a cargo/rustc/rustdoc/sccache-like process with a `cwd` inside
 the lane protects the default Cargo target, while a process `cwd`, executable,
 or readable file descriptor inside the target is live. File descriptors are
 read with `readlink`; recognized non-filesystem `pipe`, `socket`, `anon_inode`,
-and synthetic `memfd` targets are skipped, while deleted filesystem links under
-the target still protect it. Environment,
-command-line, cwd, executable, file-descriptor, bound, read, or timeout failures
-are unknown, not clear. A live match is reported as `live_target`; an incomplete,
+and synthetic `memfd` or `dmabuf` targets are skipped, while deleted filesystem
+links under the target still protect it. Environment, command-line, cwd,
+executable, file-descriptor, bound, read, or timeout failures are unknown, not
+clear for a possible build process. Linux user-manager helpers, non-build
+systemd user services, and non-build processes with a readable command line but
+an unreadable mount namespace are skipped because they do not execute build
+work themselves; any cargo/rustc descendant remains a separately scanned
+process. A live match is reported as `live_target`; an incomplete,
 oversized, timed-out, or unreconciled scan is reported as
 `target_liveness_unknown`, and both refuse deletion. Reports include bounded
 typed PID, source, and cause evidence in JSON and human output.
@@ -1422,6 +1426,17 @@ function. In particular, `<repo>/.maco/worktrees` is not adopted as that
 repository's managed root because its creation default is
 `<repo-parent>/.maco/worktrees/<repo>`; sweep the parent workspace for that
 layout, or use the separately validated `<repo>/.worktrees` convention.
+
+Repository-local dry-runs also preview healthy Git-registered lanes that predate
+the authenticated MACO worktree registry. A stale linked-worktree child cannot
+override the exact primary-repository association used to discover that root.
+When the host cannot open legacy MACO state safely, the root remains a typed
+`failed` result, but the nested dry-run report still classifies registered lanes
+and exposes exact untracked paths, byte estimates, merge state, and target
+liveness. The fallback status probe is read-only and ignores ignored files, like
+ordinary `git status`; it exists only to make legacy lanes visible. It never
+grants apply-mode removal authority: destructive sweep still requires a valid
+authenticated MACO binding and safe private state.
 
 Perform explicitly authorized force cleanup and delete a MACO-owned branch:
 

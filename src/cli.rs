@@ -5328,6 +5328,7 @@ fn worktree_gc_status_label(status: WorktreeGcStatus) -> &'static str {
 fn worktree_gc_reason_label(reason: WorktreeGcReason) -> &'static str {
     match reason {
         WorktreeGcReason::FinishedBranch => "finished-branch",
+        WorktreeGcReason::UnmergedBranch => "unmerged-branch",
         WorktreeGcReason::RetentionKeep => "retention-keep",
         WorktreeGcReason::ExcludedCurrentWorktree => "excluded-current-worktree",
         WorktreeGcReason::Dirty => "dirty",

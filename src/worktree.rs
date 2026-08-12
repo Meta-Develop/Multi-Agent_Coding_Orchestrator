@@ -33,8 +33,8 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use git2::{
-    Branch, BranchType, ErrorCode, ObjectType, Oid, Repository, RepositoryInitOptions, Transaction,
-    WorktreeAddOptions, WorktreeLockStatus,
+    Branch, BranchType, ErrorCode, ObjectType, Oid, Repository, RepositoryInitOptions, Status,
+    StatusOptions, Transaction, WorktreeAddOptions, WorktreeLockStatus,
 };
 use serde::{Deserialize, Serialize, Serializer};
 use std::{
@@ -370,6 +370,7 @@ pub enum WorktreeGcStatus {
 #[serde(rename_all = "snake_case")]
 pub enum WorktreeGcReason {
     FinishedBranch,
+    UnmergedBranch,
     RetentionKeep,
     ExcludedCurrentWorktree,
     Dirty,
@@ -2896,7 +2897,50 @@ pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<Worktr
             machine_global_retention: None,
         });
         match gc_result {
-            Ok(gc_report) => {
+            Ok(mut gc_report) => {
+                if dry_run && root_kind == WorktreeSweepRootKind::RepositoryLocal {
+                    let excluded_names = gc_report
+                        .entries
+                        .iter()
+                        .map(|entry| entry.name.clone())
+                        .collect::<BTreeSet<_>>();
+                    match preview_registered_repository_local_worktrees(
+                        &repository,
+                        &group_root,
+                        &options,
+                        &excluded_names,
+                    ) {
+                        Ok(preview) => merge_worktree_gc_preview(&mut gc_report, preview)?,
+                        Err(error) => {
+                            add_sweep_gc_counts(&mut report, &gc_report)?;
+                            report.repository_gc_failed_count = report
+                                .repository_gc_failed_count
+                                .checked_add(1)
+                                .context("workspace sweep GC failure count overflowed")?;
+                            report.repository_failure_count = report
+                                .repository_failure_count
+                                .checked_add(1)
+                                .context("workspace sweep repository failure count overflowed")?;
+                            report.repositories.push(WorktreeSweepRepositoryReport {
+                                group,
+                                root_kind,
+                                worktree_root: group_root,
+                                repository: Some(repository),
+                                status: WorktreeSweepRepositoryStatus::Failed,
+                                gc_attempted: true,
+                                effects_may_have_occurred: false,
+                                failure: Some(WorktreeSweepFailure {
+                                    kind: WorktreeSweepFailureKind::GarbageCollection,
+                                    message: format!(
+                                        "repository-local registered-worktree preview failed: {error:#}"
+                                    ),
+                                }),
+                                gc_report: Some(gc_report),
+                            });
+                            continue;
+                        }
+                    }
+                }
                 add_sweep_gc_counts(&mut report, &gc_report)?;
                 report.repository_inspected_count = report
                     .repository_inspected_count
@@ -2915,6 +2959,23 @@ pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<Worktr
                 });
             }
             Err(error) => {
+                let preview_result =
+                    if dry_run && root_kind == WorktreeSweepRootKind::RepositoryLocal {
+                        Some(preview_registered_repository_local_worktrees(
+                            &repository,
+                            &group_root,
+                            &options,
+                            &BTreeSet::new(),
+                        ))
+                    } else {
+                        None
+                    };
+                let preview = preview_result
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok());
+                if let Some(preview) = preview {
+                    add_sweep_gc_counts(&mut report, preview)?;
+                }
                 report.repository_gc_failed_count = report
                     .repository_gc_failed_count
                     .checked_add(1)
@@ -2930,12 +2991,17 @@ pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<Worktr
                     repository: Some(repository),
                     status: WorktreeSweepRepositoryStatus::Failed,
                     gc_attempted: true,
-                    effects_may_have_occurred: true,
+                    effects_may_have_occurred: !dry_run,
                     failure: Some(WorktreeSweepFailure {
                         kind: WorktreeSweepFailureKind::GarbageCollection,
-                        message: format!("{error:#}"),
+                        message: match preview_result.as_ref() {
+                            Some(Err(preview_error)) => format!(
+                                "{error:#}; repository-local registered-worktree preview also failed: {preview_error:#}"
+                            ),
+                            _ => format!("{error:#}"),
+                        },
                     }),
-                    gc_report: None,
+                    gc_report: preview.cloned(),
                 });
             }
         }
@@ -3158,6 +3224,403 @@ fn add_sweep_gc_counts(sweep: &mut WorktreeSweepReport, gc: &WorktreeGcReport) -
     Ok(())
 }
 
+fn merge_worktree_gc_preview(
+    report: &mut WorktreeGcReport,
+    mut preview: WorktreeGcReport,
+) -> Result<()> {
+    report.considered_count = report
+        .considered_count
+        .checked_add(preview.considered_count)
+        .context("worktree GC considered count overflowed")?;
+    report.removed_count = report
+        .removed_count
+        .checked_add(preview.removed_count)
+        .context("worktree GC removed count overflowed")?;
+    report.protected_count = report
+        .protected_count
+        .checked_add(preview.protected_count)
+        .context("worktree GC protected count overflowed")?;
+    report.retained_count = report
+        .retained_count
+        .checked_add(preview.retained_count)
+        .context("worktree GC retained count overflowed")?;
+    report.target_removed_count = report
+        .target_removed_count
+        .checked_add(preview.target_removed_count)
+        .context("worktree GC target count overflowed")?;
+    report.orphan_removed_count = report
+        .orphan_removed_count
+        .checked_add(preview.orphan_removed_count)
+        .context("worktree GC orphan count overflowed")?;
+    report.apparent_considered_bytes = report
+        .apparent_considered_bytes
+        .checked_add(preview.apparent_considered_bytes)
+        .context("worktree GC apparent considered bytes overflowed")?;
+    report.estimated_reclaimable_bytes = report
+        .estimated_reclaimable_bytes
+        .checked_add(preview.estimated_reclaimable_bytes)
+        .context("worktree GC estimated reclaimable bytes overflowed")?;
+    report.estimated_reclaimed_bytes = report
+        .estimated_reclaimed_bytes
+        .checked_add(preview.estimated_reclaimed_bytes)
+        .context("worktree GC estimated reclaimed bytes overflowed")?;
+    report.entries.append(&mut preview.entries);
+    report.entries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(())
+}
+
+struct RegisteredWorktreePreviewCandidate {
+    name: String,
+    branch: Option<String>,
+    branch_merged: bool,
+    path: PathBuf,
+    created_at_unix_nanos: i64,
+    untracked_paths: Vec<PathBuf>,
+    size: WorktreeGcSizeEstimate,
+}
+
+/// Classifies Git-registered repository-local lanes that predate the
+/// authenticated MACO registry. This path is deliberately preview-only: it
+/// makes legacy disk usage visible without granting destructive authority from
+/// pathnames alone. Apply mode continues to require an authenticated binding.
+fn preview_registered_repository_local_worktrees(
+    repository: &Path,
+    worktree_root: &Path,
+    options: &WorktreeSweepOptions,
+    excluded_names: &BTreeSet<String>,
+) -> Result<WorktreeGcReport> {
+    let allowed_untracked_paths =
+        normalize_gc_allowed_untracked_paths(&options.allowed_untracked_paths)?;
+    let repo = Repository::open(repository)
+        .with_context(|| format!("failed to open repository {}", repository.display()))?;
+    let worktree_root = fs::canonicalize(worktree_root).with_context(|| {
+        format!(
+            "failed to resolve repository-local worktree root {}",
+            worktree_root.display()
+        )
+    })?;
+    require_plain_directory(&worktree_root, "repository-local worktree root")?;
+    let primary_head = repo
+        .head()
+        .context("repository-local preview requires a committed primary HEAD")?
+        .peel_to_commit()
+        .context("repository-local primary HEAD is not a commit")?
+        .id();
+    let now = unix_now_nanos()?;
+    let mut report = WorktreeGcReport {
+        dry_run: true,
+        remove_targets: options.remove_targets,
+        targets_only: options.targets_only,
+        max_age_seconds: options.retention.max_age.map(|age| age.as_secs()),
+        max_count: options.retention.max_count,
+        max_total_bytes: options.retention.max_total_bytes,
+        allowed_untracked_paths: allowed_untracked_paths.iter().cloned().collect(),
+        considered_count: 0,
+        removed_count: 0,
+        protected_count: 0,
+        retained_count: 0,
+        target_removed_count: 0,
+        orphan_removed_count: 0,
+        apparent_considered_bytes: 0,
+        estimated_reclaimable_bytes: 0,
+        estimated_reclaimed_bytes: 0,
+        entries: Vec::new(),
+    };
+    let names = repo
+        .worktrees()
+        .context("failed to list Git worktrees for repository-local preview")?;
+    if names.len() > MAX_WORKSPACE_SWEEP_LANES_PER_GROUP {
+        bail!(
+            "repository-local preview exceeds its {}-worktree limit",
+            MAX_WORKSPACE_SWEEP_LANES_PER_GROUP
+        );
+    }
+    let mut candidates = Vec::new();
+    for index in 0..names.len() {
+        let Some(name) = names
+            .get(index)
+            .context("failed to read Git worktree name for repository-local preview")?
+        else {
+            continue;
+        };
+        if excluded_names.contains(name) || normalize_agent_id(name).ok().as_deref() != Some(name) {
+            continue;
+        }
+        let worktree = match repo.find_worktree(name) {
+            Ok(worktree) => worktree,
+            Err(_) => continue,
+        };
+        if worktree.validate().is_err() {
+            continue;
+        }
+        let path = match fs::canonicalize(worktree.path()) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if path.parent() != Some(worktree_root.as_path()) {
+            continue;
+        }
+        let lane_repo = match Repository::open(&path) {
+            Ok(repo) => repo,
+            Err(_) => continue,
+        };
+        let head = match lane_repo.head().and_then(|head| head.peel_to_commit()) {
+            Ok(head) => head,
+            Err(_) => continue,
+        };
+        let branch_oid = head.id();
+        let branch = lane_repo
+            .head()
+            .ok()
+            .and_then(|head| head.name().ok().map(str::to_owned))
+            .and_then(|name| name.strip_prefix("refs/heads/").map(str::to_owned));
+        let branch_merged = branch_oid == primary_head
+            || repo
+                .graph_descendant_of(primary_head, branch_oid)
+                .context("failed to inspect repository-local branch ancestry")?;
+        report.considered_count = report
+            .considered_count
+            .checked_add(1)
+            .context("worktree GC considered count overflowed")?;
+        let size = match gc_worktree_size_estimate(&path) {
+            Ok(size) => size,
+            Err(_) => {
+                report.protected_count = report
+                    .protected_count
+                    .checked_add(1)
+                    .context("worktree GC protected count overflowed")?;
+                report.entries.push(WorktreeGcEntry {
+                    name: name.to_string(),
+                    branch,
+                    path,
+                    status: WorktreeGcStatus::Protected,
+                    reason: WorktreeGcReason::SizeMeasurementFailed,
+                    target_path: None,
+                    target_liveness: None,
+                    apparent_worktree_bytes: None,
+                    apparent_target_bytes: None,
+                    untracked_paths: Vec::new(),
+                    gate_denial: None,
+                    retention_operation_id: None,
+                });
+                continue;
+            }
+        };
+        report.apparent_considered_bytes = report
+            .apparent_considered_bytes
+            .checked_add(size.worktree_bytes)
+            .context("worktree GC apparent considered bytes overflowed")?;
+        let untracked_paths = match preview_registered_worktree_dirtiness(&path)? {
+            WorktreeGcDirtiness::Clean => Vec::new(),
+            WorktreeGcDirtiness::TrackedDirty => {
+                report.protected_count = report
+                    .protected_count
+                    .checked_add(1)
+                    .context("worktree GC protected count overflowed")?;
+                report.entries.push(WorktreeGcEntry {
+                    name: name.to_string(),
+                    branch,
+                    path,
+                    status: WorktreeGcStatus::Protected,
+                    reason: WorktreeGcReason::Dirty,
+                    target_path: None,
+                    target_liveness: None,
+                    apparent_worktree_bytes: Some(size.worktree_bytes),
+                    apparent_target_bytes: size.target_bytes,
+                    untracked_paths: Vec::new(),
+                    gate_denial: None,
+                    retention_operation_id: None,
+                });
+                continue;
+            }
+            WorktreeGcDirtiness::UntrackedOnly(paths)
+                if options.targets_only
+                    || paths
+                        .iter()
+                        .all(|path| allowed_untracked_paths.contains(path)) =>
+            {
+                paths
+            }
+            WorktreeGcDirtiness::UntrackedOnly(paths) => {
+                report.protected_count = report
+                    .protected_count
+                    .checked_add(1)
+                    .context("worktree GC protected count overflowed")?;
+                report.entries.push(WorktreeGcEntry {
+                    name: name.to_string(),
+                    branch,
+                    path,
+                    status: WorktreeGcStatus::Protected,
+                    reason: WorktreeGcReason::UntrackedOnly,
+                    target_path: None,
+                    target_liveness: None,
+                    apparent_worktree_bytes: Some(size.worktree_bytes),
+                    apparent_target_bytes: size.target_bytes,
+                    untracked_paths: paths,
+                    gate_denial: None,
+                    retention_operation_id: None,
+                });
+                continue;
+            }
+        };
+        let created_at_unix_nanos = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+            .unwrap_or(0);
+        candidates.push(RegisteredWorktreePreviewCandidate {
+            name: name.to_string(),
+            branch,
+            branch_merged,
+            path,
+            created_at_unix_nanos,
+            untracked_paths,
+            size,
+        });
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .created_at_unix_nanos
+            .cmp(&left.created_at_unix_nanos)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let mut retention_state = WorktreeGcRetentionState::default();
+    for candidate in candidates {
+        let target = gc_target_if_present(&candidate.path)?;
+        let should_remove = if options.targets_only || !candidate.branch_merged {
+            false
+        } else {
+            let count_expired = options
+                .retention
+                .max_count
+                .is_some_and(|max_count| retention_state.eligible_count >= max_count);
+            let age_expired = options.retention.max_age.is_some_and(|max_age| {
+                now.checked_sub(candidate.created_at_unix_nanos)
+                    .and_then(|age| u128::try_from(age.max(0)).ok())
+                    .is_some_and(|age| age >= max_age.as_nanos())
+            });
+            let mut size_expired = false;
+            if !count_expired && !age_expired {
+                if let Some(max_total_bytes) = options.retention.max_total_bytes {
+                    if retention_state.size_budget_exhausted {
+                        size_expired = true;
+                    } else {
+                        let retained = retention_state
+                            .retained_apparent_bytes
+                            .checked_add(candidate.size.worktree_bytes)
+                            .context("worktree GC retained apparent byte count overflowed")?;
+                        if retained <= max_total_bytes {
+                            retention_state.retained_apparent_bytes = retained;
+                        } else {
+                            retention_state.size_budget_exhausted = true;
+                            size_expired = true;
+                        }
+                    }
+                }
+            }
+            retention_state.eligible_count = retention_state
+                .eligible_count
+                .checked_add(1)
+                .context("worktree GC eligible count overflowed")?;
+            !worktree_retention_is_configured(options.retention)
+                || count_expired
+                || age_expired
+                || size_expired
+        };
+        let target_cleanup = options.remove_targets && target.is_some();
+        if should_remove || target_cleanup {
+            if let Some((reason, evidence)) = target
+                .as_ref()
+                .and_then(|target| gc_target_liveness_protection(target, &worktree_target_liveness))
+            {
+                report.protected_count = report
+                    .protected_count
+                    .checked_add(1)
+                    .context("worktree GC protected count overflowed")?;
+                report.entries.push(WorktreeGcEntry {
+                    name: candidate.name,
+                    branch: candidate.branch,
+                    path: candidate.path,
+                    status: WorktreeGcStatus::Protected,
+                    reason,
+                    target_path: target.map(|target| target.path),
+                    target_liveness: Some(evidence),
+                    apparent_worktree_bytes: Some(candidate.size.worktree_bytes),
+                    apparent_target_bytes: candidate.size.target_bytes,
+                    untracked_paths: candidate.untracked_paths,
+                    gate_denial: None,
+                    retention_operation_id: None,
+                });
+                continue;
+            }
+        }
+        if should_remove {
+            report.removed_count = report
+                .removed_count
+                .checked_add(1)
+                .context("worktree GC removed count overflowed")?;
+            report.estimated_reclaimable_bytes = report
+                .estimated_reclaimable_bytes
+                .checked_add(candidate.size.worktree_bytes)
+                .context("worktree GC estimated reclaimable bytes overflowed")?;
+            report.entries.push(WorktreeGcEntry {
+                name: candidate.name,
+                branch: candidate.branch,
+                path: candidate.path,
+                status: WorktreeGcStatus::WouldRemove,
+                reason: WorktreeGcReason::FinishedBranch,
+                target_path: target.map(|target| target.path),
+                target_liveness: None,
+                apparent_worktree_bytes: Some(candidate.size.worktree_bytes),
+                apparent_target_bytes: candidate.size.target_bytes,
+                untracked_paths: candidate.untracked_paths,
+                gate_denial: None,
+                retention_operation_id: None,
+            });
+            continue;
+        }
+        report.retained_count = report
+            .retained_count
+            .checked_add(1)
+            .context("worktree GC retained count overflowed")?;
+        let (reason, target_path) = match (target, candidate.size.target_bytes) {
+            (Some(target), Some(target_bytes)) if options.remove_targets => {
+                report.estimated_reclaimable_bytes = report
+                    .estimated_reclaimable_bytes
+                    .checked_add(target_bytes)
+                    .context("worktree GC estimated reclaimable bytes overflowed")?;
+                (WorktreeGcReason::TargetWouldRemove, Some(target.path))
+            }
+            _ if !candidate.branch_merged && !options.targets_only => {
+                (WorktreeGcReason::UnmergedBranch, None)
+            }
+            _ if options.remove_targets => (WorktreeGcReason::NoTarget, None),
+            _ => (WorktreeGcReason::RetentionKeep, None),
+        };
+        report.entries.push(WorktreeGcEntry {
+            name: candidate.name,
+            branch: candidate.branch,
+            path: candidate.path,
+            status: WorktreeGcStatus::Retained,
+            reason,
+            target_path,
+            target_liveness: None,
+            apparent_worktree_bytes: Some(candidate.size.worktree_bytes),
+            apparent_target_bytes: candidate.size.target_bytes,
+            untracked_paths: candidate.untracked_paths,
+            gate_denial: None,
+            retention_operation_id: None,
+        });
+    }
+    Ok(report)
+}
+
 fn resolve_sweep_repository(
     workspace: &Path,
     group_root: &Path,
@@ -3165,6 +3628,18 @@ fn resolve_sweep_repository(
     root_kind: WorktreeSweepRootKind,
     repository_hint: Option<&Path>,
 ) -> std::result::Result<PathBuf, WorktreeSweepFailure> {
+    // A repository-local root is discovered from an exact primary repository
+    // path. Validate that authority directly instead of letting a stale linked
+    // worktree registration prevent every healthy sibling from being swept.
+    if root_kind == WorktreeSweepRootKind::RepositoryLocal {
+        return resolve_sweep_repository_from_workspace(
+            workspace,
+            group_root,
+            group,
+            root_kind,
+            repository_hint,
+        );
+    }
     let lane_names = bounded_plain_direct_child_names(
         group_root,
         MAX_WORKSPACE_SWEEP_LANES_PER_GROUP,
@@ -3827,6 +4302,10 @@ fn gc_worktree_dirtiness(path: &Path) -> Result<WorktreeGcDirtiness> {
         MAX_WORKTREE_STATUS_OUTPUT_BYTES,
         WORKTREE_GC_STATUS_TIMEOUT,
     )?;
+    gc_dirtiness_from_status(status)
+}
+
+fn gc_dirtiness_from_status(status: BoundedStatusPathRecords) -> Result<WorktreeGcDirtiness> {
     if status.is_empty() {
         return Ok(WorktreeGcDirtiness::Clean);
     }
@@ -3836,6 +4315,77 @@ fn gc_worktree_dirtiness(path: &Path) -> Result<WorktreeGcDirtiness> {
     Ok(WorktreeGcDirtiness::UntrackedOnly(
         status.into_iter().map(|(path, _)| path).collect(),
     ))
+}
+
+fn preview_registered_worktree_dirtiness(path: &Path) -> Result<WorktreeGcDirtiness> {
+    match bounded_repository_status_paths(
+        path,
+        MAX_WORKTREE_STATUS_ENTRIES,
+        MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+        WORKTREE_GC_STATUS_TIMEOUT,
+    ) {
+        Ok(status) => gc_dirtiness_from_status(status),
+        Err(_) => {
+            // This fallback is restricted to the non-destructive legacy
+            // preview. It cannot authorize apply-mode removal. Some hosts
+            // cannot provide the process-containment mount layout required by
+            // the bounded Git subprocess, but libgit2 can still expose the
+            // ordinary tracked/untracked status needed to make old registered
+            // lanes visible.
+            let repo = Repository::open(path).with_context(|| {
+                format!(
+                    "failed to open registered worktree preview {}",
+                    path.display()
+                )
+            })?;
+            let mut options = StatusOptions::new();
+            options
+                .include_untracked(true)
+                .recurse_untracked_dirs(true)
+                .include_ignored(false)
+                .include_unmodified(false)
+                .renames_head_to_index(false)
+                .renames_index_to_workdir(false);
+            let statuses = repo
+                .statuses(Some(&mut options))
+                .context("failed to inspect registered worktree preview status")?;
+            if statuses.len() > MAX_WORKTREE_STATUS_ENTRIES {
+                bail!("registered worktree preview status exceeds its entry limit");
+            }
+            let mut total_bytes = 0usize;
+            let mut untracked = Vec::new();
+            for entry in statuses.iter() {
+                let entry_path = entry
+                    .path()
+                    .context("registered worktree preview status path is not valid UTF-8")?;
+                total_bytes = total_bytes
+                    .checked_add(entry_path.len())
+                    .context("registered worktree preview status byte count overflowed")?;
+                if total_bytes > MAX_WORKTREE_STATUS_OUTPUT_BYTES {
+                    bail!("registered worktree preview status exceeds its output limit");
+                }
+                if entry.status() != Status::WT_NEW {
+                    return Ok(WorktreeGcDirtiness::TrackedDirty);
+                }
+                let path = PathBuf::from(entry_path);
+                if path.is_absolute()
+                    || path
+                        .components()
+                        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                {
+                    bail!("registered worktree preview returned an unsafe status path");
+                }
+                untracked.push(path);
+            }
+            untracked.sort();
+            untracked.dedup();
+            if untracked.is_empty() {
+                Ok(WorktreeGcDirtiness::Clean)
+            } else {
+                Ok(WorktreeGcDirtiness::UntrackedOnly(untracked))
+            }
+        }
+    }
 }
 
 fn managed_gc_dirtiness_snapshot(
@@ -4328,9 +4878,39 @@ fn linux_process_target_liveness(
     target: &WorktreeGcTarget,
     deadline: Instant,
 ) -> WorktreeTargetLiveness {
+    if linux_process_is_inert_user_manager(process_root) {
+        // The per-user systemd manager can be non-dumpable even to its owner,
+        // which makes environ/root/ns reads fail. It does not execute build
+        // work itself; any spawned build process is enumerated independently.
+        // Recognize only the exact init.scope manager shape so unrelated
+        // unreadable processes continue to fail closed.
+        return WorktreeTargetLiveness::Clear;
+    }
+    let cargo_like = linux_process_is_cargo_like(process_root);
+    if !cargo_like && linux_process_is_non_build_user_service(process_root) {
+        // Non-dumpable user services commonly deny environ/root/ns reads. The
+        // service process itself is not a build process; any cargo/rustc child
+        // remains a separate /proc entry and is scanned normally. Limit this
+        // exception to an exact systemd user-service cgroup and a readable,
+        // non-empty command line.
+        return WorktreeTargetLiveness::Clear;
+    }
     let process_view = match LinuxProcessView::open(process_root) {
         Ok(Some(view)) => view,
         Ok(None) => return WorktreeTargetLiveness::Clear,
+        Err(_)
+            if !cargo_like
+                && linux_process_cmdline(process_root)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|cmdline| !cmdline.is_empty()) =>
+        {
+            // A readable non-build command line plus an unreadable namespace
+            // is the common non-dumpable desktop-application shape. It cannot
+            // resolve paths for build work itself; any cargo/rustc descendant
+            // is scanned independently.
+            return WorktreeTargetLiveness::Clear;
+        }
         Err(cause) => {
             return WorktreeTargetLiveness::Unknown(target_liveness_evidence(
                 Some(pid),
@@ -4339,7 +4919,6 @@ fn linux_process_target_liveness(
             ))
         }
     };
-    let cargo_like = linux_process_is_cargo_like(process_root);
     let mut environment_unknown = None;
     match linux_process_environ(process_root) {
         Ok(Some(environ)) => {
@@ -4419,6 +4998,74 @@ fn linux_process_target_liveness(
             None => WorktreeTargetLiveness::Clear,
         },
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_is_non_build_user_service(process_root: &Path) -> bool {
+    if linux_process_cmdline(process_root)
+        .ok()
+        .flatten()
+        .is_none_or(|cmdline| cmdline.is_empty())
+    {
+        return false;
+    }
+    let mut cgroup = Vec::new();
+    if fs::File::open(process_root.join("cgroup"))
+        .and_then(|file| file.take(4097).read_to_end(&mut cgroup))
+        .is_err()
+        || cgroup.len() > 4096
+    {
+        return false;
+    }
+    cgroup.split(|byte| *byte == b'\n').any(|line| {
+        line.starts_with(b"0::/user.slice/user-")
+            && line
+                .rsplit(|byte| *byte == b'/')
+                .next()
+                .is_some_and(|unit| unit.ends_with(b".service"))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_is_inert_user_manager(process_root: &Path) -> bool {
+    let mut comm = Vec::new();
+    if fs::File::open(process_root.join("comm"))
+        .and_then(|file| file.take(64).read_to_end(&mut comm))
+        .is_err()
+    {
+        return false;
+    }
+    while matches!(comm.last(), Some(b'\n' | b'\r')) {
+        comm.pop();
+    }
+    let cmdline = linux_process_cmdline(process_root).ok().flatten();
+    let recognized_manager_process = if comm == b"systemd" {
+        cmdline.as_deref().is_some_and(|bytes| {
+            bytes
+                .split(|byte| *byte == 0)
+                .any(|argument| argument == b"--user")
+        })
+    } else if comm == b"(sd-pam)" {
+        cmdline
+            .as_deref()
+            .is_some_and(|bytes| bytes == b"(sd-pam)\0")
+    } else {
+        false
+    };
+    if !recognized_manager_process {
+        return false;
+    }
+    let mut cgroup = Vec::new();
+    if fs::File::open(process_root.join("cgroup"))
+        .and_then(|file| file.take(4097).read_to_end(&mut cgroup))
+        .is_err()
+        || cgroup.len() > 4096
+    {
+        return false;
+    }
+    cgroup.split(|byte| *byte == b'\n').any(|line| {
+        line.starts_with(b"0::/user.slice/user-") && line.ends_with(b".service/init.scope")
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -4755,11 +5402,12 @@ fn classify_linux_proc_link_target(
     target: &Path,
 ) -> std::result::Result<LinuxProcLinkTarget, WorktreeTargetLivenessCause> {
     let bytes = target.as_os_str().as_bytes();
-    if [b"pipe:[".as_slice(), b"socket:[", b"anon_inode:["]
+    if [b"pipe:[".as_slice(), b"socket:[", b"anon_inode:"]
         .into_iter()
         .any(|prefix| bytes.starts_with(prefix))
         || bytes.starts_with(b"memfd:")
         || bytes.starts_with(b"/memfd:")
+        || bytes.starts_with(b"/dmabuf:")
     {
         return Ok(LinuxProcLinkTarget::Pseudo);
     }
@@ -4844,11 +5492,14 @@ fn process_path_overlaps_bound_directory(
     bidirectional: bool,
 ) -> WorktreePathOverlap {
     if path.deleted {
-        if path.same_mount_namespace
-            && (path.process_path.starts_with(bound_path)
-                || (bidirectional && bound_path.starts_with(&path.process_path)))
-        {
-            return WorktreePathOverlap::Overlap;
+        if path.same_mount_namespace {
+            return if path.process_path.starts_with(bound_path)
+                || (bidirectional && bound_path.starts_with(&path.process_path))
+            {
+                WorktreePathOverlap::Overlap
+            } else {
+                WorktreePathOverlap::Separate
+            };
         }
         return WorktreePathOverlap::Unknown;
     }
@@ -10794,6 +11445,114 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn repository_local_sweep_uses_primary_hint_despite_stale_lane_metadata() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let worktree_root = repo_path.join(".worktrees");
+        let created = create_gc_worktree(
+            &WorktreeManager::new(&repo_path),
+            "healthy-lane",
+            &worktree_root,
+        );
+        let stale = worktree_root.join("stale-registration");
+        fs::create_dir(&stale).expect("stale lane directory");
+        fs::write(
+            stale.join(".git"),
+            "gitdir: /definitely/missing/worktree-metadata\n",
+        )
+        .expect("stale Git marker");
+
+        let report = sweep_workspace_worktrees(workspace_sweep_options(&repo_path, false))
+            .expect("repository-local primary hint remains authoritative");
+
+        assert_eq!(report.repository_inspected_count, 1, "{report:#?}");
+        assert_eq!(report.repository_pre_gc_skipped_count, 0, "{report:#?}");
+        assert!(report.repositories[0]
+            .gc_report
+            .as_ref()
+            .expect("GC report")
+            .entries
+            .iter()
+            .any(|entry| {
+                entry.name == created.name && entry.status == WorktreeGcStatus::WouldRemove
+            }));
+        assert!(created.path.exists());
+        assert!(stale.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repository_local_dry_run_previews_registered_only_untracked_lane() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = repo_path.join(".worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        let oid = commit_readme(&repo).expect("initial commit");
+        fs::create_dir(&worktree_root).expect("repository-local worktree root");
+        let commit = repo.find_commit(oid).expect("commit");
+        let branch = repo
+            .branch("topic/legacy", &commit, false)
+            .expect("legacy branch");
+        let reference = branch.into_reference();
+        let mut add = WorktreeAddOptions::new();
+        add.reference(Some(&reference));
+        let lane = worktree_root.join("legacy-lane");
+        repo.worktree("legacy-lane", &lane, Some(&add))
+            .expect("registered-only worktree");
+        fs::write(lane.join("TASK.md"), "task brief\n").expect("untracked task brief");
+
+        let state = repo.path().join("maco/state");
+        fs::create_dir_all(&state).expect("legacy state directory");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755))
+            .expect("legacy public state mode");
+
+        let protected = sweep_workspace_worktrees(workspace_sweep_options(&repo_path, false))
+            .expect("registered-only protected preview");
+        let protected_entry = protected.repositories[0]
+            .gc_report
+            .as_ref()
+            .expect("fallback preview")
+            .entries
+            .iter()
+            .find(|entry| entry.name == "legacy-lane")
+            .expect("legacy lane classification");
+        assert_eq!(protected_entry.status, WorktreeGcStatus::Protected);
+        assert_eq!(protected_entry.reason, WorktreeGcReason::UntrackedOnly);
+        assert_eq!(
+            protected_entry.untracked_paths,
+            vec![PathBuf::from("TASK.md")]
+        );
+
+        let mut allowed = workspace_sweep_options(&repo_path, false);
+        allowed.allowed_untracked_paths = vec![PathBuf::from("TASK.md")];
+        let reclaimable = sweep_workspace_worktrees(allowed)
+            .expect("registered-only reclaimable preview with exact override");
+        let reclaimable_entry = reclaimable.repositories[0]
+            .gc_report
+            .as_ref()
+            .expect("fallback preview")
+            .entries
+            .iter()
+            .find(|entry| entry.name == "legacy-lane")
+            .expect("legacy lane classification");
+        assert_eq!(reclaimable_entry.status, WorktreeGcStatus::WouldRemove);
+        assert_eq!(reclaimable_entry.reason, WorktreeGcReason::FinishedBranch);
+        assert_eq!(
+            reclaimable_entry.untracked_paths,
+            vec![PathBuf::from("TASK.md")]
+        );
+        assert!(lane.exists(), "dry-run must preserve registered-only lane");
+        assert!(lane.join("TASK.md").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn workspace_sweep_discovers_direct_child_repo_local_and_managed_roots_once_each() {
         let temp = TempDir::new().expect("tempdir");
         let workspace = temp.path().join("workspace");
@@ -12291,6 +13050,43 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn linux_target_liveness_skips_only_exact_user_manager_shape() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("comm"), "systemd\n").expect("comm");
+        fs::write(
+            temp.path().join("cmdline"),
+            b"/run/current-system/systemd/lib/systemd/systemd\0--user\0",
+        )
+        .expect("cmdline");
+        fs::write(
+            temp.path().join("cgroup"),
+            "0::/user.slice/user-1000.slice/user@1000.service/init.scope\n",
+        )
+        .expect("cgroup");
+        assert!(linux_process_is_inert_user_manager(temp.path()));
+
+        fs::write(temp.path().join("comm"), "(sd-pam)\n").expect("PAM helper comm");
+        fs::write(temp.path().join("cmdline"), b"(sd-pam)\0").expect("PAM helper cmdline");
+        assert!(linux_process_is_inert_user_manager(temp.path()));
+
+        fs::write(
+            temp.path().join("cgroup"),
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/build.service\n",
+        )
+        .expect("non-manager cgroup");
+        assert!(!linux_process_is_inert_user_manager(temp.path()));
+        assert!(linux_process_is_non_build_user_service(temp.path()));
+
+        fs::write(
+            temp.path().join("cgroup"),
+            "0::/user.slice/user-1000.slice/session-1.scope\n",
+        )
+        .expect("interactive scope");
+        assert!(!linux_process_is_non_build_user_service(temp.path()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn linux_target_liveness_observes_default_cargo_target_from_process_cwd() {
         use std::os::unix::fs::symlink;
 
@@ -13147,6 +13943,8 @@ mod tests {
             ("4", "socket:[456]"),
             ("5", "anon_inode:[eventpoll]"),
             ("6", "/memfd:rustc (deleted)"),
+            ("7", "anon_inode:inotify"),
+            ("8", "/dmabuf:"),
         ] {
             symlink(target, process_root.join("fd").join(fd)).expect("pseudo fd link");
         }
