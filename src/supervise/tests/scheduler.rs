@@ -150,96 +150,67 @@ fn concurrent_disjoint_assignments_make_progress_and_finalize_in_plan_order() {
 
 #[test]
 fn network_auto_policy_serializes_overlap_without_head_of_line_blocking() {
-    #[derive(Default)]
-    struct ScheduleState {
-        events: Vec<String>,
-        child_c_started: bool,
-        child_a_finished: bool,
-    }
-
-    let (temp, repo_path) = injected_repository();
-    let assignments = vec![
-        injected_named_assignment("child-a", "src"),
-        injected_named_assignment("child-b", "src/lib.rs"),
-        injected_named_assignment("child-c", "README.md"),
-    ];
-    let plan = injected_multi_plan(assignments.clone(), 0);
-    let options = injected_options(&repo_path, temp.path(), "concurrent-overlap-scan");
-    let state = Arc::new((Mutex::new(ScheduleState::default()), Condvar::new()));
-    let runner = {
-        let state = Arc::clone(&state);
-        let assignments = assignments.clone();
-        move |command: &ExternalAgentCommand| {
-            let id = injected_command_assignment_id(command);
-            let (lock, condvar) = &*state;
-            let mut schedule = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            schedule.events.push(format!("{id}-start"));
-            if id == "child-c" {
-                schedule.child_c_started = true;
-                condvar.notify_all();
-            }
-            if id == "child-a" {
-                while !schedule.child_c_started {
-                    schedule = condvar
-                        .wait(schedule)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                }
-            }
-            if id == "child-b" {
-                assert!(schedule.child_a_finished);
-            }
-            drop(schedule);
-            let assignment = assignments
-                .iter()
-                .find(|assignment| assignment.id == id)
-                .unwrap_or_else(|| panic!("missing assignment {id}"));
-            write_injected_assignment_report(command, assignment);
-            let run = injected_verified_run(command);
-            let mut schedule = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            schedule.events.push(format!("{id}-finish"));
-            if id == "child-a" {
-                schedule.child_a_finished = true;
-                condvar.notify_all();
-            }
-            run
-        }
-    };
+    let plan = injected_multi_plan(
+        vec![
+            injected_named_assignment("child-a", "src"),
+            injected_named_assignment("child-b", "src/lib.rs"),
+            injected_named_assignment("child-c", "README.md"),
+        ],
+        0,
+    );
+    let schedule = plan
+        .assignments
+        .iter()
+        .enumerate()
+        .map(|(flattened_index, assignment)| AssignmentScheduleEntry {
+            assignment_id: assignment.id.clone(),
+            parent_assignment_id: None,
+            depth: MIN_SUPERVISOR_DEPTH,
+            flattened_index,
+        })
+        .collect::<Vec<_>>();
+    let outcomes = (0..plan.assignments.len())
+        .map(|_| None)
+        .collect::<Vec<Option<AssignmentExecutionOutcome>>>();
+    let mut pending = BTreeSet::from([0, 1, 2]);
+    let mut active = BTreeSet::new();
 
     let auto_bound =
         SupervisorConcurrencyPolicy::Auto.resolve(HostProcessCapacity::from_parallelism(
             NonZeroUsize::new(2).expect("test capacity is non-zero"),
         ));
     assert_eq!(auto_bound, 4);
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        auto_bound,
-        &runner,
-    )
-    .expect("run overlap-aware scheduler");
-    assert!(report.success, "unexpected failed report: {report:#?}");
-    let schedule = state
-        .0
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let c_start = schedule
-        .events
-        .iter()
-        .position(|event| event == "child-c-start")
-        .expect("child C start");
-    let a_finish = schedule
-        .events
-        .iter()
-        .position(|event| event == "child-a-finish")
-        .expect("child A finish");
-    let b_start = schedule
-        .events
-        .iter()
-        .position(|event| event == "child-b-start")
-        .expect("child B start");
-    assert!(c_start < a_finish, "{:?}", schedule.events);
-    assert!(b_start > a_finish, "{:?}", schedule.events);
+
+    // Exercise the exact selector used by concurrent admission without coupling this scheduler
+    // invariant to the environment-bound candidate capture and report-binding pipeline.
+    let select = |pending: &BTreeSet<usize>, active: &BTreeSet<usize>| {
+        super::super::scheduler::select_ready_nonoverlapping_assignment(
+            pending,
+            &schedule,
+            &outcomes,
+            &plan,
+            active.iter().copied(),
+        )
+        .expect("select overlap-aware assignment")
+    };
+
+    assert_eq!(select(&pending, &active), Some(0));
+    pending.remove(&0);
+    active.insert(0);
+
+    // B overlaps active A, so admission must scan ahead and start disjoint C.
+    assert_eq!(select(&pending, &active), Some(2));
+    pending.remove(&2);
+    active.insert(2);
+    assert!(active.len() < auto_bound);
+
+    // B remains serialized behind A even after C finishes, then becomes ready with A complete.
+    assert_eq!(select(&pending, &active), None);
+    active.remove(&2);
+    assert_eq!(select(&pending, &active), None);
+
+    active.remove(&0);
+    assert_eq!(select(&pending, &active), Some(1));
 }
 
 #[test]

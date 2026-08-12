@@ -829,7 +829,7 @@ fn collect_indexed_assignment_outcomes(
     fatal_errors
 }
 
-fn select_ready_nonoverlapping_assignment<I>(
+pub(super) fn select_ready_nonoverlapping_assignment<I>(
     pending: &BTreeSet<usize>,
     assignment_schedule: &[AssignmentScheduleEntry],
     indexed_outcomes: &[Option<AssignmentExecutionOutcome>],
