@@ -1107,10 +1107,11 @@ fn role_model_selection(
 }
 
 pub(super) fn provisional_default_role_model_selection(role: AgentRole) -> RoleModelSelection {
-    let (model, reasoning_effort, fallbacks, on_exhausted) = match role {
+    let (model, reasoning_effort, fallbacks, budget_degrade_models, on_exhausted) = match role {
         AgentRole::Supervisor => (
             FRONTIER_PROFILE_MODEL,
             "xhigh",
+            vec![BALANCED_PROFILE_MODEL, ECONOMY_PROFILE_MODEL],
             vec![BALANCED_PROFILE_MODEL, ECONOMY_PROFILE_MODEL],
             TerminalUnavailableModelFallback::RuntimeDefault,
         ),
@@ -1118,18 +1119,21 @@ pub(super) fn provisional_default_role_model_selection(role: AgentRole) -> RoleM
             BALANCED_PROFILE_MODEL,
             "xhigh",
             vec![FRONTIER_PROFILE_MODEL, ECONOMY_PROFILE_MODEL],
+            vec![ECONOMY_PROFILE_MODEL],
             TerminalUnavailableModelFallback::RuntimeDefault,
         ),
         AgentRole::Worker => (
             ECONOMY_PROFILE_MODEL,
             "medium",
             vec![BALANCED_PROFILE_MODEL, FRONTIER_PROFILE_MODEL],
+            Vec::new(),
             TerminalUnavailableModelFallback::RuntimeDefault,
         ),
         AgentRole::GateClassifier => (
             BALANCED_PROFILE_MODEL,
             "high",
             vec![FRONTIER_PROFILE_MODEL, ECONOMY_PROFILE_MODEL],
+            Vec::new(),
             TerminalUnavailableModelFallback::LocalDeterministicFake,
         ),
     };
@@ -1139,6 +1143,10 @@ pub(super) fn provisional_default_role_model_selection(role: AgentRole) -> RoleM
         unavailable_model_fallback: UnavailableModelFallback::OrderedCatalogChain(
             OrderedCatalogFallback {
                 models: fallbacks.into_iter().map(str::to_string).collect(),
+                budget_degrade_models: budget_degrade_models
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
                 on_exhausted,
             },
         ),
@@ -1163,7 +1171,18 @@ pub fn all_frontier_role_models() -> BTreeMap<AgentRole, RoleModelSelection> {
         .into_iter()
         .map(|(role, mut selection)| {
             selection.model = Some(FRONTIER_PROFILE_MODEL.to_string());
-            selection.unavailable_model_fallback = UnavailableModelFallback::RuntimeDefault;
+            selection.unavailable_model_fallback =
+                UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
+                    models: vec![
+                        BALANCED_PROFILE_MODEL.to_string(),
+                        ECONOMY_PROFILE_MODEL.to_string(),
+                    ],
+                    budget_degrade_models: vec![
+                        BALANCED_PROFILE_MODEL.to_string(),
+                        ECONOMY_PROFILE_MODEL.to_string(),
+                    ],
+                    on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
+                });
             (role, selection)
         })
         .collect()

@@ -478,6 +478,8 @@ impl UnavailableModelFallback {
 #[serde(deny_unknown_fields)]
 pub struct OrderedCatalogFallback {
     pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budget_degrade_models: Vec<String>,
     #[serde(default)]
     pub on_exhausted: TerminalUnavailableModelFallback,
 }
@@ -497,6 +499,18 @@ impl OrderedCatalogFallback {
             }
             if configured_model == Some(model.as_str()) {
                 bail!("ordered model fallback chain repeats configured model '{model}'");
+            }
+        }
+        let mut degrade_models = BTreeSet::new();
+        for model in &self.budget_degrade_models {
+            if model.trim().is_empty() || model != model.trim() {
+                bail!("budget model downgrade entries must be non-empty and trimmed");
+            }
+            if !degrade_models.insert(model) {
+                bail!("budget model downgrade list contains duplicate model '{model}'");
+            }
+            if configured_model == Some(model.as_str()) {
+                bail!("budget model downgrade list repeats configured model '{model}'");
             }
         }
         Ok(())
@@ -718,7 +732,54 @@ pub struct SupervisorExecutionMetadata {
     pub completed_assignment_count: usize,
     pub concurrency: SupervisorConcurrencyReport,
     pub role_bindings: BTreeMap<AgentRole, ResolvedRoleExecutionBinding>,
+    #[serde(default)]
+    pub budget_degradations: Vec<BudgetDegradationRecord>,
     pub usage: SupervisorExecutionUsageReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetDegradationRecord {
+    pub sequence: usize,
+    pub assignment_id: String,
+    pub budget_action: BudgetAction,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budget_reasons: Vec<BudgetReason>,
+    pub change: BudgetDegradationChange,
+    pub effective_child_model: Option<String>,
+    pub effective_child_reasoning_effort: Option<String>,
+    pub effective_fan_out: usize,
+    pub observation: BudgetDegradationObservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetDegradationObservation {
+    AdmissionPolicyResolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BudgetDegradationChange {
+    ReasoningEffort {
+        role: AgentRole,
+        before: String,
+        after: String,
+    },
+    ModelTier {
+        role: AgentRole,
+        before: String,
+        after: String,
+        resolved_candidate_index: usize,
+    },
+    FanOut {
+        before: usize,
+        after: usize,
+    },
+    Halt {
+        before_new_dispatch_allowed: bool,
+        after_new_dispatch_allowed: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -783,6 +844,7 @@ pub enum RoleBindingObservation {
     SyntheticFake,
     CatalogUnavailable,
     ResolutionFailed,
+    AssignmentSpecific,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -3105,9 +3167,36 @@ struct AssignmentExecutionContext<'a, 'writer> {
     semantic_block_gate: Option<&'a SemanticBlockGate>,
     artifacts: &'a Mutex<SharedSupervisorArtifacts<'writer>>,
     budget_ledger: &'a RunBudgetLedger,
+    budget_policy: AssignmentBudgetPolicy,
+    admission_commit: Option<AdmissionCommitSignal>,
     runtime_model_catalog: &'a RuntimeModelCatalog,
     cancellation: ProcessCancellation,
     external_runner: &'a CancellableExternalRunner<'a>,
+}
+
+#[derive(Clone)]
+struct AdmissionCommitSignal {
+    sender: mpsc::SyncSender<()>,
+    notified: Arc<AtomicBool>,
+}
+
+impl AdmissionCommitSignal {
+    fn new() -> (Self, mpsc::Receiver<()>) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        (
+            Self {
+                sender,
+                notified: Arc::new(AtomicBool::new(false)),
+            },
+            receiver,
+        )
+    }
+
+    fn notify(&self) {
+        if !self.notified.swap(true, Ordering::SeqCst) {
+            let _ = self.sender.send(());
+        }
+    }
 }
 
 enum DispatchBudgetAdmission<'a> {
@@ -3352,7 +3441,16 @@ fn test_runtime_model_catalog(
                 AgentRole::Auditor,
             ]
             .into_iter()
-            .filter_map(|role| effective_role_model_selection(plan, role).model)
+            .flat_map(|role| {
+                let selection = effective_role_model_selection(plan, role);
+                let mut models = selection.configured_model_chain();
+                if let UnavailableModelFallback::OrderedCatalogChain(chain) =
+                    selection.unavailable_model_fallback
+                {
+                    models.extend(chain.budget_degrade_models);
+                }
+                models
+            })
             .chain(
                 plan.review_lenses
                     .iter()

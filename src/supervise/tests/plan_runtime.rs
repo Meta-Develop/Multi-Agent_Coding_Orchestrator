@@ -1417,9 +1417,14 @@ fn ordered_role_tiers_and_all_frontier_profile_round_trip_through_plan_json() {
         .role_models
         .values()
         .all(|selection| selection.model.as_deref() == Some(FRONTIER_PROFILE_MODEL)));
-    assert!(loaded.plan.role_models.values().all(|selection| {
-        selection.unavailable_model_fallback == UnavailableModelFallback::RuntimeDefault
-    }));
+    assert!(loaded.plan.role_models.values().all(|selection| matches!(
+        &selection.unavailable_model_fallback,
+        UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
+            budget_degrade_models,
+            on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
+            ..
+        }) if budget_degrade_models == &vec![BALANCED_PROFILE_MODEL.to_string(), ECONOMY_PROFILE_MODEL.to_string()]
+    )));
 }
 
 #[test]

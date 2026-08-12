@@ -1270,11 +1270,12 @@ change:
 
 ```json
 {
-  "model": "gpt-5.6-luna",
-  "reasoning_effort": "medium",
+  "model": "gpt-5.6-terra",
+  "reasoning_effort": "xhigh",
   "unavailable_model_fallback": {
     "ordered_catalog_chain": {
-      "models": ["gpt-5.6-terra", "gpt-5.6-sol"],
+      "models": ["gpt-5.6-sol", "gpt-5.6-luna"],
+      "budget_degrade_models": ["gpt-5.6-luna"],
       "on_exhausted": "runtime_default"
     }
   }
@@ -1285,6 +1286,33 @@ An explicit `all-frontier-v1` profile remains selectable by supplying
 `role_models` for all five roles with `model=gpt-5.6-sol`; the public
 `all_frontier_role_models()` helper constructs that profile data while
 preserving each role's reasoning-effort floor.
+
+The availability fallback order and the economics downgrade order are distinct
+data. `models` answers which advertised model may substitute when the primary
+is absent. `budget_degrade_models` is a monotone cheaper-tier list consulted
+only after a run crosses a soft budget ceiling; an arbitrary plan fallback is
+never assumed to be cheaper.
+
+### Budget-pressure degradation
+
+The scheduler consumes `BudgetAction::Degrade` before admitting new work. On
+successive admissions while a soft token or cost ceiling remains reached it
+lowers the child-orchestrator reasoning effort, selects the first
+runtime-advertised entry from that role's `budget_degrade_models`, and halves
+the remaining fan-out bound (never below one). A hard ceiling still halts new
+dispatch and drains already-started assignments. Concurrent admission waits
+until each newly spawned assignment has either committed its child budget
+reservation or completed without one, so the next policy decision cannot race
+past an invisible reservation.
+
+Every applied rung is retained in
+`role_economics_profile.execution.budget_degradations` with the assignment ID,
+budget reasons, typed before/after change, and the full effective child model,
+effort, and fan-out. `observation=admission_policy_resolved` deliberately says
+that this is scheduler admission evidence; `commands_run` remains the process
+evidence for a dispatch that actually started. When assignments use different
+bindings, the aggregate child role binding is marked `assignment_specific`
+instead of claiming one model or effort for the whole run.
 
 On the production Codex path, the no-override child-orchestrator and auditor
 commands are constructed with the profile's explicit model and role-specific

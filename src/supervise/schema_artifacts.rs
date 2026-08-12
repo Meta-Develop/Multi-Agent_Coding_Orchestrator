@@ -111,7 +111,7 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                 "type": "string",
                 "enum": [
                     "runtime_catalog_resolved", "runtime_default_resolved", "synthetic_fake",
-                    "catalog_unavailable", "resolution_failed"
+                    "catalog_unavailable", "resolution_failed", "assignment_specific"
                 ]
             },
             "resolution_observation": {
@@ -155,6 +155,11 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                                     "models": {
                                         "type": "array",
                                         "minItems": 1,
+                                        "items": {"type": "string"},
+                                        "uniqueItems": true
+                                    },
+                                    "budget_degrade_models": {
+                                        "type": "array",
                                         "items": {"type": "string"},
                                         "uniqueItems": true
                                     },
@@ -209,7 +214,7 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                 "additionalProperties": false,
                 "required": [
                     "assignment_count", "started_assignment_count", "completed_assignment_count",
-                    "concurrency", "role_bindings", "usage"
+                    "concurrency", "role_bindings", "budget_degradations", "usage"
                 ],
                 "properties": {
                     "assignment_count": {"type": "integer", "minimum": 0},
@@ -217,8 +222,87 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                     "completed_assignment_count": {"type": "integer", "minimum": 0},
                     "concurrency": concurrency_report_schema_value(),
                     "role_bindings": role_map_schema_value(role_binding),
+                    "budget_degradations": budget_degradation_records_schema_value(),
                     "usage": execution_usage_schema_value()
                 }
+            }
+        }
+    })
+}
+
+fn budget_degradation_records_schema_value() -> serde_json::Value {
+    let change = json!({
+        "oneOf": [
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "role", "before", "after"],
+                "properties": {
+                    "kind": {"const": "reasoning_effort"},
+                    "role": agent_role_schema_value(),
+                    "before": {"type": "string"},
+                    "after": {"type": "string"}
+                }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "role", "before", "after", "resolved_candidate_index"],
+                "properties": {
+                    "kind": {"const": "model_tier"},
+                    "role": agent_role_schema_value(),
+                    "before": {"type": "string"},
+                    "after": {"type": "string"},
+                    "resolved_candidate_index": {"type": "integer", "minimum": 0}
+                }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "before", "after"],
+                "properties": {
+                    "kind": {"const": "fan_out"},
+                    "before": {"type": "integer", "minimum": 1},
+                    "after": {"type": "integer", "minimum": 1}
+                }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "before_new_dispatch_allowed", "after_new_dispatch_allowed"],
+                "properties": {
+                    "kind": {"const": "halt"},
+                    "before_new_dispatch_allowed": {"type": "boolean"},
+                    "after_new_dispatch_allowed": {"type": "boolean"}
+                }
+            }
+        ]
+    });
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "sequence", "assignment_id", "budget_action", "budget_reasons", "change",
+                "effective_child_model", "effective_child_reasoning_effort", "effective_fan_out",
+                "observation"
+            ],
+            "properties": {
+                "sequence": {"type": "integer", "minimum": 1},
+                "assignment_id": {"type": "string", "minLength": 1},
+                "budget_action": {"type": "string", "enum": ["continue", "degrade", "owner_escalation"]},
+                "budget_reasons": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": [
+                        "soft_token_ceiling_reached", "hard_token_ceiling_reached",
+                        "soft_cost_ceiling_reached", "hard_cost_ceiling_reached",
+                        "missing_pricing", "estimated_provider_usage", "missing_provider_usage",
+                        "missing_actual_cost"
+                    ]},
+                    "uniqueItems": true
+                },
+                "change": change
+                ,"effective_child_model": {"type": ["string", "null"]}
+                ,"effective_child_reasoning_effort": {"type": ["string", "null"]}
+                ,"effective_fan_out": {"type": "integer", "minimum": 1}
+                ,"observation": {"const": "admission_policy_resolved"}
             }
         }
     })
