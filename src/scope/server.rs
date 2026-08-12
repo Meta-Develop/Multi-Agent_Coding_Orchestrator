@@ -1179,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn root_serves_embedded_spawn_tree_frontend() {
+    fn root_serves_live_first_multi_project_frontend() {
         let source: Arc<dyn ScopeDataSource> =
             Arc::new(TestDataSource::new(json!({"projects": []}), Vec::new()));
         let mut server = TestServer::start(source, test_config());
@@ -1188,11 +1188,46 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("text/html; charset=utf-8"));
-        assert!(response.contains("MACO_SCOPE_SPAWN_TREE_UI"));
-        assert!(response.contains("id=\"edgeSummary\""));
-        assert!(response.contains("reviewed_worker_ids"));
-        assert!(response.contains("event.family !== state.selectedRun.family"));
-        assert!(response.contains("event.family === pending.family"));
+        assert!(response.contains("MACO_SCOPE_LIVE_MULTIPROJECT_UI"));
+
+        for default_filter in [
+            "<select id=\"projectSelect\"><option value=\"\" selected>All projects</option></select>",
+            "<select id=\"familySelect\"><option value=\"\" selected>All families</option></select>",
+            "<select id=\"runSelect\"><option value=\"\" selected>All runs</option></select>",
+        ] {
+            assert!(
+                response.contains(default_filter),
+                "missing default filter {default_filter:?}"
+            );
+        }
+        for control in [
+            "id=\"modeSelect\"",
+            "id=\"viewSelect\"",
+            "id=\"scrubber\"",
+            "id=\"jumpToLive\"",
+        ] {
+            assert!(response.contains(control), "missing control {control:?}");
+        }
+
+        assert!(response.contains(
+            "var streamUrl = \"/api/stream\" + (params.toString() ? \"?\" + params.toString() : \"\");"
+        ));
+        assert!(response
+            .contains("if (state.selectedProject) params.set(\"repo\", state.selectedProject);"));
+        assert!(response
+            .contains("if (state.selectedFamily) params.set(\"family\", state.selectedFamily);"));
+        assert!(response.contains("if (state.selectedRun) params.set(\"run\", state.selectedRun);"));
+        assert!(response.contains(
+            "var initialMode = initialParams.get(\"mode\") === \"archive\" ? \"archive\" : \"live\";"
+        ));
+        assert!(response.contains("if (state.mode === \"archive\") params.set(\"since\", \"0\");"));
+        assert!(response.contains("appendEvent(event, message.lastEventId)"));
+        assert!(response.contains("state.eventIds.has(normalizedId)"));
+        assert!(!response.contains("if (!state.selectedProject || !state.selectedRun) return"));
+
+        assert!(response.contains("var projectionGroups = new Map()"));
+        assert!(response.contains("state.view === \"repository\""));
+        assert!(response.contains("state.view === \"combined\""));
         server.stop();
     }
 
@@ -1301,6 +1336,38 @@ mod tests {
     }
 
     #[test]
+    fn queryless_stream_emits_current_events_across_repositories_and_runs() {
+        let first = event("repo-a-worker", json!({"status": "running"}));
+        let mut second = event("repo-b-worker", json!({"status": "ready"}));
+        second.repo = "repo-b".to_string();
+        second.run = "run-2".to_string();
+
+        let source = Arc::new(TestDataSource::new(json!({"projects": []}), Vec::new()));
+        source.set_stream_events(vec![
+            family_event("o2", first),
+            family_event("autopilot", second),
+        ]);
+        let stream_source: Arc<dyn ScopeDataSource> = source;
+        let mut server = TestServer::start(stream_source, test_config());
+        let mut stream = open_stream(server.address, "/api/stream");
+        let mut response = Vec::new();
+
+        read_until(&mut stream, &mut response, "\"node\":\"repo-b-worker\"");
+
+        let response = String::from_utf8(response).expect("query-less SSE response UTF-8");
+        assert!(response.contains("\"repo\":\"repo\""));
+        assert!(response.contains("\"run\":\"run-1\""));
+        assert!(response.contains("\"family\":\"o2\""));
+        assert!(response.contains("\"node\":\"repo-a-worker\""));
+        assert!(response.contains("\"repo\":\"repo-b\""));
+        assert!(response.contains("\"run\":\"run-2\""));
+        assert!(response.contains("\"family\":\"autopilot\""));
+        assert!(response.contains("id: 1\n"));
+        assert!(response.contains("id: 2\n"));
+        server.stop();
+    }
+
+    #[test]
     fn stream_filters_resumes_and_can_start_at_live_edge() {
         let first = event("first", json!({"status": "old"}));
         let mut other_run = event("other-run", json!({}));
@@ -1345,6 +1412,7 @@ mod tests {
             "Content-Type: text/event-stream",
         );
         assert!(!String::from_utf8_lossy(&live_response).contains("data: "));
+        read_until(&mut live, &mut live_response, ": heartbeat");
         let new_event = event("live", json!({"status": "new"}));
         source.set_events(vec![first, other_run, new_event]);
         read_until(&mut live, &mut live_response, "\"node\":\"live\"");

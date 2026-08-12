@@ -80,7 +80,7 @@
       .connection[data-state="error"] { color: var(--red); }
       .toolbar {
         display: grid;
-        grid-template-columns: minmax(12rem, 1fr) minmax(14rem, 2fr) auto;
+        grid-template-columns: repeat(5, minmax(8rem, 1fr)) auto;
         gap: 0.75rem;
         align-items: end;
         padding: 0.85rem;
@@ -152,7 +152,7 @@
       .estimate-note[data-visible="true"] { display: inline; }
       .timeline {
         display: grid;
-        grid-template-columns: auto auto minmax(8rem, 1fr) auto auto;
+        grid-template-columns: auto auto auto minmax(8rem, 1fr) auto auto auto auto;
         align-items: center;
         gap: 0.6rem;
         padding: 0.75rem 0.9rem;
@@ -164,6 +164,8 @@
       .timeline button.secondary { color: var(--muted); border-color: var(--line); }
       .timeline input { width: 100%; accent-color: var(--cyan); }
       .timeline select { padding: 0.3rem 0.45rem; }
+      .timeline-edge { color: var(--muted); letter-spacing: 0.05em; text-transform: uppercase; }
+      .timeline-edge.live { color: var(--cyan); font-weight: 700; }
       .clock { min-width: 8.8rem; color: var(--muted); text-align: right; white-space: nowrap; }
       .log-panel { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-width: 0; }
       .event-log {
@@ -226,8 +228,12 @@
         border: 0;
       }
 
+      @media (max-width: 1100px) {
+        .toolbar { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .summary { grid-column: 1 / -1; }
+      }
       @media (max-width: 840px) {
-        .toolbar { grid-template-columns: 1fr; }
+        .toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .summary { white-space: normal; }
         .workspace { grid-template-columns: 1fr; }
         .tree-panel { border-right: 0; border-bottom: 1px solid var(--line); }
@@ -235,7 +241,9 @@
       }
       @media (max-width: 560px) {
         .shell { padding: 0.45rem; }
-        .timeline { grid-template-columns: auto auto 1fr; }
+        .toolbar { grid-template-columns: 1fr; }
+        .timeline { grid-template-columns: auto auto auto 1fr auto; }
+        .timeline #jumpToLive { grid-column: 1 / -1; }
         .timeline .clock { grid-column: 1 / -1; text-align: left; }
         .timeline .speed-field { justify-self: end; }
         .panel-heading .hint { display: none; }
@@ -245,8 +253,8 @@
       }
     </style>
   </head>
-  <body data-maco-scope-ui="spawn-tree-v1">
-    <!-- Stable marker: MACO_SCOPE_SPAWN_TREE_UI -->
+  <body data-maco-scope-ui="live-multiproject-v2">
+    <!-- Stable marker: MACO_SCOPE_LIVE_MULTIPROJECT_UI -->
     <main class="shell">
       <header class="masthead">
         <h1 class="brand"><span>MACO</span> Scope</h1>
@@ -255,12 +263,31 @@
 
       <section class="toolbar" aria-label="Scope run navigation">
         <div class="field">
+          <label for="modeSelect">Mode</label>
+          <select id="modeSelect">
+            <option value="live" selected>Live</option>
+            <option value="archive">Archive</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="viewSelect">View</label>
+          <select id="viewSelect">
+            <option value="session" selected>Session</option>
+            <option value="repository">Repository</option>
+            <option value="combined">Combined</option>
+          </select>
+        </div>
+        <div class="field">
           <label for="projectSelect">Project</label>
-          <select id="projectSelect" disabled><option>Loading projects…</option></select>
+          <select id="projectSelect"><option value="" selected>All projects</option></select>
+        </div>
+        <div class="field">
+          <label for="familySelect">Family</label>
+          <select id="familySelect"><option value="" selected>All families</option></select>
         </div>
         <div class="field">
           <label for="runSelect">Run</label>
-          <select id="runSelect" disabled><option>Select a project</option></select>
+          <select id="runSelect"><option value="" selected>All runs</option></select>
         </div>
         <div id="runSummary" class="summary">0 events</div>
       </section>
@@ -281,11 +308,14 @@
             <ol id="treeSummary" class="sr-only" aria-live="polite"></ol>
             <ol id="edgeSummary" class="sr-only" aria-live="polite" aria-label="Graph relationships"></ol>
           </div>
-          <div class="timeline" aria-label="Replay controls">
+          <div class="timeline" aria-label="Live timeline controls">
             <button id="playButton" type="button" disabled aria-label="Play replay">▶ Play</button>
             <button id="replayButton" class="secondary" type="button" disabled>↺ Replay</button>
-            <label class="sr-only" for="scrubber">Replay position</label>
+            <span class="timeline-edge">History</span>
+            <label class="sr-only" for="scrubber">Live timeline position</label>
             <input id="scrubber" type="range" min="0" max="0" value="0" step="1" disabled>
+            <span class="timeline-edge live">LIVE</span>
+            <button id="jumpToLive" type="button" disabled>Jump to live</button>
             <span id="clock" class="clock">event 0 / 0</span>
             <label class="speed-field">speed
               <select id="speedSelect" aria-label="Replay speed">
@@ -350,10 +380,13 @@
           blocked: "!",
           done: "✓"
         };
-        var roleOrder = { o2: 0, o1: 1, worker: 2, auditor: 3, gate: 4 };
+        var roleOrder = { root: 0, o2: 0, o1: 1, worker: 2, auditor: 3, gate: 4 };
 
         var elements = {
+          mode: document.getElementById("modeSelect"),
+          view: document.getElementById("viewSelect"),
           project: document.getElementById("projectSelect"),
+          family: document.getElementById("familySelect"),
           run: document.getElementById("runSelect"),
           summary: document.getElementById("runSummary"),
           connection: document.getElementById("connection"),
@@ -368,29 +401,40 @@
           log: document.getElementById("eventLog"),
           play: document.getElementById("playButton"),
           replay: document.getElementById("replayButton"),
+          jump: document.getElementById("jumpToLive"),
+          liveEdge: document.querySelector(".timeline-edge.live"),
           scrubber: document.getElementById("scrubber"),
           clock: document.getElementById("clock"),
           speed: document.getElementById("speedSelect")
         };
         var context = elements.canvas.getContext("2d");
+        var initialParams = new URLSearchParams(window.location.search);
+        var initialMode = initialParams.get("mode") === "archive" ? "archive" : "live";
+        var initialView = ["session", "repository", "combined"].includes(initialParams.get("view")) ?
+          initialParams.get("view") : "session";
         var state = {
           projects: [],
-          selectedProject: null,
-          selectedRun: null,
+          mode: initialMode,
+          view: initialView,
+          selectedProject: initialParams.get("repo") || "",
+          selectedFamily: initialParams.get("family") || "",
+          selectedRun: initialParams.get("run") || "",
           events: [],
           eventKeys: new Set(),
+          eventIds: new Set(),
+          lastEventId: "",
           cursor: 0,
           playing: false,
           live: true,
           source: null,
           replayTimer: null,
-          loadToken: 0,
-          pendingLoad: null,
           animationFrame: null,
           unloading: false,
           lastLogCursor: -1,
           layout: { nodes: new Map(), edges: [], width: 900, height: 496 }
         };
+        elements.mode.value = state.mode;
+        elements.view.value = state.view;
 
         function setConnection(label, mode) {
           elements.connection.textContent = label;
@@ -429,6 +473,8 @@
           var normalized = normalizeEvents(combined);
           state.events = normalized.map(function (entry) { return entry[1]; });
           state.eventKeys = new Set(normalized.map(function (entry) { return entry[0]; }));
+          state.eventIds = new Set();
+          state.lastEventId = "";
           state.cursor = state.events.length;
           state.live = true;
           state.playing = false;
@@ -437,10 +483,15 @@
           render();
         }
 
-        function appendEvent(event) {
+        function appendEvent(event, eventId) {
+          var normalizedId = String(eventId || "");
           var key = eventKey(event);
-          if (state.eventKeys.has(key)) return false;
+          if (normalizedId ? state.eventIds.has(normalizedId) : state.eventKeys.has(key)) return false;
           var wasAtLiveEdge = state.live || state.cursor === state.events.length;
+          if (normalizedId) {
+            state.eventIds.add(normalizedId);
+            state.lastEventId = normalizedId;
+          }
           state.eventKeys.add(key);
           state.events.push(event);
           if (wasAtLiveEdge) {
@@ -514,6 +565,7 @@
         }
 
         function displayRole(event) {
+          if (event.role === "root") return "root";
           if (event.role === "supervisor") return "o2";
           if (event.role === "orchestrator") return "o1";
           if (event.role === "auditor") return "auditor";
@@ -584,49 +636,158 @@
           var nodes = new Map();
           var escalationIds = [];
           var explicitCoverage = [];
+          var runContexts = new Map();
+          var projectionGroups = new Map();
+          var explicitRootIds = new Set(events.filter(function (event) {
+            return event.role === "root";
+          }).map(function (event) { return String(event.node); }));
 
-          function newNode(id, label, role, parent, status, index) {
+          function eventScope(event) {
+            return [event.repo || "", event.family || "", event.run || ""].map(String).join("\u0000");
+          }
+
+          function scopedNodeId(scope, rawId) {
+            return scope + "\u0001" + String(rawId || "unknown");
+          }
+
+          events.forEach(function (event) {
+            var scope = eventScope(event);
+            var contextForRun = runContexts.get(scope);
+            if (!contextForRun) {
+              contextForRun = {
+                scope: scope,
+                repo: String(event.repo || "unknown repository"),
+                family: String(event.family || "unknown family"),
+                run: String(event.run || "unknown run"),
+                rootRaw: null,
+                rootHasParent: true,
+                rootExternal: false,
+                groupKey: "",
+                groupLabel: "",
+                groupNodeId: null,
+                column: 0
+              };
+              runContexts.set(scope, contextForRun);
+            }
+            if (event.role === "root" && (!contextForRun.rootRaw || contextForRun.rootHasParent && !event.parent)) {
+              contextForRun.rootRaw = String(event.node);
+              contextForRun.rootHasParent = Boolean(event.parent);
+              contextForRun.rootExternal = false;
+            }
+          });
+
+          events.forEach(function (event) {
+            var contextForRun = runContexts.get(eventScope(event));
+            if (!contextForRun.rootRaw && event.parent && explicitRootIds.has(String(event.parent))) {
+              contextForRun.rootRaw = String(event.parent);
+              contextForRun.rootHasParent = false;
+              contextForRun.rootExternal = true;
+            }
+          });
+
+          runContexts.forEach(function (contextForRun) {
+            if (state.view === "repository") {
+              contextForRun.groupKey = "repository:" + encodeURIComponent(contextForRun.repo);
+              contextForRun.groupLabel = "Repository · " + contextForRun.repo;
+            } else if (state.view === "combined") {
+              contextForRun.groupKey = "combined";
+              contextForRun.groupLabel = "Combined";
+            } else {
+              // Reused root IDs are the #68 cross-repository linking contract; legacy runs fall back deterministically.
+              var rootIdentity = contextForRun.rootRaw || contextForRun.scope;
+              contextForRun.groupKey = "session:" + encodeURIComponent(rootIdentity);
+              contextForRun.groupLabel = "Session · " + (contextForRun.rootRaw ||
+                contextForRun.repo + " / " + contextForRun.family + " / " + contextForRun.run);
+            }
+            if (!projectionGroups.has(contextForRun.groupKey)) {
+              projectionGroups.set(contextForRun.groupKey, {
+                key: contextForRun.groupKey,
+                label: contextForRun.groupLabel,
+                column: projectionGroups.size,
+                nodeId: null
+              });
+            }
+            var projection = projectionGroups.get(contextForRun.groupKey);
+            contextForRun.column = projection.column;
+            if (state.view !== "combined") {
+              projection.nodeId = projection.nodeId || syntheticId("view-group", state.view + "\u0000" + projection.key);
+              contextForRun.groupNodeId = projection.nodeId;
+            }
+          });
+
+          function newNode(id, label, role, parent, status, index, contextForRun) {
             return {
               id: id,
               label: label,
               role: role,
               parent: parent || null,
+              parentRaw: null,
               status: status || "pending",
               born: index,
               last: index,
               escalation: false,
               origin: null,
+              originLabel: null,
               originNode: null,
               inferred: false,
               estimated: false,
-              column: 0,
+              groupNode: false,
+              groupKey: contextForRun ? contextForRun.groupKey : "combined",
+              scope: contextForRun ? contextForRun.scope : "",
+              column: contextForRun ? contextForRun.column : 0,
               depth: 0
             };
           }
 
+          if (state.view !== "combined") {
+            projectionGroups.forEach(function (projection) {
+              var groupNode = newNode(projection.nodeId, projection.label, "root", null, "running", 0, null);
+              groupNode.groupNode = true;
+              groupNode.groupKey = projection.key;
+              groupNode.column = projection.column;
+              nodes.set(groupNode.id, groupNode);
+            });
+          }
+
+          function contextFor(event) {
+            return runContexts.get(eventScope(event));
+          }
+
           function ensureSubject(event, index) {
-            var node = nodes.get(event.node);
-            if (!node) {
-              node = newNode(event.node, event.node, displayRole(event), event.parent, "pending", index);
-              nodes.set(event.node, node);
+            var contextForRun = contextFor(event);
+            var id = scopedNodeId(contextForRun.scope, event.node);
+            var parent = event.parent ? scopedNodeId(contextForRun.scope, event.parent) : null;
+            if (state.view === "session" && contextForRun.rootExternal &&
+                String(event.parent || "") === contextForRun.rootRaw && contextForRun.groupNodeId) {
+              parent = contextForRun.groupNodeId;
             }
-            if (event.parent) node.parent = event.parent;
+            if (event.role === "root" && contextForRun.groupNodeId) parent = contextForRun.groupNodeId;
+            var node = nodes.get(id);
+            if (!node) {
+              var label = event.role === "root" ? "root · " + event.node : event.node;
+              node = newNode(id, label, displayRole(event), parent, "pending", index, contextForRun);
+              nodes.set(id, node);
+            }
+            if (parent) node.parent = parent;
+            node.parentRaw = parent === contextForRun.groupNodeId ? null : (event.parent || null);
             node.last = index;
             return node;
           }
 
           function addGate(event, payload, index) {
+            var contextForRun = contextFor(event);
+            var subjectId = scopedNodeId(contextForRun.scope, event.node);
             var nested = payload.validation && typeof payload.validation === "object" &&
               !Array.isArray(payload.validation);
-            var subject = nodes.get(event.node);
+            var subject = nodes.get(subjectId);
             if (nested || subject && subject.role !== "gate") {
               subject = ensureSubject(event, index);
               var detail = gateDetail(payload);
-              var identity = gateIdentity(detail, event, index);
+              var identity = contextForRun.scope + "\u0000" + gateIdentity(detail, event, index);
               var id = syntheticId("gate", identity);
               var gate = nodes.get(id);
               if (!gate) {
-                gate = newNode(id, gateLabel(detail), "gate", subject.id, gateStatus(detail), index);
+                gate = newNode(id, gateLabel(detail), "gate", subject.id, gateStatus(detail), index, contextForRun);
                 nodes.set(id, gate);
               } else {
                 gate.label = gateLabel(detail);
@@ -637,48 +798,43 @@
             }
 
             var detail = gateDetail(payload);
-            var gate = newNode(event.node, gateLabel(detail), "gate", event.parent,
-              gateStatus(detail), index);
-            nodes.set(event.node, gate);
+            var parent = event.parent ? scopedNodeId(contextForRun.scope, event.parent) : null;
+            var gate = newNode(subjectId, gateLabel(detail), "gate", parent,
+              gateStatus(detail), index, contextForRun);
+            gate.parentRaw = event.parent || null;
+            nodes.set(subjectId, gate);
             return gate;
           }
 
           events.forEach(function (event, index) {
+            var contextForRun = contextFor(event);
             var payload = event.payload && typeof event.payload === "object" ? event.payload : {};
             var node = event.kind === "gate" ? addGate(event, payload, index) : ensureSubject(event, index);
             if (event.kind !== "gate") node.status = statusFromEvent(event, node.status);
             if (event.kind === "escalate") {
               node.escalation = true;
               node.role = "o2";
-              node.origin = typeof payload.origin === "string" && payload.origin ? payload.origin : (event.parent || "unknown");
+              var rawOrigin = typeof payload.origin === "string" && payload.origin ? payload.origin : (event.parent || "unknown");
+              node.origin = scopedNodeId(contextForRun.scope, rawOrigin);
+              node.originLabel = rawOrigin;
               node.inferred = payload.inferred === true;
-              node.label = (node.inferred ? "≈ " : "") + "peer-o2 ← " + node.origin;
+              node.label = (node.inferred ? "≈ " : "") + "peer-o2 ← " + rawOrigin;
               if (!escalationIds.includes(node.id)) escalationIds.push(node.id);
             }
             var coverage = coverageEvidence(event, payload);
             if (node.role === "auditor") {
-              coverage.forEach(function (target) { explicitCoverage.push([node.id, target]); });
+              coverage.forEach(function (target) {
+                explicitCoverage.push([node.id, scopedNodeId(contextForRun.scope, target)]);
+              });
             }
           });
 
           nodes.forEach(function (node) {
             if (node.parent && !nodes.has(node.parent)) {
-              nodes.set(node.parent, {
-                id: node.parent,
-                label: node.parent,
-                role: "o1",
-                parent: null,
-                status: "pending",
-                born: node.born,
-                last: node.born,
-                escalation: false,
-                origin: null,
-                originNode: null,
-                inferred: false,
-                estimated: false,
-                column: 0,
-                depth: 0
-              });
+              var contextForRun = runContexts.get(node.scope);
+              var placeholder = newNode(node.parent, node.parentRaw || "parent", "o1", null,
+                "pending", node.born, contextForRun);
+              nodes.set(node.parent, placeholder);
             }
           });
 
@@ -689,20 +845,16 @@
               escalation.originNode = escalation.origin;
               return;
             }
-            var anchorId = syntheticId("origin", escalation.origin);
+            var contextForRun = runContexts.get(escalation.scope);
+            var anchorId = syntheticId("origin", escalation.scope + "\u0000" + escalation.originLabel);
             var anchor = nodes.get(anchorId);
             if (!anchor) {
-              anchor = newNode(anchorId, "≈ " + escalation.origin + " origin", "worker",
-                escalation.parent, "pending", escalation.born);
+              anchor = newNode(anchorId, "≈ " + escalation.originLabel + " origin", "worker",
+                escalation.parent, "pending", escalation.born, contextForRun);
               anchor.estimated = true;
               nodes.set(anchorId, anchor);
             }
             escalation.originNode = anchorId;
-          });
-
-          escalationIds.forEach(function (id, index) {
-            var root = nodes.get(id);
-            if (root) root.column = index + 1;
           });
 
           function inheritedColumn(node, trail) {
@@ -959,9 +1111,12 @@
             return left.depth - right.depth || left.column - right.column || left.x - right.x;
           }).forEach(function (node) {
             var item = document.createElement("li");
+            var parentNode = node.parent ? layout.nodes.get(node.parent) : null;
+            item.dataset.viewGroup = node.groupKey || "combined";
             item.textContent = node.label + ", " + node.role + ", " + node.status +
-              (node.parent ? ", parent " + node.parent : "") +
+              (node.parent ? ", parent " + (parentNode ? parentNode.label : "unknown") : "") +
               ", depth " + node.depth + ", column " + node.column +
+              (node.groupNode ? ", view group " + node.groupKey : "") +
               (node.estimated ? ", estimated origin anchor" : "");
             if (node.inferred) item.title = "Escalation origin is an estimate inferred by the backend.";
             if (node.estimated) item.title = "Estimated anchor synthesized because the named escalation origin is absent from the event stream.";
@@ -1068,10 +1223,14 @@
           state.layout = computeLayout(graph);
           elements.empty.hidden = graph.nodes.size > 0;
           if (!graph.nodes.size) {
-            elements.empty.querySelector("strong").textContent = state.selectedRun ? "No events yet" : "No run selected";
-            elements.empty.querySelector("span").textContent = state.selectedRun ?
-              "The live stream will add nodes when normalized events arrive." :
-              "Choose a project and run to load its normalized events.";
+            var hasFilters = state.selectedProject || state.selectedFamily || state.selectedRun;
+            elements.empty.querySelector("strong").textContent = state.mode === "archive" ?
+              "Archive is empty" : "Waiting for live events";
+            elements.empty.querySelector("span").textContent = hasFilters ?
+              "Events matching the current filters will appear here." :
+              (state.mode === "archive" ?
+                "Replaying buffered history across all projects." :
+                "Watching the live stream across all projects.");
           }
           var estimated = Array.from(graph.nodes.values()).filter(function (node) {
             return node.inferred || node.estimated;
@@ -1092,11 +1251,15 @@
           elements.scrubber.disabled = count === 0;
           elements.play.disabled = count === 0;
           elements.replay.disabled = count === 0;
+          elements.jump.disabled = count === 0 || state.live;
+          elements.jump.hidden = state.mode !== "live";
+          elements.liveEdge.hidden = state.mode !== "live" || !state.live;
           elements.play.textContent = state.playing ? "⏸ Pause" : "▶ Play";
           var timestamp = state.cursor > 0 && state.events[state.cursor - 1] ? state.events[state.cursor - 1].ts : "start";
           elements.clock.textContent = "event " + state.cursor + " / " + count + " · " + timestamp;
           elements.summary.textContent = count + " event" + (count === 1 ? "" : "s") +
-            (state.live ? " · live edge" : " · replay");
+            (state.mode === "archive" ? " · archive replay" : "") +
+            (state.live ? (state.mode === "live" ? " · LIVE edge" : " · archive edge") : " · history");
         }
 
         function stopPlayback() {
@@ -1125,115 +1288,123 @@
           }, 700 / speed);
         }
 
+        function addFilterOption(select, value, label) {
+          var option = document.createElement("option");
+          option.value = value;
+          option.textContent = label;
+          select.appendChild(option);
+        }
+
+        function availableRuns() {
+          var runs = [];
+          state.projects.forEach(function (project) {
+            if (state.selectedProject && String(project.id) !== state.selectedProject) return;
+            (Array.isArray(project.runs) ? project.runs : []).forEach(function (run) {
+              runs.push({ project: String(project.id), family: String(run.family), run: String(run.run), event_count: run.event_count });
+            });
+          });
+          return runs;
+        }
+
         function populateProjects() {
           elements.project.replaceChildren();
-          if (!state.projects.length) {
-            var none = document.createElement("option");
-            none.textContent = "No watched repositories";
-            elements.project.appendChild(none);
-            elements.project.disabled = true;
-            populateRuns();
-            return;
-          }
-          state.projects.forEach(function (project, index) {
-            var option = document.createElement("option");
-            option.value = String(index);
-            option.textContent = project.id + " (" + (Array.isArray(project.runs) ? project.runs.length : 0) + " runs)";
-            elements.project.appendChild(option);
+          addFilterOption(elements.project, "", "All projects");
+          state.projects.forEach(function (project) {
+            addFilterOption(
+              elements.project,
+              String(project.id),
+              project.id + " (" + (Array.isArray(project.runs) ? project.runs.length : 0) + " runs)"
+            );
           });
+          if (state.selectedProject && !state.projects.some(function (project) {
+            return String(project.id) === state.selectedProject;
+          })) addFilterOption(elements.project, state.selectedProject, state.selectedProject + " (not discovered)");
+          elements.project.value = state.selectedProject;
           elements.project.disabled = false;
-          state.selectedProject = state.projects[0];
+          populateFamilies();
+        }
+
+        function populateFamilies() {
+          elements.family.replaceChildren();
+          addFilterOption(elements.family, "", "All families");
+          var families = Array.from(new Set(availableRuns().map(function (run) { return run.family; }))).sort();
+          families.forEach(function (family) { addFilterOption(elements.family, family, family); });
+          if (state.selectedFamily && !families.includes(state.selectedFamily)) {
+            addFilterOption(elements.family, state.selectedFamily, state.selectedFamily + " (not discovered)");
+          }
+          elements.family.value = state.selectedFamily;
+          elements.family.disabled = false;
           populateRuns();
         }
 
         function populateRuns() {
           elements.run.replaceChildren();
-          var runs = state.selectedProject && Array.isArray(state.selectedProject.runs) ? state.selectedProject.runs : [];
-          if (!runs.length) {
-            var none = document.createElement("option");
-            none.textContent = state.selectedProject ? "No runs discovered" : "Select a project";
-            elements.run.appendChild(none);
-            elements.run.disabled = true;
-            state.selectedRun = null;
-            loadSelectedRun();
-            return;
-          }
-          runs.forEach(function (run, index) {
-            var option = document.createElement("option");
-            option.value = String(index);
-            option.textContent = run.family + " / " + run.run + " · " + run.event_count + " events";
-            elements.run.appendChild(option);
+          addFilterOption(elements.run, "", "All runs");
+          var runs = availableRuns().filter(function (run) {
+            return !state.selectedFamily || run.family === state.selectedFamily;
           });
+          var runNames = Array.from(new Set(runs.map(function (run) { return run.run; }))).sort();
+          runNames.forEach(function (runName) {
+            var matching = runs.filter(function (run) { return run.run === runName; });
+            var count = matching.reduce(function (total, run) { return total + (Number(run.event_count) || 0); }, 0);
+            var familyLabel = !state.selectedFamily && matching.length === 1 ? matching[0].family + " / " : "";
+            addFilterOption(elements.run, runName, familyLabel + runName + " · " + count + " events");
+          });
+          if (state.selectedRun && !runNames.includes(state.selectedRun)) {
+            addFilterOption(elements.run, state.selectedRun, state.selectedRun + " (not discovered)");
+          }
+          elements.run.value = state.selectedRun;
           elements.run.disabled = false;
-          state.selectedRun = runs[0];
-          loadSelectedRun();
         }
 
-        async function loadSelectedRun() {
+        function updateLocation() {
+          var params = new URLSearchParams();
+          if (state.mode !== "live") params.set("mode", state.mode);
+          if (state.view !== "session") params.set("view", state.view);
+          if (state.selectedProject) params.set("repo", state.selectedProject);
+          if (state.selectedFamily) params.set("family", state.selectedFamily);
+          if (state.selectedRun) params.set("run", state.selectedRun);
+          var query = params.toString();
+          window.history.replaceState(null, "", window.location.pathname + (query ? "?" + query : "") + window.location.hash);
+        }
+
+        function applyFilters() {
           stopPlayback();
-          var project = state.selectedProject;
-          var run = state.selectedRun;
-          var token = ++state.loadToken;
-          state.pendingLoad = null;
           replaceEvents([]);
-          if (!project || !run) {
-            return;
-          }
-          state.pendingLoad = {
-            token: token,
-            repo: String(project.id),
-            family: String(run.family),
-            run: String(run.run),
-            liveEvents: [],
-            liveKeys: new Set()
-          };
-          showError("");
-          elements.status.textContent = "Loading " + run.family + " / " + run.run;
-          var segments = [project.id, run.family, run.run].map(function (segment) {
-            return encodeURIComponent(String(segment));
-          });
-          try {
-            var response = await fetch("/api/runs/" + segments.join("/") + "/events", { cache: "no-store" });
-            if (!response.ok) throw new Error("events request returned HTTP " + response.status);
-            var records = await response.json();
-            var pending = state.pendingLoad;
-            if (token !== state.loadToken || !pending || pending.token !== token) return;
-            state.pendingLoad = null;
-            replaceEvents(records, pending.liveEvents);
-            elements.status.textContent = "Loaded " + run.family + " / " + run.run;
-          } catch (error) {
-            var pending = state.pendingLoad;
-            if (token !== state.loadToken || !pending || pending.token !== token) return;
-            state.pendingLoad = null;
-            replaceEvents([], pending.liveEvents);
-            showError("Could not load run: " + error.message);
-            elements.status.textContent = "Run load failed";
-          }
+          updateLocation();
+          connectStream();
         }
 
         function connectStream() {
           if (state.source) state.source.close();
-          var source = new EventSource("/api/stream");
+          var params = new URLSearchParams();
+          if (state.selectedProject) params.set("repo", state.selectedProject);
+          if (state.selectedFamily) params.set("family", state.selectedFamily);
+          if (state.selectedRun) params.set("run", state.selectedRun);
+          if (state.mode === "archive") params.set("since", "0");
+          var streamUrl = "/api/stream" + (params.toString() ? "?" + params.toString() : "");
+          var source = new EventSource(streamUrl);
           state.source = source;
-          source.onopen = function () { setConnection("LIVE STREAM", "live"); };
-          source.onerror = function () { setConnection("RECONNECTING", "error"); };
+          source.onopen = function () {
+            setConnection(state.mode === "archive" ? "ARCHIVE BUFFERING" : "LIVE STREAM", state.mode === "archive" ? "loading" : "live");
+          };
+          source.onerror = function () {
+            setConnection(state.mode === "archive" ? "ARCHIVE RECONNECTING" : "RECONNECTING", "error");
+          };
           source.onmessage = function (message) {
             try {
               var event = JSON.parse(message.data);
-              if (!state.selectedProject || !state.selectedRun) return;
-              if (event.repo !== state.selectedProject.id ||
-                  event.family !== state.selectedRun.family ||
-                  event.run !== state.selectedRun.run) return;
-              var pending = state.pendingLoad;
-              if (pending && pending.token === state.loadToken &&
-                  event.repo === pending.repo && event.family === pending.family && event.run === pending.run) {
-                var key = eventKey(event);
-                if (!pending.liveKeys.has(key)) {
-                  pending.liveKeys.add(key);
-                  pending.liveEvents.push(event);
+              if (state.selectedProject && event.repo !== state.selectedProject) return;
+              if (state.selectedFamily && event.family !== state.selectedFamily) return;
+              if (state.selectedRun && event.run !== state.selectedRun) return;
+              if (appendEvent(event, message.lastEventId)) {
+                if (state.mode === "archive") {
+                  setConnection("ARCHIVE REPLAY", "loading");
+                  elements.status.textContent = "Archive event received: " + event.kind + " · " + event.node;
+                } else {
+                  elements.status.textContent = "Live event received: " + event.kind + " · " + event.node;
                 }
               }
-              if (appendEvent(event)) elements.status.textContent = "Live event received: " + event.kind + " · " + event.node;
             } catch (error) {
               showError("Ignored malformed stream event: " + error.message);
             }
@@ -1263,13 +1434,31 @@
         }
 
         elements.project.addEventListener("change", function () {
-          state.selectedProject = state.projects[Number(elements.project.value)] || null;
+          state.selectedProject = elements.project.value;
+          state.selectedFamily = "";
+          state.selectedRun = "";
+          populateFamilies();
+          applyFilters();
+        });
+        elements.family.addEventListener("change", function () {
+          state.selectedFamily = elements.family.value;
+          state.selectedRun = "";
           populateRuns();
+          applyFilters();
         });
         elements.run.addEventListener("change", function () {
-          var runs = state.selectedProject && Array.isArray(state.selectedProject.runs) ? state.selectedProject.runs : [];
-          state.selectedRun = runs[Number(elements.run.value)] || null;
-          loadSelectedRun();
+          state.selectedRun = elements.run.value;
+          applyFilters();
+        });
+        elements.mode.addEventListener("change", function () {
+          state.mode = elements.mode.value;
+          applyFilters();
+        });
+        elements.view.addEventListener("change", function () {
+          state.view = elements.view.value;
+          updateLocation();
+          state.lastLogCursor = -1;
+          render();
         });
         elements.play.addEventListener("click", function () {
           if (state.playing) {
@@ -1288,6 +1477,14 @@
           stopPlayback();
           state.cursor = 0;
           state.live = false;
+          state.lastLogCursor = -1;
+          updateControls();
+          render();
+        });
+        elements.jump.addEventListener("click", function () {
+          stopPlayback();
+          state.cursor = state.events.length;
+          state.live = true;
           state.lastLogCursor = -1;
           updateControls();
           render();
@@ -1319,5 +1516,5 @@
         discover();
       })();
     </script>
-  </body>
+</body>
 </html>
