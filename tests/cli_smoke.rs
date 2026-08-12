@@ -1,3 +1,5 @@
+mod support;
+
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 use multi_agent_coding_orchestrator::{orchestrator::RunId, sync_store::SyncStore};
@@ -14,6 +16,7 @@ use std::{
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
+
 #[cfg(unix)]
 const ISSUE33_PINNED_WRAPPER_ENV: &str = "MACO_ISSUE33_PINNED_WRAPPER";
 #[cfg(unix)]
@@ -649,6 +652,7 @@ fn copy_issue33_optional_logical_anchor_fixture(destination: &Path) -> Result<()
 
 #[test]
 fn cli_repo_map_orchestrate_and_sync_status_json() -> Result<()> {
+    support::require_containment!("cli_repo_map_orchestrate_and_sync_status_json");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("plan.json");

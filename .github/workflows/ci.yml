@@ -75,7 +75,7 @@ jobs:
           test_harness_args=()
           if [[ "$delegated_user_manager" == false ]]; then
             reason="current cgroup ${current_cgroup:-<unified cgroup v2 entry absent>} is not inside a delegated systemd user manager"
-            test_harness_args+=(--exact)
+            test_harness_args+=(--exact --show-output)
             while IFS= read -r test_name; do
               [[ -z "$test_name" ]] && continue
               printf 'SKIP %s: %s\n' "$test_name" "$reason"

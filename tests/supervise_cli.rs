@@ -18,6 +18,8 @@
 //!   `supervise::tests::finding_serialization_escapes_non_utf8_paths_reversibly` and
 //!   `supervisor_required_optional_and_vector_paths_share_reversible_serialization`
 
+mod support;
+
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 use multi_agent_coding_orchestrator::supervise::FieldGuideEntrySuggestion;
@@ -31,6 +33,7 @@ use std::{
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
+
 #[test]
 fn field_guide_suggestion_public_contract_accepts_content_only_and_rejects_provenance() -> Result<()>
 {
@@ -55,6 +58,9 @@ fn field_guide_suggestion_public_contract_accepts_content_only_and_rejects_prove
 #[cfg(unix)]
 #[test]
 fn fake_runtime_never_executes_codex_bin_or_task_text_and_is_never_publishable() -> Result<()> {
+    support::require_containment!(
+        "fake_runtime_never_executes_codex_bin_or_task_text_and_is_never_publishable"
+    );
     use std::os::unix::fs::PermissionsExt;
 
     let temp = TempDir::new().context("tempdir")?;
@@ -132,6 +138,9 @@ fn fake_runtime_never_executes_codex_bin_or_task_text_and_is_never_publishable()
 #[cfg(target_os = "linux")]
 #[test]
 fn deterministic_fake_cli_emits_stable_shape_artifacts_and_cleans_claims() -> Result<()> {
+    support::require_containment!(
+        "deterministic_fake_cli_emits_stable_shape_artifacts_and_cleans_claims"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("two-children.json");
@@ -182,6 +191,9 @@ fn deterministic_fake_cli_emits_stable_shape_artifacts_and_cleans_claims() -> Re
 #[cfg(unix)]
 #[test]
 fn codex_runtime_custom_bin_fails_closed_and_cannot_mutate_primary() -> Result<()> {
+    support::require_containment!(
+        "codex_runtime_custom_bin_fails_closed_and_cannot_mutate_primary"
+    );
     use std::os::unix::fs::PermissionsExt;
 
     let temp = TempDir::new().context("tempdir")?;
@@ -305,6 +317,9 @@ fn supervise_plan_normalizes_aliases_and_rejects_top_level_scope_conflicts() -> 
 
 #[test]
 fn supervise_plan_from_goal_emits_nested_traceable_disjoint_workstreams() -> Result<()> {
+    support::require_containment!(
+        "supervise_plan_from_goal_emits_nested_traceable_disjoint_workstreams"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let goal_path = temp.path().join("goal.md");
@@ -528,6 +543,9 @@ fn supervise_plan_from_goal_emits_nested_traceable_disjoint_workstreams() -> Res
 
 #[test]
 fn supervise_run_from_goal_executes_the_same_validated_plan_and_preserves_primary() -> Result<()> {
+    support::require_containment!(
+        "supervise_run_from_goal_executes_the_same_validated_plan_and_preserves_primary"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let goal_path = temp.path().join("run-goal.md");
@@ -594,6 +612,9 @@ fn supervise_run_from_goal_executes_the_same_validated_plan_and_preserves_primar
 
 #[test]
 fn supervise_plan_plain_text_without_actionable_workstreams_is_an_error() -> Result<()> {
+    support::require_containment!(
+        "supervise_plan_plain_text_without_actionable_workstreams_is_an_error"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let task_path = temp.path().join("empty-plan-task.txt");
@@ -789,6 +810,9 @@ fn supervise_run_help_documents_auto_concurrency_default() -> Result<()> {
 
 #[test]
 fn supervise_run_rejects_zero_bound_before_reserving_state_and_accepts_one() -> Result<()> {
+    support::require_containment!(
+        "supervise_run_rejects_zero_bound_before_reserving_state_and_accepts_one"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("bounded-run.json");
@@ -843,6 +867,9 @@ fn supervise_run_rejects_zero_bound_before_reserving_state_and_accepts_one() -> 
 
 #[test]
 fn supervise_run_executes_fake_runtime_with_explicit_and_auto_concurrency() -> Result<()> {
+    support::require_containment!(
+        "supervise_run_executes_fake_runtime_with_explicit_and_auto_concurrency"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("concurrent-run.json");
@@ -887,6 +914,9 @@ fn supervise_run_executes_fake_runtime_with_explicit_and_auto_concurrency() -> R
 
 #[test]
 fn supervise_run_id_reuse_is_refused_and_artifacts_remain_collectable() -> Result<()> {
+    support::require_containment!(
+        "supervise_run_id_reuse_is_refused_and_artifacts_remain_collectable"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("artifact-plan.json");
@@ -925,6 +955,9 @@ fn supervise_run_id_reuse_is_refused_and_artifacts_remain_collectable() -> Resul
 
 #[test]
 fn fake_prompt_keeps_role_assignment_and_consultant_contract_as_data() -> Result<()> {
+    support::require_containment!(
+        "fake_prompt_keeps_role_assignment_and_consultant_contract_as_data"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("prompt-plan.json");
@@ -971,6 +1004,7 @@ fn fake_prompt_keeps_role_assignment_and_consultant_contract_as_data() -> Result
 
 #[test]
 fn supervise_generates_run_ids_refuses_reuse_and_lists_artifacts() -> Result<()> {
+    support::require_containment!("supervise_generates_run_ids_refuses_reuse_and_lists_artifacts");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("generated-id.json");
@@ -1085,6 +1119,7 @@ fn supervise_plan_rejects_cross_assignment_semantic_conflicts_even_in_warn_mode(
 
 #[test]
 fn supervise_run_reports_sync_claim_conflict_owner_and_paths() -> Result<()> {
+    support::require_containment!("supervise_run_reports_sync_claim_conflict_owner_and_paths");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("claim-conflict.json");
@@ -1132,6 +1167,9 @@ fn supervise_run_reports_sync_claim_conflict_owner_and_paths() -> Result<()> {
 
 #[test]
 fn supervise_run_refuses_clean_stale_reused_child_worktree_before_execution() -> Result<()> {
+    support::require_containment!(
+        "supervise_run_refuses_clean_stale_reused_child_worktree_before_execution"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("stale-worktree.json");
@@ -1242,6 +1280,9 @@ fn supervise_plan_enforces_depth_assignment_and_retry_bounds() -> Result<()> {
 #[cfg(target_os = "linux")]
 #[test]
 fn supervise_primary_git_snapshots_ignore_ambient_repository_redirects() -> Result<()> {
+    support::require_containment!(
+        "supervise_primary_git_snapshots_ignore_ambient_repository_redirects"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let decoy_path = temp.path().join("decoy");

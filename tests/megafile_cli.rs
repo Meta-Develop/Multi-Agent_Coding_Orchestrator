@@ -1,3 +1,5 @@
+mod support;
+
 use anyhow::{Context, Result};
 use git2::Repository;
 use serde_json::Value;
@@ -8,6 +10,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 
 #[test]
 fn repo_megafile_seed_is_explicit_language_agnostic_and_queryable() -> Result<()> {
+    support::require_containment!("repo_megafile_seed_is_explicit_language_agnostic_and_queryable");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = temp.path().join("repo");
     fs::create_dir_all(repo_path.join("assets")).context("create repository directories")?;
@@ -90,6 +93,7 @@ fn repo_megafile_seed_is_explicit_language_agnostic_and_queryable() -> Result<()
 
 #[test]
 fn sync_claim_json_surfaces_typed_telemetry_warnings() -> Result<()> {
+    support::require_containment!("sync_claim_json_surfaces_typed_telemetry_warnings");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = temp.path().join("repo");
     fs::create_dir_all(repo_path.join("src")).context("create src")?;
@@ -131,6 +135,7 @@ fn sync_claim_json_surfaces_typed_telemetry_warnings() -> Result<()> {
 
 #[test]
 fn sync_claim_threshold_overrides_are_applied_and_typed() -> Result<()> {
+    support::require_containment!("sync_claim_threshold_overrides_are_applied_and_typed");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = temp.path().join("repo");
     fs::create_dir_all(repo_path.join("src")).context("create src")?;
@@ -168,6 +173,9 @@ fn sync_claim_threshold_overrides_are_applied_and_typed() -> Result<()> {
 
 #[test]
 fn sync_directory_claim_warns_for_seeded_files_in_deterministic_order() -> Result<()> {
+    support::require_containment!(
+        "sync_directory_claim_warns_for_seeded_files_in_deterministic_order"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = temp.path().join("repo");
     fs::create_dir_all(repo_path.join("src/empty")).context("create source directories")?;
@@ -288,6 +296,9 @@ fn sync_directory_claim_warns_for_seeded_files_in_deterministic_order() -> Resul
 
 #[test]
 fn sync_directory_claim_frequency_crosses_threshold_across_releases() -> Result<()> {
+    support::require_containment!(
+        "sync_directory_claim_frequency_crosses_threshold_across_releases"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = temp.path().join("repo");
     fs::create_dir_all(repo_path.join("src")).context("create src")?;

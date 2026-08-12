@@ -1,3 +1,5 @@
+mod support;
+
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::{
@@ -12,6 +14,9 @@ const ALTERNATE_BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator"
 
 #[test]
 fn relative_worktrees_share_exact_claim_state_and_map_the_selected_worktree() -> Result<()> {
+    support::require_containment!(
+        "relative_worktrees_share_exact_claim_state_and_map_the_selected_worktree"
+    );
     let fixture = RelativeWorktreeFixture::new()?;
 
     let primary_status = run_maco_success_json(&[
