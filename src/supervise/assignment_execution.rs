@@ -2993,6 +2993,8 @@ mod decomposition_tests {
             runtime: SupervisorRuntime::Fake,
             allow_dirty_primary: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
             machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
                 config: temp.path().join("unused-machine-global.json"),
                 root_id: "runtime".to_string(),
@@ -3278,6 +3280,8 @@ mod decomposition_tests {
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
             machine_global_retention: None,
         };
         let command = ExternalAgentCommand::codex(
@@ -3371,6 +3375,8 @@ done
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
             machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
                 config: config.clone(),
                 root_id: "runtime".to_string(),

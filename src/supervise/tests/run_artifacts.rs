@@ -1852,6 +1852,8 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+        budget_overrides: crate::supervise::RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
         machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
             config: temp.path().join("unused-machine-global.json"),
             root_id: "runtime".to_string(),

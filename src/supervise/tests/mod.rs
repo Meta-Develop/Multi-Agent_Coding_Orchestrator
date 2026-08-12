@@ -496,6 +496,8 @@ fn injected_options(repo: &Path, root: &Path, run_id: &str) -> SupervisorRunOpti
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+        budget_overrides: crate::supervise::RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
         machine_global_retention: Some(injected_machine_global_retention(root)),
     }
 }

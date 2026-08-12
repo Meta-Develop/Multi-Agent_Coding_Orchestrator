@@ -317,6 +317,8 @@ pub struct SupervisorRunOptions {
     pub runtime: SupervisorRuntime,
     pub allow_dirty_primary: bool,
     pub admission_overrides: SupervisorAdmissionConfig,
+    pub budget_overrides: RunBudgetLimits,
+    pub budget_max_duration_seconds: Option<u64>,
     /// Explicit reviewed binding for recoverable cleanup of every private
     /// output-staging directory created by this supervise run.
     ///
@@ -1210,6 +1212,7 @@ struct SupervisorPlanMetadata {
     assignment_schedule: Vec<AssignmentScheduleEntry>,
     coverage_gaps: Vec<SupervisorCoverageGap>,
     run_budget: SupervisorBudgetConfig,
+    run_budget_max_duration_seconds: Option<u64>,
     admission: SupervisorAdmissionConfig,
     evidence_only_reaudit: Option<EvidenceOnlyReauditPlan>,
     generated_follow_up: Option<GeneratedFollowUpPlanContext>,

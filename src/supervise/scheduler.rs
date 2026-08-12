@@ -2005,11 +2005,24 @@ fn prepare_supervisor_run(
         plan,
         consultant,
         assignment_metadata,
-        plan_metadata,
+        mut plan_metadata,
     } = loaded;
     validate_max_concurrent_children(max_concurrent_children)?;
-    let budget_ledger = RunBudgetLedger::new(plan_metadata.run_budget.limits)
-        .context("failed to initialize the supervise run budget ledger")?;
+    plan_metadata.run_budget.limits = plan_metadata
+        .run_budget
+        .limits
+        .strictest(options.budget_overrides)
+        .context("failed to compose plan and CLI run budgets")?;
+    let max_duration_seconds = match (
+        plan_metadata.run_budget_max_duration_seconds,
+        options.budget_max_duration_seconds,
+    ) {
+        (Some(plan), Some(cli)) => Some(plan.min(cli)),
+        (plan, cli) => plan.or(cli),
+    };
+    let budget_ledger =
+        RunBudgetLedger::new_with_duration(plan_metadata.run_budget.limits, max_duration_seconds)
+            .context("failed to initialize the supervise run budget ledger")?;
     match worktree_creation {
         SupervisorWorktreeCreation::Bound(_)
             if execution_runtime != SupervisorExecutionRuntime::Verified =>
@@ -3037,6 +3050,8 @@ mod decomposition_tests {
             runtime: SupervisorRuntime::Fake,
             allow_dirty_primary: true,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
             machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
                 config: repo.join("unused-machine-global.json"),
                 root_id: "runtime".to_string(),
@@ -3893,6 +3908,57 @@ mod decomposition_tests {
                 .expect("prepared budget report")
                 .new_dispatch_allowed
         );
+    }
+
+    #[test]
+    fn preflight_composes_cli_budget_overrides_with_plan_by_strictest_limit() {
+        let (_temp, repo) = test_repository();
+        let mut metadata = SupervisorPlanMetadata::default();
+        metadata.run_budget.limits = RunBudgetLimits {
+            soft_tokens: Some(100),
+            hard_tokens: Some(200),
+            soft_cost_usd: Some(0.5),
+            hard_cost_usd: Some(1.0),
+        };
+        metadata.run_budget_max_duration_seconds = Some(600);
+        let loaded = LoadedSupervisorPlan {
+            plan: test_plan(vec![test_assignment("budgeted-child", "README.md")]),
+            consultant: SupervisorConsultantPlan::default(),
+            assignment_metadata: AssignmentMetadata::new(),
+            plan_metadata: metadata,
+        };
+        let mut options = test_options(&repo, "strictest-cli-plan-budget");
+        options.budget_overrides = RunBudgetLimits {
+            hard_tokens: Some(50),
+            hard_cost_usd: Some(0.4),
+            ..RunBudgetLimits::default()
+        };
+        options.budget_max_duration_seconds = Some(300);
+
+        let prepared = prepare_supervisor_run(
+            loaded,
+            &options,
+            1,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            SupervisorWorktreeCreation::TestOnly,
+            Ok(RuntimeModelCatalog::LocalDeterministicFake),
+        )
+        .expect("prepare run with CLI budget overrides");
+        let report = prepared
+            .budget_ledger
+            .report()
+            .expect("composed run budget report");
+
+        assert_eq!(
+            report.limits,
+            RunBudgetLimits {
+                soft_tokens: Some(50),
+                hard_tokens: Some(50),
+                soft_cost_usd: Some(0.4),
+                hard_cost_usd: Some(0.4),
+            }
+        );
+        assert_eq!(report.max_duration_seconds, Some(300));
     }
 
     #[test]

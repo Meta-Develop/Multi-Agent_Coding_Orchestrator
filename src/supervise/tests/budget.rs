@@ -31,6 +31,7 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
         "hard_tokens": 20,
         "soft_cost_usd": 0.01,
         "hard_cost_usd": 0.02,
+        "max_duration_seconds": 600,
         "role_token_reservations": {
             "child_orchestrator": 10,
             "auditor": 10
@@ -49,6 +50,10 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
             hard_cost_usd: Some(0.02),
         }
     );
+    assert_eq!(
+        loaded.plan_metadata.run_budget_max_duration_seconds,
+        Some(600)
+    );
     let normalized = supervisor_plan_value(
         &loaded.plan,
         &loaded.consultant,
@@ -57,6 +62,14 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
     )
     .expect("normalize budget plan");
     assert_eq!(normalized["run_budget"], budget_source["run_budget"]);
+
+    budget_source["run_budget"]["max_duration_seconds"] = json!(0);
+    assert!(parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&budget_source).expect("serialize invalid duration budget")
+    )
+    .expect_err("zero duration budget must fail")
+    .to_string()
+    .contains("run_budget.max_duration_seconds must be greater than zero"));
 
     let schema = supervisor_final_report_schema_value();
     let required = schema["properties"]["run_budget"]["required"]
@@ -67,6 +80,7 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
         "reserved",
         "committed",
         "remaining",
+        "elapsed_seconds",
         "usage_complete",
         "action",
         "new_dispatch_allowed",
@@ -82,6 +96,13 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
             .is_some_and(|reasons| reasons
                 .iter()
                 .any(|reason| reason == "missing_provider_usage"))
+    );
+    assert!(
+        schema["properties"]["run_budget"]["properties"]["reasons"]["items"]["enum"]
+            .as_array()
+            .is_some_and(|reasons| reasons
+                .iter()
+                .any(|reason| reason == "max_duration_reached"))
     );
     let autonomy = &schema["properties"]["autonomy_kpis"];
     let required = autonomy["required"]
@@ -451,7 +472,17 @@ fn budget_integration_scheduler_applies_and_persists_degrade_ladder_before_halt(
     let plan = injected_multi_plan(assignments.clone(), 0);
     let budget = injected_run_budget(Some(10), Some(60), None, None, 10, 1);
     let run_id = "budget-degrade-production-scheduler";
-    let options = injected_options(&repo_path, temp.path(), run_id);
+    let mut options = injected_options(&repo_path, temp.path(), run_id);
+    options.admission_overrides = SupervisorAdmissionConfig {
+        provider_inflight_limit: Some(8),
+        host_memory_available_mib: Some(8_192),
+        host_memory_per_child_mib: Some(1_024),
+        host_fd_available: Some(1_024),
+        host_fds_per_child: Some(128),
+        host_disk_available_mib: Some(4_096),
+        host_disk_per_child_mib: Some(512),
+        ..SupervisorAdmissionConfig::default()
+    };
     let child_bindings = Arc::new(Mutex::new(BTreeMap::<String, (String, String)>::new()));
     let runner = {
         let child_bindings = Arc::clone(&child_bindings);

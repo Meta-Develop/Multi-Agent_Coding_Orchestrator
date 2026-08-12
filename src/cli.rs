@@ -808,6 +808,8 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             print_query_report(&plan, json)
         }
         SuperviseSubcommand::Run(args) => {
+            let budget_overrides = args.budget.limits();
+            let budget_max_duration_seconds = args.budget.max_duration_seconds();
             let (plan_file, goal_spec) = match (args.supervisor_plan, args.from_goal) {
                 (Some(plan_file), None) => (plan_file, None),
                 (None, Some(goal_file)) => {
@@ -868,6 +870,8 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 runtime: args.runtime,
                 allow_dirty_primary: args.allow_dirty_primary,
                 admission_overrides,
+                budget_overrides,
+                budget_max_duration_seconds,
                 machine_global_retention: Some(MachineGlobalRetentionBinding {
                     config: args.machine_global_config,
                     root_id: args.machine_global_runtime_root_id,
@@ -1009,6 +1013,46 @@ struct PlanSuperviseArgs {
     json: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, Args)]
+struct RunBudgetArgs {
+    /// Hard ceiling for total provider tokens committed by this supervise run.
+    #[arg(
+        long = "max-tokens",
+        visible_alias = "max-total-tokens",
+        value_parser = parse_positive_usize
+    )]
+    max_tokens: Option<usize>,
+    /// Hard ceiling for total provider cost committed by this supervise run, in USD.
+    #[arg(
+        long = "max-cost-usd",
+        visible_alias = "max-total-cost-usd",
+        value_parser = parse_positive_finite_f64
+    )]
+    max_cost_usd: Option<f64>,
+    /// Maximum elapsed duration for admitting new supervise dispatches.
+    #[arg(
+        long = "max-duration-seconds",
+        visible_alias = "max-total-duration-seconds",
+        value_parser = parse_positive_seconds
+    )]
+    max_duration_seconds: Option<u64>,
+}
+
+impl RunBudgetArgs {
+    fn limits(self) -> supervise::RunBudgetLimits {
+        supervise::RunBudgetLimits {
+            soft_tokens: None,
+            hard_tokens: self.max_tokens,
+            soft_cost_usd: None,
+            hard_cost_usd: self.max_cost_usd,
+        }
+    }
+
+    const fn max_duration_seconds(self) -> Option<u64> {
+        self.max_duration_seconds
+    }
+}
+
 #[derive(Debug, Args)]
 struct RunSuperviseArgs {
     /// JSON supervisor plan file to run.
@@ -1066,6 +1110,8 @@ struct RunSuperviseArgs {
     /// Fallback host bound if memory, file-descriptor, and disk observation all fail.
     #[arg(long, value_parser = parse_positive_usize)]
     host_fallback_children: Option<usize>,
+    #[command(flatten)]
+    budget: RunBudgetArgs,
     /// Exact reviewed config used to gate private runtime output-staging cleanup.
     #[arg(long, required = true)]
     machine_global_config: PathBuf,
@@ -1640,6 +1686,8 @@ impl AutopilotCommand {
                 print_query_report(&plan, args.json)
             }
             AutopilotSubcommand::Run(args) => {
+                let budget_overrides = args.budget.limits();
+                let budget_max_duration_seconds = args.budget.max_duration_seconds();
                 let (plan_file, goal_spec) = match (args.task_file, args.from_goal) {
                     (Some(plan_file), None) => (plan_file, None),
                     (None, Some(goal_file)) => {
@@ -1670,6 +1718,8 @@ impl AutopilotCommand {
                     reviewer_command: args.reviewer_command,
                     allow_dirty_primary: args.allow_dirty_primary,
                     max_child_dispatches: args.max_child_dispatches,
+                    budget_overrides,
+                    budget_max_duration_seconds,
                     cancellation: None,
                 };
                 let retention = Some(MachineGlobalRetentionBinding {
@@ -1729,7 +1779,7 @@ enum AutopilotSubcommand {
     /// Normalize a task file or JSON autopilot plan without running it.
     Plan(PlanAutopilotArgs),
     /// Run one depth-2 plan through the live supervise gates without applying to primary.
-    Run(RunAutopilotArgs),
+    Run(Box<RunAutopilotArgs>),
     /// Report durable autopilot run artifact state.
     Status(StatusAutopilotArgs),
     /// Collect the durable autopilot final report.
@@ -1786,6 +1836,8 @@ struct RunAutopilotArgs {
     /// Maximum source plus generated follow-up supervisor-plan dispatches admitted by this run.
     #[arg(long, value_name = "COUNT")]
     max_child_dispatches: Option<usize>,
+    #[command(flatten)]
+    budget: RunBudgetArgs,
     /// Exact reviewed config used to gate private runtime output-staging cleanup.
     #[arg(long, required = true)]
     machine_global_config: PathBuf,
@@ -4612,6 +4664,17 @@ fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
     }
 }
 
+fn parse_positive_finite_f64(value: &str) -> std::result::Result<f64, String> {
+    let value = value
+        .parse::<f64>()
+        .map_err(|_| "expected a finite positive number".to_string())?;
+    if !value.is_finite() || value <= 0.0 {
+        Err("value must be finite and greater than zero".to_string())
+    } else {
+        Ok(value)
+    }
+}
+
 fn parse_worktree_reuse_policy(value: &str) -> std::result::Result<WorktreeReusePolicy, String> {
     match value {
         "clean" => Ok(WorktreeReusePolicy::Clean),
@@ -6410,6 +6473,75 @@ mod tests {
             ])
             .is_err());
         }
+    }
+
+    #[test]
+    fn supervise_and_autopilot_budget_flags_parse_validate_and_bind_hard_limits() {
+        let retention = [
+            "--machine-global-config",
+            "/tmp/maco-machine-global.json",
+            "--machine-global-runtime-root-id",
+            "runtime",
+        ];
+        for command in ["supervise", "autopilot"] {
+            let mut argv = vec![
+                "maco",
+                command,
+                "run",
+                "plan.json",
+                "--max-tokens",
+                "12000",
+                "--max-cost-usd",
+                "1.25",
+                "--max-duration-seconds",
+                "900",
+            ];
+            argv.extend(retention);
+            let parsed = Cli::try_parse_from(argv)
+                .unwrap_or_else(|error| panic!("{command} budget flags must parse: {error}"));
+            let budget = match parsed.command {
+                Command::Supervise(SuperviseCommand {
+                    command: SuperviseSubcommand::Run(args),
+                }) => args.budget,
+                Command::Autopilot(AutopilotCommand {
+                    command: AutopilotSubcommand::Run(args),
+                }) => args.budget,
+                _ => panic!("expected {command} run command"),
+            };
+            assert_eq!(budget.limits().hard_tokens, Some(12_000));
+            assert_eq!(budget.limits().hard_cost_usd, Some(1.25));
+            assert_eq!(budget.max_duration_seconds(), Some(900));
+
+            for (flag, value) in [
+                ("--max-tokens", "0"),
+                ("--max-cost-usd", "0"),
+                ("--max-cost-usd", "NaN"),
+                ("--max-cost-usd", "inf"),
+                ("--max-duration-seconds", "0"),
+            ] {
+                let mut invalid = vec!["maco", command, "run", "plan.json", flag, value];
+                invalid.extend(retention);
+                assert!(
+                    Cli::try_parse_from(invalid).is_err(),
+                    "{command} accepted nonsense {flag}={value}"
+                );
+            }
+        }
+
+        let mut aliases = vec![
+            "maco",
+            "supervise",
+            "run",
+            "plan.json",
+            "--max-total-tokens",
+            "2",
+            "--max-total-cost-usd",
+            "0.5",
+            "--max-total-duration-seconds",
+            "3",
+        ];
+        aliases.extend(retention);
+        assert!(Cli::try_parse_from(aliases).is_ok());
     }
 
     #[test]

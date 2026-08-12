@@ -35,8 +35,9 @@ use crate::{
     supervise::{
         self, AgentRole, CommandRunRecord, FindingSeverity, OrchestratorAssignment,
         ReviewLensUsageReport, ReviewStatus, RoleModelSelection, RoleUsageObservation,
-        RoleUsageReport, SupervisorConcurrencyPolicy, SupervisorFinalReport, SupervisorPlan,
-        SupervisorRunOptions, SupervisorRuntime, ValidationResult, WorkerAssignment,
+        RoleUsageReport, RunBudgetLimits, SupervisorConcurrencyPolicy, SupervisorFinalReport,
+        SupervisorPlan, SupervisorRunOptions, SupervisorRuntime, ValidationResult,
+        WorkerAssignment,
     },
     sync::normalize_repo_relative_path,
     sync_store::SyncStore,
@@ -104,6 +105,10 @@ pub struct AutopilotRunOptions {
     /// Maximum supervisor-plan child dispatches admitted across the source plan and generated
     /// follow-up plans. `None` preserves the unbounded behavior of existing callers.
     pub max_child_dispatches: Option<usize>,
+    /// Strict per-supervisor-run ceilings supplied by the CLI. These tighten any plan JSON
+    /// budget and are propagated to generated follow-up supervise runs.
+    pub budget_overrides: RunBudgetLimits,
+    pub budget_max_duration_seconds: Option<u64>,
     /// Optional caller-owned whole-run cancellation signal. The caller keeps a clone and may
     /// request cooperative cancellation while this synchronous call is running.
     pub cancellation: Option<ProcessCancellation>,
@@ -1077,6 +1082,8 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     validate_autopilot_profile(&requested_profile)?;
     let caller_cancellation = options.cancellation.clone();
     let max_child_dispatches = options.max_child_dispatches;
+    let budget_overrides = options.budget_overrides;
+    let budget_max_duration_seconds = options.budget_max_duration_seconds;
     let cancellation_observed = AtomicBool::new(false);
     let source_dispatch_started = AtomicBool::new(false);
 
@@ -1316,6 +1323,8 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         // outer typed dirty-primary gate already handled operator worktree state.
         allow_dirty_primary: true,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+        budget_overrides,
+        budget_max_duration_seconds,
         machine_global_retention: Some(machine_global_retention),
     };
     // Goal decomposition can admit multiple independent planning roots. Capability-bound
@@ -1779,6 +1788,8 @@ fn run_autopilot_plan_file_disabled_legacy(
             // supervise should not reject autopilot's own runtime artifacts.
             allow_dirty_primary: true,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: options.budget_overrides,
+            budget_max_duration_seconds: options.budget_max_duration_seconds,
             // Autopilot run remains disabled under Issue #22. If that entrypoint
             // reaches supervise before it grows an explicit CLI binding, the
             // verified child preparation path must fail closed.
@@ -5578,6 +5589,8 @@ mod tests {
                 reviewer_command: None,
                 allow_dirty_primary: false,
                 max_child_dispatches,
+                budget_overrides: crate::supervise::RunBudgetLimits::default(),
+                budget_max_duration_seconds: None,
                 cancellation,
             },
             None,
@@ -5917,6 +5930,8 @@ mod tests {
                 reviewer_command: None,
                 allow_dirty_primary: false,
                 max_child_dispatches: None,
+                budget_overrides: crate::supervise::RunBudgetLimits::default(),
+                budget_max_duration_seconds: None,
                 cancellation: Some(caller_cancellation.clone()),
             },
             None,
@@ -6402,6 +6417,8 @@ mod tests {
                 reviewer_command: None,
                 allow_dirty_primary: false,
                 max_child_dispatches: None,
+                budget_overrides: crate::supervise::RunBudgetLimits::default(),
+                budget_max_duration_seconds: None,
                 cancellation: None,
             },
             None,
@@ -6446,6 +6463,8 @@ mod tests {
                 runtime: SupervisorRuntime::Codex,
                 allow_dirty_primary: true,
                 admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+                budget_overrides: crate::supervise::RunBudgetLimits::default(),
+                budget_max_duration_seconds: None,
                 machine_global_retention: Some(retention),
             },
             &mut resume_runner,
@@ -6536,6 +6555,8 @@ mod tests {
             reviewer_command: None,
             allow_dirty_primary: true,
             max_child_dispatches: None,
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
             cancellation: None,
         })
         .expect_err("autopilot must require the supervise retention binding");
@@ -6622,6 +6643,8 @@ mod tests {
                 reviewer_command: None,
                 allow_dirty_primary: false,
                 max_child_dispatches: None,
+                budget_overrides: crate::supervise::RunBudgetLimits::default(),
+                budget_max_duration_seconds: None,
                 cancellation: None,
             },
             Some(MachineGlobalRetentionBinding {
@@ -6673,6 +6696,8 @@ mod tests {
                 reviewer_command: None,
                 allow_dirty_primary: false,
                 max_child_dispatches: None,
+                budget_overrides: crate::supervise::RunBudgetLimits::default(),
+                budget_max_duration_seconds: None,
                 cancellation: None,
             },
             Some(nondefault_test_profile()),
@@ -6807,6 +6832,8 @@ mod tests {
                     reviewer_command: None,
                     allow_dirty_primary: false,
                     max_child_dispatches: None,
+                    budget_overrides: crate::supervise::RunBudgetLimits::default(),
+                    budget_max_duration_seconds: None,
                     cancellation: None,
                 },
                 Some(MachineGlobalRetentionBinding {

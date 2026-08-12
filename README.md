@@ -1314,6 +1314,30 @@ evidence for a dispatch that actually started. When assignments use different
 bindings, the aggregate child role binding is marked `assignment_specific`
 instead of claiming one model or effort for the whole run.
 
+### CLI run ceilings
+
+`maco supervise run` and `maco autopilot run` accept the same per-supervisor-run
+hard ceilings:
+
+- `--max-tokens` (`--max-total-tokens` alias)
+- `--max-cost-usd` (`--max-total-cost-usd` alias)
+- `--max-duration-seconds` (`--max-total-duration-seconds` alias)
+
+Token, cost, and duration values must be finite positive values. Token and cost
+flags tighten an authored or goal-derived plan's `run_budget` values by taking
+the minimum. If the resulting hard ceiling is below a plan soft threshold, the
+soft threshold is clamped to the hard ceiling. Duration likewise composes with
+`run_budget.max_duration_seconds` by taking the minimum and stops new admission
+once elapsed time reaches the bound. The effective limits, elapsed seconds, and
+remaining duration are retained in `supervisor-final.json`.
+
+Autopilot propagates these limits to its source and generated follow-up
+supervise dispatches. Each supervise run still owns an independent in-memory
+ledger. A durable workspace/machine ledger across runs and integration with
+provider rate-limit signals remain deliberately deferred behind the real
+provider boundary (#77); the attachment seams are supervisor ledger creation
+and the autopilot/inbox dispatch boundary.
+
 On the production Codex path, the no-override child-orchestrator and auditor
 commands are constructed with the profile's explicit model and role-specific
 reasoning effort. Worker selection remains declarative data in the child

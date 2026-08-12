@@ -293,6 +293,7 @@ fn budget_degradation_records_schema_value() -> serde_json::Value {
                     "items": {"type": "string", "enum": [
                         "soft_token_ceiling_reached", "hard_token_ceiling_reached",
                         "soft_cost_ceiling_reached", "hard_cost_ceiling_reached",
+                        "max_duration_reached",
                         "missing_pricing", "estimated_provider_usage", "missing_provider_usage",
                         "missing_actual_cost"
                     ]},
@@ -642,6 +643,7 @@ fn run_budget_report_schema_value() -> serde_json::Value {
             "reserved",
             "committed",
             "remaining",
+            "elapsed_seconds",
             "active_reservations",
             "usage_complete",
             "action",
@@ -658,6 +660,7 @@ fn run_budget_report_schema_value() -> serde_json::Value {
                     "hard_cost_usd": {"type": "number", "exclusiveMinimum": 0}
                 }
             },
+            "max_duration_seconds": {"type": "integer", "minimum": 1},
             "consumed": amount(),
             "reserved": amount(),
             "committed": amount(),
@@ -668,9 +671,11 @@ fn run_budget_report_schema_value() -> serde_json::Value {
                     "soft_tokens": {"type": "integer", "minimum": 0},
                     "hard_tokens": {"type": "integer", "minimum": 0},
                     "soft_cost_usd": {"type": "number", "minimum": 0},
-                    "hard_cost_usd": {"type": "number", "minimum": 0}
+                    "hard_cost_usd": {"type": "number", "minimum": 0},
+                    "max_duration_seconds": {"type": "integer", "minimum": 0}
                 }
             },
+            "elapsed_seconds": {"type": "integer", "minimum": 0},
             "roles": {
                 "type": "array",
                 "items": {
@@ -718,6 +723,7 @@ fn run_budget_report_schema_value() -> serde_json::Value {
                         "hard_token_ceiling_reached",
                         "soft_cost_ceiling_reached",
                         "hard_cost_ceiling_reached",
+                        "max_duration_reached",
                         "missing_pricing",
                         "estimated_provider_usage",
                         "missing_provider_usage",

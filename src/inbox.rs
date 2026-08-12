@@ -2468,6 +2468,8 @@ fn run_inbox_item(
         reviewer_command: None,
         allow_dirty_primary: false,
         max_child_dispatches: None,
+        budget_overrides: crate::supervise::RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
         cancellation: None,
     });
     let (autopilot_success, autopilot_message) = match autopilot_result {
