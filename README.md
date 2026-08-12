@@ -132,6 +132,10 @@ The current implementation covers a local-first command-line slice:
   result to the primary worktree.
 - `maco autopilot artifacts list/latest/prune` inspects or prunes durable
   autopilot run artifacts.
+- `maco artifacts prune --family <family>` applies one retention policy to any
+  authenticated run store, the external O2 driver store, legacy workspace
+  inbox runs, or direct `.maco/program-*` logs. Policies can combine count,
+  age, and apparent-byte ceilings and always report byte totals.
 - `maco review pr <number|url>` emits an independent fake structured review
   report by default, with `ci_reaction_supported=false`.
 - `maco inbox scan/run/status/collect/watch` provides a fake-first reaction
@@ -879,23 +883,82 @@ Runtime artifacts are local operator evidence, not source files. Autopilot,
 inbox, and supervisor runs write under `.maco/.../runs/<run-id>/`; generated run
 ids are collision checked, and an explicit `--run-id` is refused when that run
 directory already exists. Use each command family's nested artifact helpers to
-inspect or prune only that family's run directories:
+inspect or prune that family's run directories:
 
 ```bash
 cargo run -- autopilot artifacts list --repo . --json
 cargo run -- autopilot artifacts latest --repo . --json
-cargo run -- autopilot artifacts prune --repo . --keep 10 --dry-run --json
+cargo run -- autopilot artifacts prune --repo . --keep 10 \
+  --max-age-seconds 2592000 --max-total-bytes 2147483648 \
+  --unfinalized-grace-seconds 604800 --dry-run --json
 cargo run -- inbox artifacts list --repo . --json
 cargo run -- supervise artifacts latest --repo . --json
 cargo run -- consult artifacts list --repo . --json
 ```
 
-`prune` orders runs newest first, keeps the requested number, and supports
-`--dry-run` before deletion. It is scoped to the selected family root, such as
-`.maco/autopilot/runs`, `.maco/consult/runs`, `.maco/inbox/runs`, or
-`.maco/o2/runs`. Run pruning is currently for quiescent operator-owned roots;
-do not prune concurrently with an active run or an untrusted same-UID path
-mutator. Finalized-only descriptor-relative deletion remains planned work.
+The repository-level command reaches stores that have no nested producer
+command. Its accepted families and roots are:
+
+| `--family` | retained items |
+|---|---|
+| `autopilot` | `.maco/autopilot/runs/<run-id>` |
+| `consult` | `.maco/consult/runs/<run-id>` |
+| `inbox` | `.maco/inbox/runs/<run-id>` |
+| `supervise` | `.maco/o2/runs/<run-id>` |
+| `o2-autopilot` | `.maco/o2-autopilot/runs/<run-id>` |
+| `inbox-workspace` | `.maco/inbox-workspace/runs/<run-id>` legacy residue |
+| `program` | each direct `.maco/program-*` directory, including its `logs/` |
+
+For example, preview program-log retention without touching the real store:
+
+```bash
+cargo run -- artifacts prune --family program --repo . --keep 3 \
+  --max-age-seconds 2592000 --max-total-bytes 1073741824 \
+  --unfinalized-grace-seconds 604800 \
+  --acknowledge-external-writers-stopped --dry-run --json
+```
+
+Count, age, total-byte, and unfinalized-grace ceilings are independent
+maximums: an item is a candidate when any applicable ceiling is exceeded.
+Thus an abandoned unfinalized run expires after its grace even when fewer than
+`--keep` runs exist. Ordering uses the newest bounded descendant activity time,
+so appends to an active transcript refresh its age. `--max-total-bytes` counts
+apparent regular-file bytes; the JSON report
+includes per-item `bytes`, `age_seconds`, and `selected_by`, plus
+`scanned_bytes`, inventory-snapshot `retained_bytes`, planned
+`projected_retained_bytes`, `would_reclaim_bytes` for dry-run, and actual
+`reclaimed_bytes` for apply. Refused trees may change concurrently after their
+snapshot, so these are not filesystem quota measurements. A dry-run never
+counts planned deletion as actual reclamation.
+
+Fresh marker-missing runs are pinned for `--unfinalized-grace-seconds` (seven
+days by default). A held authenticated writer lock also pins a run regardless
+of age. Once a marker-missing run is both selected, older than the grace, and
+idle, retention rechecks its identity, byte count, activity, and finalization
+state before using the same identity-bound quarantine and no-follow deletion
+path as finalized runs. A present but invalid finalization marker remains
+refused unless `--reclaim-unverifiable` explicitly puts it under the same
+grace, idle-lock, identity, activity, and state rechecks. This opt-in bounds
+abandoned corrupt runs without silently treating damaged evidence as a normal
+crash. External and legacy stores have no cooperative writer lock, so both
+dry-run and apply refuse their candidates unless
+`--acknowledge-external-writers-stopped` is supplied. That acknowledgement,
+the grace, and refreshed descendant activity form the active-run boundary;
+the acknowledgement must not be supplied while a same-UID writer can mutate
+the store. Marker-missing legacy runs inside authenticated roots also require
+this acknowledgement when their cooperative writer lock file is absent.
+
+Retention deliberately does not compress transcripts in this version. A
+finalized authenticated file is immutable because its exact path, length, and
+digest are covered by the finalization MAC; rewriting it as gzip would destroy
+the evidence contract. External journals can still be append targets and have
+no common rotation handshake. The report therefore records
+`compression_strategy: none_requires_writer_migration`, counts
+`compressible_log_bytes`, and reports `compressed_bytes: 0`. Compression needs
+a writer-side, crash-safe format migration rather than an in-place prune
+rewrite. The reusable `ArtifactRetentionPolicy`, `prune_runs_with_policy`, and
+`prune_artifacts_with_policy` APIs are the policy hooks for #65 item 4; invoking
+them automatically from a workspace scheduler remains separate work.
 
 ## Cross-runtime consultant
 
