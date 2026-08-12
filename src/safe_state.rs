@@ -303,6 +303,9 @@ impl SafeRoot {
             .with_context(|| format!("failed to inspect safe root handle {}", path.display()))?;
         ensure_directory_metadata(&path, &metadata)?;
         ensure_root_policy(&path, &metadata, policy)?;
+        #[cfg(windows)]
+        let identity = identity_from_open_handle(&directory, &path)?;
+        #[cfg(not(windows))]
         let identity = identity_from_metadata(&metadata);
         Ok(Self {
             path,
@@ -321,9 +324,13 @@ impl SafeRoot {
             .with_context(|| format!("failed to inspect safe root handle {}", path.display()))?;
         ensure_directory_metadata(&path, &metadata)?;
         ensure_root_policy(&path, &metadata, RootPolicy::Managed)?;
+        #[cfg(windows)]
+        let identity = identity_from_open_handle(&directory, &path)?;
+        #[cfg(not(windows))]
+        let identity = identity_from_metadata(&metadata);
         Ok(Self {
             path,
-            identity: identity_from_metadata(&metadata),
+            identity,
             directory: Arc::new(directory),
             policy: RootPolicy::Managed,
         })
@@ -424,6 +431,9 @@ impl SafeRoot {
         })?;
         ensure_directory_metadata(&self.path, &handle_metadata)?;
         ensure_root_policy(&self.path, &handle_metadata, self.policy)?;
+        #[cfg(windows)]
+        let observed = identity_from_open_handle(&self.directory, &self.path)?;
+        #[cfg(not(windows))]
         let observed = identity_from_metadata(&handle_metadata);
         if observed != self.identity {
             bail!(
@@ -447,6 +457,9 @@ impl SafeRoot {
         })?;
         ensure_directory_metadata(&self.path, &path_metadata)?;
         ensure_root_policy(&self.path, &path_metadata, self.policy)?;
+        #[cfg(windows)]
+        let path_identity = identity_from_open_handle(&path_handle, &self.path)?;
+        #[cfg(not(windows))]
         let path_identity = identity_from_metadata(&path_metadata);
         if path_identity != self.identity {
             bail!(
@@ -2203,10 +2216,23 @@ pub fn remove_direct_child_tree(
 
 pub fn identity_for_path(path: impl AsRef<Path>) -> Result<FileIdentity> {
     let path = path.as_ref();
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect identity for {}", path.display()))?;
-    ensure_not_link_or_reparse(path, &metadata)?;
-    Ok(identity_from_metadata(&metadata))
+    #[cfg(windows)]
+    {
+        let snapshot = crate::file_identity::open_windows_path_identity(path)
+            .with_context(|| format!("failed to open identity handle for {}", path.display()))?;
+        ensure_not_link_or_reparse(path, &snapshot.metadata)?;
+        Ok(FileIdentity {
+            device: snapshot.identity.device,
+            file: snapshot.identity.file,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect identity for {}", path.display()))?;
+        ensure_not_link_or_reparse(path, &metadata)?;
+        Ok(identity_from_metadata(&metadata))
+    }
 }
 
 /// Returns a deterministic accidental-corruption checksum. This is not a MAC
@@ -2530,17 +2556,19 @@ fn identity_from_metadata(metadata: &fs::Metadata) -> FileIdentity {
     }
 }
 
-#[cfg(windows)]
-fn identity_from_metadata(metadata: &fs::Metadata) -> FileIdentity {
-    FileIdentity {
-        device: metadata.volume_serial_number().unwrap_or(0) as u64,
-        file: metadata.file_index().unwrap_or(0),
-    }
-}
-
 #[cfg(not(any(unix, windows)))]
 fn identity_from_metadata(_metadata: &fs::Metadata) -> FileIdentity {
     FileIdentity { device: 0, file: 0 }
+}
+
+#[cfg(windows)]
+fn identity_from_open_handle(file: &File, path: &Path) -> Result<FileIdentity> {
+    let identity = crate::file_identity::windows_file_identity(file)
+        .with_context(|| format!("failed to inspect file identity for {}", path.display()))?;
+    Ok(FileIdentity {
+        device: identity.device,
+        file: identity.file,
+    })
 }
 
 fn identity_from_file(file: &File, path: &Path) -> Result<FileIdentity> {
@@ -2548,7 +2576,14 @@ fn identity_from_file(file: &File, path: &Path) -> Result<FileIdentity> {
         .metadata()
         .with_context(|| format!("failed to inspect opened file {}", path.display()))?;
     ensure_regular_single_link_metadata(path, &metadata)?;
-    Ok(identity_from_metadata(&metadata))
+    #[cfg(windows)]
+    {
+        identity_from_open_handle(file, path)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(identity_from_metadata(&metadata))
+    }
 }
 
 #[cfg(unix)]
@@ -2666,6 +2701,9 @@ fn read_bounded_file_with_validator_and_hook(
     }
     let capacity = usize::try_from(before.len().min(max_bytes))
         .context("bounded read size does not fit in memory address space")?;
+    #[cfg(windows)]
+    let before_identity = crate::file_identity::windows_file_identity(file)
+        .with_context(|| format!("failed to inspect opened file identity {}", path.display()))?;
     after_initial_metadata();
     let mut contents = Vec::with_capacity(capacity);
     file.take(max_bytes.saturating_add(1))
@@ -2690,7 +2728,18 @@ fn read_bounded_file_with_validator_and_hook(
     ensure_regular_single_link_metadata(path, &after)?;
     validate(&after)
         .with_context(|| format!("opened file metadata policy changed for {}", path.display()))?;
-    if !same_file_generation(&before, &after) {
+    #[cfg(windows)]
+    let same_generation = before_identity
+        == crate::file_identity::windows_file_identity(file).with_context(|| {
+            format!(
+                "failed to revalidate opened file identity {}",
+                path.display()
+            )
+        })?
+        && same_file_generation(&before, &after);
+    #[cfg(not(windows))]
+    let same_generation = same_file_generation(&before, &after);
+    if !same_generation {
         bail!(
             "file identity changed during bounded read: {}",
             path.display()
@@ -2715,9 +2764,7 @@ fn same_file_generation(before: &fs::Metadata, after: &fs::Metadata) -> bool {
 
 #[cfg(windows)]
 fn same_file_generation(before: &fs::Metadata, after: &fs::Metadata) -> bool {
-    before.volume_serial_number() == after.volume_serial_number()
-        && before.file_index() == after.file_index()
-        && before.file_attributes() == after.file_attributes()
+    before.file_attributes() == after.file_attributes()
         && before.file_size() == after.file_size()
         && before.creation_time() == after.creation_time()
         && before.last_write_time() == after.last_write_time()
