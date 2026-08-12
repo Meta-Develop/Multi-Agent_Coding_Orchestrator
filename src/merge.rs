@@ -4368,8 +4368,8 @@ fn validate_private_runtime_owner_file_metadata(
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.number_of_links() != Some(1) {
+        let _ = metadata;
+        if windows_path_link_count(path)? != 1 {
             bail!(
                 "private runtime owner {} has multiple links",
                 path.display()
@@ -5150,8 +5150,7 @@ fn validate_repository_index_metadata(path: &Path, metadata: &fs::Metadata) -> R
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.number_of_links() != Some(1) {
+        if windows_path_link_count(path)? != 1 {
             bail!("repository index {} has multiple links", path.display());
         }
     }
@@ -6933,8 +6932,7 @@ fn validate_managed_directory(path: &Path) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.number_of_links() != Some(1) {
+        if windows_path_link_count(path)? != 1 {
             bail!(
                 "repository mutation lock {} has multiple hard links; refusing to trust it",
                 path.display()
@@ -6950,6 +6948,18 @@ fn metadata_is_windows_reparse_point(metadata: &fs::Metadata) -> bool {
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(target_os = "windows")]
+fn windows_path_link_count(path: &Path) -> Result<u32> {
+    crate::file_identity::open_windows_path_identity(path)
+        .with_context(|| {
+            format!(
+                "failed to inspect Windows link count for {}",
+                path.display()
+            )
+        })
+        .map(|snapshot| snapshot.number_of_links)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -6994,8 +7004,7 @@ fn reject_unsafe_lock_path(path: &Path) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.number_of_links() != Some(1) {
+        if windows_path_link_count(path)? != 1 {
             bail!(
                 "repository mutation lock {} has multiple hard links; refusing to trust it",
                 path.display()
@@ -7033,8 +7042,6 @@ fn validate_open_lock_file(path: &Path, file: &fs::File) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::fs::MetadataExt;
-
         let path_snapshot =
             crate::file_identity::open_windows_path_identity(path).with_context(|| {
                 format!("failed to open repository lock identity {}", path.display())
@@ -7042,12 +7049,14 @@ fn validate_open_lock_file(path: &Path, file: &fs::File) -> Result<()> {
         let path_metadata = &path_snapshot.metadata;
         let file_identity = crate::file_identity::windows_file_identity(file)
             .context("failed to inspect open repository lock identity")?;
+        let file_link_count = crate::file_identity::windows_file_link_count(file)
+            .context("failed to inspect open repository lock link count")?;
         if !path_metadata.file_type().is_file()
             || path_metadata.file_type().is_symlink()
             || metadata_is_windows_reparse_point(path_metadata)
-            || path_metadata.number_of_links() != Some(1)
+            || path_snapshot.number_of_links != 1
             || path_snapshot.identity != file_identity
-            || file_metadata.number_of_links() != Some(1)
+            || file_link_count != 1
         {
             bail!(
                 "repository mutation lock {} changed while being opened",

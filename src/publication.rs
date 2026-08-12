@@ -4196,9 +4196,7 @@ fn validate_remote_binding_secret_metadata(path: &Path, metadata: &fs::Metadata)
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::fs::MetadataExt;
-
-        if metadata.number_of_links() != Some(1) {
+        if publication_windows_path_link_count(path)? != 1 {
             bail!(
                 "publication remote binding key {} must have exactly one hard link",
                 path.display()
@@ -4214,6 +4212,18 @@ fn publication_metadata_is_windows_reparse_point(metadata: &fs::Metadata) -> boo
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(target_os = "windows")]
+fn publication_windows_path_link_count(path: &Path) -> Result<u32> {
+    crate::file_identity::open_windows_path_identity(path)
+        .with_context(|| {
+            format!(
+                "failed to inspect Windows link count for {}",
+                path.display()
+            )
+        })
+        .map(|snapshot| snapshot.number_of_links)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -4813,8 +4823,7 @@ fn validate_publication_journal_record_metadata(
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.number_of_links() != Some(1) {
+        if publication_windows_path_link_count(path)? != 1 {
             bail!(
                 "publication journal record {} has multiple links",
                 path.display()

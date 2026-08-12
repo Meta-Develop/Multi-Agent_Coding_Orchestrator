@@ -18,7 +18,7 @@ impl WindowsFileIdentity {
 }
 
 #[cfg(windows)]
-pub(crate) fn windows_file_identity(file: &std::fs::File) -> std::io::Result<WindowsFileIdentity> {
+fn windows_file_information(file: &std::fs::File) -> std::io::Result<(WindowsFileIdentity, u32)> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
@@ -33,11 +33,24 @@ pub(crate) fn windows_file_identity(file: &std::fs::File) -> std::io::Result<Win
     if succeeded == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(WindowsFileIdentity::from_parts(
-        information.dwVolumeSerialNumber,
-        information.nFileIndexHigh,
-        information.nFileIndexLow,
+    Ok((
+        WindowsFileIdentity::from_parts(
+            information.dwVolumeSerialNumber,
+            information.nFileIndexHigh,
+            information.nFileIndexLow,
+        ),
+        information.nNumberOfLinks,
     ))
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_file_identity(file: &std::fs::File) -> std::io::Result<WindowsFileIdentity> {
+    windows_file_information(file).map(|(identity, _)| identity)
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_file_link_count(file: &std::fs::File) -> std::io::Result<u32> {
+    windows_file_information(file).map(|(_, number_of_links)| number_of_links)
 }
 
 #[cfg(windows)]
@@ -45,6 +58,7 @@ pub(crate) struct WindowsPathIdentity {
     _file: std::fs::File,
     pub(crate) metadata: std::fs::Metadata,
     pub(crate) identity: WindowsFileIdentity,
+    pub(crate) number_of_links: u32,
 }
 
 #[cfg(windows)]
@@ -64,11 +78,12 @@ pub(crate) fn open_windows_path_identity(
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path)?;
     let metadata = file.metadata()?;
-    let identity = windows_file_identity(&file)?;
+    let (identity, number_of_links) = windows_file_information(&file)?;
     Ok(WindowsPathIdentity {
         _file: file,
         metadata,
         identity,
+        number_of_links,
     })
 }
 
