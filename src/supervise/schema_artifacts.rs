@@ -38,7 +38,12 @@ pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "SupervisorFinalReport",
         "type": "object",
+        "required": ["version", "role_economics_profile", "role_usage", "usage_complete"],
         "properties": {
+            "version": {"type": "integer", "const": SUPERVISOR_SCHEMA_VERSION},
+            "role_economics_profile": role_economics_profile_schema_value(),
+            "role_usage": complete_role_usage_schema_value(),
+            "usage_complete": {"type": "boolean"},
             "run_lifecycle": {
                 "type": "string",
                 "enum": ["active", "interrupted", "uncertain", "resumable", "finalized"]
@@ -86,6 +91,186 @@ pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
             },
             "generated_follow_up_tasks": generated_follow_up_tasks_schema_value()
         }
+    })
+}
+
+fn role_economics_profile_schema_value() -> serde_json::Value {
+    let role_binding = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "resolved_model", "resolved_reasoning_effort", "observation"
+        ],
+        "properties": {
+            "configured_model": {"type": "string"},
+            "configured_reasoning_effort": {"type": "string"},
+            "resolved_model": {"type": ["string", "null"]},
+            "resolved_reasoning_effort": {"type": ["string", "null"]},
+            "observation": {
+                "type": "string",
+                "enum": [
+                    "runtime_catalog_resolved", "runtime_default_resolved", "synthetic_fake",
+                    "catalog_unavailable", "resolution_failed"
+                ]
+            },
+            "unavailable_reason": {"type": "string"}
+        }
+    });
+    let role_selection = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "model": {"type": "string"},
+            "reasoning_effort": {"type": "string"},
+            "unavailable_model_fallback": {
+                "type": "string",
+                "enum": ["fail_closed", "runtime_default", "local_deterministic_fake"]
+            }
+        }
+    });
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "schema_version", "name", "evidence", "evidence_notice", "production_eligible",
+            "model_availability", "overridden_roles", "role_models",
+            "model_catalog_observation", "execution"
+        ],
+        "properties": {
+            "schema_version": {
+                "type": "integer",
+                "const": SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION
+            },
+            "name": {"type": "string"},
+            "evidence": {"type": "string"},
+            "evidence_notice": {"type": "string"},
+            "production_eligible": {"type": "boolean"},
+            "model_availability": {
+                "type": "string",
+                "enum": ["unknown", "available", "unavailable"]
+            },
+            "overridden_roles": {
+                "type": "array",
+                "items": agent_role_schema_value(),
+                "uniqueItems": true
+            },
+            "role_models": role_map_schema_value(role_selection),
+            "model_catalog_observation": {
+                "type": "string",
+                "enum": ["consulted", "consultation_failed", "not_consulted"]
+            },
+            "execution": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "assignment_count", "started_assignment_count", "completed_assignment_count",
+                    "concurrency", "role_bindings", "usage"
+                ],
+                "properties": {
+                    "assignment_count": {"type": "integer", "minimum": 0},
+                    "started_assignment_count": {"type": "integer", "minimum": 0},
+                    "completed_assignment_count": {"type": "integer", "minimum": 0},
+                    "concurrency": concurrency_report_schema_value(),
+                    "role_bindings": role_map_schema_value(role_binding),
+                    "usage": execution_usage_schema_value()
+                }
+            }
+        }
+    })
+}
+
+fn agent_role_schema_value() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "enum": ["supervisor", "child_orchestrator", "worker", "gate_classifier", "auditor"]
+    })
+}
+
+fn role_map_schema_value(value_schema: serde_json::Value) -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["supervisor", "child_orchestrator", "worker", "gate_classifier", "auditor"],
+        "properties": {
+            "supervisor": value_schema.clone(),
+            "child_orchestrator": value_schema.clone(),
+            "worker": value_schema.clone(),
+            "gate_classifier": value_schema.clone(),
+            "auditor": value_schema
+        }
+    })
+}
+
+fn concurrency_report_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "configured_max_concurrent_children", "policy_input_observation", "policy_input",
+            "policy_input_unavailable_reason", "achieved_max_concurrent_children",
+            "achieved_mean_concurrent_children", "achieved_mean_observation",
+            "achieved_mean_unavailable_reason"
+        ],
+        "properties": {
+            "configured_max_concurrent_children": {"type": "integer", "minimum": 1},
+            "policy_input_observation": process_observation_schema_value(),
+            "policy_input": {"type": ["string", "null"]},
+            "policy_input_unavailable_reason": {"type": ["string", "null"]},
+            "achieved_max_concurrent_children": {"type": "integer", "minimum": 0},
+            "achieved_mean_concurrent_children": {"type": ["number", "null"], "minimum": 0},
+            "achieved_mean_observation": process_observation_schema_value(),
+            "achieved_mean_unavailable_reason": {"type": ["string", "null"]}
+        }
+    })
+}
+
+fn process_observation_schema_value() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "enum": ["scheduler_observed", "not_retained", "not_process_observable"]
+    })
+}
+
+fn execution_usage_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "total_usage", "total_cost_usd", "usage_complete", "observation"
+        ],
+        "properties": {
+            "total_usage": {
+                "anyOf": [usage_schema_value(), {"type": "null"}]
+            },
+            "total_cost_usd": {"type": ["number", "null"], "minimum": 0},
+            "usage_complete": {"type": "boolean"},
+            "observation": role_usage_observation_schema_value(),
+            "unavailable_reason": {"type": "string"}
+        }
+    })
+}
+
+fn complete_role_usage_schema_value() -> serde_json::Value {
+    role_map_schema_value(json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["observation"],
+        "properties": {
+            "models": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+            "usage": usage_schema_value(),
+            "cost_usd": {"type": "number", "minimum": 0},
+            "observation": role_usage_observation_schema_value(),
+            "unavailable_reason": {"type": "string"}
+        }
+    }))
+}
+
+fn role_usage_observation_schema_value() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "enum": [
+            "process_observed", "supervisor_aggregate", "not_process_observable", "synthetic_fake"
+        ]
     })
 }
 

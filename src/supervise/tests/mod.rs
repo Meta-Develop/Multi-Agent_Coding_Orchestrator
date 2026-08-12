@@ -1067,9 +1067,17 @@ fn assert_parseable_partial_usage_is_conservative(
         .unavailable_reason
         .as_deref()
         .is_some_and(|reason| reason.contains("missing, incomplete, or unreliable")));
-    assert!(!report
-        .role_usage
-        .contains_key(&AgentRole::ChildOrchestrator));
+    let child_usage = &report.role_usage[&AgentRole::ChildOrchestrator];
+    assert_eq!(
+        child_usage.observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+    assert!(child_usage.usage.is_none());
+    assert!(child_usage.cost_usd.is_none());
+    assert!(child_usage
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("no reliable process-observable usage sample")));
     let budget = report.run_budget.as_ref().expect("partial usage budget");
     assert_eq!(budget.consumed.tokens, 50);
     assert_eq!(budget.committed.tokens, 50);

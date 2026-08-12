@@ -2334,6 +2334,21 @@ rejected before run artifacts are reserved. `max_child_assignments` separately
 bounds plan fan-out; it is not the concurrency limit. This default keeps the
 goal-to-swarm path tracked by Issue #22 free of an extra concurrency flag.
 
+Every newly finalized `supervisor-final.json` carries
+`role_economics_profile.schema_version=2` plus execution telemetry: planned,
+started, and completed assignment counts; the resolved configured child bound;
+scheduler-observed peak and active-interval mean concurrency; configured and
+resolved model/reasoning bindings for every role; and usage/cost with explicit
+observation markers. The scheduler boundary currently retains the resolved
+bound but not the originating `auto` versus fixed policy token, so that policy
+input is serialized as `not_retained` rather than reconstructed. Missing
+catalog, runtime-default model, nested-worker usage, and unpriced cost values
+remain explicit unavailable observations. A width-one run with multiple
+independent assignment or spec scopes emits a final-report warning. Readers
+continue accepting historical reports that omit this block or carry economics
+profile schema version 1; the generated schema describes the required version
+2 contract for newly finalized reports.
+
 A worker assignment may opt into `"kind":"megafile_decomposition"` only with an
 exact canonical `"target_path"` inside its assigned paths. Ordinary assignments
 must omit `target_path`. Accepted worker reports preserve that typed pair,

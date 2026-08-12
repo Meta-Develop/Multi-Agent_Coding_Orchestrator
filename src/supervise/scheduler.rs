@@ -118,6 +118,18 @@ fn validated_scheduler_assignment_schedule(
         .context("supervisor scheduler rejected the validated assignment schedule")
 }
 
+fn has_multiple_independent_assignment_scopes(
+    schedule: &[AssignmentScheduleEntry],
+    plan_metadata: &SupervisorPlanMetadata,
+) -> bool {
+    let schedule_has_independent_scopes = (0..schedule.len()).any(|left_index| {
+        (left_index.saturating_add(1)..schedule.len()).any(|right_index| {
+            !schedule_entries_share_strict_lineage(schedule, left_index, right_index)
+        })
+    });
+    schedule_has_independent_scopes || plan_metadata.spec_fragment_ids.len() > 1
+}
+
 pub(super) fn release_assignment_resources_after_completion(
     plan: &SupervisorPlan,
     schedule: &[AssignmentScheduleEntry],
@@ -234,6 +246,7 @@ struct SchedulerProgress {
     budget_prevented_dispatch: bool,
     budget_denied_assignment_indices: BTreeSet<usize>,
     circuit_breaker_trip: Option<CircuitBreakerTrip>,
+    concurrency: SchedulerConcurrencyTracker,
 }
 
 impl SchedulerProgress {
@@ -244,7 +257,105 @@ impl SchedulerProgress {
             budget_prevented_dispatch: false,
             budget_denied_assignment_indices: BTreeSet::new(),
             circuit_breaker_trip: None,
+            concurrency: SchedulerConcurrencyTracker::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct AchievedConcurrency {
+    started_assignment_count: usize,
+    completed_assignment_count: usize,
+    peak: usize,
+    mean: Option<f64>,
+}
+
+#[derive(Clone)]
+struct SchedulerConcurrencyTracker {
+    state: Arc<Mutex<SchedulerConcurrencyState>>,
+}
+
+struct SchedulerConcurrencyState {
+    last_transition: std::time::Instant,
+    active_children: usize,
+    peak: usize,
+    started_assignment_count: usize,
+    completed_assignment_count: usize,
+    busy_seconds: f64,
+    child_seconds: f64,
+}
+
+impl SchedulerConcurrencyTracker {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(SchedulerConcurrencyState {
+                last_transition: std::time::Instant::now(),
+                active_children: 0,
+                peak: 0,
+                started_assignment_count: 0,
+                completed_assignment_count: 0,
+                busy_seconds: 0.0,
+                child_seconds: 0.0,
+            })),
+        }
+    }
+
+    fn record_elapsed(state: &mut SchedulerConcurrencyState) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(state.last_transition).as_secs_f64();
+        if state.active_children > 0 {
+            state.busy_seconds += elapsed;
+            state.child_seconds += elapsed * state.active_children as f64;
+        }
+        state.last_transition = now;
+    }
+
+    fn assignment_started(&self) -> ActiveAssignmentConcurrencyGuard {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::record_elapsed(&mut state);
+        state.active_children = state.active_children.saturating_add(1);
+        state.started_assignment_count = state.started_assignment_count.saturating_add(1);
+        state.peak = state.peak.max(state.active_children);
+        ActiveAssignmentConcurrencyGuard {
+            tracker: self.clone(),
+        }
+    }
+
+    fn assignment_completed(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::record_elapsed(&mut state);
+        state.active_children = state.active_children.saturating_sub(1);
+        state.completed_assignment_count = state.completed_assignment_count.saturating_add(1);
+    }
+
+    fn finish(&self) -> AchievedConcurrency {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::record_elapsed(&mut state);
+        AchievedConcurrency {
+            started_assignment_count: state.started_assignment_count,
+            completed_assignment_count: state.completed_assignment_count,
+            peak: state.peak,
+            mean: (state.busy_seconds > 0.0).then(|| state.child_seconds / state.busy_seconds),
+        }
+    }
+}
+
+struct ActiveAssignmentConcurrencyGuard {
+    tracker: SchedulerConcurrencyTracker,
+}
+
+impl Drop for ActiveAssignmentConcurrencyGuard {
+    fn drop(&mut self) {
+        self.tracker.assignment_completed();
     }
 }
 
@@ -409,6 +520,7 @@ fn run_serial_assignment_schedule(
             index,
             context.budget_ledger,
         )?;
+        let concurrency_guard = progress.concurrency.assignment_started();
         let outcome = execute_supervisor_assignment(AssignmentExecutionContext {
             index,
             concurrent_mode: false,
@@ -444,6 +556,7 @@ fn run_serial_assignment_schedule(
             cancellation: cancellation.clone(),
             external_runner: context.external_runner,
         });
+        drop(concurrency_guard);
         let mut outcome = outcome;
         record_completed_assignment_checkpoint(context, index, &outcome)?;
         if context.release_per_assignment {
@@ -563,11 +676,13 @@ fn run_concurrent_assignment_schedule(
                         });
                     let completion_sender = completion_sender.clone();
                     let assignment_cancellation = cancellation.clone();
+                    let concurrency = progress.concurrency.clone();
                     let spawn_result = thread::Builder::new().spawn_scoped(scope, move || {
                         let _completion = CompletionSignal {
                             index,
                             sender: completion_sender,
                         };
+                        let _concurrency_guard = concurrency.assignment_started();
                         execute_supervisor_assignment(AssignmentExecutionContext {
                             index,
                             concurrent_mode: true,
@@ -755,6 +870,9 @@ fn record_completed_assignment_checkpoint(
 struct SupervisorFinalReportConstruction<'context> {
     plan: &'context SupervisorPlan,
     runtime_model_catalog: Option<&'context RuntimeModelCatalog>,
+    max_concurrent_children: usize,
+    achieved_concurrency: AchievedConcurrency,
+    has_multiple_independent_assignment_scopes: bool,
     run_id: RunId,
     report_plan_file: PathBuf,
     report_run_dir: PathBuf,
@@ -791,12 +909,173 @@ struct SupervisorFinalReportConstruction<'context> {
     field_guide_mutation_failed: bool,
 }
 
+fn complete_role_usage_reports(
+    mut reports: BTreeMap<AgentRole, RoleUsageReport>,
+) -> BTreeMap<AgentRole, RoleUsageReport> {
+    for role in [
+        AgentRole::Supervisor,
+        AgentRole::ChildOrchestrator,
+        AgentRole::Worker,
+        AgentRole::GateClassifier,
+        AgentRole::Auditor,
+    ] {
+        reports.entry(role).or_insert_with(|| RoleUsageReport {
+            models: Vec::new(),
+            usage: None,
+            cost_usd: None,
+            observation: RoleUsageObservation::NotProcessObservable,
+            unavailable_reason: Some(format!(
+                "no reliable process-observable usage sample was attributed to the {} role",
+                role.as_str()
+            )),
+        });
+    }
+    reports
+}
+
+fn resolved_role_execution_bindings(
+    plan: &SupervisorPlan,
+    runtime: SupervisorRuntime,
+    runtime_model_catalog: Option<&RuntimeModelCatalog>,
+) -> BTreeMap<AgentRole, ResolvedRoleExecutionBinding> {
+    [
+        AgentRole::Supervisor,
+        AgentRole::ChildOrchestrator,
+        AgentRole::Worker,
+        AgentRole::GateClassifier,
+        AgentRole::Auditor,
+    ]
+    .into_iter()
+    .map(|role| {
+        let configured = effective_role_model_selection(plan, role);
+        let (resolved_model, resolved_reasoning_effort, observation, unavailable_reason) =
+            match runtime_model_catalog {
+                None => (
+                    None,
+                    None,
+                    RoleBindingObservation::CatalogUnavailable,
+                    Some(
+                        "runtime model catalog acquisition failed before role selection could be resolved"
+                            .to_string(),
+                    ),
+                ),
+                Some(_) if runtime == SupervisorRuntime::Fake => (
+                    None,
+                    None,
+                    RoleBindingObservation::SyntheticFake,
+                    Some(
+                        "the deterministic fake runtime does not execute a provider model or reasoning effort"
+                            .to_string(),
+                    ),
+                ),
+                Some(catalog) => {
+                    let resolved = catalog
+                        .availability(configured.model.as_deref(), runtime)
+                        .and_then(|availability| {
+                            configured.resolve_for_availability(availability, runtime)
+                        });
+                    match resolved {
+                        Ok(resolved) if resolved.model.is_some() => (
+                            resolved.model,
+                            resolved.reasoning_effort,
+                            RoleBindingObservation::RuntimeCatalogResolved,
+                            None,
+                        ),
+                        Ok(resolved) => (
+                            None,
+                            resolved.reasoning_effort,
+                            RoleBindingObservation::RuntimeDefaultResolved,
+                            Some(
+                                "the runtime-default fallback was selected, so the concrete provider model slug is not process-observable"
+                                    .to_string(),
+                            ),
+                        ),
+                        Err(error) => (
+                            None,
+                            None,
+                            RoleBindingObservation::ResolutionFailed,
+                            Some(format!("role model resolution failed: {error:#}")),
+                        ),
+                    }
+                }
+            };
+        (
+            role,
+            ResolvedRoleExecutionBinding {
+                configured_model: configured.model,
+                configured_reasoning_effort: configured.reasoning_effort,
+                resolved_model,
+                resolved_reasoning_effort,
+                observation,
+                unavailable_reason,
+            },
+        )
+    })
+    .collect()
+}
+
+fn execution_role_economics_profile(
+    plan: &SupervisorPlan,
+    runtime: SupervisorRuntime,
+    runtime_model_catalog: Option<&RuntimeModelCatalog>,
+) -> RoleEconomicsProfile {
+    match runtime_model_catalog {
+        Some(catalog) => plan.effective_role_economics_profile_for_runtime(catalog),
+        None => {
+            let mut profile = plan.effective_role_economics_profile();
+            profile.model_catalog_observation = RuntimeModelCatalogObservation::ConsultationFailed;
+            if runtime == SupervisorRuntime::Fake {
+                profile.model_catalog_observation = RuntimeModelCatalogObservation::NotConsulted;
+            }
+            profile
+        }
+    }
+}
+
+fn supervisor_execution_usage_report(
+    total_usage: Option<Usage>,
+    total_cost_usd: Option<f64>,
+    usage_complete: bool,
+) -> SupervisorExecutionUsageReport {
+    SupervisorExecutionUsageReport {
+        total_usage,
+        total_cost_usd,
+        usage_complete,
+        observation: if total_usage.is_some() {
+            RoleUsageObservation::SupervisorAggregate
+        } else {
+            RoleUsageObservation::NotProcessObservable
+        },
+        unavailable_reason: if total_usage.is_none() {
+            Some(
+                "no reliable process-observable child-orchestrator or auditor usage sample was available"
+                    .to_string(),
+            )
+        } else if !usage_complete {
+            Some(
+                "the aggregate contains observable usage, but one or more launched process samples were missing or unreliable"
+                    .to_string(),
+            )
+        } else if total_cost_usd.is_none() {
+            Some(
+                "usage was process-observed, but total cost is unavailable because pricing was incomplete"
+                    .to_string(),
+            )
+        } else {
+            None
+        },
+    }
+}
+
 fn build_supervisor_final_report(
     construction: SupervisorFinalReportConstruction<'_>,
 ) -> SupervisorFinalReport {
     let SupervisorFinalReportConstruction {
         plan,
         runtime_model_catalog,
+        max_concurrent_children,
+        achieved_concurrency,
+        has_multiple_independent_assignment_scopes,
         run_id,
         report_plan_file,
         report_run_dir,
@@ -814,7 +1093,7 @@ fn build_supervisor_final_report(
         usage_complete,
         environment_failures,
         sandbox_denials,
-        collected,
+        mut collected,
         bloated_file_flags,
         decomposition_candidates,
         assignment_traceability,
@@ -838,6 +1117,45 @@ fn build_supervisor_final_report(
         .flat_map(|report| report.generated_follow_up_tasks.iter().cloned())
         .collect::<Vec<_>>();
     let generated_follow_up_task_count = generated_follow_up_tasks.len();
+    let role_usage = complete_role_usage_reports(role_usage);
+    let mut role_economics_profile =
+        execution_role_economics_profile(plan, runtime, runtime_model_catalog);
+    if has_multiple_independent_assignment_scopes && achieved_concurrency.peak == 1 {
+        collected.findings.push(Finding {
+            severity: FindingSeverity::Warning,
+            message: format!(
+                "supervisor fan-out collapsed to achieved width 1 across {} planned assignments with multiple independent scopes (resolved configured bound: {max_concurrent_children})",
+                plan.assignments.len()
+            ),
+            paths: Vec::new(),
+        });
+    }
+    role_economics_profile.execution = Some(SupervisorExecutionMetadata {
+        assignment_count: plan.assignments.len(),
+        started_assignment_count: achieved_concurrency.started_assignment_count,
+        completed_assignment_count: achieved_concurrency.completed_assignment_count,
+        concurrency: SupervisorConcurrencyReport {
+            configured_max_concurrent_children: max_concurrent_children,
+            policy_input_observation: ProcessObservation::NotRetained,
+            policy_input: None,
+            policy_input_unavailable_reason: Some(
+                "the scheduler receives only the resolved concurrency bound; the originating auto-versus-fixed policy input is not retained at the scheduler reporting boundary"
+                    .to_string(),
+            ),
+            achieved_max_concurrent_children: achieved_concurrency.peak,
+            achieved_mean_concurrent_children: achieved_concurrency.mean,
+            achieved_mean_observation: if achieved_concurrency.mean.is_some() {
+                ProcessObservation::SchedulerObserved
+            } else {
+                ProcessObservation::NotProcessObservable
+            },
+            achieved_mean_unavailable_reason: achieved_concurrency.mean.is_none().then(|| {
+                "no assignment execution interval was observed by the scheduler".to_string()
+            }),
+        },
+        role_bindings: resolved_role_execution_bindings(plan, runtime, runtime_model_catalog),
+        usage: supervisor_execution_usage_report(total_usage, total_cost_usd, usage_complete),
+    });
     SupervisorFinalReport {
         version: SUPERVISOR_SCHEMA_VERSION,
         run_id,
@@ -892,8 +1210,7 @@ fn build_supervisor_final_report(
             .iter()
             .map(|intent| intent.token.get())
             .collect(),
-        role_economics_profile: runtime_model_catalog
-            .map(|catalog| plan.effective_role_economics_profile_for_runtime(catalog)),
+        role_economics_profile: Some(role_economics_profile),
         run_budget: run_budget_report,
         role_usage,
         review_lens_usage,
@@ -1430,6 +1747,8 @@ struct RuntimeModelCatalogFailureFinalization<'context, 'checkpoint> {
     artifact_writer: ArtifactRunWriter,
     checkpoint_writer: &'checkpoint mut SupervisorCheckpointWriter,
     run_dir: &'context Path,
+    max_concurrent_children: usize,
+    has_multiple_independent_assignment_scopes: bool,
 }
 
 fn persist_runtime_model_catalog_environment_failure(
@@ -1445,6 +1764,8 @@ fn persist_runtime_model_catalog_environment_failure(
         artifact_writer,
         checkpoint_writer,
         run_dir,
+        max_concurrent_children,
+        has_multiple_independent_assignment_scopes,
     } = finalization;
     let run_budget_report = budget_ledger.report()?;
     let (report_plan_file, report_run_dir) =
@@ -1459,6 +1780,9 @@ fn persist_runtime_model_catalog_environment_failure(
     let final_report = build_supervisor_final_report(SupervisorFinalReportConstruction {
         plan,
         runtime_model_catalog: None,
+        max_concurrent_children,
+        achieved_concurrency: AchievedConcurrency::default(),
+        has_multiple_independent_assignment_scopes,
         run_id: options.run_id.clone(),
         report_plan_file,
         report_run_dir,
@@ -1557,6 +1881,12 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                     artifact_writer,
                     checkpoint_writer: &mut checkpoint_writer,
                     run_dir: &run_dir,
+                    max_concurrent_children,
+                    has_multiple_independent_assignment_scopes:
+                        has_multiple_independent_assignment_scopes(
+                            &assignment_schedule,
+                            &plan_metadata,
+                        ),
                 },
                 *failure,
             );
@@ -1583,6 +1913,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     let mut budget_prevented_dispatch = false;
     let mut budget_denied_assignment_indices = BTreeSet::new();
     let mut circuit_breaker_trip = None;
+    let mut achieved_concurrency = AchievedConcurrency::default();
     let run_result = (|| -> Result<()> {
         initialize_scheduler_evidence(&mut SchedulerEvidenceInitialization {
             plan: &plan,
@@ -1672,6 +2003,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                     &cancellation,
                     &serial_semantic_warn_intents,
                 ) {
+                    achieved_concurrency = progress.concurrency.finish();
                     budget_prevented_dispatch |= progress.budget_prevented_dispatch;
                     budget_denied_assignment_indices
                         .extend(progress.budget_denied_assignment_indices);
@@ -1689,6 +2021,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
             };
             (scheduler_result, progress)
         };
+        achieved_concurrency = progress.concurrency.finish();
         budget_prevented_dispatch |= progress.budget_prevented_dispatch;
         budget_denied_assignment_indices.extend(progress.budget_denied_assignment_indices);
         circuit_breaker_trip = progress.circuit_breaker_trip;
@@ -1917,6 +2250,12 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     let mut final_report = build_supervisor_final_report(SupervisorFinalReportConstruction {
         plan: &plan,
         runtime_model_catalog: Some(&runtime_model_catalog),
+        max_concurrent_children,
+        achieved_concurrency,
+        has_multiple_independent_assignment_scopes: has_multiple_independent_assignment_scopes(
+            &assignment_schedule,
+            &plan_metadata,
+        ),
         run_id: options.run_id,
         report_plan_file,
         report_run_dir,
@@ -2271,6 +2610,9 @@ mod decomposition_tests {
         SupervisorFinalReportConstruction {
             plan,
             runtime_model_catalog: Some(&TEST_RUNTIME_MODEL_CATALOG),
+            max_concurrent_children: 1,
+            achieved_concurrency: AchievedConcurrency::default(),
+            has_multiple_independent_assignment_scopes: false,
             run_id,
             report_plan_file: PathBuf::from("plan.json"),
             report_run_dir: PathBuf::from(".maco/o2/runs/test"),
@@ -2331,6 +2673,37 @@ mod decomposition_tests {
         .expect("select a ready non-overlapping assignment");
 
         assert_eq!(selected, Some(2));
+    }
+
+    #[test]
+    fn strict_parent_child_schedule_is_not_independent_fan_out() {
+        let schedule = vec![
+            AssignmentScheduleEntry {
+                assignment_id: "parent".to_string(),
+                parent_assignment_id: None,
+                depth: MIN_SUPERVISOR_DEPTH,
+                flattened_index: 0,
+            },
+            AssignmentScheduleEntry {
+                assignment_id: "child".to_string(),
+                parent_assignment_id: Some("parent".to_string()),
+                depth: MIN_SUPERVISOR_DEPTH + 1,
+                flattened_index: 1,
+            },
+        ];
+
+        assert!(!has_multiple_independent_assignment_scopes(
+            &schedule,
+            &SupervisorPlanMetadata::default()
+        ));
+
+        let metadata = SupervisorPlanMetadata {
+            spec_fragment_ids: vec!["scope-a".to_string(), "scope-b".to_string()],
+            ..SupervisorPlanMetadata::default()
+        };
+        assert!(has_multiple_independent_assignment_scopes(
+            &schedule, &metadata
+        ));
     }
 
     #[test]
@@ -2406,8 +2779,51 @@ mod decomposition_tests {
                 assert_eq!(outcome.released_claims.len(), 1);
                 assert!(outcome.release_errors.is_empty());
                 assert!(outcome.semantic_release_errors.is_empty());
+                let concurrency = progress.concurrency.finish();
+                assert_eq!(concurrency.started_assignment_count, 1);
+                assert_eq!(concurrency.completed_assignment_count, 1);
+                assert_eq!(concurrency.peak, 1);
+                assert!(concurrency
+                    .mean
+                    .is_some_and(|mean| mean > 0.0 && mean <= 1.0));
             }
         );
+    }
+
+    #[test]
+    fn concurrency_tracker_measures_live_guards_and_closes_on_unwind() {
+        let tracker = SchedulerConcurrencyTracker::new();
+        {
+            let first = tracker.assignment_started();
+            drop(first);
+            let second = tracker.assignment_started();
+            drop(second);
+        }
+        let sequential = tracker.finish();
+        assert_eq!(sequential.started_assignment_count, 2);
+        assert_eq!(sequential.completed_assignment_count, 2);
+        assert_eq!(sequential.peak, 1);
+
+        let tracker = SchedulerConcurrencyTracker::new();
+        let first = tracker.assignment_started();
+        let second = tracker.assignment_started();
+        drop(second);
+        drop(first);
+        let overlapping = tracker.finish();
+        assert_eq!(overlapping.started_assignment_count, 2);
+        assert_eq!(overlapping.completed_assignment_count, 2);
+        assert_eq!(overlapping.peak, 2);
+
+        let tracker = SchedulerConcurrencyTracker::new();
+        let unwind_tracker = tracker.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = unwind_tracker.assignment_started();
+            panic!("test unwind");
+        });
+        let unwound = tracker.finish();
+        assert_eq!(unwound.started_assignment_count, 1);
+        assert_eq!(unwound.completed_assignment_count, 1);
+        assert_eq!(unwound.peak, 1);
     }
 
     #[test]
@@ -2454,6 +2870,13 @@ mod decomposition_tests {
                             && outcome.semantic_release_errors.is_empty()
                     })
                 }));
+                let concurrency = progress.concurrency.finish();
+                assert_eq!(concurrency.started_assignment_count, 2);
+                assert_eq!(concurrency.completed_assignment_count, 2);
+                assert!((1..=2).contains(&concurrency.peak));
+                assert!(concurrency
+                    .mean
+                    .is_some_and(|mean| (1.0..=2.0).contains(&mean)));
             }
         );
     }
@@ -2568,6 +2991,140 @@ mod decomposition_tests {
         assert_eq!(
             report.remaining_risk,
             "fake supervisor simulation succeeded but is not publishable or acceptable as real model evidence"
+        );
+        let profile = report
+            .role_economics_profile
+            .as_ref()
+            .expect("new reports always carry economics metadata");
+        assert_eq!(
+            profile.schema_version,
+            SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION
+        );
+        assert_eq!(
+            profile.model_catalog_observation,
+            RuntimeModelCatalogObservation::NotConsulted
+        );
+        let execution = profile
+            .execution
+            .as_ref()
+            .expect("new reports always carry execution metadata");
+        assert_eq!(execution.assignment_count, 2);
+        assert_eq!(execution.concurrency.configured_max_concurrent_children, 1);
+        assert_eq!(execution.concurrency.achieved_max_concurrent_children, 0);
+        assert!(execution.role_bindings.values().all(|binding| {
+            binding.observation == RoleBindingObservation::SyntheticFake
+                && binding.resolved_model.is_none()
+                && binding.resolved_reasoning_effort.is_none()
+        }));
+        assert_eq!(report.role_usage.len(), 5);
+    }
+
+    #[test]
+    fn report_builder_warns_when_independent_scopes_collapse_to_width_one() {
+        let plan = test_plan(vec![
+            test_assignment("child-a", "README.md"),
+            test_assignment("child-b", "Cargo.toml"),
+        ]);
+        let mut construction = test_report_construction(
+            &plan,
+            RunId::new("collapsed-fan-out").expect("valid run id"),
+        );
+        construction.max_concurrent_children = 2;
+        construction.achieved_concurrency = AchievedConcurrency {
+            started_assignment_count: 2,
+            completed_assignment_count: 2,
+            peak: 1,
+            mean: Some(1.0),
+        };
+        construction.has_multiple_independent_assignment_scopes = true;
+
+        let report = build_supervisor_final_report(construction);
+
+        assert!(report.findings.iter().any(|finding| {
+            finding.severity == FindingSeverity::Warning
+                && finding.message.contains("fan-out collapsed")
+                && finding.message.contains("achieved width 1")
+        }));
+        let execution = report
+            .role_economics_profile
+            .as_ref()
+            .and_then(|profile| profile.execution.as_ref())
+            .expect("execution metadata");
+        assert_eq!(execution.concurrency.configured_max_concurrent_children, 2);
+        assert_eq!(execution.concurrency.achieved_max_concurrent_children, 1);
+        assert_eq!(
+            execution.concurrency.achieved_mean_concurrent_children,
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn legacy_economics_profile_defaults_to_version_one_without_execution() {
+        let plan = test_plan(Vec::new());
+        let report = build_supervisor_final_report(test_report_construction(
+            &plan,
+            RunId::new("legacy-economics-read").expect("valid run id"),
+        ));
+        let mut value = serde_json::to_value(report).expect("serialize current report");
+        let profile = value["role_economics_profile"]
+            .as_object_mut()
+            .expect("economics profile object");
+        profile.remove("schema_version");
+        profile.remove("model_catalog_observation");
+        profile.remove("execution");
+
+        let legacy: SupervisorFinalReport =
+            serde_json::from_value(value).expect("legacy report remains readable");
+        let profile = legacy
+            .role_economics_profile
+            .as_ref()
+            .expect("legacy economics block remains readable");
+        assert_eq!(profile.schema_version, 1);
+        assert_eq!(
+            profile.model_catalog_observation,
+            RuntimeModelCatalogObservation::NotConsulted
+        );
+        assert!(profile.execution.is_none());
+    }
+
+    #[test]
+    fn supervisor_final_economics_v2_fixture_covers_execution_contract() {
+        let profile: RoleEconomicsProfile = serde_json::from_str(include_str!(
+            "../../tests/fixtures/supervise/supervisor-final-economics-v2.json"
+        ))
+        .expect("parse supervisor-final economics fixture");
+
+        assert_eq!(
+            profile.schema_version,
+            SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION
+        );
+        assert_eq!(
+            profile.model_catalog_observation,
+            RuntimeModelCatalogObservation::Consulted
+        );
+        let execution = profile.execution.expect("fixture execution metadata");
+        assert_eq!(execution.assignment_count, 2);
+        assert_eq!(execution.concurrency.configured_max_concurrent_children, 2);
+        assert_eq!(execution.concurrency.achieved_max_concurrent_children, 2);
+        assert_eq!(execution.role_bindings.len(), 5);
+        assert_eq!(
+            execution.usage.total_usage,
+            Some(Usage {
+                input_tokens: 1_200,
+                output_tokens: 300,
+                total_tokens: 1_500,
+            })
+        );
+
+        let schema = supervisor_final_report_schema_value();
+        assert_eq!(
+            schema["properties"]["role_economics_profile"]["properties"]["schema_version"]["const"],
+            SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION
+        );
+        assert!(
+            schema["properties"]["role_economics_profile"]["properties"]["execution"]["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|field| field == "role_bindings"))
         );
     }
 

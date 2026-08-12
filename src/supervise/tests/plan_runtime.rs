@@ -1573,6 +1573,26 @@ fn known_unavailable_child_runtime_default_reaches_production_app_server_argv_be
             .map(|profile| profile.model_availability),
         Some(RoleModelAvailability::Unavailable)
     );
+    let binding = &report
+        .role_economics_profile
+        .as_ref()
+        .and_then(|profile| profile.execution.as_ref())
+        .expect("execution metadata")
+        .role_bindings[&AgentRole::ChildOrchestrator];
+    assert_eq!(
+        binding.configured_model.as_deref(),
+        Some("unavailable-child-model")
+    );
+    assert!(binding.resolved_model.is_none());
+    assert_eq!(binding.resolved_reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(
+        binding.observation,
+        RoleBindingObservation::RuntimeDefaultResolved
+    );
+    assert!(binding
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("not process-observable")));
 }
 
 #[test]
@@ -1818,7 +1838,36 @@ fn runtime_model_catalog_preflight_is_typed_persisted_and_short_circuits_assignm
     assert_eq!(report.status, ReviewStatus::Failed);
     assert!(report.commands_run.is_empty());
     assert!(report.orchestrator_reports.is_empty());
-    assert!(report.role_economics_profile.is_none());
+    let profile = report
+        .role_economics_profile
+        .as_ref()
+        .expect("catalog failure must still emit economics metadata");
+    assert_eq!(
+        profile.schema_version,
+        SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION
+    );
+    assert_eq!(
+        profile.model_catalog_observation,
+        RuntimeModelCatalogObservation::ConsultationFailed
+    );
+    let execution = profile
+        .execution
+        .as_ref()
+        .expect("catalog failure must still emit execution metadata");
+    assert_eq!(execution.assignment_count, 1);
+    assert_eq!(execution.started_assignment_count, 0);
+    assert_eq!(execution.completed_assignment_count, 0);
+    assert_eq!(execution.concurrency.achieved_max_concurrent_children, 0);
+    assert!(execution.role_bindings.values().all(|binding| {
+        binding.observation == RoleBindingObservation::CatalogUnavailable
+            && binding.resolved_model.is_none()
+            && binding.resolved_reasoning_effort.is_none()
+    }));
+    assert_eq!(
+        execution.usage.observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+    assert_eq!(report.role_usage.len(), 5);
     assert_eq!(report.environment_failures.len(), 1);
     assert_eq!(
         report.environment_failures[0].category,
