@@ -1249,11 +1249,42 @@ Issue #28 production broker path.
 ### Provisional named hybrid default
 
 When a supervisor plan supplies no `role_models` override, MACO selects the
-named `provisional-phase-a-hybrid-effort-v1` profile. The profile assigns
-`gpt-5.6-sol` to every role, with `xhigh` reasoning effort for the supervisor,
-child orchestrator, and auditor, `medium` for workers, and `high` for the
-`gate_classifier`. A per-role `role_models` entry replaces that role's
-selection.
+named `provisional-phase-a-hybrid-model-tier-v2` profile. The profile assigns
+the frontier `gpt-5.6-sol` tier to the supervisor, balanced `gpt-5.6-terra` to
+child orchestrators, auditors, and the gate classifier, and economy
+`gpt-5.6-luna` to workers. Reasoning effort remains `xhigh` for the supervisor,
+child orchestrator, and auditor, `medium` for workers, and `high` for the gate
+classifier. A per-role `role_models` entry replaces that role's selection.
+
+Each default role selection carries an ordered catalog fallback chain. MACO
+consults the authenticated runtime catalog once, chooses the first advertised
+slug from the configured primary plus fallback list, and records
+`resolution_observation=catalog_fallback` with the selected candidate index
+when the primary is missing. Only after the list is exhausted does the role's
+terminal `runtime_default`, `fail_closed`, or `local_deterministic_fake` action
+apply. The same resolved worker selection is written into nested-worker prompt
+context, so command and prompt paths cannot silently disagree.
+
+The chain is ordinary plan/profile data and round-trips without a code-shape
+change:
+
+```json
+{
+  "model": "gpt-5.6-luna",
+  "reasoning_effort": "medium",
+  "unavailable_model_fallback": {
+    "ordered_catalog_chain": {
+      "models": ["gpt-5.6-terra", "gpt-5.6-sol"],
+      "on_exhausted": "runtime_default"
+    }
+  }
+}
+```
+
+An explicit `all-frontier-v1` profile remains selectable by supplying
+`role_models` for all five roles with `model=gpt-5.6-sol`; the public
+`all_frontier_role_models()` helper constructs that profile data while
+preserving each role's reasoning-effort floor.
 
 On the production Codex path, the no-override child-orchestrator and auditor
 commands are constructed with the profile's explicit model and role-specific

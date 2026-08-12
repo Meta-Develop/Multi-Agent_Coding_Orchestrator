@@ -1288,6 +1288,20 @@ fn no_override_selects_named_provisional_hybrid_profile_in_launched_argv() {
     assert!(profile.overridden_roles.is_empty());
     assert_eq!(profile.role_models.len(), 5);
     assert_eq!(
+        profile.role_models[&AgentRole::Supervisor].model.as_deref(),
+        Some(FRONTIER_PROFILE_MODEL)
+    );
+    assert_eq!(
+        profile.role_models[&AgentRole::ChildOrchestrator]
+            .model
+            .as_deref(),
+        Some(BALANCED_PROFILE_MODEL)
+    );
+    assert_eq!(
+        profile.role_models[&AgentRole::Worker].model.as_deref(),
+        Some(ECONOMY_PROFILE_MODEL)
+    );
+    assert_eq!(
         profile.role_models[&AgentRole::ChildOrchestrator]
             .reasoning_effort
             .as_deref(),
@@ -1299,14 +1313,20 @@ fn no_override_selects_named_provisional_hybrid_profile_in_launched_argv() {
             .as_deref(),
         Some("medium")
     );
-    assert_eq!(
-        profile.role_models[&AgentRole::GateClassifier].unavailable_model_fallback,
-        UnavailableModelFallback::LocalDeterministicFake
-    );
-    assert_eq!(
-        profile.role_models[&AgentRole::Auditor].unavailable_model_fallback,
-        UnavailableModelFallback::RuntimeDefault
-    );
+    assert!(matches!(
+        &profile.role_models[&AgentRole::GateClassifier].unavailable_model_fallback,
+        UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
+            on_exhausted: TerminalUnavailableModelFallback::LocalDeterministicFake,
+            ..
+        })
+    ));
+    assert!(matches!(
+        &profile.role_models[&AgentRole::Auditor].unavailable_model_fallback,
+        UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
+            on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
+            ..
+        })
+    ));
 
     let base_command = || {
         ExternalAgentCommand::codex(
@@ -1318,7 +1338,11 @@ fn no_override_selects_named_provisional_hybrid_profile_in_launched_argv() {
             Duration::from_secs(1),
         )
     };
-    let catalog = injected_codex_runtime_catalog(&[DEFAULT_PROFILE_MODEL]);
+    let catalog = injected_codex_runtime_catalog(&[
+        FRONTIER_PROFILE_MODEL,
+        BALANCED_PROFILE_MODEL,
+        ECONOMY_PROFILE_MODEL,
+    ]);
     let runtime_profile = plan.effective_role_economics_profile_for_runtime(&catalog);
     assert_eq!(
         runtime_profile.model_availability,
@@ -1339,7 +1363,7 @@ fn no_override_selects_named_provisional_hybrid_profile_in_launched_argv() {
     assert!(
         child_argv
             .windows(2)
-            .any(|arguments| arguments == ["-c", "model=\"gpt-5.6-sol\""]),
+            .any(|arguments| arguments == ["-c", "model=\"gpt-5.6-terra\""]),
         "writable child app-server argv did not select the provisional model: {child_argv:?}"
     );
     assert!(child_argv
@@ -1360,10 +1384,89 @@ fn no_override_selects_named_provisional_hybrid_profile_in_launched_argv() {
         .collect::<Vec<_>>();
     assert!(auditor_argv
         .windows(2)
-        .any(|arguments| arguments == ["-m", DEFAULT_PROFILE_MODEL]));
+        .any(|arguments| arguments == ["-m", BALANCED_PROFILE_MODEL]));
     assert!(auditor_argv
         .windows(2)
         .any(|arguments| arguments == ["-c", "model_reasoning_effort=\"xhigh\""]));
+}
+
+#[test]
+fn ordered_role_tiers_and_all_frontier_profile_round_trip_through_plan_json() {
+    let mut plan = parse_supervisor_plan_with_consultant(
+        std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
+    )
+    .expect("base plan")
+    .plan;
+    plan.role_models = provisional_default_role_models();
+    let document = serde_json::to_string(&plan).expect("serialize tiered plan");
+    assert!(document.contains("ordered_catalog_chain"));
+    let loaded = parse_supervisor_plan_with_consultant(&document).expect("reload tiered plan");
+    assert_eq!(loaded.plan.role_models, plan.role_models);
+
+    plan.role_models = all_frontier_role_models();
+    let document = serde_json::to_string(&plan).expect("serialize all-frontier plan");
+    let loaded =
+        parse_supervisor_plan_with_consultant(&document).expect("reload all-frontier plan");
+    assert_eq!(loaded.plan.role_models, plan.role_models);
+    assert_eq!(
+        loaded.plan.effective_role_economics_profile().name,
+        ALL_FRONTIER_PROFILE_NAME
+    );
+    assert!(loaded
+        .plan
+        .role_models
+        .values()
+        .all(|selection| selection.model.as_deref() == Some(FRONTIER_PROFILE_MODEL)));
+    assert!(loaded.plan.role_models.values().all(|selection| {
+        selection.unavailable_model_fallback == UnavailableModelFallback::RuntimeDefault
+    }));
+}
+
+#[test]
+fn ordered_catalog_chain_selects_first_available_model_with_typed_observation() {
+    let configured = provisional_default_role_model_selection(AgentRole::ChildOrchestrator);
+    let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
+    let resolved = catalog
+        .resolve_role_model_selection(&configured, SupervisorRuntime::Codex)
+        .expect("resolve fallback chain");
+    assert_eq!(
+        resolved.selection.model.as_deref(),
+        Some(FRONTIER_PROFILE_MODEL)
+    );
+    assert_eq!(
+        resolved.observation,
+        ModelResolutionObservation::CatalogFallback
+    );
+    assert_eq!(resolved.resolved_candidate_index, Some(1));
+    assert_eq!(
+        resolved.configured_model_chain,
+        vec![
+            BALANCED_PROFILE_MODEL.to_string(),
+            FRONTIER_PROFILE_MODEL.to_string(),
+            ECONOMY_PROFILE_MODEL.to_string()
+        ]
+    );
+
+    let plan = parse_supervisor_plan_with_consultant(
+        std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
+    )
+    .expect("base plan")
+    .plan;
+    let resolved_prompt_plan =
+        runtime_resolved_prompt_plan(&plan, SupervisorRuntime::Codex, &catalog)
+            .expect("resolve prompt selections");
+    assert_eq!(
+        effective_role_model_selection(&resolved_prompt_plan, AgentRole::ChildOrchestrator)
+            .model
+            .as_deref(),
+        Some(FRONTIER_PROFILE_MODEL)
+    );
+    assert_eq!(
+        effective_role_model_selection(&resolved_prompt_plan, AgentRole::Worker)
+            .model
+            .as_deref(),
+        Some(FRONTIER_PROFILE_MODEL)
+    );
 }
 
 #[test]
@@ -1390,7 +1493,7 @@ fn gate_classifier_override_and_unavailable_fallback_are_independent() {
     );
     assert_eq!(
         profile.role_models[&AgentRole::Auditor].model.as_deref(),
-        Some(DEFAULT_PROFILE_MODEL)
+        Some(BALANCED_PROFILE_MODEL)
     );
     assert_eq!(profile.overridden_roles, vec![AgentRole::GateClassifier]);
 
@@ -1399,21 +1502,25 @@ fn gate_classifier_override_and_unavailable_fallback_are_independent() {
         .expect("runtime-default fallback");
     assert!(fallback.model.is_none());
     assert_eq!(fallback.reasoning_effort.as_deref(), Some("high"));
-    let local_fake = provisional_default_role_model_selection(AgentRole::GateClassifier)
-        .resolve_for_availability(RoleModelAvailability::Unavailable, SupervisorRuntime::Fake)
+    let local_fake = RuntimeModelCatalog::LocalDeterministicFake
+        .resolve_role_model_selection(
+            &provisional_default_role_model_selection(AgentRole::GateClassifier),
+            SupervisorRuntime::Fake,
+        )
         .expect("local fake fallback");
-    assert_eq!(local_fake, RoleModelSelection::default());
-    let unknown_local_fake = provisional_default_role_model_selection(AgentRole::GateClassifier)
-        .resolve_for_availability(RoleModelAvailability::Unknown, SupervisorRuntime::Fake)
-        .expect("known fake runtime uses local deterministic fallback");
-    assert_eq!(unknown_local_fake, RoleModelSelection::default());
-    assert!(
-        provisional_default_role_model_selection(AgentRole::GateClassifier)
-            .resolve_for_availability(RoleModelAvailability::Unavailable, SupervisorRuntime::Codex,)
-            .expect_err("local fake cannot replace a Codex model")
-            .to_string()
-            .contains("valid only for the fake runtime")
+    assert_eq!(local_fake.selection, RoleModelSelection::default());
+    assert_eq!(
+        local_fake.observation,
+        ModelResolutionObservation::LocalDeterministicFake
     );
+    assert!(injected_codex_runtime_catalog(&["unrelated-model"])
+        .resolve_role_model_selection(
+            &provisional_default_role_model_selection(AgentRole::GateClassifier),
+            SupervisorRuntime::Codex,
+        )
+        .expect_err("local fake cannot replace a Codex model")
+        .to_string()
+        .contains("valid only for the fake runtime"));
 }
 
 #[test]

@@ -552,6 +552,10 @@ fn prepare_child_attempt<'a>(
         max_attempts > 1,
     );
     let corrective_retry_used = retry_feedback.is_some();
+    let resolved_prompt_plan = evidence_only_reaudit
+        .is_none()
+        .then(|| runtime_resolved_prompt_plan(plan, options.runtime, runtime_model_catalog))
+        .transpose()?;
     let RenderedPromptWithMeasurements {
         prompt,
         mut measurements,
@@ -580,7 +584,7 @@ fn prepare_child_attempt<'a>(
     } else {
         render_child_orchestrator_prompt_with_incoming_root_and_field_guide(
             ChildOrchestratorPromptContext {
-                plan,
+                plan: resolved_prompt_plan.as_ref().unwrap_or(plan),
                 assignment,
                 run_dir,
                 worktree,

@@ -113,6 +113,19 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                     "catalog_unavailable", "resolution_failed"
                 ]
             },
+            "resolution_observation": {
+                "type": "string",
+                "enum": [
+                    "preferred_model", "catalog_fallback", "runtime_default",
+                    "local_deterministic_fake", "not_resolved"
+                ]
+            },
+            "configured_model_chain": {
+                "type": "array",
+                "items": {"type": "string"},
+                "uniqueItems": true
+            },
+            "resolved_candidate_index": {"type": "integer", "minimum": 0},
             "unavailable_reason": {"type": "string"}
         }
     });
@@ -123,8 +136,39 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
             "model": {"type": "string"},
             "reasoning_effort": {"type": "string"},
             "unavailable_model_fallback": {
-                "type": "string",
-                "enum": ["fail_closed", "runtime_default", "local_deterministic_fake"]
+                "oneOf": [
+                    {
+                        "type": "string",
+                        "enum": ["fail_closed", "runtime_default", "local_deterministic_fake"]
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["ordered_catalog_chain"],
+                        "properties": {
+                            "ordered_catalog_chain": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["models", "on_exhausted"],
+                                "properties": {
+                                    "models": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "items": {"type": "string"},
+                                        "uniqueItems": true
+                                    },
+                                    "on_exhausted": {
+                                        "type": "string",
+                                        "enum": [
+                                            "fail_closed", "runtime_default",
+                                            "local_deterministic_fake"
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                ]
             }
         }
     });

@@ -181,7 +181,9 @@ const LICENSED_BREAKAGE_AUDIT_VALIDATION_NAME: &str = "licensed_breakage_declara
 const MIN_SUPERVISOR_DEPTH: u8 = 2;
 const MAX_SUPERVISOR_DEPTH: u8 = 32;
 const SUPERVISOR_SCHEMA_VERSION: u32 = 1;
-pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NAME: &str = "provisional-phase-a-hybrid-effort-v1";
+pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NAME: &str =
+    "provisional-phase-a-hybrid-model-tier-v2";
+pub const ALL_FRONTIER_PROFILE_NAME: &str = "all-frontier-v1";
 pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_EVIDENCE: &str =
     "provisional deterministic fake phase-A evidence";
 pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NOTICE: &str =
@@ -192,7 +194,10 @@ pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NOTICE: &str =
      contained, authenticated runtime-advertised model catalog and applies each role's declared \
      unavailable-model fallback; the upstream catalog may be cached when refresh fails, so \
      membership is runtime-advertised availability rather than a fresh entitlement guarantee";
-const DEFAULT_PROFILE_MODEL: &str = "gpt-5.6-sol";
+const FRONTIER_PROFILE_MODEL: &str = "gpt-5.6-sol";
+const BALANCED_PROFILE_MODEL: &str = "gpt-5.6-terra";
+const ECONOMY_PROFILE_MODEL: &str = "gpt-5.6-luna";
+const DEFAULT_PROFILE_MODEL: &str = FRONTIER_PROFILE_MODEL;
 const CODEX_MODEL_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const LENIENT_JSON_EXTRACTION_WARNING: &str = "report required lenient JSON extraction";
 const GITLINK_MODE: u32 = 0o160000;
@@ -453,19 +458,55 @@ pub struct RoleModelSelection {
     pub unavailable_model_fallback: UnavailableModelFallback,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnavailableModelFallback {
     #[default]
     FailClosed,
     RuntimeDefault,
     LocalDeterministicFake,
+    OrderedCatalogChain(OrderedCatalogFallback),
 }
 
 impl UnavailableModelFallback {
     const fn is_fail_closed(&self) -> bool {
         matches!(self, Self::FailClosed)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderedCatalogFallback {
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub on_exhausted: TerminalUnavailableModelFallback,
+}
+
+impl OrderedCatalogFallback {
+    fn validate(&self) -> Result<()> {
+        if self.models.is_empty() {
+            bail!("ordered model fallback chain must contain at least one model");
+        }
+        let mut models = BTreeSet::new();
+        for model in &self.models {
+            if model.trim().is_empty() || model != model.trim() {
+                bail!("ordered model fallback chain entries must be non-empty and trimmed");
+            }
+            if !models.insert(model) {
+                bail!("ordered model fallback chain contains duplicate model '{model}'");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalUnavailableModelFallback {
+    #[default]
+    FailClosed,
+    RuntimeDefault,
+    LocalDeterministicFake,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -485,6 +526,14 @@ enum RuntimeModelCatalog {
 
 type RuntimeModelCatalogAcquisition =
     std::result::Result<RuntimeModelCatalog, Box<EnvironmentFailure>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoleModelResolution {
+    selection: RoleModelSelection,
+    observation: ModelResolutionObservation,
+    configured_model_chain: Vec<String>,
+    resolved_candidate_index: Option<usize>,
+}
 
 impl RuntimeModelCatalog {
     fn for_supervisor(
@@ -531,12 +580,11 @@ impl RuntimeModelCatalog {
         selections: impl IntoIterator<Item = RoleModelSelection>,
     ) -> RoleModelAvailability {
         match self {
-            Self::Codex(catalog) => {
-                if selections
-                    .into_iter()
-                    .filter_map(|selection| selection.model)
-                    .all(|model| catalog.contains(&model))
-                {
+            Self::Codex(_) => {
+                if selections.into_iter().all(|selection| {
+                    self.resolve_role_model_selection(&selection, SupervisorRuntime::Codex)
+                        .is_ok_and(|resolution| resolution.selection.model.is_some())
+                }) {
                     RoleModelAvailability::Available
                 } else {
                     RoleModelAvailability::Unavailable
@@ -544,6 +592,92 @@ impl RuntimeModelCatalog {
             }
             Self::LocalDeterministicFake => RoleModelAvailability::Unavailable,
         }
+    }
+
+    fn resolve_role_model_selection(
+        &self,
+        configured: &RoleModelSelection,
+        runtime: SupervisorRuntime,
+    ) -> Result<RoleModelResolution> {
+        let mut candidates = configured.model.iter().cloned().collect::<Vec<_>>();
+        let terminal = match &configured.unavailable_model_fallback {
+            UnavailableModelFallback::OrderedCatalogChain(chain) => {
+                chain.validate()?;
+                for model in &chain.models {
+                    if candidates.contains(model) {
+                        bail!("ordered model fallback chain repeats configured model '{model}'");
+                    }
+                    candidates.push(model.clone());
+                }
+                chain.on_exhausted
+            }
+            UnavailableModelFallback::FailClosed => TerminalUnavailableModelFallback::FailClosed,
+            UnavailableModelFallback::RuntimeDefault => {
+                TerminalUnavailableModelFallback::RuntimeDefault
+            }
+            UnavailableModelFallback::LocalDeterministicFake => {
+                TerminalUnavailableModelFallback::LocalDeterministicFake
+            }
+        };
+        if candidates.is_empty() {
+            return Ok(RoleModelResolution {
+                selection: configured.clone(),
+                observation: ModelResolutionObservation::PreferredModel,
+                configured_model_chain: candidates,
+                resolved_candidate_index: None,
+            });
+        }
+        for (index, model) in candidates.iter().enumerate() {
+            if self.availability(Some(model), runtime)? == RoleModelAvailability::Available {
+                return Ok(RoleModelResolution {
+                    selection: RoleModelSelection {
+                        model: Some(model.clone()),
+                        reasoning_effort: configured.reasoning_effort.clone(),
+                        unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+                    },
+                    observation: if index == 0 {
+                        ModelResolutionObservation::PreferredModel
+                    } else {
+                        ModelResolutionObservation::CatalogFallback
+                    },
+                    configured_model_chain: candidates,
+                    resolved_candidate_index: Some(index),
+                });
+            }
+        }
+        let (selection, observation) = match terminal {
+            TerminalUnavailableModelFallback::FailClosed => {
+                bail!(
+                    "configured models [{}] are unavailable and the role fallback is fail_closed",
+                    candidates.join(", ")
+                )
+            }
+            TerminalUnavailableModelFallback::RuntimeDefault => (
+                RoleModelSelection {
+                    model: None,
+                    reasoning_effort: configured.reasoning_effort.clone(),
+                    unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+                },
+                ModelResolutionObservation::RuntimeDefault,
+            ),
+            TerminalUnavailableModelFallback::LocalDeterministicFake
+                if runtime == SupervisorRuntime::Fake =>
+            {
+                (
+                    RoleModelSelection::default(),
+                    ModelResolutionObservation::LocalDeterministicFake,
+                )
+            }
+            TerminalUnavailableModelFallback::LocalDeterministicFake => {
+                bail!("local_deterministic_fake fallback is valid only for the fake runtime")
+            }
+        };
+        Ok(RoleModelResolution {
+            selection,
+            observation,
+            configured_model_chain: candidates,
+            resolved_candidate_index: None,
+        })
     }
 }
 
@@ -620,8 +754,25 @@ pub struct ResolvedRoleExecutionBinding {
     pub resolved_model: Option<String>,
     pub resolved_reasoning_effort: Option<String>,
     pub observation: RoleBindingObservation,
+    #[serde(default)]
+    pub resolution_observation: ModelResolutionObservation,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configured_model_chain: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_candidate_index: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelResolutionObservation {
+    PreferredModel,
+    CatalogFallback,
+    RuntimeDefault,
+    LocalDeterministicFake,
+    #[default]
+    NotResolved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -649,6 +800,16 @@ const fn default_role_economics_profile_schema_version() -> u32 {
 }
 
 impl RoleModelSelection {
+    fn configured_model_chain(&self) -> Vec<String> {
+        let mut models = self.model.iter().cloned().collect::<Vec<_>>();
+        if let UnavailableModelFallback::OrderedCatalogChain(chain) =
+            &self.unavailable_model_fallback
+        {
+            models.extend(chain.models.iter().cloned());
+        }
+        models
+    }
+
     pub fn resolve_for_availability(
         &self,
         availability: RoleModelAvailability,
@@ -666,7 +827,7 @@ impl RoleModelSelection {
             }
             return Ok(self.clone());
         }
-        match self.unavailable_model_fallback {
+        match &self.unavailable_model_fallback {
             UnavailableModelFallback::FailClosed => {
                 bail!("configured model is unavailable and the role fallback is fail_closed")
             }
@@ -682,6 +843,9 @@ impl RoleModelSelection {
             }
             UnavailableModelFallback::LocalDeterministicFake => {
                 bail!("local_deterministic_fake fallback is valid only for the fake runtime")
+            }
+            UnavailableModelFallback::OrderedCatalogChain(_) => {
+                bail!("ordered model fallback chains require a runtime model catalog")
             }
         }
     }
@@ -2427,9 +2591,14 @@ impl SupervisorPlan {
         for (role, selection) in &self.role_models {
             role_models.insert(*role, selection.clone());
         }
+        let profile_name = if self.role_models == all_frontier_role_models() {
+            ALL_FRONTIER_PROFILE_NAME
+        } else {
+            PROVISIONAL_DEFAULT_HYBRID_PROFILE_NAME
+        };
         RoleEconomicsProfile {
             schema_version: SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION,
-            name: PROVISIONAL_DEFAULT_HYBRID_PROFILE_NAME.to_string(),
+            name: profile_name.to_string(),
             evidence: PROVISIONAL_DEFAULT_HYBRID_PROFILE_EVIDENCE.to_string(),
             evidence_notice: PROVISIONAL_DEFAULT_HYBRID_PROFILE_NOTICE.to_string(),
             production_eligible: false,

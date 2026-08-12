@@ -948,43 +948,66 @@ fn resolved_role_execution_bindings(
     .into_iter()
     .map(|role| {
         let configured = effective_role_model_selection(plan, role);
-        let (resolved_model, resolved_reasoning_effort, observation, unavailable_reason) =
+        let (
+            resolved_model,
+            resolved_reasoning_effort,
+            observation,
+            resolution_observation,
+            configured_model_chain,
+            resolved_candidate_index,
+            unavailable_reason,
+        ) =
             match runtime_model_catalog {
                 None => (
                     None,
                     None,
                     RoleBindingObservation::CatalogUnavailable,
+                    ModelResolutionObservation::NotResolved,
+                    configured.configured_model_chain(),
+                    None,
                     Some(
                         "runtime model catalog acquisition failed before role selection could be resolved"
                             .to_string(),
                     ),
                 ),
-                Some(_) if runtime == SupervisorRuntime::Fake => (
-                    None,
-                    None,
-                    RoleBindingObservation::SyntheticFake,
-                    Some(
-                        "the deterministic fake runtime does not execute a provider model or reasoning effort"
-                            .to_string(),
-                    ),
-                ),
+                Some(catalog) if runtime == SupervisorRuntime::Fake => {
+                    let resolution = catalog.resolve_role_model_selection(&configured, runtime);
+                    let resolution_observation = resolution
+                        .as_ref()
+                        .map(|resolution| resolution.observation)
+                        .unwrap_or(ModelResolutionObservation::NotResolved);
+                    (
+                        None,
+                        None,
+                        RoleBindingObservation::SyntheticFake,
+                        resolution_observation,
+                        configured.configured_model_chain(),
+                        None,
+                        Some(
+                            "the deterministic fake runtime does not execute a provider model or reasoning effort"
+                                .to_string(),
+                        ),
+                    )
+                }
                 Some(catalog) => {
-                    let resolved = catalog
-                        .availability(configured.model.as_deref(), runtime)
-                        .and_then(|availability| {
-                            configured.resolve_for_availability(availability, runtime)
-                        });
+                    let resolved = catalog.resolve_role_model_selection(&configured, runtime);
                     match resolved {
-                        Ok(resolved) if resolved.model.is_some() => (
-                            resolved.model,
-                            resolved.reasoning_effort,
+                        Ok(resolved) if resolved.selection.model.is_some() => (
+                            resolved.selection.model,
+                            resolved.selection.reasoning_effort,
                             RoleBindingObservation::RuntimeCatalogResolved,
+                            resolved.observation,
+                            resolved.configured_model_chain,
+                            resolved.resolved_candidate_index,
                             None,
                         ),
                         Ok(resolved) => (
                             None,
-                            resolved.reasoning_effort,
+                            resolved.selection.reasoning_effort,
                             RoleBindingObservation::RuntimeDefaultResolved,
+                            resolved.observation,
+                            resolved.configured_model_chain,
+                            resolved.resolved_candidate_index,
                             Some(
                                 "the runtime-default fallback was selected, so the concrete provider model slug is not process-observable"
                                     .to_string(),
@@ -994,6 +1017,9 @@ fn resolved_role_execution_bindings(
                             None,
                             None,
                             RoleBindingObservation::ResolutionFailed,
+                            ModelResolutionObservation::NotResolved,
+                            configured.configured_model_chain(),
+                            None,
                             Some(format!("role model resolution failed: {error:#}")),
                         ),
                     }
@@ -1007,6 +1033,9 @@ fn resolved_role_execution_bindings(
                 resolved_model,
                 resolved_reasoning_effort,
                 observation,
+                resolution_observation,
+                configured_model_chain,
+                resolved_candidate_index,
                 unavailable_reason,
             },
         )
@@ -2384,6 +2413,43 @@ mod decomposition_tests {
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments,
         }
+    }
+
+    #[test]
+    fn role_binding_telemetry_retains_catalog_fallback_resolution() {
+        let plan = test_plan(Vec::new());
+        let catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs([FRONTIER_PROFILE_MODEL])
+                .expect("fallback catalog"),
+        );
+        let bindings =
+            resolved_role_execution_bindings(&plan, SupervisorRuntime::Codex, Some(&catalog));
+        let binding = &bindings[&AgentRole::ChildOrchestrator];
+        assert_eq!(
+            binding.configured_model.as_deref(),
+            Some(BALANCED_PROFILE_MODEL)
+        );
+        assert_eq!(
+            binding.resolved_model.as_deref(),
+            Some(FRONTIER_PROFILE_MODEL)
+        );
+        assert_eq!(
+            binding.observation,
+            RoleBindingObservation::RuntimeCatalogResolved
+        );
+        assert_eq!(
+            binding.resolution_observation,
+            ModelResolutionObservation::CatalogFallback
+        );
+        assert_eq!(binding.resolved_candidate_index, Some(1));
+        assert_eq!(
+            binding.configured_model_chain,
+            vec![
+                BALANCED_PROFILE_MODEL.to_string(),
+                FRONTIER_PROFILE_MODEL.to_string(),
+                ECONOMY_PROFILE_MODEL.to_string()
+            ]
+        );
     }
 
     fn root_schedule(plan: &SupervisorPlan) -> Vec<AssignmentScheduleEntry> {
