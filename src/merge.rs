@@ -33,7 +33,7 @@ use crate::{
     sync_store::SyncStore,
     worktree::{
         normalize_agent_id, ManagedWorktreeReadLease, ManagedWorktreeWriteLease,
-        NeutralWorktreeCreateOptions, WorktreeManager, WorktreeRecord,
+        NeutralWorktreeCreateOptions, WorktreeLifecycleReport, WorktreeManager, WorktreeRecord,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -1903,6 +1903,8 @@ pub struct MergeApplyReport {
     #[serde(serialize_with = "serialize_paths")]
     pub recorded_collision_paths: Vec<PathBuf>,
     pub accepted_decomposition: Option<MegafileAssessment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<WorktreeLifecycleReport>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -2826,6 +2828,7 @@ pub fn blocked_merge_apply_report(preview: MergeApplyPreview) -> Result<MergeApp
         error,
         recorded_collision_paths: Vec::new(),
         accepted_decomposition: None,
+        lifecycle: None,
     })
 }
 
@@ -2914,6 +2917,7 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
             error: None,
             recorded_collision_paths: Vec::new(),
             accepted_decomposition: None,
+            lifecycle: None,
         });
     }
 
@@ -3009,6 +3013,7 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
             error: None,
             recorded_collision_paths: Vec::new(),
             accepted_decomposition: None,
+            lifecycle: None,
         });
     }
 
@@ -3037,6 +3042,7 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
         error: None,
         recorded_collision_paths: Vec::new(),
         accepted_decomposition: None,
+        lifecycle: None,
     })
 }
 
@@ -9718,6 +9724,10 @@ mod tests {
             SemanticConflictOverlapKind::SymbolLevel
         );
         let report_json = serde_json::to_value(&report).expect("serialize semantic apply report");
+        assert!(
+            report_json.get("lifecycle").is_none(),
+            "manual merge JSON must remain unchanged when lifecycle automation is disabled"
+        );
         assert_eq!(
             report_json["preview"]["safety"]["semantic_conflicts"]["advisory"],
             true

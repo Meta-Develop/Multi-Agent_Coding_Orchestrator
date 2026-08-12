@@ -58,10 +58,11 @@ use crate::{
     worktree::{
         sweep_workspace_worktrees, worktree_report_path_text, RepositoryInfo,
         WorktreeCreateOptions, WorktreeGcOptions, WorktreeGcReason, WorktreeGcReport,
-        WorktreeGcStatus, WorktreeManager, WorktreeRecord, WorktreeRetentionPolicy,
-        WorktreeSweepDiscoveryStatus, WorktreeSweepFailureKind, WorktreeSweepOptions,
-        WorktreeSweepReport, WorktreeSweepRepositoryStatus, WorktreeSweepRootKind,
-        WorktreeTargetLivenessCause, WorktreeTargetLivenessEvidence, WorktreeTargetLivenessSource,
+        WorktreeGcStatus, WorktreeLifecycleOptions, WorktreeLifecycleReport, WorktreeManager,
+        WorktreeRecord, WorktreeRetentionPolicy, WorktreeSweepDiscoveryStatus,
+        WorktreeSweepFailureKind, WorktreeSweepOptions, WorktreeSweepReport,
+        WorktreeSweepRepositoryStatus, WorktreeSweepRootKind, WorktreeTargetLivenessCause,
+        WorktreeTargetLivenessEvidence, WorktreeTargetLivenessSource,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -70,6 +71,7 @@ use git2::Repository;
 use serde::Serialize;
 use serde_json::Value;
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -2337,9 +2339,14 @@ impl WorktreeCommand {
         match self.command {
             WorktreeSubcommand::Create(args) => {
                 let manager = WorktreeManager::new(args.repo);
+                let o2_default = args
+                    .o2_launch_retention_defaults
+                    .then(crate::worktree::o2_launch_worktree_retention_defaults);
                 let retention = WorktreeRetentionPolicy {
                     max_age: args.gc_max_age_seconds.map(Duration::from_secs),
-                    max_count: args.gc_max_count,
+                    max_count: args
+                        .gc_max_count
+                        .or(o2_default.and_then(|policy| policy.max_count)),
                     max_total_bytes: args.gc_max_total_bytes,
                 };
                 let record = manager.create_with_retention(
@@ -2351,7 +2358,24 @@ impl WorktreeCommand {
                     },
                     retention,
                 )?;
-                print_worktree_record(&record, args.json)
+                if args.supersede_retry_predecessor {
+                    let lifecycle = manager
+                        .lifecycle(WorktreeLifecycleOptions {
+                            apply: args.apply_retry_supersession,
+                            retry_successor_agent_id: Some(record.name.clone()),
+                            worktree_root: args.worktree_root,
+                            ..WorktreeLifecycleOptions::default()
+                        })
+                        .with_context(|| {
+                            format!(
+                                "worktree '{}' was created, but retry supersession failed; do not blindly retry creation",
+                                record.name
+                            )
+                        })?;
+                    print_worktree_create_lifecycle_report(&record, &lifecycle, args.json)
+                } else {
+                    print_worktree_record(&record, args.json)
+                }
             }
             WorktreeSubcommand::Gc(args) => {
                 let manager = WorktreeManager::new(args.repo);
@@ -2386,6 +2410,9 @@ impl WorktreeCommand {
                     },
                     allowed_untracked_paths: args.allow_untracked_paths,
                     exclude_agent_id: None,
+                    candidate_agent_ids: None,
+                    merged_into_reference: None,
+                    superseded_by_agent_id: std::collections::BTreeMap::new(),
                     machine_global_retention,
                 })?;
                 print_worktree_gc_report(&report, args.json)
@@ -2404,6 +2431,71 @@ impl WorktreeCommand {
                     allowed_untracked_paths: args.allow_untracked_paths,
                 })?;
                 print_worktree_sweep_report(&report, args.json)
+            }
+            WorktreeSubcommand::Lifecycle(args) => {
+                let machine_global_retention = match (
+                    args.machine_global_config,
+                    args.machine_global_worktree_root_id,
+                    args.machine_global_correlation,
+                ) {
+                    (Some(config), Some(root_id), Some(correction_correlation_id)) => {
+                        Some(MachineGlobalRetentionBinding {
+                            config,
+                            root_id,
+                            owner: "maco-worktree-lifecycle".to_string(),
+                            correction_correlation_id,
+                        })
+                    }
+                    (None, None, None) => None,
+                    _ => bail!(
+                        "--machine-global-config, --machine-global-worktree-root-id, and \
+                         --machine-global-correlation must be supplied together"
+                    ),
+                };
+                let mut options = if args.o2_launch_retention {
+                    WorktreeLifecycleOptions::o2_launch_defaults()
+                } else {
+                    WorktreeLifecycleOptions::default()
+                };
+                options.apply = args.apply;
+                options.auto_reap_merged = args.auto_reap_merged;
+                options.merged_into_reference = args.trunk_ref;
+                options.retry_successor_agent_id = args.retry_successor;
+                options.startup_reconcile = args.startup_reconciliation;
+                options.destructive_reconciliation = args.destructive_reconciliation;
+                options.worktree_root = args.worktree_root;
+                options.remove_targets = !args.keep_targets;
+                options.allowed_untracked_paths = args.allow_untracked_paths;
+                options.machine_global_retention = machine_global_retention;
+                if let Some(max_age_seconds) = args.max_age_seconds {
+                    options.worktree_retention.max_age = Some(Duration::from_secs(max_age_seconds));
+                }
+                if let Some(max_count) = args.max_count {
+                    options.worktree_retention.max_count = Some(max_count);
+                }
+                if let Some(max_total_bytes) = args.max_total_bytes {
+                    options.worktree_retention.max_total_bytes = Some(max_total_bytes);
+                }
+                if let Some(policy) = options.artifact_retention.as_mut() {
+                    if let Some(keep) = args.artifact_keep {
+                        policy.max_count = keep;
+                    }
+                    if let Some(max_age_seconds) = args.artifact_max_age_seconds {
+                        policy.max_age = Some(Duration::from_secs(max_age_seconds));
+                    }
+                    if let Some(max_total_bytes) = args.artifact_max_total_bytes {
+                        policy.max_total_bytes = Some(max_total_bytes);
+                    }
+                    if let Some(unfinalized_grace_seconds) = args.artifact_unfinalized_grace_seconds
+                    {
+                        policy.unfinalized_grace =
+                            Some(Duration::from_secs(unfinalized_grace_seconds));
+                    }
+                    policy.reclaim_unverifiable = args.reclaim_unverifiable;
+                    policy.external_writers_stopped = args.acknowledge_external_writers_stopped;
+                }
+                let report = WorktreeManager::new(args.repo).lifecycle(options)?;
+                print_worktree_lifecycle_report(&report, args.json)
             }
             WorktreeSubcommand::Remove(args) => {
                 let manager = WorktreeManager::new(args.repo);
@@ -3341,6 +3433,8 @@ enum WorktreeSubcommand {
     Gc(GcWorktreeArgs),
     /// Sweep managed worktrees across every repository group in a workspace.
     Sweep(SweepWorktreeArgs),
+    /// Classify and optionally apply opt-in worktree and artifact lifecycle automation.
+    Lifecycle(LifecycleWorktreeArgs),
     /// Remove a linked worktree for an agent.
     Remove(RemoveWorktreeArgs),
     /// List registered worktrees.
@@ -3374,6 +3468,15 @@ struct CreateWorktreeArgs {
     /// After creation, retain at most this many apparent, not allocated, bytes in newest eligible lanes.
     #[arg(long)]
     gc_max_total_bytes: Option<u64>,
+    /// Apply the bounded O2-launch default of retaining the newest 10 lanes after creation.
+    #[arg(long)]
+    o2_launch_retention_defaults: bool,
+    /// Classify this newly created retry lane's exact predecessor for guarded supersession.
+    #[arg(long)]
+    supersede_retry_predecessor: bool,
+    /// Apply eligible retry predecessor reaping after creation.
+    #[arg(long, requires = "supersede_retry_predecessor")]
+    apply_retry_supersession: bool,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -3449,6 +3552,82 @@ struct SweepWorktreeArgs {
     #[arg(long = "allow-untracked-path")]
     allow_untracked_paths: Vec<PathBuf>,
     /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LifecycleWorktreeArgs {
+    /// Repository path. Lifecycle automation is disabled unless a feature flag is supplied.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Apply explicitly enabled lifecycle actions. Without this flag, the pass is a dry-run.
+    #[arg(long)]
+    apply: bool,
+    /// Classify fully merged lanes for guarded automatic reaping.
+    #[arg(long, requires = "trunk_ref")]
+    auto_reap_merged: bool,
+    /// Exact local trunk reference used for merged ancestry, for example refs/heads/main.
+    #[arg(long, value_name = "REF", requires = "auto_reap_merged")]
+    trunk_ref: Option<String>,
+    /// Exact retry-lane successor whose unambiguous predecessor may be superseded.
+    #[arg(long, value_name = "AGENT_ID")]
+    retry_successor: Option<String>,
+    /// Detect metadata/on-disk registration mismatches left by an unclean shutdown.
+    #[arg(long)]
+    startup_reconciliation: bool,
+    /// Permit guarded destructive resolution of startup reconciliation findings.
+    #[arg(long, requires_all = ["startup_reconciliation", "apply"])]
+    destructive_reconciliation: bool,
+    /// Schedule the bounded O2-launch run-artifact retention profile.
+    #[arg(long)]
+    o2_launch_retention: bool,
+    /// Parent directory for agent worktrees.
+    #[arg(long)]
+    worktree_root: Option<PathBuf>,
+    /// Remove only eligible clean worktrees older than this many seconds.
+    #[arg(long, requires = "auto_reap_merged")]
+    max_age_seconds: Option<u64>,
+    /// Keep at most this many newest eligible clean worktrees.
+    #[arg(long, requires = "auto_reap_merged")]
+    max_count: Option<usize>,
+    /// Retain a newest eligible prefix within this many apparent, not allocated, bytes.
+    #[arg(long, requires = "auto_reap_merged")]
+    max_total_bytes: Option<u64>,
+    /// Keep per-worktree target/ directories for retained worktrees.
+    #[arg(long)]
+    keep_targets: bool,
+    /// Exact repository-relative untracked path allowed during full-lane removal. Repeatable.
+    #[arg(long = "allow-untracked-path")]
+    allow_untracked_paths: Vec<PathBuf>,
+    /// Keep the latest N O2-launch run directories instead of the bounded profile default.
+    #[arg(long, value_name = "N", requires = "o2_launch_retention")]
+    artifact_keep: Option<usize>,
+    /// Reclaim O2-launch artifacts at least this old even when within --artifact-keep.
+    #[arg(long, value_name = "SECONDS", requires = "o2_launch_retention")]
+    artifact_max_age_seconds: Option<u64>,
+    /// Retain at most this many apparent artifact bytes, newest first.
+    #[arg(long, value_name = "BYTES", requires = "o2_launch_retention")]
+    artifact_max_total_bytes: Option<u64>,
+    /// Override the grace for idle unfinalized O2-launch artifacts.
+    #[arg(long, value_name = "SECONDS", requires = "o2_launch_retention")]
+    artifact_unfinalized_grace_seconds: Option<u64>,
+    /// Allow grace-based expiry of present but unverifiable finalization evidence.
+    #[arg(long, requires = "o2_launch_retention")]
+    reclaim_unverifiable: bool,
+    /// Confirm that non-cooperating external artifact writers are stopped.
+    #[arg(long, requires = "o2_launch_retention")]
+    acknowledge_external_writers_stopped: bool,
+    /// Exact reviewed config used to gate nonempty unregistered-directory cleanup.
+    #[arg(long)]
+    machine_global_config: Option<PathBuf>,
+    /// Reviewed root id whose canonical root contains the managed worktree root.
+    #[arg(long)]
+    machine_global_worktree_root_id: Option<String>,
+    /// Correction lifecycle identity used by typed machine-global gate denials.
+    #[arg(long)]
+    machine_global_correlation: Option<String>,
+    /// Emit the aggregate lifecycle report as one machine-readable JSON document.
     #[arg(long)]
     json: bool,
 }
@@ -3614,6 +3793,12 @@ fn run_merge_apply_controller(
     args: MergeApplyArgs,
     mut deliver_report: impl FnMut(&MergeApplyReport, bool) -> Result<()>,
 ) -> Result<()> {
+    let lifecycle_repo = args.repo.clone();
+    let lifecycle_agent_id = args.agent_id.clone();
+    let auto_reap_merged = args.auto_reap_merged;
+    let apply_auto_reap = args.apply_auto_reap;
+    let lifecycle_trunk_ref = args.trunk_ref.clone();
+    let json = args.json;
     let megafile_policy = args.megafile_policy()?;
     let claims = resolve_claims(&args.repo, &args.agent_id, args.claim)?;
     let validation_evidence = load_validation_evidence(&args.validation_report, &args.agent_id)?;
@@ -3627,7 +3812,7 @@ fn run_merge_apply_controller(
         forces: args.forces.into_force_options(),
         require_validation: args.require_validation,
     };
-    let report = merge::merge_apply_report_with_megafile_policy(
+    let mut report = merge::merge_apply_report_with_megafile_policy(
         MergeApplyOptions {
             preview: preview_options,
             candidate_validation_commands,
@@ -3636,7 +3821,7 @@ fn run_merge_apply_controller(
         megafile_policy,
     )?;
     if report.status == merge::MergeApplyReportStatus::Blocked {
-        if args.json {
+        if json {
             deliver_report(&report, true)?;
         }
         let message = report
@@ -3645,7 +3830,38 @@ fn run_merge_apply_controller(
             .unwrap_or_else(|| "merge apply refused".to_string());
         bail!("{message}");
     }
-    deliver_report(&report, args.json)
+    if auto_reap_merged {
+        let lifecycle_options = WorktreeLifecycleOptions {
+            apply: apply_auto_reap,
+            auto_reap_merged: true,
+            candidate_agent_ids: Some(BTreeSet::from([lifecycle_agent_id])),
+            merged_into_reference: lifecycle_trunk_ref,
+            // A merge apply does not advance HEAD. Retain the selected lane's target cache
+            // unless and until the lane itself is classified as fully merged and reaped.
+            remove_targets: false,
+            ..WorktreeLifecycleOptions::default()
+        };
+        match WorktreeManager::new(lifecycle_repo).lifecycle(lifecycle_options) {
+            Ok(lifecycle) => report.lifecycle = Some(lifecycle),
+            Err(error) => {
+                let context = if report.applied {
+                    format!(
+                        "merge was applied, but merged-lane lifecycle classification failed; \
+                         do not retry the merge: {error:#}"
+                    )
+                } else {
+                    format!(
+                        "merge was not blocked, but merged-lane lifecycle classification failed: \
+                         {error:#}"
+                    )
+                };
+                report.error = Some(context.clone());
+                deliver_report(&report, json)?;
+                bail!("{context}");
+            }
+        }
+    }
+    deliver_report(&report, json)
 }
 
 #[derive(Debug, Subcommand)]
@@ -3724,6 +3940,15 @@ struct MergeApplyArgs {
     megafile_thresholds: MegafileThresholdArgs,
     #[command(flatten)]
     forces: MergeForceArgs,
+    /// After a non-blocked merge result, classify this lane for guarded merged-lane reaping.
+    #[arg(long, requires = "trunk_ref")]
+    auto_reap_merged: bool,
+    /// Exact local trunk reference used to verify that the lane is fully merged.
+    #[arg(long, value_name = "REF", requires = "auto_reap_merged")]
+    trunk_ref: Option<String>,
+    /// Apply an eligible merge lifecycle reap; requires --auto-reap-merged.
+    #[arg(long, requires = "auto_reap_merged")]
+    apply_auto_reap: bool,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -4948,6 +5173,12 @@ fn print_merge_apply_report(report: &MergeApplyReport, json: bool) -> Result<()>
                 decomposition.path.display()
             );
         }
+        if let Some(lifecycle) = &report.lifecycle {
+            print_worktree_lifecycle_report(lifecycle, false)?;
+        }
+        if let Some(error) = &report.error {
+            println!("Error: {error}");
+        }
     }
     Ok(())
 }
@@ -5167,6 +5398,95 @@ fn print_agent_stop_report(report: &AgentStopReport, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn print_worktree_lifecycle_report(report: &WorktreeLifecycleReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!(
+        "Worktree lifecycle: {} ({})",
+        if report.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if report.dry_run { "dry-run" } else { "apply" }
+    );
+    println!("Merged auto-reap: {}", report.auto_reap_merged);
+    println!(
+        "Retry supersession: {:?}{}",
+        report.retry.status,
+        report
+            .retry
+            .predecessor_agent_id
+            .as_deref()
+            .map(|agent_id| format!(" ({agent_id})"))
+            .unwrap_or_default()
+    );
+    if report.reconciliation.enabled {
+        println!(
+            "Startup reconciliation: {} finding(s), {} record(s) forgotten, {} registration(s) pruned, {} directory(s) quarantined",
+            report.reconciliation.entries.len(),
+            report.reconciliation.forgotten_record_count,
+            report.reconciliation.pruned_registration_count,
+            report.reconciliation.quarantined_directory_count,
+        );
+        for entry in &report.reconciliation.entries {
+            println!(
+                "  {}\t{:?}\t{:?}\t{}",
+                entry.name,
+                entry.state,
+                entry.action,
+                entry.path.display()
+            );
+        }
+    }
+    if let Some(gc) = &report.worktree_gc {
+        println!(
+            "Worktrees: considered={}, {}={}, retained={}, protected={}",
+            gc.considered_count,
+            if gc.dry_run {
+                "would_remove"
+            } else {
+                "removed"
+            },
+            gc.removed_count,
+            gc.retained_count,
+            gc.protected_count
+        );
+    }
+    println!(
+        "Git worktree prune: {:?}, stale={}, pruned={}, protected={}",
+        report.repository_prune.status,
+        report.repository_prune.stale_registration_count,
+        report.repository_prune.pruned_registration_count,
+        report.repository_prune.protected_registration_count,
+    );
+    if let Some(artifacts) = &report.artifact_prune {
+        println!(
+            "O2-launch artifacts: candidates={}, deleted={}, kept={}, refused={}",
+            artifacts.delete_candidate_count,
+            artifacts.deleted_count,
+            artifacts.kept_count,
+            artifacts.refused_unfinalized_count
+        );
+        println!(
+            "Artifact safety: reclaim_unverifiable={}, external_writers_stopped={}",
+            artifacts.reclaim_unverifiable, artifacts.external_writers_stopped
+        );
+    }
+    println!("Apparent bytes checked: {}", report.apparent_checked_bytes);
+    println!(
+        "Projected reclaimable bytes: {}",
+        report.projected_reclaimable_bytes
+    );
+    println!(
+        "Actually reclaimed bytes: {}",
+        report.actual_reclaimed_bytes
+    );
+    Ok(())
+}
+
 fn agent_status_label(status: AgentRunStatus) -> &'static str {
     match status {
         AgentRunStatus::Pending => "pending",
@@ -5183,6 +5503,31 @@ fn print_worktree_record(record: &WorktreeRecord, json: bool) -> Result<()> {
         println!("Worktree: {}", record.name);
         println!("Branch: {}", record.branch);
         println!("Path: {}", record.path.display());
+    }
+    Ok(())
+}
+
+fn print_worktree_create_lifecycle_report(
+    record: &WorktreeRecord,
+    lifecycle: &WorktreeLifecycleReport,
+    json: bool,
+) -> Result<()> {
+    if json {
+        #[derive(Serialize)]
+        struct Report<'a> {
+            worktree: &'a WorktreeRecord,
+            lifecycle: &'a WorktreeLifecycleReport,
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Report {
+                worktree: record,
+                lifecycle,
+            })?
+        );
+    } else {
+        print_worktree_record(record, false)?;
+        print_worktree_lifecycle_report(lifecycle, false)?;
     }
     Ok(())
 }
@@ -5536,6 +5881,7 @@ fn worktree_gc_status_label(status: WorktreeGcStatus) -> &'static str {
 fn worktree_gc_reason_label(reason: WorktreeGcReason) -> &'static str {
     match reason {
         WorktreeGcReason::FinishedBranch => "finished-branch",
+        WorktreeGcReason::SupersededLane => "superseded-lane",
         WorktreeGcReason::UnmergedBranch => "unmerged-branch",
         WorktreeGcReason::RetentionKeep => "retention-keep",
         WorktreeGcReason::ExcludedCurrentWorktree => "excluded-current-worktree",
@@ -5793,6 +6139,205 @@ mod tests {
             vec![PathBuf::from("TASK.md"), PathBuf::from("notes/output.txt")]
         );
         assert!(args.json);
+    }
+
+    #[test]
+    fn worktree_lifecycle_defaults_all_automation_off_and_dry_run() {
+        let parsed = Cli::try_parse_from(["maco", "worktree", "lifecycle"])
+            .expect("default lifecycle pass should parse");
+        let Command::Worktree(WorktreeCommand {
+            command: WorktreeSubcommand::Lifecycle(args),
+        }) = parsed.command
+        else {
+            panic!("expected worktree lifecycle command");
+        };
+        assert_eq!(args.repo, PathBuf::from("."));
+        assert!(!args.apply, "lifecycle must default to dry-run");
+        assert!(!args.auto_reap_merged);
+        assert_eq!(args.trunk_ref, None);
+        assert_eq!(args.retry_successor, None);
+        assert!(!args.startup_reconciliation);
+        assert!(!args.destructive_reconciliation);
+        assert!(!args.o2_launch_retention);
+        assert_eq!(args.worktree_root, None);
+        assert_eq!(args.max_age_seconds, None);
+        assert_eq!(args.max_count, None);
+        assert_eq!(args.max_total_bytes, None);
+        assert!(!args.keep_targets);
+        assert!(args.allow_untracked_paths.is_empty());
+        assert_eq!(args.artifact_keep, None);
+        assert_eq!(args.artifact_max_age_seconds, None);
+        assert_eq!(args.artifact_max_total_bytes, None);
+        assert_eq!(args.artifact_unfinalized_grace_seconds, None);
+        assert!(!args.reclaim_unverifiable);
+        assert!(!args.acknowledge_external_writers_stopped);
+        assert_eq!(args.machine_global_config, None);
+        assert_eq!(args.machine_global_worktree_root_id, None);
+        assert_eq!(args.machine_global_correlation, None);
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn worktree_create_retry_supersession_is_explicit_and_apply_is_separate() {
+        let parsed = Cli::try_parse_from(["maco", "worktree", "create", "task-r2"])
+            .expect("ordinary create should parse unchanged");
+        let Command::Worktree(WorktreeCommand {
+            command: WorktreeSubcommand::Create(args),
+        }) = parsed.command
+        else {
+            panic!("expected worktree create command");
+        };
+        assert!(!args.supersede_retry_predecessor);
+        assert!(!args.apply_retry_supersession);
+        assert!(!args.o2_launch_retention_defaults);
+
+        assert!(Cli::try_parse_from([
+            "maco",
+            "worktree",
+            "create",
+            "task-r2",
+            "--apply-retry-supersession",
+        ])
+        .is_err());
+        let parsed = Cli::try_parse_from([
+            "maco",
+            "worktree",
+            "create",
+            "task-r2",
+            "--supersede-retry-predecessor",
+            "--apply-retry-supersession",
+            "--o2-launch-retention-defaults",
+        ])
+        .expect("explicit retry supersession should parse");
+        let Command::Worktree(WorktreeCommand {
+            command: WorktreeSubcommand::Create(args),
+        }) = parsed.command
+        else {
+            panic!("expected worktree create command");
+        };
+        assert!(args.supersede_retry_predecessor);
+        assert!(args.apply_retry_supersession);
+        assert!(args.o2_launch_retention_defaults);
+    }
+
+    #[test]
+    fn worktree_lifecycle_parses_explicit_automation_and_safety_inputs() {
+        let parsed = Cli::try_parse_from([
+            "maco",
+            "worktree",
+            "lifecycle",
+            "--repo",
+            "repo",
+            "--apply",
+            "--auto-reap-merged",
+            "--trunk-ref",
+            "refs/heads/main",
+            "--retry-successor",
+            "agent-task-r2",
+            "--startup-reconciliation",
+            "--destructive-reconciliation",
+            "--o2-launch-retention",
+            "--worktree-root",
+            "lanes",
+            "--max-age-seconds",
+            "86400",
+            "--max-count",
+            "8",
+            "--max-total-bytes",
+            "1073741824",
+            "--keep-targets",
+            "--allow-untracked-path",
+            "TASK.md",
+            "--artifact-keep",
+            "6",
+            "--artifact-max-age-seconds",
+            "172800",
+            "--artifact-max-total-bytes",
+            "536870912",
+            "--artifact-unfinalized-grace-seconds",
+            "604800",
+            "--reclaim-unverifiable",
+            "--acknowledge-external-writers-stopped",
+            "--machine-global-config",
+            "machine-global.json",
+            "--machine-global-worktree-root-id",
+            "worktrees",
+            "--machine-global-correlation",
+            "startup-65",
+            "--json",
+        ])
+        .expect("explicit lifecycle automation should parse");
+        let Command::Worktree(WorktreeCommand {
+            command: WorktreeSubcommand::Lifecycle(args),
+        }) = parsed.command
+        else {
+            panic!("expected worktree lifecycle command");
+        };
+        assert_eq!(args.repo, PathBuf::from("repo"));
+        assert!(args.apply);
+        assert!(args.auto_reap_merged);
+        assert_eq!(args.trunk_ref.as_deref(), Some("refs/heads/main"));
+        assert_eq!(args.retry_successor.as_deref(), Some("agent-task-r2"));
+        assert!(args.startup_reconciliation);
+        assert!(args.destructive_reconciliation);
+        assert!(args.o2_launch_retention);
+        assert_eq!(args.worktree_root, Some(PathBuf::from("lanes")));
+        assert_eq!(args.max_age_seconds, Some(86_400));
+        assert_eq!(args.max_count, Some(8));
+        assert_eq!(args.max_total_bytes, Some(1_073_741_824));
+        assert!(args.keep_targets);
+        assert_eq!(args.allow_untracked_paths, vec![PathBuf::from("TASK.md")]);
+        assert_eq!(args.artifact_keep, Some(6));
+        assert_eq!(args.artifact_max_age_seconds, Some(172_800));
+        assert_eq!(args.artifact_max_total_bytes, Some(536_870_912));
+        assert_eq!(args.artifact_unfinalized_grace_seconds, Some(604_800));
+        assert!(args.reclaim_unverifiable);
+        assert!(args.acknowledge_external_writers_stopped);
+        assert_eq!(
+            args.machine_global_config,
+            Some(PathBuf::from("machine-global.json"))
+        );
+        assert_eq!(
+            args.machine_global_worktree_root_id.as_deref(),
+            Some("worktrees")
+        );
+        assert_eq!(
+            args.machine_global_correlation.as_deref(),
+            Some("startup-65")
+        );
+        assert!(args.json);
+    }
+
+    #[test]
+    fn worktree_lifecycle_rejects_unscoped_destructive_and_artifact_flags() {
+        for args in [
+            vec![
+                "maco",
+                "worktree",
+                "lifecycle",
+                "--destructive-reconciliation",
+            ],
+            vec![
+                "maco",
+                "worktree",
+                "lifecycle",
+                "--startup-reconciliation",
+                "--destructive-reconciliation",
+            ],
+            vec!["maco", "worktree", "lifecycle", "--artifact-keep", "3"],
+            vec!["maco", "worktree", "lifecycle", "--reclaim-unverifiable"],
+            vec![
+                "maco",
+                "worktree",
+                "lifecycle",
+                "--acknowledge-external-writers-stopped",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "dependent safety flag must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -6178,6 +6723,47 @@ mod tests {
     }
 
     #[test]
+    fn merge_auto_reap_is_default_off_and_apply_requires_classification() {
+        let parsed = Cli::try_parse_from(["maco", "merge", "apply", "agent-a"])
+            .expect("default merge apply should parse");
+        let Command::Merge(MergeCommand {
+            command: MergeSubcommand::Apply(args),
+        }) = parsed.command
+        else {
+            panic!("expected merge apply command");
+        };
+        assert!(!args.auto_reap_merged);
+        assert!(!args.apply_auto_reap);
+        assert_eq!(args.trunk_ref, None);
+
+        assert!(
+            Cli::try_parse_from(["maco", "merge", "apply", "agent-a", "--apply-auto-reap",])
+                .is_err()
+        );
+
+        let parsed = Cli::try_parse_from([
+            "maco",
+            "merge",
+            "apply",
+            "agent-a",
+            "--auto-reap-merged",
+            "--trunk-ref",
+            "refs/heads/main",
+            "--apply-auto-reap",
+        ])
+        .expect("explicit merge lifecycle apply should parse");
+        let Command::Merge(MergeCommand {
+            command: MergeSubcommand::Apply(args),
+        }) = parsed.command
+        else {
+            panic!("expected merge apply command");
+        };
+        assert!(args.auto_reap_merged);
+        assert!(args.apply_auto_reap);
+        assert_eq!(args.trunk_ref.as_deref(), Some("refs/heads/main"));
+    }
+
+    #[test]
     fn merge_apply_json_delivers_unclaimed_edits_denial_to_integration_controller() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo_path = temp.path().join("repo");
@@ -6225,7 +6811,7 @@ mod tests {
 
         let args = MergeApplyArgs {
             agent_id: "agent-a".to_string(),
-            repo: repo_path,
+            repo: repo_path.clone(),
             claim: vec![PathBuf::from("README.md")],
             validation_report: Vec::new(),
             require_validation: false,
@@ -6241,6 +6827,9 @@ mod tests {
                 force_validation_failures: false,
                 force_apply_conflicts: false,
             },
+            auto_reap_merged: true,
+            trunk_ref: Some("refs/heads/main".to_string()),
+            apply_auto_reap: false,
             json: true,
         };
         let mut delivered = None;
@@ -6255,6 +6844,10 @@ mod tests {
         let report = delivered.expect("integration controller must receive the blocked report");
         assert_eq!(report.status, merge::MergeApplyReportStatus::Blocked);
         assert!(!report.applied);
+        assert!(
+            report.lifecycle.is_none(),
+            "blocked merge must not run its lifecycle hook"
+        );
         let denial = report
             .gate_denials
             .iter()
@@ -6287,6 +6880,165 @@ mod tests {
         assert!(correlation_id.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
         }));
+    }
+
+    #[test]
+    fn merge_apply_auto_reap_waits_for_trunk_then_reaps_on_finalization_rerun() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repository");
+        fs::write(repo_path.join("README.md"), "# Before\n").expect("write README");
+        let repo = Repository::open(&repo_path).expect("open repository");
+        let mut index = repo.index().expect("open index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("stage README");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("commit fixture");
+        drop(tree);
+        drop(repo);
+
+        let worktree = WorktreeManager::new(&repo_path)
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "agent-merge-hook".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create test worktree");
+        fs::write(worktree.path.join("README.md"), "# After\n").expect("edit agent README");
+        let agent_repo = Repository::open(&worktree.path).expect("open agent repository");
+        let mut index = agent_repo.index().expect("open agent index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("stage agent README");
+        index.write().expect("write agent index");
+        let tree_id = index.write_tree().expect("write agent tree");
+        let tree = agent_repo.find_tree(tree_id).expect("find agent tree");
+        let parent = agent_repo
+            .head()
+            .expect("agent HEAD")
+            .peel_to_commit()
+            .expect("agent parent commit");
+        agent_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "agent change",
+                &tree,
+                &[&parent],
+            )
+            .expect("commit agent change");
+        drop(parent);
+        drop(tree);
+        drop(agent_repo);
+
+        let args = MergeApplyArgs {
+            agent_id: "agent-merge-hook".to_string(),
+            repo: repo_path.clone(),
+            claim: vec![PathBuf::from("README.md")],
+            validation_report: Vec::new(),
+            require_validation: false,
+            validation_command: Vec::new(),
+            block_megafiles: false,
+            decomposition_target: None,
+            decomposition_run_id: None,
+            megafile_thresholds: MegafileThresholdArgs::default(),
+            forces: MergeForceArgs {
+                force_dirty_primary: false,
+                force_stale_base: false,
+                force_unclaimed_edits: false,
+                force_validation_failures: false,
+                force_apply_conflicts: false,
+            },
+            auto_reap_merged: true,
+            trunk_ref: Some("refs/heads/main".to_string()),
+            apply_auto_reap: false,
+            json: true,
+        };
+        let mut delivered = None;
+        run_merge_apply_controller(args, |report, json| {
+            assert!(json);
+            delivered = Some(report.clone());
+            Ok(())
+        })
+        .expect("merge and lifecycle classification should succeed");
+
+        let report = delivered.expect("merge report");
+        assert_eq!(report.status, merge::MergeApplyReportStatus::Applied);
+        assert!(report.applied);
+        let lifecycle = report.lifecycle.expect("opt-in lifecycle report");
+        assert!(lifecycle.enabled);
+        assert!(lifecycle.dry_run);
+        let gc = lifecycle
+            .worktree_gc
+            .expect("targeted worktree classification");
+        assert_eq!(gc.considered_count, 1);
+        assert_eq!(gc.removed_count, 0);
+        assert_eq!(gc.entries.len(), 1);
+        assert_eq!(gc.entries[0].reason, WorktreeGcReason::UnmergedBranch);
+        assert!(worktree.path.exists(), "unmerged lane must remain present");
+
+        let primary = Repository::open(&repo_path).expect("reopen primary");
+        let lane_oid = primary
+            .find_branch("maco/agent-merge-hook", git2::BranchType::Local)
+            .expect("lane branch")
+            .get()
+            .target()
+            .expect("lane branch target");
+        primary
+            .reference("refs/heads/main", lane_oid, true, "test merge finalization")
+            .expect("advance trunk to lane commit");
+        let lane_commit = primary.find_commit(lane_oid).expect("lane commit");
+        primary
+            .reset(lane_commit.as_object(), git2::ResetType::Hard, None)
+            .expect("refresh primary worktree and index");
+        drop(lane_commit);
+        drop(primary);
+
+        let args = MergeApplyArgs {
+            agent_id: "agent-merge-hook".to_string(),
+            repo: repo_path,
+            claim: vec![PathBuf::from("README.md")],
+            validation_report: Vec::new(),
+            require_validation: false,
+            validation_command: Vec::new(),
+            block_megafiles: false,
+            decomposition_target: None,
+            decomposition_run_id: None,
+            megafile_thresholds: MegafileThresholdArgs::default(),
+            forces: MergeForceArgs {
+                force_dirty_primary: false,
+                force_stale_base: true,
+                force_unclaimed_edits: false,
+                force_validation_failures: false,
+                force_apply_conflicts: false,
+            },
+            auto_reap_merged: true,
+            trunk_ref: Some("refs/heads/main".to_string()),
+            apply_auto_reap: true,
+            json: true,
+        };
+        let mut finalized = None;
+        run_merge_apply_controller(args, |report, json| {
+            assert!(json);
+            finalized = Some(report.clone());
+            Ok(())
+        })
+        .expect("fully merged finalization rerun should reap the lane");
+        let finalized = finalized.expect("finalized report");
+        let lifecycle = finalized.lifecycle.expect("final lifecycle report");
+        let gc = lifecycle.worktree_gc.expect("final GC report");
+        assert_eq!(gc.removed_count, 1, "{gc:#?}");
+        assert_eq!(gc.entries[0].status, WorktreeGcStatus::Removed);
+        assert_eq!(gc.entries[0].reason, WorktreeGcReason::FinishedBranch);
+        assert!(!worktree.path.exists());
     }
 
     #[test]
