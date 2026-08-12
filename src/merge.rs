@@ -3968,8 +3968,8 @@ impl PrivateRuntimeRootLock {
                 path.display()
             );
         }
-        validate_private_runtime_owner_file_metadata(&path, &path_metadata)?;
-        validate_private_runtime_owner_file_metadata(&path, &file_metadata)?;
+        validate_private_runtime_owner_file_metadata(&path, &path_metadata, None)?;
+        validate_private_runtime_owner_file_metadata(&path, &file_metadata, Some(&file))?;
         Ok(Self { file })
     }
 }
@@ -4305,7 +4305,7 @@ fn read_private_runtime_owner(
             path.display()
         );
     }
-    validate_private_runtime_owner_file_metadata(&path, &path_metadata)?;
+    validate_private_runtime_owner_file_metadata(&path, &path_metadata, None)?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -4319,7 +4319,7 @@ fn read_private_runtime_owner(
     let file_metadata = file
         .metadata()
         .with_context(|| format!("failed to inspect private runtime owner {}", path.display()))?;
-    validate_private_runtime_owner_file_metadata(&path, &file_metadata)?;
+    validate_private_runtime_owner_file_metadata(&path, &file_metadata, Some(&file))?;
     if !same_filesystem_identity(&path_metadata, &file_metadata) {
         bail!(
             "private runtime owner {} changed while it was opened",
@@ -4350,6 +4350,7 @@ fn read_private_runtime_owner(
 fn validate_private_runtime_owner_file_metadata(
     path: &Path,
     metadata: &fs::Metadata,
+    opened_file: Option<&fs::File>,
 ) -> Result<()> {
     #[cfg(unix)]
     {
@@ -4368,14 +4369,27 @@ fn validate_private_runtime_owner_file_metadata(
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.number_of_links() != Some(1) {
+        let _ = metadata;
+        let number_of_links = match opened_file {
+            Some(file) => {
+                crate::file_identity::windows_file_link_count(file).with_context(|| {
+                    format!(
+                        "failed to inspect open Windows link count for {}",
+                        path.display()
+                    )
+                })?
+            }
+            None => windows_path_link_count(path)?,
+        };
+        if number_of_links != 1 {
             bail!(
                 "private runtime owner {} has multiple links",
                 path.display()
             );
         }
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = opened_file;
     Ok(())
 }
 
@@ -5053,7 +5067,7 @@ fn hash_optional_file(path: &Path) -> Result<Option<Oid>> {
             return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
         }
     };
-    validate_repository_index_metadata(path, &path_metadata)?;
+    validate_repository_index_metadata(path, &path_metadata, None)?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -5067,7 +5081,7 @@ fn hash_optional_file(path: &Path) -> Result<Option<Oid>> {
     let file_metadata = file
         .metadata()
         .with_context(|| format!("failed to inspect opened {}", path.display()))?;
-    validate_repository_index_metadata(path, &file_metadata)?;
+    validate_repository_index_metadata(path, &file_metadata, Some(&file))?;
     #[cfg(windows)]
     let file_identity = crate::file_identity::windows_file_identity(&file)
         .with_context(|| format!("failed to inspect opened file identity {}", path.display()))?;
@@ -5106,7 +5120,7 @@ fn hash_optional_file(path: &Path) -> Result<Option<Oid>> {
     #[cfg(not(windows))]
     let after = fs::symlink_metadata(path)
         .with_context(|| format!("failed to recheck {}", path.display()))?;
-    validate_repository_index_metadata(path, &after)?;
+    validate_repository_index_metadata(path, &after, None)?;
     #[cfg(windows)]
     let identity_matches = file_identity == after_snapshot.identity;
     #[cfg(not(windows))]
@@ -5122,7 +5136,11 @@ fn hash_optional_file(path: &Path) -> Result<Option<Oid>> {
         .map(Some)
 }
 
-fn validate_repository_index_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+fn validate_repository_index_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    opened_file: Option<&fs::File>,
+) -> Result<()> {
     if metadata.file_type().is_symlink()
         || metadata_is_windows_reparse_point(metadata)
         || !metadata.file_type().is_file()
@@ -5150,11 +5168,23 @@ fn validate_repository_index_metadata(path: &Path, metadata: &fs::Metadata) -> R
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.number_of_links() != Some(1) {
+        let number_of_links = match opened_file {
+            Some(file) => {
+                crate::file_identity::windows_file_link_count(file).with_context(|| {
+                    format!(
+                        "failed to inspect open Windows link count for {}",
+                        path.display()
+                    )
+                })?
+            }
+            None => windows_path_link_count(path)?,
+        };
+        if number_of_links != 1 {
             bail!("repository index {} has multiple links", path.display());
         }
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = opened_file;
     Ok(())
 }
 
@@ -6933,8 +6963,7 @@ fn validate_managed_directory(path: &Path) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.number_of_links() != Some(1) {
+        if windows_path_link_count(path)? != 1 {
             bail!(
                 "repository mutation lock {} has multiple hard links; refusing to trust it",
                 path.display()
@@ -6950,6 +6979,18 @@ fn metadata_is_windows_reparse_point(metadata: &fs::Metadata) -> bool {
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(target_os = "windows")]
+fn windows_path_link_count(path: &Path) -> Result<u32> {
+    crate::file_identity::open_windows_path_identity(path)
+        .with_context(|| {
+            format!(
+                "failed to inspect Windows link count for {}",
+                path.display()
+            )
+        })
+        .map(|snapshot| snapshot.number_of_links)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -6994,8 +7035,7 @@ fn reject_unsafe_lock_path(path: &Path) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.number_of_links() != Some(1) {
+        if windows_path_link_count(path)? != 1 {
             bail!(
                 "repository mutation lock {} has multiple hard links; refusing to trust it",
                 path.display()
@@ -7007,6 +7047,7 @@ fn reject_unsafe_lock_path(path: &Path) -> Result<()> {
 
 fn validate_open_lock_file(path: &Path, file: &fs::File) -> Result<()> {
     reject_unsafe_lock_path(path)?;
+    #[cfg(unix)]
     let path_metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to re-inspect repository lock {}", path.display()))?;
     let file_metadata = file
@@ -7033,8 +7074,6 @@ fn validate_open_lock_file(path: &Path, file: &fs::File) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::fs::MetadataExt;
-
         let path_snapshot =
             crate::file_identity::open_windows_path_identity(path).with_context(|| {
                 format!("failed to open repository lock identity {}", path.display())
@@ -7042,12 +7081,14 @@ fn validate_open_lock_file(path: &Path, file: &fs::File) -> Result<()> {
         let path_metadata = &path_snapshot.metadata;
         let file_identity = crate::file_identity::windows_file_identity(file)
             .context("failed to inspect open repository lock identity")?;
+        let file_link_count = crate::file_identity::windows_file_link_count(file)
+            .context("failed to inspect open repository lock link count")?;
         if !path_metadata.file_type().is_file()
             || path_metadata.file_type().is_symlink()
             || metadata_is_windows_reparse_point(path_metadata)
-            || path_metadata.number_of_links() != Some(1)
+            || path_snapshot.number_of_links != 1
             || path_snapshot.identity != file_identity
-            || file_metadata.number_of_links() != Some(1)
+            || file_link_count != 1
         {
             bail!(
                 "repository mutation lock {} changed while being opened",

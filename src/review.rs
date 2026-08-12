@@ -2786,6 +2786,7 @@ fn sanitized_view_parent_directories(
     Ok(directories)
 }
 
+#[cfg(target_os = "linux")]
 fn validate_sanitized_view_symlinks(
     entries: &BTreeMap<PathBuf, SnapshotTreeEntry>,
     directories: &BTreeMap<PathBuf, BoundReviewDirectory>,

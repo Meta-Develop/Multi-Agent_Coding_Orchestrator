@@ -1494,7 +1494,9 @@ mod tests {
             .join(&identity.run_id);
         let temp_name = record_temp_name(3, &"a".repeat(64));
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true).mode(0o600);
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
         options
             .open(run.join(&temp_name))
             .expect("create crash temp")
