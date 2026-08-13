@@ -4,6 +4,9 @@
 //! worktree and merge throughput are intentionally absent because their public
 //! entrypoints cannot construct the required capability-bound worktree today.
 
+#[path = "../tests/support/containment.rs"]
+mod containment;
+
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use git2::{IndexAddOption, Oid, Repository, RepositoryInitOptions, Signature};
 use multi_agent_coding_orchestrator::{
@@ -23,6 +26,8 @@ use tempfile::{tempdir, TempDir};
 const SAMPLE_SIZE: usize = 10;
 const WARM_UP_TIME: Duration = Duration::from_millis(300);
 const MEASUREMENT_TIME: Duration = Duration::from_millis(700);
+#[cfg(target_os = "linux")]
+const FORCE_CONTAINMENT_UNAVAILABLE_ENV: &str = "MACO_BENCH_FORCE_CONTAINMENT_UNAVAILABLE";
 
 struct RepositoryFixture {
     _temp: TempDir,
@@ -348,7 +353,26 @@ fn assert_semantic_fixture(map: &SemanticRepoMap) {
     );
 }
 
+fn skip_repository_queries_if_containment_unavailable() -> bool {
+    const GROUP_NAME: &str = "benchmark group repository_queries";
+
+    #[cfg(target_os = "linux")]
+    if std::env::var_os(FORCE_CONTAINMENT_UNAVAILABLE_ENV).is_some() {
+        return containment::skip_if_unavailable_for_cgroups(
+            GROUP_NAME,
+            "0::/system.slice/maco-bench-forced-unavailable.service\n",
+        );
+    }
+
+    containment::skip_if_unavailable(GROUP_NAME)
+        .expect("probe containment capability for repository_queries benchmark group")
+}
+
 fn repository_queries(criterion: &mut Criterion) {
+    if skip_repository_queries_if_containment_unavailable() {
+        return;
+    }
+
     let mut group = criterion.benchmark_group("repository_queries");
     bound_group(&mut group);
 
