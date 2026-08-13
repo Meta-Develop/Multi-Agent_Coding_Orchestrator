@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod support;
+
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 use serde_json::Value;
@@ -1381,6 +1383,7 @@ fn pr_publish_bound_evidence_rejects_later_same_path_commit_without_push() -> Re
 
 #[test]
 fn pr_publish_from_branch_requires_and_accepts_bound_validation() -> Result<()> {
+    support::require_containment!("pr_publish_from_branch_requires_and_accepts_bound_validation");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let base_branch = git_current_branch(&repo_path)?;
@@ -1457,6 +1460,7 @@ fn pr_publish_from_branch_requires_and_accepts_bound_validation() -> Result<()> 
 
 #[test]
 fn pr_publish_squash_onto_builds_import_commit_on_disjoint_base() -> Result<()> {
+    support::require_containment!("pr_publish_squash_onto_builds_import_commit_on_disjoint_base");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let base_branch = git_current_branch(&repo_path)?;
@@ -1524,6 +1528,7 @@ fn pr_publish_squash_onto_builds_import_commit_on_disjoint_base() -> Result<()> 
 
 #[test]
 fn pr_publish_exclude_refuses_referenced_missing_path() -> Result<()> {
+    support::require_containment!("pr_publish_exclude_refuses_referenced_missing_path");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let base_branch = git_current_branch(&repo_path)?;
@@ -1578,6 +1583,7 @@ fn pr_publish_exclude_refuses_referenced_missing_path() -> Result<()> {
 
 #[test]
 fn pr_publish_exclude_refuses_rust_path_attribute_reference() -> Result<()> {
+    support::require_containment!("pr_publish_exclude_refuses_rust_path_attribute_reference");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let base_branch = git_current_branch(&repo_path)?;
@@ -1626,6 +1632,7 @@ fn pr_publish_exclude_refuses_rust_path_attribute_reference() -> Result<()> {
 
 #[test]
 fn pr_publish_from_branch_blocks_dirty_primary_and_stale_base() -> Result<()> {
+    support::require_containment!("pr_publish_from_branch_blocks_dirty_primary_and_stale_base");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let base_branch = git_current_branch(&repo_path)?;
