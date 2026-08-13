@@ -1,3 +1,5 @@
+mod support;
+
 use anyhow::{Context, Result};
 use git2::Repository;
 use serde_json::Value;
@@ -79,6 +81,9 @@ fn cli_semantic_risk_report_emits_touched_symbols_and_dependency_impact() -> Res
 
 #[test]
 fn cli_semantic_risk_enriches_only_touched_threshold_crossing_paths() -> Result<()> {
+    support::require_containment!(
+        "cli_semantic_risk_enriches_only_touched_threshold_crossing_paths"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = temp.path().join("repo");
     fs::create_dir_all(repo_path.join("src")).context("create src")?;
@@ -155,6 +160,9 @@ fn cli_semantic_risk_enriches_only_touched_threshold_crossing_paths() -> Result<
 
 #[test]
 fn cli_semantic_risk_excludes_sampled_path_that_is_now_a_directory() -> Result<()> {
+    support::require_containment!(
+        "cli_semantic_risk_excludes_sampled_path_that_is_now_a_directory"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = temp.path().join("repo");
     fs::create_dir_all(repo_path.join("src")).context("create src")?;
@@ -216,6 +224,9 @@ fn cli_semantic_risk_excludes_sampled_path_that_is_now_a_directory() -> Result<(
 
 #[test]
 fn cli_semantic_risk_propagates_authenticated_megafile_read_failures() -> Result<()> {
+    support::require_containment!(
+        "cli_semantic_risk_propagates_authenticated_megafile_read_failures"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = temp.path().join("repo");
     fs::create_dir_all(repo_path.join("src")).context("create src")?;
