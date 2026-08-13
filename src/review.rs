@@ -2652,7 +2652,7 @@ fn collect_sanitized_view_selection(
     repository: &ReviewRepositoryBinding,
 ) -> Result<SanitizedViewSelection> {
     repository.verify()?;
-    let git = git2::Repository::open(repository.worktree_root.path())
+    let git = crate::git_repository::open(repository.worktree_root.path())
         .context("failed to enumerate sanitized reviewer selection")?;
     let index = git
         .index()
@@ -3466,7 +3466,7 @@ enum ReviewStateBinding {
 impl ReviewRepositoryBinding {
     fn bind(path: &Path) -> Result<Self> {
         let repository =
-            git2::Repository::open(path).context("failed to bind review repository")?;
+            crate::git_repository::open(path).context("failed to bind review repository")?;
         let worktree = repository
             .workdir()
             .context("review requires a non-bare repository")?;
@@ -3499,7 +3499,7 @@ impl ReviewRepositoryBinding {
             .map_err(|_| anyhow::anyhow!("review Git common directory identity changed"))?;
         self.state.verify(&self.common_dir_root)?;
 
-        let rebound = git2::Repository::open(self.worktree_root.path())
+        let rebound = crate::git_repository::open(self.worktree_root.path())
             .context("review repository could not be rebound")?;
         let rebound_git = SafeRoot::open_existing(rebound.path())
             .map_err(|_| anyhow::anyhow!("review Git directory rebound is unsafe"))?;
@@ -3558,7 +3558,7 @@ impl ReviewRepositoryBinding {
 
     fn snapshot(&self) -> Result<ReviewRepoSnapshot> {
         self.verify()?;
-        let repository = git2::Repository::open(self.worktree_root.path())
+        let repository = crate::git_repository::open(self.worktree_root.path())
             .context("failed to open bound review repository")?;
         let (head, head_name) = match repository.head() {
             Ok(head) => {

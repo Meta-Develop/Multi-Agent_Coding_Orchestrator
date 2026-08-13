@@ -4832,7 +4832,7 @@ fn load_fake_proposal(path: &Path) -> Result<WorkProposal> {
 }
 
 fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
-    let repo = Repository::discover(repo_path)
+    let repo = crate::git_repository::discover(repo_path)
         .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
     repo.workdir()
         .map(Path::to_path_buf)
@@ -6775,7 +6775,7 @@ mod tests {
             "pub fn ok() -> bool { true }\n",
         )
         .expect("write lib");
-        let repo = Repository::open(&repo_path).expect("open repository");
+        let repo = crate::git_repository::open(&repo_path).expect("open repository");
         let mut index = repo.index().expect("open index");
         index
             .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
@@ -6888,7 +6888,7 @@ mod tests {
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repository");
         fs::write(repo_path.join("README.md"), "# Before\n").expect("write README");
-        let repo = Repository::open(&repo_path).expect("open repository");
+        let repo = crate::git_repository::open(&repo_path).expect("open repository");
         let mut index = repo.index().expect("open index");
         index
             .add_path(Path::new("README.md"))
@@ -6912,7 +6912,8 @@ mod tests {
             })
             .expect("create test worktree");
         fs::write(worktree.path.join("README.md"), "# After\n").expect("edit agent README");
-        let agent_repo = Repository::open(&worktree.path).expect("open agent repository");
+        let agent_repo =
+            crate::git_repository::open(&worktree.path).expect("open agent repository");
         let mut index = agent_repo.index().expect("open agent index");
         index
             .add_path(Path::new("README.md"))
@@ -6985,7 +6986,7 @@ mod tests {
         assert_eq!(gc.entries[0].reason, WorktreeGcReason::UnmergedBranch);
         assert!(worktree.path.exists(), "unmerged lane must remain present");
 
-        let primary = Repository::open(&repo_path).expect("reopen primary");
+        let primary = crate::git_repository::open(&repo_path).expect("reopen primary");
         let lane_oid = primary
             .find_branch("maco/agent-merge-hook", git2::BranchType::Local)
             .expect("lane branch")

@@ -390,7 +390,7 @@ fn finish_with_lock_verification<T>(result: Result<T>, verification: Result<()>)
 
 impl SyncStore {
     pub fn open(repo_path: impl AsRef<Path>) -> Result<Self> {
-        let repo = Repository::discover(repo_path.as_ref()).with_context(|| {
+        let repo = crate::git_repository::discover(repo_path.as_ref()).with_context(|| {
             format!(
                 "failed to discover repository from {}",
                 repo_path.as_ref().display()
@@ -1317,7 +1317,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repository = Repository::open(&repo_path).expect("repository");
+        let repository = crate::git_repository::open(&repo_path).expect("repository");
         let state_root = SafeRoot::open_or_create(repository.commondir().join("maco/state"))
             .expect("state root");
         AtomicStateWriter::write_direct(&state_root, "claims.json", ISSUE33_CLAIMS_V1)
@@ -1440,7 +1440,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("repo");
+        let repo = crate::git_repository::open(&repo_path).expect("repo");
         let state =
             RepositoryStateRoot::open(&repo, "claims.json", "claims.lock").expect("state root");
         let lock = state.lock().expect("claims lock");
@@ -1843,7 +1843,7 @@ mod tests {
         let repo_path = temp.path().join("repo");
         let worktree_root = temp.path().join("worktrees");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         commit_readme(&repo).expect("commit");
         let worktree = WorktreeManager::new(&repo_path)
             .create_for_test(crate::worktree::WorktreeCreateOptions {

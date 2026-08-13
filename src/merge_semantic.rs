@@ -516,12 +516,13 @@ fn collect_primary_changes(
         .or(candidate.metadata.primary_head.as_deref())
         .context("merge base and primary HEAD are unavailable")?;
     let base = Oid::from_str(base).context("merge base object id is invalid")?;
-    let repo = Repository::open(&candidate.metadata.primary_repo_root).with_context(|| {
-        format!(
-            "failed to open primary repository {}",
-            candidate.metadata.primary_repo_root.display()
-        )
-    })?;
+    let repo =
+        crate::git_repository::open(&candidate.metadata.primary_repo_root).with_context(|| {
+            format!(
+                "failed to open primary repository {}",
+                candidate.metadata.primary_repo_root.display()
+            )
+        })?;
     let base_tree = repo
         .find_commit(base)
         .with_context(|| format!("failed to find merge base commit {base}"))?

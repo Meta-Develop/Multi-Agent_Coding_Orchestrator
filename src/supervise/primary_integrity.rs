@@ -32,7 +32,7 @@ fn primary_worktree_snapshot_at_depth(
             repo_path.display()
         );
     }
-    let repo = Repository::open(repo_path)
+    let repo = crate::git_repository::open(repo_path)
         .with_context(|| format!("failed to open repository {}", repo_path.display()))?;
     let gitdir_identity = fs::canonicalize(repo.path()).with_context(|| {
         format!(
@@ -471,7 +471,7 @@ fn primary_path_state(
     }
     if file_type.is_dir() {
         let nested_repository = if capture_nested_repository {
-            match Repository::open(path) {
+            match crate::git_repository::open(path) {
                 Ok(_) => Some(Box::new(primary_worktree_snapshot_at_depth(
                     path,
                     depth.saturating_add(1),

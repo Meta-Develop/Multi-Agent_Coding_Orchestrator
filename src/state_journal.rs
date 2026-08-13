@@ -1393,7 +1393,7 @@ mod tests {
     }
 
     fn reopen(repo_path: &Path, identity: &JournalIdentity) -> Result<StateJournal> {
-        let repo = Repository::open(repo_path)?;
+        let repo = crate::git_repository::open(repo_path)?;
         let auth = RepositoryAuthenticator::open_existing(repo.commondir())?;
         StateJournal::open(auth, identity)
     }
@@ -1413,7 +1413,7 @@ mod tests {
         let mut journal = StateJournal::create(auth, "exclusive-run").expect("create journal");
         journal.append("planned", None, &()).expect("planned");
         let identity = journal.identity().clone();
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         let competing_auth =
             RepositoryAuthenticator::open_existing(repo.commondir()).expect("auth");
         assert!(StateJournal::open(competing_auth, &identity).is_err());

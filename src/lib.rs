@@ -17,6 +17,7 @@ pub mod field_guide;
 pub(crate) mod file_identity;
 pub(crate) mod follow_up_queue;
 pub mod gate_denial;
+mod git_repository;
 pub mod inbox;
 pub mod live_claim;
 pub mod llm;
@@ -47,6 +48,9 @@ pub mod swarm_health;
 pub mod sync;
 pub mod sync_store;
 pub mod worktree;
+
+#[doc(hidden)]
+pub use git_repository::configure_libgit2_repository_extensions;
 
 /// Reserved package-internal bootstrap used by the sealed executable guardian.
 ///

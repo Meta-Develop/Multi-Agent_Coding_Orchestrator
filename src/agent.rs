@@ -565,7 +565,7 @@ fn select_worktree(
 }
 
 fn ensure_clean_worktree(record: &WorktreeRecord) -> Result<()> {
-    let repo = Repository::open(&record.path).with_context(|| {
+    let repo = crate::git_repository::open(&record.path).with_context(|| {
         format!(
             "failed to inspect existing worktree '{}' at {}",
             record.name,
@@ -1088,7 +1088,7 @@ fn duration_millis(duration: std::time::Duration) -> u64 {
 }
 
 fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
-    let repo = Repository::discover(repo_path)
+    let repo = crate::git_repository::discover(repo_path)
         .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
     repo.workdir()
         .map(Path::to_path_buf)
@@ -1373,7 +1373,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             "pub fn ok() -> bool { true }\n",
         )
         .context("write lib")?;
-        let repo = Repository::open(&repo_path).context("open repo")?;
+        let repo = crate::git_repository::open(&repo_path).context("open repo")?;
         commit_all(&repo, "initial commit")?;
         Ok(repo_path)
     }

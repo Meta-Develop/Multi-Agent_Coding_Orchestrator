@@ -3593,7 +3593,7 @@ fn inbox_detail_paths(details: &[InboxLockRefusalDetail]) -> Vec<PathBuf> {
 }
 
 fn dirty_primary_paths(repo_path: &Path) -> Result<Vec<PathBuf>> {
-    let repo = Repository::open(repo_path)
+    let repo = crate::git_repository::open(repo_path)
         .with_context(|| format!("failed to open repository {}", repo_path.display()))?;
     let mut options = StatusOptions::new();
     options.include_untracked(true).recurse_untracked_dirs(true);
@@ -4101,7 +4101,7 @@ fn read_artifact_json(reader: &ArtifactRunReader, relative: impl AsRef<Path>) ->
 }
 
 fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
-    let repo = Repository::discover(repo_path)
+    let repo = crate::git_repository::discover(repo_path)
         .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
     repo.workdir()
         .map(Path::to_path_buf)
@@ -4449,7 +4449,8 @@ fn source_repository_binding_context(
     config: &InboxConfig,
     require_remote_match: bool,
 ) -> Result<SourceRepositoryBindingContext> {
-    let repo = Repository::open(repo_path).context("failed to bind inbox source repository")?;
+    let repo =
+        crate::git_repository::open(repo_path).context("failed to bind inbox source repository")?;
     let common = SafeRoot::open_existing(repo.commondir())
         .context("failed to bind inbox source repository common directory")?;
     let identity = publication::external_source_repository_identity(
@@ -5497,7 +5498,7 @@ mod tests {
     #[test]
     fn source_repository_binding_matches_configured_owner_name_and_is_locally_durable() {
         let (temp, repo_path) = temp_repo();
-        let repo = Repository::open(&repo_path).expect("open repository");
+        let repo = crate::git_repository::open(&repo_path).expect("open repository");
         repo.remote("origin", "https://github.com/acme/inbox.git")
             .expect("create origin");
         let mut config = InboxConfig::default();
@@ -5563,7 +5564,8 @@ mod tests {
             .external_source_guard()
             .expect("source guard conversion")
             .expect("GitHub source guard");
-        let moved_repository = Repository::open(&moved_repo).expect("open moved repository");
+        let moved_repository =
+            crate::git_repository::open(&moved_repo).expect("open moved repository");
         moved_repository
             .remote_set_url("origin", "https://other.example/acme/inbox.git")
             .expect("swap origin host");

@@ -203,7 +203,7 @@ pub(super) fn ensure_reusable_child_worktree(
     record: &WorktreeRecord,
     primary_head: &Oid,
 ) -> Result<()> {
-    let repo = Repository::open(&record.path).with_context(|| {
+    let repo = crate::git_repository::open(&record.path).with_context(|| {
         format!(
             "failed to inspect existing child worktree '{}' at {}",
             record.name,
@@ -299,7 +299,7 @@ pub(super) fn repo_relative_path_from_git_bytes(path: &[u8]) -> PathBuf {
 }
 
 pub(super) fn current_head_oid(repo_path: &Path) -> Result<Oid> {
-    let repo = Repository::open(repo_path)
+    let repo = crate::git_repository::open(repo_path)
         .with_context(|| format!("failed to open repository {}", repo_path.display()))?;
     head_oid(&repo)
 }
@@ -318,7 +318,7 @@ pub(super) fn collect_paths_changed_since_base(
     worktree_path: &Path,
     base_oid: &Oid,
 ) -> Result<Vec<PathBuf>> {
-    let repo = Repository::open(worktree_path)
+    let repo = crate::git_repository::open(worktree_path)
         .with_context(|| format!("failed to open child worktree {}", worktree_path.display()))?;
     let base_commit = repo
         .find_commit(*base_oid)
@@ -359,7 +359,7 @@ pub(super) fn collect_diff_since_base(
     base_oid: &Oid,
     max_bytes: usize,
 ) -> Result<String> {
-    let repo = Repository::open(worktree_path)
+    let repo = crate::git_repository::open(worktree_path)
         .with_context(|| format!("failed to open child worktree {}", worktree_path.display()))?;
     let base_commit = repo
         .find_commit(*base_oid)

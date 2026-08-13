@@ -1892,7 +1892,7 @@ fn validate_resume_worktrees(
             );
         }
 
-        let worktree_repo = Repository::open(&current.path).with_context(|| {
+        let worktree_repo = crate::git_repository::open(&current.path).with_context(|| {
             format!(
                 "failed to inspect checkpoint worktree '{}' at {}",
                 current.name,
@@ -2781,7 +2781,7 @@ fn select_worktrees(
 }
 
 fn ensure_reusable_worktree(record: &WorktreeRecord, primary_head: &Oid) -> Result<()> {
-    let repo = Repository::open(&record.path).with_context(|| {
+    let repo = crate::git_repository::open(&record.path).with_context(|| {
         format!(
             "failed to inspect existing worktree '{}' at {}",
             record.name,
@@ -2819,7 +2819,7 @@ fn reset_reusable_worktree(
     primary_head: &Oid,
 ) -> Result<()> {
     ensure_no_active_reset_claims(store, agent)?;
-    let repo = Repository::open(&record.path).with_context(|| {
+    let repo = crate::git_repository::open(&record.path).with_context(|| {
         format!(
             "failed to inspect existing worktree '{}' at {}",
             record.name,
@@ -3636,7 +3636,7 @@ fn inspect_agent_paths_without_patch(
         );
         return;
     }
-    let repo = match Repository::open(worktree.path()) {
+    let repo = match crate::git_repository::open(worktree.path()) {
         Ok(repo) => repo,
         Err(error) => {
             fail_summary(
@@ -3773,7 +3773,8 @@ fn capture_candidate_state_once(
     base_oid: &Oid,
     runtime: OrchestrationExecutionRuntime,
 ) -> Result<CandidateStateSnapshot> {
-    let repo = Repository::open(worktree_path).context("failed to open candidate worktree")?;
+    let repo =
+        crate::git_repository::open(worktree_path).context("failed to open candidate worktree")?;
     let head_oid = head_oid(&repo).context("failed to capture candidate HEAD")?;
     let merge_base = repo
         .merge_base(*base_oid, head_oid)
@@ -4163,7 +4164,8 @@ fn capture_bound_candidate(
     if let Some(drift) = before.drift_from(expected_state) {
         bail!("{drift}");
     }
-    let repo = Repository::open(worktree_path).context("failed to open candidate worktree")?;
+    let repo =
+        crate::git_repository::open(worktree_path).context("failed to open candidate worktree")?;
     let (changed_paths, patch) = match runtime {
         OrchestrationExecutionRuntime::Verified => {
             capture_worktree_diff_from_commit(&repo, worktree_path, *base_oid)
@@ -4425,7 +4427,7 @@ fn run_fixed_git_with_stdin(
                     StrictOfflineWorkspaceProfile::read_write(worktree_path)
                 }
             };
-            let repository = Repository::open(worktree_path)
+            let repository = crate::git_repository::open(worktree_path)
                 .context("failed to resolve Git administration roots for fixed command")?;
             let profile = profile
                 .with_visible_read_only_root(repository.commondir())
@@ -4512,7 +4514,7 @@ fn command_spec(
 }
 
 fn orchestration_sandbox_roots(worktree: &Path) -> Result<(PathBuf, PathBuf)> {
-    let repository = Repository::open(worktree).with_context(|| {
+    let repository = crate::git_repository::open(worktree).with_context(|| {
         format!(
             "failed to resolve the repository common directory for {}",
             worktree.display()
@@ -4714,7 +4716,7 @@ impl<'a> DisposableValidationWorktree<'a> {
         };
         let verification = (|| -> Result<()> {
             guard.verify_binding()?;
-            let repo = Repository::open(guard.path()?)
+            let repo = crate::git_repository::open(guard.path()?)
                 .context("combined candidate managed worktree could not be opened")?;
             let head =
                 head_oid(&repo).context("combined candidate worktree HEAD capture failed")?;
@@ -6212,7 +6214,7 @@ fn release_semantic_intents(
 }
 
 fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
-    let repo = Repository::discover(repo_path)
+    let repo = crate::git_repository::discover(repo_path)
         .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
     repo.workdir()
         .map(Path::to_path_buf)
@@ -6220,7 +6222,7 @@ fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
 }
 
 fn current_head_oid(repo_path: &Path) -> Result<Oid> {
-    let repo = Repository::open(repo_path)
+    let repo = crate::git_repository::open(repo_path)
         .with_context(|| format!("failed to open repository {}", repo_path.display()))?;
     head_oid(&repo)
 }
@@ -6336,7 +6338,7 @@ mod tests {
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
         SyncStore::open(&repo_path).expect("create sensitive state root");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("claimed.txt"), "base\n").expect("write claimed");
         fs::write(repo_path.join("other.txt"), "base\n").expect("write other");
         let base_oid = commit_all(&repo, "initial commit").expect("commit");
@@ -6774,7 +6776,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let primary = temp.path().join("primary");
         WorktreeManager::init_repository(&primary, "main").expect("init primary");
-        let repo = Repository::open(&primary).expect("open primary");
+        let repo = crate::git_repository::open(&primary).expect("open primary");
         fs::write(primary.join("a.txt"), "base-a\n").expect("write a");
         fs::write(primary.join("b.txt"), "base-b\n").expect("write b");
         let base_oid = commit_all(&repo, "initial commit").expect("commit");
@@ -6876,7 +6878,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let primary = temp.path().join("primary");
         WorktreeManager::init_repository(&primary, "main").expect("init primary");
-        let repo = Repository::open(&primary).expect("open primary");
+        let repo = crate::git_repository::open(&primary).expect("open primary");
         fs::write(primary.join("README.md"), "base\n").expect("write readme");
         let base_oid = commit_all(&repo, "initial commit").expect("commit");
         let candidate =
@@ -6903,7 +6905,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let primary = temp.path().join("primary");
         WorktreeManager::init_repository(&primary, "main").expect("init primary");
-        let repo = Repository::open(&primary).expect("open primary");
+        let repo = crate::git_repository::open(&primary).expect("open primary");
         fs::write(primary.join("shared.txt"), "base\n").expect("write shared");
         let base_oid = commit_all(&repo, "initial commit").expect("commit");
         let first = clone_candidate(
@@ -7157,7 +7159,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::create_dir_all(repo_path.join("src")).expect("create src");
         fs::write(repo_path.join("src/lib.rs"), "pub fn ok() {}\n").expect("write lib");
         commit_all(&repo, "initial commit").expect("commit");
@@ -7208,7 +7210,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write README");
         commit_all(&repo, "initial commit").expect("commit");
         let manager = WorktreeManager::new(&repo_path);
@@ -7326,7 +7328,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write README");
         commit_all(&repo, "initial commit").expect("commit");
         let plan_file = temp.path().join("plan.json");
@@ -7370,7 +7372,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "base\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let manager = WorktreeManager::new(&repo_path);
@@ -7453,7 +7455,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let plan_file = temp.path().join("plan.json");
@@ -7502,7 +7504,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         SyncStore::open(&repo_path)
@@ -7551,7 +7553,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::create_dir_all(repo_path.join("src")).expect("create src");
         fs::write(repo_path.join("src/lib.rs"), "pub struct Shared;\n").expect("write lib");
         fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
@@ -7638,7 +7640,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::create_dir_all(repo_path.join("src")).expect("create src");
         fs::write(repo_path.join("src/lib.rs"), "pub struct Shared;\n").expect("write lib");
         fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
@@ -7718,7 +7720,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::create_dir_all(repo_path.join("src")).expect("create src");
         fs::write(repo_path.join("src/lib.rs"), "pub struct Existing;\n").expect("write lib");
         fs::write(repo_path.join("owned.txt"), "owned\n").expect("write owned");
@@ -7783,7 +7785,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::create_dir_all(repo_path.join("src")).expect("create src");
         fs::write(
             repo_path.join("src/lib.rs"),
@@ -7858,7 +7860,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
         fs::write(repo_path.join("Cargo.toml"), "[package]\n").expect("write cargo");
         commit_all(&repo, "initial commit").expect("commit");
@@ -7907,7 +7909,7 @@ mod tests {
         let repo_path = temp.path().join("repo");
         let patch_dir = temp.path().join("patches");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let plan_file = temp.path().join("plan.json");
@@ -7952,7 +7954,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::create_dir_all(repo_path.join("src")).expect("create src");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
         fs::write(repo_path.join("src/lib.rs"), "pub fn ok() {}\n").expect("write lib");
@@ -7999,7 +8001,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let plan_file = temp.path().join("plan.json");
@@ -8053,7 +8055,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let plan_file = temp.path().join("plan.json");
@@ -8092,7 +8094,7 @@ mod tests {
         let repo_path = temp.path().join("repo");
         let checkpoint_dir = temp.path().join("checkpoints");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("a.txt"), "start\n").expect("write a");
         fs::write(repo_path.join("b.txt"), "start\n").expect("write b");
         commit_all(&repo, "initial commit").expect("commit");
@@ -8234,7 +8236,7 @@ mod tests {
         let repo_path = temp.path().join("repo");
         let checkpoint_dir = temp.path().join("checkpoints");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write README");
         commit_all(&repo, "initial commit").expect("commit");
         let manager = WorktreeManager::new(&repo_path);
@@ -8370,7 +8372,7 @@ mod tests {
         let repo_path = temp.path().join("repo");
         let checkpoint_dir = temp.path().join("checkpoints");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::create_dir_all(repo_path.join("src")).expect("create src");
         fs::write(
             repo_path.join("src/lib.rs"),
@@ -8547,7 +8549,7 @@ mod tests {
         let repo_path = temp.path().join("repo");
         let checkpoint_dir = temp.path().join("checkpoints");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::create_dir_all(repo_path.join("src")).expect("create src");
         fs::write(repo_path.join("src/lib.rs"), "pub struct Shared;\n").expect("write lib");
         fs::write(repo_path.join("a.txt"), "start\n").expect("write a");
@@ -8695,7 +8697,7 @@ mod tests {
         let repo_path = temp.path().join("repo");
         let checkpoint_dir = temp.path().join("checkpoints");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let worktree = WorktreeManager::new(&repo_path)
@@ -8773,7 +8775,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "# v1\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let worktree = WorktreeManager::new(&repo_path)
@@ -8809,7 +8811,7 @@ mod tests {
 
         assert!(summary.success);
         assert!(summary.agents[0].worktree_reused);
-        let worktree_repo = Repository::open(worktree.path).expect("open worktree");
+        let worktree_repo = crate::git_repository::open(worktree.path).expect("open worktree");
         assert_eq!(
             head_oid(&worktree_repo).expect("worktree head"),
             current_head
@@ -8821,7 +8823,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let worktree = WorktreeManager::new(&repo_path)
@@ -8862,7 +8864,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         WorktreeManager::new(&repo_path)
@@ -8907,7 +8909,7 @@ mod tests {
         let repo_path = temp.path().join("repo");
         let checkpoint_dir = temp.path().join("checkpoints");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "base\n").expect("write readme");
         fs::create_dir_all(repo_path.join("src")).expect("create src");
         fs::write(repo_path.join("src/lib.rs"), "pub struct Recovery;\n")
@@ -9023,7 +9025,7 @@ mod tests {
         let repo_path = temp.path().join("repo");
         let checkpoint_dir = temp.path().join("checkpoints");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "base\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let plan_file = temp.path().join("plan.json");
@@ -9079,7 +9081,7 @@ mod tests {
         let repo_path = temp.path().join("repo");
         let checkpoint_dir = temp.path().join("checkpoints");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "base\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let plan_file = temp.path().join("plan.json");
@@ -9214,7 +9216,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "base\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         SyncStore::open(&repo_path).expect("create repository state root");
@@ -9228,7 +9230,7 @@ mod tests {
             .expect("create worktree");
         let (common, sensitive) =
             orchestration_sandbox_roots(&worktree.path).expect("resolve sandbox roots");
-        let linked = Repository::open(&worktree.path).expect("open linked worktree");
+        let linked = crate::git_repository::open(&worktree.path).expect("open linked worktree");
         assert_eq!(common, linked.commondir());
         assert_eq!(sensitive, linked.commondir().join("maco/state"));
         let spec = CommandRunSpec {
@@ -9253,7 +9255,7 @@ mod tests {
         let repo_path = temp.path().join("repo");
         let checkpoint_dir = temp.path().join("checkpoints");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "base\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let plan_file = temp.path().join("plan.json");
@@ -9339,7 +9341,7 @@ mod tests {
             .expect_err("existing marker must block key creation");
         assert!(error.to_string().contains("existing final marker"));
         assert!(!checkpoint_path(&checkpoint_dir, &checkpoint.run_id).exists());
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         assert!(!repo
             .commondir()
             .join("maco/state")
@@ -9353,7 +9355,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         Repository::init(&repo_path).expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         let maco = repo.commondir().join("maco");
         let state = maco.join("state");
         let journals = state.join(crate::state_journal::JOURNAL_ROOT_NAME);
@@ -9421,7 +9423,7 @@ mod tests {
             updated_unix_ms: 1,
         };
         drop(repository_auth_writer(&repo_path).expect("establish auth epoch"));
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         let key = repo
             .commondir()
             .join("maco/state")
@@ -9634,7 +9636,7 @@ mod tests {
         let repo_path = temp.path().join("repo");
         let checkpoint_dir = temp.path().join("checkpoints");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "base\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let plan_file = temp.path().join("plan.json");
@@ -9756,7 +9758,7 @@ mod tests {
         let repo_path = temp.path().join("repo");
         let checkpoint_dir = temp.path().join("checkpoints");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let plan_file = temp.path().join("plan.json");
@@ -9823,7 +9825,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "# paths\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let worktree = WorktreeManager::new(&repo_path)
@@ -9855,7 +9857,8 @@ mod tests {
         )
         .expect("capture exact candidate patch");
 
-        let worktree_repo = Repository::open(&worktree.path).expect("open worktree repo");
+        let worktree_repo =
+            crate::git_repository::open(&worktree.path).expect("open worktree repo");
         let index = worktree_repo.index().expect("open linked index");
         let indexed = index
             .iter()

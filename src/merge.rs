@@ -885,7 +885,7 @@ impl ArbitrationEnvironment for ProductionArbitrationEnvironment {
         }
 
         let reviewed_base = reviewed_arbitration_base(&candidates)?;
-        let primary_repo = Repository::open(&repo_root).with_context(|| {
+        let primary_repo = crate::git_repository::open(&repo_root).with_context(|| {
             format!("failed to open primary repository {}", repo_root.display())
         })?;
         primary_repo.find_commit(reviewed_base).with_context(|| {
@@ -2163,9 +2163,9 @@ fn collect_agent_result_from_verified_record(
     repo_root: PathBuf,
     record: &WorktreeRecord,
 ) -> Result<MergeCandidate> {
-    let primary_repo = Repository::open(&repo_root)
+    let primary_repo = crate::git_repository::open(&repo_root)
         .with_context(|| format!("failed to open primary repository {}", repo_root.display()))?;
-    let agent_repo = Repository::open(&record.path)
+    let agent_repo = crate::git_repository::open(&record.path)
         .with_context(|| format!("failed to open agent worktree {}", record.path.display()))?;
 
     let claimed_paths = normalize_claim_paths(options.claimed_paths)?;
@@ -2474,12 +2474,13 @@ fn verify_decomposition_candidate_structure(
         bail!("verified decomposition evidence has no replacement paths");
     }
 
-    let repo = Repository::open(&candidate.metadata.primary_repo_root).with_context(|| {
-        format!(
-            "failed to open primary repository {} for decomposition structure verification",
-            candidate.metadata.primary_repo_root.display()
-        )
-    })?;
+    let repo =
+        crate::git_repository::open(&candidate.metadata.primary_repo_root).with_context(|| {
+            format!(
+                "failed to open primary repository {} for decomposition structure verification",
+                candidate.metadata.primary_repo_root.display()
+            )
+        })?;
     let primary_head = candidate
         .metadata
         .primary_head
@@ -2597,12 +2598,13 @@ fn candidate_regular_file_size(
 fn recapture_candidate_snapshot_entries(
     candidate: &MergeCandidate,
 ) -> Result<BTreeMap<PathBuf, CandidateSnapshotEntry>> {
-    let agent_repo = Repository::open(&candidate.metadata.worktree_path).with_context(|| {
-        format!(
-            "failed to open candidate worktree {} for decomposition recapture",
-            candidate.metadata.worktree_path.display()
-        )
-    })?;
+    let agent_repo =
+        crate::git_repository::open(&candidate.metadata.worktree_path).with_context(|| {
+            format!(
+                "failed to open candidate worktree {} for decomposition recapture",
+                candidate.metadata.worktree_path.display()
+            )
+        })?;
     let agent_head = candidate
         .metadata
         .agent_head
@@ -3516,7 +3518,7 @@ fn collect_candidate_snapshot_entries(
     snapshot_tree: Oid,
     changes: &[ChangedPath],
 ) -> Result<BTreeMap<PathBuf, CandidateSnapshotEntry>> {
-    let snapshot_repo = Repository::open_bare(&index.directory)
+    let snapshot_repo = crate::git_repository::open_bare(&index.directory)
         .context("failed to open private candidate snapshot object database")?;
     let tree = snapshot_repo
         .find_tree(snapshot_tree)
@@ -5270,7 +5272,7 @@ fn validation_evidence_check(
 }
 
 fn dirty_primary_check(repo_root: &Path) -> Result<SafetyCheck> {
-    let repo = Repository::open(repo_root)
+    let repo = crate::git_repository::open(repo_root)
         .with_context(|| format!("failed to open primary repository {}", repo_root.display()))?;
     let paths = collect_changed_paths(&repo)?
         .into_iter()
@@ -5738,7 +5740,7 @@ impl CandidateValidationSandbox {
             &primary_repo_root,
             PrivateRuntimeKind::CandidateValidation,
         )?;
-        let primary_repo = Repository::open(&primary_repo_root).with_context(|| {
+        let primary_repo = crate::git_repository::open(&primary_repo_root).with_context(|| {
             format!(
                 "failed to open primary repository {}",
                 primary_repo_root.display()
@@ -5843,7 +5845,7 @@ impl CandidateValidationSandbox {
         &self,
         preview: &MergeApplyPreview,
     ) -> Result<CandidateValidationSandboxIntegrity> {
-        let repo = Repository::open(self.path()).with_context(|| {
+        let repo = crate::git_repository::open(self.path()).with_context(|| {
             format!(
                 "failed to open validation sandbox {}",
                 self.path().display()
@@ -5908,7 +5910,7 @@ fn validation_repository_fingerprint(
             continue;
         }
         let filesystem = validation_submodule_marker_fingerprint(&marker)?;
-        let submodule_repo = Repository::open(&submodule_path).with_context(|| {
+        let submodule_repo = crate::git_repository::open(&submodule_path).with_context(|| {
             format!(
                 "initialized validation submodule {} could not be opened",
                 path_json_text(&path)
@@ -5935,7 +5937,7 @@ fn validation_repository_fingerprint(
 }
 
 fn validation_gitlinks(worktree_path: &Path) -> Result<Vec<(PathBuf, Oid)>> {
-    let repo = Repository::open(worktree_path).with_context(|| {
+    let repo = crate::git_repository::open(worktree_path).with_context(|| {
         format!(
             "failed to open validation repository {}",
             worktree_path.display()
@@ -6803,7 +6805,7 @@ fn merge_base_oid(repo: &Repository, primary: Oid, agent: Oid) -> Result<Option<
 }
 
 fn discover_primary_repo_root(repo_path: &Path) -> Result<PathBuf> {
-    let repo = Repository::discover(repo_path)
+    let repo = crate::git_repository::discover(repo_path)
         .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
     repo.workdir()
         .map(Path::to_path_buf)
@@ -6819,7 +6821,7 @@ impl RepoCommonLock {
         {
             bail!("repository lock operation name is invalid");
         }
-        let repo = Repository::open(repo_root).with_context(|| {
+        let repo = crate::git_repository::open(repo_root).with_context(|| {
             format!(
                 "failed to open repository for {operation} lock {}",
                 repo_root.display()
@@ -7351,7 +7353,7 @@ impl PrimaryRepositoryState {
     }
 
     fn capture_once(repo_root: &Path) -> Result<Self> {
-        let repo = Repository::open(repo_root).with_context(|| {
+        let repo = crate::git_repository::open(repo_root).with_context(|| {
             format!("failed to open primary repository {}", repo_root.display())
         })?;
         let head = head_oid(&repo).context("failed to read primary HEAD for merge transaction")?;
@@ -7366,7 +7368,7 @@ impl PrimaryRepositoryState {
 }
 
 fn run_git_with_input(repo_root: &Path, args: &[&str], input: &[u8]) -> Result<GitCommandOutput> {
-    let repo = Repository::open(repo_root)
+    let repo = crate::git_repository::open(repo_root)
         .with_context(|| format!("failed to open Git worktree {}", repo_root.display()))?;
     let context = TemporaryIndex::create(repo.commondir())?;
     initialize_isolated_index(&context, repo_root, head_oid(&repo)?)?;
@@ -9028,7 +9030,7 @@ mod tests {
         let repo_path = root.join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repository");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write README");
-        let repo = Repository::open(&repo_path).expect("open repository");
+        let repo = crate::git_repository::open(&repo_path).expect("open repository");
         let mut index = repo.index().expect("open index");
         index
             .add_path(Path::new("README.md"))
@@ -9076,7 +9078,7 @@ mod tests {
             }
             fs::write(path, contents).expect("write semantic fixture file");
         }
-        let repo = Repository::open(&repo_path).expect("open repository");
+        let repo = crate::git_repository::open(&repo_path).expect("open repository");
         commit_all_for_semantic_test(&repo, "initial semantic fixture")
             .expect("commit semantic fixture");
         drop(repo);
@@ -9671,7 +9673,7 @@ mod tests {
             "pub fn compute() -> i32 {\n    3\n}\n",
         )
         .expect("edit primary function");
-        let primary = Repository::open(&repo_path).expect("open primary");
+        let primary = crate::git_repository::open(&repo_path).expect("open primary");
         commit_all_for_semantic_test(&primary, "change primary function")
             .expect("commit primary function");
 
@@ -9758,7 +9760,7 @@ mod tests {
             "use crate::alpha::renamed;\n\npub mod alpha;\npub mod beta;\n\npub fn call() {}\n",
         )
         .expect("edit primary import");
-        let primary = Repository::open(&repo_path).expect("open primary");
+        let primary = crate::git_repository::open(&repo_path).expect("open primary");
         commit_all_for_semantic_test(&primary, "change primary import")
             .expect("commit primary import");
 
@@ -9800,7 +9802,7 @@ mod tests {
             "pub struct Worker;\n\nimpl Worker {\n    pub fn run(&self, value: i32) -> i64 { value as i64 }\n}\n",
         )
         .expect("edit primary signature");
-        let primary = Repository::open(&repo_path).expect("open primary");
+        let primary = crate::git_repository::open(&repo_path).expect("open primary");
         commit_all_for_semantic_test(&primary, "change primary signature")
             .expect("commit primary signature");
 
@@ -9840,7 +9842,7 @@ mod tests {
         );
         fs::write(agent.path.join("README.md"), "# Candidate\n").expect("edit candidate readme");
         fs::write(repo_path.join("README.md"), "# Primary\n").expect("edit primary readme");
-        let primary = Repository::open(&repo_path).expect("open primary");
+        let primary = crate::git_repository::open(&repo_path).expect("open primary");
         commit_all_for_semantic_test(&primary, "change primary readme")
             .expect("commit primary readme");
 

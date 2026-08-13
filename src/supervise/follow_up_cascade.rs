@@ -1111,7 +1111,7 @@ fn generated_plan_file(
     repo: &Path,
     plan: &GeneratedFollowUpSupervisorPlan,
 ) -> Result<tempfile::NamedTempFile> {
-    let repository = Repository::open(repo)?;
+    let repository = crate::git_repository::open(repo)?;
     let mut file = tempfile::Builder::new()
         .prefix("maco-generated-follow-up-")
         .suffix(".json")

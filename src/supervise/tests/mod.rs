@@ -271,7 +271,7 @@ fn injected_repository() -> (tempfile::TempDir, PathBuf) {
 }
 
 fn commit_injected_repository(path: &Path, message: &str) {
-    let repo = Repository::open(path).expect("open injected repository");
+    let repo = crate::git_repository::open(path).expect("open injected repository");
     let mut index = repo.index().expect("open injected index");
     index
         .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
