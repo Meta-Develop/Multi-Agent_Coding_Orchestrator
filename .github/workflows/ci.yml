@@ -259,7 +259,9 @@ jobs:
           fi
 
           if ((${#test_harness_args[@]})); then
-            cargo test --locked --all-targets -- "${test_harness_args[@]}"
+            cargo test --locked --lib -- "${test_harness_args[@]}"
+            cargo test --locked --bins --test '*' -- --show-output
+            cargo test --locked --bench '*' --examples
           else
             cargo test --locked --all-targets
           fi
