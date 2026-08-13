@@ -891,11 +891,12 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     )?
                 }
                 (Some(goal_spec), false) => {
-                    supervise::run_supervisor_goal_spec_cascade_with_concurrency_policy(
+                    supervise::run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_worktree_opt_in(
                         options,
                         "",
                         &goal_spec,
                         args.max_concurrent_children,
+                        args.allow_primary_worktree,
                     )?
                 }
                 (None, true) => {
@@ -905,9 +906,10 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     )?
                 }
                 (None, false) => {
-                    supervise::run_supervisor_plan_file_cascade_with_concurrency_policy(
+                    supervise::run_supervisor_plan_file_cascade_with_concurrency_policy_and_primary_worktree_opt_in(
                         options,
                         args.max_concurrent_children,
+                        args.allow_primary_worktree,
                     )?
                 }
             };
@@ -1085,6 +1087,9 @@ struct RunSuperviseArgs {
     /// Allow supervise to run when the primary worktree is dirty.
     #[arg(long)]
     allow_dirty_primary: bool,
+    /// Acknowledge an exact execution_target.kind=primary_worktree plan declaration.
+    #[arg(long)]
+    allow_primary_worktree: bool,
     /// Maximum concurrent child assignments: `auto` uses the conservative network-bound default.
     #[arg(long, default_value_t = supervise::SupervisorConcurrencyPolicy::Auto)]
     max_concurrent_children: supervise::SupervisorConcurrencyPolicy,

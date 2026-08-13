@@ -230,6 +230,7 @@ const ARTIFACT_FINALIZATION_MARKER: &str = ".maco-artifact-final.json";
 const SPARSE_DIRECTORY_MODE: u32 = 0o040000;
 const MAX_NESTED_REPOSITORY_DEPTH: usize = 32;
 const MAX_DIRECTORY_FINGERPRINT_DEPTH: usize = 256;
+const MAX_PRIMARY_WORKTREE_CLAIM_PATHS: usize = 16;
 const BREAKER_RECOVERY_GUIDANCE: &str = "inspect the breaker window and child evidence, correct the repeated coordination failure, then start a new supervise run; pending assignments were not launched";
 const LOCAL_RUNTIME_ROOTS: &[&[u8]] = &[
     b".maco",
@@ -368,6 +369,51 @@ pub enum SupervisorRuntime {
     #[default]
     Codex,
     Fake,
+}
+
+/// Explicit, narrowly scoped departure from the default managed-child-
+/// worktree execution policy.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SupervisorExecutionTarget {
+    PrimaryWorktree {
+        #[serde(serialize_with = "serialize_paths")]
+        claim_paths: Vec<PathBuf>,
+    },
+}
+
+impl SupervisorExecutionTarget {
+    pub fn claim_paths(&self) -> &[PathBuf] {
+        match self {
+            Self::PrimaryWorktree { claim_paths } => claim_paths,
+        }
+    }
+
+    fn claim_paths_mut(&mut self) -> &mut Vec<PathBuf> {
+        match self {
+            Self::PrimaryWorktree { claim_paths } => claim_paths,
+        }
+    }
+
+    pub const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::PrimaryWorktree { .. } => "primary_worktree",
+        }
+    }
+}
+
+/// Typed double-opt-in refusal surfaced before any run artifact, claim, or
+/// child workspace is created.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SupervisorExecutionTargetOptInError {
+    #[error(
+        "supervisor plan declares execution_target.kind='primary_worktree', but the run omitted the required --allow-primary-worktree acknowledgement"
+    )]
+    MissingCliAcknowledgement,
+    #[error(
+        "--allow-primary-worktree requires the supervisor plan declaration execution_target.kind='primary_worktree'"
+    )]
+    MissingPlanDeclaration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1290,6 +1336,7 @@ struct SupervisorPlanMetadata {
     admission: SupervisorAdmissionConfig,
     evidence_only_reaudit: Option<EvidenceOnlyReauditPlan>,
     generated_follow_up: Option<GeneratedFollowUpPlanContext>,
+    execution_target: Option<SupervisorExecutionTarget>,
 }
 
 #[derive(Debug, Clone)]
