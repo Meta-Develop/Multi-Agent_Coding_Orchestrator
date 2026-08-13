@@ -2822,7 +2822,7 @@ mod decomposition_tests {
     use std::time::Instant;
 
     fn commit_fixture_repository(path: &Path) {
-        let repo = Repository::open(path).expect("open fixture repository");
+        let repo = crate::git_repository::open(path).expect("open fixture repository");
         let mut index = repo.index().expect("open fixture index");
         index
             .add_path(Path::new("README.md"))

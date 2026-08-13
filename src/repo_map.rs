@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use git2::Repository;
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
@@ -63,7 +62,7 @@ pub enum RepoGitStatus {
 }
 
 pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<RepoMap> {
-    let repo = Repository::discover(repo_path.as_ref()).with_context(|| {
+    let repo = crate::git_repository::discover(repo_path.as_ref()).with_context(|| {
         format!(
             "failed to discover repository from {}",
             repo_path.as_ref().display()

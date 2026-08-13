@@ -31,6 +31,7 @@ use crate::{
     worktree::ManagedSnapshotSpec,
 };
 use anyhow::{bail, Context, Result};
+#[cfg(test)]
 use git2::Repository;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -280,7 +281,7 @@ pub(crate) fn prepare_legacy_retirement<S: SnapshotSpec>(
     legacy_fence: &impl Fn() -> Result<()>,
 ) -> Result<LegacyRetirementPreparation> {
     legacy_fence()?;
-    let repository = Repository::discover(repo_path)?;
+    let repository = crate::git_repository::discover(repo_path)?;
     let common_root = SafeRoot::open_existing(repository.commondir())?;
     let state_root = SafeRoot::open_existing(common_root.path().join("maco/state"))?;
     if state_root.direct_child_exists(file_name)? {
@@ -469,7 +470,7 @@ pub(crate) fn finalize_legacy_retirement<S: SnapshotSpec>(
     legacy_fence: &impl Fn() -> Result<()>,
 ) -> Result<()> {
     legacy_fence()?;
-    let repository = Repository::discover(repo_path)?;
+    let repository = crate::git_repository::discover(repo_path)?;
     let common_root = SafeRoot::open_existing(repository.commondir())?;
     let state_root = SafeRoot::open_existing(common_root.path().join("maco/state"))?;
     let bytes = BoundedRegularReader::read_direct(&state_root, file_name, MAX_LEGACY_STATE_BYTES)?;
@@ -771,7 +772,7 @@ pub(crate) fn authenticated_legacy_adoption(
     store_name: &str,
     file_name: &str,
 ) -> Result<LegacyAdoption> {
-    let repository = Repository::discover(repo_path)?;
+    let repository = crate::git_repository::discover(repo_path)?;
     let common_root = SafeRoot::open_existing(repository.commondir())?;
     let state_path = common_root.path().join("maco/state");
     let state_root = match SafeRoot::open_existing(&state_path) {
@@ -928,7 +929,7 @@ pub(crate) fn migrate_repository_state_with_options(
 ) -> Result<StateMigrationReport> {
     validate_migration_options(options)?;
     let repo_path = repo_path.as_ref();
-    let repository = Repository::discover(repo_path).with_context(|| {
+    let repository = crate::git_repository::discover(repo_path).with_context(|| {
         format!(
             "failed to discover repository for state migration from {}",
             repo_path.display()
@@ -3501,7 +3502,7 @@ mod tests {
     }
 
     fn expected_bindings_for(path: &Path) -> ExpectedLegacyBindings {
-        let repository = Repository::open(path).expect("repository");
+        let repository = crate::git_repository::open(path).expect("repository");
         let common = SafeRoot::open_existing(repository.commondir()).expect("common root");
         let primary =
             SafeRoot::open_existing(common.path().parent().expect("embedded primary workdir"))
@@ -3664,7 +3665,7 @@ mod tests {
         fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).expect("state mode");
         fs::set_permissions(state.join("claims.json"), fs::Permissions::from_mode(0o644))
             .expect("claims mode");
-        let repository = Repository::open(&path).expect("repository");
+        let repository = crate::git_repository::open(&path).expect("repository");
         let transaction_root = repository.commondir().join(TRANSACTION_ROOT_NAME);
 
         let unauthenticated = migrate_repository_state(&path, false)
@@ -3774,7 +3775,7 @@ mod tests {
     fn migration_preflight_accepts_isolated_legacy_state_directory() {
         let (_temp, path, state) = repository_with_claims();
         make_legacy_permissions(&state);
-        let repository = Repository::open(&path).expect("repository");
+        let repository = crate::git_repository::open(&path).expect("repository");
 
         let preflight = preflight_legacy_state(
             &path,
@@ -3793,7 +3794,7 @@ mod tests {
     fn dry_run_is_non_mutating_and_apply_is_signed_and_idempotent() {
         let (_temp, path, state) = repository_with_claims();
         make_legacy_permissions(&state);
-        let repo = Repository::open(&path).expect("repo");
+        let repo = crate::git_repository::open(&path).expect("repo");
         let transaction_root = repo.commondir().join(TRANSACTION_ROOT_NAME);
 
         let dry = migrate_repository_state(&path, false).expect("dry run");
@@ -3830,7 +3831,7 @@ mod tests {
     #[test]
     fn checksumless_semantic_requires_offline_manifest_then_adopts_authenticated_snapshot() {
         let (_temp, path, state, expected_intent) = repository_with_checksumless_semantic();
-        let repository = Repository::open(&path).expect("repository");
+        let repository = crate::git_repository::open(&path).expect("repository");
         let transaction_root = repository.commondir().join(TRANSACTION_ROOT_NAME);
 
         let direct_error = SemanticIntentStore::open(&path)
@@ -3890,7 +3891,7 @@ mod tests {
                 "intents": [],
             }),
         ];
-        let repository = Repository::open(&path).expect("repository");
+        let repository = crate::git_repository::open(&path).expect("repository");
         let transaction_root = repository.commondir().join(TRANSACTION_ROOT_NAME);
 
         for value in invalid_states {
@@ -3970,7 +3971,7 @@ mod tests {
         let (_temp, path, state) = repository_with_claims();
         make_legacy_permissions(&state);
         migrate_repository_state(&path, true).expect("publish signed migration manifest");
-        let repo = Repository::open(&path).expect("repo");
+        let repo = crate::git_repository::open(&path).expect("repo");
         let transaction_root = repo.commondir().join(TRANSACTION_ROOT_NAME);
         let original_root = repo.commondir().join("maco-state-migration-v1.original");
         set_migration_after_preflight_hook({
@@ -4009,7 +4010,7 @@ mod tests {
     fn initial_apply_refuses_common_directory_replacement_with_same_state_inode() {
         let (_temp, path, state) = repository_with_claims();
         make_legacy_permissions(&state);
-        let repository = Repository::open(&path).expect("repository");
+        let repository = crate::git_repository::open(&path).expect("repository");
         let common_dir = repository.commondir().to_path_buf();
         let displaced_common = path.join("displaced-common-dir");
         let state_identity = identity_for_path(&state).expect("state identity");
@@ -4051,7 +4052,7 @@ mod tests {
     fn completed_apply_refuses_common_replacement_with_same_state_and_transaction_inodes() {
         let (_temp, path, state) = repository_with_claims();
         make_legacy_permissions(&state);
-        let repository = Repository::open(&path).expect("repository");
+        let repository = crate::git_repository::open(&path).expect("repository");
         let common_dir = repository.commondir().to_path_buf();
         let displaced_common = path.join("post-manifest-displaced-common");
         let state_identity = identity_for_path(&state).expect("state identity");
@@ -4179,7 +4180,7 @@ mod tests {
             MigrationFaultAction::Crash,
         );
         migrate_repository_state(&path, true).expect_err("crash after manifest publication");
-        let repo = Repository::open(&path).expect("repo");
+        let repo = crate::git_repository::open(&path).expect("repo");
         let transaction_root = repo.commondir().join(TRANSACTION_ROOT_NAME);
         assert!(!transaction_root.join(RECEIPT_FILE).exists());
         let lock_path = state.join("claims.lock");
@@ -4217,7 +4218,7 @@ mod tests {
         make_legacy_permissions(&state);
         migrate_repository_state(&path, true).expect("publish manifest");
         drop(SyncStore::open(&path).expect("adopt claims"));
-        let repo = Repository::open(&path).expect("repo");
+        let repo = crate::git_repository::open(&path).expect("repo");
         let transaction_root = repo.commondir().join(TRANSACTION_ROOT_NAME);
         let transaction_before =
             fs::read(transaction_root.join(TRANSACTION_FILE)).expect("transaction before");
@@ -4300,7 +4301,7 @@ mod tests {
         let error = migrate_repository_state(&path, false).expect_err("checksum mismatch");
         assert!(error.to_string().contains("checksum mismatch"));
         assert_eq!(mode(&state), 0o755);
-        let repo = Repository::open(&path).expect("repo");
+        let repo = crate::git_repository::open(&path).expect("repo");
         assert!(!repo.commondir().join(TRANSACTION_ROOT_NAME).exists());
     }
 

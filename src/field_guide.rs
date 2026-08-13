@@ -17,6 +17,7 @@ use crate::{
     state_journal::JournalSpec,
 };
 use anyhow::{bail, Context, Result};
+#[cfg(test)]
 use git2::Repository;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::{
@@ -421,7 +422,7 @@ impl FieldGuideStore {
         repo_path: impl AsRef<Path>,
         limits: FieldGuideLimits,
     ) -> Result<Option<Self>> {
-        let repo = Repository::discover(repo_path.as_ref()).with_context(|| {
+        let repo = crate::git_repository::discover(repo_path.as_ref()).with_context(|| {
             format!(
                 "failed to discover repository from {}",
                 repo_path.as_ref().display()
@@ -911,7 +912,7 @@ fn curate_oldest_first(entries: &mut Vec<FieldGuideEntry>, entry_budget: usize) 
 }
 
 fn discover_repository_path(repo_path: &Path) -> Result<PathBuf> {
-    let repository = Repository::discover(repo_path)
+    let repository = crate::git_repository::discover(repo_path)
         .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
     Ok(repository
         .workdir()

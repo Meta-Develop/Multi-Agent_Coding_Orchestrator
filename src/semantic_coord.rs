@@ -17,6 +17,7 @@ use crate::{
     },
 };
 use anyhow::{bail, Context, Result};
+#[cfg(test)]
 use git2::Repository;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -196,7 +197,7 @@ struct PersistedSemanticState {
 
 impl SemanticIntentStore {
     pub fn open(repo_path: impl AsRef<Path>) -> Result<Self> {
-        let repo = Repository::discover(repo_path.as_ref()).with_context(|| {
+        let repo = crate::git_repository::discover(repo_path.as_ref()).with_context(|| {
             format!(
                 "failed to discover repository from {}",
                 repo_path.as_ref().display()

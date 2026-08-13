@@ -1070,7 +1070,7 @@ fn revalidate_external_source_with(
 ) -> Result<()> {
     expected.validate()?;
     let repository =
-        Repository::discover(repo).context("failed to discover guarded source repo")?;
+        crate::git_repository::discover(repo).context("failed to discover guarded source repo")?;
     let remote_url = remote_url(&repository, "origin")
         .context("external source revalidation requires canonical origin")?;
     let github_repository = github_repository_identity(&remote_url)?;
@@ -1973,7 +1973,7 @@ fn verify_prepared_commit(
     commit_id: Oid,
     expected_tree: Oid,
 ) -> Result<()> {
-    let repo = Repository::open(worktree_path).with_context(|| {
+    let repo = crate::git_repository::open(worktree_path).with_context(|| {
         format!(
             "failed to verify prepared worktree {}",
             worktree_path.display()
@@ -1998,7 +1998,7 @@ fn publication_report_from_preview(
     options: PrPublicationOptions,
     preview: MergeApplyPreview,
 ) -> Result<PrPublicationReport> {
-    let primary_repo = Repository::open(&preview.candidate.metadata.primary_repo_root)
+    let primary_repo = crate::git_repository::open(&preview.candidate.metadata.primary_repo_root)
         .context("failed to open primary repository")?;
     let base = options.squash_onto.clone().map(Ok).unwrap_or_else(|| {
         current_branch_name(&primary_repo).map(|name| name.unwrap_or_else(|| "HEAD".to_string()))
@@ -2341,7 +2341,8 @@ fn publish_pr_with_verified_authority(
     after_local.commit_id = published_commit.clone();
     after_local.head_id = after_local.preview.candidate.metadata.agent_head.clone();
 
-    let primary_repo = Repository::open(&repo_root).context("failed to open primary repository")?;
+    let primary_repo =
+        crate::git_repository::open(&repo_root).context("failed to open primary repository")?;
     let raw_remote_url = match after_local.forge {
         ForgeKind::Fake => None,
         ForgeKind::Git => Some(
@@ -2419,7 +2420,8 @@ fn publish_branch_pr_with_validation_evidence(
     report.commit_id = published_commit.clone();
     report.head_id = report.preview.candidate.metadata.agent_head.clone();
 
-    let primary_repo = Repository::open(&repo_root).context("failed to open primary repository")?;
+    let primary_repo =
+        crate::git_repository::open(&repo_root).context("failed to open primary repository")?;
     let raw_remote_url = publication_remote_url_for_forge(report.forge, &primary_repo)?;
     if options.squash_onto.is_some() || !options.exclude_paths.is_empty() {
         let materialized = materialize_branch_publication_import_commit(&options)?;
@@ -2486,7 +2488,7 @@ fn build_branch_publication_preview(
     validation_evidence: ValidationEvidenceBundle,
 ) -> Result<(MergeApplyPreview, Option<ExcludedReference>)> {
     let repo_root = discover_primary_repo_root(&options.repo)?;
-    let repo = Repository::open(&repo_root)
+    let repo = crate::git_repository::open(&repo_root)
         .with_context(|| format!("failed to open primary repository {}", repo_root.display()))?;
     let source_branch = options
         .from_branch
@@ -2662,7 +2664,7 @@ fn planned_squashed_import_commit_oid(
 
 fn materialize_branch_publication_import_commit(options: &PrPublicationOptions) -> Result<Oid> {
     let repo_root = discover_primary_repo_root(&options.repo)?;
-    let repo = Repository::open(&repo_root)
+    let repo = crate::git_repository::open(&repo_root)
         .with_context(|| format!("failed to open primary repository {}", repo_root.display()))?;
     let source_branch = options
         .from_branch
@@ -3187,7 +3189,7 @@ fn publication_transaction_failure(
 }
 
 fn discover_primary_repo_root(repo_path: &Path) -> Result<PathBuf> {
-    let repo = Repository::discover(repo_path)
+    let repo = crate::git_repository::discover(repo_path)
         .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
     repo.workdir()
         .map(Path::to_path_buf)
@@ -3342,7 +3344,7 @@ fn pr_body_with_publication_marker(body: &str, nonce: &str) -> Result<String> {
 }
 
 fn has_uncommitted_changes(worktree_path: &Path) -> Result<bool> {
-    let repo = Repository::open(worktree_path)
+    let repo = crate::git_repository::open(worktree_path)
         .with_context(|| format!("failed to open agent worktree {}", worktree_path.display()))?;
     let mut options = git2::StatusOptions::new();
     options.include_untracked(true).recurse_untracked_dirs(true);
@@ -3362,7 +3364,7 @@ fn commit_agent_changes(
         bail!("agent worktree has local changes but merge preview found no changed paths");
     }
 
-    let repo = Repository::open(worktree_path)
+    let repo = crate::git_repository::open(worktree_path)
         .with_context(|| format!("failed to open agent worktree {}", worktree_path.display()))?;
     let signature = repo.signature().context(
         "git identity missing; configure user.name and user.email before publishing uncommitted agent changes",
@@ -4345,7 +4347,7 @@ impl PublicationTransaction {
         let expected_pr_title = (report.forge == ForgeKind::Github).then(|| report.title.clone());
         let unmarked_pr_body =
             (report.forge == ForgeKind::Github).then(|| pr_body(&report.preview));
-        let repo = Repository::open(repo_root).with_context(|| {
+        let repo = crate::git_repository::open(repo_root).with_context(|| {
             format!(
                 "failed to open repository for publication journal {}",
                 repo_root.display()
@@ -5665,7 +5667,7 @@ impl PublicationGitContext {
         mut observe_runtime: impl FnMut(&Path),
     ) -> Result<Self> {
         let transport = publication_remote_transport(remote_url)?;
-        let repo = Repository::open(worktree_path).with_context(|| {
+        let repo = crate::git_repository::open(worktree_path).with_context(|| {
             format!(
                 "failed to open publication worktree {}",
                 worktree_path.display()
@@ -5727,7 +5729,7 @@ impl PublicationGitContext {
                     let common_objects = fs::canonicalize(repo.commondir().join("objects"))
                         .context("failed to resolve publication source object directory")?;
                     validate_publication_object_store_is_self_contained(&repo, &common_objects)?;
-                    let private = Repository::open_bare(&directory)
+                    let private = crate::git_repository::open_bare(&directory)
                         .context("failed to open private publication Git repository")?;
                     Some(materialize_publication_object_closure(
                         &repo,
@@ -5911,11 +5913,11 @@ impl PublicationGitContext {
 
     fn verify_object_seal(&self) -> Result<()> {
         if let Some(seal) = &self.object_seal {
-            let private = Repository::open_bare(&self.directory)
+            let private = crate::git_repository::open_bare(&self.directory)
                 .context("failed to reopen private publication object database")?;
             verify_private_publication_object_closure(&private, seal)?;
         } else {
-            let private = Repository::open_bare(&self.directory)
+            let private = crate::git_repository::open_bare(&self.directory)
                 .context("failed to inspect observation-only publication object database")?;
             let odb = private
                 .odb()
@@ -7306,7 +7308,7 @@ impl GhCommandContext {
         )?;
         let directory = runtime_directory.path().to_path_buf();
         let result = (|| -> Result<GhCommandContextSetup> {
-            let source = Repository::discover(worktree_path).with_context(|| {
+            let source = crate::git_repository::discover(worktree_path).with_context(|| {
                 format!(
                     "failed to discover gh source repository from {}",
                     worktree_path.display()
@@ -8499,7 +8501,7 @@ pub(crate) fn publish_github_source_comment(
     body: &str,
 ) -> Result<String> {
     source.validate()?;
-    let repository = Repository::discover(repo)
+    let repository = crate::git_repository::discover(repo)
         .context("failed to discover GitHub comment source repository")?;
     let remote_url = remote_url(&repository, "origin")
         .context("GitHub comment publication requires an origin remote")?;
@@ -8738,7 +8740,7 @@ fn github_comment_id_from_url(
 }
 
 fn create_github_issue(repo: &Path, title: &str, body: &str, labels: &[String]) -> Result<String> {
-    let repository = Repository::discover(repo).with_context(|| {
+    let repository = crate::git_repository::discover(repo).with_context(|| {
         format!(
             "failed to discover issue repository from {}",
             repo.display()
@@ -9299,7 +9301,7 @@ mod tests {
             execute_external_effect_exactly_once(repo.path(), first.clone(), &mut provider)
                 .expect("initial effect");
         assert_eq!(remote.lock().expect("remote").invoke_calls, 1);
-        let repository = Repository::open(repo.path()).expect("open effect repository");
+        let repository = crate::git_repository::open(repo.path()).expect("open effect repository");
         assert!(!repository
             .commondir()
             .join("maco/state/publication-transactions")
@@ -9345,7 +9347,7 @@ mod tests {
         execute_external_effect_exactly_once(repo.path(), request, &mut provider)
             .expect("snapshot-backed external effect");
 
-        let repository = Repository::open(repo.path()).expect("open effect repository");
+        let repository = crate::git_repository::open(repo.path()).expect("open effect repository");
         let root = repository
             .commondir()
             .join("maco/state")
@@ -9787,7 +9789,7 @@ mod tests {
     #[test]
     fn legacy_plaintext_publication_journal_requires_explicit_migration_without_mutation() {
         let repo = fake_effect_repo();
-        let repository = Repository::open(repo.path()).expect("open legacy test repo");
+        let repository = crate::git_repository::open(repo.path()).expect("open legacy test repo");
         let legacy_root = repository
             .commondir()
             .join("maco/state/publication-transactions/legacy");
@@ -9833,7 +9835,7 @@ mod tests {
         WorktreeManager::init_repository(&repo_path, "main").expect("init repository");
         fs::write(repo_path.join("README.md"), "# Publication fixture\n")
             .expect("write fixture README");
-        let repo = Repository::open(&repo_path).expect("open fixture repository");
+        let repo = crate::git_repository::open(&repo_path).expect("open fixture repository");
         let mut config = repo.config().expect("open fixture config");
         config
             .set_str("user.name", "maco test")
@@ -9894,7 +9896,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn commit_agent_readme(worktree: &Path, contents: &str, message: &str) -> Oid {
         fs::write(worktree.join("README.md"), contents).expect("write committed README");
-        let repo = Repository::open(worktree).expect("open agent repository");
+        let repo = crate::git_repository::open(worktree).expect("open agent repository");
         let mut index = repo.index().expect("open agent index");
         index
             .add_path(Path::new("README.md"))
@@ -9951,7 +9953,7 @@ mod tests {
         let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
         fs::write(agent_a.path.join("README.md"), "# Prepared dirty\n")
             .expect("edit dirty candidate");
-        let before_head = Repository::open(&agent_a.path)
+        let before_head = crate::git_repository::open(&agent_a.path)
             .expect("open agent repository")
             .head()
             .expect("agent HEAD")
@@ -10020,7 +10022,7 @@ mod tests {
         let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
         fs::write(agent_a.path.join("README.md"), "# Reviewed candidate\n")
             .expect("write reviewed candidate");
-        let before_head = Repository::open(&agent_a.path)
+        let before_head = crate::git_repository::open(&agent_a.path)
             .expect("open agent repository")
             .head()
             .expect("agent HEAD")
@@ -10044,7 +10046,7 @@ mod tests {
             .to_string()
             .contains("changed before candidate preparation"));
         assert_eq!(
-            Repository::open(&agent_a.path)
+            crate::git_repository::open(&agent_a.path)
                 .expect("reopen agent repository")
                 .head()
                 .expect("agent HEAD after drift")
@@ -10367,7 +10369,7 @@ mod tests {
         let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
         fs::write(agent_a.path.join("README.md"), "# Shared preview\n")
             .expect("edit agent worktree");
-        let agent_repo = Repository::open(&agent_a.path).expect("open agent repository");
+        let agent_repo = crate::git_repository::open(&agent_a.path).expect("open agent repository");
         let before_head = agent_repo
             .head()
             .expect("agent HEAD")

@@ -1,5 +1,6 @@
 use crate::safe_state::BoundedRegularReader;
 use anyhow::{bail, Context, Result};
+#[cfg(test)]
 use git2::Repository;
 use proc_macro2::{LineColumn, Span};
 use quote::ToTokens;
@@ -192,7 +193,7 @@ fn scan_repository_with_limits(
     repo_path: &Path,
     limits: SemanticScanLimits,
 ) -> Result<SemanticRepoMap> {
-    let repo = Repository::discover(repo_path)
+    let repo = crate::git_repository::discover(repo_path)
         .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
     let root = repo
         .workdir()

@@ -1031,7 +1031,8 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
     let primary_head = current_head_oid(&repo_path).expect("read primary HEAD");
     let child_head = current_head_oid(&records[0].path).expect("read assignment HEAD");
     assert_eq!(child_head, primary_head);
-    let child_repo = Repository::open(&records[0].path).expect("open assignment worktree");
+    let child_repo =
+        crate::git_repository::open(&records[0].path).expect("open assignment worktree");
     assert!(
         !repository_is_dirty(&child_repo, "inspect materialized assignment cleanliness")
             .expect("inspect materialized assignment cleanliness")
@@ -1068,7 +1069,7 @@ fn verified_run_entry_refuses_dirty_repository_before_assignment_creation() {
         .join(".maco/o2/runs/verified-capability-dirty-primary")
         .exists());
     assert!(!temp.path().join(".maco/worktrees/repo/child-a").exists());
-    assert!(Repository::open(&repo_path)
+    assert!(crate::git_repository::open(&repo_path)
         .expect("reopen dirty primary")
         .find_branch("maco/child-a", git2::BranchType::Local)
         .is_err());

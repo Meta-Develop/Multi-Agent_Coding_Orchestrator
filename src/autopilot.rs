@@ -44,6 +44,7 @@ use crate::{
     worktree::{ManagedWorktreeWriteLease, WorktreeManager},
 };
 use anyhow::{bail, Context, Result};
+#[cfg(test)]
 use git2::Repository;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -4201,7 +4202,7 @@ struct RepositoryPathBindings {
 
 impl RepositoryPathBindings {
     fn bind(repo_path: &Path) -> Result<Self> {
-        let repository = Repository::open(repo_path)
+        let repository = crate::git_repository::open(repo_path)
             .with_context(|| format!("failed to bind repository {}", repo_path.display()))?;
         let worktree = repository
             .workdir()
@@ -4354,7 +4355,7 @@ fn attempt_agent_id(run_id: &RunId, attempt: usize) -> Result<String> {
 }
 
 fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
-    let repo = Repository::discover(repo_path)
+    let repo = crate::git_repository::discover(repo_path)
         .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
     repo.workdir()
         .map(Path::to_path_buf)
@@ -4388,7 +4389,7 @@ fn sanitize_text(repo: &Path, text: &str) -> String {
     if let Some(parent) = repo.parent() {
         redactor = redactor.with_private_value("repository-parent", parent.display().to_string());
     }
-    if let Ok(repository) = Repository::open(repo) {
+    if let Ok(repository) = crate::git_repository::open(repo) {
         redactor = redactor
             .with_private_value("git-path", repository.path().display().to_string())
             .with_private_value(
@@ -5199,7 +5200,7 @@ mod tests {
         WorktreeManager::init_repository(&repo_path, "main").expect("init repository");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write README");
         fs::write(repo_path.join(".gitignore"), ".maco/\n.agents/\n").expect("write gitignore");
-        let repository = Repository::open(&repo_path).expect("open repository");
+        let repository = crate::git_repository::open(&repo_path).expect("open repository");
         let mut index = repository.index().expect("open index");
         index
             .add_path(Path::new("README.md"))
@@ -6159,7 +6160,7 @@ mod tests {
     fn autopilot_authenticated_follow_up_dispatch_sets_boolean_after_real_gates() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = create_committed_autopilot_repo(temp.path());
-        let head_before = Repository::open(&repo)
+        let head_before = crate::git_repository::open(&repo)
             .expect("open injected Autopilot repository")
             .head()
             .expect("read injected Autopilot HEAD")
@@ -6203,7 +6204,7 @@ mod tests {
             1
         );
         assert_eq!(
-            Repository::open(&repo)
+            crate::git_repository::open(&repo)
                 .expect("reopen injected Autopilot repository")
                 .head()
                 .expect("reread injected Autopilot HEAD")
@@ -6398,7 +6399,7 @@ mod tests {
         supervise::set_generated_follow_up_queue_observer(move |observation| {
             observed.borrow_mut().push(observation);
         });
-        let head_before = Repository::open(&repo)
+        let head_before = crate::git_repository::open(&repo)
             .expect("open cross-entrypoint repository")
             .head()
             .expect("read cross-entrypoint HEAD")
@@ -6523,7 +6524,7 @@ mod tests {
             primary_before
         );
         assert_eq!(
-            Repository::open(&repo)
+            crate::git_repository::open(&repo)
                 .expect("reopen cross-entrypoint repository")
                 .head()
                 .expect("reread cross-entrypoint HEAD")
@@ -6603,7 +6604,7 @@ mod tests {
         let repo = temp.path().join("repo");
         WorktreeManager::init_repository(&repo, "main").expect("init repo");
         fs::write(repo.join("README.md"), "baseline\n").expect("write README");
-        let repository = Repository::open(&repo).expect("open repo");
+        let repository = crate::git_repository::open(&repo).expect("open repo");
         let mut index = repository.index().expect("open index");
         index
             .add_path(Path::new("README.md"))
@@ -6981,7 +6982,7 @@ mod tests {
         let repo_path = root.join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repository");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write README");
-        let repo = Repository::open(&repo_path).expect("open repository");
+        let repo = crate::git_repository::open(&repo_path).expect("open repository");
         let mut index = repo.index().expect("open index");
         index
             .add_path(Path::new("README.md"))
@@ -7055,7 +7056,8 @@ mod tests {
         )
         .expect("edit candidate README");
 
-        let candidate_repo = Repository::open(&record.path).expect("open candidate repository");
+        let candidate_repo =
+            crate::git_repository::open(&record.path).expect("open candidate repository");
         let parent = candidate_repo
             .head()
             .expect("candidate HEAD")
@@ -7341,7 +7343,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn assert_no_remote_publication_state(repo: &Path) {
         assert!(!publication_transactions_path(repo).exists());
-        let repository = Repository::open(repo).expect("open primary repository");
+        let repository = crate::git_repository::open(repo).expect("open primary repository");
         let mut references = repository
             .references_glob("refs/remotes/*")
             .expect("list remote refs");

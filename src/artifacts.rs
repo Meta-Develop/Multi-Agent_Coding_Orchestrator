@@ -667,12 +667,13 @@ impl ArtifactRunWriter {
         let producer = producer.into();
         validate_producer(&producer)?;
         let repository = discover_artifact_repository(repo.as_ref())?;
-        let repo_handle = Repository::discover(&repository.worktree).with_context(|| {
-            format!(
-                "failed to reopen artifact repository {}",
-                repository.worktree.display()
-            )
-        })?;
+        let repo_handle =
+            crate::git_repository::discover(&repository.worktree).with_context(|| {
+                format!(
+                    "failed to reopen artifact repository {}",
+                    repository.worktree.display()
+                )
+            })?;
         let source_revision = repo_handle
             .head()
             .ok()
@@ -2673,7 +2674,7 @@ fn check_run_dir_available(repo: &Path, family: RunArtifactFamily, run_id: &RunI
 }
 
 fn discover_artifact_repository(repo_path: &Path) -> Result<ArtifactRepository> {
-    let repo = Repository::discover(repo_path)
+    let repo = crate::git_repository::discover(repo_path)
         .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
     artifact_repository_from_open(&repo)
 }
@@ -2862,7 +2863,7 @@ fn verify_finalization_marker_key_binding(
 fn registered_artifact_repositories(
     repository: &ArtifactRepository,
 ) -> Result<Vec<ArtifactRepository>> {
-    let common_repo = Repository::open(&repository.common_dir).with_context(|| {
+    let common_repo = crate::git_repository::open(&repository.common_dir).with_context(|| {
         format!(
             "failed to open common repository while scanning artifact key scope {}",
             repository.common_dir.display()
@@ -2916,7 +2917,7 @@ fn registered_artifact_repositories(
         let worktree_root = SafeRoot::open_existing(worktree.path()).with_context(|| {
             format!("registered linked worktree '{name}' is not safely reachable without links")
         })?;
-        let linked_repo = Repository::open(worktree_root.path())
+        let linked_repo = crate::git_repository::open(worktree_root.path())
             .with_context(|| format!("failed to open registered linked worktree '{name}'"))?;
         let linked = artifact_repository_from_open(&linked_repo)
             .with_context(|| format!("failed to bind registered linked worktree '{name}'"))?;
@@ -6173,7 +6174,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
         let workdir = repo.workdir().expect("workdir");
         fs::write(workdir.join("README.md"), "# Test\n").expect("README");
         let mut index = repo.index().expect("index");

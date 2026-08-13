@@ -512,7 +512,7 @@ mod tests {
         )
         .expect("create tamper WAL");
         let physical_id = wal.identity().run_id.clone();
-        let repository = Repository::open(path).expect("reopen tamper repository");
+        let repository = crate::git_repository::open(path).expect("reopen tamper repository");
         let record = repository
             .commondir()
             .join("maco/state")

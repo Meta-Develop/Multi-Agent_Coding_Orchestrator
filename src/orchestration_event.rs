@@ -1327,7 +1327,7 @@ mod tests {
         let repo_path = temp.path().join("repo");
         Repository::init(&repo_path).expect("initialize repository");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write README");
-        let repo = Repository::open(&repo_path).expect("open repository");
+        let repo = crate::git_repository::open(&repo_path).expect("open repository");
         let mut index = repo.index().expect("open index");
         index
             .add_path(Path::new("README.md"))

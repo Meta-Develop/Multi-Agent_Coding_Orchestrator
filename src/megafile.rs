@@ -240,7 +240,7 @@ impl MegafileStore {
         thresholds: MegafileThresholds,
     ) -> Result<Self> {
         thresholds.validate()?;
-        let repo = git2::Repository::discover(repo_path.as_ref()).with_context(|| {
+        let repo = crate::git_repository::discover(repo_path.as_ref()).with_context(|| {
             format!(
                 "failed to discover repository from {}",
                 repo_path.as_ref().display()
@@ -266,7 +266,7 @@ impl MegafileStore {
         thresholds: MegafileThresholds,
     ) -> Result<Option<Self>> {
         thresholds.validate()?;
-        let repo = git2::Repository::discover(repo_path.as_ref()).with_context(|| {
+        let repo = crate::git_repository::discover(repo_path.as_ref()).with_context(|| {
             format!(
                 "failed to discover repository from {}",
                 repo_path.as_ref().display()

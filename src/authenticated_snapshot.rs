@@ -2409,7 +2409,7 @@ mod tests {
         .err()
         .expect("quota+1 logical store must fail before creation");
         assert!(error.to_string().contains("capacity"));
-        let repo = Repository::open(&path).expect("repo");
+        let repo = crate::git_repository::open(&path).expect("repo");
         let root = repo
             .commondir()
             .join("maco/state")
@@ -2432,7 +2432,7 @@ mod tests {
             .expect("fill logical quota");
             drop(store);
         }
-        let repo = Repository::open(&path).expect("repo");
+        let repo = crate::git_repository::open(&path).expect("repo");
         let root_path = repo
             .commondir()
             .join("maco/state")
@@ -2468,7 +2468,7 @@ mod tests {
             .expect("fill logical quota");
             drop(store);
         }
-        let repo = Repository::open(&path).expect("repo");
+        let repo = crate::git_repository::open(&path).expect("repo");
         let root_path = repo
             .commondir()
             .join("maco/state")
@@ -2533,7 +2533,7 @@ mod tests {
             .expect("fill many-logical namespace");
             drop(store);
         }
-        let repo = Repository::open(&path).expect("repo");
+        let repo = crate::git_repository::open(&path).expect("repo");
         let root_path = repo
             .commondir()
             .join("maco/state")
@@ -2858,7 +2858,7 @@ mod tests {
         )
         .err()
         .expect("leave pending initialization");
-        let repo = Repository::open(&path).expect("repo");
+        let repo = crate::git_repository::open(&path).expect("repo");
         let root_path = repo
             .commondir()
             .join("maco/state")
@@ -2944,7 +2944,7 @@ mod tests {
         )
         .err()
         .expect("injected post-locator crash");
-        let repo = Repository::open(&path).expect("repo");
+        let repo = crate::git_repository::open(&path).expect("repo");
         let root = repo
             .commondir()
             .join("maco/state")

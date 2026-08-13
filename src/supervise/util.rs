@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
-    let repo = Repository::discover(repo_path)
+    let repo = crate::git_repository::discover(repo_path)
         .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
     repo.workdir()
         .map(Path::to_path_buf)
