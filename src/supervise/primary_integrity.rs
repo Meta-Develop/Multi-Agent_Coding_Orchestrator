@@ -19,7 +19,7 @@ pub(super) fn capture_primary_scope_snapshot(
                             .iter()
                             .any(|claim| path_is_covered_by_claim(&candidate, claim))
                     })
-                    .map(|candidate| repo_relative_path_from_git_bytes(candidate))
+                    .map(repo_relative_path_from_git_bytes)
             })
             .collect::<BTreeSet<_>>();
         if !dirty.is_empty() {
