@@ -360,6 +360,7 @@ fn environment_preflight_refusal_is_typed_terminal_and_not_malformed_or_containm
         external_command: &command,
         worktree_path: Path::new("."),
         child_base_head: &child_base_head,
+        observed_changed_paths: None,
         worker_journals: &worker_journals,
         evidence_only_source: None,
     });

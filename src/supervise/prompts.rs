@@ -259,6 +259,44 @@ Rules:
     )
 }
 
+fn child_cacheable_prefix_for_target(
+    execution_target: Option<&SupervisorExecutionTarget>,
+) -> String {
+    let prefix = child_orchestrator_cacheable_prefix();
+    if execution_target.is_some() {
+        prefix
+            .replace(
+                "Primary worktree mutation is forbidden. Work only in the assigned child worktree identified in the assignment-specific context below.",
+                "This assignment explicitly targets the existing primary checkout. Mutation authority is limited to the exact declared primary-worktree claim paths in the assignment-specific context below.",
+            )
+            .replace(
+                "- Do not mutate the primary worktree.",
+                "- The primary checkout is the assigned workspace. Mutate only the exact declared claim paths; do not stage, commit, or change Git metadata.",
+            )
+    } else {
+        prefix
+    }
+}
+
+fn worker_cacheable_prefix_for_target(
+    execution_target: Option<&SupervisorExecutionTarget>,
+) -> String {
+    let prefix = worker_cacheable_prefix();
+    if execution_target.is_some() {
+        prefix
+            .replace(
+                "- Edit only inside your assigned worktree and only inside claimed paths.\n- Do not mutate the primary worktree.",
+                "- The assigned worktree is the existing primary checkout. Edit only the exact declared primary-worktree claim paths; do not stage, commit, or change Git metadata.",
+            )
+            .replace(
+                "This typed evidence does not bypass the isolated worktree, hard claim, execution journal, validation, terminal audit, or later merge gates.",
+                "This typed evidence does not bypass the hard claim, exact primary-worktree scope, execution journal, validation, or terminal audit gates.",
+            )
+    } else {
+        prefix
+    }
+}
+
 pub(super) fn review_auditor_cacheable_prefix() -> String {
     format!(
         r#"You are a terminal read-only review auditor in an opt-in local Codex CLI supervised run.
@@ -514,6 +552,7 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
 ) -> Result<RenderedPromptWithMeasurements> {
     let ChildOrchestratorPromptContext {
         plan,
+        execution_target,
         assignment,
         run_dir,
         worktree,
@@ -537,6 +576,7 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
             let rendered = worker_prompt_with_field_guide(
                 WorkerPromptRenderContext {
                     plan,
+                    execution_target,
                     orchestrator: assignment,
                     worker,
                     metadata: &metadata,
@@ -546,7 +586,7 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
                 },
                 field_guide,
             )?;
-            let invariant_prefix = worker_cacheable_prefix();
+            let invariant_prefix = worker_cacheable_prefix_for_target(execution_target);
             let measurement = PromptByteMeasurement::new(
                 PromptMeasurementRole::TerminalWorker,
                 &worker.id,
@@ -589,13 +629,22 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
         role_model_selection(plan, AgentRole::ChildOrchestrator);
     let (worker_model, worker_reasoning_effort) = role_model_selection(plan, AgentRole::Worker);
     let consultation_section = consultation_prompt_section(consultant);
-    let cacheable_prefix = child_orchestrator_cacheable_prefix();
+    let cacheable_prefix = child_cacheable_prefix_for_target(execution_target);
+    let execution_target_context = execution_target
+        .map(|target| {
+            format!(
+                "- Execution target: {} (declared scope: {})\n",
+                target.kind_name(),
+                display_paths(target.claim_paths())
+            )
+        })
+        .unwrap_or_default();
     let prompt = format!(
         r#"{cacheable_prefix}{role_prefix}{field_guide_section}
 
 Assignment-specific context:
 - Assigned child worktree: {worktree_path}
-- Child orchestrator id: {child_id}
+{execution_target_context}- Child orchestrator id: {child_id}
 - Megafile decomposition worker targets: {decomposition_targets}
 - Assigned paths: {assigned_paths}
 - Semantic symbols: {semantic_symbols}
@@ -638,6 +687,7 @@ Review auditor prompt template:
         field_guide_section = field_guide.section,
         worktree_path = worktree.path.display(),
         child_id = assignment.id,
+        execution_target_context = execution_target_context,
         decomposition_targets = display_decomposition_targets(assignment, assignment_metadata),
         assigned_paths = display_paths(&assignment.assigned_paths),
         semantic_symbols = assignment.semantic_symbols.join(", "),
@@ -739,6 +789,7 @@ pub(super) fn worker_prompt_with_incoming_root(
     worker_prompt_with_field_guide(
         WorkerPromptRenderContext {
             plan,
+            execution_target: None,
             orchestrator,
             worker,
             metadata,
@@ -756,6 +807,7 @@ pub(super) fn worker_prompt_with_field_guide(
 ) -> Result<String> {
     let WorkerPromptRenderContext {
         plan,
+        execution_target,
         orchestrator,
         worker,
         metadata,
@@ -797,7 +849,7 @@ Supervisor task:
 Worker assignment JSON:
 {worker_json}
 "#,
-        cacheable_prefix = worker_cacheable_prefix(),
+        cacheable_prefix = worker_cacheable_prefix_for_target(execution_target),
         role_prefix = role_prefix,
         field_guide_section = field_guide.section,
         orchestrator_id = orchestrator.id,
@@ -1333,6 +1385,7 @@ mod regression_tests {
         let worker_prompt = worker_prompt_with_field_guide(
             WorkerPromptRenderContext {
                 plan: &plan,
+                execution_target: None,
                 orchestrator: &assignment,
                 worker: &assignment.worker_assignments[0],
                 metadata: &worker_metadata,
@@ -1365,6 +1418,7 @@ mod regression_tests {
         let child_prompt = child_orchestrator_prompt_with_incoming_root_and_field_guide(
             ChildOrchestratorPromptContext {
                 plan: &plan,
+                execution_target: None,
                 assignment: &assignment,
                 run_dir,
                 worktree: &worktree,

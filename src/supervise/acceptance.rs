@@ -13,6 +13,7 @@ pub(super) fn collect_child_report(
         child_base_head,
         worker_journals,
         evidence_only_source,
+        observed_changed_paths,
     } = context;
     if external_run.environment_blocked() {
         return (
@@ -131,7 +132,13 @@ pub(super) fn collect_child_report(
     }
     validate_worker_report_delegation_attestations(assignment, report_path, &mut report);
     if evidence_only_source.is_none() {
-        verify_child_report_paths(assignment, worktree_path, child_base_head, &mut report);
+        verify_child_report_paths(
+            assignment,
+            worktree_path,
+            child_base_head,
+            observed_changed_paths,
+            &mut report,
+        );
     }
     prepare_licensed_breakage_review(assignment, &mut report);
     validate_worker_report_evidence(assignment, assignment_metadata, report_path, &mut report);
@@ -965,6 +972,37 @@ pub(super) fn inspect_supervisor_candidate(
     })
 }
 
+pub(super) fn inspect_primary_scope_candidate(
+    repo: &Path,
+    assignment: &OrchestratorAssignment,
+    baseline: &PrimaryScopeSnapshot,
+    runtime: SupervisorExecutionRuntime,
+) -> Result<SupervisorCandidateInspection> {
+    let current = capture_primary_scope_snapshot(repo, &assignment.assigned_paths, false, runtime)?;
+    let changed_paths = primary_scope_changed_paths(baseline, &current);
+    let framed = format!(
+        "maco-primary-worktree-candidate-v1\nassignment={}\nbaseline={baseline:?}\ncurrent={current:?}",
+        assignment.id
+    );
+    let diff_oid = Oid::hash_object(ObjectType::Blob, framed.as_bytes())
+        .context("failed to hash primary-worktree candidate binding")?;
+    let head = current_head_oid(repo)?.to_string();
+    let binding = CandidateValidationBinding {
+        version: VALIDATION_BINDING_VERSION,
+        agent_id: assignment.id.clone(),
+        primary_head: Some(head.clone()),
+        agent_head: Some(head.clone()),
+        merge_base: Some(head),
+        diff_oid: diff_oid.to_string(),
+    }
+    .canonicalized()
+    .context("primary-worktree candidate binding is invalid")?;
+    Ok(SupervisorCandidateInspection {
+        binding,
+        changed_paths,
+    })
+}
+
 pub(super) fn bind_supervisor_decomposition_candidate(
     repo: &Path,
     assignment: &OrchestratorAssignment,
@@ -1206,10 +1244,14 @@ fn verify_child_report_paths(
     assignment: &OrchestratorAssignment,
     worktree_path: &Path,
     child_base_head: &Oid,
+    observed_changed_paths: Option<&[PathBuf]>,
     report: &mut OrchestratorReviewReport,
 ) {
     let reported_paths = normalize_paths(report.files_changed.clone());
-    let actual_paths = match collect_paths_changed_since_base(worktree_path, child_base_head) {
+    let actual_paths = match observed_changed_paths
+        .map(|paths| Ok(paths.to_vec()))
+        .unwrap_or_else(|| collect_paths_changed_since_base(worktree_path, child_base_head))
+    {
         Ok(paths) => paths,
         Err(error) => {
             report.status = ReviewStatus::Failed;

@@ -1,5 +1,231 @@
 use super::*;
 
+pub(super) fn capture_primary_scope_snapshot(
+    repo_path: &Path,
+    claim_paths: &[PathBuf],
+    require_git_clean: bool,
+    runtime: SupervisorExecutionRuntime,
+) -> Result<PrimaryScopeSnapshot> {
+    if require_git_clean {
+        let status = primary_status_snapshot(repo_path, runtime)?;
+        let dirty = status
+            .iter()
+            .filter_map(|(path, state)| {
+                std::iter::once(path.as_slice())
+                    .chain(state.original_path.as_deref())
+                    .find(|candidate| {
+                        let candidate = repo_relative_path_from_git_bytes(candidate);
+                        claim_paths
+                            .iter()
+                            .any(|claim| path_is_covered_by_claim(&candidate, claim))
+                    })
+                    .map(|candidate| repo_relative_path_from_git_bytes(candidate))
+            })
+            .collect::<BTreeSet<_>>();
+        if !dirty.is_empty() {
+            bail!(
+                "execution_target.kind='primary_worktree' refuses Git-visible dirty state inside declared claim_paths: {}",
+                display_paths(&dirty.into_iter().collect::<Vec<_>>())
+            );
+        }
+    }
+
+    let canonical_repo = fs::canonicalize(repo_path)
+        .with_context(|| format!("failed to resolve primary checkout {}", repo_path.display()))?;
+    let mut files = BTreeMap::new();
+    let mut aggregate_bytes = 0usize;
+    for claim in claim_paths {
+        validate_primary_scope_parent_chain(&canonical_repo, claim)?;
+        let absolute = canonical_repo.join(claim);
+        let state = match fs::symlink_metadata(&absolute) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!(
+                    "execution_target.kind='primary_worktree' claim path '{}' is a symlink; exact-file primary execution refuses link traversal",
+                    claim.display()
+                )
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                bail!(
+                    "execution_target.kind='primary_worktree' claim path '{}' is a directory; declare exact files instead of a subtree",
+                    claim.display()
+                )
+            }
+            Ok(metadata) if metadata.is_file() => {
+                let bytes = read_primary_scope_file(&absolute)?;
+                aggregate_bytes = aggregate_bytes
+                    .checked_add(bytes.len())
+                    .context("primary-worktree scope byte count overflowed")?;
+                if aggregate_bytes > MAX_PRIMARY_WORKTREE_SCOPE_BYTES {
+                    bail!(
+                        "execution_target.kind='primary_worktree' claimed files exceed the {} byte snapshot limit",
+                        MAX_PRIMARY_WORKTREE_SCOPE_BYTES
+                    );
+                }
+                PrimaryScopedFileState::File {
+                    id: Oid::hash_object(ObjectType::Blob, &bytes)
+                        .context("failed to hash primary-worktree claimed file")?,
+                    mode: primary_path_mode(&metadata),
+                    bytes,
+                }
+            }
+            Ok(metadata) => {
+                bail!(
+                    "execution_target.kind='primary_worktree' claim path '{}' has unsupported file type and mode {:o}",
+                    claim.display(),
+                    primary_path_mode(&metadata)
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                PrimaryScopedFileState::Missing
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect primary-worktree claim {}",
+                        claim.display()
+                    )
+                })
+            }
+        };
+        files.insert(claim.clone(), state);
+    }
+    Ok(PrimaryScopeSnapshot { files })
+}
+
+fn validate_primary_scope_parent_chain(canonical_repo: &Path, claim: &Path) -> Result<()> {
+    let mut cursor = canonical_repo.to_path_buf();
+    let component_count = claim.components().count();
+    for component in claim.components().take(component_count.saturating_sub(1)) {
+        cursor.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&cursor).with_context(|| {
+            format!(
+                "primary-worktree claim parent does not exist or is inaccessible: {}",
+                cursor.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!(
+                "primary-worktree claim parent must be a non-symlink directory: {}",
+                cursor.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_primary_scope_file(path: &Path) -> Result<Vec<u8>> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    read_primary_scope_file_from_handle(options.open(path)?, path)
+}
+
+#[cfg(not(unix))]
+fn read_primary_scope_file(path: &Path) -> Result<Vec<u8>> {
+    read_primary_scope_file_from_handle(fs::File::open(path)?, path)
+}
+
+fn read_primary_scope_file_from_handle(mut file: fs::File, path: &Path) -> Result<Vec<u8>> {
+    let limit = u64::try_from(MAX_PRIMARY_WORKTREE_SCOPE_BYTES)
+        .context("primary-worktree scope limit does not fit u64")?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read claimed file {}", path.display()))?;
+    if bytes.len() > MAX_PRIMARY_WORKTREE_SCOPE_BYTES {
+        bail!(
+            "primary-worktree claimed file {} exceeds the {} byte snapshot limit",
+            path.display(),
+            MAX_PRIMARY_WORKTREE_SCOPE_BYTES
+        );
+    }
+    Ok(bytes)
+}
+
+pub(super) fn primary_scope_changed_paths(
+    before: &PrimaryScopeSnapshot,
+    after: &PrimaryScopeSnapshot,
+) -> Vec<PathBuf> {
+    before
+        .files
+        .keys()
+        .chain(after.files.keys())
+        .filter(|path| before.files.get(*path) != after.files.get(*path))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+pub(super) fn primary_integrity_changes_outside_scope(
+    changes: &PrimaryIntegrityChanges,
+    claim_paths: &[PathBuf],
+) -> PrimaryIntegrityChanges {
+    let paths = changes
+        .paths
+        .iter()
+        .filter(|path| {
+            !claim_paths
+                .iter()
+                .any(|claim| path_is_covered_by_claim(path, claim))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let details = (!paths.is_empty()).then(|| {
+        vec![format!(
+            "primary worktree changed outside declared execution_target claim_paths: {}",
+            display_paths(&paths)
+        )]
+    });
+    PrimaryIntegrityChanges {
+        details: details.unwrap_or_default(),
+        paths,
+    }
+}
+
+pub(super) fn render_primary_scope_diff(
+    before: &PrimaryScopeSnapshot,
+    after: &PrimaryScopeSnapshot,
+) -> Result<String> {
+    let mut rendered = String::new();
+    for path in primary_scope_changed_paths(before, after) {
+        let before_state = before.files.get(&path);
+        let after_state = after.files.get(&path);
+        rendered.push_str(&format!(
+            "--- {} ({})\n+++ {} ({})\n",
+            path.display(),
+            primary_scope_state_label(before_state),
+            path.display(),
+            primary_scope_state_label(after_state)
+        ));
+        if let Some(PrimaryScopedFileState::File { bytes, .. }) = after_state {
+            match std::str::from_utf8(bytes) {
+                Ok(text) => rendered.push_str(text),
+                Err(_) => rendered.push_str("<binary content omitted>\n"),
+            }
+            if !rendered.ends_with('\n') {
+                rendered.push('\n');
+            }
+        }
+        if rendered.len() > REVIEW_LENS_REQUEST_LIMIT_BYTES {
+            bail!("primary-worktree scoped diff exceeds the review-lens input limit");
+        }
+    }
+    Ok(rendered)
+}
+
+fn primary_scope_state_label(state: Option<&PrimaryScopedFileState>) -> String {
+    match state {
+        Some(PrimaryScopedFileState::Missing) | None => "missing".to_string(),
+        Some(PrimaryScopedFileState::File { id, mode, .. }) => {
+            format!("blob {id} mode {mode:o}")
+        }
+    }
+}
+
 pub(super) fn primary_worktree_snapshot(
     repo_path: &Path,
     runtime: SupervisorExecutionRuntime,

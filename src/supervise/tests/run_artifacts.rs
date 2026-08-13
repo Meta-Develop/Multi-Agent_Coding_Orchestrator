@@ -1560,6 +1560,7 @@ fn accepted_audited_suggestions_append_with_trusted_provenance_and_redacted_jour
     let worker_prompt = worker_prompt_with_field_guide(
         WorkerPromptRenderContext {
             plan: &plan,
+            execution_target: None,
             orchestrator: &assignment,
             worker,
             metadata: &WorkerAssignmentMetadata::default(),

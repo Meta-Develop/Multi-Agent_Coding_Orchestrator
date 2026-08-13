@@ -8,13 +8,7 @@ fn validate_execution_target_pre_dispatch(
     validate_execution_target_opt_in(
         loaded.plan_metadata.execution_target.as_ref(),
         allow_primary_worktree,
-    )?;
-    if loaded.plan_metadata.execution_target.is_some() {
-        bail!(
-            "execution_target.kind='primary_worktree' passed double opt-in validation, but primary-worktree dispatch is not available in this build"
-        );
-    }
-    Ok(())
+    )
 }
 
 pub fn supervisor_plan_from_task_file(
@@ -213,6 +207,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
         assignments,
     };
     let metadata = SupervisorPlanMetadata {
+        execution_target: None,
         spec_fragment_ids,
         spec_fragment_ids_by_assignment,
         assignment_schedule,
@@ -222,7 +217,6 @@ fn supervisor_plan_and_consultant_from_goal_spec(
         admission: SupervisorAdmissionConfig::default(),
         evidence_only_reaudit: None,
         generated_follow_up: None,
-        execution_target: None,
     };
     let (plan, plan_metadata) = validate_supervisor_plan(plan, metadata)?;
     Ok(LoadedSupervisorPlan {
@@ -1010,10 +1004,10 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_work
     validate_max_concurrent_children(max_concurrent_children)?;
     let outer_run_id = options.run_id.clone();
     let repo = discover_repo_root(&options.repo)?;
-    let manager = WorktreeManager::new(&repo);
-    let cleanliness = manager.acquire_repository_cleanliness()?;
     let loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
     validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
+    let manager = WorktreeManager::new(&repo);
+    let cleanliness = manager.acquire_repository_cleanliness()?;
     let source_loaded = loaded.clone();
     let template = options.clone();
     let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
@@ -1195,8 +1189,6 @@ fn run_supervisor_plan_file_cascade_with_gate(
     let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
     validate_max_concurrent_children(max_concurrent_children)?;
     let repo = discover_repo_root(&options.repo)?;
-    let manager = WorktreeManager::new(&repo);
-    let cleanliness = manager.acquire_repository_cleanliness()?;
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
     validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
     if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
@@ -1220,16 +1212,29 @@ fn run_supervisor_plan_file_cascade_with_gate(
     if let Some(source_dispatch_started) = source_dispatch_started {
         source_dispatch_started.store(true, Ordering::SeqCst);
     }
-    let source_report = run_supervisor_plan_with_runner_and_creation(
-        loaded,
-        options,
-        max_concurrent_children,
-        SupervisorExecutionRuntime::Verified,
-        SupervisorWorktreeCreation::Bound(&cleanliness),
-        runtime_model_catalog,
-        external_runner,
-    )?;
-    drop(cleanliness);
+    let source_report = if source_loaded.plan_metadata.execution_target.is_some() {
+        run_supervisor_plan_with_runner_and_creation(
+            loaded,
+            options,
+            max_concurrent_children,
+            SupervisorExecutionRuntime::Verified,
+            SupervisorWorktreeCreation::PrimaryWorktree,
+            runtime_model_catalog,
+            external_runner,
+        )?
+    } else {
+        let manager = WorktreeManager::new(&repo);
+        let cleanliness = manager.acquire_repository_cleanliness()?;
+        run_supervisor_plan_with_runner_and_creation(
+            loaded,
+            options,
+            max_concurrent_children,
+            SupervisorExecutionRuntime::Verified,
+            SupervisorWorktreeCreation::Bound(&cleanliness),
+            runtime_model_catalog,
+            external_runner,
+        )?
+    };
     run_generated_follow_up_cascade(
         &repo,
         &source_loaded,
@@ -1256,10 +1261,10 @@ fn run_supervisor_goal_spec_with_max_concurrent_children(
 ) -> Result<SupervisorFinalReport> {
     validate_max_concurrent_children(max_concurrent_children)?;
     let repo = discover_repo_root(&options.repo)?;
-    let manager = WorktreeManager::new(&repo);
-    let cleanliness = manager.acquire_repository_cleanliness()?;
     let loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
+    let manager = WorktreeManager::new(&repo);
+    let cleanliness = manager.acquire_repository_cleanliness()?;
     let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
     run_supervisor_plan_with_runner_and_creation(
         loaded,

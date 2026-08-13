@@ -436,6 +436,14 @@ fn validate_primary_worktree_execution_target(
             MAX_PRIMARY_WORKTREE_CLAIM_PATHS
         );
     }
+    for path in claim_paths.iter() {
+        if path.as_os_str().is_empty() || path == Path::new(".") {
+            bail!(
+                "execution_target.kind='primary_worktree' claim path '{}' is over-broad; name an exact file below a top-level directory",
+                path.display()
+            );
+        }
+    }
     *claim_paths = normalize_paths(std::mem::take(claim_paths))
         .context("execution_target.kind='primary_worktree' claim_paths are invalid")?;
     for path in claim_paths.iter() {

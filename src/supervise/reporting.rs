@@ -1,5 +1,47 @@
 use super::*;
 
+pub(super) fn apply_execution_target_reporting(
+    report: &mut SupervisorFinalReport,
+    execution_target: Option<&SupervisorExecutionTarget>,
+) {
+    let Some(target) = execution_target else {
+        return;
+    };
+    report.findings.push(Finding {
+        severity: FindingSeverity::Info,
+        message: format!(
+            "supervise run explicitly targeted the existing primary checkout with declared scope: {}",
+            display_paths(target.claim_paths())
+        ),
+        paths: target.claim_paths().to_vec(),
+    });
+    if report.success && report.publishable {
+        report.remaining_risk = format!(
+            "accepted changes already reside in the existing primary checkout and were bounded to declared scope: {}",
+            display_paths(target.claim_paths())
+        );
+        report.next_safe_action =
+            "review the in-place primary-checkout changes; no separate child-worktree merge or apply step exists for this run"
+                .to_string();
+    } else if report.success {
+        report.remaining_risk = format!(
+            "the simulation targeted primary-worktree semantics for declared scope {} but is not publishable evidence",
+            display_paths(target.claim_paths())
+        );
+        report.next_safe_action =
+            "rerun the same double-opted-in primary-worktree plan with the verified Codex runtime before acceptance"
+                .to_string();
+    } else {
+        report.remaining_risk = format!(
+            "the failed run targeted the existing primary checkout within declared scope {}; inspect that scope before retrying",
+            display_paths(target.claim_paths())
+        );
+        report.next_safe_action =
+            "inspect the declared primary-worktree scope and authenticated run evidence before deciding whether a new in-place run is safe"
+                .to_string();
+    }
+}
+
 pub(super) fn read_child_report(
     contents: Option<&[u8]>,
     display_path: &Path,

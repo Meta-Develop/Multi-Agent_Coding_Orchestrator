@@ -177,6 +177,7 @@ fn o1_worker_and_auditor_production_prompts_place_the_nonce_frame_after_role_met
     let child_prompt = child_orchestrator_prompt_with_incoming_root_and_field_guide(
         ChildOrchestratorPromptContext {
             plan: &plan,
+            execution_target: None,
             assignment: &assignment,
             run_dir: Path::new("/tmp/maco-run"),
             worktree: &worktree,
@@ -212,6 +213,7 @@ fn o1_worker_and_auditor_production_prompts_place_the_nonce_frame_after_role_met
     let worker_prompt = worker_prompt_with_field_guide(
         WorkerPromptRenderContext {
             plan: &plan,
+            execution_target: None,
             orchestrator: &assignment,
             worker,
             metadata: &worker_metadata,

@@ -149,6 +149,54 @@ pub(super) fn provision_mandatory_worktree_controls(
     Ok(controls)
 }
 
+/// Binds the existing primary checkout without provisioning any control
+/// directory. Primary-target execution must not create `.agents`, `.codex`, or
+/// other out-of-scope paths as a side effect of supervisor bootstrap.
+#[cfg(unix)]
+pub(super) fn bind_primary_worktree_controls(
+    workspace_path: &Path,
+) -> Result<MandatoryWorktreeControls> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let workspace = options
+        .open(workspace_path)
+        .context("failed to bind primary worktree root")?;
+    let path_metadata =
+        fs::symlink_metadata(workspace_path).context("failed to inspect primary worktree root")?;
+    let workspace_identity = worktree_control_identity_from_metadata(&workspace.metadata()?);
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.is_dir()
+        || worktree_control_identity_from_metadata(&path_metadata) != workspace_identity
+    {
+        bail!("primary worktree root is not an identity-stable non-symlink directory");
+    }
+    let git_identity = direct_worktree_control_identity(&workspace, ".git")
+        .context("primary worktree .git metadata must already exist")?;
+    if git_identity.file_type != crate::safe_state::unsigned_to_u32(libc::S_IFREG)
+        && git_identity.file_type != crate::safe_state::unsigned_to_u32(libc::S_IFDIR)
+    {
+        bail!("primary worktree .git marker must be a regular file or directory");
+    }
+    let controls = MandatoryWorktreeControls {
+        workspace_path: workspace_path.to_path_buf(),
+        workspace,
+        workspace_identity,
+        git_identity,
+        directories: Vec::new(),
+    };
+    controls.revalidate()?;
+    Ok(controls)
+}
+
+#[cfg(not(unix))]
+pub(super) fn bind_primary_worktree_controls(
+    _workspace_path: &Path,
+) -> Result<MandatoryWorktreeControls> {
+    bail!("primary-worktree control binding is unsupported on this platform")
+}
+
 #[cfg(not(unix))]
 pub(super) fn provision_mandatory_worktree_controls(
     _workspace_path: &Path,

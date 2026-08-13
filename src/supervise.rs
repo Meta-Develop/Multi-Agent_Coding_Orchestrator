@@ -33,6 +33,7 @@ use crate::{
     merge::{
         collect_agent_result_with_evidence_and_write_lease, ApplyBlockerDetail,
         CandidateValidationBinding, MergeCollectOptions, ValidationEvidenceBundle,
+        VALIDATION_BINDING_VERSION,
     },
     orchestration_event::{
         FieldGuideEventKind, OrchestrationEventJournal, OrchestrationEventKind, OrchestrationRole,
@@ -91,6 +92,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fmt, fs,
+    io::Read,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     str::FromStr,
@@ -231,6 +233,7 @@ const SPARSE_DIRECTORY_MODE: u32 = 0o040000;
 const MAX_NESTED_REPOSITORY_DEPTH: usize = 32;
 const MAX_DIRECTORY_FINGERPRINT_DEPTH: usize = 256;
 const MAX_PRIMARY_WORKTREE_CLAIM_PATHS: usize = 16;
+const MAX_PRIMARY_WORKTREE_SCOPE_BYTES: usize = 1024 * 1024;
 const BREAKER_RECOVERY_GUIDANCE: &str = "inspect the breaker window and child evidence, correct the repeated coordination failure, then start a new supervise run; pending assignments were not launched";
 const LOCAL_RUNTIME_ROOTS: &[&[u8]] = &[
     b".maco",
@@ -2500,6 +2503,7 @@ pub struct ChildPromptClaimContext<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct ChildOrchestratorPromptContext<'a> {
     pub plan: &'a SupervisorPlan,
+    pub execution_target: Option<&'a SupervisorExecutionTarget>,
     pub assignment: &'a OrchestratorAssignment,
     pub run_dir: &'a Path,
     pub worktree: &'a WorktreeRecord,
@@ -3118,6 +3122,7 @@ impl SupervisePromptRole {
 
 struct WorkerPromptRenderContext<'a> {
     plan: &'a SupervisorPlan,
+    execution_target: Option<&'a SupervisorExecutionTarget>,
     orchestrator: &'a OrchestratorAssignment,
     worker: &'a WorkerAssignment,
     metadata: &'a WorkerAssignmentMetadata,
@@ -3329,6 +3334,7 @@ enum ChildAttemptCorrection {
 enum SupervisorWorktreeCreation<'a> {
     Bound(&'a RepositoryCleanlinessCapability),
     ExistingOnly,
+    PrimaryWorktree,
     #[cfg(test)]
     TestOnly,
 }
@@ -3646,6 +3652,7 @@ struct AssignmentExecutionContext<'a, 'writer> {
     run_dir: &'a Path,
     dirs: &'a RunDirs,
     execution_runtime: SupervisorExecutionRuntime,
+    execution_target: Option<&'a SupervisorExecutionTarget>,
     worktree_creation: SupervisorWorktreeCreation<'a>,
     manager: &'a WorktreeManager,
     reused: bool,
@@ -4185,6 +4192,7 @@ struct ChildReportCollectionContext<'a> {
     child_base_head: &'a Oid,
     worker_journals: &'a WorkerExecutionJournalEvidenceSet,
     evidence_only_source: Option<&'a OrchestratorReviewReport>,
+    observed_changed_paths: Option<&'a [PathBuf]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4278,6 +4286,17 @@ enum PrimaryPathState {
 struct PrimaryIntegrityChanges {
     details: Vec<String>,
     paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrimaryScopeSnapshot {
+    files: BTreeMap<PathBuf, PrimaryScopedFileState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrimaryScopedFileState {
+    Missing,
+    File { id: Oid, mode: u32, bytes: Vec<u8> },
 }
 
 impl PrimaryIntegrityChanges {

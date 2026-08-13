@@ -67,7 +67,8 @@ struct AssignmentExecutionPreflight<'a> {
     child_base_head: Oid,
     mandatory_worktree_controls: MandatoryWorktreeControls,
     worktree: WorktreeRecord,
-    worktree_write_lease: ManagedWorktreeWriteLease,
+    worktree_write_lease: Option<ManagedWorktreeWriteLease>,
+    primary_scope_baseline: Option<PrimaryScopeSnapshot>,
     claim: PathClaim,
     assignment: OrchestratorAssignment,
     _semantic_block_turn: Option<SemanticBlockTurn<'a>>,
@@ -179,6 +180,28 @@ fn prepare_assignment_execution<'a>(
                     &conflicted_paths,
                 )
                 .context("failed to construct pre-launch claim-conflict denial")?;
+                if matches!(
+                    worktree_creation,
+                    SupervisorWorktreeCreation::PrimaryWorktree
+                ) {
+                    outcome
+                        .gate_tracker
+                        .as_mut()
+                        .context("gate correction tracker was not initialized")?
+                        .escalate(
+                            denial,
+                            artifacts,
+                            &effective_assignment.id,
+                            journal_parent_id,
+                        )?;
+                    outcome.findings.push(claim_failure_finding(
+                        sync_store,
+                        &effective_assignment,
+                        &error,
+                    ));
+                    outcome.assignment_failed = true;
+                    return Ok(AssignmentExecutionDisposition::Complete);
+                }
                 let Some(narrowed) =
                     safely_narrow_claim_scope(&effective_assignment, &conflicted_paths)
                 else {
@@ -227,7 +250,31 @@ fn prepare_assignment_execution<'a>(
     outcome.claim_tokens.push(claim.token);
     outcome.claimed_paths = claim.paths.clone();
     let current_primary_head = current_head_oid(repo)?;
-    if !reused {
+    let primary_scope_baseline = if matches!(
+        worktree_creation,
+        SupervisorWorktreeCreation::PrimaryWorktree
+    ) {
+        match capture_primary_scope_snapshot(repo, &claim.paths, true, context.execution_runtime) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                record_isolated_assignment_failure(
+                    outcome,
+                    &effective_assignment,
+                    "primary-worktree declared-scope cleanliness preflight",
+                    &error,
+                );
+                return Ok(AssignmentExecutionDisposition::Complete);
+            }
+        }
+    } else {
+        None
+    };
+    if !reused
+        && !matches!(
+            worktree_creation,
+            SupervisorWorktreeCreation::PrimaryWorktree
+        )
+    {
         if evidence_only_reaudit.is_some() {
             record_isolated_assignment_failure(
                 outcome,
@@ -255,6 +302,9 @@ fn prepare_assignment_execution<'a>(
             SupervisorWorktreeCreation::ExistingOnly => {
                 bail!("existing-only supervisor operation cannot create a child worktree")
             }
+            SupervisorWorktreeCreation::PrimaryWorktree => {
+                bail!("primary-worktree execution does not create a managed child worktree")
+            }
             #[cfg(test)]
             SupervisorWorktreeCreation::TestOnly => manager.create_for_test(create_options),
         };
@@ -268,30 +318,47 @@ fn prepare_assignment_execution<'a>(
             return Ok(AssignmentExecutionDisposition::Complete);
         }
     }
-    let worktree_write_lease = match manager
-        .acquire_write_execution_lease(&effective_assignment.id)
-        .with_context(|| {
-            format!(
-                "failed to acquire exclusive execution lease for child worktree '{}'",
-                effective_assignment.id
-            )
-        }) {
-        Ok(lease) => lease,
-        Err(error) => {
-            record_isolated_assignment_failure(
-                outcome,
-                &effective_assignment,
-                "worktree execution lease acquisition",
-                &error,
-            );
-            return Ok(AssignmentExecutionDisposition::Complete);
+    let worktree_write_lease = if matches!(
+        worktree_creation,
+        SupervisorWorktreeCreation::PrimaryWorktree
+    ) {
+        None
+    } else {
+        match manager
+            .acquire_write_execution_lease(&effective_assignment.id)
+            .with_context(|| {
+                format!(
+                    "failed to acquire exclusive execution lease for child worktree '{}'",
+                    effective_assignment.id
+                )
+            }) {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                record_isolated_assignment_failure(
+                    outcome,
+                    &effective_assignment,
+                    "worktree execution lease acquisition",
+                    &error,
+                );
+                return Ok(AssignmentExecutionDisposition::Complete);
+            }
         }
     };
-    let worktree = worktree_write_lease.record().clone();
-    if *reused {
+    let worktree = match worktree_write_lease.as_ref() {
+        Some(lease) => lease.record().clone(),
+        None => WorktreeRecord {
+            name: effective_assignment.id.clone(),
+            path: repo.to_path_buf(),
+            branch: "primary_worktree".to_string(),
+        },
+    };
+    if *reused && worktree_write_lease.is_some() {
+        let lease = worktree_write_lease
+            .as_ref()
+            .context("managed child worktree lease disappeared")?;
         let reusable = if let Some(source) = evidence_only_reaudit {
-            inspect_supervisor_candidate(repo, &effective_assignment, &worktree_write_lease)
-                .and_then(|inspection| {
+            inspect_supervisor_candidate(repo, &effective_assignment, lease).and_then(
+                |inspection| {
                     if inspection.binding != source.operation.preserved_candidate_binding {
                         bail!(
                             "preserved candidate binding changed: expected {:?}, observed {:?}",
@@ -300,7 +367,8 @@ fn prepare_assignment_execution<'a>(
                         );
                     }
                     Ok(())
-                })
+                },
+            )
         } else {
             ensure_reusable_child_worktree(&worktree, &current_primary_head)
         };
@@ -342,7 +410,11 @@ fn prepare_assignment_execution<'a>(
             return Ok(AssignmentExecutionDisposition::Complete);
         }
     }
-    let mandatory_worktree_controls = match provision_mandatory_worktree_controls(&worktree.path) {
+    let mandatory_worktree_controls = match if primary_scope_baseline.is_some() {
+        bind_primary_worktree_controls(&worktree.path)
+    } else {
+        provision_mandatory_worktree_controls(&worktree.path)
+    } {
         Ok(controls) => controls,
         Err(error) => {
             record_isolated_assignment_failure(
@@ -480,6 +552,7 @@ fn prepare_assignment_execution<'a>(
             mandatory_worktree_controls,
             worktree,
             worktree_write_lease,
+            primary_scope_baseline,
             claim,
             assignment: effective_assignment,
             _semantic_block_turn: semantic_block_turn,
@@ -492,6 +565,7 @@ struct PreparedChildAttempt<'a> {
     corrective_retry_used: bool,
     command: ExternalAgentCommand,
     primary_before: PrimaryWorktreeSnapshot,
+    primary_scope_before: Option<PrimaryScopeSnapshot>,
     incoming_scratch: ArtifactScratchDirectory,
     capture_scratch: ArtifactScratchDirectory,
     incoming_output_root: SecureOutputRoot,
@@ -590,6 +664,7 @@ fn prepare_child_attempt<'a>(
         render_child_orchestrator_prompt_with_incoming_root_and_field_guide(
             ChildOrchestratorPromptContext {
                 plan: resolved_prompt_plan.as_ref().unwrap_or(&budget_plan),
+                execution_target: context.execution_target,
                 assignment,
                 run_dir,
                 worktree,
@@ -699,6 +774,18 @@ fn prepare_child_attempt<'a>(
     if let Some(error) = primary_before.inspection_problem() {
         bail!("refusing to launch child without a complete primary integrity snapshot: {error}");
     }
+    let primary_scope_before = preflight
+        .primary_scope_baseline
+        .as_ref()
+        .map(|_| {
+            capture_primary_scope_snapshot(
+                repo,
+                &assignment.assigned_paths,
+                false,
+                *execution_runtime,
+            )
+        })
+        .transpose()?;
     let (incoming_scratch, capture_scratch) = with_supervisor_artifacts(artifacts, |writer, _| {
         create_named_invocation_scratches(writer, &incoming_name, &capture_name)
     })?;
@@ -772,6 +859,7 @@ fn prepare_child_attempt<'a>(
             corrective_retry_used,
             command,
             primary_before,
+            primary_scope_before,
             incoming_scratch,
             capture_scratch,
             incoming_output_root,
@@ -795,10 +883,12 @@ struct CollectedChildAttempt<'a> {
     external_run: ExternalAgentRun,
     _worker_journal_evidence: WorkerExecutionJournalEvidenceSet,
     _primary_after: PrimaryWorktreeSnapshot,
+    _primary_scope_after: Option<PrimaryScopeSnapshot>,
     _budget_reservation: DispatchBudgetReservation<'a>,
     _capture_scratch: ArtifactScratchDirectory,
     _incoming_scratch: ArtifactScratchDirectory,
     _primary_before: PrimaryWorktreeSnapshot,
+    _primary_scope_before: Option<PrimaryScopeSnapshot>,
     _command: ExternalAgentCommand,
 }
 
@@ -826,6 +916,7 @@ fn dispatch_and_collect_child_attempt<'a>(
     let corrective_retry_used = prepared.corrective_retry_used;
     let command = prepared.command;
     let primary_before = prepared.primary_before;
+    let primary_scope_before = prepared.primary_scope_before;
     let incoming_scratch = prepared.incoming_scratch;
     let capture_scratch = prepared.capture_scratch;
     let incoming_output_root = prepared.incoming_output_root;
@@ -1014,6 +1105,26 @@ fn dispatch_and_collect_child_attempt<'a>(
     })?;
     let primary_after = primary_worktree_snapshot(repo, *execution_runtime)?;
     let primary_changes = primary_integrity_changes(&primary_before, &primary_after);
+    let primary_scope_after = primary_scope_before
+        .as_ref()
+        .map(|_| {
+            capture_primary_scope_snapshot(
+                repo,
+                &assignment.assigned_paths,
+                false,
+                *execution_runtime,
+            )
+        })
+        .transpose()?;
+    let observed_primary_scope_changes = primary_scope_before
+        .as_ref()
+        .zip(primary_scope_after.as_ref())
+        .map(|(before, after)| primary_scope_changed_paths(before, after));
+    let primary_changes = if primary_scope_before.is_some() {
+        primary_integrity_changes_outside_scope(&primary_changes, &assignment.assigned_paths)
+    } else {
+        primary_changes
+    };
     let sandbox_denials = external_run.sandbox_denials().to_vec();
     let (pre_action_refusals, retryable_gate_denials): (Vec<_>, Vec<_>) = external_run
         .gate_denials()
@@ -1025,7 +1136,7 @@ fn dispatch_and_collect_child_attempt<'a>(
         outcome.pre_action_review_metrics.push(metrics.clone());
     }
     let external_side_effect_state = external_run.external_side_effect_state();
-    let (attempt_report, report_shape_problems) =
+    let (mut attempt_report, report_shape_problems) =
         collect_child_report(ChildReportCollectionContext {
             assignment,
             assignment_metadata,
@@ -1036,7 +1147,18 @@ fn dispatch_and_collect_child_attempt<'a>(
             child_base_head: &preflight.child_base_head,
             worker_journals: &worker_journal_evidence,
             evidence_only_source: context.evidence_only_reaudit.map(|source| &source.report),
+            observed_changed_paths: observed_primary_scope_changes.as_deref(),
         });
+    if preflight.primary_scope_baseline.is_some() {
+        attempt_report.findings.push(Finding {
+            severity: FindingSeverity::Info,
+            message: format!(
+                "child execution targeted the existing primary checkout with declared scope: {}",
+                display_paths(&assignment.assigned_paths)
+            ),
+            paths: assignment.assigned_paths.clone(),
+        });
+    }
     Ok(CollectedChildAttempt {
         attempt_report,
         report_shape_problems,
@@ -1051,10 +1173,12 @@ fn dispatch_and_collect_child_attempt<'a>(
         external_run,
         _worker_journal_evidence: worker_journal_evidence,
         _primary_after: primary_after,
+        _primary_scope_after: primary_scope_after,
         _budget_reservation: budget_reservation,
         _capture_scratch: capture_scratch,
         _incoming_scratch: incoming_scratch,
         _primary_before: primary_before,
+        _primary_scope_before: primary_scope_before,
         _command: command,
     })
 }
@@ -1148,6 +1272,8 @@ fn decide_child_attempt(
         _capture_scratch,
         _incoming_scratch,
         _primary_before,
+        _primary_scope_after,
+        _primary_scope_before,
         _command,
     } = collected;
     let pre_action_refused = !pre_action_refusals.is_empty();
@@ -2135,6 +2261,25 @@ enum ParentAuditorGateDisposition {
     },
 }
 
+fn inspect_assignment_candidate(
+    context: &AssignmentExecutionContext<'_, '_>,
+    preflight: &AssignmentExecutionPreflight<'_>,
+) -> Result<SupervisorCandidateInspection> {
+    if let Some(baseline) = preflight.primary_scope_baseline.as_ref() {
+        return inspect_primary_scope_candidate(
+            context.repo,
+            &preflight.assignment,
+            baseline,
+            context.execution_runtime,
+        );
+    }
+    let lease = preflight
+        .worktree_write_lease
+        .as_ref()
+        .context("managed child candidate inspection has no write lease")?;
+    inspect_supervisor_candidate(context.repo, &preflight.assignment, lease)
+}
+
 fn parent_auditor_repair_eligible(
     parent_auditor_failed: bool,
     assignment_containment_verified: bool,
@@ -2187,9 +2332,7 @@ fn decide_parent_auditor_gate(
     mut child_report: OrchestratorReviewReport,
     retry_feedback: &mut Option<ChildAttemptCorrection>,
 ) -> Result<ParentAuditorGateDisposition> {
-    let AssignmentExecutionContext {
-        repo, artifacts, ..
-    } = context;
+    let AssignmentExecutionContext { artifacts, .. } = context;
     let assignment = &preflight.assignment;
     if child_containment_verified
         && child_report.environment_failures.is_empty()
@@ -2276,8 +2419,7 @@ fn decide_parent_auditor_gate(
     }
     let mut traceability_candidate = None;
     if !report_failed(&child_report) || evidence_only_rejection {
-        let post_auditor_candidate =
-            inspect_supervisor_candidate(repo, assignment, &preflight.worktree_write_lease);
+        let post_auditor_candidate = inspect_assignment_candidate(context, preflight);
         match (pre_auditor_candidate.as_ref(), post_auditor_candidate) {
             (Some(before), Ok(after)) if before == &after => {
                 traceability_candidate = Some(after);
@@ -2453,7 +2595,6 @@ fn execute_supervisor_assignment_inner(
     };
     let journal_parent_id = preflight.journal_parent_id;
     let assignment = &preflight.assignment;
-    let worktree_write_lease = &preflight.worktree_write_lease;
     let final_report_name = format!("{}.json", assignment.id);
     let final_report_relative = PathBuf::from("reports").join(&final_report_name);
     let final_report_path = dirs.reports.join(&final_report_name);
@@ -2541,24 +2682,46 @@ fn execute_supervisor_assignment_inner(
             append_child_attempt_history(&mut child_report, &attempt_history);
         }
         let pre_auditor_candidate = if child_containment_verified {
-            match bind_supervisor_decomposition_candidate(
-                repo,
-                assignment,
-                &mut child_report,
-                worktree_write_lease,
-            ) {
-                Ok(Some(inspection)) => Some(inspection),
-                Ok(None) if !report_failed(&child_report) => {
-                    inspect_supervisor_candidate(repo, assignment, worktree_write_lease).ok()
-                }
-                Ok(None) => None,
-                Err(error) => {
+            if preflight.primary_scope_baseline.is_some() {
+                if !child_report.decomposition_completions.is_empty() {
+                    let error = anyhow!(
+                        "primary-worktree execution does not support megafile decomposition evidence"
+                    );
                     reject_supervisor_candidate_binding(
                         &mut child_report,
                         &final_report_path,
                         &error,
                     );
                     None
+                } else if !report_failed(&child_report) {
+                    inspect_assignment_candidate(context, &preflight).ok()
+                } else {
+                    None
+                }
+            } else {
+                let lease = preflight
+                    .worktree_write_lease
+                    .as_ref()
+                    .context("managed decomposition candidate has no worktree lease")?;
+                match bind_supervisor_decomposition_candidate(
+                    repo,
+                    assignment,
+                    &mut child_report,
+                    lease,
+                ) {
+                    Ok(Some(inspection)) => Some(inspection),
+                    Ok(None) if !report_failed(&child_report) => {
+                        inspect_assignment_candidate(context, &preflight).ok()
+                    }
+                    Ok(None) => None,
+                    Err(error) => {
+                        reject_supervisor_candidate_binding(
+                            &mut child_report,
+                            &final_report_path,
+                            &error,
+                        );
+                        None
+                    }
                 }
             }
         } else {
@@ -2647,11 +2810,21 @@ fn execute_supervisor_assignment_inner(
                 .transpose()
                 .context("preserved candidate binding primary HEAD is invalid")?
                 .unwrap_or(preflight.child_base_head);
-            let diff = collect_diff_since_base(
-                &preflight.worktree.path,
-                &review_base,
-                REVIEW_LENS_REQUEST_LIMIT_BYTES,
-            )?;
+            let diff = if let Some(baseline) = preflight.primary_scope_baseline.as_ref() {
+                let current = capture_primary_scope_snapshot(
+                    repo,
+                    &assignment.assigned_paths,
+                    false,
+                    context.execution_runtime,
+                )?;
+                render_primary_scope_diff(baseline, &current)?
+            } else {
+                collect_diff_since_base(
+                    &preflight.worktree.path,
+                    &review_base,
+                    REVIEW_LENS_REQUEST_LIMIT_BYTES,
+                )?
+            };
             let output_report = serde_json::to_string(&child_report)
                 .context("failed to serialize child output report for review lenses")?;
             let sources = ReviewLensRequestSources {
@@ -3051,6 +3224,7 @@ mod decomposition_tests {
             index: 0,
             concurrent_mode: false,
             plan: &plan,
+            execution_target: None,
             budget_config: &budget_config,
             consultant: &consultant,
             assignment_metadata: &assignment_metadata,
