@@ -2558,6 +2558,64 @@ specification.
 treats the bounded UTF-8 file as a high-level goal/spec, even if its contents
 happen to be valid JSON.
 
+### Explicit bounded primary-worktree target
+
+Managed child worktrees remain the default. An authored plan can opt one
+assignment into the existing primary checkout only by declaring an exact-file
+scope and the operator separately passing `--allow-primary-worktree`:
+
+```json
+{
+  "version": 1,
+  "task": "update one local deployment file",
+  "max_child_retries": 0,
+  "max_gate_corrections": 0,
+  "execution_target": {
+    "kind": "primary_worktree",
+    "claim_paths": ["local/deploy.txt"]
+  },
+  "assignments": [{
+    "id": "local-deploy",
+    "assigned_paths": ["local/deploy.txt"],
+    "worker_assignments": []
+  }]
+}
+```
+
+```bash
+cargo run -- supervise run primary-plan.json --repo . \
+  --run-id bounded-primary-deploy --allow-primary-worktree \
+  --codex-bin codex \
+  --machine-global-config /exact/path/to/machine-global.json \
+  --machine-global-runtime-root-id runtime --json
+```
+
+The declaration and flag are a double opt-in; either one without the other is
+refused before run artifacts or claims are created. This deliberately small
+mode accepts one assignment, 1-16 disjoint exact files below a top-level
+directory, an aggregate snapshot of at most 1 MiB, and an exact match between
+`claim_paths` and `assigned_paths`. It rejects `.` and top-level scopes,
+directories, symlinks, missing parent directories, `.git` overlap, retries,
+gate corrections, generated follow-ups, evidence-only re-audit, licensed
+breakage, and decomposition evidence.
+
+The supervisor acquires the ordinary durable path claim before checking the
+scope and holds it through child execution and parent audit. Git-visible dirty
+state in a declared file is refused even with `--allow-dirty-primary`; an
+existing ignored/local-only file is permitted only after its exact bytes and
+mode are captured as the baseline. During and after the run, changes to HEAD,
+the index, or any path outside the exact declared files fail integrity gates.
+Claims are released on success and failure. Supervisor-owned findings in both
+the child report and final report state `primary_worktree` intent and list the
+declared scope, and accepted changes already reside in the primary checkout—no
+managed-worktree merge step exists.
+
+This opt-in does not relax the existing external-Codex containment,
+machine-global retention, pre-action review, or acceptance gates. In
+particular, if the current verified writable-Codex coverage gate refuses child
+release, this mode reports that refusal rather than bypassing it. The fake
+runtime does not execute a primary-worktree target.
+
 Goal/spec planning fragments the source and emits one nested subtree per
 disjoint workstream: a depth-2 read-only planning root followed by a depth-3
 execution child with a real `parent_assignment_id`. The execution child keeps

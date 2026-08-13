@@ -984,6 +984,7 @@ fn supervisor_traceability_reports_missing_changes_and_diff_binding() {
         0,
     );
     let metadata = SupervisorPlanMetadata {
+        execution_target: None,
         spec_fragment_ids: vec!["SPEC-a".to_string(), "SPEC-b".to_string()],
         spec_fragment_ids_by_assignment: BTreeMap::from([
             ("child-a".to_string(), vec!["SPEC-a".to_string()]),
@@ -1042,6 +1043,7 @@ fn supervisor_traceability_reports_missing_changes_and_diff_binding() {
 fn supervisor_traceability_binds_ordinary_success_to_observed_paths_and_diff() {
     let plan = injected_multi_plan(vec![injected_named_assignment("child-a", "src/a.rs")], 0);
     let metadata = SupervisorPlanMetadata {
+        execution_target: None,
         spec_fragment_ids: vec!["SPEC-a".to_string()],
         spec_fragment_ids_by_assignment: BTreeMap::from([(
             "child-a".to_string(),
@@ -1149,6 +1151,7 @@ fn admitted_nested_assignment_retains_ordinary_pipeline_and_acceptance_evidence(
     };
     let prompt = child_orchestrator_prompt(ChildOrchestratorPromptContext {
         plan: &plan,
+        execution_target: None,
         assignment: &execution,
         run_dir: Path::new("/tmp/maco-run"),
         worktree: &worktree,
@@ -1182,6 +1185,7 @@ fn admitted_nested_assignment_retains_ordinary_pipeline_and_acceptance_evidence(
         diff_oid: "3333333333333333333333333333333333333333".to_string(),
     };
     let metadata = SupervisorPlanMetadata {
+        execution_target: None,
         spec_fragment_ids: vec!["SPEC-execution".to_string()],
         spec_fragment_ids_by_assignment: BTreeMap::from([(
             execution.id.clone(),

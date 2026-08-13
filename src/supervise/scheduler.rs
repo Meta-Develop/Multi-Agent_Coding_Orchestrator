@@ -232,6 +232,7 @@ struct AssignmentSchedulerContext<'context, 'writer> {
     run_dir: &'context Path,
     dirs: &'context RunDirs,
     execution_runtime: SupervisorExecutionRuntime,
+    execution_target: Option<&'context SupervisorExecutionTarget>,
     worktree_creation: SupervisorWorktreeCreation<'context>,
     manager: &'context WorktreeManager,
     existing_ids: &'context BTreeSet<String>,
@@ -949,6 +950,7 @@ fn run_serial_assignment_schedule(
             run_dir: context.run_dir,
             dirs: context.dirs,
             execution_runtime: context.execution_runtime,
+            execution_target: context.execution_target,
             worktree_creation: context.worktree_creation,
             manager: context.manager,
             reused: context.existing_ids.contains(&assignment.id),
@@ -1139,6 +1141,7 @@ fn run_concurrent_assignment_schedule(
                             run_dir: context.run_dir,
                             dirs: context.dirs,
                             execution_runtime: context.execution_runtime,
+                            execution_target: context.execution_target,
                             worktree_creation: context.worktree_creation,
                             manager: context.manager,
                             reused: context.existing_ids.contains(&assignment.id),
@@ -2062,6 +2065,7 @@ struct SchedulerEvidenceInitialization<'context> {
     options: &'context SupervisorRunOptions,
     repo: &'context Path,
     execution_runtime: SupervisorExecutionRuntime,
+    execution_target: Option<&'context SupervisorExecutionTarget>,
     artifact_writer: &'context mut ArtifactRunWriter,
     field_guide_store_slot: &'context mut Option<FieldGuideStore>,
     field_guide_prompt_slot: &'context mut Option<SupervisorFieldGuidePrompt>,
@@ -2074,7 +2078,7 @@ struct SchedulerEvidenceInitialization<'context> {
 fn initialize_scheduler_evidence(
     initialization: &mut SchedulerEvidenceInitialization<'_>,
 ) -> Result<()> {
-    if !initialization.options.allow_dirty_primary {
+    if initialization.execution_target.is_none() && !initialization.options.allow_dirty_primary {
         ensure_clean_primary(initialization.repo, initialization.execution_runtime)?;
     }
     write_plan_snapshot(
@@ -2195,6 +2199,11 @@ fn prepare_supervisor_run(
         {
             bail!("existing-only worktree execution requires the verified supervisor runtime")
         }
+        SupervisorWorktreeCreation::PrimaryWorktree
+            if execution_runtime != SupervisorExecutionRuntime::Verified =>
+        {
+            bail!("primary-worktree execution requires the verified supervisor runtime")
+        }
         #[cfg(test)]
         SupervisorWorktreeCreation::TestOnly
             if execution_runtime != SupervisorExecutionRuntime::NonpublishableSimulation =>
@@ -2202,6 +2211,19 @@ fn prepare_supervisor_run(
             bail!("test-only worktree creation requires the simulation supervisor runtime")
         }
         _ => {}
+    }
+    match (worktree_creation, plan_metadata.execution_target.as_ref()) {
+        (
+            SupervisorWorktreeCreation::PrimaryWorktree,
+            Some(SupervisorExecutionTarget::PrimaryWorktree { .. }),
+        ) => {}
+        (SupervisorWorktreeCreation::PrimaryWorktree, None) => {
+            bail!("primary-worktree execution requires its validated plan declaration")
+        }
+        (_, Some(SupervisorExecutionTarget::PrimaryWorktree { .. })) => {
+            bail!("primary-worktree plan declaration cannot use managed-child execution")
+        }
+        (_, None) => {}
     }
     let runtime = options.runtime;
     let repo = discover_repo_root(&options.repo)?;
@@ -2314,7 +2336,7 @@ fn persist_runtime_model_catalog_environment_failure(
             .to_string(),
         paths: Vec::new(),
     });
-    let final_report = build_supervisor_final_report(SupervisorFinalReportConstruction {
+    let mut final_report = build_supervisor_final_report(SupervisorFinalReportConstruction {
         plan,
         runtime_model_catalog: None,
         max_concurrent_children,
@@ -2358,6 +2380,7 @@ fn persist_runtime_model_catalog_environment_failure(
         breaker_tripped: false,
         field_guide_mutation_failed: false,
     });
+    apply_execution_target_reporting(&mut final_report, plan_metadata.execution_target.as_ref());
     let binding = artifact_writer
         .resume_binding()
         .context("failed to establish runtime-catalog preflight report boundary")?;
@@ -2468,6 +2491,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
             options: &options,
             repo: &repo,
             execution_runtime,
+            execution_target: plan_metadata.execution_target.as_ref(),
             artifact_writer: &mut artifact_writer,
             field_guide_store_slot: &mut field_guide_store_slot,
             field_guide_prompt_slot: &mut field_guide_prompt_slot,
@@ -2527,6 +2551,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 run_dir: &run_dir,
                 dirs: &dirs,
                 execution_runtime,
+                execution_target: plan_metadata.execution_target.as_ref(),
                 worktree_creation,
                 manager: &manager,
                 existing_ids: &existing_ids,
@@ -2658,6 +2683,12 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                     true
                 } else {
                     let changes = primary_integrity_changes(baseline, &final_snapshot);
+                    let changes = match plan_metadata.execution_target.as_ref() {
+                        Some(target) => {
+                            primary_integrity_changes_outside_scope(&changes, target.claim_paths())
+                        }
+                        None => changes,
+                    };
                     let integrity_failed = !changes.is_empty();
                     if integrity_failed {
                         collected.findings.push(Finding {
@@ -2863,6 +2894,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         breaker_tripped,
         field_guide_mutation_failed,
     });
+    apply_execution_target_reporting(&mut final_report, plan_metadata.execution_target.as_ref());
     let checkpoint_finalization = match artifact_writer.resume_binding() {
         Ok(binding) => {
             checkpoint_writer.scheduler_closed(binding, budget_ledger.report()?)?;
@@ -3464,6 +3496,7 @@ mod decomposition_tests {
             };
             let $context = AssignmentSchedulerContext {
                 plan: &plan,
+                execution_target: None,
                 budget_config: &budget_config,
                 consultant: &consultant,
                 assignment_metadata: &assignment_metadata,
@@ -3544,6 +3577,7 @@ mod decomposition_tests {
             };
             let $context = AssignmentSchedulerContext {
                 plan: &plan,
+                execution_target: None,
                 budget_config: &budget_config,
                 consultant: &consultant,
                 assignment_metadata: &assignment_metadata,
@@ -4324,6 +4358,7 @@ mod decomposition_tests {
 
         initialize_scheduler_evidence(&mut SchedulerEvidenceInitialization {
             plan: &plan,
+            execution_target: None,
             consultant: &consultant,
             assignment_metadata: &assignment_metadata,
             plan_metadata: &plan_metadata,

@@ -190,6 +190,7 @@ pub(super) fn validate_supervisor_plan(
     if plan.assignments.is_empty() {
         bail!("supervisor plan must include at least one orchestrator assignment");
     }
+    validate_primary_worktree_execution_target(&plan, &mut metadata)?;
     validate_review_lens_set(&plan.review_lenses)
         .context("supervisor review_lenses are invalid")?;
     if plan
@@ -419,6 +420,115 @@ pub(super) fn validate_supervisor_plan(
         .collect();
 
     Ok((plan, metadata))
+}
+
+fn validate_primary_worktree_execution_target(
+    plan: &SupervisorPlan,
+    metadata: &mut SupervisorPlanMetadata,
+) -> Result<()> {
+    let Some(target) = metadata.execution_target.as_mut() else {
+        return Ok(());
+    };
+    let claim_paths = target.claim_paths_mut();
+    if claim_paths.is_empty() || claim_paths.len() > MAX_PRIMARY_WORKTREE_CLAIM_PATHS {
+        bail!(
+            "execution_target.kind='primary_worktree' requires between 1 and {} claim_paths",
+            MAX_PRIMARY_WORKTREE_CLAIM_PATHS
+        );
+    }
+    for path in claim_paths.iter() {
+        if path.as_os_str().is_empty() || path == Path::new(".") {
+            bail!(
+                "execution_target.kind='primary_worktree' claim path '{}' is over-broad; name an exact file below a top-level directory",
+                path.display()
+            );
+        }
+    }
+    *claim_paths = normalize_paths(std::mem::take(claim_paths))
+        .context("execution_target.kind='primary_worktree' claim_paths are invalid")?;
+    for path in claim_paths.iter() {
+        if path.as_os_str().is_empty() || path == Path::new(".") || path.components().count() < 2 {
+            bail!(
+                "execution_target.kind='primary_worktree' claim path '{}' is over-broad; name an exact file below a top-level directory",
+                path.display()
+            );
+        }
+        if path == Path::new(".git")
+            || path.starts_with(".git")
+            || Path::new(".git").starts_with(path)
+        {
+            bail!(
+                "execution_target.kind='primary_worktree' claim path '{}' overlaps protected .git metadata",
+                path.display()
+            );
+        }
+        if path.starts_with(".maco")
+            || path.starts_with(".codex")
+            || path == Path::new(".agents")
+            || path == Path::new("AGENTS.md")
+        {
+            bail!(
+                "execution_target.kind='primary_worktree' claim path '{}' overlaps a protected orchestration or policy control",
+                path.display()
+            );
+        }
+    }
+    for (index, path) in claim_paths.iter().enumerate() {
+        if let Some(overlap) = claim_paths
+            .iter()
+            .skip(index.saturating_add(1))
+            .find(|candidate| paths_overlap(path, candidate))
+        {
+            bail!(
+                "execution_target.kind='primary_worktree' claim paths '{}' and '{}' overlap; declare disjoint exact files",
+                path.display(),
+                overlap.display()
+            );
+        }
+    }
+    if plan.assignments.len() != 1 {
+        bail!(
+            "execution_target.kind='primary_worktree' requires exactly one orchestrator assignment"
+        );
+    }
+    let assignment = plan
+        .assignments
+        .first()
+        .context("primary-worktree plan lost its sole assignment")?;
+    let normalized_assignment_paths = normalize_paths(assignment.assigned_paths.clone())
+        .context("primary-worktree assignment paths are invalid")?;
+    if normalized_assignment_paths != *claim_paths {
+        bail!(
+            "execution_target.kind='primary_worktree' claim_paths must exactly equal the sole assignment assigned_paths"
+        );
+    }
+    if plan.max_child_retries != 0 || plan.max_gate_corrections != 0 {
+        bail!(
+            "execution_target.kind='primary_worktree' requires max_child_retries=0 and max_gate_corrections=0 because failed in-place attempts cannot be discarded as isolated candidates"
+        );
+    }
+    if assignment.licensed_breakage.is_some()
+        || metadata.evidence_only_reaudit.is_some()
+        || metadata.generated_follow_up.is_some()
+    {
+        bail!(
+            "execution_target.kind='primary_worktree' does not support licensed breakage, evidence-only re-audit, or generated follow-up execution"
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn validate_execution_target_opt_in(
+    execution_target: Option<&SupervisorExecutionTarget>,
+    allow_primary_worktree: bool,
+) -> Result<()> {
+    match (execution_target, allow_primary_worktree) {
+        (Some(SupervisorExecutionTarget::PrimaryWorktree { .. }), true) | (None, false) => Ok(()),
+        (Some(SupervisorExecutionTarget::PrimaryWorktree { .. }), false) => {
+            Err(SupervisorExecutionTargetOptInError::MissingCliAcknowledgement.into())
+        }
+        (None, true) => Err(SupervisorExecutionTargetOptInError::MissingPlanDeclaration.into()),
+    }
 }
 
 pub(super) fn generated_follow_up_operator_defaults() -> Vec<GeneratedFollowUpOperatorDefault> {

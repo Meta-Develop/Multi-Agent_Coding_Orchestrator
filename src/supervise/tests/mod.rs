@@ -4,6 +4,7 @@ mod budget;
 mod environment_controls;
 mod licensed_breakage;
 mod plan_runtime;
+mod primary_worktree;
 mod prompts_gates;
 mod reaudit;
 mod run_artifacts;

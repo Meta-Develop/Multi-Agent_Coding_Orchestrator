@@ -316,6 +316,139 @@ fn supervise_plan_normalizes_aliases_and_rejects_top_level_scope_conflicts() -> 
 }
 
 #[test]
+fn primary_worktree_cli_requires_plan_and_flag_and_rejects_invalid_scope() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let primary_plan_path = temp.path().join("primary-worktree.json");
+    fs::write(
+        &primary_plan_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "task": "bounded local deployment",
+            "max_child_retries": 0,
+            "max_gate_corrections": 0,
+            "execution_target": {
+                "kind": "primary_worktree",
+                "claim_paths": ["local/deploy.txt"]
+            },
+            "assignments": [{
+                "id": "primary-child",
+                "assigned_paths": ["local/deploy.txt"],
+                "worker_assignments": []
+            }]
+        }))?,
+    )?;
+
+    let normalized = run_success_json(&[
+        "supervise",
+        "plan",
+        path_str(&primary_plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(normalized["execution_target"]["kind"], "primary_worktree");
+    assert_eq!(
+        normalized["execution_target"]["claim_paths"],
+        serde_json::json!(["local/deploy.txt"])
+    );
+
+    let missing_flag = run_failure_stderr(&[
+        "supervise",
+        "run",
+        path_str(&primary_plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "primary-cli-missing-flag",
+        "--runtime",
+        "fake",
+        "--json",
+    ])?;
+    assert!(
+        missing_flag.contains("execution_target.kind='primary_worktree'")
+            && missing_flag.contains("--allow-primary-worktree"),
+        "unexpected missing-flag refusal: {missing_flag}"
+    );
+    assert!(!repo_path
+        .join(".maco/o2/runs/primary-cli-missing-flag")
+        .exists());
+
+    let ordinary_plan_path = temp.path().join("ordinary.json");
+    write_simple_plan(&ordinary_plan_path, "ordinary-child")?;
+    let missing_declaration = run_failure_stderr(&[
+        "supervise",
+        "run",
+        path_str(&ordinary_plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "primary-cli-missing-declaration",
+        "--runtime",
+        "fake",
+        "--allow-primary-worktree",
+        "--json",
+    ])?;
+    assert!(
+        missing_declaration.contains(
+            "--allow-primary-worktree requires the supervisor plan declaration execution_target.kind='primary_worktree'"
+        ),
+        "unexpected missing-declaration refusal: {missing_declaration}"
+    );
+    assert!(!repo_path
+        .join(".maco/o2/runs/primary-cli-missing-declaration")
+        .exists());
+
+    for (name, execution_target, expected) in [
+        (
+            "missing-scope",
+            serde_json::json!({"kind": "primary_worktree"}),
+            "missing field `claim_paths`",
+        ),
+        (
+            "broad-scope",
+            serde_json::json!({"kind": "primary_worktree", "claim_paths": ["."]}),
+            "is over-broad",
+        ),
+        (
+            "git-scope",
+            serde_json::json!({"kind": "primary_worktree", "claim_paths": [".git/config"]}),
+            "overlaps protected .git metadata",
+        ),
+    ] {
+        let path = temp.path().join(format!("{name}.json"));
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "task": "invalid primary scope",
+                "max_child_retries": 0,
+                "max_gate_corrections": 0,
+                "execution_target": execution_target,
+                "assignments": [{
+                    "id": "primary-child",
+                    "assigned_paths": ["local/deploy.txt"],
+                    "worker_assignments": []
+                }]
+            }))?,
+        )?;
+        let error = run_failure_stderr(&[
+            "supervise",
+            "plan",
+            path_str(&path)?,
+            "--repo",
+            path_str(&repo_path)?,
+            "--json",
+        ])?;
+        assert!(
+            error.contains(expected),
+            "{name} did not fail with {expected:?}: {error}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn supervise_plan_from_goal_emits_nested_traceable_disjoint_workstreams() -> Result<()> {
     support::require_containment!(
         "supervise_plan_from_goal_emits_nested_traceable_disjoint_workstreams"
