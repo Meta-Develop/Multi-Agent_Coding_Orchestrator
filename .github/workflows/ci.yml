@@ -186,6 +186,9 @@ jobs:
           supervise::tests::plan_runtime::plain_text_task_without_actionable_scope_returns_guidance
           supervise::tests::plan_runtime::stacked_review_lenses_execute_every_configured_boundary_and_aggregate
           supervise::tests::plan_runtime::supervisor_input_loader_accepts_direct_regular_files_and_refuses_unsafe_inputs
+          supervise::tests::primary_worktree::bounded_primary_command_run_mutates_scope_holds_and_releases_claim_and_marks_reports
+          supervise::tests::primary_worktree::dirty_primary_scope_refuses_before_dispatch_and_releases_claim
+          supervise::tests::primary_worktree::primary_worktree_outside_scope_mutation_fails_integrity_and_releases_claim
           supervise::tests::prompts_gates::auditor_rejection_reenters_child_and_parent_auditor
           supervise::tests::prompts_gates::repeated_auditor_denial_uses_one_correlation_across_prompts_and_journal
           supervise::tests::prompts_gates::repeated_validation_denial_uses_one_correlation_across_prompts_and_journal
