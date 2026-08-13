@@ -17,7 +17,9 @@ use crate::{
     worktree::{normalize_agent_id, WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
 };
 use anyhow::{bail, Context, Result};
-use git2::{Repository, StatusOptions};
+#[cfg(test)]
+use git2::Repository;
+use git2::StatusOptions;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},

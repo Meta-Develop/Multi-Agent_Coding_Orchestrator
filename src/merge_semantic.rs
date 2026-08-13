@@ -5,7 +5,7 @@ use crate::{
     },
 };
 use anyhow::{Context, Result};
-use git2::{Diff, DiffFormat, DiffOptions, Oid, Repository};
+use git2::{Diff, DiffFormat, DiffOptions, Oid};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},

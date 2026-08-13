@@ -31,6 +31,7 @@ use crate::{
     worktree::ManagedSnapshotSpec,
 };
 use anyhow::{bail, Context, Result};
+#[cfg(test)]
 use git2::Repository;
 use serde::{Deserialize, Serialize};
 use std::{

@@ -1,5 +1,6 @@
 use crate::safe_state::BoundedRegularReader;
 use anyhow::{bail, Context, Result};
+#[cfg(test)]
 use git2::Repository;
 use proc_macro2::{LineColumn, Span};
 use quote::ToTokens;

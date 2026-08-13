@@ -44,6 +44,7 @@ use crate::{
     worktree::{ManagedWorktreeWriteLease, WorktreeManager},
 };
 use anyhow::{bail, Context, Result};
+#[cfg(test)]
 use git2::Repository;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

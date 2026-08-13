@@ -67,7 +67,6 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use git2::Repository;
 use serde::Serialize;
 use serde_json::Value;
 use std::{

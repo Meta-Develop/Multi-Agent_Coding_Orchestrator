@@ -17,6 +17,7 @@ use crate::{
     state_journal::JournalSpec,
 };
 use anyhow::{bail, Context, Result};
+#[cfg(test)]
 use git2::Repository;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::{

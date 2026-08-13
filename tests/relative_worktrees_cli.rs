@@ -1,6 +1,7 @@
 mod support;
 
 use anyhow::{bail, Context, Result};
+use multi_agent_coding_orchestrator::sync_store::SyncStore;
 use serde_json::Value;
 use std::{
     fs,
@@ -11,6 +12,61 @@ use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_maco");
 const ALTERNATE_BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
+
+#[test]
+fn supervise_plan_entrypoint_accepts_relative_linked_worktree() -> Result<()> {
+    let fixture = RelativeWorktreeFixture::new()?;
+    let plan_path = fixture
+        .primary
+        .parent()
+        .context("relative-worktree fixture parent")?
+        .join("supervisor-plan.json");
+    fs::write(
+        &plan_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "task": "validate relative linked worktree",
+            "assignments": [{
+                "id": "child-a",
+                "assigned_paths": ["./src/lib.rs"],
+                "worker_assignments": []
+            }]
+        }))?,
+    )
+    .context("write supervisor plan")?;
+
+    let plan = run_maco_success_json(&[
+        "supervise",
+        "plan",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&fixture.linked)?,
+        "--json",
+    ])?;
+
+    assert_eq!(plan["version"], 1);
+    assert_eq!(plan["task"], "validate relative linked worktree");
+    assert_eq!(
+        plan["assignments"][0]["assigned_paths"],
+        serde_json::json!(["src/lib.rs"]),
+        "ordinary plan validation must run after the linked repository opens"
+    );
+    Ok(())
+}
+
+#[test]
+fn direct_sync_store_open_accepts_relative_linked_worktree() -> Result<()> {
+    let fixture = RelativeWorktreeFixture::new()?;
+
+    let store = SyncStore::open(&fixture.linked)?;
+
+    assert_eq!(store.snapshot()?, Vec::new());
+    assert_eq!(
+        store.state_path(),
+        fixture.primary.join(".git/maco/state/claims.json")
+    );
+    Ok(())
+}
 
 #[test]
 fn relative_worktrees_share_exact_claim_state_and_map_the_selected_worktree() -> Result<()> {
@@ -153,6 +209,11 @@ fn relative_worktree_support_does_not_accept_an_unrelated_extension() -> Result<
         "extensions.macoUnsupported",
         "true",
     ])?;
+
+    let direct_error = SyncStore::open(&fixture.linked)
+        .expect_err("direct library open must reject an unrelated repository extension");
+    assert!(format!("{direct_error:#}")
+        .contains("unsupported extension name extensions.macounsupported"));
 
     let output = run_maco(&[
         "sync",

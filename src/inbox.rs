@@ -18,7 +18,9 @@ use crate::{
     sync_store::SyncStore,
 };
 use anyhow::{bail, Context, Result};
-use git2::{Repository, StatusOptions};
+#[cfg(test)]
+use git2::Repository;
+use git2::StatusOptions;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
