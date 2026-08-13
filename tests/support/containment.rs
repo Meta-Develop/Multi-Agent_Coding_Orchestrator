@@ -15,8 +15,13 @@ pub(crate) fn delegated_user_manager_available(cgroups: &str) -> bool {
 #[cfg(target_os = "linux")]
 pub(crate) fn skip_if_unavailable(test_name: &str) -> io::Result<bool> {
     let cgroups = std::fs::read_to_string("/proc/self/cgroup")?;
-    if delegated_user_manager_available(&cgroups) {
-        return Ok(false);
+    Ok(skip_if_unavailable_for_cgroups(test_name, &cgroups))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn skip_if_unavailable_for_cgroups(test_name: &str, cgroups: &str) -> bool {
+    if delegated_user_manager_available(cgroups) {
+        return false;
     }
 
     let current = cgroups
@@ -26,7 +31,7 @@ pub(crate) fn skip_if_unavailable(test_name: &str) -> io::Result<bool> {
     eprintln!(
         "SKIP {test_name}: current cgroup {current} is not inside a delegated systemd user manager"
     );
-    Ok(true)
+    true
 }
 
 #[cfg(not(target_os = "linux"))]
