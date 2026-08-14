@@ -2073,12 +2073,11 @@ fn run_external_agent_runtime(
 }
 
 fn validate_universal_pre_action_coverage() -> Result<()> {
-    // Codex 0.144.4 exposes client callbacks only for actions for which the server chooses to ask
-    // approval. AskForApproval has no force-review-every-action mode, and `approvalsReviewer=user`
-    // does not block reads, writes, or tools already permitted by the active sandbox. The MACO
-    // policy additionally distinguishes safe writes from destructive writes, which a static
-    // filesystem sandbox cannot express. Until the protocol supplies a blocking callback for
-    // every relevant proposed action, a writable production child must not be released.
+    // Codex 0.144.4's strongest `untrusted` policy still auto-approves known-safe reads.
+    // `approvalsReviewer=user` routes surfaced prompts to MACO, but cannot make those reads block.
+    // The MACO policy additionally distinguishes safe writes from destructive writes, which a
+    // static filesystem sandbox cannot express. Until the protocol supplies a blocking callback
+    // for every relevant proposed action, a writable production child must not be released.
     bail!(
         "writable Codex failed closed before launch: the current app-server protocol does not guarantee a blocking MACO callback for every in-sandbox read, write, destructive operation, and tool action"
     )
@@ -5885,7 +5884,7 @@ fn codex_app_server_argv(
         OsString::from("--stdio"),
         OsString::from("--strict-config"),
         OsString::from("-c"),
-        OsString::from("approval_policy=\"on-request\""),
+        OsString::from("approval_policy=\"untrusted\""),
         OsString::from("-c"),
         OsString::from("approvals_reviewer=\"user\""),
         OsString::from("-c"),
@@ -6533,16 +6532,18 @@ send({"id": initialize["id"], "result": {}})
 assert receive()["method"] == "initialized"
 thread_start = receive()
 assert thread_start["method"] == "thread/start"
+assert thread_start["params"]["approvalPolicy"] == "untrusted"
 assert thread_start["params"]["approvalsReviewer"] == "user"
 send({"id": thread_start["id"], "result": {
     "thread": {"id": "thread-contained"},
-    "approvalPolicy": "on-request",
+    "approvalPolicy": "untrusted",
     "approvalsReviewer": "user",
     "activePermissionProfile": {"id": "maco_external_codex"},
     "cwd": sys.argv[3]
 }})
 turn_start = receive()
 assert turn_start["method"] == "turn/start"
+assert turn_start["params"]["approvalPolicy"] == "untrusted"
 assert turn_start["params"]["approvalsReviewer"] == "user"
 send({"id": turn_start["id"], "result": {
     "turn": {"id": "turn-contained", "status": "inProgress"}
@@ -6563,6 +6564,19 @@ send({"method": "item/started", "params": {
     "turnId": "turn-contained",
     "item": item
 }})
+if mode == "fallback_required":
+    marker.touch()
+    send({"method": "item/completed", "params": {
+        "threadId": "thread-contained",
+        "turnId": "turn-contained",
+        "completedAtMs": 2,
+        "item": {"id": "item-contained", "type": "fileChange", "status": "completed"}
+    }})
+    send({"method": "turn/completed", "params": {
+        "threadId": "thread-contained",
+        "turn": {"id": "turn-contained", "status": "completed", "items": []}
+    }})
+    sys.exit(0)
 send({"id": 77, "method": "item/fileChange/requestApproval", "params": {
     "threadId": "thread-contained",
     "turnId": "turn-contained",
@@ -6571,32 +6585,6 @@ send({"id": 77, "method": "item/fileChange/requestApproval", "params": {
     "reason": "incomplete manifest"
 }})
 first = receive()
-def send_auto_review(status):
-    send({"method": "item/autoApprovalReview/started", "params": {
-        "threadId": "thread-contained",
-        "turnId": "turn-contained",
-        "reviewId": "review-contained",
-        "targetItemId": "item-contained",
-        "startedAtMs": 1,
-        "action": {"type": "applyPatch"},
-        "review": {"status": "inProgress"}
-    }})
-    send({"method": "item/autoApprovalReview/completed", "params": {
-        "threadId": "thread-contained",
-        "turnId": "turn-contained",
-        "reviewId": "review-contained",
-        "targetItemId": "item-contained",
-        "startedAtMs": 1,
-        "completedAtMs": 2,
-        "action": {"type": "applyPatch"},
-        "decisionSource": "agent",
-        "review": {
-            "status": status,
-            "rationale": "bounded fixture decision",
-            "riskLevel": "low",
-            "userAuthorization": "low"
-        }
-    }})
 if mode in ("decline", "protocol_loss"):
     assert first["method"] == "turn/steer"
     assert first["params"]["threadId"] == "thread-contained"
@@ -6611,7 +6599,6 @@ if mode in ("decline", "protocol_loss"):
         marker.touch()
     if mode == "protocol_loss":
         sys.exit(0)
-    send_auto_review("denied")
     send({"method": "item/completed", "params": {
         "threadId": "thread-contained",
         "turnId": "turn-contained",
@@ -6622,12 +6609,10 @@ if mode in ("decline", "protocol_loss"):
         "threadId": "thread-contained",
         "turn": {"id": "turn-contained", "status": "completed", "items": []}
     }})
-elif mode in ("accept", "fallback_required"):
+elif mode == "accept":
     assert first["id"] == 77
     assert first["result"]["decision"] == "accept"
     marker.touch()
-    if mode == "accept":
-        send_auto_review("approved")
     send({"method": "item/completed", "params": {
         "threadId": "thread-contained",
         "turnId": "turn-contained",
@@ -6815,14 +6800,14 @@ else:
             gate_denials[0].next_safe_operation,
             crate::gate_denial::NextSafeOperation::RestorePreActionReviewService
         );
-        assert_eq!(journal.records.len(), 3);
+        assert_eq!(journal.records.len(), 2);
         assert_eq!(
-            journal.records[1].rationale,
+            journal.records[0].rationale,
             PreActionJournalRationale::DuplexFallbackRequired
         );
-        assert_eq!(journal.records[1].allowed, Some(false));
-        assert_eq!(journal.records[1].denial.as_ref(), Some(&gate_denials[0]));
-        assert_eq!(metrics.reviewed_action_denials.denominator, 1);
+        assert_eq!(journal.records[0].allowed, Some(false));
+        assert_eq!(journal.records[0].denial.as_ref(), Some(&gate_denials[0]));
+        assert_eq!(metrics.reviewed_action_denials.denominator, 0);
     }
 
     #[test]
@@ -8028,7 +8013,7 @@ printf '{"type":"done"}\n'
             Some(vec!["app-server", "--stdio", "--strict-config"])
         );
         for required in [
-            "approval_policy=\"on-request\"",
+            "approval_policy=\"untrusted\"",
             "approvals_reviewer=\"user\"",
             "default_permissions=\"maco_external_codex\"",
             "permissions.maco_external_codex.network={enabled=false}",

@@ -22,6 +22,7 @@ const HARD_MAX_PROMPT_BYTES: usize = 1024 * 1024;
 const OUTPUT_AGENT_MESSAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EXTERNAL_CODEX_PERMISSION_PROFILE: &str = "maco_external_codex";
+const DUPLEX_APPROVAL_POLICY: &str = "untrusted";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransportRead {
@@ -418,6 +419,7 @@ pub(crate) struct AppServerOutcome {
     pub(crate) gate_denials: Vec<GateDenial>,
     pub(crate) final_message: Option<String>,
     pub(crate) auto_reviews: Vec<AutoReviewEvidence>,
+    pub(crate) unreviewed_action_items: Vec<ItemOutcome>,
     pub(crate) duplex_fallback_required: bool,
     pub(crate) messages_received: usize,
     pub(crate) bytes_received: usize,
@@ -684,7 +686,10 @@ where
     let thread_start_id = state.allocate_request_id()?;
     let mut thread_params = Map::from_iter([
         ("cwd".to_string(), Value::from(turn.cwd.clone())),
-        ("approvalPolicy".to_string(), Value::from("on-request")),
+        (
+            "approvalPolicy".to_string(),
+            Value::from(DUPLEX_APPROVAL_POLICY),
+        ),
         // Production routes every surfaced request through the client-owned MACO callback.
         // Upstream auto_review remains experiment-only evidence because it does not review
         // actions already allowed inside the active sandbox.
@@ -719,7 +724,7 @@ where
     require_exact_text(
         &thread_response,
         &["result", "approvalPolicy"],
-        "on-request",
+        DUPLEX_APPROVAL_POLICY,
         "thread/start",
     )?;
     require_exact_text(
@@ -757,7 +762,7 @@ where
             "params": {
                 "threadId": thread_id,
                 "input": [{"type": "text", "text": turn.prompt, "text_elements": []}],
-                "approvalPolicy": "on-request",
+                "approvalPolicy": DUPLEX_APPROVAL_POLICY,
                 "approvalsReviewer": "user",
                 "permissions": turn.permission_profile,
                 "environments": []
@@ -978,6 +983,7 @@ where
                     "item/started",
                     "item type",
                 )?;
+                validate_item_type(item_type)?;
                 validate_identifier(item_id, "item id", 256)?;
                 if completed_items.contains(item_id)
                     || active_items
@@ -1431,20 +1437,13 @@ where
                         });
                     }
                 };
-                let duplex_fallback_required = auto_reviews.is_empty()
-                    || auto_reviews
-                        .iter()
-                        .any(|review| !review.structured_policy_decision)
-                    || {
-                        let adequate_review_targets = auto_reviews
-                            .iter()
-                            .filter(|review| review.structured_policy_decision)
-                            .filter_map(|review| review.target_item_id.as_deref())
-                            .collect::<BTreeSet<_>>();
-                        !approval_request_items
-                            .iter()
-                            .all(|item_id| adequate_review_targets.contains(item_id.as_str()))
-                    };
+                let unreviewed_action_items = item_outcomes
+                    .iter()
+                    .filter(|item| item_requires_blocking_review(&item.item_type))
+                    .filter(|item| !approval_request_items.contains(&item.item_id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let duplex_fallback_required = !unreviewed_action_items.is_empty();
                 return Ok(AppServerOutcome {
                     thread_id: thread_id.to_string(),
                     turn_id: turn_id.to_string(),
@@ -1455,6 +1454,7 @@ where
                     gate_denials,
                     final_message,
                     auto_reviews,
+                    unreviewed_action_items,
                     duplex_fallback_required,
                     messages_received: state.messages_received,
                     bytes_received: state.bytes_received,
@@ -1485,6 +1485,52 @@ where
             }
         }
     }
+}
+
+fn validate_item_type(item_type: &str) -> Result<(), AppServerError> {
+    if matches!(
+        item_type,
+        "userMessage"
+            | "hookPrompt"
+            | "agentMessage"
+            | "plan"
+            | "reasoning"
+            | "commandExecution"
+            | "fileChange"
+            | "mcpToolCall"
+            | "dynamicToolCall"
+            | "collabAgentToolCall"
+            | "subAgentActivity"
+            | "webSearch"
+            | "imageView"
+            | "sleep"
+            | "imageGeneration"
+            | "enteredReviewMode"
+            | "exitedReviewMode"
+            | "contextCompaction"
+    ) {
+        Ok(())
+    } else {
+        Err(AppServerError::Unexpected {
+            phase: "item/started",
+            message: format!("unsupported item action class {item_type}"),
+        })
+    }
+}
+
+fn item_requires_blocking_review(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "commandExecution"
+            | "fileChange"
+            | "mcpToolCall"
+            | "dynamicToolCall"
+            | "collabAgentToolCall"
+            | "subAgentActivity"
+            | "webSearch"
+            | "imageView"
+            | "imageGeneration"
+    )
 }
 
 fn parse_approval_request(
@@ -1906,7 +1952,7 @@ mod tests {
                 "id": 2,
                 "result": {
                     "thread": {"id": "thread-1"},
-                    "approvalPolicy": "on-request",
+                    "approvalPolicy": "untrusted",
                     "approvalsReviewer": "user",
                     "activePermissionProfile": {"id": "maco_external_codex"},
                     "cwd": "/workspace"
@@ -2072,7 +2118,7 @@ mod tests {
         ]
     }
 
-    fn run_two_approval_item_transcript(review_second_item: bool) -> AppServerOutcome {
+    fn run_two_approval_item_transcript(request_second_item: bool) -> AppServerOutcome {
         let mut messages = base_messages();
         messages.extend([
             json!({
@@ -2095,7 +2141,6 @@ mod tests {
                 }
             }),
         ]);
-        messages.extend(auto_review_lifecycle("review-one", "item-one", 2));
         messages.extend([
             json!({
                 "method": "item/completed",
@@ -2114,7 +2159,9 @@ mod tests {
                     "item": {"id": "item-two", "type": "commandExecution", "status": "inProgress"}
                 }
             }),
-            json!({
+        ]);
+        if request_second_item {
+            messages.push(json!({
                 "id": 62,
                 "method": "item/commandExecution/requestApproval",
                 "params": {
@@ -2124,10 +2171,7 @@ mod tests {
                     "startedAtMs": 5,
                     "command": "cargo test two"
                 }
-            }),
-        ]);
-        if review_second_item {
-            messages.extend(auto_review_lifecycle("review-two", "item-two", 6));
+            }));
         }
         messages.extend([
             json!({
@@ -2224,7 +2268,8 @@ mod tests {
         .expect("command approval transcript");
 
         assert_eq!(outcome.completed_items, 1);
-        assert!(outcome.duplex_fallback_required);
+        assert!(!outcome.duplex_fallback_required);
+        assert!(outcome.unreviewed_action_items.is_empty());
         let response = transport
             .sent
             .iter()
@@ -2736,6 +2781,162 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_approval_policy_downgrade_is_rejected() {
+        let mut messages = base_messages();
+        messages[1]["result"]["approvalPolicy"] = Value::from("on-request");
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("downgrade")),
+            || false,
+        )
+        .expect_err("approval policy downgrade");
+
+        assert!(matches!(
+            error,
+            AppServerError::Unexpected {
+                phase: "thread/start",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_item_action_class_aborts_the_protocol() {
+        let mut messages = base_messages();
+        messages.push(json!({
+            "method": "item/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {"id": "item-unknown", "type": "futureAction"}
+            }
+        }));
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("unknown-item")),
+            || false,
+        )
+        .expect_err("unknown action class");
+
+        assert!(matches!(
+            error,
+            AppServerError::Unexpected {
+                phase: "item/started",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn known_action_classes_all_require_blocking_parent_coverage() {
+        for item_type in [
+            "commandExecution",
+            "fileChange",
+            "mcpToolCall",
+            "dynamicToolCall",
+            "collabAgentToolCall",
+            "subAgentActivity",
+            "webSearch",
+            "imageView",
+            "imageGeneration",
+        ] {
+            assert!(item_requires_blocking_review(item_type), "{item_type}");
+        }
+        for item_type in [
+            "userMessage",
+            "hookPrompt",
+            "agentMessage",
+            "plan",
+            "reasoning",
+            "sleep",
+            "enteredReviewMode",
+            "exitedReviewMode",
+            "contextCompaction",
+        ] {
+            assert!(!item_requires_blocking_review(item_type), "{item_type}");
+        }
+    }
+
+    #[test]
+    fn unsupported_mcp_approval_shape_aborts_before_client_response() {
+        let mut messages = base_messages();
+        messages.extend([
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "mcp-item",
+                        "type": "mcpToolCall",
+                        "server": "probe",
+                        "tool": "read",
+                        "status": "inProgress"
+                    }
+                }
+            }),
+            json!({
+                "id": 88,
+                "method": "mcpServer/elicitation/request",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "serverName": "probe",
+                    "mode": "form"
+                }
+            }),
+        ]);
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("mcp-shape")),
+            || false,
+        )
+        .expect_err("unsupported MCP approval shape");
+
+        assert!(matches!(
+            error,
+            AppServerError::Unexpected { phase: "turn", .. }
+        ));
+        assert!(!transport
+            .sent
+            .iter()
+            .any(|message| message.get("id") == Some(&json!(88))));
+    }
+
+    #[test]
+    fn turn_without_action_items_needs_no_fallback() {
+        let mut messages = base_messages();
+        messages.push(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "completed", "items": []}
+            }
+        }));
+        let mut transport = FakeTransport::from_values(messages);
+        let outcome = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("no-actions")),
+            || false,
+        )
+        .expect("no-action turn");
+
+        assert!(!outcome.duplex_fallback_required);
+        assert!(outcome.unreviewed_action_items.is_empty());
+    }
+
+    #[test]
     fn duplicate_turn_started_notification_is_rejected() {
         let mut messages = base_messages();
         messages.push(json!({
@@ -2758,9 +2959,11 @@ mod tests {
     }
 
     #[test]
-    fn exact_item_correlated_auto_review_can_avoid_fallback() {
+    fn auto_review_cannot_substitute_for_parent_callback() {
         let outcome = run_auto_review_transcript(Some("item-reviewed"), Some("item-reviewed"));
-        assert!(!outcome.duplex_fallback_required);
+        assert!(outcome.duplex_fallback_required);
+        assert_eq!(outcome.unreviewed_action_items.len(), 1);
+        assert_eq!(outcome.unreviewed_action_items[0].item_id, "item-reviewed");
     }
 
     #[test]
@@ -2782,14 +2985,14 @@ mod tests {
     }
 
     #[test]
-    fn every_approval_item_requires_adequate_review_coverage() {
+    fn every_action_item_requires_a_blocking_parent_request() {
         let outcome = run_two_approval_item_transcript(false);
         assert_eq!(outcome.completed_items, 2);
         assert!(outcome.duplex_fallback_required);
     }
 
     #[test]
-    fn complete_approval_item_review_coverage_can_avoid_fallback() {
+    fn complete_parent_request_coverage_can_avoid_fallback() {
         let outcome = run_two_approval_item_transcript(true);
         assert_eq!(outcome.completed_items, 2);
         assert!(!outcome.duplex_fallback_required);
