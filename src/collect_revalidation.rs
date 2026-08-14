@@ -92,8 +92,8 @@ pub enum CollectRevalidationError {
     )]
     WorktreeIdentityMismatch {
         agent_id: String,
-        expected: WorktreeRecord,
-        actual: WorktreeRecord,
+        expected: Box<WorktreeRecord>,
+        actual: Box<WorktreeRecord>,
     },
     #[error(
         "worktree identity binding broke for agent '{agent_id}': expected managed worktree {expected:?} is unavailable"
@@ -164,8 +164,8 @@ pub fn revalidate_for_collection(
     {
         return Err(CollectRevalidationError::WorktreeIdentityMismatch {
             agent_id: request.agent_id.to_string(),
-            expected: request.expected_worktree.clone(),
-            actual: actual_worktree,
+            expected: Box::new(request.expected_worktree.clone()),
+            actual: Box::new(actual_worktree),
         });
     }
 
