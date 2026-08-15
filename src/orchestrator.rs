@@ -10,9 +10,6 @@ use crate::{
         decode_agent_checkpoint, decode_run_checkpoint, encode_agent_checkpoint,
         encode_run_checkpoint, LosslessPath,
     },
-    collect_revalidation::{
-        revalidate_for_collection, CollectRevalidationGuard, CollectRevalidationRequest,
-    },
     merge::capture_worktree_diff_from_commit,
     process_runner::{
         run_process, trusted_system_executable, CapturedBytes, EnvironmentMode, ProcessRunError,
@@ -1082,7 +1079,6 @@ fn run_plan_with_controls_runtime(
         let captured_candidates = run_agent_schedule_with_patch_dir(
             &AgentScheduleContext {
                 manager: &manager,
-                store: &store,
                 plan: &plan,
                 worktrees: &worktrees,
                 jobs: options.jobs,
@@ -1371,7 +1367,6 @@ fn resume_plan_file_runtime(
         let captured_candidates = run_agent_schedule_with_patch_dir(
             &AgentScheduleContext {
                 manager: &manager,
-                store: &store,
                 plan: &plan,
                 worktrees: &worktrees,
                 jobs: options.jobs,
@@ -2969,7 +2964,6 @@ impl Drop for PatchOutputGuard {
 
 struct AgentScheduleContext<'a> {
     manager: &'a WorktreeManager,
-    store: &'a SyncStore,
     plan: &'a OrchestrationPlan,
     worktrees: &'a [SelectedWorktree],
     jobs: usize,
@@ -3092,21 +3086,15 @@ fn run_agent_schedule(
                 summaries[index].id
             );
         }
-        let captured = match capture_revalidated_selected_bound_candidate(
-            context,
-            index,
+        let captured = capture_selected_bound_candidate(
+            context.manager,
+            &context.plan.agents[index],
             &summaries[index],
+            &context.worktrees[index],
+            context.base_oid,
             &expected,
-        ) {
-            Ok(captured) => captured,
-            Err(error) => {
-                fail_summary(
-                    &mut summaries[index],
-                    format!("pre-collection revalidation or candidate collection failed: {error}"),
-                );
-                continue;
-            }
-        };
+            context.runtime,
+        )?;
         if let Some(binding) = candidate_binding.as_ref() {
             if &captured.binding != binding {
                 bail!(
@@ -3270,11 +3258,14 @@ fn run_agent_schedule(
             let patch_output = patch_outputs[index].take();
             let captured = if state_intact {
                 expected_state.as_ref().and_then(|expected_state| {
-                    match capture_revalidated_selected_bound_candidate(
-                        context,
-                        index,
+                    match capture_selected_bound_candidate(
+                        context.manager,
+                        &context.plan.agents[index],
                         &summaries[index],
+                        &context.worktrees[index],
+                        context.base_oid,
                         expected_state,
+                        context.runtime,
                     ) {
                         Ok(captured) => Some(captured),
                         Err(error) => {
@@ -3422,56 +3413,6 @@ fn capture_selected_bound_candidate(
     let captured = capture_bound_candidate(worktree.path(), base_oid, expected_state, runtime)?;
     verify_selected_worktree_binding(manager, agent, summary, worktree)?;
     Ok(captured)
-}
-
-fn capture_revalidated_selected_bound_candidate(
-    context: &AgentScheduleContext<'_>,
-    index: usize,
-    summary: &AgentRunSummary,
-    expected_state: &CandidateStateSnapshot,
-) -> Result<CapturedCandidate> {
-    let agent = &context.plan.agents[index];
-    let worktree = &context.worktrees[index];
-    let guard =
-        revalidate_selected_collection(context.store, context.manager, agent, summary, worktree)?;
-    let captured = capture_selected_bound_candidate(
-        context.manager,
-        agent,
-        summary,
-        worktree,
-        context.base_oid,
-        expected_state,
-        context.runtime,
-    )?;
-    guard
-        .verify()
-        .context("authenticated claim binding changed during candidate collection")?;
-    Ok(captured)
-}
-
-fn revalidate_selected_collection(
-    store: &SyncStore,
-    manager: &WorktreeManager,
-    agent: &AgentPlan,
-    summary: &AgentRunSummary,
-    worktree: &SelectedWorktree,
-) -> Result<CollectRevalidationGuard> {
-    let claim = summary
-        .claim
-        .as_ref()
-        .with_context(|| format!("agent '{}' has no claimed-path binding", agent.id))?;
-    revalidate_for_collection(
-        store,
-        manager,
-        CollectRevalidationRequest {
-            agent_id: &agent.id,
-            claim_token: claim.token,
-            claimed_paths: &agent.paths,
-            expected_worktree: worktree.record(),
-            expected_branch: &worktree.record().branch,
-        },
-    )
-    .map_err(Into::into)
 }
 
 fn propagate_dependency_failures(
