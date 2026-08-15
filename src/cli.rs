@@ -53,7 +53,8 @@ use crate::{
     supervise::{self, SupervisorRunOptions},
     sync::{normalize_repo_relative_path, ClaimToken},
     sync_store::{
-        ClaimStatusReport, ClaimTelemetryOutcome, MegafileClaimWarning, OwnerReport, SyncStore,
+        ClaimLivenessReport, ClaimStatusReport, ClaimTelemetryOutcome, ClaimTiming,
+        MegafileClaimWarning, OwnerReport, SyncStore,
     },
     worktree::{
         sweep_workspace_worktrees, worktree_report_path_text, RepositoryInfo,
@@ -2574,13 +2575,15 @@ impl SyncCommand {
             SyncSubcommand::Claim(args) => {
                 let store = SyncStore::open(args.repo)?;
                 let configured_thresholds = args.thresholds.configured_thresholds();
+                let timing = args.timing.timing()?.unwrap_or_default();
                 let outcome = match configured_thresholds {
-                    Some(thresholds) => store.claim_paths_with_telemetry_thresholds(
+                    Some(thresholds) => store.claim_paths_with_telemetry_thresholds_and_timing(
                         &args.agent_id,
                         args.paths,
                         thresholds,
+                        timing,
                     )?,
-                    None => store.claim_paths_with_telemetry(&args.agent_id, args.paths)?,
+                    None => store.claim_paths_with_timing(&args.agent_id, args.paths, timing)?,
                 };
                 print_claim_telemetry_outcome(&outcome, args.json)
             }
@@ -2604,6 +2607,39 @@ impl SyncCommand {
                 let claims = store.status_snapshot()?;
                 print_claim_statuses(&claims, args.json)
             }
+            SyncSubcommand::Liveness(args) => {
+                let store = SyncStore::open(args.repo)?;
+                let claims = store.liveness_snapshot()?;
+                print_claim_liveness(&claims, args.json)
+            }
+            SyncSubcommand::Heartbeat(args) => {
+                let store = SyncStore::open(args.repo)?;
+                let report = store.heartbeat(
+                    ClaimToken::from_u64(args.token),
+                    &args.agent_id,
+                    args.timing.timing()?,
+                )?;
+                print_query_report(&report, args.json)
+            }
+            SyncSubcommand::Sweep(args) => {
+                let store = SyncStore::open(args.repo)?;
+                let report = store.sweep_stale()?;
+                print_query_report(&report, args.json)
+            }
+            SyncSubcommand::Takeover(args) => {
+                let store = SyncStore::open(args.repo)?;
+                let report = store.takeover(
+                    ClaimToken::from_u64(args.prior_token),
+                    &args.agent_id,
+                    args.timing.timing()?,
+                )?;
+                print_query_report(&report, args.json)
+            }
+            SyncSubcommand::History(args) => {
+                let store = SyncStore::open(args.repo)?;
+                let history = store.supersession_history()?;
+                print_query_report(&history, args.json)
+            }
         }
     }
 }
@@ -2620,6 +2656,16 @@ enum SyncSubcommand {
     Owner(OwnerSyncArgs),
     /// List active path claims.
     Status(StatusSyncArgs),
+    /// List bounded heartbeat and takeover state for active claims.
+    Liveness(StatusSyncArgs),
+    /// Refresh one exact-owner claim heartbeat.
+    Heartbeat(HeartbeatSyncArgs),
+    /// Mark stale claims takeover-eligible without releasing their paths.
+    Sweep(SweepSyncArgs),
+    /// Atomically replace one takeover-eligible claim with a successor.
+    Takeover(TakeoverSyncArgs),
+    /// List the bounded durable claim-supersession audit history.
+    History(StatusSyncArgs),
 }
 
 #[derive(Debug, Args)]
@@ -2634,6 +2680,8 @@ struct ClaimSyncArgs {
     paths: Vec<PathBuf>,
     #[command(flatten)]
     thresholds: MegafileThresholdArgs,
+    #[command(flatten)]
+    timing: ClaimTimingArgs,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -2680,6 +2728,68 @@ struct StatusSyncArgs {
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args, Default)]
+struct ClaimTimingArgs {
+    /// Desired heartbeat interval in seconds. Must be paired with --stale-after-seconds.
+    #[arg(long, requires = "stale_after_seconds")]
+    heartbeat_interval_seconds: Option<u64>,
+    /// Age in seconds at which a claim becomes stale. Must be paired with --heartbeat-interval-seconds.
+    #[arg(long, requires = "heartbeat_interval_seconds")]
+    stale_after_seconds: Option<u64>,
+}
+
+impl ClaimTimingArgs {
+    fn timing(&self) -> Result<Option<ClaimTiming>> {
+        match (self.heartbeat_interval_seconds, self.stale_after_seconds) {
+            (None, None) => Ok(None),
+            (Some(heartbeat), Some(stale)) => Ok(Some(ClaimTiming::new(heartbeat, stale)?)),
+            _ => bail!("heartbeat interval and stale threshold must be configured together"),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct HeartbeatSyncArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Active claim token to refresh.
+    token: u64,
+    /// Exact stable agent id recorded on the claim.
+    agent_id: String,
+    #[command(flatten)]
+    timing: ClaimTimingArgs,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct SweepSyncArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct TakeoverSyncArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Exact active predecessor token observed as takeover-eligible.
+    prior_token: u64,
+    /// Stable agent id for the successor claim.
+    agent_id: String,
+    #[command(flatten)]
+    timing: ClaimTimingArgs,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -5985,6 +6095,34 @@ fn print_claim_statuses(claims: &[ClaimStatusReport], json: bool) -> Result<()> 
                 status.owner_run_state.as_str(),
                 paths,
             );
+        }
+    }
+    Ok(())
+}
+
+fn print_claim_liveness(claims: &[ClaimLivenessReport], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(claims)?);
+    } else if claims.is_empty() {
+        println!("No active claims.");
+    } else {
+        for report in claims {
+            println!(
+                "{}\t{}\t{:?}\theartbeat={}\tstale_after={}\tsupersedes={}",
+                report.claim_id,
+                report.claim.agent_id,
+                report.state,
+                report
+                    .heartbeat_unix_seconds
+                    .map_or_else(|| "<unknown>".to_string(), |value| value.to_string()),
+                report
+                    .stale_after_seconds
+                    .map_or_else(|| "<unknown>".to_string(), |value| value.to_string()),
+                report.supersedes.as_deref().unwrap_or("<none>"),
+            );
+            if let Some(ambiguity) = &report.ambiguity {
+                println!("  Ambiguity: {ambiguity}");
+            }
         }
     }
     Ok(())
