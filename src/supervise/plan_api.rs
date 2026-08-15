@@ -284,6 +284,7 @@ pub(crate) fn validate_generated_follow_up_plan_document(
         .context("generated follow-up plan failed the ordinary full-document loader")?;
     if loaded.plan != generated.ordinary_plan()
         || loaded.consultant != generated.consultant
+        || loaded.assignment_metadata.suitability != generated.effective_assignment_suitability()
         || loaded.plan_metadata.assignment_schedule != generated.assignment_schedule
         || loaded.plan_metadata.run_budget != generated.run_budget
         || loaded.plan_metadata.generated_follow_up != Some(generated.generated_follow_up.clone())
@@ -642,6 +643,9 @@ fn assignment_metadata_from_plan_value(
         None => &[],
     };
     let mut metadata_by_worker = AssignmentMetadata::new();
+    if value.get("assignment_suitability").is_some() {
+        bail!("top-level assignment_suitability is unsupported; configure each assignment.suitability explicitly");
+    }
     let assignments_by_id = plan
         .assignments
         .iter()
@@ -649,6 +653,19 @@ fn assignment_metadata_from_plan_value(
         .collect::<BTreeMap<_, _>>();
     for raw_assignment in raw_assignments {
         collect_assignment_metadata(raw_assignment, &assignments_by_id, &mut metadata_by_worker)?;
+    }
+    let expected_ids = plan
+        .assignments
+        .iter()
+        .map(|assignment| assignment.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let suitability_ids = metadata_by_worker
+        .suitability
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if suitability_ids != expected_ids {
+        bail!("assignment suitability must cover every normalized assignment exactly once");
     }
     Ok(metadata_by_worker)
 }
@@ -665,6 +682,18 @@ fn collect_assignment_metadata(
         .trim();
     let assignment = assignments_by_id.get(raw_id).copied();
     if let Some(assignment) = assignment {
+        let nested_suitability = raw_assignment
+            .get("suitability")
+            .map(|suitability| {
+                serde_json::from_value::<AssignmentSuitabilityConfig>(suitability.clone())
+                    .with_context(|| {
+                        format!("assignment '{}' suitability is invalid", assignment.id)
+                    })
+            })
+            .transpose()?;
+        let suitability = nested_suitability.unwrap_or_default();
+        suitability.validate(&assignment.id)?;
+        metadata_by_worker.insert_suitability(assignment.id.clone(), suitability);
         if let Some(effort) = raw_assignment.get("reasoning_effort") {
             let effort =
                 serde_json::from_value::<ReasoningEffort>(effort.clone()).with_context(|| {
@@ -767,6 +796,14 @@ pub(super) fn supervisor_plan_value(
         .and_then(Value::as_array_mut)
         .context("normalized supervisor plan assignments did not serialize to an array")?;
     for (assignment_value, assignment) in assignments.iter_mut().zip(&plan.assignments) {
+        assignment_value
+            .as_object_mut()
+            .context("normalized assignment did not serialize to an object")?
+            .insert(
+                "suitability".to_string(),
+                serde_json::to_value(assignment_metadata.suitability(&assignment.id))
+                    .context("failed to serialize assignment suitability")?,
+            );
         if let Some(effort) = assignment_metadata.reasoning_effort(&assignment.id) {
             assignment_value
                 .as_object_mut()
@@ -2005,6 +2042,7 @@ pub fn collect_supervisor_run(
         decomposition_candidates: Vec::new(),
         generated_follow_up_tasks: Vec::new(),
         assignment_traceability: Vec::new(),
+        assignment_suitability_outcomes: Vec::new(),
         coverage_gaps: Vec::new(),
         breaker_trip: None,
         orchestrator_reports: Vec::new(),

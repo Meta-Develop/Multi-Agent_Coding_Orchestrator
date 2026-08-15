@@ -9,6 +9,7 @@ mod prompts_gates;
 mod reaudit;
 mod run_artifacts;
 mod scheduler;
+mod suitability;
 use super::*;
 use crate::{
     external_agent::{
@@ -549,6 +550,7 @@ fn artifact_test_final_report(run_id: &RunId) -> SupervisorFinalReport {
         decomposition_candidates: Vec::new(),
         generated_follow_up_tasks: Vec::new(),
         assignment_traceability: Vec::new(),
+        assignment_suitability_outcomes: Vec::new(),
         coverage_gaps: Vec::new(),
         breaker_trip: None,
         orchestrator_reports: Vec::new(),

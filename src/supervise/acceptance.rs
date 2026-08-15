@@ -520,6 +520,8 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 .context("generated follow-up supervisor plan is not dispatchable")?;
             if loaded.plan != supervisor_plan.ordinary_plan()
                 || loaded.consultant != supervisor_plan.consultant
+                || loaded.assignment_metadata.suitability
+                    != supervisor_plan.effective_assignment_suitability()
                 || loaded.plan_metadata.assignment_schedule != supervisor_plan.assignment_schedule
                 || loaded.plan_metadata.run_budget != supervisor_plan.run_budget
                 || loaded.plan_metadata.generated_follow_up

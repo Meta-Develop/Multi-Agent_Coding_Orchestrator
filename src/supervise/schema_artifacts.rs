@@ -38,7 +38,10 @@ pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "SupervisorFinalReport",
         "type": "object",
-        "required": ["version", "role_economics_profile", "role_usage", "usage_complete"],
+        "required": [
+            "version", "role_economics_profile", "role_usage", "usage_complete",
+            "assignment_suitability_outcomes"
+        ],
         "properties": {
             "version": {"type": "integer", "const": SUPERVISOR_SCHEMA_VERSION},
             "role_economics_profile": role_economics_profile_schema_value(),
@@ -89,7 +92,104 @@ pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
                 "type": "array",
                 "items": environment_failure_schema_value()
             },
+            "assignment_suitability_outcomes": assignment_suitability_outcomes_schema_value(),
             "generated_follow_up_tasks": generated_follow_up_tasks_schema_value()
+        }
+    })
+}
+
+fn assignment_suitability_config_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "classification", "bounded_scope", "max_scope_paths",
+            "verification_path", "autonomous_completion"
+        ],
+        "properties": {
+            "classification": {
+                "type": "string",
+                "enum": ["viable", "unclear", "needs_decision", "duplicate", "invalid", "out_of_scope"]
+            },
+            "bounded_scope": {"type": "boolean"},
+            "max_scope_paths": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_SUPERVISOR_ASSIGNMENT_SCOPE_PATHS
+            },
+            "verification_path": {
+                "type": ["string", "null"],
+                "enum": ["supervisor_validation_floor", null]
+            },
+            "autonomous_completion": {"type": "boolean"},
+            "rationale": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_ASSIGNMENT_SUITABILITY_RATIONALE_BYTES
+            }
+        }
+    })
+}
+
+fn assignment_suitability_outcomes_schema_value() -> serde_json::Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "assignment_id", "classification", "disposition", "verification_path",
+                "axes", "reasons"
+            ],
+            "properties": {
+                "assignment_id": {"type": "string", "minLength": 1},
+                "classification": assignment_suitability_config_schema_value()["properties"]["classification"].clone(),
+                "disposition": {"type": "string", "enum": ["admitted", "parked", "refused"]},
+                "verification_path": assignment_suitability_config_schema_value()["properties"]["verification_path"].clone(),
+                "axes": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "bounded_scope", "scope_path_count", "max_scope_paths",
+                        "within_scope_path_limit", "verification_path_declared",
+                        "autonomous_completion"
+                    ],
+                    "properties": {
+                        "bounded_scope": {"type": "boolean"},
+                        "scope_path_count": {
+                            "type": "integer",
+                            "minimum": 1
+                        },
+                        "max_scope_paths": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_SUPERVISOR_ASSIGNMENT_SCOPE_PATHS
+                        },
+                        "within_scope_path_limit": {"type": "boolean"},
+                        "verification_path_declared": {"type": "boolean"},
+                        "autonomous_completion": {"type": "boolean"}
+                    }
+                },
+                "reasons": {
+                    "type": "array",
+                    "maxItems": MAX_ASSIGNMENT_SUITABILITY_REASONS,
+                    "uniqueItems": true,
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "classification_unclear", "classification_needs_decision",
+                            "classification_duplicate", "classification_invalid",
+                            "classification_out_of_scope", "scope_not_bounded",
+                            "verification_path_missing", "autonomous_completion_not_viable"
+                        ]
+                    }
+                },
+                "rationale": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_ASSIGNMENT_SUITABILITY_RATIONALE_BYTES
+                }
+            }
         }
     })
 }

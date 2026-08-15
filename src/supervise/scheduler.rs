@@ -102,6 +102,93 @@ fn plan_has_overlapping_assignments(plan: &SupervisorPlan) -> bool {
         })
 }
 
+fn assignment_suitability_outcomes(
+    plan: &SupervisorPlan,
+    assignment_metadata: &AssignmentMetadata,
+) -> Vec<AssignmentSuitabilityOutcome> {
+    plan.assignments
+        .iter()
+        .map(|assignment| {
+            assignment_metadata
+                .suitability(&assignment.id)
+                .outcome(&assignment.id, assignment.assigned_paths.len())
+        })
+        .collect()
+}
+
+fn non_admitted_suitability_execution_outcome(
+    assignment: &OrchestratorAssignment,
+    suitability: &AssignmentSuitabilityOutcome,
+) -> AssignmentExecutionOutcome {
+    AssignmentExecutionOutcome {
+        findings: vec![Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "supervisor assignment '{}' was not dispatched by the pre-claim suitability gate ({:?})",
+                assignment.id, suitability.disposition
+            ),
+            paths: assignment.assigned_paths.clone(),
+        }],
+        assignment_failed: true,
+        ..AssignmentExecutionOutcome::default()
+    }
+}
+
+fn seed_non_admitted_suitability_outcomes(
+    progress: &mut SchedulerProgress,
+    plan: &SupervisorPlan,
+    suitability_outcomes: &[AssignmentSuitabilityOutcome],
+) -> Result<()> {
+    if suitability_outcomes.len() != plan.assignments.len() {
+        bail!("assignment suitability outcomes do not cover the supervisor plan");
+    }
+    for (index, (assignment, suitability)) in plan
+        .assignments
+        .iter()
+        .zip(suitability_outcomes)
+        .enumerate()
+    {
+        if suitability.disposition == AssignmentSuitabilityDisposition::Admitted {
+            continue;
+        }
+        let slot = progress
+            .indexed_outcomes
+            .get_mut(index)
+            .context("assignment suitability index is outside scheduler outcomes")?;
+        *slot = Some(non_admitted_suitability_execution_outcome(
+            assignment,
+            suitability,
+        ));
+    }
+    Ok(())
+}
+
+fn record_assignment_suitability_outcomes(
+    outcomes: &[AssignmentSuitabilityOutcome],
+    schedule: &[AssignmentScheduleEntry],
+    run_id: &RunId,
+    journal: &mut Option<OrchestrationEventJournal>,
+    writer: &mut ArtifactRunWriter,
+) -> Result<()> {
+    if outcomes.len() != schedule.len() {
+        bail!("assignment suitability events do not cover the validated schedule");
+    }
+    for (outcome, schedule_entry) in outcomes.iter().zip(schedule) {
+        let parent = schedule_entry
+            .parent_assignment_id
+            .as_deref()
+            .or(Some(run_id.as_str()));
+        record_assignment_suitability_event_strict(
+            journal,
+            writer,
+            &outcome.assignment_id,
+            parent,
+            outcome,
+        )?;
+    }
+    Ok(())
+}
+
 fn validated_scheduler_assignment_schedule(
     plan: &SupervisorPlan,
     metadata: &SupervisorPlanMetadata,
@@ -864,7 +951,9 @@ fn run_serial_assignment_schedule(
     cancellation: &ProcessCancellation,
     serial_semantic_warn_intents: &Mutex<Vec<(usize, SemanticIntent)>>,
 ) -> Result<()> {
-    let mut pending = (0..context.plan.assignments.len()).collect::<BTreeSet<_>>();
+    let mut pending = (0..context.plan.assignments.len())
+        .filter(|index| progress.indexed_outcomes[*index].is_none())
+        .collect::<BTreeSet<_>>();
     while !pending.is_empty() {
         suppress_failed_descendants(
             &mut pending,
@@ -1035,7 +1124,9 @@ fn run_concurrent_assignment_schedule(
 ) -> Result<()> {
     thread::scope(|scope| -> Result<()> {
         let (completion_sender, completion_receiver) = mpsc::channel::<usize>();
-        let mut pending = (0..context.plan.assignments.len()).collect::<BTreeSet<_>>();
+        let mut pending = (0..context.plan.assignments.len())
+            .filter(|index| progress.indexed_outcomes[*index].is_none())
+            .collect::<BTreeSet<_>>();
         let mut active = BTreeMap::new();
         let mut stop_scheduling = false;
         let mut next_semantic_block_order = 0usize;
@@ -1350,6 +1441,7 @@ struct SupervisorFinalReportConstruction<'context> {
     bloated_file_flags: Vec<BloatedFileFlag>,
     decomposition_candidates: Vec<DecompositionCompletion>,
     assignment_traceability: Vec<AssignmentTraceability>,
+    assignment_suitability_outcomes: Vec<AssignmentSuitabilityOutcome>,
     coverage_gaps: Vec<SupervisorCoverageGap>,
     supervisor_breaker_trip: Option<SupervisorBreakerTrip>,
     autonomy_kpis: AutonomyKpiReport,
@@ -1588,6 +1680,7 @@ fn build_supervisor_final_report(
         bloated_file_flags,
         decomposition_candidates,
         assignment_traceability,
+        assignment_suitability_outcomes,
         coverage_gaps,
         supervisor_breaker_trip,
         autonomy_kpis,
@@ -1608,6 +1701,10 @@ fn build_supervisor_final_report(
         .flat_map(|report| report.generated_follow_up_tasks.iter().cloned())
         .collect::<Vec<_>>();
     let generated_follow_up_task_count = generated_follow_up_tasks.len();
+    let non_admitted_suitability_count = assignment_suitability_outcomes
+        .iter()
+        .filter(|outcome| outcome.disposition != AssignmentSuitabilityDisposition::Admitted)
+        .count();
     let role_usage = complete_role_usage_reports(role_usage);
     let mut role_economics_profile =
         execution_role_economics_profile(plan, runtime, runtime_model_catalog);
@@ -1757,6 +1854,7 @@ fn build_supervisor_final_report(
         decomposition_candidates,
         generated_follow_up_tasks,
         assignment_traceability,
+        assignment_suitability_outcomes,
         coverage_gaps: coverage_gaps.clone(),
         breaker_trip: supervisor_breaker_trip,
         orchestrator_reports: collected.orchestrator_reports,
@@ -1800,6 +1898,10 @@ fn build_supervisor_final_report(
         } else if field_guide_mutation_failed {
             "field-guide mutation or strict journal provenance did not complete; planned evidence may require manual reconciliation"
                 .to_string()
+        } else if non_admitted_suitability_count > 0 {
+            format!(
+                "the pre-claim suitability gate parked or refused {non_admitted_suitability_count} assignment(s) before resource acquisition or child dispatch"
+            )
         } else {
             "one or more child or worker reports failed, were rejected, or were missing".to_string()
         },
@@ -1833,6 +1935,9 @@ fn build_supervisor_final_report(
             BREAKER_RECOVERY_GUIDANCE.to_string()
         } else if field_guide_mutation_failed {
             "inspect strict field-guide planned/committed journal evidence and authenticated state before any manual retry"
+                .to_string()
+        } else if non_admitted_suitability_count > 0 {
+            "inspect assignment_suitability_outcomes, narrow or reclassify the task with an explicit verification path and autonomous completion authority, then start a new run"
                 .to_string()
         } else {
             "inspect run reports and rerun failed child scopes after correcting the issue"
@@ -2307,6 +2412,7 @@ struct RuntimeModelCatalogFailureFinalization<'context, 'checkpoint> {
     max_concurrent_children: usize,
     admission_policy_input: SupervisorAdmissionPolicyInput,
     has_multiple_independent_assignment_scopes: bool,
+    assignment_suitability_outcomes: Vec<AssignmentSuitabilityOutcome>,
 }
 
 fn persist_runtime_model_catalog_environment_failure(
@@ -2325,6 +2431,7 @@ fn persist_runtime_model_catalog_environment_failure(
         max_concurrent_children,
         admission_policy_input,
         has_multiple_independent_assignment_scopes,
+        assignment_suitability_outcomes,
     } = finalization;
     let run_budget_report = budget_ledger.report()?;
     let (report_plan_file, report_run_dir) =
@@ -2366,6 +2473,7 @@ fn persist_runtime_model_catalog_environment_failure(
         bloated_file_flags: Vec::new(),
         decomposition_candidates: Vec::new(),
         assignment_traceability: Vec::new(),
+        assignment_suitability_outcomes,
         coverage_gaps: plan_metadata.coverage_gaps.clone(),
         supervisor_breaker_trip: None,
         autonomy_kpis: AutonomyKpiReport::default(),
@@ -2430,6 +2538,8 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         worktree_creation,
         runtime_model_catalog,
     )?;
+    let assignment_suitability_outcomes =
+        assignment_suitability_outcomes(&plan, &assignment_metadata);
     // Runtime catalog acquisition is the first dispatch-capable environment preflight. A typed
     // failure is finalized here and deliberately short-circuits every assignment environment
     // preflight, which can begin only inside `external_runner` below.
@@ -2453,6 +2563,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                             &assignment_schedule,
                             &plan_metadata,
                         ),
+                    assignment_suitability_outcomes,
                 },
                 *failure,
             );
@@ -2500,6 +2611,13 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
             orchestration_journal: &mut orchestration_journal,
             primary_run_baseline: &mut primary_run_baseline,
         })?;
+        record_assignment_suitability_outcomes(
+            &assignment_suitability_outcomes,
+            &assignment_schedule,
+            &options.run_id,
+            &mut orchestration_journal,
+            &mut artifact_writer,
+        )?;
         let sync_store = sync_store_slot
             .as_ref()
             .context("supervisor sync store was not initialized")?;
@@ -2540,6 +2658,11 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
             let serial_semantic_warn_intents = Mutex::new(Vec::<(usize, SemanticIntent)>::new());
             let mut progress =
                 SchedulerProgress::new(plan.assignments.len(), max_concurrent_children);
+            seed_non_admitted_suitability_outcomes(
+                &mut progress,
+                &plan,
+                &assignment_suitability_outcomes,
+            )?;
             let scheduler_context = AssignmentSchedulerContext {
                 plan: &plan,
                 budget_config,
@@ -2880,6 +3003,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         bloated_file_flags,
         decomposition_candidates,
         assignment_traceability,
+        assignment_suitability_outcomes,
         coverage_gaps,
         supervisor_breaker_trip,
         autonomy_kpis,
@@ -3645,6 +3769,7 @@ mod decomposition_tests {
             bloated_file_flags: Vec::new(),
             decomposition_candidates: Vec::new(),
             assignment_traceability: Vec::new(),
+            assignment_suitability_outcomes: Vec::new(),
             coverage_gaps: Vec::new(),
             supervisor_breaker_trip: None,
             autonomy_kpis: AutonomyKpiReport::default(),
