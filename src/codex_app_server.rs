@@ -752,6 +752,7 @@ where
         "thread id",
     )?
     .to_string();
+    wait_for_thread_started(&mut state, transport, &thread_id, &cancelled)?;
 
     let turn_start_id = state.allocate_request_id()?;
     state.send(
@@ -803,6 +804,36 @@ where
         }
         Err(error) => Err(error),
     }
+}
+
+fn wait_for_thread_started<T, C>(
+    state: &mut ProtocolState,
+    transport: &mut T,
+    thread_id: &str,
+    cancelled: &C,
+) -> Result<(), AppServerError>
+where
+    T: JsonLineTransport,
+    C: Fn() -> bool,
+{
+    // Codex 0.144.4 sends this notification immediately after the correlated thread/start
+    // response. Consuming it here prevents a missing or reordered lifecycle from being mistaken
+    // for part of the later turn.
+    let message = state.receive(transport, "thread/started", cancelled)?;
+    if message.get("method").and_then(Value::as_str) != Some("thread/started") {
+        return Err(AppServerError::Unexpected {
+            phase: "thread/started",
+            message: "required thread lifecycle notification was missing or reordered".to_string(),
+        });
+    }
+    require_exact_text(&message, &["method"], "thread/started", "thread/started")?;
+    require_exact_text(
+        &message,
+        &["params", "thread", "id"],
+        thread_id,
+        "thread/started",
+    )?;
+    Ok(())
 }
 
 fn wait_for_response<T, C>(
@@ -897,10 +928,10 @@ where
     let mut completed_reviews = BTreeSet::<String>::new();
     let mut auto_reviews = Vec::new();
     let mut gate_denials = Vec::new();
-    let mut approval_request_items = BTreeSet::<String>::new();
+    let mut action_review_decisions = BTreeMap::<String, ApprovalDecision>::new();
+    let mut permission_request_items = BTreeSet::<String>::new();
     let mut pending_correction_responses = BTreeMap::<RequestId, String>::new();
     let mut refused_ceiling_expansions = 0usize;
-    let mut thread_started_seen = false;
     let mut turn_started_seen = false;
 
     loop {
@@ -943,16 +974,6 @@ where
         let params = required_object(&message, &["params"], "turn", "params")?;
 
         match method {
-            "thread/started" => {
-                if thread_started_seen {
-                    return Err(AppServerError::Duplicate {
-                        phase: "thread/started",
-                        message: "thread lifecycle started more than once".to_string(),
-                    });
-                }
-                require_exact_text(&message, &["params", "thread", "id"], thread_id, "turn")?;
-                thread_started_seen = true;
-            }
             "turn/started" => {
                 if turn_started_seen {
                     return Err(AppServerError::Duplicate {
@@ -971,6 +992,12 @@ where
             }
             "item/started" => {
                 validate_turn_correlation(params, thread_id, turn_id, "item/started")?;
+                if !turn_started_seen {
+                    return Err(AppServerError::Unexpected {
+                        phase: "item/started",
+                        message: "item started before the required turn lifecycle".to_string(),
+                    });
+                }
                 let item_id = required_text(
                     &message,
                     &["params", "item", "id"],
@@ -1024,7 +1051,7 @@ where
                 }
                 let item_id =
                     required_text(&message, &["params", "itemId"], "approval", "item id")?;
-                if !approval_request_items.insert(item_id.to_string()) {
+                if action_review_decisions.contains_key(item_id) {
                     return Err(AppServerError::Duplicate {
                         phase: "approval",
                         message: "active item requested approval more than once".to_string(),
@@ -1075,6 +1102,7 @@ where
                     }
                     Err(error) => return Err(error),
                 };
+                action_review_decisions.insert(item_id.to_string(), review.decision);
                 if expansion {
                     refused_ceiling_expansions = refused_ceiling_expansions.saturating_add(1);
                     if review.decision == ApprovalDecision::Accept {
@@ -1149,10 +1177,10 @@ where
                     "permission approval",
                     "item id",
                 )?;
-                if !approval_request_items.insert(item_id.to_string()) {
+                if !permission_request_items.insert(item_id.to_string()) {
                     return Err(AppServerError::Duplicate {
                         phase: "permission approval",
-                        message: "active item requested approval more than once".to_string(),
+                        message: "active item requested permission more than once".to_string(),
                     });
                 }
                 let active_item =
@@ -1391,6 +1419,14 @@ where
                         .unwrap_or("completed")
                         .to_string()
                 };
+                if status == "completed"
+                    && action_review_decisions.get(item_id) == Some(&ApprovalDecision::Decline)
+                {
+                    return Err(AppServerError::Unexpected {
+                        phase: "item/completed",
+                        message: "declined action item reported successful completion".to_string(),
+                    });
+                }
                 if item_type == "agentMessage" {
                     final_message = optional_bounded_text(
                         message.pointer("/params/item/text"),
@@ -1406,6 +1442,12 @@ where
             }
             "turn/completed" => {
                 validate_turn_correlation(params, thread_id, turn_id, "turn/completed")?;
+                if !turn_started_seen {
+                    return Err(AppServerError::Unexpected {
+                        phase: "turn/completed",
+                        message: "turn completed before the required turn lifecycle".to_string(),
+                    });
+                }
                 if !pending_correction_responses.is_empty() {
                     return Err(AppServerError::Unexpected {
                         phase: "turn/completed",
@@ -1440,7 +1482,7 @@ where
                 let unreviewed_action_items = item_outcomes
                     .iter()
                     .filter(|item| item_requires_blocking_review(&item.item_type))
-                    .filter(|item| !approval_request_items.contains(&item.item_id))
+                    .filter(|item| !action_review_decisions.contains_key(&item.item_id))
                     .cloned()
                     .collect::<Vec<_>>();
                 let duplex_fallback_required = !unreviewed_action_items.is_empty();
@@ -1957,6 +1999,10 @@ mod tests {
                     "activePermissionProfile": {"id": "maco_external_codex"},
                     "cwd": "/workspace"
                 }
+            }),
+            json!({
+                "method": "thread/started",
+                "params": {"thread": {"id": "thread-1"}}
             }),
             json!({
                 "id": 3,
@@ -2692,6 +2738,190 @@ mod tests {
     }
 
     #[test]
+    fn permission_expansion_request_alone_does_not_cover_action_review() {
+        let mut messages = base_messages();
+        messages.extend([
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "permission-only", "type": "commandExecution", "status": "inProgress"}
+                }
+            }),
+            json!({
+                "id": 80,
+                "method": "item/permissions/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "permission-only",
+                    "reason": "request broader access"
+                }
+            }),
+            json!({"id": 4, "result": {}}),
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "permission-only", "type": "commandExecution", "status": "completed"}
+                }
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed", "items": []}
+                }
+            }),
+        ]);
+        let mut transport = FakeTransport::from_values(messages);
+        let outcome = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |request: ApprovalRequest| {
+                assert_eq!(request.kind, ApprovalKind::PermissionExpansion);
+                Ok(reviewer_decline_for_test("permission-only"))
+            },
+            || false,
+        )
+        .expect("permission-only transcript");
+
+        assert_eq!(outcome.refused_ceiling_expansions, 1);
+        assert!(outcome.duplex_fallback_required);
+        assert_eq!(outcome.unreviewed_action_items.len(), 1);
+        assert_eq!(
+            outcome.unreviewed_action_items[0].item_id,
+            "permission-only"
+        );
+    }
+
+    #[test]
+    fn permission_expansion_can_be_followed_by_required_action_review() {
+        let mut messages = base_messages();
+        messages.extend([
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "permission-then-action", "type": "fileChange", "status": "inProgress"}
+                }
+            }),
+            json!({
+                "id": 81,
+                "method": "item/permissions/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "permission-then-action",
+                    "reason": "request broader access"
+                }
+            }),
+            json!({"id": 4, "result": {}}),
+            json!({
+                "id": 82,
+                "method": "item/fileChange/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "permission-then-action",
+                    "reason": "bounded change"
+                }
+            }),
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "permission-then-action", "type": "fileChange", "status": "completed"}
+                }
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed", "items": []}
+                }
+            }),
+        ]);
+        let mut transport = FakeTransport::from_values(messages);
+        let outcome = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |request: ApprovalRequest| match request.kind {
+                ApprovalKind::PermissionExpansion => {
+                    Ok(reviewer_decline_for_test("permission-before-action"))
+                }
+                ApprovalKind::FileChange => Ok(ApprovalReview::accept()),
+                ApprovalKind::CommandExecution => {
+                    Err("unexpected command review in file-change transcript".to_string())
+                }
+            },
+            || false,
+        )
+        .expect("permission followed by action review transcript");
+
+        assert_eq!(outcome.refused_ceiling_expansions, 1);
+        assert!(!outcome.duplex_fallback_required);
+        assert!(outcome.unreviewed_action_items.is_empty());
+    }
+
+    #[test]
+    fn declined_action_cannot_report_success_after_feedback_ack() {
+        let mut messages = base_messages();
+        messages.extend([
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "declined-completed", "type": "commandExecution", "status": "inProgress"}
+                }
+            }),
+            json!({
+                "id": 83,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "declined-completed",
+                    "command": "unsafe command"
+                }
+            }),
+            json!({"id": 4, "result": {}}),
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "declined-completed", "type": "commandExecution", "status": "completed"}
+                }
+            }),
+        ]);
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("declined-completed")),
+            || false,
+        )
+        .expect_err("declined item reported success");
+
+        assert!(matches!(
+            error,
+            AppServerError::Unexpected {
+                phase: "item/completed",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn protocol_timeout_is_a_bounded_failure() {
         let mut transport = FakeTransport {
             incoming: Vec::new(),
@@ -2732,7 +2962,7 @@ mod tests {
             &test_turn(),
             AppServerLimits::default(),
             &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("turn-cancel")),
-            move || cancellation_reads.load(Ordering::SeqCst) >= 3,
+            move || cancellation_reads.load(Ordering::SeqCst) >= 4,
         )
         .expect_err("turn cancellation");
         assert_eq!(error, AppServerError::Cancelled { phase: "turn" });
@@ -2934,6 +3164,92 @@ mod tests {
 
         assert!(!outcome.duplex_fallback_required);
         assert!(outcome.unreviewed_action_items.is_empty());
+    }
+
+    #[test]
+    fn missing_turn_started_lifecycle_is_rejected() {
+        let mut messages = base_messages();
+        messages.retain(|message| message.get("method") != Some(&json!("turn/started")));
+        messages.push(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "completed", "items": []}
+            }
+        }));
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("missing-turn-started")),
+            || false,
+        )
+        .expect_err("missing required turn lifecycle");
+
+        assert!(matches!(
+            error,
+            AppServerError::Unexpected {
+                phase: "turn/completed",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn missing_thread_started_lifecycle_is_rejected() {
+        let mut messages = base_messages();
+        messages.retain(|message| message.get("method") != Some(&json!("thread/started")));
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("missing-thread-started")),
+            || false,
+        )
+        .expect_err("missing required thread lifecycle");
+
+        assert!(matches!(
+            error,
+            AppServerError::Unexpected {
+                phase: "thread/started",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn turn_started_before_thread_started_is_rejected() {
+        let mut messages = base_messages();
+        let thread_started = messages
+            .iter()
+            .position(|message| message.get("method") == Some(&json!("thread/started")))
+            .expect("thread lifecycle fixture");
+        messages[thread_started] = json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "inProgress"}
+            }
+        });
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("reordered-lifecycle")),
+            || false,
+        )
+        .expect_err("turn lifecycle before thread lifecycle");
+
+        assert!(matches!(
+            error,
+            AppServerError::Unexpected {
+                phase: "thread/started",
+                ..
+            }
+        ));
     }
 
     #[test]

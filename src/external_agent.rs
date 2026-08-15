@@ -6541,6 +6541,9 @@ send({"id": thread_start["id"], "result": {
     "activePermissionProfile": {"id": "maco_external_codex"},
     "cwd": sys.argv[3]
 }})
+send({"method": "thread/started", "params": {
+    "thread": {"id": "thread-contained"}
+}})
 turn_start = receive()
 assert turn_start["method"] == "turn/start"
 assert turn_start["params"]["approvalPolicy"] == "untrusted"
@@ -6772,7 +6775,7 @@ else:
     }
 
     #[test]
-    fn production_duplex_consumer_refuses_fallback_required_child_with_typed_denial() {
+    fn post_turn_fallback_detection_cannot_prevent_unreviewed_mutation() {
         let mut journal = RecordingPreActionJournal::default();
         let (result, metrics, gate_denials, marker) =
             nonpublishable_trusted_compatibility_fake_app_server("fallback_required", &mut journal);
