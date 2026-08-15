@@ -714,13 +714,8 @@ where
             "params": thread_params
         }),
     )?;
-    let thread_response = wait_for_response(
-        &mut state,
-        transport,
-        &thread_start_id,
-        "thread/start",
-        &cancelled,
-    )?;
+    let (thread_response, started_thread_id) =
+        wait_for_thread_start_events(&mut state, transport, &thread_start_id, &cancelled)?;
     require_exact_text(
         &thread_response,
         &["result", "approvalPolicy"],
@@ -752,7 +747,13 @@ where
         "thread id",
     )?
     .to_string();
-    wait_for_thread_started(&mut state, transport, &thread_id, &cancelled)?;
+    if started_thread_id != thread_id {
+        return Err(AppServerError::Unexpected {
+            phase: "thread/start",
+            message: "thread/started id did not match the correlated thread/start response"
+                .to_string(),
+        });
+    }
 
     let turn_start_id = state.allocate_request_id()?;
     state.send(
@@ -806,34 +807,87 @@ where
     }
 }
 
-fn wait_for_thread_started<T, C>(
+fn wait_for_thread_start_events<T, C>(
     state: &mut ProtocolState,
     transport: &mut T,
-    thread_id: &str,
+    expected_id: &RequestId,
     cancelled: &C,
-) -> Result<(), AppServerError>
+) -> Result<(Value, String), AppServerError>
 where
     T: JsonLineTransport,
     C: Fn() -> bool,
 {
-    // Codex 0.144.4 sends this notification immediately after the correlated thread/start
-    // response. Consuming it here prevents a missing or reordered lifecycle from being mistaken
-    // for part of the later turn.
-    let message = state.receive(transport, "thread/started", cancelled)?;
-    if message.get("method").and_then(Value::as_str) != Some("thread/started") {
-        return Err(AppServerError::Unexpected {
-            phase: "thread/started",
-            message: "required thread lifecycle notification was missing or reordered".to_string(),
-        });
+    let mut response = None;
+    let mut started_thread_id = None;
+
+    // The app-server may publish the lifecycle notification before or after the correlated
+    // response. Exactly these two events must arrive before MACO starts a turn.
+    for _ in 0..2 {
+        let message = state.receive(transport, "thread/start", cancelled)?;
+        let object = message
+            .as_object()
+            .ok_or_else(|| AppServerError::Malformed {
+                phase: "thread/start",
+                message: "top-level message is not an object".to_string(),
+            })?;
+        if object.contains_key("method") {
+            let method = required_text(&message, &["method"], "thread/start", "method")?;
+            if method != "thread/started" {
+                return Err(AppServerError::Unexpected {
+                    phase: "thread/start",
+                    message: "unsupported event arrived before thread startup completed"
+                        .to_string(),
+                });
+            }
+            if object.contains_key("id")
+                || object.contains_key("result")
+                || object.contains_key("error")
+            {
+                return Err(AppServerError::Malformed {
+                    phase: "thread/start",
+                    message: "thread/started was not a notification".to_string(),
+                });
+            }
+            if started_thread_id.is_some() {
+                return Err(AppServerError::Duplicate {
+                    phase: "thread/start",
+                    message: "thread lifecycle started more than once".to_string(),
+                });
+            }
+            started_thread_id = Some(
+                required_text(
+                    &message,
+                    &["params", "thread", "id"],
+                    "thread/start",
+                    "thread/started thread id",
+                )?
+                .to_string(),
+            );
+        } else {
+            if response.is_some() {
+                return Err(AppServerError::Duplicate {
+                    phase: "thread/start",
+                    message: "thread/start response arrived more than once".to_string(),
+                });
+            }
+            response = Some(validate_correlated_response(
+                state,
+                message,
+                expected_id,
+                "thread/start",
+            )?);
+        }
     }
-    require_exact_text(&message, &["method"], "thread/started", "thread/started")?;
-    require_exact_text(
-        &message,
-        &["params", "thread", "id"],
-        thread_id,
-        "thread/started",
-    )?;
-    Ok(())
+
+    let response = response.ok_or_else(|| AppServerError::Unexpected {
+        phase: "thread/start",
+        message: "correlated thread/start response was missing".to_string(),
+    })?;
+    let started_thread_id = started_thread_id.ok_or_else(|| AppServerError::Unexpected {
+        phase: "thread/start",
+        message: "required thread/started lifecycle notification was missing".to_string(),
+    })?;
+    Ok((response, started_thread_id))
 }
 
 fn wait_for_response<T, C>(
@@ -848,6 +902,15 @@ where
     C: Fn() -> bool,
 {
     let message = state.receive(transport, phase, cancelled)?;
+    validate_correlated_response(state, message, expected_id, phase)
+}
+
+fn validate_correlated_response(
+    state: &mut ProtocolState,
+    message: Value,
+    expected_id: &RequestId,
+    phase: &'static str,
+) -> Result<Value, AppServerError> {
     let object = message
         .as_object()
         .ok_or_else(|| AppServerError::Malformed {
@@ -3199,7 +3262,7 @@ mod tests {
     #[test]
     fn missing_thread_started_lifecycle_is_rejected() {
         let mut messages = base_messages();
-        messages.retain(|message| message.get("method") != Some(&json!("thread/started")));
+        messages.truncate(2);
         let mut transport = FakeTransport::from_values(messages);
         let error = run_app_server_turn(
             &mut transport,
@@ -3212,8 +3275,105 @@ mod tests {
 
         assert!(matches!(
             error,
+            AppServerError::ProtocolLoss {
+                phase: "thread/start"
+            }
+        ));
+    }
+
+    #[test]
+    fn thread_started_before_correlated_response_is_accepted() {
+        let mut messages = base_messages();
+        messages.swap(1, 2);
+        messages.push(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "completed", "items": []}
+            }
+        }));
+        let mut transport = FakeTransport::from_values(messages);
+        let outcome = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("notification-first")),
+            || false,
+        )
+        .expect("notification-first thread startup transcript");
+
+        assert_eq!(outcome.thread_id, "thread-1");
+        assert!(!outcome.duplex_fallback_required);
+    }
+
+    #[test]
+    fn duplicate_thread_started_lifecycle_is_rejected() {
+        let mut messages = base_messages();
+        messages[1] = messages[2].clone();
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("duplicate-thread-started")),
+            || false,
+        )
+        .expect_err("duplicate thread lifecycle");
+
+        assert!(matches!(
+            error,
+            AppServerError::Duplicate {
+                phase: "thread/start",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn duplicate_thread_start_response_is_rejected() {
+        let mut messages = base_messages();
+        messages[2] = messages[1].clone();
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("duplicate-thread-response")),
+            || false,
+        )
+        .expect_err("duplicate thread/start response");
+
+        assert!(matches!(
+            error,
+            AppServerError::Duplicate {
+                phase: "thread/start",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mismatched_thread_started_lifecycle_is_rejected() {
+        let mut messages = base_messages();
+        let started = messages
+            .iter()
+            .position(|message| message.get("method") == Some(&json!("thread/started")))
+            .expect("thread lifecycle fixture");
+        messages[started]["params"]["thread"]["id"] = json!("thread-other");
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("mismatched-thread-started")),
+            || false,
+        )
+        .expect_err("mismatched thread lifecycle");
+
+        assert!(matches!(
+            error,
             AppServerError::Unexpected {
-                phase: "thread/started",
+                phase: "thread/start",
                 ..
             }
         ));
@@ -3246,7 +3406,7 @@ mod tests {
         assert!(matches!(
             error,
             AppServerError::Unexpected {
-                phase: "thread/started",
+                phase: "thread/start",
                 ..
             }
         ));
