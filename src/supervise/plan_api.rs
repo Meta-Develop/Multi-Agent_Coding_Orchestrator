@@ -466,7 +466,7 @@ fn combined_goal_spec(goal: &str, spec: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderSupervisorExecutionBinding {
     run_id: RunId,
-    session_plan_sha256: String,
+    durable: DurableProviderSupervisorExecutionBinding,
 }
 
 impl ProviderSupervisorExecutionBinding {
@@ -484,6 +484,28 @@ pub struct BoundProviderSupervisorPlan {
     pub execution_binding: ProviderSupervisorExecutionBinding,
 }
 
+const PROVIDER_SUPERVISOR_BINDING_VERSION: u32 = 1;
+const PROVIDER_SUPERVISOR_BINDING_NOTES_PREFIX: &str =
+    "maco-provider-supervisor-execution-binding-v1:";
+const PROVIDER_SUPERVISOR_BINDING_MAX_BYTES: usize = 4096;
+const NORMALIZED_SUPERVISOR_PLAN_ARTIFACT_PATH: &str = "assignments/supervisor-plan.json";
+
+/// Trusted planning authority carried by the already-authenticated normalized
+/// supervisor plan. Provider-authored proposal fields never populate this
+/// record: it is added only after deterministic lowering and validation.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DurableProviderSupervisorExecutionBinding {
+    version: u32,
+    run_id: RunId,
+    session_id: String,
+    provider_id: String,
+    model: String,
+    session_authority_sha256: String,
+    normalized_plan_sha256: String,
+    authority_sha256: String,
+}
+
 /// Lowers and binds a validated provider planning session to an exact future
 /// supervisor run without invoking the provider or performing scheduler work.
 pub fn bind_provider_task_planning_session_to_supervisor_run(
@@ -497,22 +519,53 @@ pub fn bind_provider_task_planning_session_to_supervisor_run(
     {
         bail!("supervisor execution binding requires a provider planning session and tree");
     }
-    let loaded =
+    let mut loaded =
         supervisor_plan_and_consultant_from_task_planning_session(goal, spec, None, session)?;
+    let unbound_document = supervisor_plan_value(
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )?;
+    let durable =
+        durable_provider_supervisor_execution_binding(session, run_id.clone(), &unbound_document)?;
+    let first_assignment = loaded
+        .plan
+        .assignments
+        .first_mut()
+        .context("provider supervisor execution binding has no assignment authority carrier")?;
+    if first_assignment.notes.is_some() {
+        bail!("provider supervisor execution binding carrier is already occupied");
+    }
+    first_assignment.notes = Some(format!(
+        "{PROVIDER_SUPERVISOR_BINDING_NOTES_PREFIX}{}",
+        serde_json::to_string(&durable)
+            .context("failed to serialize durable provider supervisor execution binding")?
+    ));
     let document = supervisor_plan_value(
         &loaded.plan,
         &loaded.consultant,
         &loaded.assignment_metadata,
         &loaded.plan_metadata,
     )?;
-    let session_plan_sha256 = provider_session_plan_sha256(session, &document)?;
+    let reparsed = parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&document)
+            .context("failed to serialize bound provider supervisor plan")?,
+    )
+    .context("bound provider supervisor plan failed strict round-trip validation")?;
+    let round_trip = supervisor_plan_value(
+        &reparsed.plan,
+        &reparsed.consultant,
+        &reparsed.assignment_metadata,
+        &reparsed.plan_metadata,
+    )?;
+    if round_trip != document {
+        bail!("bound provider supervisor plan changed during strict round-trip validation");
+    }
     Ok(BoundProviderSupervisorPlan {
-        plan: loaded.plan,
+        plan: reparsed.plan,
         document,
-        execution_binding: ProviderSupervisorExecutionBinding {
-            run_id,
-            session_plan_sha256,
-        },
+        execution_binding: ProviderSupervisorExecutionBinding { run_id, durable },
     })
 }
 
@@ -532,19 +585,26 @@ pub(crate) fn task_execution_feedback_from_authenticated_supervisor_run(
         session,
         binding.run_id.clone(),
     )?;
-    if current.execution_binding.session_plan_sha256 != binding.session_plan_sha256 {
+    if current.execution_binding.durable != binding.durable {
         bail!("provider supervisor execution binding does not match the current session and normalized plan");
     }
 
     let repo = discover_repo_root(repo.as_ref())?;
-    let run_dir = run_dir(&repo, &binding.run_id);
-    let report =
-        read_finalized_supervisor_report(&repo, &binding.run_id, &run_dir)?.with_context(|| {
+    let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &binding.run_id)
+        .with_context(|| {
             format!(
                 "provider supervisor run '{}' is not an authenticated finalized artifact",
                 binding.run_id.as_str()
             )
         })?;
+    let report_bytes = reader
+        .read(RunArtifactFamily::Supervise.final_report_relative_path())
+        .context("authenticated provider supervisor run has no final report")?;
+    if report_bytes.len() > MAX_SUPERVISOR_REPORT_BYTES {
+        bail!("authenticated provider supervisor final report exceeds its bounded size");
+    }
+    let report: SupervisorFinalReport = serde_json::from_slice(&report_bytes)
+        .context("authenticated provider supervisor final report is invalid")?;
     if report.run_id != binding.run_id {
         bail!(
             "authenticated supervisor report run id '{}' does not match bound run '{}'",
@@ -553,14 +613,12 @@ pub(crate) fn task_execution_feedback_from_authenticated_supervisor_run(
         );
     }
 
-    let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &binding.run_id)
-        .context("failed to reopen authenticated provider supervisor run")?;
     let plan_bytes = reader
-        .read("assignments/supervisor-plan.json")
+        .read(NORMALIZED_SUPERVISOR_PLAN_ARTIFACT_PATH)
         .context("authenticated provider supervisor run has no normalized supervisor plan")?;
-    let plan_text = String::from_utf8(plan_bytes)
+    let plan_text = std::str::from_utf8(&plan_bytes)
         .context("authenticated provider supervisor plan is not UTF-8")?;
-    let persisted = parse_supervisor_plan_with_consultant(&plan_text)
+    let persisted = parse_supervisor_plan_with_consultant(plan_text)
         .context("authenticated provider supervisor plan is invalid")?;
     let persisted_document = supervisor_plan_value(
         &persisted.plan,
@@ -568,9 +626,20 @@ pub(crate) fn task_execution_feedback_from_authenticated_supervisor_run(
         &persisted.assignment_metadata,
         &persisted.plan_metadata,
     )?;
+    let persisted_binding = durable_provider_binding_from_persisted_plan(&persisted.plan)?;
+    if persisted_binding != binding.durable {
+        bail!("authenticated supervisor run carries the wrong provider/session/model/plan execution binding");
+    }
     if persisted_document != current.document {
         bail!("authenticated supervisor run normalized plan does not match its provider execution binding");
     }
+    verify_provider_binding_preceded_authenticated_dispatch(
+        &repo,
+        &binding.run_id,
+        &persisted_document,
+        &plan_bytes,
+        &report_bytes,
+    )?;
 
     normalize_task_execution_feedback_from_supervisor_final_report(session, &report)
 }
@@ -599,17 +668,239 @@ pub fn replan_provider_task_planning_session_from_authenticated_supervisor_run<
     planning::replan_task_decomposition_with_provider(&repo, session, &feedback, provider, config)
 }
 
-fn provider_session_plan_sha256(
+fn durable_provider_supervisor_execution_binding(
     session: &planning::TaskPlanningSession,
-    normalized_document: &Value,
-) -> Result<String> {
-    let payload = serde_json::to_vec(&json!({
+    run_id: RunId,
+    unbound_normalized_document: &Value,
+) -> Result<DurableProviderSupervisorExecutionBinding> {
+    let provider_id = session
+        .provider_id()
+        .context("provider planning session has no bound provider identity")?;
+    let model = session
+        .model()
+        .context("provider planning session has no bound model identity")?;
+    if provider_id.is_empty() || model.is_empty() {
+        bail!("provider planning session has an empty provider or model identity");
+    }
+    let session_authority = serde_json::to_vec(&json!({
         "version": 1,
-        "planning_session_authority": session.replan_authority_state(),
-        "normalized_supervisor_plan": normalized_document,
+        "session_id": session.session_id(),
+        "planning_session_authority": session.execution_binding_authority_state(),
     }))
-    .context("failed to serialize provider supervisor execution binding")?;
-    Ok(crate::artifacts::state_auth::sha256_hex(&payload))
+    .context("failed to serialize provider planning session authority")?;
+    let normalized_plan = serde_json::to_vec(unbound_normalized_document)
+        .context("failed to serialize unbound normalized provider supervisor plan")?;
+    let session_authority_sha256 = crate::artifacts::state_auth::sha256_hex(&session_authority);
+    let normalized_plan_sha256 = crate::artifacts::state_auth::sha256_hex(&normalized_plan);
+    let authority = serde_json::to_vec(&json!({
+        "version": PROVIDER_SUPERVISOR_BINDING_VERSION,
+        "run_id": run_id,
+        "session_id": session.session_id(),
+        "provider_id": provider_id,
+        "model": model,
+        "session_authority_sha256": session_authority_sha256,
+        "normalized_plan_sha256": normalized_plan_sha256,
+    }))
+    .context("failed to serialize provider supervisor execution authority")?;
+    let binding = DurableProviderSupervisorExecutionBinding {
+        version: PROVIDER_SUPERVISOR_BINDING_VERSION,
+        run_id,
+        session_id: session.session_id().to_string(),
+        provider_id: provider_id.to_string(),
+        model: model.to_string(),
+        session_authority_sha256,
+        normalized_plan_sha256,
+        authority_sha256: crate::artifacts::state_auth::sha256_hex(&authority),
+    };
+    validate_durable_provider_supervisor_execution_binding(&binding)?;
+    Ok(binding)
+}
+
+fn validate_durable_provider_supervisor_execution_binding(
+    binding: &DurableProviderSupervisorExecutionBinding,
+) -> Result<()> {
+    if binding.version != PROVIDER_SUPERVISOR_BINDING_VERSION {
+        bail!(
+            "unsupported durable provider supervisor execution binding version {}",
+            binding.version
+        );
+    }
+    if binding.session_id.len() != 64
+        || binding.provider_id.is_empty()
+        || binding.model.is_empty()
+        || binding.provider_id.len() > 256
+        || binding.model.len() > 256
+        || binding.provider_id.trim() != binding.provider_id
+        || binding.model.trim() != binding.model
+        || !is_canonical_lower_hex_sha256(&binding.session_id)
+        || !is_canonical_lower_hex_sha256(&binding.session_authority_sha256)
+        || !is_canonical_lower_hex_sha256(&binding.normalized_plan_sha256)
+        || !is_canonical_lower_hex_sha256(&binding.authority_sha256)
+    {
+        bail!("durable provider supervisor execution binding is malformed");
+    }
+    let authority = serde_json::to_vec(&json!({
+        "version": binding.version,
+        "run_id": binding.run_id,
+        "session_id": binding.session_id,
+        "provider_id": binding.provider_id,
+        "model": binding.model,
+        "session_authority_sha256": binding.session_authority_sha256,
+        "normalized_plan_sha256": binding.normalized_plan_sha256,
+    }))
+    .context("failed to reserialize provider supervisor execution authority")?;
+    if crate::artifacts::state_auth::sha256_hex(&authority) != binding.authority_sha256 {
+        bail!("durable provider supervisor execution binding authority digest is invalid");
+    }
+    Ok(())
+}
+
+fn durable_provider_binding_from_persisted_plan(
+    plan: &SupervisorPlan,
+) -> Result<DurableProviderSupervisorExecutionBinding> {
+    let carriers = plan
+        .assignments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, assignment)| {
+            assignment.notes.as_deref().and_then(|notes| {
+                notes
+                    .contains(PROVIDER_SUPERVISOR_BINDING_NOTES_PREFIX)
+                    .then_some((index, notes))
+            })
+        })
+        .collect::<Vec<_>>();
+    if carriers.len() != 1 || carriers[0].0 != 0 {
+        bail!("authenticated supervisor plan must carry exactly one provider execution binding on its first assignment");
+    }
+    let encoded = carriers[0]
+        .1
+        .strip_prefix(PROVIDER_SUPERVISOR_BINDING_NOTES_PREFIX)
+        .context("authenticated supervisor plan provider execution binding is not canonical")?;
+    if encoded.is_empty() || encoded.len() > PROVIDER_SUPERVISOR_BINDING_MAX_BYTES {
+        bail!("authenticated supervisor plan provider execution binding exceeds its strict bound");
+    }
+    let binding: DurableProviderSupervisorExecutionBinding = serde_json::from_str(encoded)
+        .context("authenticated supervisor plan provider execution binding is invalid")?;
+    validate_durable_provider_supervisor_execution_binding(&binding)?;
+    Ok(binding)
+}
+
+fn verify_provider_binding_preceded_authenticated_dispatch(
+    repo: &Path,
+    run_id: &RunId,
+    persisted_document: &Value,
+    persisted_plan_bytes: &[u8],
+    persisted_report_bytes: &[u8],
+) -> Result<()> {
+    // Capture the raw, MAC-verified ordering evidence while holding the
+    // journal's exclusive instance lock. Reopen through the semantic analyzer
+    // immediately afterwards; that second lock is retained through every
+    // comparison so an appended valid-MAC tail cannot race these checks.
+    let authenticator = repository_authenticator_key_only(repo)?;
+    crate::artifacts::validate_repository_authenticated_state(repo, &authenticator)?;
+    let journal =
+        crate::state_journal::StateJournal::open_instance(authenticator, run_id.as_str())?;
+    let records = journal.records().to_vec();
+    drop(journal);
+    let (_checkpoint_guard, snapshot) = open_supervisor_checkpoint(repo, run_id)
+        .context("provider execution feedback requires an authenticated supervise checkpoint")?;
+    if !snapshot.finalization_started || !snapshot.finalized {
+        bail!("provider execution feedback checkpoint is not durably finalized");
+    }
+    let checkpoint_report = snapshot
+        .final_report
+        .as_ref()
+        .context("provider execution feedback checkpoint has no planned final report")?;
+    if !checkpoint_report.artifact_committed {
+        bail!("provider execution feedback checkpoint has no committed final report");
+    }
+    if checkpoint_report.report_bytes != persisted_report_bytes {
+        bail!("authenticated provider supervisor final report differs from its checkpoint-committed bytes");
+    }
+    let prepared = records
+        .first()
+        .filter(|record| record.phase == "supervise_prepared" && record.subject.is_none())
+        .context("authenticated supervise checkpoint has no canonical prepared record")?;
+    if prepared.payload.get("run_id").and_then(Value::as_str) != Some(run_id.as_str()) {
+        bail!("authenticated supervise checkpoint prepared run id is inconsistent");
+    }
+    let normalized_plan = serde_json::to_vec(persisted_document)
+        .context("failed to serialize authenticated normalized provider supervisor plan")?;
+    let expected_normalized_sha256 = crate::artifacts::state_auth::sha256_hex(&normalized_plan);
+    if prepared
+        .payload
+        .get("normalized_plan_sha256")
+        .and_then(Value::as_str)
+        != Some(expected_normalized_sha256.as_str())
+    {
+        bail!("authenticated supervise checkpoint was prepared for a different normalized provider plan");
+    }
+
+    let dispatch_index = records
+        .iter()
+        .position(|record| {
+            matches!(
+                record.phase.as_str(),
+                "child_dispatch_started" | "auditor_dispatch_started"
+            )
+        })
+        .context(
+            "authenticated provider supervisor run has no child or auditor dispatch evidence",
+        )?;
+    let dispatch = &records[dispatch_index];
+    let assignment_start = if dispatch.phase == "child_dispatch_started" {
+        let subject = dispatch
+            .subject
+            .as_deref()
+            .context("authenticated child dispatch has no assignment subject")?;
+        records[..dispatch_index]
+            .iter()
+            .rev()
+            .find(|record| {
+                record.phase == "assignment_started" && record.subject.as_deref() == Some(subject)
+            })
+            .context("authenticated child dispatch has no preceding matching assignment artifact boundary")?
+    } else {
+        records[..dispatch_index]
+            .iter()
+            .rev()
+            .find(|record| record.phase == "assignment_started")
+            .context(
+                "authenticated auditor dispatch preceded every assignment plan artifact boundary",
+            )?
+    };
+    let files = assignment_start
+        .payload
+        .get("artifact")
+        .and_then(|artifact| artifact.get("files"))
+        .and_then(Value::as_array)
+        .context("authenticated pre-dispatch assignment boundary has no artifact manifest")?;
+    let plan_records = files
+        .iter()
+        .filter(|record| {
+            record.get("path").and_then(Value::as_str)
+                == Some(NORMALIZED_SUPERVISOR_PLAN_ARTIFACT_PATH)
+        })
+        .collect::<Vec<_>>();
+    if plan_records.len() != 1 {
+        bail!("authenticated pre-dispatch artifact manifest does not contain exactly one normalized supervisor plan");
+    }
+    let expected_artifact_sha256 = crate::artifacts::state_auth::sha256_hex(persisted_plan_bytes);
+    if plan_records[0].get("sha256").and_then(Value::as_str)
+        != Some(expected_artifact_sha256.as_str())
+        || plan_records[0].get("disposition").and_then(Value::as_str) != Some("private_evidence")
+    {
+        bail!("authenticated normalized provider plan was missing or replaced after the pre-dispatch artifact boundary");
+    }
+    Ok(())
+}
+
+fn is_canonical_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn normalize_task_execution_feedback_from_supervisor_final_report(

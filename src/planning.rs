@@ -250,6 +250,7 @@ pub enum TaskPlanningSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskPlanningSession {
+    session_id: String,
     proposal: TaskDecompositionProposal,
     source: TaskPlanningSource,
     provider_id: Option<String>,
@@ -262,6 +263,27 @@ pub struct TaskPlanningSession {
 }
 
 impl TaskPlanningSession {
+    /// Opaque provider-session authority retained across bounded re-plans and
+    /// clones. Provider sessions receive a unique value; heuristic sessions
+    /// leave it empty because they cannot be bound to provider execution.
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reissue_provider_authority_for_test(
+        &self,
+        provider_id: &str,
+        model: &str,
+    ) -> Result<Self> {
+        let mut reissued = self.clone();
+        reissued.session_id = crate::artifacts::state_auth::random_identifier()
+            .context("failed to reissue test planning-session authority")?;
+        reissued.provider_id = Some(provider_id.to_string());
+        reissued.model = Some(model.to_string());
+        Ok(reissued)
+    }
+
     pub fn proposal(&self) -> &TaskDecompositionProposal {
         &self.proposal
     }
@@ -296,14 +318,17 @@ impl TaskPlanningSession {
         &self.provider_assignment_tree
     }
 
-    pub(crate) fn replan_authority_state(&self) -> serde_json::Value {
+    /// Stable execution authority for the last deterministically validated
+    /// provider plan. Attempt counters and cumulative usage are deliberately
+    /// excluded: a failed transactional proposal consumes an attempt without
+    /// changing the plan that an already-authenticated run executed.
+    pub(crate) fn execution_binding_authority_state(&self) -> serde_json::Value {
         serde_json::json!({
+            "session_id": self.session_id,
             "proposal": self.proposal,
             "source": self.source,
             "provider_id": self.provider_id,
             "model": self.model,
-            "provider_usage": self.provider_usage,
-            "replans_used": self.replans_used,
             "completed_fragment_ids": self.completed_fragment_ids,
             "completed_assignments": self.completed_assignments,
             "provider_assignment_tree": self.provider_assignment_tree,
@@ -704,6 +729,7 @@ pub fn propose_task_decomposition_with_optional_provider(
             propose_task_decomposition_with_provider(repo, title, body, provider, config)
         }
         None => Ok(TaskPlanningSession {
+            session_id: String::new(),
             proposal: propose_task_decomposition(repo, title, body)?,
             source: TaskPlanningSource::Heuristic,
             provider_id: None,
@@ -785,11 +811,60 @@ pub fn propose_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
     append_provider_diagnostics(&mut proposal.diagnostics, &response, "initial proposal");
 
     Ok(TaskPlanningSession {
+        session_id: crate::artifacts::state_auth::random_identifier()
+            .context("failed to create provider task-planning session authority")?,
         proposal,
         source: TaskPlanningSource::Provider,
         provider_id: Some(response.provider_id),
         model: Some(response.model),
         provider_usage: response.usage,
+        replans_used: 0,
+        completed_fragment_ids: BTreeSet::new(),
+        completed_assignments: Vec::new(),
+        provider_assignment_tree,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn validated_provider_session_for_test(
+    fragments: Vec<TaskSpecFragment>,
+    provider_plan: ProviderRecursiveTaskPlan,
+    repository_paths: Vec<PathBuf>,
+    semantic_modules: BTreeSet<String>,
+    semantic_symbols: BTreeSet<String>,
+    provider_id: &str,
+    model: &str,
+    config: &ProviderPlanningConfig,
+) -> Result<TaskPlanningSession> {
+    validate_provider_planning_config(config)?;
+    if provider_id.is_empty() || model.is_empty() || model != config.model.trim() {
+        anyhow::bail!("test provider planning authority is invalid");
+    }
+    let allowed_fragment_ids = fragments
+        .iter()
+        .map(|fragment| fragment.id.clone())
+        .collect::<BTreeSet<_>>();
+    let (proposal, provider_assignment_tree) = validated_provider_proposal(
+        fragments,
+        provider_plan,
+        &allowed_fragment_ids,
+        &repository_paths,
+        &ProviderSemanticInventory {
+            modules: semantic_modules,
+            symbols: semantic_symbols,
+        },
+        &[],
+        config,
+        "validated test provider task decomposition",
+    )?;
+    Ok(TaskPlanningSession {
+        session_id: crate::artifacts::state_auth::random_identifier()
+            .context("failed to create test provider planning-session authority")?,
+        proposal,
+        source: TaskPlanningSource::Provider,
+        provider_id: Some(provider_id.to_string()),
+        model: Some(model.to_string()),
+        provider_usage: Usage::default(),
         replans_used: 0,
         completed_fragment_ids: BTreeSet::new(),
         completed_assignments: Vec::new(),
