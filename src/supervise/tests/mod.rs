@@ -7,6 +7,7 @@ mod plan_runtime;
 mod primary_worktree;
 mod prompts_gates;
 mod reaudit;
+mod review_loop_guard;
 mod run_artifacts;
 mod scheduler;
 mod suitability;

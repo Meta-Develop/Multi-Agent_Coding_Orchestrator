@@ -436,6 +436,7 @@ fn prepare_semantic_warn_assignments(
 
 struct AssignmentSchedulerContext<'context, 'writer> {
     plan: &'context SupervisorPlan,
+    review_loop_guard: Option<ReviewLoopGuardConfig>,
     budget_config: &'context SupervisorBudgetConfig,
     consultant: &'context SupervisorConsultantPlan,
     assignment_metadata: &'context AssignmentMetadata,
@@ -1155,6 +1156,7 @@ fn run_serial_assignment_schedule(
             index,
             concurrent_mode: false,
             plan: context.plan,
+            review_loop_guard: context.review_loop_guard,
             budget_config: context.budget_config,
             consultant: context.consultant,
             assignment_metadata: context.assignment_metadata,
@@ -1348,6 +1350,7 @@ fn run_concurrent_assignment_schedule(
                             index,
                             concurrent_mode: true,
                             plan: context.plan,
+                            review_loop_guard: context.review_loop_guard,
                             budget_config: context.budget_config,
                             consultant: context.consultant,
                             assignment_metadata: context.assignment_metadata,
@@ -2958,6 +2961,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
             )?;
             let scheduler_context = AssignmentSchedulerContext {
                 plan: &plan,
+                review_loop_guard: plan_metadata.review_loop_guard,
                 budget_config,
                 consultant: &consultant,
                 assignment_metadata: &assignment_metadata,
@@ -3936,6 +3940,7 @@ mod decomposition_tests {
             };
             let $context = AssignmentSchedulerContext {
                 plan: &plan,
+                review_loop_guard: None,
                 execution_target: None,
                 budget_config: &budget_config,
                 consultant: &consultant,
@@ -4017,6 +4022,7 @@ mod decomposition_tests {
             };
             let $context = AssignmentSchedulerContext {
                 plan: &plan,
+                review_loop_guard: None,
                 execution_target: None,
                 budget_config: &budget_config,
                 consultant: &consultant,

@@ -240,6 +240,7 @@ const MAX_SUPERVISOR_ASSIGNMENT_SCOPE_PATHS: usize = 256;
 const MAX_SUPERVISOR_ASSIGNMENT_INPUT_PATHS: usize = 4096;
 const MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES: usize = 4096;
 const MAX_SUPERVISOR_ASSIGNMENT_ID_BYTES: usize = 64;
+const MAX_REVIEW_LOOP_GUARD_CYCLES: usize = MAX_GATE_CORRECTIONS_LIMIT as usize + 1;
 const ASSIGNMENT_SUITABILITY_RATIONALE_PATTERN: &str = r"^[^\u0000-\u001F\u007F-\u009F\s](?:[^\u0000-\u001F\u007F-\u009F]*[^\u0000-\u001F\u007F-\u009F\s])?$";
 const BREAKER_RECOVERY_GUIDANCE: &str = "inspect the breaker window and child evidence, correct the repeated coordination failure, then start a new supervise run; pending assignments were not launched";
 const LOCAL_RUNTIME_ROOTS: &[&[u8]] = &[
@@ -470,6 +471,20 @@ pub struct SupervisorPlan {
     pub review_aggregation_policy: ReviewAggregationPolicy,
     #[serde(default)]
     pub assignments: Vec<OrchestratorAssignment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewLoopLowSeverity {
+    Info,
+    Warning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewLoopGuardConfig {
+    pub max_low_severity: ReviewLoopLowSeverity,
+    pub consecutive_low_severity_cycles: u8,
 }
 
 pub(crate) fn default_supervisor_review_lenses() -> Vec<ReviewLensConfig> {
@@ -1602,6 +1617,7 @@ struct SupervisorPlanMetadata {
     evidence_only_reaudit: Option<EvidenceOnlyReauditPlan>,
     generated_follow_up: Option<GeneratedFollowUpPlanContext>,
     execution_target: Option<SupervisorExecutionTarget>,
+    review_loop_guard: Option<ReviewLoopGuardConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -2202,6 +2218,42 @@ pub struct OrchestratorReviewReport {
     pub remaining_risk: String,
     #[serde(default)]
     pub next_safe_action: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewLoopStopDisposition {
+    ThresholdNotReached,
+    CorrectionRetrySuppressed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewLoopValidationFloor {
+    Passed,
+    Missing,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewLoopCycleRecord {
+    pub cycle_ordinal: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highest_severity: Option<FindingSeverity>,
+    pub low_severity: bool,
+    pub consecutive_low_severity_cycles: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewLoopGuardEvidence {
+    pub config: ReviewLoopGuardConfig,
+    pub cycles: Vec<ReviewLoopCycleRecord>,
+    pub stop_disposition: ReviewLoopStopDisposition,
+    pub retry_suppressed: bool,
+    pub final_validation_floor: ReviewLoopValidationFloor,
+    pub locked_review_accepted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -3935,6 +3987,7 @@ struct AssignmentExecutionContext<'a, 'writer> {
     index: usize,
     concurrent_mode: bool,
     plan: &'a SupervisorPlan,
+    review_loop_guard: Option<ReviewLoopGuardConfig>,
     budget_config: &'a SupervisorBudgetConfig,
     consultant: &'a SupervisorConsultantPlan,
     assignment_metadata: &'a AssignmentMetadata,

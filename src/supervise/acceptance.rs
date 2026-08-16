@@ -378,6 +378,7 @@ fn all_failed_commands_are_licensed(
 pub(super) fn generated_licensed_follow_up_tasks(
     plan: &SupervisorPlan,
     consultant: &SupervisorConsultantPlan,
+    review_loop_guard: Option<ReviewLoopGuardConfig>,
     source_budget: &SupervisorBudgetConfig,
     assignment: &OrchestratorAssignment,
     report: &OrchestratorReviewReport,
@@ -491,7 +492,9 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 cascade_depth: LICENSED_BREAKAGE_CASCADE_DEPTH,
                 dispatch_status: GeneratedFollowUpDispatchStatus::DeferredForPlannedRun,
                 handoff: handoff.clone(),
-                operator_defaults: generated_follow_up_operator_defaults(),
+                operator_defaults: generated_follow_up_operator_defaults_with_review_loop_guard(
+                    review_loop_guard,
+                ),
             };
             let supervisor_plan = GeneratedFollowUpSupervisorPlan {
                 version: ordinary_plan.version,

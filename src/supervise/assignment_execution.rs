@@ -2468,6 +2468,7 @@ fn decide_parent_auditor_gate(
         let tasks = generated_licensed_follow_up_tasks(
             context.plan,
             context.consultant,
+            context.review_loop_guard,
             context.budget_config,
             assignment,
             &child_report,
@@ -3227,6 +3228,7 @@ mod decomposition_tests {
             index: 0,
             concurrent_mode: false,
             plan: &plan,
+            review_loop_guard: None,
             execution_target: None,
             budget_config: &budget_config,
             consultant: &consultant,

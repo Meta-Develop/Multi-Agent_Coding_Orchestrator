@@ -465,6 +465,7 @@ fn generated_follow_up_plan_inherits_gate_context_and_closes_budget() {
     let tasks = generated_licensed_follow_up_tasks(
         &source_plan,
         &source_consultant,
+        None,
         &source_budget,
         &assignment,
         &report,
@@ -774,6 +775,7 @@ fn strict_journal_failure_cannot_silently_swallow_generated_tasks() {
     let tasks = generated_licensed_follow_up_tasks(
         &injected_plan(assignment.clone(), 0),
         &SupervisorConsultantPlan::default(),
+        None,
         &SupervisorBudgetConfig::default(),
         &assignment,
         &report,

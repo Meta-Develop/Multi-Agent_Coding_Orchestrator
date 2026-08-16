@@ -13,8 +13,9 @@ fn validate_execution_target_pre_dispatch(
 
 /// Returns only the executable plan model.
 ///
-/// Assignment suitability provenance and other document sidecar metadata are
-/// intentionally not represented by [`SupervisorPlan`]. Call
+/// Assignment suitability provenance, review-loop guard configuration, and
+/// other document sidecar metadata are intentionally not represented by
+/// [`SupervisorPlan`]. Call
 /// [`supervisor_plan_document_from_task_file`] when that metadata must survive
 /// a parse/normalize round trip.
 pub fn supervisor_plan_from_task_file(
@@ -26,9 +27,10 @@ pub fn supervisor_plan_from_task_file(
 
 /// Returns only the executable plan model.
 ///
-/// Generated suitability provenance and other document sidecar metadata are
-/// intentionally omitted. Use [`supervisor_plan_document_from_goal_spec`] for
-/// a normalized document that preserves them.
+/// Generated suitability provenance, review-loop guard configuration, and
+/// other document sidecar metadata are intentionally omitted. Use
+/// [`supervisor_plan_document_from_goal_spec`] for a normalized document that
+/// preserves them.
 pub fn supervisor_plan_from_goal_spec(
     repo: impl AsRef<Path>,
     goal: &str,
@@ -230,6 +232,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
         admission: SupervisorAdmissionConfig::default(),
         evidence_only_reaudit: None,
         generated_follow_up: None,
+        review_loop_guard: None,
     };
     let (plan, plan_metadata) = validate_supervisor_plan(plan, metadata)?;
     Ok(LoadedSupervisorPlan {
@@ -254,10 +257,11 @@ pub(super) fn insert_generated_planner_suitability(
 /// Loads only the executable plan model from a plan document.
 ///
 /// This historical API has a deliberately lossy compatibility boundary:
-/// assignment-local suitability declarations and their descriptive provenance
-/// live in validated document sidecar metadata. Execution entrypoints use the
-/// complete internal document loader; callers that need normalized metadata
-/// should use [`supervisor_plan_document_from_task_file`].
+/// assignment-local suitability declarations, their descriptive provenance,
+/// and review-loop guard configuration live in validated document sidecar
+/// metadata. Execution entrypoints use the complete internal document loader;
+/// callers that need normalized metadata should use
+/// [`supervisor_plan_document_from_task_file`].
 pub fn load_supervisor_plan_file(path: impl AsRef<Path>) -> Result<SupervisorPlan> {
     Ok(load_supervisor_plan_file_with_consultant(path)?.plan)
 }
@@ -324,6 +328,8 @@ pub(crate) fn validate_generated_follow_up_plan_document(
                 *source != AssignmentSuitabilityAssessmentSource::GeneratedFollowUpAuthority
             })
         || loaded.plan_metadata.assignment_schedule != generated.assignment_schedule
+        || loaded.plan_metadata.review_loop_guard
+            != generated_follow_up_review_loop_guard(&generated.generated_follow_up)?
         || loaded.plan_metadata.run_budget != generated.run_budget
         || loaded.plan_metadata.generated_follow_up != Some(generated.generated_follow_up.clone())
         || !loaded.plan_metadata.spec_fragment_ids.is_empty()
@@ -427,6 +433,25 @@ fn supervisor_plan_metadata_from_value(
                 .context("execution_target is invalid")
         })
         .transpose()?;
+    let explicit_review_loop_guard = value
+        .get("review_loop_guard")
+        .map(|guard| {
+            serde_json::from_value::<ReviewLoopGuardConfig>(guard.clone())
+                .context("review_loop_guard is invalid")
+        })
+        .transpose()?;
+    let generated_review_loop_guard = generated_follow_up
+        .as_ref()
+        .map(generated_follow_up_review_loop_guard)
+        .transpose()?
+        .flatten();
+    if explicit_review_loop_guard.is_some()
+        && generated_review_loop_guard.is_some()
+        && explicit_review_loop_guard != generated_review_loop_guard
+    {
+        bail!("generated follow-up review_loop_guard differs from its reserved operator defaults");
+    }
+    let review_loop_guard = explicit_review_loop_guard.or(generated_review_loop_guard);
     let raw_assignments = value
         .get("assignments")
         .and_then(Value::as_array)
@@ -439,6 +464,7 @@ fn supervisor_plan_metadata_from_value(
         evidence_only_reaudit,
         generated_follow_up,
         execution_target,
+        review_loop_guard,
         ..SupervisorPlanMetadata::default()
     };
     collect_assignment_plan_metadata(
@@ -1021,6 +1047,13 @@ pub(super) fn supervisor_plan_value(
             "execution_target".to_string(),
             serde_json::to_value(execution_target)
                 .context("failed to serialize execution_target plan field")?,
+        );
+    }
+    if let Some(review_loop_guard) = plan_metadata.review_loop_guard {
+        object.insert(
+            "review_loop_guard".to_string(),
+            serde_json::to_value(review_loop_guard)
+                .context("failed to serialize review_loop_guard plan field")?,
         );
     }
     if let Some(operation) = &plan_metadata.evidence_only_reaudit {
@@ -1673,6 +1706,7 @@ pub(super) fn evidence_only_reaudit_plan_from_source(
         evidence_only_reaudit: Some(operation),
         generated_follow_up: None,
         execution_target: None,
+        review_loop_guard: source_loaded.plan_metadata.review_loop_guard,
     };
     let (plan, plan_metadata) = validate_supervisor_plan(plan, plan_metadata)?;
     Ok(LoadedSupervisorPlan {

@@ -92,7 +92,80 @@ pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
                 "items": environment_failure_schema_value()
             },
             "assignment_suitability_outcomes": assignment_suitability_outcomes_schema_value(),
+            "orchestrator_reports": {
+                "type": "array",
+                "maxItems": MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES,
+                "items": orchestrator_report_schema_value()
+            },
             "generated_follow_up_tasks": generated_follow_up_tasks_schema_value()
+        }
+    })
+}
+
+pub(super) fn review_loop_guard_config_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["max_low_severity", "consecutive_low_severity_cycles"],
+        "properties": {
+            "max_low_severity": {"type": "string", "enum": ["info", "warning"]},
+            "consecutive_low_severity_cycles": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_REVIEW_LOOP_GUARD_CYCLES
+            }
+        }
+    })
+}
+
+pub(super) fn review_loop_guard_evidence_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "config", "cycles", "stop_disposition", "retry_suppressed",
+            "final_validation_floor", "locked_review_accepted"
+        ],
+        "properties": {
+            "config": review_loop_guard_config_schema_value(),
+            "cycles": {
+                "type": "array",
+                "maxItems": MAX_REVIEW_LOOP_GUARD_CYCLES,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "cycle_ordinal", "low_severity", "consecutive_low_severity_cycles"
+                    ],
+                    "properties": {
+                        "cycle_ordinal": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_REVIEW_LOOP_GUARD_CYCLES
+                        },
+                        "highest_severity": {
+                            "type": ["string", "null"],
+                            "enum": ["info", "warning", "error", null]
+                        },
+                        "low_severity": {"type": "boolean"},
+                        "consecutive_low_severity_cycles": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": MAX_REVIEW_LOOP_GUARD_CYCLES
+                        }
+                    }
+                }
+            },
+            "stop_disposition": {
+                "type": "string",
+                "enum": ["threshold_not_reached", "correction_retry_suppressed"]
+            },
+            "retry_suppressed": {"type": "boolean"},
+            "final_validation_floor": {
+                "type": "string",
+                "enum": ["passed", "missing", "failed"]
+            },
+            "locked_review_accepted": {"type": "boolean"}
         }
     })
 }
