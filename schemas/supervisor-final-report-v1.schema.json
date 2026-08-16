@@ -1,0 +1,1909 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/supervisor-final-report-v1.schema.json",
+  "title": "MACO Newly Finalized Supervisor Report v1",
+  "description": "Contract for newly finalized `supervisor-final.json` reports. Historical top-level version-1 reports that predate finalized economics telemetry are outside this publication contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "run_id",
+    "role",
+    "repo",
+    "plan_file",
+    "run_dir",
+    "runtime",
+    "publishable",
+    "success",
+    "accepted",
+    "rejected",
+    "status",
+    "run_lifecycle",
+    "assigned_paths",
+    "semantic_symbols",
+    "semantic_modules",
+    "claim_tokens",
+    "semantic_intent_tokens",
+    "role_economics_profile",
+    "role_usage",
+    "usage_complete",
+    "commands_run",
+    "environment_failures",
+    "autonomy_kpis",
+    "files_changed",
+    "validation_results",
+    "findings",
+    "bloated_file_flags",
+    "decomposition_candidates",
+    "breaker_trip",
+    "orchestrator_reports",
+    "released_claims",
+    "release_errors",
+    "released_semantic_intents",
+    "semantic_release_errors",
+    "remaining_risk",
+    "next_safe_action"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "run_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "role": {
+      "const": "supervisor"
+    },
+    "repo": {
+      "const": "."
+    },
+    "plan_file": {
+      "$ref": "#/$defs/safePublishedPath"
+    },
+    "run_dir": {
+      "$ref": "#/$defs/safePublishedPath"
+    },
+    "runtime": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "fake"
+      ]
+    },
+    "publishable": {
+      "type": "boolean"
+    },
+    "success": {
+      "type": "boolean"
+    },
+    "accepted": {
+      "type": "boolean"
+    },
+    "rejected": {
+      "type": "boolean"
+    },
+    "status": {
+      "$ref": "#/$defs/reviewStatus"
+    },
+    "run_lifecycle": {
+      "const": "finalized"
+    },
+    "evidence_only_reaudit": {
+      "type": "object",
+      "description": "Optional typed evidence-only re-audit record; retained as an open compatibility subobject."
+    },
+    "assigned_paths": {
+      "$ref": "#/$defs/pathArray"
+    },
+    "semantic_symbols": {
+      "$ref": "#/$defs/stringArray"
+    },
+    "semantic_modules": {
+      "$ref": "#/$defs/stringArray"
+    },
+    "claim_tokens": {
+      "$ref": "#/$defs/nonnegativeIntegerArray"
+    },
+    "semantic_intent_tokens": {
+      "$ref": "#/$defs/nonnegativeIntegerArray"
+    },
+    "role_economics_profile": {
+      "$ref": "#/$defs/economicsProfile"
+    },
+    "run_budget": {
+      "$ref": "#/$defs/runBudget"
+    },
+    "role_usage": {
+      "$ref": "#/$defs/roleUsageMap"
+    },
+    "review_lens_usage": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/reviewLensUsage"
+      }
+    },
+    "review_lens_total_usage": {
+      "$ref": "#/$defs/usage"
+    },
+    "review_lens_total_cost_usd": {
+      "type": "number",
+      "minimum": 0
+    },
+    "total_usage": {
+      "$ref": "#/$defs/usage"
+    },
+    "total_cost_usd": {
+      "type": "number",
+      "minimum": 0
+    },
+    "usage_complete": {
+      "type": "boolean"
+    },
+    "commands_run": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/commandRun"
+      }
+    },
+    "environment_failures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "description": "Typed environment failure; maintained as a separately evolving compatibility subobject."
+      }
+    },
+    "sandbox_denials": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/sandboxDenial"
+      }
+    },
+    "gate_denials": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "description": "Versioned gate-denial envelope; maintained by its own typed contract."
+      }
+    },
+    "pre_action_review_metrics": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "gate_correction_outcomes": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "autonomy_kpis": {
+      "$ref": "#/$defs/autonomyKpis"
+    },
+    "files_changed": {
+      "$ref": "#/$defs/pathArray"
+    },
+    "validation_results": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/validationResult"
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
+    },
+    "bloated_file_flags": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "path": {
+            "$ref": "#/$defs/repositoryRelativePath"
+          }
+        }
+      }
+    },
+    "decomposition_candidates": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/decompositionCandidate"
+      }
+    },
+    "generated_follow_up_tasks": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "assignment_traceability": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "coverage_gaps": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "breaker_trip": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "orchestrator_reports": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "description": "Orchestrator review report with its own runtime schema."
+      }
+    },
+    "released_claims": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "release_errors": {
+      "$ref": "#/$defs/stringArray"
+    },
+    "released_semantic_intents": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "semantic_release_errors": {
+      "$ref": "#/$defs/stringArray"
+    },
+    "remaining_risk": {
+      "type": "string"
+    },
+    "next_safe_action": {
+      "type": "string"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "publishable": {
+            "const": true
+          }
+        },
+        "required": [
+          "publishable"
+        ]
+      },
+      "then": {
+        "properties": {
+          "accepted": {
+            "const": true
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "accepted": {
+            "const": false
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "safePublishedPath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?![\\\\/])(?![A-Za-z]:)(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$))[^\\u0000-\\u001F]+$",
+      "description": "Repository-relative or explicit producer sentinel path; absolute, drive-prefixed, traversal, and control-character forms are forbidden while native separators remain portable."
+    },
+    "repositoryRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?![\\\\/])(?![A-Za-z]:)(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$))[^\\u0000-\\u001F]+$"
+    },
+    "pathArray": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/repositoryRelativePath"
+      }
+    },
+    "stringArray": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "nonnegativeIntegerArray": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "reviewStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "succeeded",
+        "failed",
+        "rejected",
+        "missing"
+      ]
+    },
+    "agentRole": {
+      "type": "string",
+      "enum": [
+        "supervisor",
+        "child_orchestrator",
+        "worker",
+        "gate_classifier",
+        "auditor"
+      ]
+    },
+    "usageObservation": {
+      "type": "string",
+      "enum": [
+        "process_observed",
+        "supervisor_aggregate",
+        "not_process_observable",
+        "synthetic_fake"
+      ]
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "total_tokens"
+      ],
+      "properties": {
+        "input_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_tokens": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "nullableUsage": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/usage"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "roleUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observation"
+      ],
+      "properties": {
+        "models": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "usage": {
+          "$ref": "#/$defs/usage"
+        },
+        "cost_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "observation": {
+          "$ref": "#/$defs/usageObservation"
+        },
+        "unavailable_reason": {
+          "type": "string"
+        }
+      }
+    },
+    "roleUsageMap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supervisor",
+        "child_orchestrator",
+        "worker",
+        "gate_classifier",
+        "auditor"
+      ],
+      "properties": {
+        "supervisor": {
+          "$ref": "#/$defs/roleUsage"
+        },
+        "child_orchestrator": {
+          "$ref": "#/$defs/roleUsage"
+        },
+        "worker": {
+          "$ref": "#/$defs/roleUsage"
+        },
+        "gate_classifier": {
+          "$ref": "#/$defs/roleUsage"
+        },
+        "auditor": {
+          "$ref": "#/$defs/roleUsage"
+        }
+      }
+    },
+    "reviewLensUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lens_id",
+        "backend_id",
+        "model",
+        "observation"
+      ],
+      "properties": {
+        "lens_id": {
+          "type": "string"
+        },
+        "backend_id": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/usage"
+        },
+        "cost_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "observation": {
+          "$ref": "#/$defs/usageObservation"
+        },
+        "unavailable_reason": {
+          "type": "string"
+        }
+      }
+    },
+    "roleSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "reasoning_effort": {
+          "type": "string"
+        },
+        "unavailable_model_fallback": {
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "fail_closed",
+                "runtime_default",
+                "local_deterministic_fake"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "ordered_catalog_chain"
+              ],
+              "properties": {
+                "ordered_catalog_chain": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "models",
+                    "on_exhausted"
+                  ],
+                  "properties": {
+                    "models": {
+                      "type": "array",
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "budget_degrade_models": {
+                      "type": "array",
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "on_exhausted": {
+                      "type": "string",
+                      "enum": [
+                        "fail_closed",
+                        "runtime_default",
+                        "local_deterministic_fake"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "roleBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "resolved_model",
+        "resolved_reasoning_effort",
+        "observation",
+        "resolution_observation"
+      ],
+      "properties": {
+        "configured_model": {
+          "type": "string"
+        },
+        "configured_reasoning_effort": {
+          "type": "string"
+        },
+        "resolved_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resolved_reasoning_effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "observation": {
+          "type": "string",
+          "enum": [
+            "runtime_catalog_resolved",
+            "runtime_default_resolved",
+            "synthetic_fake",
+            "catalog_unavailable",
+            "resolution_failed",
+            "assignment_specific"
+          ]
+        },
+        "resolution_observation": {
+          "type": "string",
+          "enum": [
+            "preferred_model",
+            "catalog_fallback",
+            "runtime_default",
+            "local_deterministic_fake",
+            "not_resolved"
+          ]
+        },
+        "configured_model_chain": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "resolved_candidate_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unavailable_reason": {
+          "type": "string"
+        }
+      }
+    },
+    "exactRoleSelections": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supervisor",
+        "child_orchestrator",
+        "worker",
+        "gate_classifier",
+        "auditor"
+      ],
+      "properties": {
+        "supervisor": {
+          "$ref": "#/$defs/roleSelection"
+        },
+        "child_orchestrator": {
+          "$ref": "#/$defs/roleSelection"
+        },
+        "worker": {
+          "$ref": "#/$defs/roleSelection"
+        },
+        "gate_classifier": {
+          "$ref": "#/$defs/roleSelection"
+        },
+        "auditor": {
+          "$ref": "#/$defs/roleSelection"
+        }
+      }
+    },
+    "exactRoleBindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supervisor",
+        "child_orchestrator",
+        "worker",
+        "gate_classifier",
+        "auditor"
+      ],
+      "properties": {
+        "supervisor": {
+          "$ref": "#/$defs/roleBinding"
+        },
+        "child_orchestrator": {
+          "$ref": "#/$defs/roleBinding"
+        },
+        "worker": {
+          "$ref": "#/$defs/roleBinding"
+        },
+        "gate_classifier": {
+          "$ref": "#/$defs/roleBinding"
+        },
+        "auditor": {
+          "$ref": "#/$defs/roleBinding"
+        }
+      }
+    },
+    "economicsProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "name",
+        "evidence",
+        "evidence_notice",
+        "production_eligible",
+        "model_availability",
+        "overridden_roles",
+        "role_models",
+        "model_catalog_observation",
+        "execution"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 5
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "evidence_notice": {
+          "type": "string"
+        },
+        "production_eligible": {
+          "type": "boolean"
+        },
+        "model_availability": {
+          "type": "string",
+          "enum": [
+            "unknown",
+            "available",
+            "unavailable"
+          ]
+        },
+        "overridden_roles": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/agentRole"
+          }
+        },
+        "role_models": {
+          "$ref": "#/$defs/exactRoleSelections"
+        },
+        "model_catalog_observation": {
+          "type": "string",
+          "enum": [
+            "consulted",
+            "consultation_failed",
+            "not_consulted"
+          ]
+        },
+        "execution": {
+          "$ref": "#/$defs/execution"
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "assignment_count",
+        "started_assignment_count",
+        "completed_assignment_count",
+        "concurrency",
+        "role_bindings",
+        "assignment_effort_bindings",
+        "budget_degradations",
+        "usage"
+      ],
+      "properties": {
+        "assignment_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "started_assignment_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "completed_assignment_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "concurrency": {
+          "$ref": "#/$defs/concurrency"
+        },
+        "role_bindings": {
+          "$ref": "#/$defs/exactRoleBindings"
+        },
+        "assignment_effort_bindings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/assignmentEffortBinding"
+          }
+        },
+        "budget_degradations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/budgetDegradationRecord"
+          }
+        },
+        "usage": {
+          "$ref": "#/$defs/executionUsage"
+        }
+      }
+    },
+    "reasoningEffort": {
+      "type": "string",
+      "enum": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ]
+    },
+    "assignmentEffortBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "assignment_id",
+        "duty_id",
+        "role",
+        "fallback_reasoning_effort",
+        "resolved_reasoning_effort",
+        "resolution_observation",
+        "process_observation"
+      ],
+      "properties": {
+        "assignment_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "duty_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "$ref": "#/$defs/agentRole"
+        },
+        "requested_reasoning_effort": {
+          "$ref": "#/$defs/reasoningEffort"
+        },
+        "fallback_reasoning_effort": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolved_reasoning_effort": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolution_observation": {
+          "type": "string",
+          "enum": [
+            "role_fallback",
+            "assignment_override",
+            "hard_floor_clamped",
+            "budget_degraded"
+          ]
+        },
+        "process_observation": {
+          "$ref": "#/$defs/processObservation"
+        },
+        "unavailable_reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "budgetReason": {
+      "type": "string",
+      "enum": [
+        "soft_token_ceiling_reached",
+        "hard_token_ceiling_reached",
+        "soft_cost_ceiling_reached",
+        "hard_cost_ceiling_reached",
+        "max_duration_reached",
+        "missing_pricing",
+        "estimated_provider_usage",
+        "missing_provider_usage",
+        "missing_actual_cost"
+      ]
+    },
+    "budgetDegradationChange": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "role",
+            "before",
+            "after"
+          ],
+          "properties": {
+            "kind": {
+              "const": "reasoning_effort"
+            },
+            "role": {
+              "$ref": "#/$defs/agentRole"
+            },
+            "before": {
+              "type": "string"
+            },
+            "after": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "role",
+            "before",
+            "after",
+            "resolved_candidate_index"
+          ],
+          "properties": {
+            "kind": {
+              "const": "model_tier"
+            },
+            "role": {
+              "$ref": "#/$defs/agentRole"
+            },
+            "before": {
+              "type": "string"
+            },
+            "after": {
+              "type": "string"
+            },
+            "resolved_candidate_index": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "before",
+            "after"
+          ],
+          "properties": {
+            "kind": {
+              "const": "fan_out"
+            },
+            "before": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "after": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "before_new_dispatch_allowed",
+            "after_new_dispatch_allowed"
+          ],
+          "properties": {
+            "kind": {
+              "const": "halt"
+            },
+            "before_new_dispatch_allowed": {
+              "type": "boolean"
+            },
+            "after_new_dispatch_allowed": {
+              "type": "boolean"
+            }
+          }
+        }
+      ]
+    },
+    "budgetDegradationRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "assignment_id",
+        "budget_action",
+        "budget_reasons",
+        "change",
+        "effective_child_model",
+        "effective_child_reasoning_effort",
+        "effective_fan_out",
+        "observation"
+      ],
+      "properties": {
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "assignment_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "budget_action": {
+          "type": "string",
+          "enum": [
+            "continue",
+            "degrade",
+            "owner_escalation"
+          ]
+        },
+        "budget_reasons": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/budgetReason"
+          }
+        },
+        "change": {
+          "$ref": "#/$defs/budgetDegradationChange"
+        },
+        "effective_child_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effective_child_reasoning_effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effective_fan_out": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "observation": {
+          "const": "admission_policy_resolved"
+        }
+      }
+    },
+    "concurrency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "configured_max_concurrent_children",
+        "policy_input_observation",
+        "policy_input",
+        "policy_input_details",
+        "policy_input_unavailable_reason",
+        "achieved_max_concurrent_children",
+        "achieved_mean_concurrent_children",
+        "achieved_mean_observation",
+        "achieved_mean_unavailable_reason"
+      ],
+      "properties": {
+        "configured_max_concurrent_children": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "policy_input_observation": {
+          "$ref": "#/$defs/processObservation"
+        },
+        "policy_input": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "policy_input_details": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/admissionPolicyInput"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "policy_input_unavailable_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "achieved_max_concurrent_children": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "achieved_mean_concurrent_children": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "achieved_mean_observation": {
+          "$ref": "#/$defs/processObservation"
+        },
+        "achieved_mean_unavailable_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "processObservation": {
+      "type": "string",
+      "enum": [
+        "scheduler_observed",
+        "not_retained",
+        "not_process_observable"
+      ]
+    },
+    "admissionConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_concurrent_children": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "provider_inflight_limit": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "host_memory_available_mib": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "host_memory_per_child_mib": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "host_fd_available": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "host_fds_per_child": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "host_disk_available_mib": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "host_disk_per_child_mib": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "host_fallback_children": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "admissionInputSource": {
+      "type": "string",
+      "enum": [
+        "configured",
+        "conservative_default",
+        "measured"
+      ]
+    },
+    "admissionPolicyInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entrypoint_bound",
+        "plan",
+        "cli",
+        "effective",
+        "provider_inflight_bound",
+        "provider_inflight_source",
+        "host",
+        "resolved_bound"
+      ],
+      "properties": {
+        "entrypoint_bound": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "plan": {
+          "$ref": "#/$defs/admissionConfig"
+        },
+        "cli": {
+          "$ref": "#/$defs/admissionConfig"
+        },
+        "effective": {
+          "$ref": "#/$defs/admissionConfig"
+        },
+        "provider_inflight_bound": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "provider_inflight_source": {
+          "$ref": "#/$defs/admissionInputSource"
+        },
+        "host": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "memory_available_mib",
+            "memory_available_source",
+            "memory_per_child_mib",
+            "memory_bound",
+            "fd_available",
+            "fd_available_source",
+            "fds_per_child",
+            "fd_bound",
+            "disk_available_mib",
+            "disk_available_source",
+            "disk_per_child_mib",
+            "disk_bound",
+            "fallback_children",
+            "resolved_bound"
+          ],
+          "properties": {
+            "memory_available_mib": {
+              "type": ["integer", "null"],
+              "minimum": 1
+            },
+            "memory_available_source": {
+              "$ref": "#/$defs/admissionInputSource"
+            },
+            "memory_per_child_mib": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "memory_bound": {
+              "type": ["integer", "null"],
+              "minimum": 1
+            },
+            "fd_available": {
+              "type": ["integer", "null"],
+              "minimum": 1
+            },
+            "fd_available_source": {
+              "$ref": "#/$defs/admissionInputSource"
+            },
+            "fds_per_child": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "fd_bound": {
+              "type": ["integer", "null"],
+              "minimum": 1
+            },
+            "disk_available_mib": {
+              "type": ["integer", "null"],
+              "minimum": 1
+            },
+            "disk_available_source": {
+              "$ref": "#/$defs/admissionInputSource"
+            },
+            "disk_per_child_mib": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "disk_bound": {
+              "type": ["integer", "null"],
+              "minimum": 1
+            },
+            "fallback_children": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "resolved_bound": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "resolved_bound": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "executionUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total_usage",
+        "total_cost_usd",
+        "usage_complete",
+        "observation"
+      ],
+      "properties": {
+        "total_usage": {
+          "$ref": "#/$defs/nullableUsage"
+        },
+        "total_cost_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "usage_complete": {
+          "type": "boolean"
+        },
+        "observation": {
+          "$ref": "#/$defs/usageObservation"
+        },
+        "unavailable_reason": {
+          "type": "string"
+        }
+      }
+    },
+    "budgetAmount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tokens"
+      ],
+      "properties": {
+        "tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cost_usd": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "budgetLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "soft_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "hard_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "soft_cost_usd": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "hard_cost_usd": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "budgetRemaining": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "soft_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "hard_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "soft_cost_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "hard_cost_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_duration_seconds": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "roleBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "consumed",
+        "reserved",
+        "active_reservations",
+        "usage_complete"
+      ],
+      "properties": {
+        "role": {
+          "$ref": "#/$defs/agentRole"
+        },
+        "consumed": {
+          "$ref": "#/$defs/budgetAmount"
+        },
+        "reserved": {
+          "$ref": "#/$defs/budgetAmount"
+        },
+        "active_reservations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "usage_complete": {
+          "type": "boolean"
+        }
+      }
+    },
+    "runBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "limits",
+        "consumed",
+        "reserved",
+        "committed",
+        "remaining",
+        "elapsed_seconds",
+        "active_reservations",
+        "usage_complete",
+        "action",
+        "new_dispatch_allowed"
+      ],
+      "properties": {
+        "limits": {
+          "$ref": "#/$defs/budgetLimits"
+        },
+        "max_duration_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "consumed": {
+          "$ref": "#/$defs/budgetAmount"
+        },
+        "reserved": {
+          "$ref": "#/$defs/budgetAmount"
+        },
+        "committed": {
+          "$ref": "#/$defs/budgetAmount"
+        },
+        "remaining": {
+          "$ref": "#/$defs/budgetRemaining"
+        },
+        "elapsed_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "roles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/roleBudget"
+          }
+        },
+        "active_reservations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "usage_complete": {
+          "type": "boolean"
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "continue",
+            "degrade",
+            "owner_escalation"
+          ]
+        },
+        "new_dispatch_allowed": {
+          "type": "boolean"
+        },
+        "reasons": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/budgetReason"
+          }
+        }
+      }
+    },
+    "ratioMetric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "numerator",
+        "denominator"
+      ],
+      "properties": {
+        "numerator": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "denominator": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "reviewedGateAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action_gate_id",
+        "allowed"
+      ],
+      "properties": {
+        "action_gate_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "correction_correlation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "denial_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "allowed": {
+          "type": "boolean"
+        },
+        "human_intervention": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "target",
+            "outcome"
+          ],
+          "properties": {
+            "target": {
+              "const": "human"
+            },
+            "outcome": {
+              "const": "intervention_required"
+            }
+          }
+        }
+      }
+    },
+    "gateCorrectionLifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "denial_id",
+        "correction_correlation_id",
+        "route",
+        "correction_attempts"
+      ],
+      "properties": {
+        "denial_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "correction_correlation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "route": {
+          "type": "string",
+          "enum": [
+            "planner_parent",
+            "child_controller",
+            "integration_controller"
+          ]
+        },
+        "correction_attempts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4
+        },
+        "terminal_outcome": {
+          "type": "string",
+          "enum": [
+            "self_corrected",
+            "exhausted",
+            "escalated"
+          ]
+        }
+      }
+    },
+    "coverageMarker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observation"
+      ],
+      "properties": {
+        "observation": {
+          "type": "string",
+          "enum": [
+            "supervisor_aggregate",
+            "not_process_observable"
+          ]
+        },
+        "unavailable_reason": {
+          "type": "string"
+        }
+      }
+    },
+    "autonomyKpis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observation",
+        "population",
+        "coverage",
+        "actions_reviewed",
+        "denials",
+        "self_corrections",
+        "human_escalations",
+        "interrupted"
+      ],
+      "properties": {
+        "observation": {
+          "type": "string",
+          "enum": [
+            "supervisor_aggregate",
+            "not_process_observable"
+          ]
+        },
+        "population": {
+          "const": "reviewed_gate_actions"
+        },
+        "coverage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "review_decisions",
+            "reviewed_denial_terminal_lifecycles",
+            "human_follow_up_responses",
+            "scheduler_budget_denial_lifecycles",
+            "rate_denominators"
+          ],
+          "properties": {
+            "review_decisions": {
+              "$ref": "#/$defs/coverageMarker"
+            },
+            "reviewed_denial_terminal_lifecycles": {
+              "$ref": "#/$defs/coverageMarker"
+            },
+            "human_follow_up_responses": {
+              "$ref": "#/$defs/coverageMarker"
+            },
+            "scheduler_budget_denial_lifecycles": {
+              "$ref": "#/$defs/coverageMarker"
+            },
+            "rate_denominators": {
+              "$ref": "#/$defs/coverageMarker"
+            }
+          }
+        },
+        "actions_reviewed": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "denials": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "self_corrections": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "human_escalations": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "interrupted": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "licensed_dependent_failures": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "generated_follow_up_tasks": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "denial_rate": {
+          "$ref": "#/$defs/ratioMetric"
+        },
+        "self_correction_rate": {
+          "$ref": "#/$defs/ratioMetric"
+        },
+        "interruption_rate": {
+          "$ref": "#/$defs/ratioMetric"
+        },
+        "reviewed_actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reviewedGateAction"
+          }
+        },
+        "gate_lifecycles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/gateCorrectionLifecycle"
+          }
+        },
+        "unavailable_reason": {
+          "type": "string"
+        }
+      }
+    },
+    "commandRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command",
+        "cwd",
+        "status",
+        "timeout_seconds",
+        "duration_ms",
+        "timed_out",
+        "stdout",
+        "stderr"
+      ],
+      "properties": {
+        "command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "$ref": "#/$defs/safePublishedPath"
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/$defs/reviewStatus"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "timed_out": {
+          "type": "boolean"
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        },
+        "sandbox_denials": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/sandboxDenial"
+          }
+        },
+        "environment_preflight_results": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "environment_failures": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "sandboxDenial": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "boundary",
+        "policy_id",
+        "operation",
+        "retryability"
+      ],
+      "properties": {
+        "boundary": {
+          "type": "string",
+          "enum": [
+            "outer_systemd",
+            "inner_codex"
+          ]
+        },
+        "policy_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "establish_boundary",
+            "write"
+          ]
+        },
+        "path": {
+          "$ref": "#/$defs/repositoryRelativePath"
+        },
+        "retryability": {
+          "type": "string",
+          "enum": [
+            "requires_declared_exception",
+            "not_retryable"
+          ]
+        }
+      }
+    },
+    "validationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "status",
+        "command"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/reviewStatus"
+        },
+        "command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "severity",
+        "message",
+        "paths"
+      ],
+      "properties": {
+        "severity": {
+          "type": "string",
+          "enum": [
+            "info",
+            "warning",
+            "error"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "paths": {
+          "$ref": "#/$defs/pathArray"
+        }
+      }
+    },
+    "decompositionCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_path",
+        "replacement_paths"
+      ],
+      "properties": {
+        "target_path": {
+          "$ref": "#/$defs/repositoryRelativePath"
+        },
+        "replacement_paths": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/repositoryRelativePath"
+          }
+        },
+        "supervisor_candidate_binding": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/validationBinding"
+        }
+      }
+    }
+  }
+}

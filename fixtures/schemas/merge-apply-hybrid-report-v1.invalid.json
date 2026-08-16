@@ -1,0 +1,15 @@
+{
+  "status": "refused",
+  "applied": false,
+  "review_requested": true,
+  "review_bound": false,
+  "review_binding_status": "not_bound",
+  "error_kind": "merge_preview_freshness",
+  "reason": "preview_freshness_drift",
+  "drift_axes": [
+    "primary_head"
+  ],
+  "message": "merge apply refused because the reviewed primary HEAD moved",
+  "next_action": "run merge preview again and review the new freshness_watermark",
+  "error": null
+}

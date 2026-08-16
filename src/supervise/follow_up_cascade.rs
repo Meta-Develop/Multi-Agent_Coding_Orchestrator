@@ -7,7 +7,9 @@ use crate::{
         GeneratedFollowUpQueueRootInput, GeneratedFollowUpQueueSource,
         GeneratedFollowUpRetentionBinding,
     },
+    gate_denial::ApprovalReviewDenial,
     machine_global::MachineGlobalRetentionBinding,
+    mutation_taxonomy::autonomous_decision_for_supervisor_child_dispatch,
 };
 use std::io::Write;
 
@@ -293,6 +295,23 @@ pub(super) fn run_generated_follow_up_cascade(
             }
             if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
                 return Ok(FollowUpPreparation::Cancelled);
+            }
+            let taxonomy_decision = autonomous_decision_for_supervisor_child_dispatch();
+            if let Some(gate_id) = taxonomy_decision.gate_id() {
+                let effective_paths = reloaded
+                    .plan
+                    .assignments
+                    .iter()
+                    .flat_map(|assignment| assignment.assigned_paths.iter().cloned())
+                    .collect::<Vec<_>>();
+                return Ok(FollowUpPreparation::Refused(
+                    GateDenial::from_approval_review(
+                        &item_id,
+                        gate_id,
+                        ApprovalReviewDenial::HumanReviewRequired,
+                        effective_paths,
+                    )?,
+                ));
             }
             if let Some(denial) = before_dispatch(&reloaded.plan)? {
                 return Ok(FollowUpPreparation::Refused(denial));

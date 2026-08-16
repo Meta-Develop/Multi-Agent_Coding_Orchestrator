@@ -3418,10 +3418,12 @@ mod decomposition_tests {
             return Ok(());
         }
 
-        let test_binary = std::env::current_exe()?;
-        let test_output_root = test_binary
+        let test_binary = fs::canonicalize(std::env::current_exe()?)?;
+        let test_binary_parent = test_binary
             .parent()
-            .and_then(Path::parent)
+            .context("test binary omitted its canonical parent")?;
+        let test_output_root = test_binary_parent
+            .parent()
             .context("test binary omitted its target output root")?;
         let temp = tempfile::tempdir_in(test_output_root)?;
         let primary_root = temp.path().join("primary");
@@ -3448,7 +3450,8 @@ mod decomposition_tests {
         let command =
             configure_review_lens_execution_boundary(command, &primary_root, &child_root)?;
 
-        let mut profile = crate::process_runner::ExternalCodexProfile::read_only(&command.cwd);
+        let mut profile = crate::process_runner::ExternalCodexProfile::read_only(&command.cwd)
+            .with_visible_read_only_root(test_binary_parent);
         for hidden_root in &command.hidden_roots {
             profile = profile.with_hidden_root(hidden_root);
         }
@@ -3466,7 +3469,7 @@ mod decomposition_tests {
         let output = match run_process(
             ProcessSpec::direct(
                 "review lens hostile hidden-root probe",
-                std::env::current_exe()?,
+                test_binary,
                 [
                     OsStr::new("--exact"),
                     OsStr::new(

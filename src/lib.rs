@@ -26,6 +26,7 @@ pub mod machine_global;
 pub mod megafile;
 pub mod merge;
 pub(crate) mod merge_semantic;
+pub mod mutation_taxonomy;
 pub mod orchestration_event;
 pub mod orchestrator;
 pub(crate) mod pinned_exec;

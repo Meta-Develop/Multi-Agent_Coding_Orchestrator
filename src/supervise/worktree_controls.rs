@@ -94,6 +94,70 @@ fn open_direct_worktree_directory(
 }
 
 #[cfg(unix)]
+fn ensure_registered_worktree_guard_if_repository(workspace_path: &Path) -> Result<()> {
+    match crate::git_repository::open(workspace_path) {
+        Ok(repository) => {
+            drop(repository);
+            crate::worktree::ensure_registered_managed_worktree_guard(workspace_path)
+                .context("failed to install advisory managed-worktree Git guard")?;
+        }
+        Err(error)
+            if error.code() == git2::ErrorCode::NotFound
+                && allow_synthetic_unresolved_git_marker(workspace_path)? =>
+        {
+            // Mandatory-control unit fixtures deliberately use a fully
+            // unresolved absolute marker. A marker whose target, worktrees
+            // parent, or common-directory candidate exists is plausibly a
+            // damaged real lane and must not receive this exception.
+        }
+        Err(error) => {
+            return Err(error).context(
+                "failed to open linked worktree repository for advisory Git guard installation",
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, test))]
+fn allow_synthetic_unresolved_git_marker(workspace_path: &Path) -> Result<bool> {
+    unresolved_git_marker_is_synthetic(workspace_path)
+}
+
+#[cfg(all(unix, not(test)))]
+fn allow_synthetic_unresolved_git_marker(_workspace_path: &Path) -> Result<bool> {
+    // Production supervisor bootstrap never treats a missing Git ancestry as
+    // synthetic. A damaged or substituted real lane therefore fails closed.
+    Ok(false)
+}
+
+#[cfg(all(unix, test))]
+fn unresolved_git_marker_is_synthetic(workspace_path: &Path) -> Result<bool> {
+    let marker_path = workspace_path.join(".git");
+    let bytes = BoundedRegularReader::read_tree_no_follow(&marker_path, 4096)
+        .context("failed to inspect unresolved linked-worktree marker")?;
+    let line = bytes
+        .strip_suffix(b"\n")
+        .and_then(|line| line.strip_prefix(b"gitdir: "))
+        .context("unresolved linked-worktree marker is malformed")?;
+    if line.is_empty() || line.contains(&b'\n') || line.contains(&b'\r') {
+        bail!("unresolved linked-worktree marker is malformed");
+    }
+    let text =
+        std::str::from_utf8(line).context("unresolved linked-worktree marker is not UTF-8")?;
+    let target = Path::new(text);
+    if !target.is_absolute() {
+        return Ok(false);
+    }
+    let parent_exists = target.parent().is_some_and(Path::exists);
+    let common_candidate_exists = target
+        .parent()
+        .and_then(Path::parent)
+        .is_some_and(Path::exists);
+    Ok(!target.exists() && !parent_exists && !common_candidate_exists)
+}
+
+#[cfg(unix)]
 pub(super) fn provision_mandatory_worktree_controls(
     workspace_path: &Path,
 ) -> Result<MandatoryWorktreeControls> {
@@ -145,6 +209,13 @@ pub(super) fn provision_mandatory_worktree_controls(
         git_identity,
         directories,
     };
+    controls.revalidate()?;
+    // Older registered lanes may predate the creation-time guard. Bootstrap
+    // installs it only after every mandatory control is bound and validated;
+    // a second validation prevents an unsafe success if the named workspace
+    // changes while the advisory guard is being checked. The primary path uses
+    // `bind_primary_worktree_controls` and never reaches implicit installation.
+    ensure_registered_worktree_guard_if_repository(workspace_path)?;
     controls.revalidate()?;
     Ok(controls)
 }
