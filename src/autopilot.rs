@@ -1049,9 +1049,7 @@ fn find_generated_follow_up_taxonomy_gate_id(
         // vector verbatim. Subtract those exact records (stable denial ID,
         // correction correlation, and typed context) before interpreting a
         // queue-local pre-dispatch refusal.
-        let originated_in_dispatched_subordinate = dispatched_subordinate_denials
-            .iter()
-            .any(|subordinate| *subordinate == denial);
+        let originated_in_dispatched_subordinate = dispatched_subordinate_denials.contains(&denial);
         (matches!(
             denial.reason,
             GateDenialReason::ApprovalReview {
@@ -1556,9 +1554,9 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 run_id: &options.run_id,
                 status: if cancellation_cleanup_completed {
                     AutopilotRunStatus::Cancelled
-                } else if taxonomy_refused_before_source_dispatch {
-                    AutopilotRunStatus::Refused
-                } else if admission_refused_before_source_dispatch {
+                } else if taxonomy_refused_before_source_dispatch
+                    || admission_refused_before_source_dispatch
+                {
                     AutopilotRunStatus::Refused
                 } else {
                     AutopilotRunStatus::Failed
@@ -1659,9 +1657,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         AutopilotRunStatus::Cancelled
     } else if cancellation_was_observed {
         AutopilotRunStatus::Failed
-    } else if taxonomy_refusal_gate_id.is_some() {
-        AutopilotRunStatus::Refused
-    } else if child_dispatch_admission_refused {
+    } else if taxonomy_refusal_gate_id.is_some() || child_dispatch_admission_refused {
         AutopilotRunStatus::Refused
     } else if supervisor.success && follow_up_cascade_success && !execution_profile_mismatch {
         AutopilotRunStatus::Succeeded
@@ -6348,11 +6344,11 @@ mod tests {
         )
         .expect("construct taxonomy-shaped denial");
         assert_eq!(
-            find_generated_follow_up_taxonomy_gate_id(&[denial.clone()], &[]),
+            find_generated_follow_up_taxonomy_gate_id(std::slice::from_ref(&denial), &[]),
             Some(TAXONOMY_REVIEW_REQUIRED_GATE_ID.to_string())
         );
         assert_eq!(
-            find_generated_follow_up_taxonomy_gate_id(&[denial.clone()], &[&denial]),
+            find_generated_follow_up_taxonomy_gate_id(std::slice::from_ref(&denial), &[&denial],),
             None
         );
     }
