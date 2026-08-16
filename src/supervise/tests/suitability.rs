@@ -833,8 +833,10 @@ fn suitability_legacy_default_recursive_roundtrip_and_bounds_are_strict() {
         vec![AssignmentSuitabilityReason::ClassificationDuplicate]
     );
 
-    let mut rationale_config = AssignmentSuitabilityConfig::default();
-    rationale_config.rationale = Some("界".repeat(MAX_ASSIGNMENT_SUITABILITY_RATIONALE_CHARS));
+    let mut rationale_config = AssignmentSuitabilityConfig {
+        rationale: Some("界".repeat(MAX_ASSIGNMENT_SUITABILITY_RATIONALE_CHARS)),
+        ..AssignmentSuitabilityConfig::default()
+    };
     rationale_config
         .validate("unicode-rationale-at-limit")
         .expect("runtime bound counts Unicode characters like JSON Schema maxLength");

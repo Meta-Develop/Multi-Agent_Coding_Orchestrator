@@ -343,61 +343,41 @@ fn low_severity_threshold_durably_suppresses_retry_without_spending_correction_b
         run_id.as_str(),
     ));
     let mut autonomy_kpis = AutonomyKpiCollector::default();
-    let artifacts = Mutex::new(SharedSupervisorArtifacts {
-        writer: &mut writer,
-        journal: &mut journal,
-        autonomy_kpis: &mut autonomy_kpis,
-        checkpoint: None,
-    });
-    let assignment = injected_assignment(false);
-    let config = ReviewLoopGuardConfig {
-        max_low_severity: ReviewLoopLowSeverity::Warning,
-        consecutive_low_severity_cycles: 1,
-    };
-    let mut tracker = ReviewLoopGuardTracker::new(config);
-    let warning = review_auditor_with_finding(&assignment, FindingSeverity::Warning);
-    assert!(tracker
-        .observe_real_parent_review(&artifacts, &assignment, "review-loop-parent", &[warning])
-        .expect("observe low-severity review cycle"));
+    {
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let assignment = injected_assignment(false);
+        let config = ReviewLoopGuardConfig {
+            max_low_severity: ReviewLoopLowSeverity::Warning,
+            consecutive_low_severity_cycles: 1,
+        };
+        let mut tracker = ReviewLoopGuardTracker::new(config);
+        let warning = review_auditor_with_finding(&assignment, FindingSeverity::Warning);
+        assert!(tracker
+            .observe_real_parent_review(&artifacts, &assignment, "review-loop-parent", &[warning])
+            .expect("observe low-severity review cycle"));
 
-    let denial = review_loop_auditor_denial(&assignment, 1);
-    let mut outcome = AssignmentExecutionOutcome {
-        gate_tracker: Some(GateCorrectionTracker::new(2)),
-        ..AssignmentExecutionOutcome::default()
-    };
-    let mut locked_rejection = injected_child_report(&assignment);
-    let plan = injected_plan(assignment.clone(), 0);
-    attach_parent_computed_review_lens_aggregate(&plan, &assignment, &mut locked_rejection);
-    locked_rejection
-        .review_lens_aggregate
-        .as_mut()
-        .expect("locked review aggregate")
-        .decision = ReviewAggregationDecision::Reject;
-    locked_rejection.status = ReviewStatus::Failed;
-    locked_rejection.accepted = false;
-    locked_rejection.rejected = true;
-    let locked_status_before = (
-        locked_rejection.status,
-        locked_rejection.accepted,
-        locked_rejection.rejected,
+        let denial = review_loop_auditor_denial(&assignment, 1);
+        let mut outcome = AssignmentExecutionOutcome {
+            gate_tracker: Some(GateCorrectionTracker::new(2)),
+            ..AssignmentExecutionOutcome::default()
+        };
+        let mut locked_rejection = injected_child_report(&assignment);
+        let plan = injected_plan(assignment.clone(), 0);
+        attach_parent_computed_review_lens_aggregate(&plan, &assignment, &mut locked_rejection);
         locked_rejection
             .review_lens_aggregate
-            .as_ref()
+            .as_mut()
             .expect("locked review aggregate")
-            .decision,
-    );
-    assert!(suppress_review_loop_retry_if_threshold(
-        true,
-        Some(&mut tracker),
-        &mut outcome,
-        &artifacts,
-        &assignment,
-        "review-loop-parent",
-        &denial,
-    )
-    .expect("durably suppress low-severity correction retry"));
-    assert_eq!(
-        (
+            .decision = ReviewAggregationDecision::Reject;
+        locked_rejection.status = ReviewStatus::Failed;
+        locked_rejection.accepted = false;
+        locked_rejection.rejected = true;
+        let locked_status_before = (
             locked_rejection.status,
             locked_rejection.accepted,
             locked_rejection.rejected,
@@ -406,33 +386,54 @@ fn low_severity_threshold_durably_suppresses_retry_without_spending_correction_b
                 .as_ref()
                 .expect("locked review aggregate")
                 .decision,
-        ),
-        locked_status_before
-    );
-    assert!(
-        !tracker
-            .evidence(&assignment, &locked_rejection)
-            .locked_review_accepted
-    );
-    let gate_tracker = outcome
-        .gate_tracker
-        .as_ref()
-        .expect("gate tracker remains available");
-    assert_eq!(gate_tracker.used, 0);
-    assert_eq!(gate_tracker.denials.len(), 1);
-    assert_eq!(gate_tracker.outcomes.len(), 1);
-    assert_eq!(
-        gate_tracker.outcomes[0].terminal_class,
-        GateCorrectionTerminalClass::Escalated
-    );
+        );
+        assert!(suppress_review_loop_retry_if_threshold(
+            true,
+            Some(&mut tracker),
+            &mut outcome,
+            &artifacts,
+            &assignment,
+            "review-loop-parent",
+            &denial,
+        )
+        .expect("durably suppress low-severity correction retry"));
+        assert_eq!(
+            (
+                locked_rejection.status,
+                locked_rejection.accepted,
+                locked_rejection.rejected,
+                locked_rejection
+                    .review_lens_aggregate
+                    .as_ref()
+                    .expect("locked review aggregate")
+                    .decision,
+            ),
+            locked_status_before
+        );
+        assert!(
+            !tracker
+                .evidence(&assignment, &locked_rejection)
+                .locked_review_accepted
+        );
+        let gate_tracker = outcome
+            .gate_tracker
+            .as_ref()
+            .expect("gate tracker remains available");
+        assert_eq!(gate_tracker.used, 0);
+        assert_eq!(gate_tracker.denials.len(), 1);
+        assert_eq!(gate_tracker.outcomes.len(), 1);
+        assert_eq!(
+            gate_tracker.outcomes[0].terminal_class,
+            GateCorrectionTerminalClass::Escalated
+        );
 
-    let evidence = tracker.evidence(&assignment, &injected_child_report(&assignment));
-    assert!(evidence.retry_suppressed);
-    assert_eq!(
-        evidence.stop_disposition,
-        ReviewLoopStopDisposition::CorrectionRetrySuppressed
-    );
-    drop(artifacts);
+        let evidence = tracker.evidence(&assignment, &injected_child_report(&assignment));
+        assert!(evidence.retry_suppressed);
+        assert_eq!(
+            evidence.stop_disposition,
+            ReviewLoopStopDisposition::CorrectionRetrySuppressed
+        );
+    }
     let journal = fs::read_to_string(run_dir.join(ORCHESTRATION_EVENT_PATH))
         .expect("read durable review-loop journal");
     let events = journal
@@ -634,155 +635,157 @@ fn high_severity_resets_streak_and_validation_floor_locks_declared_success() {
         "review-loop-repo",
         run_id.as_str(),
     ));
-    let mut autonomy_kpis = AutonomyKpiCollector::default();
-    let artifacts = Mutex::new(SharedSupervisorArtifacts {
-        writer: &mut writer,
-        journal: &mut journal,
-        autonomy_kpis: &mut autonomy_kpis,
-        checkpoint: None,
-    });
     let assignment = injected_assignment(false);
-    let mut tracker = ReviewLoopGuardTracker::new(ReviewLoopGuardConfig {
-        max_low_severity: ReviewLoopLowSeverity::Warning,
-        consecutive_low_severity_cycles: 2,
-    });
-    let mut advisory = review_auditor_with_finding(&assignment, FindingSeverity::Error);
-    advisory.id = parent_auditor_id(&assignment);
-    let empty_parent = injected_auditor_report(&assignment, &injected_child_report(&assignment));
-    let collected_reports = vec![advisory, empty_parent];
-    let current_parent_audit_start = 1;
-    assert!(!tracker
-        .observe_real_parent_review(
-            &artifacts,
-            &assignment,
-            "review-loop-parent",
-            &collected_reports[current_parent_audit_start..],
-        )
-        .expect("score only the current finding-free parent review"));
-    assert_eq!(tracker.cycles.len(), 1);
-    assert_eq!(tracker.cycles[0].highest_severity, None);
-    assert!(tracker.cycles[0].low_severity);
+    let mut autonomy_kpis = AutonomyKpiCollector::default();
+    {
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let mut tracker = ReviewLoopGuardTracker::new(ReviewLoopGuardConfig {
+            max_low_severity: ReviewLoopLowSeverity::Warning,
+            consecutive_low_severity_cycles: 2,
+        });
+        let mut advisory = review_auditor_with_finding(&assignment, FindingSeverity::Error);
+        advisory.id = parent_auditor_id(&assignment);
+        let empty_parent =
+            injected_auditor_report(&assignment, &injected_child_report(&assignment));
+        let collected_reports = [advisory, empty_parent];
+        let current_parent_audit_start = 1;
+        assert!(!tracker
+            .observe_real_parent_review(
+                &artifacts,
+                &assignment,
+                "review-loop-parent",
+                &collected_reports[current_parent_audit_start..],
+            )
+            .expect("score only the current finding-free parent review"));
+        assert_eq!(tracker.cycles.len(), 1);
+        assert_eq!(tracker.cycles[0].highest_severity, None);
+        assert!(tracker.cycles[0].low_severity);
 
-    for (severity, threshold_reached) in [
-        (FindingSeverity::Error, false),
-        (FindingSeverity::Info, false),
-        (FindingSeverity::Warning, true),
-    ] {
-        let auditor = review_auditor_with_finding(&assignment, severity);
-        assert_eq!(
-            tracker
-                .observe_real_parent_review(
-                    &artifacts,
-                    &assignment,
-                    "review-loop-parent",
-                    &[auditor],
-                )
-                .expect("observe review-loop severity cycle"),
-            threshold_reached
-        );
-    }
-    assert_eq!(
-        tracker
-            .cycles
-            .iter()
-            .map(|cycle| cycle.consecutive_low_severity_cycles)
-            .collect::<Vec<_>>(),
-        vec![1, 0, 1, 2]
-    );
-    tracker
-        .suppress_correction_retry(&artifacts, &assignment, "review-loop-parent")
-        .expect("record durable review-loop stop");
-
-    let plan = injected_plan(assignment.clone(), 0);
-    let report_path = Path::new("reports/review-loop-validation-floor.json");
-    let mut failed_child_report = None;
-    for (blocker, expected_floor) in [
-        (
-            GateApplyBlocker::ValidationMissing,
-            ReviewLoopValidationFloor::Missing,
-        ),
-        (
-            GateApplyBlocker::ValidationFailed,
-            ReviewLoopValidationFloor::Failed,
-        ),
-    ] {
-        let mut child_report = injected_child_report(&assignment);
-        attach_parent_computed_review_lens_aggregate(&plan, &assignment, &mut child_report);
-        match blocker {
-            GateApplyBlocker::ValidationMissing => child_report.validation_results.clear(),
-            GateApplyBlocker::ValidationFailed => {
-                child_report.validation_results[0].status = ReviewStatus::Failed;
-            }
-            _ => panic!("unexpected validation-floor blocker"),
+        for (severity, threshold_reached) in [
+            (FindingSeverity::Error, false),
+            (FindingSeverity::Info, false),
+            (FindingSeverity::Warning, true),
+        ] {
+            let auditor = review_auditor_with_finding(&assignment, severity);
+            assert_eq!(
+                tracker
+                    .observe_real_parent_review(
+                        &artifacts,
+                        &assignment,
+                        "review-loop-parent",
+                        &[auditor],
+                    )
+                    .expect("observe review-loop severity cycle"),
+                threshold_reached
+            );
         }
-        assert_eq!(child_report.status, ReviewStatus::Succeeded);
-        assert!(child_report.accepted);
-        assert!(!child_report.rejected);
-        assert!(
-            tracker
-                .evidence(&assignment, &child_report)
-                .locked_review_accepted
-        );
-        let mut validation_outcome = AssignmentExecutionOutcome {
-            gate_tracker: Some(GateCorrectionTracker::new(0)),
-            ..AssignmentExecutionOutcome::default()
-        };
-        let mut retry_feedback = None;
-        assert!(!apply_validation_floor_gate(
-            blocker,
-            &mut child_report,
-            report_path,
-            &mut validation_outcome,
-            &artifacts,
-            &assignment,
-            "review-loop-parent",
-            &mut retry_feedback,
-        )
-        .expect("exhaust validation-floor repair without bypass"));
-        assert!(retry_feedback.is_none());
         assert_eq!(
-            validation_outcome
-                .gate_tracker
-                .as_ref()
-                .expect("validation-floor gate tracker")
-                .outcomes[0]
-                .terminal_class,
-            GateCorrectionTerminalClass::Exhausted
+            tracker
+                .cycles
+                .iter()
+                .map(|cycle| cycle.consecutive_low_severity_cycles)
+                .collect::<Vec<_>>(),
+            vec![1, 0, 1, 2]
         );
+        tracker
+            .suppress_correction_retry(&artifacts, &assignment, "review-loop-parent")
+            .expect("record durable review-loop stop");
+
+        let plan = injected_plan(assignment.clone(), 0);
+        let report_path = Path::new("reports/review-loop-validation-floor.json");
+        let mut failed_child_report = None;
+        for (blocker, expected_floor) in [
+            (
+                GateApplyBlocker::ValidationMissing,
+                ReviewLoopValidationFloor::Missing,
+            ),
+            (
+                GateApplyBlocker::ValidationFailed,
+                ReviewLoopValidationFloor::Failed,
+            ),
+        ] {
+            let mut child_report = injected_child_report(&assignment);
+            attach_parent_computed_review_lens_aggregate(&plan, &assignment, &mut child_report);
+            match blocker {
+                GateApplyBlocker::ValidationMissing => child_report.validation_results.clear(),
+                GateApplyBlocker::ValidationFailed => {
+                    child_report.validation_results[0].status = ReviewStatus::Failed;
+                }
+                _ => panic!("unexpected validation-floor blocker"),
+            }
+            assert_eq!(child_report.status, ReviewStatus::Succeeded);
+            assert!(child_report.accepted);
+            assert!(!child_report.rejected);
+            assert!(
+                tracker
+                    .evidence(&assignment, &child_report)
+                    .locked_review_accepted
+            );
+            let mut validation_outcome = AssignmentExecutionOutcome {
+                gate_tracker: Some(GateCorrectionTracker::new(0)),
+                ..AssignmentExecutionOutcome::default()
+            };
+            let mut retry_feedback = None;
+            assert!(!apply_validation_floor_gate(
+                blocker,
+                &mut child_report,
+                report_path,
+                &mut validation_outcome,
+                &artifacts,
+                &assignment,
+                "review-loop-parent",
+                &mut retry_feedback,
+            )
+            .expect("exhaust validation-floor repair without bypass"));
+            assert!(retry_feedback.is_none());
+            assert_eq!(
+                validation_outcome
+                    .gate_tracker
+                    .as_ref()
+                    .expect("validation-floor gate tracker")
+                    .outcomes[0]
+                    .terminal_class,
+                GateCorrectionTerminalClass::Exhausted
+            );
+            assert!(report_failed(&child_report));
+            assert_eq!(child_report.status, ReviewStatus::Failed);
+            assert!(!child_report.accepted);
+            assert!(child_report.rejected);
+            assert_eq!(
+                child_report
+                    .findings
+                    .last()
+                    .expect("validation-floor finding")
+                    .severity,
+                FindingSeverity::Error
+            );
+            let evidence = tracker.evidence(&assignment, &child_report);
+            assert_eq!(evidence.final_validation_floor, expected_floor);
+            assert!(evidence.locked_review_accepted);
+            assert!(evidence.retry_suppressed);
+            if blocker == GateApplyBlocker::ValidationFailed {
+                failed_child_report = Some(child_report);
+            }
+        }
+        let mut child_report = failed_child_report.expect("failed validation-floor report");
+        finalize_review_loop_guard_evidence(&tracker, &artifacts, &assignment, &mut child_report)
+            .expect("finalize review-loop validation-floor evidence");
         assert!(report_failed(&child_report));
-        assert_eq!(child_report.status, ReviewStatus::Failed);
-        assert!(!child_report.accepted);
-        assert!(child_report.rejected);
+        assert_eq!(tracker.cycles.len(), 4);
         assert_eq!(
             child_report
                 .findings
                 .last()
-                .expect("validation-floor finding")
+                .expect("post-scoring evidence pointer")
                 .severity,
-            FindingSeverity::Error
+            FindingSeverity::Info
         );
-        let evidence = tracker.evidence(&assignment, &child_report);
-        assert_eq!(evidence.final_validation_floor, expected_floor);
-        assert!(evidence.locked_review_accepted);
-        assert!(evidence.retry_suppressed);
-        if blocker == GateApplyBlocker::ValidationFailed {
-            failed_child_report = Some(child_report);
-        }
     }
-    let mut child_report = failed_child_report.expect("failed validation-floor report");
-    finalize_review_loop_guard_evidence(&tracker, &artifacts, &assignment, &mut child_report)
-        .expect("finalize review-loop validation-floor evidence");
-    assert!(report_failed(&child_report));
-    assert_eq!(tracker.cycles.len(), 4);
-    assert_eq!(
-        child_report
-            .findings
-            .last()
-            .expect("post-scoring evidence pointer")
-            .severity,
-        FindingSeverity::Info
-    );
-    drop(artifacts);
 
     let evidence_path = run_dir
         .join("reports")
