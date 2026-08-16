@@ -1,0 +1,378 @@
+{
+  "version": 1,
+  "run_binding": {
+    "evaluation_results_version": 3,
+    "experiment_id": "issue26-phase-a-readme-v1",
+    "declared_inputs_digest": "fnv1a64:e7da008318253760",
+    "profile_id": "frontier-all-v1",
+    "repetition": 0,
+    "synthetic_run_id": "fake-issue26-phase-a-readme-v1-frontier-all-v1-aafd0d6ef73eb2a1-0",
+    "candidate_validation_binding": {
+      "version": 1,
+      "agent_id": "issue-26-committed-fixture",
+      "primary_head": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
+      "agent_head": "3f85ca4c3cb7ee1b9eee884142177afd37d6f263",
+      "merge_base": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
+      "diff_oid": "5db3261f2b15fe2885883ea8b3c1000b4913441a"
+    }
+  },
+  "held_out_results": [
+    {
+      "id": "provider-boundary",
+      "validation_binding": "sha256:da66ee65b87195f7b813572600adc058c755854420e7212d7c29f1e02a175e0c",
+      "evidence": "deterministic_synthetic_fake_only",
+      "real_command_executed": false,
+      "assertions_run": 6,
+      "assertions_passed": 5,
+      "passed": false,
+      "terminal_outcome_retained": true
+    },
+    {
+      "id": "readme-contract",
+      "validation_binding": "sha256:4f51ab19c60544668dc8ea9261ece7ac168c06c627b949ab05e4e089be04b93b",
+      "evidence": "deterministic_synthetic_fake_only",
+      "real_command_executed": false,
+      "assertions_run": 5,
+      "assertions_passed": 4,
+      "passed": false,
+      "terminal_outcome_retained": true
+    }
+  ],
+  "blinded_grader_input": {
+    "version": 1,
+    "task_spec_digest": "sha256:2248287b2efaaf7ea6a7af665e432fa29da2678c89823b3ca17fd99306140b24",
+    "task_material": "{\"version\":1,\"assignment\":{\"id\":\"assignment-evaluation-26\",\"task\":\"implement the deterministic evaluation grading slice\",\"fragment_ids\":[\"spec-evaluation-26\"],\"assigned_paths\":[\"src/evaluation.rs\"],\"semantic_symbols\":[\"ImplementationGradingAddendum\"],\"semantic_modules\":[\"evaluation\"]},\"spec_fragments\":[{\"id\":\"spec-evaluation-26\",\"text\":\"bind assignment, candidate, auditor verdict, and outcome\"}]}",
+    "task_material_digest": "sha256:56f24c3d17ffd7149fbb9f9ea9075cef0f2538f66d0151eecb609f9a439214fb",
+    "rubric_material": "versioned issue-26 correctness and evidence-integrity rubric",
+    "rubric_material_digest": "sha256:0bec60613d0b360087fd2532d74d471b114d18ad8c03c1f825d4760c5c83b27c",
+    "candidate_patch": "+committed synthetic candidate line one\n+committed synthetic candidate line two",
+    "candidate_content_digest": "sha256:06a6becc2eb2d056680e9fa1405bf9e14857bf71ab1f4982c17195f2a430173e",
+    "deterministic_held_out_observations": [
+      {
+        "check_index": 0,
+        "assertions_run": 6,
+        "assertions_passed": 5,
+        "passed": false,
+        "terminal_outcome_retained": true,
+        "evidence": "deterministic_synthetic_fake_only",
+        "real_command_executed": false
+      },
+      {
+        "check_index": 1,
+        "assertions_run": 5,
+        "assertions_passed": 4,
+        "passed": false,
+        "terminal_outcome_retained": true,
+        "evidence": "deterministic_synthetic_fake_only",
+        "real_command_executed": false
+      }
+    ],
+    "rubric_version": 1,
+    "axes": [
+      "correctness",
+      "completeness",
+      "maintainability",
+      "safety",
+      "evidence_integrity"
+    ],
+    "evidence": "deterministic_synthetic_fake_only",
+    "candidate_git_object_linkage_process_observed": false
+  },
+  "graders": [
+    {
+      "grader_id": "grader-a",
+      "model_id": "fake-grader-model",
+      "reasoning_effort": "deterministic",
+      "evidence": "deterministic_synthetic_fake_only",
+      "real_grader_executed": false,
+      "prompt_version": 1,
+      "policy_version": 1,
+      "rubric_version": 1,
+      "blinded_input_digest": "sha256:0e90ce76a595927e84521634cf3994c14b5be588645a5c3935fe1fac2352177c",
+      "findings": [
+        {
+          "axis": "correctness",
+          "passed": true,
+          "reason": "synthetic finding for Correctness"
+        },
+        {
+          "axis": "completeness",
+          "passed": true,
+          "reason": "synthetic finding for Completeness"
+        },
+        {
+          "axis": "maintainability",
+          "passed": true,
+          "reason": "synthetic finding for Maintainability"
+        },
+        {
+          "axis": "safety",
+          "passed": true,
+          "reason": "synthetic finding for Safety"
+        },
+        {
+          "axis": "evidence_integrity",
+          "passed": true,
+          "reason": "synthetic finding for EvidenceIntegrity"
+        }
+      ],
+      "passed_axes": 5,
+      "overall_passed": true
+    },
+    {
+      "grader_id": "grader-b",
+      "model_id": "fake-grader-model",
+      "reasoning_effort": "deterministic",
+      "evidence": "deterministic_synthetic_fake_only",
+      "real_grader_executed": false,
+      "prompt_version": 1,
+      "policy_version": 1,
+      "rubric_version": 1,
+      "blinded_input_digest": "sha256:0e90ce76a595927e84521634cf3994c14b5be588645a5c3935fe1fac2352177c",
+      "findings": [
+        {
+          "axis": "correctness",
+          "passed": false,
+          "reason": "synthetic blinded disagreement retained for human rejection"
+        },
+        {
+          "axis": "completeness",
+          "passed": true,
+          "reason": "synthetic finding for Completeness"
+        },
+        {
+          "axis": "maintainability",
+          "passed": true,
+          "reason": "synthetic finding for Maintainability"
+        },
+        {
+          "axis": "safety",
+          "passed": true,
+          "reason": "synthetic finding for Safety"
+        },
+        {
+          "axis": "evidence_integrity",
+          "passed": true,
+          "reason": "synthetic finding for EvidenceIntegrity"
+        }
+      ],
+      "passed_axes": 4,
+      "overall_passed": false
+    }
+  ],
+  "disagreement": {
+    "axes": [
+      "correctness"
+    ],
+    "count": 1
+  },
+  "anti_reward_hacking": {
+    "primitive_evidence": {
+      "evidence": "deterministic_synthetic_fake_only",
+      "real_process_executed": false,
+      "gate_policy_trial_results_digest": "sha256:59550ee2c66c8744afc1e402fc555f40eea6921321d69bad83bcaeb644e1f1a2",
+      "gate_policy_trial_plan_binding_digest": "sha256:68f772d54b771dcdbcdf8106b99e4bb91e618a45606799d80ddd32d169e6303b",
+      "gate_policy_trial_corpus_binding_digest": "sha256:022348063bac9ff5b4809cb21d35483fdf14343f67aad9e2b4d294fec78c9c3b",
+      "terminal_inventory": {
+        "expected_terminal_count": 64,
+        "expected_failure_count": 18,
+        "retained_outcomes": [
+          "human_review",
+          "blocked",
+          "human_review",
+          "human_review",
+          "allowed",
+          "blocked",
+          "blocked",
+          "blocked",
+          "allowed",
+          "blocked",
+          "blocked",
+          "blocked",
+          "allowed",
+          "blocked",
+          "reward_hacking_signal",
+          "reward_hacking_signal",
+          "allowed",
+          "blocked",
+          "blocked",
+          "blocked",
+          "allowed",
+          "blocked",
+          "environment_failure",
+          "environment_failure",
+          "allowed",
+          "blocked",
+          "malformed_tool_call",
+          "malformed_tool_call",
+          "blocked",
+          "allowed",
+          "allowed",
+          "allowed",
+          "allowed",
+          "blocked",
+          "classifier_parse_failure",
+          "classifier_parse_failure",
+          "allowed",
+          "blocked",
+          "deferred_required_edit",
+          "deferred_required_edit",
+          "allowed",
+          "blocked",
+          "blocked",
+          "blocked",
+          "allowed",
+          "blocked",
+          "classifier_protocol_failure",
+          "classifier_protocol_failure",
+          "allowed",
+          "blocked",
+          "sandbox_failure",
+          "sandbox_failure",
+          "allowed",
+          "blocked",
+          "gate_denied",
+          "gate_denied",
+          "allowed",
+          "blocked",
+          "blocked",
+          "blocked",
+          "allowed",
+          "blocked",
+          "classifier_timeout",
+          "classifier_timeout"
+        ]
+      },
+      "candidate_diff": {
+        "candidate_diff_oid": "5db3261f2b15fe2885883ea8b3c1000b4913441a",
+        "candidate_content_digest": "sha256:06a6becc2eb2d056680e9fa1405bf9e14857bf71ab1f4982c17195f2a430173e",
+        "diff_bytes": 79,
+        "changed_line_count": 2,
+        "git_object_linkage_process_observed": false
+      }
+    },
+    "checks": [
+      {
+        "axis": "malformed_tool_retention",
+        "passed": true,
+        "reason": "retained terminal inventory contains malformed-tool outcome"
+      },
+      {
+        "axis": "deferred_required_edit_detection",
+        "passed": true,
+        "reason": "retained terminal inventory contains deferred-required-edit outcome"
+      },
+      {
+        "axis": "trivial_or_empty_diff_avoidance",
+        "passed": true,
+        "reason": "candidate diff meets deterministic byte and changed-line minima, recomputed from blinded patch material"
+      },
+      {
+        "axis": "complete_terminal_outcome_retention",
+        "passed": true,
+        "reason": "retained terminal and failure counts match the expected inventory"
+      },
+      {
+        "axis": "held_out_boundary_preservation",
+        "passed": true,
+        "reason": "blinded held-out facts exactly project retained terminal observations"
+      },
+      {
+        "axis": "metric_manipulation",
+        "passed": true,
+        "reason": "held-out, grader-axis, and disagreement totals are internally recomputed"
+      }
+    ],
+    "all_mandatory_passed": true
+  },
+  "aggregation": {
+    "held_out_passed": 0,
+    "held_out_total": 2,
+    "grader_passed_axes": 9,
+    "grader_total_axes": 10,
+    "graders_unanimously_passed": false,
+    "anti_reward_hacking_passed": true,
+    "eligible_for_acceptance": false
+  },
+  "human_outcome": {
+    "label_schema_version": 1,
+    "outcome": "rejected",
+    "reason": "explicit synthetic human-label fixture reason",
+    "provenance": {
+      "labeler_id": "fixture-human-reviewer",
+      "authority": "issue-26-test-fixture",
+      "recorded_at": "deterministic-fixture-time",
+      "evidence": "deterministic_synthetic_fake_only",
+      "process_observed": false,
+      "eligible_for_production_default": false,
+      "evidence_material": "deterministic synthetic human-review fixture evidence; no reviewer process observed",
+      "evidence_digest": "sha256:85725082c6625d0c5a092a4bc088588b6c55baf4ceb92290f5b5b32b41eed5d6"
+    },
+    "resulting_candidate_validation_binding": null
+  },
+  "assignment_provenance": {
+    "version": 1,
+    "assignment": {
+      "assignment_id": "assignment-evaluation-26",
+      "assignment_digest": "sha256:cd1dc53ddcdf3659d077d4c28dd7a5e5329646e9a8154bf2b09f9ff5c4ab6bab",
+      "spec_fragments": [
+        {
+          "fragment_id": "spec-evaluation-26",
+          "fragment_digest": "sha256:691b52945998a2f1be5854c84d0d3003f42e1d242d37db27efc747399f696937"
+        }
+      ]
+    },
+    "candidate_validation_binding": {
+      "version": 1,
+      "agent_id": "issue-26-committed-fixture",
+      "primary_head": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
+      "agent_head": "3f85ca4c3cb7ee1b9eee884142177afd37d6f263",
+      "merge_base": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
+      "diff_oid": "5db3261f2b15fe2885883ea8b3c1000b4913441a"
+    },
+    "candidate_content_digest": "sha256:06a6becc2eb2d056680e9fa1405bf9e14857bf71ab1f4982c17195f2a430173e",
+    "auditor_verdict": {
+      "version": 1,
+      "verdict_id": "auditor-verdict-evaluation-26",
+      "auditor_id": "terminal-review-auditor",
+      "verdict": "approved",
+      "evidence": "deterministic_synthetic_fake_only",
+      "process_observed": false,
+      "git_object_linkage_process_observed": false,
+      "candidate_validation_binding": {
+        "version": 1,
+        "agent_id": "issue-26-committed-fixture",
+        "primary_head": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
+        "agent_head": "3f85ca4c3cb7ee1b9eee884142177afd37d6f263",
+        "merge_base": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
+        "diff_oid": "5db3261f2b15fe2885883ea8b3c1000b4913441a"
+      },
+      "blinded_input_digest": "sha256:0e90ce76a595927e84521634cf3994c14b5be588645a5c3935fe1fac2352177c",
+      "evidence_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888"
+    },
+    "outcome_event": {
+      "kind": "human_override",
+      "version": 1,
+      "event_id": "human-override-event-evaluation-26",
+      "evidence": "deterministic_synthetic_fake_only",
+      "process_observed": false,
+      "git_object_linkage_process_observed": false,
+      "assignment_id": "assignment-evaluation-26",
+      "auditor_verdict_id": "auditor-verdict-evaluation-26",
+      "auditor_verdict_digest": "sha256:5fc907dc5583a6b737aa11f65efdc19abbd74f17af165de5fdaffbfc09a6a883",
+      "candidate_validation_binding": {
+        "version": 1,
+        "agent_id": "issue-26-committed-fixture",
+        "primary_head": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
+        "agent_head": "3f85ca4c3cb7ee1b9eee884142177afd37d6f263",
+        "merge_base": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
+        "diff_oid": "5db3261f2b15fe2885883ea8b3c1000b4913441a"
+      },
+      "outcome": "rejected",
+      "authority": "issue-26-test-fixture",
+      "evidence_digest": "sha256:85725082c6625d0c5a092a4bc088588b6c55baf4ceb92290f5b5b32b41eed5d6",
+      "resulting_candidate_validation_binding": null
+    }
+  },
+  "binding_digest": "sha256:bf662965ae31b83edccb11536e98f0d21b2853f6b4a1f1b6595c796972dd3fcf"
+}
