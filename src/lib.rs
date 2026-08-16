@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod cli;
+mod git_repository;
 pub mod llm;
 pub mod merge;
 pub mod orchestrator;
