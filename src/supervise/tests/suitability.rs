@@ -119,11 +119,33 @@ fn relative_regular_files(root: &Path) -> Result<BTreeSet<PathBuf>> {
         .collect())
 }
 
+fn primary_worktree_byte_tree_without_git_or_refusal_artifacts(
+    repo: &Path,
+    run_id: &RunId,
+) -> Result<BTreeMap<PathBuf, ByteTreeEntry>> {
+    let run_relative = PathBuf::from(".maco/o2/runs").join(run_id.as_str());
+    let excluded_exact = BTreeSet::from([
+        PathBuf::from(".maco"),
+        PathBuf::from(".maco/o2"),
+        PathBuf::from(".maco/o2/runs"),
+        PathBuf::from(".maco/o2/runs/.runs.lock"),
+    ]);
+    let snapshot = snapshot_byte_tree(repo)?
+        .with_context(|| format!("primary worktree {} did not exist", repo.display()))?;
+    Ok(snapshot
+        .into_iter()
+        .filter(|(path, _)| {
+            !path.starts_with(".git")
+                && !excluded_exact.contains(path)
+                && !path.starts_with(&run_relative)
+        })
+        .collect())
+}
+
 #[test]
 fn parked_assignment_is_classified_before_claim_worktree_checkpoint_or_dispatch() {
     let (temp, repo) = injected_repository();
-    let loaded = parse_supervisor_plan_with_consultant(
-        &serde_json::to_string(&suitability_test_plan(
+    let plan_document = serde_json::to_string(&suitability_test_plan(
             json!([
                 {
                     "id": "parked-parent",
@@ -156,9 +178,7 @@ fn parked_assignment_is_classified_before_claim_worktree_checkpoint_or_dispatch(
             ]),
             3,
         ))
-        .expect("serialize parked suitability plan"),
-    )
-    .expect("parse parked suitability plan");
+        .expect("serialize parked suitability plan");
 
     let git = crate::git_repository::open(&repo).expect("open injected Git repository");
     let authenticated_state_root = git.commondir().join("maco/state");
@@ -188,10 +208,11 @@ fn parked_assignment_is_classified_before_claim_worktree_checkpoint_or_dispatch(
     let head_before = current_head_oid(&repo).expect("capture initial HEAD");
     let index_before = fs::read(git.path().join("index")).expect("capture initial index bytes");
     let readme_before = fs::read(repo.join("README.md")).expect("capture initial tracked file");
-    let primary_before = verified_whole_primary_snapshot_sha256(&repo)
-        .expect("capture initial whole-primary digest");
-
     let run_id = RunId::new("preclaim-suitability-parked").expect("valid run id");
+    let primary_worktree_before =
+        primary_worktree_byte_tree_without_git_or_refusal_artifacts(&repo, &run_id)
+            .expect("capture initial in-process primary byte tree");
+
     let run_root = repo.join(".maco/o2/runs").join(run_id.as_str());
     let checkpoint_run_root = authenticated_state_root
         .join(crate::state_journal::JOURNAL_ROOT_NAME)
@@ -225,39 +246,56 @@ fn parked_assignment_is_classified_before_claim_worktree_checkpoint_or_dispatch(
     set_before_scheduler_execution_state_initialization_hook(|| {
         panic!("a wholly non-admitted plan reached execution-state initialization")
     });
-    let runner_calls = AtomicUsize::new(0);
-    let mut runner = |_command: &ExternalAgentCommand, _review: bool| {
-        runner_calls.fetch_add(1, Ordering::SeqCst);
-        panic!("a parked assignment must never reach the child or auditor runner")
-    };
-    let report = run_loaded_supervisor_plan_with_runner(
-        loaded,
-        injected_options(&repo, temp.path(), run_id.as_str()),
-        &mut runner,
+    let options = injected_options(&repo, temp.path(), run_id.as_str());
+    fs::write(&options.plan_file, plan_document).expect("write production-boundary plan file");
+    let cascade = run_supervisor_plan_file_cascade_with_concurrency_policy(
+        options,
+        SupervisorConcurrencyPolicy::Auto,
     )
-    .expect("finalize parked suitability outcome");
+    .expect("finalize parked suitability outcome through the production cascade entrypoint");
+    let report = cascade.source_report;
     clear_before_scheduler_execution_state_initialization_hook();
 
     assert!(!report.success);
     assert!(report
         .next_safe_action
         .contains("assignment_suitability_outcomes"));
-    assert_eq!(runner_calls.load(Ordering::SeqCst), 0);
     let parked = report
         .assignment_suitability_outcomes
         .iter()
         .filter(|outcome| outcome.disposition == AssignmentSuitabilityDisposition::Parked)
         .collect::<Vec<_>>();
-    assert_eq!(parked.len(), 1);
-    assert_eq!(parked[0].assignment_id, "parked-parent");
+    assert_eq!(parked.len(), 2);
+    let parked_parent = parked
+        .iter()
+        .find(|outcome| outcome.assignment_id == "parked-parent")
+        .expect("parked parent outcome");
     assert_eq!(
-        parked[0].assessment_source,
+        parked_parent.assessment_source,
         AssignmentSuitabilityAssessmentSource::ExplicitAssignmentAuthority
     );
     assert_eq!(
-        parked[0].reasons,
+        parked_parent.reasons,
         vec![AssignmentSuitabilityReason::ClassificationUnclear]
     );
+    let suppressed_descendant = parked
+        .iter()
+        .find(|outcome| outcome.assignment_id == "suppressed-descendant")
+        .expect("dependency-suppressed descendant outcome");
+    assert_eq!(
+        suppressed_descendant.assessment_source,
+        AssignmentSuitabilityAssessmentSource::HistoricalCompatibilityDefault,
+        "the descriptive origin remains historical even though the validated hierarchy suppresses dispatch"
+    );
+    assert_eq!(
+        suppressed_descendant.reasons,
+        vec![AssignmentSuitabilityReason::AncestorNotAdmitted]
+    );
+    assert!(report.findings.iter().any(|finding| {
+        finding
+            .message
+            .contains("'suppressed-descendant' was dependency-suppressed")
+    }));
     let refused = report
         .assignment_suitability_outcomes
         .iter()
@@ -345,22 +383,32 @@ fn parked_assignment_is_classified_before_claim_worktree_checkpoint_or_dispatch(
         readme_before
     );
     assert_eq!(
-        verified_whole_primary_snapshot_sha256(&repo)
-            .expect("whole-primary digest after parked run"),
-        primary_before
+        primary_worktree_byte_tree_without_git_or_refusal_artifacts(&repo, &run_id)
+            .expect("capture final in-process primary byte tree"),
+        primary_worktree_before,
+        "the verified refusal changed the primary worktree outside the exact durable refusal artifacts"
     );
-
     let authenticator =
         repository_authenticator_key_only(&repo).expect("open checkpoint authenticator");
     let checkpoint =
         crate::state_journal::StateJournal::open_instance(authenticator, run_id.as_str())
             .expect("authenticate finalized checkpoint records");
-    assert!(!checkpoint.records().iter().any(|record| {
-        matches!(
-            record.phase.as_str(),
-            "assignment_started" | "child_dispatch_started" | "auditor_dispatch_started"
-        )
-    }));
+    assert_eq!(
+        checkpoint
+            .records()
+            .iter()
+            .map(|record| record.phase.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "supervise_prepared",
+            "scheduler_closed",
+            "final_report_planned",
+            "final_report_committed",
+            "artifact_finalization_started",
+            "artifact_finalized"
+        ],
+        "the verified refusal path must not add an execution-capable checkpoint phase"
+    );
     let scheduler_closed = checkpoint
         .records()
         .iter()
@@ -370,24 +418,82 @@ fn parked_assignment_is_classified_before_claim_worktree_checkpoint_or_dispatch(
         scheduler_closed.payload["pending_assignments"],
         json!([
             "parked-parent",
-            "suppressed-descendant",
-            "refused-duplicate"
+            "refused-duplicate",
+            "suppressed-descendant"
         ])
     );
 
-    let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
+    let _reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
         .expect("open parked run artifacts");
-    assert!(!reader.run_dir().join(ORCHESTRATION_EVENT_PATH).exists());
-    let artifact_files = relative_regular_files(&repo.join(".maco/o2/runs").join(run_id.as_str()))
+    let artifact_run_dir = repo.join(".maco/o2/runs").join(run_id.as_str());
+    assert!(!artifact_run_dir.join(ORCHESTRATION_EVENT_PATH).exists());
+    let artifact_files = relative_regular_files(&artifact_run_dir)
         .expect("snapshot finalized run-owned artifact files");
-    assert!(!artifact_files.iter().any(|path| {
-        let path = path.to_string_lossy();
-        path.contains("assignments/") && path.ends_with(".prompt.md")
-    }));
-    assert!(!artifact_files.iter().any(|path| {
-        let path = path.to_string_lossy();
-        path.starts_with("evidence/incoming/") && path.ends_with(".json")
-    }));
+    assert_eq!(
+        artifact_files,
+        BTreeSet::from([
+            PathBuf::from(".artifact.lock"),
+            PathBuf::from(".maco-artifact-final.json"),
+            PathBuf::from("reports/supervisor-final.json")
+        ]),
+        "the verified refusal path created an unexpected run-owned artifact"
+    );
+}
+
+#[test]
+fn refused_primary_target_uses_verified_refusal_capability_before_cleanliness_or_runtime() {
+    let (temp, repo) = injected_repository();
+    fs::write(
+        repo.join("README.md"),
+        "dirty primary state that cleanliness would reject\n",
+    )
+    .expect("dirty tracked primary file");
+    let mut plan_document = suitability_test_plan(
+        json!([{
+            "id": "refused-primary",
+            "assigned_paths": ["docs/refused.md"],
+            "suitability": {
+                "classification": "out_of_scope",
+                "bounded_scope": true,
+                "max_scope_paths": 1,
+                "verification_path": "supervisor_validation_floor",
+                "autonomous_completion": true,
+                "rationale": "the requested primary mutation lies outside approved scope"
+            }
+        }]),
+        2,
+    );
+    plan_document["execution_target"] = json!({
+        "kind": "primary_worktree",
+        "claim_paths": ["docs/refused.md"]
+    });
+    let options = injected_options(&repo, temp.path(), "refused-primary-target");
+    fs::write(
+        &options.plan_file,
+        serde_json::to_vec(&plan_document).expect("serialize refused primary plan"),
+    )
+    .expect("write refused primary plan file");
+    set_before_scheduler_execution_state_initialization_hook(|| {
+        panic!("verified primary-target refusal reached execution-state initialization")
+    });
+    let cascade =
+        run_supervisor_plan_file_cascade_with_concurrency_policy_and_primary_worktree_opt_in(
+            options,
+            SupervisorConcurrencyPolicy::Auto,
+            true,
+        )
+        .expect("verified refusal capability accepts a non-mutating primary target");
+    let report = cascade.source_report;
+    clear_before_scheduler_execution_state_initialization_hook();
+
+    assert!(!report.success);
+    assert_eq!(report.assignment_suitability_outcomes.len(), 1);
+    assert_eq!(
+        report.assignment_suitability_outcomes[0].reasons,
+        vec![AssignmentSuitabilityReason::ClassificationOutOfScope]
+    );
+    assert!(report.claim_tokens.is_empty());
+    assert!(report.orchestrator_reports.is_empty());
 }
 
 #[test]
@@ -422,14 +528,28 @@ fn suitability_legacy_default_recursive_roundtrip_and_bounds_are_strict() {
         .get("suitability_assessment_source")
         .is_none());
 
-    let (_planner_temp, planner_repo) = injected_repository();
-    let planned = supervisor_plan_and_consultant_from_goal_spec(
-        &planner_repo,
-        "Update the repository overview",
-        "- Update README.md with the bounded lifecycle note.",
-        None,
-    )
-    .expect("generate a goal/spec supervisor plan");
+    let planned_assignment = injected_assignment(false);
+    let planned_assignment_id = planned_assignment.id.clone();
+    let planned_plan = injected_plan(planned_assignment, 0);
+    let mut planned_assignment_metadata = AssignmentMetadata::new();
+    insert_generated_planner_suitability(
+        &mut planned_assignment_metadata,
+        planned_assignment_id.clone(),
+    );
+    let planned = LoadedSupervisorPlan {
+        plan: planned_plan,
+        consultant: SupervisorConsultantPlan::default(),
+        assignment_metadata: planned_assignment_metadata,
+        plan_metadata: SupervisorPlanMetadata {
+            assignment_schedule: vec![AssignmentScheduleEntry {
+                assignment_id: planned_assignment_id,
+                parent_assignment_id: None,
+                depth: MIN_SUPERVISOR_DEPTH,
+                flattened_index: 0,
+            }],
+            ..SupervisorPlanMetadata::default()
+        },
+    };
     assert!(!planned.plan.assignments.is_empty());
     assert!(planned
         .assignment_metadata
@@ -492,7 +612,6 @@ fn suitability_legacy_default_recursive_roundtrip_and_bounds_are_strict() {
         broad_outcome.disposition,
         AssignmentSuitabilityDisposition::Admitted
     );
-
     let configured_value = suitability_test_plan(
         json!([{
             "id": "root",
@@ -555,6 +674,26 @@ fn suitability_legacy_default_recursive_roundtrip_and_bounds_are_strict() {
             .suitability("child")
             .classification,
         AssignmentSuitabilityClassification::NeedsDecision
+    );
+    let plan_only_temp = tempfile::tempdir().expect("create plan-only compatibility tempdir");
+    let plan_only_path = plan_only_temp.path().join("configured-plan.json");
+    fs::write(
+        &plan_only_path,
+        serde_json::to_vec(&configured_value).expect("serialize plan-only compatibility input"),
+    )
+    .expect("write plan-only compatibility input");
+    let plan_only = load_supervisor_plan_file(&plan_only_path)
+        .expect("historical plan-only API remains readable");
+    let plan_only_json = serde_json::to_value(plan_only).expect("serialize plan-only model");
+    assert!(plan_only_json["assignments"]
+        .as_array()
+        .expect("plan-only assignments")
+        .iter()
+        .all(|assignment| {
+            assignment.get("suitability").is_none()
+                && assignment.get("suitability_assessment_source").is_none()
+        }),
+        "the documented plan-only API is intentionally lossy; normalized document APIs preserve descriptive suitability provenance"
     );
 
     for invalid in [0, MAX_SUPERVISOR_ASSIGNMENT_SCOPE_PATHS + 1] {

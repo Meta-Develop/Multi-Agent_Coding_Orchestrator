@@ -205,7 +205,8 @@ fn assignment_suitability_outcomes_schema_value() -> serde_json::Value {
                             "classification_unclear", "classification_needs_decision",
                             "classification_duplicate", "classification_invalid",
                             "classification_out_of_scope", "scope_not_bounded",
-                            "verification_path_missing", "autonomous_completion_not_viable"
+                            "verification_path_missing", "autonomous_completion_not_viable",
+                            "ancestor_not_admitted"
                         ]
                     }
                 },

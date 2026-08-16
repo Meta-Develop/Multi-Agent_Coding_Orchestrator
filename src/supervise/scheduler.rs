@@ -169,25 +169,90 @@ fn assignment_suitability_outcomes(
         .collect()
 }
 
-pub(super) fn supervisor_plan_is_wholly_non_admitted(loaded: &LoadedSupervisorPlan) -> bool {
-    let outcomes = assignment_suitability_outcomes(&loaded.plan, &loaded.assignment_metadata);
-    !outcomes.is_empty()
+fn apply_ancestor_suitability_suppression(
+    outcomes: &mut [AssignmentSuitabilityOutcome],
+    assignment_schedule: &[AssignmentScheduleEntry],
+) -> Result<()> {
+    if outcomes.len() != assignment_schedule.len() {
+        bail!("assignment suitability outcomes do not cover the validated schedule");
+    }
+    let indices = assignment_schedule
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.assignment_id.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    for (index, entry) in assignment_schedule.iter().enumerate() {
+        let Some(parent_assignment_id) = entry.parent_assignment_id.as_deref() else {
+            continue;
+        };
+        let parent_index = *indices.get(parent_assignment_id).with_context(|| {
+            format!("validated assignment schedule parent '{parent_assignment_id}' is missing")
+        })?;
+        if parent_index >= index {
+            bail!(
+                "validated assignment schedule parent '{parent_assignment_id}' does not precede child '{}'",
+                entry.assignment_id
+            );
+        }
+        if outcomes[parent_index].disposition != AssignmentSuitabilityDisposition::Admitted
+            && outcomes[index].disposition == AssignmentSuitabilityDisposition::Admitted
+        {
+            outcomes[index].disposition = AssignmentSuitabilityDisposition::Parked;
+            outcomes[index]
+                .reasons
+                .push(AssignmentSuitabilityReason::AncestorNotAdmitted);
+        }
+    }
+    Ok(())
+}
+
+fn effective_assignment_suitability_outcomes(
+    plan: &SupervisorPlan,
+    assignment_metadata: &AssignmentMetadata,
+    plan_metadata: &SupervisorPlanMetadata,
+) -> Result<Vec<AssignmentSuitabilityOutcome>> {
+    let mut outcomes = assignment_suitability_outcomes(plan, assignment_metadata);
+    let assignment_schedule = validated_scheduler_assignment_schedule(plan, plan_metadata)?;
+    apply_ancestor_suitability_suppression(&mut outcomes, &assignment_schedule)?;
+    Ok(outcomes)
+}
+
+pub(super) fn supervisor_plan_is_wholly_non_admitted(
+    loaded: &LoadedSupervisorPlan,
+) -> Result<bool> {
+    let outcomes = effective_assignment_suitability_outcomes(
+        &loaded.plan,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )?;
+    Ok(!outcomes.is_empty()
         && outcomes
             .iter()
-            .all(|outcome| outcome.disposition != AssignmentSuitabilityDisposition::Admitted)
+            .all(|outcome| outcome.disposition != AssignmentSuitabilityDisposition::Admitted))
 }
 
 fn non_admitted_suitability_execution_outcome(
     assignment: &OrchestratorAssignment,
     suitability: &AssignmentSuitabilityOutcome,
 ) -> AssignmentExecutionOutcome {
+    let message = if suitability
+        .reasons
+        .contains(&AssignmentSuitabilityReason::AncestorNotAdmitted)
+    {
+        format!(
+            "supervisor assignment '{}' was dependency-suppressed before dispatch because its validated hierarchy ancestor was not admitted",
+            assignment.id
+        )
+    } else {
+        format!(
+            "supervisor assignment '{}' was not dispatched by the pre-claim suitability gate ({:?})",
+            assignment.id, suitability.disposition
+        )
+    };
     AssignmentExecutionOutcome {
         findings: vec![Finding {
             severity: FindingSeverity::Error,
-            message: format!(
-                "supervisor assignment '{}' was not dispatched by the pre-claim suitability gate ({:?})",
-                assignment.id, suitability.disposition
-            ),
+            message,
             paths: assignment.assigned_paths.clone(),
         }],
         assignment_failed: true,
@@ -1799,19 +1864,31 @@ fn build_supervisor_final_report(
             paths: Vec::new(),
         });
     }
+    let (policy_input_observation, policy_input, policy_input_unavailable_reason) =
+        match serde_json::to_string(&admission_policy_input) {
+            Ok(serialized) => (
+                ProcessObservation::SchedulerObserved,
+                Some(serialized),
+                None,
+            ),
+            Err(error) => (
+                ProcessObservation::NotProcessObservable,
+                None,
+                Some(format!(
+                    "scheduler admission policy input could not be serialized: {error}"
+                )),
+            ),
+        };
     role_economics_profile.execution = Some(SupervisorExecutionMetadata {
         assignment_count: plan.assignments.len(),
         started_assignment_count: achieved_concurrency.started_assignment_count,
         completed_assignment_count: achieved_concurrency.completed_assignment_count,
         concurrency: SupervisorConcurrencyReport {
             configured_max_concurrent_children: max_concurrent_children,
-            policy_input_observation: ProcessObservation::SchedulerObserved,
-            policy_input: Some(
-                serde_json::to_string(&admission_policy_input)
-                    .expect("admission policy input is JSON serializable"),
-            ),
+            policy_input_observation,
+            policy_input,
             policy_input_details: Some(admission_policy_input),
-            policy_input_unavailable_reason: None,
+            policy_input_unavailable_reason,
             achieved_max_concurrent_children: achieved_concurrency.peak,
             achieved_mean_concurrent_children: achieved_concurrency.mean,
             achieved_mean_observation: if achieved_concurrency.mean.is_some() {
@@ -2386,6 +2463,7 @@ fn prepare_supervisor_run(
         _ => {}
     }
     match (worktree_creation, plan_metadata.execution_target.as_ref()) {
+        (SupervisorWorktreeCreation::SuitabilityRefusalOnly, _) => {}
         (
             SupervisorWorktreeCreation::PrimaryWorktree,
             Some(SupervisorExecutionTarget::PrimaryWorktree { .. }),
@@ -2692,8 +2770,11 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     runtime_model_catalog: RuntimeModelCatalogAcquisition,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
-    let assignment_suitability_outcomes =
-        assignment_suitability_outcomes(&loaded.plan, &loaded.assignment_metadata);
+    let assignment_suitability_outcomes = effective_assignment_suitability_outcomes(
+        &loaded.plan,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )?;
     #[cfg(test)]
     run_after_assignment_suitability_classification_hook(&assignment_suitability_outcomes);
     let wholly_non_admitted = !assignment_suitability_outcomes.is_empty()
@@ -3289,7 +3370,7 @@ pub(super) fn finalize_wholly_non_admitted_supervisor_plan(
     max_concurrent_children: usize,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
-    if !supervisor_plan_is_wholly_non_admitted(&loaded) {
+    if !supervisor_plan_is_wholly_non_admitted(&loaded)? {
         bail!("suitability refusal finalization requires a wholly non-admitted plan");
     }
     // The central runner returns before consuming this catalog placeholder.

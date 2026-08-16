@@ -11,6 +11,12 @@ fn validate_execution_target_pre_dispatch(
     )
 }
 
+/// Returns only the executable plan model.
+///
+/// Assignment suitability provenance and other document sidecar metadata are
+/// intentionally not represented by [`SupervisorPlan`]. Call
+/// [`supervisor_plan_document_from_task_file`] when that metadata must survive
+/// a parse/normalize round trip.
 pub fn supervisor_plan_from_task_file(
     repo: impl AsRef<Path>,
     task_file: impl AsRef<Path>,
@@ -18,6 +24,11 @@ pub fn supervisor_plan_from_task_file(
     Ok(supervisor_plan_and_consultant_from_task_file(repo, task_file)?.plan)
 }
 
+/// Returns only the executable plan model.
+///
+/// Generated suitability provenance and other document sidecar metadata are
+/// intentionally omitted. Use [`supervisor_plan_document_from_goal_spec`] for
+/// a normalized document that preserves them.
 pub fn supervisor_plan_from_goal_spec(
     repo: impl AsRef<Path>,
     goal: &str,
@@ -146,11 +157,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
             depth: MIN_SUPERVISOR_DEPTH,
             flattened_index: planning_index,
         });
-        assignment_metadata.insert_suitability(
-            planning_id.clone(),
-            AssignmentSuitabilityConfig::default(),
-            AssignmentSuitabilityAssessmentSource::GeneratedPlannerAuthority,
-        );
+        insert_generated_planner_suitability(&mut assignment_metadata, planning_id.clone());
 
         spec_fragment_ids_by_assignment
             .insert(assignment.id.clone(), assignment.fragment_ids.clone());
@@ -168,11 +175,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
             (assignment.id.clone(), worker.id.clone()),
             WorkerAssignmentMetadata::default(),
         );
-        assignment_metadata.insert_suitability(
-            assignment.id.clone(),
-            AssignmentSuitabilityConfig::default(),
-            AssignmentSuitabilityAssessmentSource::GeneratedPlannerAuthority,
-        );
+        insert_generated_planner_suitability(&mut assignment_metadata, assignment.id.clone());
         let execution_index = assignments.len();
         assignments.push(OrchestratorAssignment {
             id: assignment.id.clone(),
@@ -237,6 +240,24 @@ fn supervisor_plan_and_consultant_from_goal_spec(
     })
 }
 
+pub(super) fn insert_generated_planner_suitability(
+    assignment_metadata: &mut AssignmentMetadata,
+    assignment_id: String,
+) {
+    assignment_metadata.insert_suitability(
+        assignment_id,
+        AssignmentSuitabilityConfig::default(),
+        AssignmentSuitabilityAssessmentSource::GeneratedPlannerAuthority,
+    );
+}
+
+/// Loads only the executable plan model from a plan document.
+///
+/// This historical API has a deliberately lossy compatibility boundary:
+/// assignment-local suitability declarations and their descriptive provenance
+/// live in validated document sidecar metadata. Execution entrypoints use the
+/// complete internal document loader; callers that need normalized metadata
+/// should use [`supervisor_plan_document_from_task_file`].
 pub fn load_supervisor_plan_file(path: impl AsRef<Path>) -> Result<SupervisorPlan> {
     Ok(load_supervisor_plan_file_with_consultant(path)?.plan)
 }
@@ -1151,7 +1172,7 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_work
     validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
     let source_loaded = loaded.clone();
     let template = options.clone();
-    let source_report = if supervisor_plan_is_wholly_non_admitted(&loaded) {
+    let source_report = if supervisor_plan_is_wholly_non_admitted(&loaded)? {
         finalize_wholly_non_admitted_supervisor_plan(
             loaded,
             options,
@@ -1356,7 +1377,7 @@ fn run_supervisor_plan_file_cascade_with_gate(
     }
     let source_loaded = loaded.clone();
     let template = options.clone();
-    let wholly_non_admitted = supervisor_plan_is_wholly_non_admitted(&loaded);
+    let wholly_non_admitted = supervisor_plan_is_wholly_non_admitted(&loaded)?;
     let source_report = if wholly_non_admitted {
         finalize_wholly_non_admitted_supervisor_plan(
             loaded,
@@ -1429,7 +1450,7 @@ fn run_supervisor_goal_spec_with_max_concurrent_children(
     let repo = discover_repo_root(&options.repo)?;
     let loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
-    if supervisor_plan_is_wholly_non_admitted(&loaded) {
+    if supervisor_plan_is_wholly_non_admitted(&loaded)? {
         return finalize_wholly_non_admitted_supervisor_plan(
             loaded,
             options,
@@ -1764,7 +1785,7 @@ fn run_supervisor_plan_file_with_runner_and_max_concurrent_children(
     let repo = discover_repo_root(&options.repo)?;
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
-    if supervisor_plan_is_wholly_non_admitted(&loaded) {
+    if supervisor_plan_is_wholly_non_admitted(&loaded)? {
         return finalize_wholly_non_admitted_supervisor_plan(
             loaded,
             options,

@@ -1309,6 +1309,10 @@ pub enum AssignmentVerificationPath {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
+/// Descriptive origin metadata for a suitability assessment.
+///
+/// This label preserves parse/normalize provenance; it is not an authenticated
+/// credential and does not by itself authorize assignment admission.
 pub enum AssignmentSuitabilityAssessmentSource {
     #[default]
     HistoricalCompatibilityDefault,
@@ -1317,7 +1321,7 @@ pub enum AssignmentSuitabilityAssessmentSource {
     GeneratedFollowUpAuthority,
 }
 
-/// Strict assignment-local authority consumed by the pre-claim gate.
+/// Strict assignment-local declaration consumed by the pre-claim gate.
 ///
 /// Historical plans omit this object and receive the deliberate legacy-safe
 /// default: viable, bounded, autonomously completable, and verified through
@@ -1474,6 +1478,7 @@ pub enum AssignmentSuitabilityReason {
     ScopeNotBounded,
     VerificationPathMissing,
     AutonomousCompletionNotViable,
+    AncestorNotAdmitted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -2800,7 +2805,7 @@ fn run_supervisor_plan_file_with_runner(
     let repo = discover_repo_root(&options.repo)?;
     let serialized_runner = Mutex::new(external_runner);
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
-    if supervisor_plan_is_wholly_non_admitted(&loaded) {
+    if supervisor_plan_is_wholly_non_admitted(&loaded)? {
         return finalize_wholly_non_admitted_supervisor_plan(
             loaded,
             options,
