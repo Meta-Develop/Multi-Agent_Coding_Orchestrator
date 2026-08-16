@@ -6206,6 +6206,22 @@ fn build_sandbox_mount_checks(
 }
 
 #[cfg(target_os = "linux")]
+fn apply_systemd_capability_boundary(command: &mut Command, effective_uid: libc::uid_t) {
+    if effective_uid != 0 {
+        return;
+    }
+
+    // A root user manager has an independent privileged execution context, so the caller's
+    // dropped capability sets do not constrain the transient service it creates. Empty values
+    // reset both sets for the service itself. Do not ask an unprivileged user manager to perform
+    // these capability operations: otherwise-valid non-root services may fail during exec setup.
+    command.args([
+        "--property=CapabilityBoundingSet=",
+        "--property=AmbientCapabilities=",
+    ]);
+}
+
+#[cfg(target_os = "linux")]
 fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSystemdSandbox) {
     command.args([
         "--property=ProtectSystem=strict",
@@ -6325,10 +6341,26 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
 }
 
 #[cfg(target_os = "linux")]
+fn verify_systemd_capability_boundary(
+    properties: &BTreeMap<String, String>,
+    effective_uid: libc::uid_t,
+) -> std::io::Result<()> {
+    if effective_uid != 0 {
+        return Ok(());
+    }
+
+    for name in ["CapabilityBoundingSet", "AmbientCapabilities"] {
+        require_effective_property(properties, name, |value| value.is_empty(), "an empty set")?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn verify_systemd_sandbox_properties(
     sandbox: &ResolvedSystemdSandbox,
     properties: &BTreeMap<String, String>,
     runtime_dir: &Path,
+    effective_uid: libc::uid_t,
 ) -> std::io::Result<()> {
     for (name, expected) in [
         ("ProtectSystem", "strict"),
@@ -6356,6 +6388,7 @@ fn verify_systemd_sandbox_properties(
     ] {
         require_effective_property(properties, name, |value| value == expected, expected)?;
     }
+    verify_systemd_capability_boundary(properties, effective_uid)?;
     verify_system_call_error_number(property_value(properties, "SystemCallErrorNumber")?)?;
     require_effective_property(
         properties,
@@ -7152,6 +7185,7 @@ fn known_sensitive_socket_paths() -> Vec<PathBuf> {
 #[cfg(target_os = "linux")]
 struct SystemdUnit {
     _permit: SystemdUnitPermit,
+    client_effective_uid: libc::uid_t,
     systemd_run: PathBuf,
     systemctl: PathBuf,
     env_program: PathBuf,
@@ -7314,6 +7348,8 @@ impl SystemdUnit {
         }
         let client_runtime = trusted_linux_runtime_root()?;
         let permit = SystemdUnitPermit::acquire(&client_runtime, operation_deadline, cancellation)?;
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        let client_effective_uid = unsafe { libc::geteuid() };
         let systemd_run = find_trusted_unix_executable(
             "systemd-run",
             &[
@@ -7439,6 +7475,7 @@ impl SystemdUnit {
         let sandbox_report_path = runtime_dir.join("sandbox-mount-report");
         Ok(Self {
             _permit: permit,
+            client_effective_uid,
             systemd_run,
             systemctl,
             env_program,
@@ -7596,6 +7633,7 @@ impl SystemdUnit {
                 "--property=RuntimeMaxSec={}ms",
                 runtime_max.as_millis()
             ));
+        apply_systemd_capability_boundary(&mut command, self.client_effective_uid);
         if let Some(sandbox) = &sandbox {
             apply_systemd_sandbox_properties(&mut command, sandbox);
             command
@@ -7819,7 +7857,12 @@ impl SystemdUnit {
             &self.name,
             SYSTEMD_SANDBOX_SHOW_PROPERTIES,
         )?;
-        verify_systemd_sandbox_properties(sandbox, &properties, &self.runtime_dir)
+        verify_systemd_sandbox_properties(
+            sandbox,
+            &properties,
+            &self.runtime_dir,
+            self.client_effective_uid,
+        )
     }
 
     fn release_start_gate(
@@ -10937,6 +10980,71 @@ mod tests {
             128,
         );
         assert!(validate_process_spec_bounds(&spec).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn root_user_systemd_command_resets_capabilities_without_changing_nonroot_command() {
+        let mut root_command = Command::new("systemd-run");
+        apply_systemd_capability_boundary(&mut root_command, 0);
+        let root_arguments = root_command.get_args().collect::<Vec<_>>();
+        assert_eq!(
+            root_arguments,
+            [
+                OsStr::new("--property=CapabilityBoundingSet="),
+                OsStr::new("--property=AmbientCapabilities="),
+            ]
+        );
+
+        let mut nonroot_command = Command::new("systemd-run");
+        apply_systemd_capability_boundary(&mut nonroot_command, 1_000);
+        assert!(nonroot_command.get_args().next().is_none());
+
+        let sandbox = program_visibility_sandbox(Path::new("/workspace"));
+        apply_systemd_sandbox_properties(&mut root_command, &sandbox);
+        apply_systemd_sandbox_properties(&mut nonroot_command, &sandbox);
+        for command in [&root_command, &nonroot_command] {
+            assert_eq!(
+                command
+                    .get_args()
+                    .filter(|argument| {
+                        *argument == OsStr::new("--property=NoNewPrivileges=yes")
+                    })
+                    .count(),
+                1,
+                "NoNewPrivileges must remain universal and singular"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn root_user_systemd_capability_properties_fail_closed() {
+        let empty_properties = BTreeMap::from([
+            ("CapabilityBoundingSet".to_string(), String::new()),
+            ("AmbientCapabilities".to_string(), String::new()),
+        ]);
+        verify_systemd_capability_boundary(&empty_properties, 0)
+            .expect("empty root capability properties");
+
+        let mut retained_capability = empty_properties.clone();
+        retained_capability.insert(
+            "CapabilityBoundingSet".to_string(),
+            "cap_dac_override".to_string(),
+        );
+        assert!(verify_systemd_capability_boundary(&retained_capability, 0).is_err());
+
+        let mut retained_ambient = empty_properties.clone();
+        retained_ambient.insert("AmbientCapabilities".to_string(), "cap_net_raw".to_string());
+        assert!(verify_systemd_capability_boundary(&retained_ambient, 0).is_err());
+        assert!(verify_systemd_capability_boundary(
+            &BTreeMap::from([("CapabilityBoundingSet".to_string(), String::new())]),
+            0,
+        )
+        .is_err());
+
+        verify_systemd_capability_boundary(&BTreeMap::new(), 1_000)
+            .expect("non-root command keeps its existing effective-property contract");
     }
 
     #[cfg(target_os = "linux")]
