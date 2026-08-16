@@ -798,16 +798,17 @@ pub fn propose_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
         payload,
     )?;
     let provider_plan = parse_provider_task_plan(&response, "provider task decomposition")?;
-    let (mut proposal, provider_assignment_tree) = validated_provider_proposal(
-        fragments,
-        provider_plan,
-        &allowed_fragment_ids,
-        &files,
-        &semantic_inventory,
-        &[],
-        config,
-        "provider task decomposition",
-    )?;
+    let (mut proposal, provider_assignment_tree) =
+        validated_provider_proposal(ProviderProposalValidationInput {
+            fragments,
+            provider_plan,
+            allowed_fragment_ids: &allowed_fragment_ids,
+            files: &files,
+            semantic_inventory: &semantic_inventory,
+            completed_assignments: &[],
+            config,
+            operation: "provider task decomposition",
+        })?;
     append_provider_diagnostics(&mut proposal.diagnostics, &response, "initial proposal");
 
     Ok(TaskPlanningSession {
@@ -826,16 +827,31 @@ pub fn propose_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
 }
 
 #[cfg(test)]
+pub(crate) struct ValidatedProviderSessionTestInput<'a> {
+    pub(crate) fragments: Vec<TaskSpecFragment>,
+    pub(crate) provider_plan: ProviderRecursiveTaskPlan,
+    pub(crate) repository_paths: Vec<PathBuf>,
+    pub(crate) semantic_modules: BTreeSet<String>,
+    pub(crate) semantic_symbols: BTreeSet<String>,
+    pub(crate) provider_id: &'a str,
+    pub(crate) model: &'a str,
+    pub(crate) config: &'a ProviderPlanningConfig,
+}
+
+#[cfg(test)]
 pub(crate) fn validated_provider_session_for_test(
-    fragments: Vec<TaskSpecFragment>,
-    provider_plan: ProviderRecursiveTaskPlan,
-    repository_paths: Vec<PathBuf>,
-    semantic_modules: BTreeSet<String>,
-    semantic_symbols: BTreeSet<String>,
-    provider_id: &str,
-    model: &str,
-    config: &ProviderPlanningConfig,
+    input: ValidatedProviderSessionTestInput<'_>,
 ) -> Result<TaskPlanningSession> {
+    let ValidatedProviderSessionTestInput {
+        fragments,
+        provider_plan,
+        repository_paths,
+        semantic_modules,
+        semantic_symbols,
+        provider_id,
+        model,
+        config,
+    } = input;
     validate_provider_planning_config(config)?;
     if provider_id.is_empty() || model.is_empty() || model != config.model.trim() {
         anyhow::bail!("test provider planning authority is invalid");
@@ -844,19 +860,20 @@ pub(crate) fn validated_provider_session_for_test(
         .iter()
         .map(|fragment| fragment.id.clone())
         .collect::<BTreeSet<_>>();
-    let (proposal, provider_assignment_tree) = validated_provider_proposal(
-        fragments,
-        provider_plan,
-        &allowed_fragment_ids,
-        &repository_paths,
-        &ProviderSemanticInventory {
-            modules: semantic_modules,
-            symbols: semantic_symbols,
-        },
-        &[],
-        config,
-        "validated test provider task decomposition",
-    )?;
+    let (proposal, provider_assignment_tree) =
+        validated_provider_proposal(ProviderProposalValidationInput {
+            fragments,
+            provider_plan,
+            allowed_fragment_ids: &allowed_fragment_ids,
+            files: &repository_paths,
+            semantic_inventory: &ProviderSemanticInventory {
+                modules: semantic_modules,
+                symbols: semantic_symbols,
+            },
+            completed_assignments: &[],
+            config,
+            operation: "validated test provider task decomposition",
+        })?;
     Ok(TaskPlanningSession {
         session_id: crate::artifacts::state_auth::random_identifier()
             .context("failed to create test provider planning-session authority")?,
@@ -987,16 +1004,17 @@ pub(crate) fn replan_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
         payload,
     )?;
     let provider_plan = parse_provider_task_plan(&response, "provider task re-planning")?;
-    let (mut proposal, provider_assignment_tree) = validated_provider_proposal(
-        session.proposal.fragments.clone(),
-        provider_plan,
-        &allowed_fragment_ids,
-        &files,
-        &semantic_inventory,
-        &next_completed_assignments,
-        config,
-        "provider task re-planning",
-    )?;
+    let (mut proposal, provider_assignment_tree) =
+        validated_provider_proposal(ProviderProposalValidationInput {
+            fragments: session.proposal.fragments.clone(),
+            provider_plan,
+            allowed_fragment_ids: &allowed_fragment_ids,
+            files: &files,
+            semantic_inventory: &semantic_inventory,
+            completed_assignments: &next_completed_assignments,
+            config,
+            operation: "provider task re-planning",
+        })?;
     append_provider_diagnostics(
         &mut proposal.diagnostics,
         &response,
@@ -1210,16 +1228,30 @@ impl ProviderDescendantScope {
     }
 }
 
-fn validated_provider_proposal(
+struct ProviderProposalValidationInput<'a> {
     fragments: Vec<TaskSpecFragment>,
     provider_plan: ProviderRecursiveTaskPlan,
-    allowed_fragment_ids: &BTreeSet<String>,
-    files: &[PathBuf],
-    semantic_inventory: &ProviderSemanticInventory,
-    completed_assignments: &[TaskAssignmentProposal],
-    config: &ProviderPlanningConfig,
-    operation: &str,
+    allowed_fragment_ids: &'a BTreeSet<String>,
+    files: &'a [PathBuf],
+    semantic_inventory: &'a ProviderSemanticInventory,
+    completed_assignments: &'a [TaskAssignmentProposal],
+    config: &'a ProviderPlanningConfig,
+    operation: &'a str,
+}
+
+fn validated_provider_proposal(
+    input: ProviderProposalValidationInput<'_>,
 ) -> Result<(TaskDecompositionProposal, Vec<ProviderTaskAssignmentTree>)> {
+    let ProviderProposalValidationInput {
+        fragments,
+        provider_plan,
+        allowed_fragment_ids,
+        files,
+        semantic_inventory,
+        completed_assignments,
+        config,
+        operation,
+    } = input;
     if provider_plan.assignments.is_empty() {
         anyhow::bail!("{operation} returned no actionable assignments");
     }

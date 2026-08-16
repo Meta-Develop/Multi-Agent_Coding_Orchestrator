@@ -748,25 +748,27 @@ fn provider_feedback_requires_exact_authenticated_pre_dispatch_planning_binding(
         .with_max_child_assignments(1)
         .with_max_depth(1);
     let session = planning::validated_provider_session_for_test(
-        vec![planning::TaskSpecFragment {
-            id: "fragment-001".to_string(),
-            text: "Implement alpha.".to_string(),
-        }],
-        ProviderRecursiveTaskPlan {
-            assignments: vec![provider_planning_node(
-                "provider-alpha",
-                "Implement alpha.",
-                &["fragment-001"],
-                "src/alpha.rs",
-                Vec::new(),
-            )],
+        planning::ValidatedProviderSessionTestInput {
+            fragments: vec![planning::TaskSpecFragment {
+                id: "fragment-001".to_string(),
+                text: "Implement alpha.".to_string(),
+            }],
+            provider_plan: ProviderRecursiveTaskPlan {
+                assignments: vec![provider_planning_node(
+                    "provider-alpha",
+                    "Implement alpha.",
+                    &["fragment-001"],
+                    "src/alpha.rs",
+                    Vec::new(),
+                )],
+            },
+            repository_paths: vec![PathBuf::from("src/alpha.rs")],
+            semantic_modules: ["crate::alpha".to_string()].into_iter().collect(),
+            semantic_symbols: ["crate::alpha::alpha".to_string()].into_iter().collect(),
+            provider_id: "fake-planner",
+            model: "fake-model",
+            config: &config,
         },
-        vec![PathBuf::from("src/alpha.rs")],
-        ["crate::alpha".to_string()].into_iter().collect(),
-        ["crate::alpha::alpha".to_string()].into_iter().collect(),
-        "fake-planner",
-        "fake-model",
-        &config,
     )
     .expect("deterministically validated provider session");
     let run_id = RunId::new("provider-binding-timeline").expect("valid run id");
@@ -3510,9 +3512,17 @@ fn local_deterministic_fake_fallback_reaches_shared_supervisor_core_without_exte
     .expect("run deterministic fake fallback through the shared supervisor core");
 
     assert_eq!(invocations, 0);
-    assert!(report.success, "unexpected fake-core failure: {report:#?}");
+    assert!(!report.success);
     assert!(!report.publishable);
+    assert!(!report.accepted);
+    assert!(report.rejected);
+    assert_eq!(report.status, ReviewStatus::Failed);
     assert_eq!(report.commands_run.len(), 2);
+    assert!(report.commands_run.iter().all(|command| {
+        command.command.len() == 1
+            && command.command[0] == "maco-internal-deterministic-fake"
+            && command.status == ReviewStatus::Succeeded
+    }));
     assert_eq!(
         report
             .role_economics_profile
@@ -3520,6 +3530,16 @@ fn local_deterministic_fake_fallback_reaches_shared_supervisor_core_without_exte
             .map(|profile| profile.model_availability),
         Some(RoleModelAvailability::Unavailable)
     );
+    let child = report
+        .orchestrator_reports
+        .first()
+        .expect("shared core must retain the deterministic child report");
+    assert!(!child.accepted);
+    assert!(child.rejected);
+    assert_eq!(child.status, ReviewStatus::Failed);
+    assert!(child.findings.iter().any(|finding| finding
+        .message
+        .contains("no pre-auditor supervisor candidate binding")));
 }
 
 #[test]
