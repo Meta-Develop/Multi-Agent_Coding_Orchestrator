@@ -1360,6 +1360,176 @@ struct WorkerAssignmentMetadata {
     target_path: Option<PathBuf>,
 }
 
+pub const ASSIGNMENT_PHASE_MODEL_BINDINGS_NOTES_PREFIX: &str = "maco-phase-model-bindings-v1:";
+
+/// Typed payload carried by the assignment's existing optional `notes` seam.
+///
+/// The reserved prefix keeps ordinary legacy notes unchanged while allowing a
+/// strict, backward-compatible payload without adding fields to the ordinary
+/// plan structs. The payload is trusted only after exact worker-id and model
+/// selection validation; free-form task or note text is never classified.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentPhaseModelBindings {
+    pub workers: BTreeMap<String, WorkerPhaseModelBinding>,
+}
+
+pub fn assignment_phase_model_bindings_notes(
+    bindings: &AssignmentPhaseModelBindings,
+) -> Result<String> {
+    if bindings.workers.is_empty() {
+        bail!("assignment phase-model binding payload must name at least one worker");
+    }
+    let payload = serde_json::to_string(bindings)
+        .context("failed to serialize assignment phase-model bindings")?;
+    Ok(format!(
+        "{ASSIGNMENT_PHASE_MODEL_BINDINGS_NOTES_PREFIX}{payload}"
+    ))
+}
+
+/// One terminal Worker duty bound to an exact model selection and exact
+/// operands. Model capability is deliberately absent: only immutable built-in
+/// policy may classify a model slug.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerPhaseModelBinding {
+    pub model: String,
+    pub phase: OrchestrationPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mechanical_duty: Option<MechanicalTerminalDuty>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mechanical_operands: Option<MechanicalTerminalOperands>,
+}
+
+impl WorkerPhaseModelBinding {
+    fn validate_selected_model(&self, selected_model: Option<&str>) -> Result<()> {
+        if self.model.trim().is_empty() || self.model != self.model.trim() {
+            bail!("worker phase-model binding model must be non-empty and trimmed");
+        }
+        let selected_model = selected_model
+            .context("worker phase-model binding requires an explicit resolved Worker model")?;
+        if selected_model != self.model {
+            bail!(
+                "worker phase-model binding authorizes model '{}', but runtime selection resolved '{}'",
+                self.model,
+                selected_model
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_for_selected_model(
+        &self,
+        worker: &WorkerAssignment,
+        selected_model: Option<&str>,
+    ) -> Result<PhaseModelPolicyDecision> {
+        self.validate_selected_model(selected_model)?;
+        let selected_capability =
+            trusted_builtin_model_capability(&self.model).with_context(|| {
+                format!(
+                    "Worker model '{}' has no trusted built-in capability policy",
+                    self.model
+                )
+            })?;
+        let mut decision = validate_phase_model_binding(
+            AgentRole::Worker,
+            self.phase,
+            self.mechanical_duty,
+            selected_capability,
+        )?;
+        match (self.phase, self.mechanical_duty, &self.mechanical_operands) {
+            (OrchestrationPhase::MechanicalTerminal, Some(duty), Some(mechanical_operands)) => {
+                mechanical_operands.validate_for_worker(duty, worker)?;
+                decision.mechanical_operands = Some(mechanical_operands.clone());
+            }
+            (OrchestrationPhase::MechanicalTerminal, Some(_), None) => {
+                bail!("mechanical_terminal binding requires typed exact operands")
+            }
+            (_, _, Some(_)) => {
+                bail!("typed mechanical operands may only be bound to mechanical_terminal work")
+            }
+            (_, _, None) => {}
+        }
+        Ok(decision)
+    }
+}
+
+fn assignment_phase_model_bindings(
+    assignment: &OrchestratorAssignment,
+) -> Result<Option<AssignmentPhaseModelBindings>> {
+    let Some(notes) = assignment.notes.as_deref() else {
+        return Ok(None);
+    };
+    let Some(payload) = notes.strip_prefix(ASSIGNMENT_PHASE_MODEL_BINDINGS_NOTES_PREFIX) else {
+        return Ok(None);
+    };
+    if payload.is_empty() {
+        bail!("assignment phase-model binding payload is empty");
+    }
+    let bindings: AssignmentPhaseModelBindings = serde_json::from_str(payload)
+        .context("assignment phase-model binding payload is invalid")?;
+    if bindings.workers.is_empty() {
+        bail!("assignment phase-model binding payload must name at least one worker");
+    }
+    let mut worker_ids = BTreeSet::new();
+    for worker in &assignment.worker_assignments {
+        if !worker_ids.insert(worker.id.as_str()) {
+            bail!(
+                "assignment phase-model bindings cannot identify duplicate worker id '{}' one-to-one",
+                worker.id
+            );
+        }
+    }
+    for worker_id in bindings.workers.keys() {
+        if worker_id.trim().is_empty() || worker_id != worker_id.trim() {
+            bail!("assignment phase-model binding worker ids must be non-empty and trimmed");
+        }
+        if !worker_ids.contains(worker_id.as_str()) {
+            bail!(
+                "assignment phase-model binding names unknown worker '{}'",
+                worker_id
+            );
+        }
+    }
+    Ok(Some(bindings))
+}
+
+fn worker_phase_model_binding(
+    assignment: &OrchestratorAssignment,
+    worker: &WorkerAssignment,
+) -> Result<Option<WorkerPhaseModelBinding>> {
+    Ok(assignment_phase_model_bindings(assignment)?
+        .and_then(|bindings| bindings.workers.get(&worker.id).cloned()))
+}
+
+fn validate_worker_phase_model_selection(
+    _plan: &SupervisorPlan,
+    assignment: &OrchestratorAssignment,
+    worker: &WorkerAssignment,
+    selected_model: Option<&str>,
+) -> Result<Option<PhaseModelPolicyDecision>> {
+    let selected_capability = selected_model
+        .map(|model| {
+            trusted_builtin_model_capability(model).with_context(|| {
+                format!("Worker model '{model}' has no trusted built-in capability policy")
+            })
+        })
+        .transpose()?;
+    let Some(binding) = worker_phase_model_binding(assignment, worker)? else {
+        if selected_capability == Some(ModelCapabilityClass::WeakMechanical) {
+            bail!(
+                "Worker model '{}' is trusted only for weak_mechanical work, but worker '{}' has no authenticated mechanical phase-model binding",
+                selected_model.unwrap_or("<runtime default>"),
+                worker.id
+            );
+        }
+        return Ok(None);
+    };
+    binding
+        .validate_for_selected_model(worker, selected_model)
+        .map(Some)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OrchestratorAssignment {
     pub id: String,
@@ -1617,6 +1787,856 @@ pub enum AgentRole {
     Auditor,
 }
 
+/// Capability classes used by phase-aware model selection.
+///
+/// The ordering is intentional: policy callers may select a more capable
+/// model than required, but never a less capable one. `WeakMechanical` is not
+/// a general implementation tier; it is reserved for the enumerated terminal
+/// duties in [`MechanicalTerminalDuty`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCapabilityClass {
+    WeakMechanical,
+    GeneralJudgment,
+    CriticalJudgment,
+}
+
+/// Orchestration phases with materially different judgment requirements.
+///
+/// Running a preselected validation command is mechanical terminal execution;
+/// interpreting its outcome is `ValidationInterpretation`. Similarly, an
+/// exact replacement supplied by a stronger planner may be mechanical, while
+/// choosing or designing an implementation remains `Implementation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationPhase {
+    Discovery,
+    Triage,
+    Planning,
+    MechanicalTerminal,
+    Implementation,
+    ValidationInterpretation,
+    Merge,
+    GateClassification,
+    ReviewAcceptance,
+    Audit,
+}
+
+impl OrchestrationPhase {
+    pub const fn required_model_capability(self) -> ModelCapabilityClass {
+        match self {
+            Self::MechanicalTerminal => ModelCapabilityClass::WeakMechanical,
+            Self::Discovery
+            | Self::Triage
+            | Self::Planning
+            | Self::Implementation
+            | Self::ValidationInterpretation
+            | Self::Merge => ModelCapabilityClass::GeneralJudgment,
+            Self::GateClassification | Self::ReviewAcceptance | Self::Audit => {
+                ModelCapabilityClass::CriticalJudgment
+            }
+        }
+    }
+
+    pub const fn hard_excludes_weak_models(self) -> bool {
+        !matches!(self, Self::MechanicalTerminal)
+    }
+}
+
+/// Closed list of duties that a constrained weak-model profile may perform.
+///
+/// Each duty assumes that a stronger caller already supplied every input and
+/// decision. Ambiguity, unexpected output, or a need to choose a different
+/// operation must be escalated rather than resolved by the weak model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MechanicalTerminalDuty {
+    ApplyExplicitTextReplacement,
+    RunPreselectedCommand,
+    FormatPreselectedFiles,
+    EnumerateDeclaredArtifacts,
+    ValidateAgainstFixedSchema,
+}
+
+impl MechanicalTerminalDuty {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ApplyExplicitTextReplacement => "apply_explicit_text_replacement",
+            Self::RunPreselectedCommand => "run_preselected_command",
+            Self::FormatPreselectedFiles => "format_preselected_files",
+            Self::EnumerateDeclaredArtifacts => "enumerate_declared_artifacts",
+            Self::ValidateAgainstFixedSchema => "validate_against_fixed_schema",
+        }
+    }
+}
+
+/// Exact operands for the closed mechanical duty named by a Worker binding.
+///
+/// Commands are represented as argv rather than shell source, and every path
+/// is validated as canonical, repository-relative, and covered by the
+/// Worker's assigned paths before scheduler artifacts or prompts are created.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MechanicalTerminalOperands {
+    ApplyExplicitTextReplacement {
+        path: PathBuf,
+        expected_text: String,
+        replacement_text: String,
+    },
+    RunPreselectedCommand {
+        argv: Vec<String>,
+        working_directory: PathBuf,
+    },
+    FormatPreselectedFiles {
+        formatter_argv: Vec<String>,
+        paths: Vec<PathBuf>,
+    },
+    EnumerateDeclaredArtifacts {
+        paths: Vec<PathBuf>,
+    },
+    ValidateAgainstFixedSchema {
+        document_path: PathBuf,
+        schema_path: PathBuf,
+    },
+}
+
+impl MechanicalTerminalOperands {
+    const fn duty(&self) -> MechanicalTerminalDuty {
+        match self {
+            Self::ApplyExplicitTextReplacement { .. } => {
+                MechanicalTerminalDuty::ApplyExplicitTextReplacement
+            }
+            Self::RunPreselectedCommand { .. } => MechanicalTerminalDuty::RunPreselectedCommand,
+            Self::FormatPreselectedFiles { .. } => MechanicalTerminalDuty::FormatPreselectedFiles,
+            Self::EnumerateDeclaredArtifacts { .. } => {
+                MechanicalTerminalDuty::EnumerateDeclaredArtifacts
+            }
+            Self::ValidateAgainstFixedSchema { .. } => {
+                MechanicalTerminalDuty::ValidateAgainstFixedSchema
+            }
+        }
+    }
+
+    fn validate_for_worker(
+        &self,
+        duty: MechanicalTerminalDuty,
+        worker: &WorkerAssignment,
+    ) -> Result<()> {
+        if self.duty() != duty {
+            bail!(
+                "mechanical duty '{}' does not match typed operand kind '{}'",
+                duty.as_str(),
+                self.duty().as_str()
+            );
+        }
+        let validate_argv = |label: &str, argv: &[String]| -> Result<()> {
+            if argv.is_empty() {
+                bail!("{label} must contain an exact executable argv");
+            }
+            if argv[0].trim().is_empty() {
+                bail!("{label} executable argv[0] must be non-empty and trimmed");
+            }
+            if argv.iter().any(|argument| argument.contains('\0')) {
+                bail!("{label} must not contain NUL bytes");
+            }
+            Ok(())
+        };
+        let validate_path = |label: &str, path: &Path| -> Result<()> {
+            let normalized = normalize_repo_relative_path(path)
+                .with_context(|| format!("{label} is not repository-relative"))?;
+            if normalized.as_path() != path {
+                bail!("{label} must be canonical repository-relative path");
+            }
+            if !worker
+                .assigned_paths
+                .iter()
+                .any(|assigned| path == assigned || path.starts_with(assigned))
+            {
+                bail!(
+                    "{label} '{}' is outside worker '{}' assigned paths",
+                    path.display(),
+                    worker.id
+                );
+            }
+            Ok(())
+        };
+        let validate_paths = |label: &str, paths: &[PathBuf]| -> Result<()> {
+            if paths.is_empty() {
+                bail!("{label} must contain at least one exact path");
+            }
+            let mut unique = BTreeSet::new();
+            for path in paths {
+                validate_path(label, path)?;
+                if !unique.insert(path) {
+                    bail!("{label} contains duplicate path '{}'", path.display());
+                }
+            }
+            Ok(())
+        };
+
+        match self {
+            Self::ApplyExplicitTextReplacement {
+                path,
+                expected_text,
+                ..
+            } => {
+                validate_path("replacement path", path)?;
+                if expected_text.is_empty() {
+                    bail!("explicit text replacement requires non-empty expected text");
+                }
+            }
+            Self::RunPreselectedCommand {
+                argv,
+                working_directory,
+            } => {
+                validate_argv("preselected command", argv)?;
+                validate_path("preselected command working directory", working_directory)?;
+            }
+            Self::FormatPreselectedFiles {
+                formatter_argv,
+                paths,
+            } => {
+                validate_argv("preselected formatter", formatter_argv)?;
+                validate_paths("preselected format paths", paths)?;
+            }
+            Self::EnumerateDeclaredArtifacts { paths } => {
+                validate_paths("declared artifact paths", paths)?;
+            }
+            Self::ValidateAgainstFixedSchema {
+                document_path,
+                schema_path,
+            } => {
+                validate_path("fixed-schema document path", document_path)?;
+                validate_path("fixed schema path", schema_path)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Auditable result of a successful phase/model policy decision.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhaseModelPolicyDecision {
+    pub role: AgentRole,
+    pub phase: OrchestrationPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mechanical_duty: Option<MechanicalTerminalDuty>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mechanical_operands: Option<MechanicalTerminalOperands>,
+    pub selected_capability: ModelCapabilityClass,
+    pub required_capability: ModelCapabilityClass,
+    pub weak_model_permitted: bool,
+}
+
+/// Validate an explicit phase/model binding before dispatch or budget
+/// degradation.
+///
+/// Invalid weak-model bindings fail closed. In particular, even a nominally
+/// mechanical phase cannot weaken an orchestrator, gate classifier, or
+/// auditor; only a terminal worker with one enumerated mechanical duty is
+/// eligible. The separate phase argument prevents callers from treating all
+/// implementation or validation work as mechanical.
+pub fn validate_phase_model_binding(
+    role: AgentRole,
+    phase: OrchestrationPhase,
+    mechanical_duty: Option<MechanicalTerminalDuty>,
+    selected_capability: ModelCapabilityClass,
+) -> Result<PhaseModelPolicyDecision> {
+    match (phase, mechanical_duty) {
+        (OrchestrationPhase::MechanicalTerminal, None) => {
+            bail!("mechanical_terminal phase requires an enumerated mechanical duty")
+        }
+        (OrchestrationPhase::MechanicalTerminal, Some(_)) => {}
+        (_, Some(_)) => {
+            bail!("mechanical duties may only be bound to the mechanical_terminal phase")
+        }
+        (_, None) => {}
+    }
+
+    let phase_requirement = phase.required_model_capability();
+    let role_requirement = role.minimum_model_capability();
+    let required_capability = phase_requirement.max(role_requirement);
+    let weak_model_permitted = role == AgentRole::Worker
+        && phase == OrchestrationPhase::MechanicalTerminal
+        && mechanical_duty.is_some();
+
+    if selected_capability == ModelCapabilityClass::WeakMechanical && !weak_model_permitted {
+        bail!(
+            "weak-model binding is forbidden for role '{}' in phase '{}'; only enumerated mechanical terminal worker duties are eligible",
+            role.as_str(),
+            phase.as_str()
+        );
+    }
+    if selected_capability < required_capability {
+        bail!(
+            "model capability '{selected}' is below the '{required}' floor for role '{}' in phase '{}'",
+            role.as_str(),
+            phase.as_str(),
+            selected = selected_capability.as_str(),
+            required = required_capability.as_str(),
+        );
+    }
+
+    Ok(PhaseModelPolicyDecision {
+        role,
+        phase,
+        mechanical_duty,
+        mechanical_operands: None,
+        selected_capability,
+        required_capability,
+        weak_model_permitted,
+    })
+}
+
+/// Budget degradation uses the same fail-closed phase policy as initial model
+/// binding. This dedicated entry point makes it difficult for a scheduler to
+/// accidentally bypass the phase exclusions when choosing a cheaper tier.
+pub fn validate_budget_model_degradation(
+    role: AgentRole,
+    phase: OrchestrationPhase,
+    mechanical_duty: Option<MechanicalTerminalDuty>,
+    target_capability: ModelCapabilityClass,
+) -> Result<PhaseModelPolicyDecision> {
+    validate_phase_model_binding(role, phase, mechanical_duty, target_capability).with_context(
+        || {
+            format!(
+                "budget model degradation is not permitted for role '{}' in phase '{}'",
+                role.as_str(),
+                phase.as_str()
+            )
+        },
+    )
+}
+
+impl ModelCapabilityClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WeakMechanical => "weak_mechanical",
+            Self::GeneralJudgment => "general_judgment",
+            Self::CriticalJudgment => "critical_judgment",
+        }
+    }
+}
+
+/// Immutable capability policy for MACO's exact built-in model slugs.
+/// Availability catalogs and plan-authored metadata are intentionally not
+/// capability authorities; unknown custom slugs fail closed.
+pub fn trusted_builtin_model_capability(model: &str) -> Option<ModelCapabilityClass> {
+    match model {
+        FRONTIER_PROFILE_MODEL => Some(ModelCapabilityClass::CriticalJudgment),
+        BALANCED_PROFILE_MODEL => Some(ModelCapabilityClass::GeneralJudgment),
+        ECONOMY_PROFILE_MODEL => Some(ModelCapabilityClass::WeakMechanical),
+        _ => None,
+    }
+}
+
+fn validate_known_judgment_role_model(role: AgentRole, model: Option<&str>) -> Result<()> {
+    let Some(model) = model else {
+        bail!(
+            "role '{}' resolved without an authoritative trusted model identity; runtime-default model selection is not capability evidence",
+            role.as_str()
+        );
+    };
+    let capability = trusted_builtin_model_capability(model)
+        .with_context(|| format!("model '{model}' has no trusted built-in capability policy"))?;
+    let phase = match role {
+        AgentRole::Supervisor => OrchestrationPhase::Planning,
+        AgentRole::ChildOrchestrator => OrchestrationPhase::Implementation,
+        AgentRole::Worker => return Ok(()),
+        AgentRole::GateClassifier => OrchestrationPhase::GateClassification,
+        AgentRole::Auditor => OrchestrationPhase::Audit,
+    };
+    validate_phase_model_binding(role, phase, None, capability)
+        .map(|_| ())
+        .with_context(|| {
+            format!(
+                "built-in model '{}' does not satisfy role '{}' judgment floor",
+                model,
+                role.as_str()
+            )
+        })
+}
+
+impl OrchestrationPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovery => "discovery",
+            Self::Triage => "triage",
+            Self::Planning => "planning",
+            Self::MechanicalTerminal => "mechanical_terminal",
+            Self::Implementation => "implementation",
+            Self::ValidationInterpretation => "validation_interpretation",
+            Self::Merge => "merge",
+            Self::GateClassification => "gate_classification",
+            Self::ReviewAcceptance => "review_acceptance",
+            Self::Audit => "audit",
+        }
+    }
+}
+
+#[cfg(test)]
+mod phase_model_policy_tests {
+    use super::*;
+
+    fn worker_assignment_with_notes(notes: Option<String>) -> OrchestratorAssignment {
+        OrchestratorAssignment {
+            id: "child-a".to_string(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("src/lib.rs")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: vec![WorkerAssignment {
+                id: "worker-a".to_string(),
+                role: AgentRole::Worker,
+                assigned_paths: vec![PathBuf::from("src/lib.rs")],
+                semantic_symbols: Vec::new(),
+                semantic_modules: Vec::new(),
+                task: None,
+                environment_requirements: Vec::new(),
+                report_path: None,
+            }],
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes,
+        }
+    }
+
+    #[test]
+    fn assignment_notes_seam_round_trips_typed_phase_model_binding() {
+        let binding = WorkerPhaseModelBinding {
+            model: ECONOMY_PROFILE_MODEL.to_string(),
+            phase: OrchestrationPhase::MechanicalTerminal,
+            mechanical_duty: Some(MechanicalTerminalDuty::RunPreselectedCommand),
+            mechanical_operands: Some(MechanicalTerminalOperands::RunPreselectedCommand {
+                argv: vec!["cargo".to_string(), "check".to_string()],
+                working_directory: PathBuf::from("src"),
+            }),
+        };
+        let notes = assignment_phase_model_bindings_notes(&AssignmentPhaseModelBindings {
+            workers: BTreeMap::from([("worker-a".to_string(), binding.clone())]),
+        })
+        .expect("serialize phase-model binding notes");
+        let assignment = worker_assignment_with_notes(Some(notes));
+        assert_eq!(
+            worker_phase_model_binding(&assignment, &assignment.worker_assignments[0])
+                .expect("parse phase-model binding"),
+            Some(binding)
+        );
+
+        let legacy = worker_assignment_with_notes(Some("ordinary legacy note".to_string()));
+        assert!(
+            worker_phase_model_binding(&legacy, &legacy.worker_assignments[0])
+                .expect("legacy notes remain valid")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn assignment_notes_seam_rejects_unknown_worker_binding() {
+        let notes = assignment_phase_model_bindings_notes(&AssignmentPhaseModelBindings {
+            workers: BTreeMap::from([(
+                "unknown-worker".to_string(),
+                WorkerPhaseModelBinding {
+                    model: ECONOMY_PROFILE_MODEL.to_string(),
+                    phase: OrchestrationPhase::MechanicalTerminal,
+                    mechanical_duty: Some(MechanicalTerminalDuty::FormatPreselectedFiles),
+                    mechanical_operands: Some(MechanicalTerminalOperands::FormatPreselectedFiles {
+                        formatter_argv: vec!["rustfmt".to_string()],
+                        paths: vec![PathBuf::from("src/lib.rs")],
+                    }),
+                },
+            )]),
+        })
+        .expect("serialize unknown-worker fixture");
+        let assignment = worker_assignment_with_notes(Some(notes));
+        let error = worker_phase_model_binding(&assignment, &assignment.worker_assignments[0])
+            .expect_err("unknown worker binding must fail closed");
+        assert!(error.to_string().contains("unknown worker"));
+    }
+
+    #[test]
+    fn assignment_notes_seam_rejects_duplicate_assignment_worker_ids() {
+        let notes = assignment_phase_model_bindings_notes(&AssignmentPhaseModelBindings {
+            workers: BTreeMap::from([(
+                "worker-a".to_string(),
+                WorkerPhaseModelBinding {
+                    model: ECONOMY_PROFILE_MODEL.to_string(),
+                    phase: OrchestrationPhase::MechanicalTerminal,
+                    mechanical_duty: Some(MechanicalTerminalDuty::RunPreselectedCommand),
+                    mechanical_operands: Some(MechanicalTerminalOperands::RunPreselectedCommand {
+                        argv: vec!["cargo".to_string(), "check".to_string()],
+                        working_directory: PathBuf::from("src"),
+                    }),
+                },
+            )]),
+        })
+        .expect("serialize duplicate-worker fixture");
+        let mut assignment = worker_assignment_with_notes(Some(notes));
+        assignment
+            .worker_assignments
+            .push(assignment.worker_assignments[0].clone());
+
+        let error = worker_phase_model_binding(&assignment, &assignment.worker_assignments[0])
+            .expect_err("duplicate assignment worker ids must fail closed");
+        assert!(error.to_string().contains("duplicate worker id 'worker-a'"));
+    }
+
+    #[test]
+    fn shared_weak_worker_model_requires_every_worker_to_be_mechanically_bound() {
+        let mut assignment = worker_assignment_with_notes(None);
+        let mut unbound_worker = assignment.worker_assignments[0].clone();
+        unbound_worker.id = "worker-unbound".to_string();
+        assignment.worker_assignments.push(unbound_worker.clone());
+        assignment.notes = Some(
+            assignment_phase_model_bindings_notes(&AssignmentPhaseModelBindings {
+                workers: BTreeMap::from([(
+                    "worker-a".to_string(),
+                    WorkerPhaseModelBinding {
+                        model: ECONOMY_PROFILE_MODEL.to_string(),
+                        phase: OrchestrationPhase::MechanicalTerminal,
+                        mechanical_duty: Some(MechanicalTerminalDuty::RunPreselectedCommand),
+                        mechanical_operands: Some(
+                            MechanicalTerminalOperands::RunPreselectedCommand {
+                                argv: vec!["cargo".to_string(), "check".to_string()],
+                                working_directory: PathBuf::from("src"),
+                            },
+                        ),
+                    },
+                )]),
+            })
+            .expect("serialize shared weak model fixture"),
+        );
+        let plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "shared weak Worker model".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 60,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+        let error = validate_worker_phase_model_selection(
+            &plan,
+            &assignment,
+            &unbound_worker,
+            Some(ECONOMY_PROFILE_MODEL),
+        )
+        .expect_err("shared weak Worker model must not reach an unbound Worker");
+        assert!(error
+            .to_string()
+            .contains("has no authenticated mechanical phase-model binding"));
+    }
+
+    #[test]
+    fn unknown_worker_model_cannot_gain_capability_from_binding_metadata() {
+        let mut assignment = worker_assignment_with_notes(None);
+        assignment.notes = Some(
+            assignment_phase_model_bindings_notes(&AssignmentPhaseModelBindings {
+                workers: BTreeMap::from([(
+                    "worker-a".to_string(),
+                    WorkerPhaseModelBinding {
+                        model: "custom-unknown-model".to_string(),
+                        phase: OrchestrationPhase::MechanicalTerminal,
+                        mechanical_duty: Some(MechanicalTerminalDuty::RunPreselectedCommand),
+                        mechanical_operands: Some(
+                            MechanicalTerminalOperands::RunPreselectedCommand {
+                                argv: vec!["cargo".to_string(), "check".to_string()],
+                                working_directory: PathBuf::from("src"),
+                            },
+                        ),
+                    },
+                )]),
+            })
+            .expect("serialize unknown-model fixture"),
+        );
+        let plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "unknown Worker model".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 60,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+
+        let error = validate_worker_phase_model_selection(
+            &plan,
+            &assignment,
+            &assignment.worker_assignments[0],
+            Some("custom-unknown-model"),
+        )
+        .expect_err("assignment metadata must not classify an unknown model");
+        assert!(error
+            .to_string()
+            .contains("no trusted built-in capability policy"));
+    }
+
+    #[test]
+    fn economy_worker_binding_requires_exact_typed_operands() {
+        let mut assignment = worker_assignment_with_notes(None);
+        assignment.notes = Some(
+            assignment_phase_model_bindings_notes(&AssignmentPhaseModelBindings {
+                workers: BTreeMap::from([(
+                    "worker-a".to_string(),
+                    WorkerPhaseModelBinding {
+                        model: ECONOMY_PROFILE_MODEL.to_string(),
+                        phase: OrchestrationPhase::MechanicalTerminal,
+                        mechanical_duty: Some(MechanicalTerminalDuty::RunPreselectedCommand),
+                        mechanical_operands: None,
+                    },
+                )]),
+            })
+            .expect("serialize missing-operands fixture"),
+        );
+        let plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "missing mechanical operands".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 60,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+
+        let error = validate_worker_phase_model_selection(
+            &plan,
+            &assignment,
+            &assignment.worker_assignments[0],
+            Some(ECONOMY_PROFILE_MODEL),
+        )
+        .expect_err("weak binding without exact operands must fail closed");
+        assert!(error.to_string().contains("requires typed exact operands"));
+    }
+
+    #[test]
+    fn mechanical_operands_reject_empty_executable_out_of_scope_and_duplicate_paths() {
+        let assignment = worker_assignment_with_notes(None);
+        let worker = &assignment.worker_assignments[0];
+        let empty_executable = MechanicalTerminalOperands::RunPreselectedCommand {
+            argv: vec!["  ".to_string(), "check".to_string()],
+            working_directory: PathBuf::from("src"),
+        }
+        .validate_for_worker(MechanicalTerminalDuty::RunPreselectedCommand, worker)
+        .expect_err("empty argv[0] must fail closed");
+        assert!(empty_executable.to_string().contains("argv[0]"));
+
+        let out_of_scope = MechanicalTerminalOperands::EnumerateDeclaredArtifacts {
+            paths: vec![PathBuf::from("tests/outside.txt")],
+        }
+        .validate_for_worker(MechanicalTerminalDuty::EnumerateDeclaredArtifacts, worker)
+        .expect_err("mechanical paths outside Worker scope must fail closed");
+        assert!(out_of_scope
+            .to_string()
+            .contains("outside worker 'worker-a'"));
+
+        let duplicate_paths = MechanicalTerminalOperands::FormatPreselectedFiles {
+            formatter_argv: vec!["rustfmt".to_string()],
+            paths: vec![PathBuf::from("src/lib.rs"), PathBuf::from("src/lib.rs")],
+        }
+        .validate_for_worker(MechanicalTerminalDuty::FormatPreselectedFiles, worker)
+        .expect_err("duplicate mechanical paths must fail closed");
+        assert!(duplicate_paths.to_string().contains("duplicate path"));
+    }
+
+    #[test]
+    fn phase_taxonomy_keeps_judgment_and_acceptance_out_of_weak_tier() {
+        let general_judgment = [
+            OrchestrationPhase::Discovery,
+            OrchestrationPhase::Triage,
+            OrchestrationPhase::Planning,
+            OrchestrationPhase::Implementation,
+            OrchestrationPhase::ValidationInterpretation,
+            OrchestrationPhase::Merge,
+        ];
+        for phase in general_judgment {
+            assert!(phase.hard_excludes_weak_models());
+            assert_eq!(
+                phase.required_model_capability(),
+                ModelCapabilityClass::GeneralJudgment
+            );
+        }
+
+        for phase in [
+            OrchestrationPhase::GateClassification,
+            OrchestrationPhase::ReviewAcceptance,
+            OrchestrationPhase::Audit,
+        ] {
+            assert!(phase.hard_excludes_weak_models());
+            assert_eq!(
+                phase.required_model_capability(),
+                ModelCapabilityClass::CriticalJudgment
+            );
+        }
+    }
+
+    #[test]
+    fn weak_tier_requires_terminal_worker_and_enumerated_mechanical_duty() {
+        let duty = Some(MechanicalTerminalDuty::RunPreselectedCommand);
+        let accepted = validate_phase_model_binding(
+            AgentRole::Worker,
+            OrchestrationPhase::MechanicalTerminal,
+            duty,
+            ModelCapabilityClass::WeakMechanical,
+        )
+        .expect("enumerated mechanical terminal worker duty should be eligible");
+        assert!(accepted.weak_model_permitted);
+        assert_eq!(
+            accepted.required_capability,
+            ModelCapabilityClass::WeakMechanical
+        );
+
+        let missing_duty = validate_phase_model_binding(
+            AgentRole::Worker,
+            OrchestrationPhase::MechanicalTerminal,
+            None,
+            ModelCapabilityClass::WeakMechanical,
+        )
+        .expect_err("unclassified mechanical work must fail closed");
+        assert!(missing_duty
+            .to_string()
+            .contains("requires an enumerated mechanical duty"));
+
+        for role in [
+            AgentRole::Supervisor,
+            AgentRole::ChildOrchestrator,
+            AgentRole::GateClassifier,
+            AgentRole::Auditor,
+        ] {
+            let error = validate_phase_model_binding(
+                role,
+                OrchestrationPhase::MechanicalTerminal,
+                duty,
+                ModelCapabilityClass::WeakMechanical,
+            )
+            .expect_err("non-worker roles must retain their model capability floor");
+            assert!(error
+                .to_string()
+                .contains("weak-model binding is forbidden"));
+        }
+    }
+
+    #[test]
+    fn budget_degradation_reuses_hard_phase_exclusions() {
+        for phase in [
+            OrchestrationPhase::Discovery,
+            OrchestrationPhase::Triage,
+            OrchestrationPhase::Implementation,
+            OrchestrationPhase::Merge,
+            OrchestrationPhase::ReviewAcceptance,
+        ] {
+            let error = validate_budget_model_degradation(
+                AgentRole::Worker,
+                phase,
+                None,
+                ModelCapabilityClass::WeakMechanical,
+            )
+            .expect_err("judgment-heavy phases must not budget-degrade to weak models");
+            assert!(error
+                .to_string()
+                .contains("budget model degradation is not permitted"));
+        }
+
+        let accepted = validate_budget_model_degradation(
+            AgentRole::Worker,
+            OrchestrationPhase::MechanicalTerminal,
+            Some(MechanicalTerminalDuty::ValidateAgainstFixedSchema),
+            ModelCapabilityClass::WeakMechanical,
+        )
+        .expect("fixed-schema validation is an enumerated mechanical duty");
+        assert!(accepted.weak_model_permitted);
+    }
+
+    #[test]
+    fn gate_and_auditor_bindings_retain_critical_capability_floor() {
+        for (role, phase) in [
+            (
+                AgentRole::GateClassifier,
+                OrchestrationPhase::GateClassification,
+            ),
+            (AgentRole::Auditor, OrchestrationPhase::Audit),
+        ] {
+            let error = validate_phase_model_binding(
+                role,
+                phase,
+                None,
+                ModelCapabilityClass::GeneralJudgment,
+            )
+            .expect_err("critical gate and auditor floors must reject general models");
+            assert!(error.to_string().contains("critical_judgment"));
+
+            let accepted = validate_phase_model_binding(
+                role,
+                phase,
+                None,
+                ModelCapabilityClass::CriticalJudgment,
+            )
+            .expect("critical model should satisfy gate and auditor floors");
+            assert_eq!(
+                accepted.required_capability,
+                ModelCapabilityClass::CriticalJudgment
+            );
+        }
+    }
+
+    #[test]
+    fn built_in_profile_models_cannot_cross_judgment_floors() {
+        assert_eq!(
+            trusted_builtin_model_capability(ECONOMY_PROFILE_MODEL),
+            Some(ModelCapabilityClass::WeakMechanical)
+        );
+        validate_known_judgment_role_model(
+            AgentRole::ChildOrchestrator,
+            Some(ECONOMY_PROFILE_MODEL),
+        )
+        .expect_err("economy model must not bind child implementation judgment");
+        validate_known_judgment_role_model(AgentRole::Auditor, Some(BALANCED_PROFILE_MODEL))
+            .expect_err("balanced model must not cross the auditor critical floor");
+        validate_known_judgment_role_model(AgentRole::Auditor, Some(FRONTIER_PROFILE_MODEL))
+            .expect("frontier model satisfies the auditor critical floor");
+        let runtime_default =
+            validate_known_judgment_role_model(AgentRole::ChildOrchestrator, None)
+                .expect_err("runtime-default identity must not satisfy judgment capability policy");
+        assert!(runtime_default
+            .to_string()
+            .contains("runtime-default model selection is not capability evidence"));
+        for role in [
+            AgentRole::Supervisor,
+            AgentRole::ChildOrchestrator,
+            AgentRole::GateClassifier,
+            AgentRole::Auditor,
+        ] {
+            let unknown = validate_known_judgment_role_model(role, Some("custom-unknown-model"))
+                .expect_err("unknown custom judgment model must fail closed");
+            assert!(unknown
+                .to_string()
+                .contains("no trusted built-in capability policy"));
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
@@ -1737,6 +2757,14 @@ impl AgentRole {
             Self::Worker => "worker",
             Self::GateClassifier => "gate_classifier",
             Self::Auditor => "auditor",
+        }
+    }
+
+    const fn minimum_model_capability(self) -> ModelCapabilityClass {
+        match self {
+            Self::Supervisor | Self::ChildOrchestrator => ModelCapabilityClass::GeneralJudgment,
+            Self::Worker => ModelCapabilityClass::WeakMechanical,
+            Self::GateClassifier | Self::Auditor => ModelCapabilityClass::CriticalJudgment,
         }
     }
 

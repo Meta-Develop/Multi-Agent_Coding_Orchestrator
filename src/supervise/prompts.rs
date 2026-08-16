@@ -259,6 +259,48 @@ Rules:
     )
 }
 
+pub const CONSTRAINED_WEAK_MODEL_PROFILE_NAME: &str = "constrained-mechanical-terminal-v1";
+
+/// Render the additional instruction profile required for a weak-model
+/// terminal worker.
+///
+/// The phase policy is checked before any text is returned, so callers cannot
+/// reuse this profile to authorize discovery, triage, general implementation,
+/// merge, gate, audit, or review-acceptance work. Stronger planning must have
+/// already reduced the task to one enumerated deterministic duty.
+pub fn constrained_weak_model_instruction_profile(
+    phase: OrchestrationPhase,
+    duty: Option<MechanicalTerminalDuty>,
+) -> Result<String> {
+    let decision = validate_phase_model_binding(
+        AgentRole::Worker,
+        phase,
+        duty,
+        ModelCapabilityClass::WeakMechanical,
+    )?;
+    let duty = decision
+        .mechanical_duty
+        .context("validated weak-model policy decision omitted its mechanical duty")?;
+    Ok(format!(
+        r#"WEAK_MODEL_INSTRUCTION_PROFILE: {profile_name}
+MODEL_CAPABILITY: weak_mechanical
+ORCHESTRATION_PHASE: mechanical_terminal
+MECHANICAL_DUTY: {duty}
+
+Constrained execution contract:
+- Perform only the named mechanical duty using the exact paths, inputs, command, replacement, or schema supplied by the stronger parent.
+- Do not discover scope, requirements, architecture, or additional work.
+- Do not triage, prioritize, diagnose ambiguous failures, choose an implementation, or interpret validation results.
+- Do not merge, rebase, commit, resolve conflicts, classify a gate, audit evidence, approve work, or make a review-acceptance decision.
+- Do not broaden the task, substitute inputs or commands, or treat general implementation as mechanical execution.
+- If any required input is absent, ambiguous, inconsistent, or produces unexpected output or changes, stop without guessing, preserve the evidence, and escalate to the stronger parent.
+- Report only commands and changes directly observed. Nested worker token, cost, and process usage are not independently process-observable unless the runtime supplies role-tagged evidence; otherwise report them as unavailable.
+"#,
+        profile_name = CONSTRAINED_WEAK_MODEL_PROFILE_NAME,
+        duty = duty.as_str(),
+    ))
+}
+
 fn child_cacheable_prefix_for_target(
     execution_target: Option<&SupervisorExecutionTarget>,
 ) -> String {
@@ -568,6 +610,8 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
         assignment_metadata,
     )?)
     .context("failed to serialize orchestrator assignment")?;
+    assignment_phase_model_bindings(assignment)
+        .context("orchestrator assignment phase-model metadata is invalid")?;
     let worker_prompt_renders = assignment
         .worker_assignments
         .iter()
@@ -821,6 +865,33 @@ pub(super) fn worker_prompt_with_field_guide(
     let task = worker_task(plan, orchestrator, worker);
     let journal_path = incoming_root.join(worker_execution_journal_incoming_relative(worker));
     let (worker_model, worker_reasoning_effort) = role_model_selection(plan, AgentRole::Worker);
+    let phase_model_decision = validated_worker_phase_model_decision(plan, orchestrator, worker)?;
+    let (orchestration_phase, model_capability, mechanical_duty) = phase_model_decision
+        .as_ref()
+        .map(|decision| {
+            (
+                decision.phase.as_str(),
+                decision.selected_capability.as_str(),
+                decision
+                    .mechanical_duty
+                    .map(MechanicalTerminalDuty::as_str)
+                    .unwrap_or("<none>"),
+            )
+        })
+        .unwrap_or(("<unbound>", "<unbound>", "<none>"));
+    let mechanical_operands = phase_model_decision
+        .as_ref()
+        .and_then(|decision| decision.mechanical_operands.as_ref())
+        .map(serde_json::to_string)
+        .transpose()
+        .context("failed to serialize validated mechanical operands")?
+        .unwrap_or_else(|| "<none>".to_string());
+    let weak_model_profile = match phase_model_decision {
+        Some(decision) if decision.selected_capability == ModelCapabilityClass::WeakMechanical => {
+            constrained_weak_model_instruction_profile(decision.phase, decision.mechanical_duty)?
+        }
+        Some(_) | None => String::new(),
+    };
     Ok(format!(
         r#"{cacheable_prefix}{role_prefix}{field_guide_section}
 
@@ -839,7 +910,12 @@ Assignment-specific context:
 Declared role selection:
 - Worker model: {worker_model}
 - Worker reasoning effort: {worker_reasoning_effort}
+- Orchestration phase: {orchestration_phase}
+- Model capability: {model_capability}
+- Mechanical duty: {mechanical_duty}
+- Mechanical operands: {mechanical_operands}
 - These values are declarative nested-worker context. MACO does not launch a separate worker process, so worker usage remains unavailable until runtime-side role-tagged usage reporting exists.
+{weak_model_profile}
 
 - Use the worker report schema path: {schema_path}
 
@@ -874,6 +950,11 @@ Worker assignment JSON:
         worker_reasoning_effort = worker_reasoning_effort
             .as_deref()
             .unwrap_or("<runtime default>"),
+        orchestration_phase = orchestration_phase,
+        model_capability = model_capability,
+        mechanical_duty = mechanical_duty,
+        mechanical_operands = mechanical_operands,
+        weak_model_profile = weak_model_profile,
         schema_path = schema_path.display(),
         task = task,
         worker_json = worker_json,
@@ -1158,6 +1239,16 @@ fn role_model_selection(
     (selection.model, selection.reasoning_effort)
 }
 
+fn validated_worker_phase_model_decision(
+    plan: &SupervisorPlan,
+    assignment: &OrchestratorAssignment,
+    worker: &WorkerAssignment,
+) -> Result<Option<PhaseModelPolicyDecision>> {
+    let selection = effective_role_model_selection(plan, AgentRole::Worker);
+    validate_worker_phase_model_selection(plan, assignment, worker, selection.model.as_deref())
+        .with_context(|| format!("worker '{}' phase-model binding is invalid", worker.id))
+}
+
 pub(super) fn provisional_default_role_model_selection(role: AgentRole) -> RoleModelSelection {
     let (reasoning_effort, budget_degrade_models, on_exhausted) = match role {
         AgentRole::Supervisor => (
@@ -1245,6 +1336,9 @@ pub(super) fn apply_role_model_selection(
     let selection = catalog
         .resolve_role_model_selection(&configured, runtime)?
         .selection;
+    if runtime != SupervisorRuntime::Fake {
+        validate_known_judgment_role_model(role, selection.model.as_deref())?;
+    }
     Ok(command.with_model_selection(selection.model, selection.reasoning_effort))
 }
 
@@ -1259,6 +1353,18 @@ pub(super) fn runtime_resolved_prompt_plan(
         let selection = catalog
             .resolve_role_model_selection(&configured, runtime)?
             .selection;
+        if runtime != SupervisorRuntime::Fake {
+            if role == AgentRole::Worker {
+                let model = selection.model.as_deref().context(
+                    "Worker resolved without an authoritative trusted model identity; runtime-default model selection is not capability evidence",
+                )?;
+                trusted_builtin_model_capability(model).with_context(|| {
+                    format!("Worker model '{model}' has no trusted built-in capability policy")
+                })?;
+            } else {
+                validate_known_judgment_role_model(role, selection.model.as_deref())?;
+            }
+        }
         resolved.role_models.insert(role, selection);
     }
     Ok(resolved)
@@ -1305,6 +1411,8 @@ pub(super) fn validate_review_lens_runtime_selection(
     let ReviewLensBackendConfig::Model { model, .. } = &lens.backend else {
         bail!("precomputed review lenses cannot be dispatched as model processes");
     };
+    validate_known_judgment_role_model(AgentRole::Auditor, Some(model))
+        .with_context(|| format!("review lens '{}' model policy is invalid", lens.id))?;
     if runtime != SupervisorRuntime::Fake
         && catalog.availability(Some(model), runtime)? != RoleModelAvailability::Available
     {
@@ -1491,6 +1599,167 @@ mod regression_tests {
             .zip(right.bytes())
             .take_while(|(left_byte, right_byte)| left_byte == right_byte)
             .count()
+    }
+
+    #[test]
+    fn weak_model_profile_is_limited_to_enumerated_mechanical_terminal_work() {
+        let rendered = constrained_weak_model_instruction_profile(
+            OrchestrationPhase::MechanicalTerminal,
+            Some(MechanicalTerminalDuty::RunPreselectedCommand),
+        )
+        .expect("render constrained weak-model profile");
+
+        assert!(rendered.contains(CONSTRAINED_WEAK_MODEL_PROFILE_NAME));
+        assert!(rendered.contains("MECHANICAL_DUTY: run_preselected_command"));
+        assert!(rendered.contains("Do not discover scope"));
+        assert!(rendered.contains("Do not triage"));
+        assert!(rendered.contains("Do not merge, rebase, commit, resolve conflicts"));
+        assert!(rendered.contains("make a review-acceptance decision"));
+        assert!(rendered.contains("stop without guessing"));
+        assert!(rendered.contains("not independently process-observable"));
+        assert!(rendered.contains("report them as unavailable"));
+    }
+
+    #[test]
+    fn weak_model_profile_fails_closed_for_judgment_phases() {
+        for phase in [
+            OrchestrationPhase::Discovery,
+            OrchestrationPhase::Triage,
+            OrchestrationPhase::Implementation,
+            OrchestrationPhase::Merge,
+            OrchestrationPhase::ReviewAcceptance,
+        ] {
+            let error = constrained_weak_model_instruction_profile(phase, None)
+                .expect_err("weak profile must reject judgment-heavy phases");
+            assert!(error
+                .to_string()
+                .contains("weak-model binding is forbidden"));
+        }
+    }
+
+    fn phase_bound_worker_prompt(
+        binding: WorkerPhaseModelBinding,
+        selected_model: &str,
+    ) -> Result<String> {
+        let worker = WorkerAssignment {
+            id: "worker-phase-bound".to_string(),
+            role: AgentRole::Worker,
+            assigned_paths: vec![PathBuf::from("src/lib.rs")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: Some("perform the exact declared duty".to_string()),
+            environment_requirements: Vec::new(),
+            report_path: None,
+        };
+        let notes = assignment_phase_model_bindings_notes(&AssignmentPhaseModelBindings {
+            workers: BTreeMap::from([(worker.id.clone(), binding)]),
+        })?;
+        let assignment = OrchestratorAssignment {
+            id: "child-phase-bound".to_string(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: worker.assigned_paths.clone(),
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: vec![worker],
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: Some(notes),
+        };
+        let mut plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "phase-bound worker prompt".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 60,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+        plan.role_models.insert(
+            AgentRole::Worker,
+            RoleModelSelection {
+                model: Some(selected_model.to_string()),
+                reasoning_effort: Some("low".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        worker_prompt_with_incoming_root(
+            &plan,
+            &assignment,
+            &assignment.worker_assignments[0],
+            &WorkerAssignmentMetadata::default(),
+            Path::new("/tmp/maco-phase-model-prompt"),
+            Path::new("/tmp/maco-phase-model-prompt/incoming"),
+            Path::new("/tmp/maco-phase-model-prompt/worker-schema.json"),
+        )
+    }
+
+    #[test]
+    fn real_worker_prompt_includes_weak_profile_only_after_typed_validation() {
+        let binding = WorkerPhaseModelBinding {
+            model: ECONOMY_PROFILE_MODEL.to_string(),
+            phase: OrchestrationPhase::MechanicalTerminal,
+            mechanical_duty: Some(MechanicalTerminalDuty::FormatPreselectedFiles),
+            mechanical_operands: Some(MechanicalTerminalOperands::FormatPreselectedFiles {
+                formatter_argv: vec!["rustfmt".to_string()],
+                paths: vec![PathBuf::from("src/lib.rs")],
+            }),
+        };
+        let prompt = phase_bound_worker_prompt(binding.clone(), ECONOMY_PROFILE_MODEL)
+            .expect("render policy-validated weak Worker prompt");
+        assert!(prompt.contains("WEAK_MODEL_INSTRUCTION_PROFILE"));
+        assert!(prompt.contains("Mechanical duty: format_preselected_files"));
+        assert!(prompt.contains("Mechanical operands: {\"kind\":\"format_preselected_files\""));
+        assert!(prompt.contains("\"paths\":[\"src/lib.rs\"]"));
+
+        let mut judgment_binding = binding.clone();
+        judgment_binding.phase = OrchestrationPhase::Discovery;
+        judgment_binding.mechanical_duty = None;
+        let judgment_error = phase_bound_worker_prompt(judgment_binding, ECONOMY_PROFILE_MODEL)
+            .expect_err("weak discovery binding must fail before prompt emission");
+        assert!(judgment_error
+            .to_string()
+            .contains("phase-model binding is invalid"));
+
+        let model_error = phase_bound_worker_prompt(binding, "different-model")
+            .expect_err("runtime model mismatch must invalidate the authorization");
+        assert!(model_error
+            .to_string()
+            .contains("phase-model binding is invalid"));
+
+        let (legacy_worker, _, _, _) =
+            fixed_prompt_fixture().expect("render unbound legacy Worker prompt");
+        assert!(legacy_worker.contains("Orchestration phase: <unbound>"));
+        assert!(!legacy_worker.contains("WEAK_MODEL_INSTRUCTION_PROFILE"));
+    }
+
+    #[test]
+    fn review_lens_rejects_unknown_model_even_when_catalog_advertises_it() {
+        let lens = ReviewLensConfig {
+            id: "unknown-review-model".to_string(),
+            backend: ReviewLensBackendConfig::Model {
+                backend_id: "openai".to_string(),
+                model: "custom-unknown-model".to_string(),
+                reasoning_effort: Some("xhigh".to_string()),
+            },
+            information_scope: ReviewInformationScope::DiffOnly,
+        };
+        let catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs(["custom-unknown-model"])
+                .expect("unknown review model catalog"),
+        );
+
+        let error =
+            validate_review_lens_runtime_selection(&lens, SupervisorRuntime::Codex, &catalog)
+                .expect_err("catalog availability must not imply trusted review capability");
+        assert!(format!("{error:#}").contains("no trusted built-in capability policy"));
     }
 
     #[test]

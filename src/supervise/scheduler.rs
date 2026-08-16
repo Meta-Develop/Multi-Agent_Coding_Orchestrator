@@ -126,6 +126,103 @@ fn validated_scheduler_assignment_schedule(
         .context("supervisor scheduler rejected the validated assignment schedule")
 }
 
+fn validate_reserved_phase_model_metadata(plan: &SupervisorPlan) -> Result<()> {
+    for assignment in &plan.assignments {
+        assignment_phase_model_bindings(assignment).with_context(|| {
+            format!(
+                "assignment '{}' phase-model metadata is invalid",
+                assignment.id
+            )
+        })?;
+        for worker in &assignment.worker_assignments {
+            if let Some(binding) = worker_phase_model_binding(assignment, worker)? {
+                binding
+                    .validate_for_selected_model(worker, Some(&binding.model))
+                    .with_context(|| {
+                        format!(
+                            "worker '{}' reserved phase-model metadata is invalid",
+                            worker.id
+                        )
+                    })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_resolved_role_model_policy(
+    plan: &SupervisorPlan,
+    role: AgentRole,
+    model: Option<&str>,
+) -> Result<()> {
+    let Some(model) = model else {
+        bail!(
+            "role '{}' resolved without an authoritative trusted model identity; runtime-default model selection is not capability evidence",
+            role.as_str()
+        );
+    };
+    if role != AgentRole::Worker {
+        return validate_known_judgment_role_model(role, Some(model));
+    }
+    let capability = trusted_builtin_model_capability(model).with_context(|| {
+        format!("Worker model '{model}' has no trusted built-in capability policy")
+    })?;
+    let mut worker_count = 0usize;
+    for assignment in &plan.assignments {
+        for worker in &assignment.worker_assignments {
+            worker_count = worker_count.saturating_add(1);
+            validate_worker_phase_model_selection(plan, assignment, worker, Some(model))
+                .with_context(|| {
+                    format!(
+                        "resolved Worker model policy rejected worker '{}'",
+                        worker.id
+                    )
+                })?;
+        }
+    }
+    if capability == ModelCapabilityClass::WeakMechanical && worker_count == 0 {
+        bail!(
+            "Worker model '{model}' is weak_mechanical, but the plan has no authenticated closed mechanical Worker duty"
+        );
+    }
+    Ok(())
+}
+
+fn validate_scheduler_model_policy(
+    plan: &SupervisorPlan,
+    runtime: SupervisorRuntime,
+    catalog: &RuntimeModelCatalog,
+) -> Result<()> {
+    if runtime == SupervisorRuntime::Fake {
+        for lens in &plan.review_lenses {
+            if matches!(&lens.backend, ReviewLensBackendConfig::Model { .. }) {
+                validate_review_lens_runtime_selection(lens, runtime, catalog)?;
+            }
+        }
+        return Ok(());
+    }
+    for role in [
+        AgentRole::Supervisor,
+        AgentRole::ChildOrchestrator,
+        AgentRole::Worker,
+        AgentRole::GateClassifier,
+        AgentRole::Auditor,
+    ] {
+        let configured = effective_role_model_selection(plan, role);
+        let resolved = catalog
+            .resolve_role_model_selection(&configured, runtime)
+            .with_context(|| format!("failed to resolve '{}' model policy", role.as_str()))?;
+        validate_resolved_role_model_policy(plan, role, resolved.selection.model.as_deref())
+            .with_context(|| format!("resolved '{}' model policy is invalid", role.as_str()))?;
+    }
+    for lens in &plan.review_lenses {
+        if matches!(&lens.backend, ReviewLensBackendConfig::Model { .. }) {
+            validate_review_lens_runtime_selection(lens, runtime, catalog)?;
+        }
+    }
+    Ok(())
+}
+
 fn has_multiple_independent_assignment_scopes(
     schedule: &[AssignmentScheduleEntry],
     plan_metadata: &SupervisorPlanMetadata,
@@ -274,17 +371,12 @@ impl SchedulerProgress {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct AssignmentBudgetPolicy {
-    model_overrides: BTreeMap<AgentRole, RoleModelSelection>,
-    child_effort_degradation_steps: usize,
     assignment_reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl AssignmentBudgetPolicy {
     pub(super) fn apply(&self, plan: &SupervisorPlan) -> SupervisorPlan {
         let mut effective = plan.clone();
-        for (role, selection) in &self.model_overrides {
-            effective.role_models.insert(*role, selection.clone());
-        }
         for role in [
             AgentRole::ChildOrchestrator,
             AgentRole::Worker,
@@ -298,11 +390,7 @@ impl AssignmentBudgetPolicy {
                 configured_role_model_selection(plan, role)
                     .reasoning_effort
                     .as_deref(),
-                if role == AgentRole::ChildOrchestrator {
-                    self.child_effort_degradation_steps
-                } else {
-                    0
-                },
+                0,
             );
             selection.reasoning_effort = Some(resolved.resolved);
             effective.role_models.insert(role, selection);
@@ -311,11 +399,15 @@ impl AssignmentBudgetPolicy {
     }
 }
 
+/// Budget pressure may reduce concurrency without changing model judgment.
+///
+/// Only a strict assignment phase-model binding may authenticate an enumerated
+/// [`MechanicalTerminalDuty`]. The scheduler never infers eligibility from
+/// assignment text or an ordinary Worker role. Even an eligible binding stays
+/// fan-out-only until a separately launched Worker model is process-observable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum BudgetDegradationRung {
     #[default]
-    Effort,
-    ModelTier,
     FanOut,
     Exhausted,
 }
@@ -326,6 +418,7 @@ struct BudgetDegradationController {
     policy: AssignmentBudgetPolicy,
     effective_fan_out: usize,
     records: Vec<BudgetDegradationRecord>,
+    model_policy_findings: Vec<Finding>,
     assignment_effort_bindings: Vec<AssignmentEffortBinding>,
     last_new_dispatch_allowed: bool,
 }
@@ -333,10 +426,11 @@ struct BudgetDegradationController {
 impl BudgetDegradationController {
     fn new(max_concurrent_children: usize) -> Self {
         Self {
-            rung: BudgetDegradationRung::Effort,
+            rung: BudgetDegradationRung::FanOut,
             policy: AssignmentBudgetPolicy::default(),
             effective_fan_out: max_concurrent_children.max(1),
             records: Vec::new(),
+            model_policy_findings: Vec::new(),
             assignment_effort_bindings: Vec::new(),
             last_new_dispatch_allowed: true,
         }
@@ -352,7 +446,14 @@ impl BudgetDegradationController {
         runtime: SupervisorRuntime,
     ) -> Result<Option<AssignmentBudgetPolicy>> {
         if !report.new_dispatch_allowed || report.action == BudgetAction::OwnerEscalation {
-            self.record_halt(&assignment.id, report);
+            self.record_halt(
+                &assignment.id,
+                requested_reasoning_effort,
+                report,
+                plan,
+                catalog,
+                runtime,
+            )?;
             return Ok(None);
         }
         if report.action == BudgetAction::Degrade
@@ -363,6 +464,7 @@ impl BudgetDegradationController {
                 )
             })
         {
+            self.observe_budget_model_policy(assignment, plan, catalog, runtime)?;
             self.advance(
                 assignment,
                 requested_reasoning_effort,
@@ -375,13 +477,86 @@ impl BudgetDegradationController {
         self.last_new_dispatch_allowed = report.new_dispatch_allowed;
         let mut policy = self.policy.clone();
         policy.assignment_reasoning_effort = requested_reasoning_effort;
-        self.record_assignment_effort_bindings(
-            assignment,
-            requested_reasoning_effort,
-            plan,
-            &policy,
-        );
+        self.record_assignment_effort_bindings(assignment, requested_reasoning_effort, plan);
         Ok(Some(policy))
+    }
+
+    fn observe_budget_model_policy(
+        &mut self,
+        assignment: &OrchestratorAssignment,
+        plan: &SupervisorPlan,
+        catalog: &RuntimeModelCatalog,
+        runtime: SupervisorRuntime,
+    ) -> Result<()> {
+        let worker_selection = effective_role_model_selection(plan, AgentRole::Worker);
+        let worker_selection = catalog
+            .resolve_role_model_selection(&worker_selection, runtime)
+            .context("failed to resolve Worker model for budget phase policy")?;
+        if assignment.worker_assignments.is_empty() {
+            assignment_phase_model_bindings(assignment)
+                .context("assignment phase-model metadata is invalid")?;
+            self.push_model_policy_finding(format!(
+                "budget weak-model candidate skipped for assignment '{}': child-orchestrator duties are judgment work and no terminal Worker duty is present; degradation remains fan-out-only",
+                assignment.id
+            ));
+            return Ok(());
+        }
+
+        for worker in &assignment.worker_assignments {
+            let decision = validate_worker_phase_model_selection(
+                plan,
+                assignment,
+                worker,
+                worker_selection.selection.model.as_deref(),
+            )
+            .with_context(|| {
+                format!("budget phase-model policy rejected worker '{}'", worker.id)
+            })?;
+            let Some(decision) = decision else {
+                self.push_model_policy_finding(format!(
+                    "budget weak-model candidate skipped for worker '{}': no authenticated phase-model binding with an enumerated mechanical duty; degradation remains fan-out-only",
+                    worker.id
+                ));
+                continue;
+            };
+            let decision = validate_budget_model_degradation(
+                decision.role,
+                decision.phase,
+                decision.mechanical_duty,
+                decision.selected_capability,
+            )
+            .with_context(|| {
+                format!("budget phase-model policy rejected worker '{}'", worker.id)
+            })?;
+            if decision.selected_capability == ModelCapabilityClass::WeakMechanical {
+                self.push_model_policy_finding(format!(
+                    "budget weak-model binding for worker '{}' is policy-eligible, but nested Worker model usage is not independently process-observable and no separate worker transport is available; the binding is preserved without a model downgrade and degradation remains fan-out-only",
+                    worker.id
+                ));
+            } else {
+                self.push_model_policy_finding(format!(
+                    "budget weak-model candidate skipped for worker '{}': authenticated capability '{}' is not weak_mechanical; degradation remains fan-out-only",
+                    worker.id,
+                    decision.selected_capability.as_str()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn push_model_policy_finding(&mut self, message: String) {
+        if self
+            .model_policy_findings
+            .iter()
+            .any(|finding| finding.message == message)
+        {
+            return;
+        }
+        self.model_policy_findings.push(Finding {
+            severity: FindingSeverity::Info,
+            message,
+            paths: Vec::new(),
+        });
     }
 
     fn advance(
@@ -394,116 +569,15 @@ impl BudgetDegradationController {
         runtime: SupervisorRuntime,
     ) -> Result<()> {
         let change = match self.rung {
-            BudgetDegradationRung::Effort => {
-                let before = resolve_reasoning_effort(
-                    AgentRole::ChildOrchestrator,
-                    requested_reasoning_effort,
-                    effective_role_model_selection(plan, AgentRole::ChildOrchestrator)
-                        .reasoning_effort
-                        .as_deref(),
-                    self.policy.child_effort_degradation_steps,
-                )
-                .resolved;
-                self.policy.child_effort_degradation_steps =
-                    self.policy.child_effort_degradation_steps.saturating_add(1);
-                let after = resolve_reasoning_effort(
-                    AgentRole::ChildOrchestrator,
-                    requested_reasoning_effort,
-                    effective_role_model_selection(plan, AgentRole::ChildOrchestrator)
-                        .reasoning_effort
-                        .as_deref(),
-                    self.policy.child_effort_degradation_steps,
-                )
-                .resolved;
-                self.rung = BudgetDegradationRung::ModelTier;
-                BudgetDegradationChange::ReasoningEffort {
-                    role: AgentRole::ChildOrchestrator,
-                    before,
-                    after,
-                }
-            }
-            BudgetDegradationRung::ModelTier => {
-                let configured = self
-                    .policy
-                    .model_overrides
-                    .get(&AgentRole::ChildOrchestrator)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        effective_role_model_selection(plan, AgentRole::ChildOrchestrator)
-                    });
-                let resolved = catalog.resolve_role_model_selection(&configured, runtime)?;
-                let Some(before) = resolved.selection.model.clone() else {
-                    self.rung = BudgetDegradationRung::FanOut;
-                    return self.advance(
-                        assignment,
-                        requested_reasoning_effort,
-                        report,
-                        plan,
-                        catalog,
-                        runtime,
-                    );
-                };
-                let candidates = match &configured.unavailable_model_fallback {
-                    UnavailableModelFallback::OrderedCatalogChain(chain) => {
-                        &chain.budget_degrade_models
-                    }
-                    _ => {
-                        self.rung = BudgetDegradationRung::FanOut;
-                        return self.advance(
-                            assignment,
-                            requested_reasoning_effort,
-                            report,
-                            plan,
-                            catalog,
-                            runtime,
-                        );
-                    }
-                };
-                let Some((resolved_candidate_index, after)) = candidates
-                    .iter()
-                    .enumerate()
-                    .find(|(_, model)| {
-                        model.as_str() != before
-                            && catalog
-                                .availability(Some(model.as_str()), runtime)
-                                .is_ok_and(|availability| {
-                                    availability == RoleModelAvailability::Available
-                                })
-                    })
-                    .map(|(index, model)| (index, model.clone()))
-                else {
-                    self.rung = BudgetDegradationRung::FanOut;
-                    return self.advance(
-                        assignment,
-                        requested_reasoning_effort,
-                        report,
-                        plan,
-                        catalog,
-                        runtime,
-                    );
-                };
-                self.policy.model_overrides.insert(
-                    AgentRole::ChildOrchestrator,
-                    RoleModelSelection {
-                        model: Some(after.clone()),
-                        reasoning_effort: None,
-                        unavailable_model_fallback: UnavailableModelFallback::FailClosed,
-                    },
-                );
-                self.rung = BudgetDegradationRung::FanOut;
-                BudgetDegradationChange::ModelTier {
-                    role: AgentRole::ChildOrchestrator,
-                    before,
-                    after,
-                    resolved_candidate_index,
-                }
-            }
             BudgetDegradationRung::FanOut => {
                 let before = self.effective_fan_out;
                 self.effective_fan_out = (before / 2).max(1);
-                self.rung = BudgetDegradationRung::Exhausted;
                 if self.effective_fan_out == before {
+                    self.rung = BudgetDegradationRung::Exhausted;
                     return Ok(());
+                }
+                if self.effective_fan_out == 1 {
+                    self.rung = BudgetDegradationRung::Exhausted;
                 }
                 BudgetDegradationChange::FanOut {
                     before,
@@ -531,13 +605,33 @@ impl BudgetDegradationController {
         Ok(())
     }
 
-    fn record_halt(&mut self, assignment_id: &str, report: &RunBudgetReport) {
+    fn record_halt(
+        &mut self,
+        assignment_id: &str,
+        requested_reasoning_effort: Option<ReasoningEffort>,
+        report: &RunBudgetReport,
+        plan: &SupervisorPlan,
+        catalog: &RuntimeModelCatalog,
+        runtime: SupervisorRuntime,
+    ) -> Result<()> {
         if self.records.iter().any(|record| {
             record.assignment_id == assignment_id
                 && matches!(record.change, BudgetDegradationChange::Halt { .. })
         }) {
-            return;
+            return Ok(());
         }
+        let mut assignment_policy = self.policy.clone();
+        assignment_policy.assignment_reasoning_effort = requested_reasoning_effort;
+        let effective = assignment_policy.apply(plan);
+        let effective = effective_role_model_selection(&effective, AgentRole::ChildOrchestrator);
+        let resolved = catalog
+            .resolve_role_model_selection(&effective, runtime)
+            .with_context(|| {
+                format!(
+                    "failed to resolve child model while recording budget halt for assignment '{}'",
+                    assignment_id
+                )
+            })?;
         self.records.push(BudgetDegradationRecord {
             sequence: self.records.len().saturating_add(1),
             assignment_id: assignment_id.to_string(),
@@ -547,20 +641,12 @@ impl BudgetDegradationController {
                 before_new_dispatch_allowed: self.last_new_dispatch_allowed,
                 after_new_dispatch_allowed: report.new_dispatch_allowed,
             },
-            effective_child_model: self
-                .policy
-                .model_overrides
-                .get(&AgentRole::ChildOrchestrator)
-                .and_then(|selection| selection.model.clone()),
-            effective_child_reasoning_effort: self
-                .assignment_effort_bindings
-                .iter()
-                .rev()
-                .find(|binding| binding.role == AgentRole::ChildOrchestrator)
-                .map(|binding| binding.resolved_reasoning_effort.clone()),
+            effective_child_model: resolved.selection.model,
+            effective_child_reasoning_effort: resolved.selection.reasoning_effort,
             effective_fan_out: self.effective_fan_out,
             observation: BudgetDegradationObservation::AdmissionPolicyResolved,
         });
+        Ok(())
     }
 
     fn record_assignment_effort_bindings(
@@ -568,7 +654,6 @@ impl BudgetDegradationController {
         assignment: &OrchestratorAssignment,
         requested_reasoning_effort: Option<ReasoningEffort>,
         plan: &SupervisorPlan,
-        policy: &AssignmentBudgetPolicy,
     ) {
         let mut push = |duty_id: String,
                         role: AgentRole,
@@ -598,7 +683,7 @@ impl BudgetDegradationController {
             AgentRole::ChildOrchestrator,
             requested_reasoning_effort,
             child_fallback.as_deref(),
-            policy.child_effort_degradation_steps,
+            0,
             ProcessObservation::SchedulerObserved,
             None,
         );
@@ -889,9 +974,16 @@ fn run_serial_assignment_schedule(
                 .budget_denied_assignment_indices
                 .extend(pending.iter().copied());
             for index in &pending {
-                progress
-                    .budget_degradation
-                    .record_halt(&context.plan.assignments[*index].id, &budget_report);
+                progress.budget_degradation.record_halt(
+                    &context.plan.assignments[*index].id,
+                    context
+                        .assignment_metadata
+                        .reasoning_effort(&context.plan.assignments[*index].id),
+                    &budget_report,
+                    context.plan,
+                    context.runtime_model_catalog,
+                    context.options.runtime,
+                )?;
             }
             break;
         }
@@ -1064,9 +1156,16 @@ fn run_concurrent_assignment_schedule(
                             .budget_denied_assignment_indices
                             .extend(pending.iter().copied());
                         for index in &pending {
-                            progress
-                                .budget_degradation
-                                .record_halt(&context.plan.assignments[*index].id, &budget_report);
+                            progress.budget_degradation.record_halt(
+                                &context.plan.assignments[*index].id,
+                                context
+                                    .assignment_metadata
+                                    .reasoning_effort(&context.plan.assignments[*index].id),
+                                &budget_report,
+                                context.plan,
+                                context.runtime_model_catalog,
+                                context.options.runtime,
+                            )?;
                         }
                         stop_scheduling = true;
                         break;
@@ -1393,6 +1492,7 @@ fn resolved_role_execution_bindings(
     plan: &SupervisorPlan,
     runtime: SupervisorRuntime,
     runtime_model_catalog: Option<&RuntimeModelCatalog>,
+    role_usage: &BTreeMap<AgentRole, RoleUsageReport>,
 ) -> BTreeMap<AgentRole, ResolvedRoleExecutionBinding> {
     [
         AgentRole::Supervisor,
@@ -1451,24 +1551,62 @@ fn resolved_role_execution_bindings(
                 Some(catalog) => {
                     let resolved = catalog.resolve_role_model_selection(&effective, runtime);
                     match resolved {
-                        Ok(resolved) if resolved.selection.model.is_some() => (
-                            resolved.selection.model,
-                            resolved.selection.reasoning_effort,
-                            RoleBindingObservation::RuntimeCatalogResolved,
-                            resolved.observation,
-                            resolved.configured_model_chain,
-                            resolved.resolved_candidate_index,
-                            None,
-                        ),
+                        Ok(resolved) if resolved.selection.model.is_some() => {
+                            let model = resolved.selection.model.as_deref();
+                            match validate_resolved_role_model_policy(plan, role, model) {
+                                Ok(())
+                                    if role_usage.get(&role).is_some_and(|usage| {
+                                        usage.observation == RoleUsageObservation::ProcessObserved
+                                            && usage.usage.is_some()
+                                            && model.is_some_and(|model| {
+                                                usage.models.iter().any(|observed| observed == model)
+                                            })
+                                    }) => (
+                                        resolved.selection.model,
+                                        None,
+                                        RoleBindingObservation::RuntimeCatalogResolved,
+                                        resolved.observation,
+                                        resolved.configured_model_chain,
+                                        resolved.resolved_candidate_index,
+                                        Some(
+                                            "the concrete model is supported by retained role-tagged process usage; reasoning effort was not retained as process evidence"
+                                                .to_string(),
+                                        ),
+                                    ),
+                                Ok(()) => (
+                                    None,
+                                    None,
+                                    RoleBindingObservation::ResolutionFailed,
+                                    ModelResolutionObservation::NotResolved,
+                                    resolved.configured_model_chain,
+                                    None,
+                                    Some(
+                                        "catalog selection is policy intent only; no matching role-tagged command, usage, or process evidence was retained"
+                                            .to_string(),
+                                    ),
+                                ),
+                                Err(error) => (
+                                    None,
+                                    None,
+                                    RoleBindingObservation::ResolutionFailed,
+                                    ModelResolutionObservation::NotResolved,
+                                    resolved.configured_model_chain,
+                                    None,
+                                    Some(format!(
+                                        "resolved role model failed trusted capability policy: {error:#}"
+                                    )),
+                                ),
+                            }
+                        }
                         Ok(resolved) => (
                             None,
-                            resolved.selection.reasoning_effort,
-                            RoleBindingObservation::RuntimeDefaultResolved,
-                            resolved.observation,
+                            None,
+                            RoleBindingObservation::ResolutionFailed,
+                            ModelResolutionObservation::NotResolved,
                             resolved.configured_model_chain,
-                            resolved.resolved_candidate_index,
+                            None,
                             Some(
-                                "the runtime-default fallback was selected, so the concrete provider model slug is not process-observable"
+                                "runtime-default selection supplied no authoritative trusted model identity and cannot satisfy capability policy"
                                     .to_string(),
                             ),
                         ),
@@ -1611,7 +1749,8 @@ fn build_supervisor_final_report(
     let role_usage = complete_role_usage_reports(role_usage);
     let mut role_economics_profile =
         execution_role_economics_profile(plan, runtime, runtime_model_catalog);
-    let mut role_bindings = resolved_role_execution_bindings(plan, runtime, runtime_model_catalog);
+    let mut role_bindings =
+        resolved_role_execution_bindings(plan, runtime, runtime_model_catalog, &role_usage);
     if budget_degradations.iter().any(|record| {
         matches!(
             record.change,
@@ -1641,6 +1780,16 @@ fn build_supervisor_final_report(
             paths: Vec::new(),
         });
     }
+    let (serialized_policy_input, policy_input_unavailable_reason) =
+        match serde_json::to_string(&admission_policy_input) {
+            Ok(serialized) => (Some(serialized), None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "failed to serialize the observed admission policy input: {error}"
+                )),
+            ),
+        };
     role_economics_profile.execution = Some(SupervisorExecutionMetadata {
         assignment_count: plan.assignments.len(),
         started_assignment_count: achieved_concurrency.started_assignment_count,
@@ -1648,12 +1797,9 @@ fn build_supervisor_final_report(
         concurrency: SupervisorConcurrencyReport {
             configured_max_concurrent_children: max_concurrent_children,
             policy_input_observation: ProcessObservation::SchedulerObserved,
-            policy_input: Some(
-                serde_json::to_string(&admission_policy_input)
-                    .expect("admission policy input is JSON serializable"),
-            ),
+            policy_input: serialized_policy_input,
             policy_input_details: Some(admission_policy_input),
-            policy_input_unavailable_reason: None,
+            policy_input_unavailable_reason,
             achieved_max_concurrent_children: achieved_concurrency.peak,
             achieved_mean_concurrent_children: achieved_concurrency.mean,
             achieved_mean_observation: if achieved_concurrency.mean.is_some() {
@@ -2173,6 +2319,12 @@ fn prepare_supervisor_run(
         mut plan_metadata,
     } = loaded;
     validate_max_concurrent_children(max_concurrent_children)?;
+    validate_reserved_phase_model_metadata(&plan)
+        .context("scheduler preparation rejected reserved phase-model metadata")?;
+    if let Ok(catalog) = runtime_model_catalog.as_ref() {
+        validate_scheduler_model_policy(&plan, options.runtime, catalog)
+            .context("scheduler preparation rejected model capability policy")?;
+    }
     plan_metadata.run_budget.limits = plan_metadata
         .run_budget
         .limits
@@ -2578,14 +2730,23 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                     if let Ok(report) = budget_ledger.report() {
                         if !report.new_dispatch_allowed {
                             for index in &progress.budget_denied_assignment_indices {
-                                progress
-                                    .budget_degradation
-                                    .record_halt(&plan.assignments[*index].id, &report);
+                                progress.budget_degradation.record_halt(
+                                    &plan.assignments[*index].id,
+                                    assignment_metadata
+                                        .reasoning_effort(&plan.assignments[*index].id),
+                                    &report,
+                                    &plan,
+                                    &runtime_model_catalog,
+                                    options.runtime,
+                                )?;
                             }
                         }
                     }
                     budget_denied_assignment_indices
                         .extend(progress.budget_denied_assignment_indices);
+                    collected
+                        .findings
+                        .append(&mut progress.budget_degradation.model_policy_findings);
                     budget_degradations.append(&mut progress.budget_degradation.records);
                     assignment_effort_bindings
                         .append(&mut progress.budget_degradation.assignment_effort_bindings);
@@ -2608,13 +2769,21 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         if let Ok(report) = budget_ledger.report() {
             if !report.new_dispatch_allowed {
                 for index in &progress.budget_denied_assignment_indices {
-                    progress
-                        .budget_degradation
-                        .record_halt(&plan.assignments[*index].id, &report);
+                    progress.budget_degradation.record_halt(
+                        &plan.assignments[*index].id,
+                        assignment_metadata.reasoning_effort(&plan.assignments[*index].id),
+                        &report,
+                        &plan,
+                        &runtime_model_catalog,
+                        options.runtime,
+                    )?;
                 }
             }
         }
         budget_denied_assignment_indices.extend(progress.budget_denied_assignment_indices);
+        collected
+            .findings
+            .append(&mut progress.budget_degradation.model_policy_findings);
         budget_degradations.append(&mut progress.budget_degradation.records);
         assignment_effort_bindings
             .append(&mut progress.budget_degradation.assignment_effort_bindings);
@@ -2991,7 +3160,7 @@ mod decomposition_tests {
     }
 
     #[test]
-    fn role_binding_telemetry_retains_catalog_fallback_resolution() {
+    fn role_binding_telemetry_retains_observed_catalog_fallback_model_only() {
         let mut plan = test_plan(Vec::new());
         plan.role_models.insert(
             AgentRole::ChildOrchestrator,
@@ -3014,8 +3183,22 @@ mod decomposition_tests {
             CodexRuntimeModelCatalog::from_slugs([FRONTIER_PROFILE_MODEL])
                 .expect("fallback catalog"),
         );
-        let bindings =
-            resolved_role_execution_bindings(&plan, SupervisorRuntime::Codex, Some(&catalog));
+        let role_usage = BTreeMap::from([(
+            AgentRole::ChildOrchestrator,
+            RoleUsageReport {
+                models: vec![FRONTIER_PROFILE_MODEL.to_string()],
+                usage: Some(Usage::default()),
+                cost_usd: None,
+                observation: RoleUsageObservation::ProcessObserved,
+                unavailable_reason: None,
+            },
+        )]);
+        let bindings = resolved_role_execution_bindings(
+            &plan,
+            SupervisorRuntime::Codex,
+            Some(&catalog),
+            &role_usage,
+        );
         let binding = &bindings[&AgentRole::ChildOrchestrator];
         assert_eq!(
             binding.configured_model.as_deref(),
@@ -3034,6 +3217,11 @@ mod decomposition_tests {
             ModelResolutionObservation::CatalogFallback
         );
         assert_eq!(binding.resolved_candidate_index, Some(1));
+        assert_eq!(binding.resolved_reasoning_effort, None);
+        assert!(binding
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("reasoning effort was not retained")));
         assert_eq!(
             binding.configured_model_chain,
             vec![
@@ -3045,11 +3233,159 @@ mod decomposition_tests {
     }
 
     #[test]
-    fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
+    fn role_binding_telemetry_does_not_claim_unobserved_catalog_selection() {
         let plan = test_plan(Vec::new());
-        let effort_assignment = test_assignment("effort-assignment", "effort.txt");
-        let model_assignment = test_assignment("model-assignment", "model.txt");
+        let catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs([FRONTIER_PROFILE_MODEL])
+                .expect("unobserved selection catalog"),
+        );
+
+        let bindings = resolved_role_execution_bindings(
+            &plan,
+            SupervisorRuntime::Codex,
+            Some(&catalog),
+            &BTreeMap::new(),
+        );
+        let binding = &bindings[&AgentRole::ChildOrchestrator];
+        assert_eq!(binding.resolved_model, None);
+        assert_eq!(binding.resolved_reasoning_effort, None);
+        assert_eq!(
+            binding.observation,
+            RoleBindingObservation::ResolutionFailed
+        );
+        assert_eq!(
+            binding.resolution_observation,
+            ModelResolutionObservation::NotResolved
+        );
+        assert_eq!(binding.resolved_candidate_index, None);
+        assert!(binding
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("policy intent only")));
+    }
+
+    #[test]
+    fn role_binding_telemetry_rejects_forbidden_judgment_fallback() {
+        let mut plan = test_plan(Vec::new());
+        plan.role_models.insert(
+            AgentRole::ChildOrchestrator,
+            RoleModelSelection {
+                model: Some(BALANCED_PROFILE_MODEL.to_string()),
+                reasoning_effort: Some("high".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::OrderedCatalogChain(
+                    OrderedCatalogFallback {
+                        models: vec![ECONOMY_PROFILE_MODEL.to_string()],
+                        budget_degrade_models: Vec::new(),
+                        on_exhausted: TerminalUnavailableModelFallback::FailClosed,
+                    },
+                ),
+            },
+        );
+        let catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs([ECONOMY_PROFILE_MODEL])
+                .expect("forbidden fallback catalog"),
+        );
+
+        let bindings = resolved_role_execution_bindings(
+            &plan,
+            SupervisorRuntime::Codex,
+            Some(&catalog),
+            &BTreeMap::new(),
+        );
+        let binding = &bindings[&AgentRole::ChildOrchestrator];
+        assert_eq!(binding.resolved_model, None);
+        assert_eq!(binding.resolved_reasoning_effort, None);
+        assert_eq!(
+            binding.observation,
+            RoleBindingObservation::ResolutionFailed
+        );
+        assert_eq!(
+            binding.resolution_observation,
+            ModelResolutionObservation::NotResolved
+        );
+        assert_eq!(binding.resolved_candidate_index, None);
+        assert!(binding
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("failed trusted capability policy")));
+    }
+
+    #[test]
+    fn scheduler_policy_rejects_runtime_default_for_every_real_role() {
+        let catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs([FRONTIER_PROFILE_MODEL])
+                .expect("runtime-default rejection catalog"),
+        );
+        for role in [
+            AgentRole::Supervisor,
+            AgentRole::ChildOrchestrator,
+            AgentRole::Worker,
+            AgentRole::GateClassifier,
+            AgentRole::Auditor,
+        ] {
+            let mut plan = test_plan(Vec::new());
+            plan.role_models.insert(
+                role,
+                RoleModelSelection {
+                    model: Some(ECONOMY_PROFILE_MODEL.to_string()),
+                    reasoning_effort: Some("high".to_string()),
+                    unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+                },
+            );
+
+            let error = validate_scheduler_model_policy(&plan, SupervisorRuntime::Codex, &catalog)
+                .expect_err("runtime default without a concrete model identity must fail closed");
+            assert!(format!("{error:#}").contains("runtime-default model selection"));
+        }
+    }
+
+    #[test]
+    fn role_binding_telemetry_never_reports_runtime_default_as_resolved() {
+        let mut plan = test_plan(Vec::new());
+        plan.role_models.insert(
+            AgentRole::ChildOrchestrator,
+            RoleModelSelection {
+                model: Some(ECONOMY_PROFILE_MODEL.to_string()),
+                reasoning_effort: Some("high".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+            },
+        );
+        let catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs([FRONTIER_PROFILE_MODEL])
+                .expect("runtime-default telemetry catalog"),
+        );
+
+        let bindings = resolved_role_execution_bindings(
+            &plan,
+            SupervisorRuntime::Codex,
+            Some(&catalog),
+            &BTreeMap::new(),
+        );
+        let binding = &bindings[&AgentRole::ChildOrchestrator];
+        assert_eq!(binding.resolved_model, None);
+        assert_eq!(binding.resolved_reasoning_effort, None);
+        assert_eq!(
+            binding.observation,
+            RoleBindingObservation::ResolutionFailed
+        );
+        assert_eq!(
+            binding.resolution_observation,
+            ModelResolutionObservation::NotResolved
+        );
+        assert_eq!(binding.resolved_candidate_index, None);
+        assert!(binding
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no authoritative trusted model identity")));
+    }
+
+    #[test]
+    fn budget_degrade_preserves_judgment_models_and_effort_then_reduces_fanout() {
+        let plan = test_plan(Vec::new());
         let fanout_assignment = test_assignment("fanout-assignment", "fanout.txt");
+        let reduced_assignment = test_assignment("reduced-assignment", "reduced.txt");
+        let minimum_assignment = test_assignment("minimum-assignment", "minimum.txt");
+        let exhausted_assignment = test_assignment("exhausted-assignment", "exhausted.txt");
         let halted_assignment = test_assignment("halted-assignment", "halted.txt");
         let catalog = RuntimeModelCatalog::Codex(
             CodexRuntimeModelCatalog::from_slugs([
@@ -3078,41 +3414,7 @@ mod decomposition_tests {
         assert_eq!(soft.action, BudgetAction::Degrade);
 
         let mut controller = BudgetDegradationController::new(8);
-        let effort_policy = controller
-            .assignment_policy(
-                &effort_assignment,
-                None,
-                &soft,
-                &plan,
-                &catalog,
-                SupervisorRuntime::Codex,
-            )
-            .expect("effort degradation")
-            .expect("effort admission");
-        assert_eq!(
-            effort_policy.apply(&plan).role_models[&AgentRole::ChildOrchestrator]
-                .reasoning_effort
-                .as_deref(),
-            Some("high")
-        );
-        let model_policy = controller
-            .assignment_policy(
-                &model_assignment,
-                None,
-                &soft,
-                &plan,
-                &catalog,
-                SupervisorRuntime::Codex,
-            )
-            .expect("model degradation")
-            .expect("model admission");
-        assert_eq!(
-            model_policy.apply(&plan).role_models[&AgentRole::ChildOrchestrator]
-                .model
-                .as_deref(),
-            Some(BALANCED_PROFILE_MODEL)
-        );
-        controller
+        let fanout_policy = controller
             .assignment_policy(
                 &fanout_assignment,
                 None,
@@ -3123,7 +3425,95 @@ mod decomposition_tests {
             )
             .expect("fan-out degradation")
             .expect("fan-out admission");
+        let effective = fanout_policy.apply(&plan);
+        for role in [
+            AgentRole::ChildOrchestrator,
+            AgentRole::Worker,
+            AgentRole::GateClassifier,
+            AgentRole::Auditor,
+        ] {
+            assert_eq!(
+                effective.role_models[&role],
+                effective_role_model_selection(&plan, role),
+                "budget degradation changed the protected {role:?} binding"
+            );
+        }
         assert_eq!(controller.effective_fan_out, 4);
+
+        let reduced_policy = controller
+            .assignment_policy(
+                &reduced_assignment,
+                None,
+                &soft,
+                &plan,
+                &catalog,
+                SupervisorRuntime::Codex,
+            )
+            .expect("second fan-out degradation")
+            .expect("second fan-out admission");
+        assert_eq!(reduced_policy.apply(&plan), effective);
+        assert_eq!(controller.effective_fan_out, 2);
+
+        let minimum_policy = controller
+            .assignment_policy(
+                &minimum_assignment,
+                None,
+                &soft,
+                &plan,
+                &catalog,
+                SupervisorRuntime::Codex,
+            )
+            .expect("minimum fan-out degradation")
+            .expect("minimum fan-out admission");
+        assert_eq!(minimum_policy.apply(&plan), effective);
+        assert_eq!(controller.effective_fan_out, 1);
+
+        let exhausted_policy = controller
+            .assignment_policy(
+                &exhausted_assignment,
+                None,
+                &soft,
+                &plan,
+                &catalog,
+                SupervisorRuntime::Codex,
+            )
+            .expect("exhausted degradation")
+            .expect("exhausted admission");
+        assert_eq!(exhausted_policy.apply(&plan), effective);
+        assert_eq!(controller.effective_fan_out, 1);
+        assert_eq!(controller.records.len(), 3);
+        assert_eq!(controller.model_policy_findings.len(), 4);
+        assert!(controller
+            .model_policy_findings
+            .iter()
+            .all(|finding| { finding.message.contains("degradation remains fan-out-only") }));
+
+        for (role, phase) in [
+            (
+                AgentRole::ChildOrchestrator,
+                OrchestrationPhase::Implementation,
+            ),
+            (
+                AgentRole::GateClassifier,
+                OrchestrationPhase::GateClassification,
+            ),
+            (AgentRole::Auditor, OrchestrationPhase::ReviewAcceptance),
+        ] {
+            validate_budget_model_degradation(
+                role,
+                phase,
+                None,
+                ModelCapabilityClass::WeakMechanical,
+            )
+            .expect_err("protected judgment duty must reject a weak budget binding");
+        }
+        validate_budget_model_degradation(
+            AgentRole::Worker,
+            OrchestrationPhase::MechanicalTerminal,
+            None,
+            ModelCapabilityClass::WeakMechanical,
+        )
+        .expect_err("an unclassified worker assignment has no authenticated mechanical duty");
 
         let hard = ledger
             .reserve(BudgetReservationRequest {
@@ -3138,7 +3528,7 @@ mod decomposition_tests {
         assert!(controller
             .assignment_policy(
                 &halted_assignment,
-                None,
+                Some(ReasoningEffort::High),
                 &hard,
                 &plan,
                 &catalog,
@@ -3148,25 +3538,25 @@ mod decomposition_tests {
             .is_none());
 
         assert_eq!(controller.records.len(), 4);
-        assert!(matches!(
-            &controller.records[0].change,
-            BudgetDegradationChange::ReasoningEffort { before, after, .. }
-                if before == "xhigh" && after == "high"
-        ));
-        assert!(matches!(
-            &controller.records[1].change,
-            BudgetDegradationChange::ModelTier {
-                before,
-                after,
-                resolved_candidate_index: 0,
-                ..
-            } if before == FRONTIER_PROFILE_MODEL && after == BALANCED_PROFILE_MODEL
-        ));
         assert_eq!(
-            controller.records[2].change,
+            controller.records[0].change,
             BudgetDegradationChange::FanOut {
                 before: 8,
                 after: 4
+            }
+        );
+        assert_eq!(
+            controller.records[1].change,
+            BudgetDegradationChange::FanOut {
+                before: 4,
+                after: 2
+            }
+        );
+        assert_eq!(
+            controller.records[2].change,
+            BudgetDegradationChange::FanOut {
+                before: 2,
+                after: 1
             }
         );
         assert_eq!(
@@ -3176,40 +3566,45 @@ mod decomposition_tests {
                 after_new_dispatch_allowed: false
             }
         );
+        assert!(controller.records.iter().all(|record| !matches!(
+            record.change,
+            BudgetDegradationChange::ReasoningEffort { .. }
+                | BudgetDegradationChange::ModelTier { .. }
+        )));
         assert_eq!(
             serde_json::to_value(&controller.records).expect("degradation artifact sample"),
             json!([
                 {
                     "sequence": 1,
-                    "assignment_id": "effort-assignment",
-                    "budget_action": "degrade",
-                    "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
-                    "change": {"kind": "reasoning_effort", "role": "child_orchestrator", "before": "xhigh", "after": "high"},
-                    "effective_child_model": FRONTIER_PROFILE_MODEL,
-                    "effective_child_reasoning_effort": "high",
-                    "effective_fan_out": 8,
-                    "observation": "admission_policy_resolved"
-                },
-                {
-                    "sequence": 2,
-                    "assignment_id": "model-assignment",
-                    "budget_action": "degrade",
-                    "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
-                    "change": {"kind": "model_tier", "role": "child_orchestrator", "before": FRONTIER_PROFILE_MODEL, "after": BALANCED_PROFILE_MODEL, "resolved_candidate_index": 0},
-                    "effective_child_model": BALANCED_PROFILE_MODEL,
-                    "effective_child_reasoning_effort": "high",
-                    "effective_fan_out": 8,
-                    "observation": "admission_policy_resolved"
-                },
-                {
-                    "sequence": 3,
                     "assignment_id": "fanout-assignment",
                     "budget_action": "degrade",
                     "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
                     "change": {"kind": "fan_out", "before": 8, "after": 4},
-                    "effective_child_model": BALANCED_PROFILE_MODEL,
-                    "effective_child_reasoning_effort": "high",
+                    "effective_child_model": FRONTIER_PROFILE_MODEL,
+                    "effective_child_reasoning_effort": "xhigh",
                     "effective_fan_out": 4,
+                    "observation": "admission_policy_resolved"
+                },
+                {
+                    "sequence": 2,
+                    "assignment_id": "reduced-assignment",
+                    "budget_action": "degrade",
+                    "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
+                    "change": {"kind": "fan_out", "before": 4, "after": 2},
+                    "effective_child_model": FRONTIER_PROFILE_MODEL,
+                    "effective_child_reasoning_effort": "xhigh",
+                    "effective_fan_out": 2,
+                    "observation": "admission_policy_resolved"
+                },
+                {
+                    "sequence": 3,
+                    "assignment_id": "minimum-assignment",
+                    "budget_action": "degrade",
+                    "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
+                    "change": {"kind": "fan_out", "before": 2, "after": 1},
+                    "effective_child_model": FRONTIER_PROFILE_MODEL,
+                    "effective_child_reasoning_effort": "xhigh",
+                    "effective_fan_out": 1,
                     "observation": "admission_policy_resolved"
                 },
                 {
@@ -3218,9 +3613,9 @@ mod decomposition_tests {
                     "budget_action": "owner_escalation",
                     "budget_reasons": ["soft_token_ceiling_reached", "hard_token_ceiling_reached", "missing_pricing"],
                     "change": {"kind": "halt", "before_new_dispatch_allowed": true, "after_new_dispatch_allowed": false},
-                    "effective_child_model": BALANCED_PROFILE_MODEL,
+                    "effective_child_model": FRONTIER_PROFILE_MODEL,
                     "effective_child_reasoning_effort": "high",
-                    "effective_fan_out": 4,
+                    "effective_fan_out": 1,
                     "observation": "admission_policy_resolved"
                 }
             ])
@@ -3250,6 +3645,163 @@ mod decomposition_tests {
                 ["oneOf"][2]["properties"]["kind"]["const"],
             "fan_out"
         );
+    }
+
+    #[test]
+    fn budget_phase_policy_records_eligible_skip_and_rejects_weak_judgment() {
+        let worker = WorkerAssignment {
+            id: "mechanical-worker".to_string(),
+            role: AgentRole::Worker,
+            assigned_paths: vec![PathBuf::from("mechanical.txt")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            environment_requirements: Vec::new(),
+            report_path: None,
+        };
+        let binding = WorkerPhaseModelBinding {
+            model: ECONOMY_PROFILE_MODEL.to_string(),
+            phase: OrchestrationPhase::MechanicalTerminal,
+            mechanical_duty: Some(MechanicalTerminalDuty::RunPreselectedCommand),
+            mechanical_operands: Some(MechanicalTerminalOperands::RunPreselectedCommand {
+                argv: vec!["true".to_string()],
+                working_directory: PathBuf::from("mechanical.txt"),
+            }),
+        };
+        let mut assignment = test_assignment("mechanical-assignment", "mechanical.txt");
+        assignment.worker_assignments = vec![worker.clone()];
+        assignment.notes = Some(
+            assignment_phase_model_bindings_notes(&AssignmentPhaseModelBindings {
+                workers: BTreeMap::from([(worker.id.clone(), binding.clone())]),
+            })
+            .expect("serialize mechanical phase binding"),
+        );
+        let mut plan = test_plan(Vec::new());
+        plan.role_models.insert(
+            AgentRole::Worker,
+            RoleModelSelection {
+                model: Some(ECONOMY_PROFILE_MODEL.to_string()),
+                reasoning_effort: Some("low".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs([FRONTIER_PROFILE_MODEL, ECONOMY_PROFILE_MODEL])
+                .expect("phase-policy model catalog"),
+        );
+        let soft = RunBudgetLedger::new(RunBudgetLimits {
+            soft_tokens: Some(1),
+            hard_tokens: Some(2),
+            soft_cost_usd: None,
+            hard_cost_usd: None,
+        })
+        .expect("phase-policy budget ledger")
+        .reserve(BudgetReservationRequest {
+            role: AgentRole::ChildOrchestrator,
+            tokens: 1,
+            cost_usd: None,
+        })
+        .expect("phase-policy soft reservation")
+        .report()
+        .clone();
+
+        let mut controller = BudgetDegradationController::new(4);
+        controller
+            .assignment_policy(
+                &assignment,
+                None,
+                &soft,
+                &plan,
+                &catalog,
+                SupervisorRuntime::Codex,
+            )
+            .expect("eligible mechanical binding remains admitted")
+            .expect("eligible mechanical assignment policy");
+        assert_eq!(controller.effective_fan_out, 2);
+        assert!(controller.model_policy_findings.iter().any(|finding| {
+            finding.message.contains("is policy-eligible")
+                && finding
+                    .message
+                    .contains("not independently process-observable")
+        }));
+        assert!(controller
+            .records
+            .iter()
+            .all(|record| matches!(record.change, BudgetDegradationChange::FanOut { .. })));
+
+        let mut invalid_binding = binding;
+        invalid_binding.phase = OrchestrationPhase::ReviewAcceptance;
+        invalid_binding.mechanical_duty = None;
+        assignment.notes = Some(
+            assignment_phase_model_bindings_notes(&AssignmentPhaseModelBindings {
+                workers: BTreeMap::from([(worker.id, invalid_binding)]),
+            })
+            .expect("serialize invalid phase binding fixture"),
+        );
+        let mut rejected = BudgetDegradationController::new(4);
+        let error = rejected
+            .assignment_policy(
+                &assignment,
+                None,
+                &soft,
+                &plan,
+                &catalog,
+                SupervisorRuntime::Codex,
+            )
+            .expect_err("weak review-acceptance binding must fail closed");
+        assert!(error
+            .to_string()
+            .contains("budget phase-model policy rejected"));
+        assert_eq!(rejected.effective_fan_out, 4);
+        assert!(rejected.records.is_empty());
+    }
+
+    #[test]
+    fn halt_model_resolution_failure_is_explicit_and_not_recorded_as_resolved() {
+        let assignment = test_assignment("halt-resolution", "halt.txt");
+        let mut plan = test_plan(Vec::new());
+        plan.role_models.insert(
+            AgentRole::ChildOrchestrator,
+            RoleModelSelection {
+                model: Some("unavailable-child-model".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs([FRONTIER_PROFILE_MODEL])
+                .expect("halt resolution catalog"),
+        );
+        let hard = RunBudgetLedger::new(RunBudgetLimits {
+            soft_tokens: None,
+            hard_tokens: Some(1),
+            soft_cost_usd: None,
+            hard_cost_usd: None,
+        })
+        .expect("halt resolution ledger")
+        .reserve(BudgetReservationRequest {
+            role: AgentRole::ChildOrchestrator,
+            tokens: 1,
+            cost_usd: None,
+        })
+        .expect("halt resolution reservation")
+        .report()
+        .clone();
+        let mut controller = BudgetDegradationController::new(2);
+        let error = controller
+            .assignment_policy(
+                &assignment,
+                Some(ReasoningEffort::High),
+                &hard,
+                &plan,
+                &catalog,
+                SupervisorRuntime::Codex,
+            )
+            .expect_err("unavailable halt model must remain an explicit error");
+        assert!(error
+            .to_string()
+            .contains("failed to resolve child model while recording budget halt"));
+        assert!(controller.records.is_empty());
     }
 
     #[test]
@@ -3360,7 +3912,7 @@ mod decomposition_tests {
     }
 
     #[test]
-    fn protected_duty_floors_bound_budget_effort_degradation() {
+    fn reasoning_effort_resolution_still_clamps_protected_duties() {
         let gate = resolve_reasoning_effort(
             AgentRole::GateClassifier,
             Some(ReasoningEffort::Xhigh),
@@ -4280,6 +4832,47 @@ mod decomposition_tests {
                 .expect("prepared budget report")
                 .new_dispatch_allowed
         );
+    }
+
+    #[test]
+    fn preflight_rejects_unknown_selected_model_before_artifact_reservation() {
+        let (_temp, repo) = test_repository();
+        let mut plan = test_plan(vec![test_assignment("unknown-child", "README.md")]);
+        plan.role_models.insert(
+            AgentRole::ChildOrchestrator,
+            RoleModelSelection {
+                model: Some("custom-unknown-model".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let loaded = LoadedSupervisorPlan {
+            plan,
+            consultant: SupervisorConsultantPlan::default(),
+            assignment_metadata: AssignmentMetadata::new(),
+            plan_metadata: SupervisorPlanMetadata::default(),
+        };
+        let mut options = test_options(&repo, "unknown-model-preflight");
+        options.runtime = SupervisorRuntime::Codex;
+        let catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs([FRONTIER_PROFILE_MODEL, "custom-unknown-model"])
+                .expect("unknown selected model catalog"),
+        );
+
+        let error = match prepare_supervisor_run(
+            loaded,
+            &options,
+            1,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            SupervisorWorktreeCreation::TestOnly,
+            Ok(catalog),
+        ) {
+            Ok(_) => panic!("unknown selected model must fail before artifact reservation"),
+            Err(error) => error,
+        };
+
+        assert!(format!("{error:#}").contains("no trusted built-in capability policy"));
+        assert!(!repo.join(".maco").exists());
     }
 
     #[test]
