@@ -10564,6 +10564,238 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn normalized_nix_store_descendant_for_test(path: &Path) -> bool {
+        path.is_absolute()
+            && path != Path::new("/nix/store")
+            && path.starts_with("/nix/store")
+            && !path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir
+                        | std::path::Component::ParentDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn select_store_backed_executable_from_path_for_test(
+        name: &OsStr,
+        search_path: &OsStr,
+        mut trusted_target: impl FnMut(&Path) -> Option<PathBuf>,
+    ) -> Option<(PathBuf, PathBuf)> {
+        let mut name_components = Path::new(name).components();
+        if !matches!(
+            name_components.next(),
+            Some(std::path::Component::Normal(_))
+        ) || name_components.next().is_some()
+        {
+            return None;
+        }
+        for directory in env::split_paths(search_path) {
+            let alias = directory.join(name);
+            if !normalized_nix_store_descendant_for_test(&alias) {
+                continue;
+            }
+            let Some(canonical) = trusted_target(&alias) else {
+                continue;
+            };
+            if normalized_nix_store_descendant_for_test(&canonical) {
+                return Some((alias, canonical));
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn trusted_store_ancestor_chain_for_test(path: &Path) -> bool {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let mut ancestor = path.parent();
+        while let Some(directory) = ancestor {
+            let Ok(metadata) = fs::metadata(directory) else {
+                return false;
+            };
+            let immutable_nix_store_root = directory == Path::new("/nix/store")
+                && metadata.uid() == 0
+                && metadata.permissions().mode() & 0o1000 != 0;
+            if !metadata.file_type().is_dir()
+                || metadata.uid() != 0
+                || (!immutable_nix_store_root && metadata.permissions().mode() & 0o022 != 0)
+            {
+                return false;
+            }
+            ancestor = directory.parent();
+        }
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn trusted_store_executable_mode_for_test(mode: u32) -> bool {
+        mode & 0o100 != 0 && mode & 0o022 == 0
+    }
+
+    #[cfg(target_os = "linux")]
+    fn trusted_store_executable_target_for_test(alias: &Path) -> Option<PathBuf> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if !normalized_nix_store_descendant_for_test(alias) {
+            return None;
+        }
+        let alias_metadata = fs::symlink_metadata(alias).ok()?;
+        if alias_metadata.uid() != 0
+            || !(alias_metadata.file_type().is_file() || alias_metadata.file_type().is_symlink())
+        {
+            return None;
+        }
+        let canonical = fs::canonicalize(alias).ok()?;
+        if !normalized_nix_store_descendant_for_test(&canonical) {
+            return None;
+        }
+        let target_metadata = fs::symlink_metadata(&canonical).ok()?;
+        let target_mode = target_metadata.permissions().mode();
+        if !target_metadata.file_type().is_file()
+            || target_metadata.uid() != 0
+            || !trusted_store_executable_mode_for_test(target_mode)
+            || !trusted_store_ancestor_chain_for_test(alias)
+            || !trusted_store_ancestor_chain_for_test(&canonical)
+        {
+            return None;
+        }
+        Some(canonical)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn trusted_store_executable_from_development_path_for_test(
+        name: &OsStr,
+    ) -> Option<(PathBuf, PathBuf)> {
+        let search_path = env::var_os("PATH")?;
+        select_store_backed_executable_from_path_for_test(
+            name,
+            &search_path,
+            trusted_store_executable_target_for_test,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn store_backed_test_helper_paths_are_normalized_component_descendants() {
+        for path in [
+            Path::new("/nix/store/package/bin/env"),
+            Path::new("/nix/store/package/bin/coreutils"),
+        ] {
+            assert!(normalized_nix_store_descendant_for_test(path));
+        }
+        for path in [
+            Path::new("/nix/store"),
+            Path::new("/nix/store-alike/package/bin/env"),
+            Path::new("/nix/store/package/bin/../env"),
+            Path::new("nix/store/package/bin/env"),
+            Path::new("/usr/bin/env"),
+        ] {
+            assert!(
+                !normalized_nix_store_descendant_for_test(path),
+                "unsafe store helper path was accepted: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn store_backed_test_helper_target_mode_requires_owner_execution() {
+        for mode in [0o100, 0o500, 0o555] {
+            assert!(trusted_store_executable_mode_for_test(mode));
+        }
+        for mode in [0o001, 0o010, 0o011, 0o055, 0o122, 0o133] {
+            assert!(
+                !trusted_store_executable_mode_for_test(mode),
+                "unsafe executable mode was accepted: {mode:o}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn store_backed_test_helper_selector_uses_only_trusted_store_aliases_and_targets() {
+        let fhs = PathBuf::from("/usr/bin");
+        let lexical_prefix = PathBuf::from("/nix/store-alike/package/bin");
+        let non_normalized = PathBuf::from("/nix/store/package/bin/..");
+        let escaping_target = PathBuf::from("/nix/store/escaping/bin");
+        let rejected = PathBuf::from("/nix/store/rejected/bin");
+        let accepted = PathBuf::from("/nix/store/accepted/bin");
+        let search_path = env::join_paths([
+            &fhs,
+            &lexical_prefix,
+            &non_normalized,
+            &escaping_target,
+            &rejected,
+            &accepted,
+        ])
+        .expect("synthetic PATH");
+        let mut inspected = Vec::new();
+        let selected = select_store_backed_executable_from_path_for_test(
+            OsStr::new("env"),
+            &search_path,
+            |candidate| {
+                inspected.push(candidate.to_path_buf());
+                if candidate == escaping_target.join("env") {
+                    Some(PathBuf::from("/usr/bin/env"))
+                } else if candidate == rejected.join("env") {
+                    None
+                } else if candidate == accepted.join("env") {
+                    Some(PathBuf::from("/nix/store/accepted/bin/coreutils"))
+                } else {
+                    panic!(
+                        "selector inspected an unsafe candidate: {}",
+                        candidate.display()
+                    )
+                }
+            },
+        )
+        .expect("select trusted store helper");
+        assert_eq!(selected.0, accepted.join("env"));
+        assert_eq!(
+            selected.1,
+            PathBuf::from("/nix/store/accepted/bin/coreutils")
+        );
+        assert_eq!(
+            inspected,
+            vec![
+                escaping_target.join("env"),
+                rejected.join("env"),
+                accepted.join("env")
+            ]
+        );
+
+        assert!(select_store_backed_executable_from_path_for_test(
+            OsStr::new("../env"),
+            &search_path,
+            |_| panic!("invalid executable name reached trust inspection"),
+        )
+        .is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolated_runtime_file_guard_still_rejects_non_store_executables() {
+        let current_executable = env::current_exe().expect("current test executable");
+        assert!(
+            !fs::canonicalize(&current_executable)
+                .expect("canonical test executable")
+                .starts_with("/nix/store"),
+            "the configured Cargo target must keep this rejection fixture outside /nix/store"
+        );
+        let mut sandbox = program_visibility_sandbox(Path::new("/workspace"));
+        sandbox.isolated_host_view = true;
+        let error = sandbox
+            .add_isolated_runtime_file(&current_executable)
+            .expect_err("non-store helper must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("outside /nix/store"));
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn sandbox_program_visibility_rejects_private_tmp_and_hidden_roots() {
         let mut sandbox = program_visibility_sandbox(Path::new("/opt/maco/workspace"));
@@ -12448,12 +12680,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn isolated_host_view_resolves_disjoint_required_mounts_and_root_tmpfs() {
-        if !Path::new("/nix/store").is_dir() {
+        let Some((env_helper, canonical_env_helper)) =
+            trusted_store_executable_from_development_path_for_test(OsStr::new("env"))
+        else {
             eprintln!(
-                "skipping Nix-store-dependent isolated-host-view test: /nix/store is unavailable"
+                "skipping isolated-host-view fixture: development-shell PATH has no trusted store-backed env helper"
             );
             return;
-        }
+        };
 
         let temp = tempfile::tempdir().expect("tempdir");
         let view = temp.path().join("view");
@@ -12481,18 +12715,12 @@ mod tests {
         let mut sandbox = resolve_systemd_sandbox(&spec)
             .expect("resolve isolated sandbox")
             .expect("sandbox config");
-        let env_helper = trusted_system_executable(
-            "env",
-            &["/usr/bin/env", "/bin/env", "/run/current-system/sw/bin/env"],
-        )
-        .expect("trusted env helper");
         sandbox
             .add_isolated_runtime_file(&env_helper)
-            .expect("bind exact helper alias");
-        let canonical_env_helper = fs::canonicalize(&env_helper).expect("canonical env helper");
+            .expect("bind trusted store helper alias");
         sandbox
             .add_isolated_runtime_file(&canonical_env_helper)
-            .expect("bind helper nested under visible Nix store");
+            .expect("bind trusted store helper canonical target");
         sandbox
             .add_private_runtime_root(&runtime)
             .expect("bind private runtime");
