@@ -56,10 +56,7 @@ pub enum ExecutorError {
     #[error("changed path is outside assignment scope: {0}")]
     ChangedPathOutsideScope(String),
     #[error("remote collection was rejected: {reason}")]
-    CollectionRejected {
-        reason: String,
-        cleanup: Box<Effect<CleanupReceipt>>,
-    },
+    CollectionRejected { reason: String },
 }
 
 pub type ExecutorResult<T> = Result<T, ExecutorError>;
@@ -571,10 +568,26 @@ impl ManifestPurpose {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum ManifestEntryKind {
     Input { bytes: Vec<u8>, digest: Digest },
     Output { max_bytes: u64 },
+}
+
+impl fmt::Debug for ManifestEntryKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input { bytes, digest } => formatter
+                .debug_struct("Input")
+                .field("byte_len", &bytes.len())
+                .field("digest", digest)
+                .finish(),
+            Self::Output { max_bytes } => formatter
+                .debug_struct("Output")
+                .field("max_bytes", max_bytes)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -718,17 +731,28 @@ impl InputManifest {
         }
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         let mut total = 0_usize;
-        let mut previous: Option<&LogicalPath> = None;
+        let mut seen_paths = BTreeSet::new();
         let mut canonical = Vec::new();
         for entry in entries.iter() {
             entry.revalidate()?;
-            if previous == Some(&entry.path) {
+            if seen_paths.contains(entry.path.as_str()) {
                 return Err(ExecutorError::Duplicate {
                     what: "manifest path",
                     value: entry.path.to_string(),
                 });
             }
-            previous = Some(&entry.path);
+            if entry
+                .path
+                .as_str()
+                .match_indices('/')
+                .any(|(separator, _)| seen_paths.contains(&entry.path.as_str()[..separator]))
+            {
+                return Err(invalid(
+                    "manifest path",
+                    format!("'{}' collides with an ancestor manifest path", entry.path),
+                ));
+            }
+            seen_paths.insert(entry.path.as_str());
             let input_length = entry.input_bytes().map_or(0, <[u8]>::len);
             total = total
                 .checked_add(input_length)
@@ -841,17 +865,35 @@ impl AssignmentIdentity {
 pub struct StageRequest {
     pub(super) identity: AssignmentIdentity,
     pub(super) manifest: InputManifest,
+    pub(super) launch_spec: LaunchSpec,
+    pub(super) collection: CollectionAuthority,
     pub(super) key: IdempotencyKey,
 }
 
 impl StageRequest {
-    pub fn new(identity: AssignmentIdentity, manifest: InputManifest) -> Self {
-        let key = derive_assignment_key("stage", &identity, manifest.digest());
-        Self {
+    pub fn new(
+        identity: AssignmentIdentity,
+        manifest: InputManifest,
+        launch_spec: LaunchSpec,
+        output_policy: OutputPolicy,
+    ) -> ExecutorResult<Self> {
+        manifest.revalidate()?;
+        launch_spec.revalidate()?;
+        let collection = CollectionAuthority::for_stage(
+            &identity,
+            manifest.digest(),
+            launch_spec.digest(),
+            output_policy,
+        )?;
+        validate_staged_output_declarations(&manifest, collection.policy())?;
+        let key = derive_assignment_key("stage", &identity, manifest.digest(), &collection);
+        Ok(Self {
             identity,
             manifest,
+            launch_spec,
+            collection,
             key,
-        }
+        })
     }
 
     pub fn identity(&self) -> &AssignmentIdentity {
@@ -860,6 +902,14 @@ impl StageRequest {
 
     pub fn manifest(&self) -> &InputManifest {
         &self.manifest
+    }
+
+    pub fn collection_authority(&self) -> &CollectionAuthority {
+        &self.collection
+    }
+
+    pub fn launch_spec(&self) -> &LaunchSpec {
+        &self.launch_spec
     }
 
     pub fn key(&self) -> &IdempotencyKey {
@@ -939,6 +989,8 @@ pub struct StagedAssignment {
     pub(super) session_id: SessionId,
     pub(super) workspace_id: WorkspaceId,
     pub(super) manifest: InputManifest,
+    pub(super) launch_spec: LaunchSpec,
+    pub(super) collection: CollectionAuthority,
 }
 
 impl StagedAssignment {
@@ -960,6 +1012,14 @@ impl StagedAssignment {
 
     pub fn manifest(&self) -> &InputManifest {
         &self.manifest
+    }
+
+    pub fn collection_authority(&self) -> &CollectionAuthority {
+        &self.collection
+    }
+
+    pub fn launch_spec(&self) -> &LaunchSpec {
+        &self.launch_spec
     }
 }
 
@@ -1054,16 +1114,15 @@ fn digest_launch_spec(argv: &TypedArgv, stdin: &LogicalPath, deadline: BoundedMi
 #[derive(Debug, PartialEq, Eq)]
 pub struct LaunchRequest {
     pub(super) staged: StagedAssignment,
-    pub(super) spec: LaunchSpec,
 }
 
 impl LaunchRequest {
-    pub fn new(staged: StagedAssignment, spec: LaunchSpec) -> Self {
-        Self { staged, spec }
+    pub fn new(staged: StagedAssignment) -> Self {
+        Self { staged }
     }
 
     pub fn spec(&self) -> &LaunchSpec {
-        &self.spec
+        &self.staged.launch_spec
     }
 
     pub fn staged(&self) -> &StagedAssignment {
@@ -1078,18 +1137,20 @@ pub struct SubmittedLaunchIdentity {
     pub(super) session_id: SessionId,
     pub(super) workspace_id: WorkspaceId,
     pub(super) launch_spec_digest: Digest,
+    pub(super) collection: CollectionAuthority,
     pub(super) launch_key: IdempotencyKey,
 }
 
 impl SubmittedLaunchIdentity {
-    pub(super) fn for_launch(staged: &StagedAssignment, spec: &LaunchSpec) -> Self {
-        let launch_key = derive_staged_key("launch", staged, spec.digest());
+    pub(super) fn for_launch(staged: &StagedAssignment) -> Self {
+        let launch_key = derive_staged_key(staged, staged.launch_spec.digest());
         Self {
             assignment: staged.identity.clone(),
             staged_digest: staged.staged_digest.clone(),
             session_id: staged.session_id.clone(),
             workspace_id: staged.workspace_id.clone(),
-            launch_spec_digest: spec.digest().clone(),
+            launch_spec_digest: staged.launch_spec.digest().clone(),
+            collection: staged.collection.clone(),
             launch_key,
         }
     }
@@ -1117,6 +1178,10 @@ impl SubmittedLaunchIdentity {
     pub fn launch_spec_digest(&self) -> &Digest {
         &self.launch_spec_digest
     }
+
+    pub fn collection_authority(&self) -> &CollectionAuthority {
+        &self.collection
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1138,6 +1203,7 @@ pub struct ExecutionIdentity {
     pub(super) session_id: SessionId,
     pub(super) workspace_id: WorkspaceId,
     pub(super) launch_spec_digest: Digest,
+    pub(super) collection: CollectionAuthority,
     pub(super) pid: u32,
     pub(super) pgid: u32,
     pub(super) start_token: StartToken,
@@ -1155,6 +1221,7 @@ impl ExecutionIdentity {
         session_id: SessionId,
         workspace_id: WorkspaceId,
         launch_spec_digest: Digest,
+        collection: CollectionAuthority,
         pid: u32,
         pgid: u32,
         start_token: StartToken,
@@ -1166,6 +1233,27 @@ impl ExecutionIdentity {
                 "PID and PGID must be nonzero",
             ));
         }
+        let assignment = AssignmentIdentity::new(
+            host_id.clone(),
+            run_id.clone(),
+            assignment_id.clone(),
+            nonce.clone(),
+        );
+        collection.revalidate_for(&assignment, &staged_digest, &launch_spec_digest)?;
+        let expected_launch_key = derive_launch_key_parts(
+            &assignment,
+            &staged_digest,
+            &session_id,
+            &workspace_id,
+            &launch_spec_digest,
+            &collection,
+        );
+        if launch_key != expected_launch_key {
+            return Err(invalid(
+                "execution identity",
+                "launch key does not bind the staged launch and collection authority",
+            ));
+        }
         Ok(Self {
             host_id,
             run_id,
@@ -1175,6 +1263,7 @@ impl ExecutionIdentity {
             session_id,
             workspace_id,
             launch_spec_digest,
+            collection,
             pid,
             pgid,
             start_token,
@@ -1216,6 +1305,10 @@ impl ExecutionIdentity {
 
     pub fn launch_spec_digest(&self) -> &Digest {
         &self.launch_spec_digest
+    }
+
+    pub fn collection_authority(&self) -> &CollectionAuthority {
+        &self.collection
     }
 
     pub fn pid(&self) -> u32 {
@@ -1261,11 +1354,6 @@ impl LaunchReceipt {
 
     pub fn key(&self) -> &IdempotencyKey {
         &self.key
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_protocol_version_for_test(&mut self, value: u32) {
-        self.protocol_version = value;
     }
 }
 
@@ -1765,6 +1853,116 @@ impl OutputPolicy {
     }
 }
 
+/// Immutable collection authority fixed before staging can have a remote effect.
+///
+/// The full policy is retained so collection cannot substitute a wider scope or a
+/// different output declaration after launch. The digest and collection key are
+/// canonical bindings carried through every later lifecycle identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionAuthority {
+    policy: OutputPolicy,
+    policy_digest: Digest,
+    launch_spec_digest: Digest,
+    collection_key: IdempotencyKey,
+}
+
+impl CollectionAuthority {
+    pub(super) fn for_stage(
+        identity: &AssignmentIdentity,
+        staged_digest: &Digest,
+        launch_spec_digest: &Digest,
+        policy: OutputPolicy,
+    ) -> ExecutorResult<Self> {
+        policy.revalidate()?;
+        let policy_digest = policy.digest().clone();
+        let collection_key =
+            derive_collection_key(identity, staged_digest, launch_spec_digest, &policy_digest);
+        Ok(Self {
+            policy,
+            policy_digest,
+            launch_spec_digest: launch_spec_digest.clone(),
+            collection_key,
+        })
+    }
+
+    pub fn policy(&self) -> &OutputPolicy {
+        &self.policy
+    }
+
+    pub fn policy_digest(&self) -> &Digest {
+        &self.policy_digest
+    }
+
+    pub fn collection_key(&self) -> &IdempotencyKey {
+        &self.collection_key
+    }
+
+    pub fn launch_spec_digest(&self) -> &Digest {
+        &self.launch_spec_digest
+    }
+
+    pub(super) fn revalidate_for(
+        &self,
+        identity: &AssignmentIdentity,
+        staged_digest: &Digest,
+        launch_spec_digest: &Digest,
+    ) -> ExecutorResult<()> {
+        self.policy.revalidate()?;
+        if self.policy.digest() != &self.policy_digest {
+            return Err(invalid(
+                "collection authority",
+                "policy digest does not match the immutable output policy",
+            ));
+        }
+        if &self.launch_spec_digest != launch_spec_digest {
+            return Err(invalid(
+                "collection authority",
+                "launch-spec digest does not match the immutable staged launch",
+            ));
+        }
+        let expected_key = derive_collection_key(
+            identity,
+            staged_digest,
+            launch_spec_digest,
+            &self.policy_digest,
+        );
+        if self.collection_key != expected_key {
+            return Err(invalid(
+                "collection authority",
+                "collection key does not bind assignment, staged manifest, launch spec, and output policy",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn validate_staged_output_declarations(
+    manifest: &InputManifest,
+    policy: &OutputPolicy,
+) -> ExecutorResult<()> {
+    let staged = manifest
+        .entries()
+        .iter()
+        .filter(|entry| entry.purpose() == ManifestPurpose::DeclaredOutput)
+        .collect::<Vec<_>>();
+    if staged.len() != policy.declared_outputs().len() {
+        return Err(invalid(
+            "staged output declarations",
+            "declared-output entry count does not match the collection policy",
+        ));
+    }
+    for (entry, declared) in staged.into_iter().zip(policy.declared_outputs()) {
+        if entry.path() != declared.path() || entry.output_max_bytes() != Some(declared.max_bytes())
+        {
+            return Err(invalid(
+                "staged output declarations",
+                "declared-output paths and byte limits must exactly match the collection policy",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn digest_output_policy(
     patch_max_bytes: u64,
     changed_paths_max: usize,
@@ -1808,12 +2006,11 @@ fn reject_duplicates<'a>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectRequest {
     pub(super) identity: ExecutionIdentity,
-    pub(super) policy: OutputPolicy,
 }
 
 impl CollectRequest {
-    pub fn new(identity: ExecutionIdentity, policy: OutputPolicy) -> Self {
-        Self { identity, policy }
+    pub fn new(identity: ExecutionIdentity) -> Self {
+        Self { identity }
     }
 
     pub fn identity(&self) -> &ExecutionIdentity {
@@ -1821,7 +2018,15 @@ impl CollectRequest {
     }
 
     pub fn policy(&self) -> &OutputPolicy {
-        &self.policy
+        self.identity.collection_authority().policy()
+    }
+
+    pub fn policy_digest(&self) -> &Digest {
+        self.identity.collection_authority().policy_digest()
+    }
+
+    pub fn collection_key(&self) -> &IdempotencyKey {
+        self.identity.collection_authority().collection_key()
     }
 }
 
@@ -1974,11 +2179,22 @@ impl TransportReadLimits {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CollectedBlob {
     pub(super) bytes: Vec<u8>,
     pub(super) declared_size: u64,
     pub(super) digest: Digest,
+}
+
+impl fmt::Debug for CollectedBlob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CollectedBlob")
+            .field("byte_len", &self.bytes.len())
+            .field("declared_size", &self.declared_size)
+            .field("digest", &self.digest)
+            .finish()
+    }
 }
 
 impl CollectedBlob {
@@ -2392,6 +2608,9 @@ fn append_execution_identity(canonical: &mut Vec<u8>, identity: &ExecutionIdenti
         identity.session_id.as_str(),
         identity.workspace_id.as_str(),
         identity.launch_spec_digest.as_str(),
+        identity.collection.policy_digest.as_str(),
+        identity.collection.launch_spec_digest.as_str(),
+        identity.collection.collection_key.as_str(),
         identity.start_token.as_str(),
         identity.launch_key.as_str(),
     ] {
@@ -2401,12 +2620,24 @@ fn append_execution_identity(canonical: &mut Vec<u8>, identity: &ExecutionIdenti
     append_framed(canonical, &identity.pgid.to_be_bytes());
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CollectedOutput {
     pub(super) path: LogicalPath,
     pub(super) media_type: String,
     pub(super) bytes: Vec<u8>,
     pub(super) digest: Digest,
+}
+
+impl fmt::Debug for CollectedOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CollectedOutput")
+            .field("path", &self.path)
+            .field("media_type", &self.media_type)
+            .field("byte_len", &self.bytes.len())
+            .field("digest", &self.digest)
+            .finish()
+    }
 }
 
 impl CollectedOutput {
@@ -2427,17 +2658,32 @@ impl CollectedOutput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CollectedResult {
     pub(super) identity: ExecutionIdentity,
     pub(super) patch: Vec<u8>,
     pub(super) patch_digest: Digest,
     pub(super) changed_paths: Vec<LogicalPath>,
     pub(super) outputs: Vec<CollectedOutput>,
-    pub(super) cleanup: Effect<CleanupReceipt>,
+    pub(super) binding: CollectionEvidenceBinding,
     /// Remote output is candidate evidence only. It is never local containment,
     /// review, validation, merge, or apply evidence.
     pub(super) candidate_evidence_only: bool,
+}
+
+impl fmt::Debug for CollectedResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CollectedResult")
+            .field("identity", &self.identity)
+            .field("patch_byte_len", &self.patch.len())
+            .field("patch_digest", &self.patch_digest)
+            .field("changed_paths", &self.changed_paths)
+            .field("outputs", &self.outputs)
+            .field("binding", &self.binding)
+            .field("candidate_evidence_only", &self.candidate_evidence_only)
+            .finish()
+    }
 }
 
 impl CollectedResult {
@@ -2461,12 +2707,62 @@ impl CollectedResult {
         &self.outputs
     }
 
-    pub fn cleanup(&self) -> &Effect<CleanupReceipt> {
-        &self.cleanup
+    pub fn binding(&self) -> &CollectionEvidenceBinding {
+        &self.binding
     }
 
     pub fn is_candidate_evidence_only(&self) -> bool {
         self.candidate_evidence_only
+    }
+}
+
+/// Canonical receipt binding that must be durably retained with collected bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionEvidenceBinding {
+    pub(super) manifest_digest: Digest,
+    pub(super) policy_digest: Digest,
+    pub(super) collection_key: IdempotencyKey,
+}
+
+impl CollectionEvidenceBinding {
+    pub fn manifest_digest(&self) -> &Digest {
+        &self.manifest_digest
+    }
+
+    pub fn policy_digest(&self) -> &Digest {
+        &self.policy_digest
+    }
+
+    pub fn collection_key(&self) -> &IdempotencyKey {
+        &self.collection_key
+    }
+}
+
+/// Explicit remote-workspace cleanup authority. Construct this only after the
+/// caller has durably persisted and locally imported/recaptured collection evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupRequest {
+    pub(super) identity: ExecutionIdentity,
+    pub(super) key: IdempotencyKey,
+}
+
+impl CleanupRequest {
+    pub fn new(identity: ExecutionIdentity) -> Self {
+        let key = derive_execution_key("cleanup", &identity);
+        Self { identity, key }
+    }
+
+    pub fn identity(&self) -> &ExecutionIdentity {
+        &self.identity
+    }
+
+    pub fn key(&self) -> &IdempotencyKey {
+        &self.key
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tamper_key_for_test(&mut self, key: IdempotencyKey) {
+        self.key = key;
     }
 }
 
@@ -2560,6 +2856,9 @@ impl fmt::Display for Operation {
 pub struct StageLookup {
     pub identity: AssignmentIdentity,
     pub manifest_digest: Digest,
+    pub launch_spec_digest: Digest,
+    pub policy_digest: Digest,
+    pub collection_key: IdempotencyKey,
     pub stage_key: IdempotencyKey,
     /// Stage has no automatic replay path in wave 1. An operator or a future
     /// helper status endpoint must reconcile this exact binding.
@@ -2581,9 +2880,17 @@ pub struct CollectionLookup {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlLookup {
+    pub identity: ExecutionIdentity,
+    pub signal: ControlSignal,
+    pub control_key: IdempotencyKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconciliationTarget {
     StageOperator(StageLookup),
     Execution(ExecutionQuery),
+    Control(ControlLookup),
     Collection(CollectionLookup),
     Cleanup(CleanupLookup),
 }
@@ -2612,6 +2919,7 @@ pub(crate) fn derive_assignment_key(
     phase: &str,
     identity: &AssignmentIdentity,
     staged_digest: &Digest,
+    collection: &CollectionAuthority,
 ) -> IdempotencyKey {
     derive_key(
         phase,
@@ -2621,26 +2929,49 @@ pub(crate) fn derive_assignment_key(
             identity.assignment_id.as_str(),
             identity.nonce.as_str(),
             staged_digest.as_str(),
+            collection.policy_digest.as_str(),
+            collection.launch_spec_digest.as_str(),
+            collection.collection_key.as_str(),
         ],
     )
 }
 
 pub(crate) fn derive_staged_key(
-    phase: &str,
     staged: &StagedAssignment,
     launch_spec_digest: &Digest,
 ) -> IdempotencyKey {
+    derive_launch_key_parts(
+        &staged.identity,
+        &staged.staged_digest,
+        &staged.session_id,
+        &staged.workspace_id,
+        launch_spec_digest,
+        &staged.collection,
+    )
+}
+
+fn derive_launch_key_parts(
+    identity: &AssignmentIdentity,
+    staged_digest: &Digest,
+    session_id: &SessionId,
+    workspace_id: &WorkspaceId,
+    launch_spec_digest: &Digest,
+    collection: &CollectionAuthority,
+) -> IdempotencyKey {
     derive_key(
-        phase,
+        "launch",
         [
-            staged.identity.host_id.as_str(),
-            staged.identity.run_id.as_str(),
-            staged.identity.assignment_id.as_str(),
-            staged.identity.nonce.as_str(),
-            staged.staged_digest.as_str(),
-            staged.session_id.as_str(),
-            staged.workspace_id.as_str(),
+            identity.host_id.as_str(),
+            identity.run_id.as_str(),
+            identity.assignment_id.as_str(),
+            identity.nonce.as_str(),
+            staged_digest.as_str(),
+            session_id.as_str(),
+            workspace_id.as_str(),
             launch_spec_digest.as_str(),
+            collection.policy_digest.as_str(),
+            collection.launch_spec_digest.as_str(),
+            collection.collection_key.as_str(),
         ],
     )
 }
@@ -2660,6 +2991,9 @@ pub(crate) fn derive_submitted_key(
             submitted.session_id.as_str(),
             submitted.workspace_id.as_str(),
             submitted.launch_spec_digest.as_str(),
+            submitted.collection.policy_digest.as_str(),
+            submitted.collection.launch_spec_digest.as_str(),
+            submitted.collection.collection_key.as_str(),
             submitted.launch_key.as_str(),
         ],
     )
@@ -2679,6 +3013,9 @@ pub(crate) fn derive_execution_key(phase: &str, identity: &ExecutionIdentity) ->
             identity.session_id.as_str(),
             identity.workspace_id.as_str(),
             identity.launch_spec_digest.as_str(),
+            identity.collection.policy_digest.as_str(),
+            identity.collection.launch_spec_digest.as_str(),
+            identity.collection.collection_key.as_str(),
             pid.as_str(),
             pgid.as_str(),
             identity.start_token.as_str(),
@@ -2715,11 +3052,23 @@ pub(crate) fn derive_control_key(
 }
 
 pub(crate) fn derive_collection_key(
-    identity: &ExecutionIdentity,
+    identity: &AssignmentIdentity,
+    staged_digest: &Digest,
+    launch_spec_digest: &Digest,
     policy_digest: &Digest,
 ) -> IdempotencyKey {
-    let identity_key = derive_execution_key("identity", identity);
-    derive_key("collect", [identity_key.as_str(), policy_digest.as_str()])
+    derive_key(
+        "collect",
+        [
+            identity.host_id.as_str(),
+            identity.run_id.as_str(),
+            identity.assignment_id.as_str(),
+            identity.nonce.as_str(),
+            staged_digest.as_str(),
+            launch_spec_digest.as_str(),
+            policy_digest.as_str(),
+        ],
+    )
 }
 
 pub(crate) fn derive_query_key(phase: &str, query: &ExecutionQuery) -> IdempotencyKey {

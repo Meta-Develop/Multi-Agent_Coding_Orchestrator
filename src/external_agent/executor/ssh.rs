@@ -9,7 +9,10 @@ pub trait AgentExecutor: Send + Sync {
     fn status(&self, request: StatusRequest) -> ExecutorResult<ExecutionStatus>;
     fn wait(&self, request: WaitRequest) -> ExecutorResult<WaitOutcome>;
     fn terminate(&self, request: TerminateRequest) -> ExecutorResult<Effect<TerminationReceipt>>;
+    /// Validate and return remote candidate evidence without performing cleanup.
     fn collect(&self, request: CollectRequest) -> ExecutorResult<Effect<CollectedResult>>;
+    /// Explicit cleanup effect for use after durable persistence and local recapture.
+    fn cleanup(&self, request: CleanupRequest) -> ExecutorResult<Effect<CleanupReceipt>>;
 }
 
 /// Typed transport boundary for the fixed remote helper.
@@ -54,16 +57,36 @@ impl<T: SshTransport> AgentExecutor for SshExecutor<T> {
     fn stage(&self, request: StageRequest) -> ExecutorResult<Effect<StagedAssignment>> {
         self.require_target_host(&request.identity.host_id)?;
         request.manifest.revalidate()?;
-        let expected_key =
-            derive_assignment_key("stage", &request.identity, request.manifest.digest());
+        request.collection.revalidate_for(
+            &request.identity,
+            request.manifest.digest(),
+            request.launch_spec.digest(),
+        )?;
+        validate_staged_output_declarations(&request.manifest, request.collection.policy())?;
+        validate_manifest_launch_spec(&request.manifest, &request.launch_spec)?;
+        let expected_key = derive_assignment_key(
+            "stage",
+            &request.identity,
+            request.manifest.digest(),
+            &request.collection,
+        );
         if request.key != expected_key {
             return Err(ExecutorError::InvalidField {
                 field: "stage idempotency key",
-                reason: "is not bound to the host/run/assignment/nonce/manifest digest".to_string(),
+                reason: "is not bound to the assignment, manifest, launch spec, and collection authority"
+                    .to_string(),
             });
         }
         let key = request.key.clone();
-        let reconciliation_key = key.clone();
+        let lookup = StageLookup {
+            identity: request.identity.clone(),
+            manifest_digest: request.manifest.digest().clone(),
+            launch_spec_digest: request.launch_spec.digest().clone(),
+            policy_digest: request.collection.policy_digest().clone(),
+            collection_key: request.collection.collection_key().clone(),
+            stage_key: key.clone(),
+            operator_only: true,
+        };
         let call = self.transport.stage(StageTransportRequest {
             target: self.target.clone(),
             stage: request.clone(),
@@ -73,55 +96,66 @@ impl<T: SshTransport> AgentExecutor for SshExecutor<T> {
             TransportCall::LostResponse { detail } => {
                 return Ok(Effect::Uncertain(Box::new(UncertainEffect {
                     operation: Operation::Stage,
-                    key: reconciliation_key.clone(),
-                    reconciliation: ReconciliationTarget::StageOperator(StageLookup {
-                        identity: request.identity,
-                        manifest_digest: request.manifest.digest().clone(),
-                        stage_key: reconciliation_key,
-                        operator_only: true,
-                    }),
+                    key,
+                    reconciliation: ReconciliationTarget::StageOperator(lookup),
                     detail,
                 })));
             }
         };
-        require_protocol(Operation::Stage, receipt.protocol_version)?;
-        require_equal(
-            Operation::Stage,
-            &receipt.key,
-            &key,
-            "idempotency key does not match the request",
-        )?;
-        require_equal(
-            Operation::Stage,
-            &receipt.identity,
-            &request.identity,
-            "assignment identity does not match the request",
-        )?;
-        require_equal(
-            Operation::Stage,
-            &receipt.staged_digest,
-            request.manifest.digest(),
-            "staged digest does not match the manifest",
-        )?;
+        let validation = require_protocol(Operation::Stage, receipt.protocol_version)
+            .and_then(|()| {
+                require_equal(
+                    Operation::Stage,
+                    &receipt.key,
+                    &key,
+                    "idempotency key does not match the request",
+                )
+            })
+            .and_then(|()| {
+                require_equal(
+                    Operation::Stage,
+                    &receipt.identity,
+                    &request.identity,
+                    "assignment identity does not match the request",
+                )
+            })
+            .and_then(|()| {
+                require_equal(
+                    Operation::Stage,
+                    &receipt.staged_digest,
+                    request.manifest.digest(),
+                    "staged digest does not match the manifest",
+                )
+            });
+        if let Err(error) = validation {
+            return Ok(Effect::Uncertain(Box::new(UncertainEffect {
+                operation: Operation::Stage,
+                key,
+                reconciliation: ReconciliationTarget::StageOperator(lookup),
+                detail: error.to_string(),
+            })));
+        }
         Ok(Effect::Confirmed(StagedAssignment {
             identity: request.identity,
             staged_digest: receipt.staged_digest,
             session_id: receipt.session_id,
             workspace_id: receipt.workspace_id,
             manifest: request.manifest,
+            launch_spec: request.launch_spec,
+            collection: request.collection,
         }))
     }
 
     fn launch(&self, request: LaunchRequest) -> ExecutorResult<Effect<LaunchReceipt>> {
         self.require_target_host(&request.staged.identity.host_id)?;
         validate_launch_manifest(&request)?;
-        let submitted = SubmittedLaunchIdentity::for_launch(&request.staged, &request.spec);
+        let submitted = SubmittedLaunchIdentity::for_launch(&request.staged);
         let call = self.transport.launch(LaunchTransportRequest {
             target: self.target.clone(),
             submitted: submitted.clone(),
-            argv: request.spec.argv,
-            stdin: request.spec.stdin,
-            deadline: request.spec.deadline,
+            argv: request.staged.launch_spec.argv,
+            stdin: request.staged.launch_spec.stdin,
+            deadline: request.staged.launch_spec.deadline,
         });
         let receipt = match call {
             TransportCall::Response(receipt) => receipt,
@@ -136,7 +170,16 @@ impl<T: SshTransport> AgentExecutor for SshExecutor<T> {
                 })));
             }
         };
-        validate_launch_receipt(&submitted, &receipt)?;
+        if let Err(error) = validate_launch_receipt(&submitted, &receipt) {
+            return Ok(Effect::Uncertain(Box::new(UncertainEffect {
+                operation: Operation::Launch,
+                key: submitted.launch_key.clone(),
+                reconciliation: ReconciliationTarget::Execution(ExecutionQuery::Submitted(
+                    submitted,
+                )),
+                detail: error.to_string(),
+            })));
+        }
         Ok(Effect::Confirmed(receipt))
     }
 
@@ -190,9 +233,6 @@ impl<T: SshTransport> AgentExecutor for SshExecutor<T> {
 
     fn terminate(&self, request: TerminateRequest) -> ExecutorResult<Effect<TerminationReceipt>> {
         self.require_target_host(&request.identity.host_id)?;
-        let query =
-            ReconciliationTarget::Execution(ExecutionQuery::Known(request.identity.clone()));
-
         let term_key = derive_control_key(
             "terminate-term",
             &request.identity,
@@ -206,10 +246,7 @@ impl<T: SshTransport> AgentExecutor for SshExecutor<T> {
             ControlSignal::Term,
         )? {
             Effect::Confirmed(receipt) => receipt,
-            Effect::Uncertain(mut uncertain) => {
-                uncertain.reconciliation = query.clone();
-                return Ok(Effect::Uncertain(uncertain));
-            }
+            Effect::Uncertain(uncertain) => return Ok(Effect::Uncertain(uncertain)),
         };
 
         let grace_key = derive_wait_key(
@@ -224,10 +261,7 @@ impl<T: SshTransport> AgentExecutor for SshExecutor<T> {
             request.policy.term_grace,
         )? {
             Effect::Confirmed(receipt) => receipt.outcome,
-            Effect::Uncertain(mut uncertain) => {
-                uncertain.reconciliation = query.clone();
-                return Ok(Effect::Uncertain(uncertain));
-            }
+            Effect::Uncertain(uncertain) => return Ok(Effect::Uncertain(uncertain)),
         };
 
         if !after_term.is_running() {
@@ -252,10 +286,7 @@ impl<T: SshTransport> AgentExecutor for SshExecutor<T> {
             ControlSignal::Kill,
         )? {
             Effect::Confirmed(receipt) => receipt,
-            Effect::Uncertain(mut uncertain) => {
-                uncertain.reconciliation = query.clone();
-                return Ok(Effect::Uncertain(uncertain));
-            }
+            Effect::Uncertain(uncertain) => return Ok(Effect::Uncertain(uncertain)),
         };
 
         let kill_wait_key = derive_wait_key(
@@ -270,10 +301,7 @@ impl<T: SshTransport> AgentExecutor for SshExecutor<T> {
             request.policy.kill_wait,
         )? {
             Effect::Confirmed(receipt) => receipt.outcome,
-            Effect::Uncertain(mut uncertain) => {
-                uncertain.reconciliation = query;
-                return Ok(Effect::Uncertain(uncertain));
-            }
+            Effect::Uncertain(uncertain) => return Ok(Effect::Uncertain(uncertain)),
         };
 
         Ok(Effect::Confirmed(TerminationReceipt {
@@ -286,15 +314,17 @@ impl<T: SshTransport> AgentExecutor for SshExecutor<T> {
 
     fn collect(&self, request: CollectRequest) -> ExecutorResult<Effect<CollectedResult>> {
         self.require_target_host(&request.identity.host_id)?;
-        request.policy.revalidate()?;
-        let policy_digest = request.policy.digest().clone();
-        let key = derive_collection_key(&request.identity, &policy_digest);
-        let read_limits = TransportReadLimits::for_policy(&request.policy)?;
+        validate_execution_collection_authority(&request.identity)?;
+        let authority = request.identity.collection_authority().clone();
+        let policy = authority.policy().clone();
+        let policy_digest = authority.policy_digest().clone();
+        let key = authority.collection_key().clone();
+        let read_limits = TransportReadLimits::for_policy(&policy)?;
         let call = self.transport.collect(CollectionTransportRequest {
             target: self.target.clone(),
             key: key.clone(),
             identity: request.identity.clone(),
-            policy: request.policy.clone(),
+            policy: policy.clone(),
             policy_digest: policy_digest.clone(),
             read_limits,
         });
@@ -313,32 +343,54 @@ impl<T: SshTransport> AgentExecutor for SshExecutor<T> {
                 })));
             }
         };
-        let validated = validate_collection(
-            &request.identity,
-            &request.policy,
-            &policy_digest,
-            &key,
-            receipt,
-        );
-        let cleanup = self.cleanup(&request.identity);
-        let validated = match validated {
-            Ok(validated) => validated,
-            Err(error) => {
-                return Err(ExecutorError::CollectionRejected {
-                    reason: error.to_string(),
-                    cleanup: Box::new(cleanup),
-                });
+        let receipt =
+            match validate_collection_envelope(&request.identity, &policy_digest, &key, receipt) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return Ok(Effect::Uncertain(Box::new(UncertainEffect {
+                        operation: Operation::Collect,
+                        key: key.clone(),
+                        reconciliation: ReconciliationTarget::Collection(CollectionLookup {
+                            identity: request.identity,
+                            policy_digest,
+                            collection_key: key,
+                        }),
+                        detail: error.to_string(),
+                    })));
+                }
+            };
+        let manifest_digest = receipt.manifest_digest.clone();
+        let validated = validate_collection_contents(&policy, receipt).map_err(|error| {
+            ExecutorError::CollectionRejected {
+                reason: error.to_string(),
             }
-        };
+        })?;
         Ok(Effect::Confirmed(CollectedResult {
             identity: request.identity,
             patch: validated.patch,
             patch_digest: validated.patch_digest,
             changed_paths: validated.changed_paths,
             outputs: validated.outputs,
-            cleanup,
+            binding: CollectionEvidenceBinding {
+                manifest_digest,
+                policy_digest,
+                collection_key: key,
+            },
             candidate_evidence_only: true,
         }))
+    }
+
+    fn cleanup(&self, request: CleanupRequest) -> ExecutorResult<Effect<CleanupReceipt>> {
+        self.require_target_host(&request.identity.host_id)?;
+        validate_execution_collection_authority(&request.identity)?;
+        let expected_key = derive_execution_key("cleanup", &request.identity);
+        if request.key != expected_key {
+            return Err(ExecutorError::InvalidField {
+                field: "cleanup idempotency key",
+                reason: "is not bound to the exact execution identity".to_string(),
+            });
+        }
+        Ok(self.call_cleanup(request))
     }
 }
 
@@ -405,20 +457,32 @@ impl<T: SshTransport> SshExecutor<T> {
                 })));
             }
         };
-        require_protocol(operation, receipt.protocol_version)?;
-        require_equal(
-            operation,
-            &receipt.key,
-            &key,
-            "idempotency key does not match the request",
-        )?;
-        require_equal(
-            operation,
-            &receipt.identity,
-            &identity,
-            "execution identity does not match the request",
-        )?;
-        Ok(Effect::Confirmed(receipt))
+        let validation = require_protocol(operation, receipt.protocol_version)
+            .and_then(|()| {
+                require_equal(
+                    operation,
+                    &receipt.key,
+                    &key,
+                    "idempotency key does not match the request",
+                )
+            })
+            .and_then(|()| {
+                require_equal(
+                    operation,
+                    &receipt.identity,
+                    &identity,
+                    "execution identity does not match the request",
+                )
+            });
+        match validation {
+            Ok(()) => Ok(Effect::Confirmed(receipt)),
+            Err(error) => Ok(Effect::Uncertain(Box::new(UncertainEffect {
+                operation,
+                key,
+                reconciliation: ReconciliationTarget::Execution(ExecutionQuery::Known(identity)),
+                detail: error.to_string(),
+            }))),
+        }
     }
 
     fn call_control(
@@ -428,6 +492,11 @@ impl<T: SshTransport> SshExecutor<T> {
         identity: ExecutionIdentity,
         signal: ControlSignal,
     ) -> ExecutorResult<Effect<ControlReceipt>> {
+        let lookup = ControlLookup {
+            identity: identity.clone(),
+            signal,
+            control_key: key.clone(),
+        };
         let call = self.transport.control(ControlTransportRequest {
             target: self.target.clone(),
             key: key.clone(),
@@ -440,37 +509,50 @@ impl<T: SshTransport> SshExecutor<T> {
                 return Ok(Effect::Uncertain(Box::new(UncertainEffect {
                     operation,
                     key,
-                    reconciliation: ReconciliationTarget::Execution(ExecutionQuery::Known(
-                        identity,
-                    )),
+                    reconciliation: ReconciliationTarget::Control(lookup),
                     detail,
                 })));
             }
         };
-        require_protocol(operation, receipt.protocol_version)?;
-        require_equal(
-            operation,
-            &receipt.key,
-            &key,
-            "idempotency key does not match the request",
-        )?;
-        require_equal(
-            operation,
-            &receipt.identity,
-            &identity,
-            "execution identity does not match the request",
-        )?;
-        require_equal(
-            operation,
-            &receipt.signal,
-            &signal,
-            "control signal does not match the request",
-        )?;
-        Ok(Effect::Confirmed(receipt))
+        let validation = require_protocol(operation, receipt.protocol_version)
+            .and_then(|()| {
+                require_equal(
+                    operation,
+                    &receipt.key,
+                    &key,
+                    "idempotency key does not match the request",
+                )
+            })
+            .and_then(|()| {
+                require_equal(
+                    operation,
+                    &receipt.identity,
+                    &identity,
+                    "execution identity does not match the request",
+                )
+            })
+            .and_then(|()| {
+                require_equal(
+                    operation,
+                    &receipt.signal,
+                    &signal,
+                    "control signal does not match the request",
+                )
+            });
+        match validation {
+            Ok(()) => Ok(Effect::Confirmed(receipt)),
+            Err(error) => Ok(Effect::Uncertain(Box::new(UncertainEffect {
+                operation,
+                key,
+                reconciliation: ReconciliationTarget::Control(lookup),
+                detail: error.to_string(),
+            }))),
+        }
     }
 
-    fn cleanup(&self, identity: &ExecutionIdentity) -> Effect<CleanupReceipt> {
-        let key = derive_execution_key("cleanup", identity);
+    fn call_cleanup(&self, request: CleanupRequest) -> Effect<CleanupReceipt> {
+        let identity = request.identity;
+        let key = request.key;
         let lookup = CleanupLookup {
             identity: identity.clone(),
             workspace_id: identity.workspace_id.clone(),
@@ -506,7 +588,7 @@ impl<T: SshTransport> SshExecutor<T> {
                 require_equal(
                     Operation::Cleanup,
                     &receipt.identity,
-                    identity,
+                    &identity,
                     "execution identity does not match the request",
                 )
             })
@@ -532,30 +614,45 @@ impl<T: SshTransport> SshExecutor<T> {
 
 fn validate_launch_manifest(request: &LaunchRequest) -> ExecutorResult<()> {
     request.staged.manifest.revalidate()?;
-    request.spec.revalidate()?;
     if &request.staged.staged_digest != request.staged.manifest.digest() {
         return Err(ExecutorError::InvalidField {
             field: "staged digest",
             reason: "does not match the immutable input manifest".to_string(),
         });
     }
-    let stdin_entry = request
-        .staged
-        .manifest
-        .entry(&request.spec.stdin)
-        .ok_or_else(|| ExecutorError::InvalidField {
-            field: "launch stdin",
-            reason: "does not name a staged manifest entry".to_string(),
-        })?;
+    request.staged.collection.revalidate_for(
+        &request.staged.identity,
+        &request.staged.staged_digest,
+        request.staged.launch_spec.digest(),
+    )?;
+    validate_staged_output_declarations(
+        &request.staged.manifest,
+        request.staged.collection.policy(),
+    )?;
+    validate_manifest_launch_spec(&request.staged.manifest, &request.staged.launch_spec)
+}
+
+fn validate_manifest_launch_spec(
+    manifest: &InputManifest,
+    launch_spec: &LaunchSpec,
+) -> ExecutorResult<()> {
+    launch_spec.revalidate()?;
+    let stdin_entry =
+        manifest
+            .entry(&launch_spec.stdin)
+            .ok_or_else(|| ExecutorError::InvalidField {
+                field: "launch stdin",
+                reason: "does not name a staged manifest entry".to_string(),
+            })?;
     if stdin_entry.purpose() != ManifestPurpose::Prompt || stdin_entry.input_bytes().is_none() {
         return Err(ExecutorError::InvalidField {
             field: "launch stdin",
             reason: "must name the staged Prompt input entry".to_string(),
         });
     }
-    for argument in request.spec.argv.arguments() {
+    for argument in launch_spec.argv.arguments() {
         if let TypedArg::ManifestPath(path) = argument {
-            if !request.staged.manifest.declares(path) {
+            if !manifest.declares(path) {
                 return Err(ExecutorError::InvalidField {
                     field: "manifest argv path",
                     reason: format!("'{path}' is not declared by the staged manifest"),
@@ -618,6 +715,7 @@ fn require_submitted_identity(
         && identity.session_id == submitted.session_id
         && identity.workspace_id == submitted.workspace_id
         && identity.launch_spec_digest == submitted.launch_spec_digest
+        && identity.collection == submitted.collection
         && identity.launch_key == submitted.launch_key
         && identity.pid != 0
         && identity.pgid != 0;
@@ -626,10 +724,24 @@ fn require_submitted_identity(
     } else {
         Err(ExecutorError::MalformedReceipt {
             operation,
-            reason: "execution identity is not bound to the submitted host/run/assignment/nonce/digest/session/workspace/launch key"
+            reason: "execution identity is not bound to the submitted host/run/assignment/nonce/digest/session/workspace/collection authority/launch key"
                 .to_string(),
         })
     }
+}
+
+fn validate_execution_collection_authority(identity: &ExecutionIdentity) -> ExecutorResult<()> {
+    let assignment = AssignmentIdentity::new(
+        identity.host_id.clone(),
+        identity.run_id.clone(),
+        identity.assignment_id.clone(),
+        identity.nonce.clone(),
+    );
+    identity.collection.revalidate_for(
+        &assignment,
+        &identity.staged_digest,
+        &identity.launch_spec_digest,
+    )
 }
 
 struct ValidatedCollection {
@@ -639,13 +751,12 @@ struct ValidatedCollection {
     outputs: Vec<CollectedOutput>,
 }
 
-fn validate_collection(
+fn validate_collection_envelope(
     expected_identity: &ExecutionIdentity,
-    policy: &OutputPolicy,
     policy_digest: &Digest,
     expected_key: &IdempotencyKey,
     receipt: CollectionReceipt,
-) -> ExecutorResult<ValidatedCollection> {
+) -> ExecutorResult<CollectionReceipt> {
     require_protocol(Operation::Collect, receipt.protocol_version)?;
     require_equal(
         Operation::Collect,
@@ -680,6 +791,13 @@ fn validate_collection(
         &expected_manifest_digest,
         "collection manifest digest does not bind the complete receipt",
     )?;
+    Ok(receipt)
+}
+
+fn validate_collection_contents(
+    policy: &OutputPolicy,
+    receipt: CollectionReceipt,
+) -> ExecutorResult<ValidatedCollection> {
     validate_blob("patch", &receipt.patch, policy.patch_max_bytes)?;
     if receipt.changed_paths.len() > policy.changed_paths_max {
         return Err(ExecutorError::LimitExceeded {

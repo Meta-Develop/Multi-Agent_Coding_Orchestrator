@@ -5,7 +5,7 @@
 /// command, cancellation token, and optional borrowed review value exactly once and
 /// returns the existing runner's value unchanged.
 ///
-/// This type intentionally does not implement the six-phase [`super::AgentExecutor`]
+/// This type intentionally does not implement the remote [`super::AgentExecutor`]
 /// remote lifecycle. The current local contract is one synchronous higher-ranked
 /// callback carrying a borrowed review runtime and returning the concrete local run
 /// report. Claiming lifecycle parity here would require type erasure or fabricated
