@@ -1774,7 +1774,7 @@ fn validate_approval_request_fields(
     };
     if let Some(field) = params
         .keys()
-        .find(|field| !allowed.iter().any(|known| *known == field.as_str()))
+        .find(|field| !allowed.contains(&field.as_str()))
     {
         return Err(AppServerError::Unexpected {
             phase: "approval",

@@ -39,6 +39,7 @@ use std::{
 
 #[path = "codex_app_server.rs"]
 pub(crate) mod codex_app_server;
+#[allow(dead_code, unused_imports)]
 pub(crate) mod executor;
 
 pub use crate::protected_path::SandboxDenialRetryability;
