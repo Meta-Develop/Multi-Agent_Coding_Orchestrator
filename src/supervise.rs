@@ -2236,6 +2236,7 @@ pub enum ReviewLoopValidationFloor {
     Passed,
     Missing,
     Failed,
+    LicensedDependentFailures,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

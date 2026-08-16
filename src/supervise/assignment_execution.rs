@@ -109,6 +109,7 @@ impl ReviewLoopGuardTracker {
 
     pub(super) fn evidence(
         &self,
+        assignment: &OrchestratorAssignment,
         child_report: &OrchestratorReviewReport,
     ) -> ReviewLoopGuardEvidence {
         ReviewLoopGuardEvidence {
@@ -122,7 +123,10 @@ impl ReviewLoopGuardTracker {
                 ReviewLoopStopDisposition::ThresholdNotReached
             },
             retry_suppressed: self.retry_suppressed,
-            final_validation_floor: review_loop_validation_floor(child_report),
+            final_validation_floor: effective_review_loop_validation_floor(
+                assignment,
+                child_report,
+            ),
             locked_review_accepted: locked_parent_review_accepted(child_report),
         }
     }
@@ -160,19 +164,65 @@ fn review_loop_severity_is_low(
     }
 }
 
-fn review_loop_validation_floor(
+pub(super) fn effective_review_loop_validation_floor(
+    assignment: &OrchestratorAssignment,
     child_report: &OrchestratorReviewReport,
 ) -> ReviewLoopValidationFloor {
     if child_report.validation_results.is_empty() {
         ReviewLoopValidationFloor::Missing
-    } else if child_report
+    } else if !child_report
         .validation_results
         .iter()
         .any(validation_failed)
     {
-        ReviewLoopValidationFloor::Failed
-    } else {
         ReviewLoopValidationFloor::Passed
+    } else if licensed_top_level_validation_failures_are_authenticated(assignment, child_report) {
+        ReviewLoopValidationFloor::LicensedDependentFailures
+    } else {
+        ReviewLoopValidationFloor::Failed
+    }
+}
+
+fn licensed_top_level_validation_failures_are_authenticated(
+    assignment: &OrchestratorAssignment,
+    child_report: &OrchestratorReviewReport,
+) -> bool {
+    let (Some(declaration), Some(review)) = (
+        assignment.licensed_breakage.as_ref(),
+        child_report.licensed_breakage_review.as_ref(),
+    ) else {
+        return false;
+    };
+    let Ok(expected_digest) = licensed_breakage_declaration_sha256(declaration) else {
+        return false;
+    };
+    if review.declaration_sha256 != expected_digest || review.failures.is_empty() {
+        return false;
+    }
+    child_report
+        .validation_results
+        .iter()
+        .filter(|validation| validation_failed(validation))
+        .all(|validation| {
+            validation.message.as_deref().is_some_and(|message| {
+                review.failures.iter().any(|failure| {
+                    failure.dependent_id == validation.name
+                        && failure.validation_name == validation.name
+                        && failure.failure_signature == message
+                })
+            })
+        })
+}
+
+pub(super) fn effective_validation_floor_blocker(
+    assignment: &OrchestratorAssignment,
+    child_report: &OrchestratorReviewReport,
+) -> Option<GateApplyBlocker> {
+    match effective_review_loop_validation_floor(assignment, child_report) {
+        ReviewLoopValidationFloor::Missing => Some(GateApplyBlocker::ValidationMissing),
+        ReviewLoopValidationFloor::Failed => Some(GateApplyBlocker::ValidationFailed),
+        ReviewLoopValidationFloor::Passed
+        | ReviewLoopValidationFloor::LicensedDependentFailures => None,
     }
 }
 
@@ -269,7 +319,7 @@ pub(super) fn finalize_review_loop_guard_evidence(
     assignment: &OrchestratorAssignment,
     child_report: &mut OrchestratorReviewReport,
 ) -> Result<()> {
-    let evidence = tracker.evidence(child_report);
+    let evidence = tracker.evidence(assignment, child_report);
     if evidence.cycles.len() > MAX_REVIEW_LOOP_GUARD_CYCLES {
         bail!("review-loop guard evidence exceeds its bounded cycle history");
     }
@@ -1860,17 +1910,7 @@ fn decide_child_attempt(
         *retry_feedback = Some(ChildAttemptCorrection::StructuralReport);
         return Ok(ChildAttemptDisposition::Retry);
     }
-    let validation_blocker = if attempt_report.validation_results.is_empty() {
-        Some(GateApplyBlocker::ValidationMissing)
-    } else if attempt_report
-        .validation_results
-        .iter()
-        .any(validation_failed)
-    {
-        Some(GateApplyBlocker::ValidationFailed)
-    } else {
-        None
-    };
+    let validation_blocker = effective_validation_floor_blocker(assignment, &attempt_report);
     if report_shape_problems.is_empty() {
         if let Some(blocker) = validation_blocker {
             if apply_validation_floor_gate(

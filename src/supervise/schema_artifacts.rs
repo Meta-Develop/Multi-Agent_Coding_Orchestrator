@@ -197,7 +197,9 @@ pub(super) fn review_loop_guard_evidence_schema_value() -> serde_json::Value {
             "retry_suppressed": {"type": "boolean"},
             "final_validation_floor": {
                 "type": "string",
-                "enum": ["passed", "missing", "failed"]
+                "enum": [
+                    "passed", "missing", "failed", "licensed_dependent_failures"
+                ]
             },
             "locked_review_accepted": {"type": "boolean"}
         }

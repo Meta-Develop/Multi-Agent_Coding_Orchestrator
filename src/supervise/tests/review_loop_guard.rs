@@ -250,6 +250,15 @@ fn generated_follow_up_and_evidence_schemas_preserve_review_loop_state() {
     let decoded: ReviewLoopGuardEvidence =
         serde_json::from_value(evidence_json).expect("round-trip strict review-loop evidence");
     assert_eq!(decoded, evidence);
+    let licensed_floor_json =
+        serde_json::to_value(ReviewLoopValidationFloor::LicensedDependentFailures)
+            .expect("serialize licensed validation-floor evidence");
+    assert_eq!(licensed_floor_json, json!("licensed_dependent_failures"));
+    assert_eq!(
+        serde_json::from_value::<ReviewLoopValidationFloor>(licensed_floor_json)
+            .expect("round-trip licensed validation-floor evidence"),
+        ReviewLoopValidationFloor::LicensedDependentFailures
+    );
     let mut invalid_evidence = serde_json::to_value(&evidence)
         .expect("serialize review-loop evidence for strictness check");
     invalid_evidence["unexpected"] = json!(true);
@@ -270,6 +279,10 @@ fn generated_follow_up_and_evidence_schemas_preserve_review_loop_state() {
     assert_eq!(
         evidence_schema["properties"]["cycles"]["maxItems"],
         MAX_REVIEW_LOOP_GUARD_CYCLES
+    );
+    assert_eq!(
+        evidence_schema["properties"]["final_validation_floor"]["enum"],
+        json!(["passed", "missing", "failed", "licensed_dependent_failures"])
     );
     let generated_json = serde_json::to_value(generated)
         .expect("serialize generated plan without widening its public schema");
@@ -396,7 +409,11 @@ fn low_severity_threshold_durably_suppresses_retry_without_spending_correction_b
         ),
         locked_status_before
     );
-    assert!(!tracker.evidence(&locked_rejection).locked_review_accepted);
+    assert!(
+        !tracker
+            .evidence(&assignment, &locked_rejection)
+            .locked_review_accepted
+    );
     let gate_tracker = outcome
         .gate_tracker
         .as_ref()
@@ -409,7 +426,7 @@ fn low_severity_threshold_durably_suppresses_retry_without_spending_correction_b
         GateCorrectionTerminalClass::Escalated
     );
 
-    let evidence = tracker.evidence(&injected_child_report(&assignment));
+    let evidence = tracker.evidence(&assignment, &injected_child_report(&assignment));
     assert!(evidence.retry_suppressed);
     assert_eq!(
         evidence.stop_disposition,
@@ -511,7 +528,8 @@ fn threshold_without_prospective_retry_exhausts_normally_and_is_not_suppressed()
             .terminal_class,
         GateCorrectionTerminalClass::Exhausted
     );
-    let zero_evidence = zero_budget_tracker.evidence(&injected_child_report(&assignment));
+    let zero_evidence =
+        zero_budget_tracker.evidence(&assignment, &injected_child_report(&assignment));
     assert!(!zero_evidence.retry_suppressed);
     assert_eq!(
         zero_evidence.stop_disposition,
@@ -591,7 +609,8 @@ fn threshold_without_prospective_retry_exhausts_normally_and_is_not_suppressed()
             .terminal_class,
         GateCorrectionTerminalClass::Exhausted
     );
-    let exhausted_evidence = exhausted_review_tracker.evidence(&injected_child_report(&assignment));
+    let exhausted_evidence =
+        exhausted_review_tracker.evidence(&assignment, &injected_child_report(&assignment));
     assert!(!exhausted_evidence.retry_suppressed);
     assert_eq!(
         exhausted_evidence.stop_disposition,
@@ -699,7 +718,11 @@ fn high_severity_resets_streak_and_validation_floor_locks_declared_success() {
         assert_eq!(child_report.status, ReviewStatus::Succeeded);
         assert!(child_report.accepted);
         assert!(!child_report.rejected);
-        assert!(tracker.evidence(&child_report).locked_review_accepted);
+        assert!(
+            tracker
+                .evidence(&assignment, &child_report)
+                .locked_review_accepted
+        );
         let mut validation_outcome = AssignmentExecutionOutcome {
             gate_tracker: Some(GateCorrectionTracker::new(0)),
             ..AssignmentExecutionOutcome::default()
@@ -738,7 +761,7 @@ fn high_severity_resets_streak_and_validation_floor_locks_declared_success() {
                 .severity,
             FindingSeverity::Error
         );
-        let evidence = tracker.evidence(&child_report);
+        let evidence = tracker.evidence(&assignment, &child_report);
         assert_eq!(evidence.final_validation_floor, expected_floor);
         assert!(evidence.locked_review_accepted);
         assert!(evidence.retry_suppressed);
