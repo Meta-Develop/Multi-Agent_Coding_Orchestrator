@@ -437,6 +437,36 @@ while [ "$sandbox_check_count" -gt 0 ]; do
         sandbox_check_count=$((sandbox_check_count - 1))
         continue
     fi
+    if [ "$sandbox_mode" = protect-home-root ]; then
+        protect_home_mount=$(
+            "$findmnt_program" --raw --noheadings --output SOURCE,FSTYPE,VFS-OPTIONS --mountpoint "$sandbox_path"
+        ) || fail_guardian "could not inspect ProtectHome mount: $sandbox_path"
+        protect_home_source=${protect_home_mount%% *}
+        protect_home_rest=${protect_home_mount#* }
+        protect_home_fstype=${protect_home_rest%% *}
+        protect_home_options=${protect_home_rest#* }
+        [ "$protect_home_source" != "$protect_home_mount" ] || fail_guardian "ProtectHome mount report was malformed: $sandbox_path"
+        [ "$protect_home_fstype" != "$protect_home_rest" ] || fail_guardian "ProtectHome mount report was malformed: $sandbox_path"
+        [ "$protect_home_fstype" = tmpfs ] || fail_guardian "ProtectHome root was not backed by tmpfs: $sandbox_path"
+        protect_home_read_only=false
+        for protect_home_option_line in $protect_home_options; do
+            case ",$protect_home_option_line," in
+                *,ro,*) protect_home_read_only=true ;;
+            esac
+        done
+        [ "$protect_home_read_only" = true ] || fail_guardian "ProtectHome root was not read-only: $sandbox_path"
+        printf 'protect-home-root %s %s %s\n' "$protect_home_source" "$protect_home_fstype" "$protect_home_options" >> "$sandbox_report" || fail_guardian "could not write ProtectHome mount report"
+        sandbox_check_count=$((sandbox_check_count - 1))
+        continue
+    fi
+    if [ "$sandbox_mode" = protect-home-hidden ]; then
+        if "$stat_program" -L -c '%d %i' -- "$sandbox_path" >/dev/null 2>&1; then
+            fail_guardian "ProtectHome-covered hidden path remained reachable: $sandbox_path"
+        fi
+        printf 'protect-home-hidden\n' >> "$sandbox_report" || fail_guardian "could not write ProtectHome hidden-path report"
+        sandbox_check_count=$((sandbox_check_count - 1))
+        continue
+    fi
     if [ "$sandbox_mode" = inaccessible-required ] || [ "$sandbox_mode" = inaccessible-optional ]; then
         if "$stat_program" -L -c '%d %i' -- "$sandbox_path" >/dev/null 2>&1; then
             inaccessible_source=$("$findmnt_program" --raw --noheadings --output SOURCE --mountpoint "$sandbox_path") || fail_guardian "could not inspect inaccessible-path source: $sandbox_path"
@@ -4735,6 +4765,8 @@ enum SandboxMountAccess {
     ReadWrite,
     PrivateRuntime,
     Inaccessible,
+    ProtectHomeRoot,
+    ProtectHomeHidden,
     IsolatedRoot,
 }
 
@@ -4745,6 +4777,13 @@ struct SandboxMountCheck {
     inode: u64,
     access: SandboxMountAccess,
     optional: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProtectHomeMountPlan {
+    covering_roots: BTreeSet<PathBuf>,
+    covered_hidden_roots: BTreeSet<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
@@ -4769,6 +4808,29 @@ struct SandboxMountRegion {
 
 #[cfg(target_os = "linux")]
 impl ResolvedSystemdSandbox {
+    fn protect_home_mount_plan(&self) -> ProtectHomeMountPlan {
+        build_protect_home_mount_plan(
+            &self.hidden_roots,
+            std::iter::once(self.workspace_root.as_path())
+                .chain(self.visible_read_only_roots.iter().map(PathBuf::as_path))
+                .chain(self.visible_read_only_files.iter().map(PathBuf::as_path))
+                .chain(self.visible_read_write_roots.iter().map(PathBuf::as_path))
+                .chain(self.visible_read_write_files.iter().map(PathBuf::as_path))
+                .chain(self.writable_artifact_roots.iter().map(PathBuf::as_path)),
+        )
+    }
+
+    fn temporary_file_system_roots(
+        &self,
+        protect_home: &ProtectHomeMountPlan,
+    ) -> BTreeSet<PathBuf> {
+        let mut roots = protect_home.covering_roots.clone();
+        if self.isolated_host_view {
+            roots.insert(PathBuf::from("/"));
+        }
+        roots
+    }
+
     fn explicitly_binds_program(&self, program: &Path) -> bool {
         std::iter::once(&self.workspace_root)
             .chain(self.visible_read_only_roots.iter())
@@ -6103,6 +6165,68 @@ struct SandboxMountPaths<'a> {
 }
 
 #[cfg(target_os = "linux")]
+impl SandboxMountPaths<'_> {
+    fn protect_home_mount_plan(&self) -> ProtectHomeMountPlan {
+        build_protect_home_mount_plan(
+            self.hidden_roots,
+            std::iter::once(self.workspace_root)
+                .chain(self.visible_read_only_roots.iter().map(PathBuf::as_path))
+                .chain(self.visible_read_only_files.iter().map(PathBuf::as_path))
+                .chain(self.visible_read_write_roots.iter().map(PathBuf::as_path))
+                .chain(self.visible_read_write_files.iter().map(PathBuf::as_path))
+                .chain(self.writable_artifact_roots.iter().map(PathBuf::as_path)),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn protect_home_tmpfs_covering_root<'a>(
+    hidden_root: &Path,
+    visible_paths: impl IntoIterator<Item = &'a Path>,
+) -> Option<&'static Path> {
+    if !hidden_root.is_absolute()
+        || hidden_root.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir
+                    | std::path::Component::ParentDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    let covering_root = ["/home", "/root", "/run/user"]
+        .into_iter()
+        .map(Path::new)
+        .find(|root| hidden_root != *root && hidden_root.starts_with(root))?;
+    if visible_paths
+        .into_iter()
+        .any(|visible| hidden_root.starts_with(visible) || visible.starts_with(hidden_root))
+    {
+        return None;
+    }
+    Some(covering_root)
+}
+
+#[cfg(target_os = "linux")]
+fn build_protect_home_mount_plan<'a>(
+    hidden_roots: &[PathBuf],
+    visible_paths: impl IntoIterator<Item = &'a Path> + Clone,
+) -> ProtectHomeMountPlan {
+    let mut plan = ProtectHomeMountPlan::default();
+    for hidden_root in hidden_roots {
+        if let Some(covering_root) =
+            protect_home_tmpfs_covering_root(hidden_root, visible_paths.clone())
+        {
+            plan.covering_roots.insert(covering_root.to_path_buf());
+            plan.covered_hidden_roots.insert(hidden_root.clone());
+        }
+    }
+    plan
+}
+
+#[cfg(target_os = "linux")]
 fn build_sandbox_mount_checks(
     paths: SandboxMountPaths<'_>,
 ) -> std::io::Result<Vec<SandboxMountCheck>> {
@@ -6186,12 +6310,15 @@ fn build_sandbox_mount_checks(
             })
         })
         .collect::<std::io::Result<Vec<_>>>()?;
+    let protect_home = paths.protect_home_mount_plan();
     let mut inaccessible = known_sensitive_socket_paths()
         .into_iter()
         .map(|path| (path, true))
         .collect::<BTreeMap<_, _>>();
     for path in paths.hidden_roots {
-        inaccessible.insert(path.clone(), false);
+        if !protect_home.covered_hidden_roots.contains(path) {
+            inaccessible.insert(path.clone(), false);
+        }
     }
     for (path, optional) in inaccessible {
         checks.push(SandboxMountCheck {
@@ -6200,6 +6327,24 @@ fn build_sandbox_mount_checks(
             inode: 0,
             access: SandboxMountAccess::Inaccessible,
             optional,
+        });
+    }
+    for path in protect_home.covering_roots {
+        checks.push(SandboxMountCheck {
+            path,
+            device: 0,
+            inode: 0,
+            access: SandboxMountAccess::ProtectHomeRoot,
+            optional: false,
+        });
+    }
+    for path in protect_home.covered_hidden_roots {
+        checks.push(SandboxMountCheck {
+            path,
+            device: 0,
+            inode: 0,
+            access: SandboxMountAccess::ProtectHomeHidden,
+            optional: false,
         });
     }
     Ok(checks)
@@ -6223,6 +6368,7 @@ fn apply_systemd_capability_boundary(command: &mut Command, effective_uid: libc:
 
 #[cfg(target_os = "linux")]
 fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSystemdSandbox) {
+    let protect_home = sandbox.protect_home_mount_plan();
     command.args([
         "--property=ProtectSystem=strict",
         "--property=ProtectHome=tmpfs",
@@ -6249,8 +6395,8 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
         "--property=OOMPolicy=kill",
     ]);
     command.arg("--property=RestrictNamespaces=yes");
-    if sandbox.isolated_host_view {
-        command.arg("--property=TemporaryFileSystem=/:ro");
+    for root in sandbox.temporary_file_system_roots(&protect_home) {
+        command.arg(systemd_read_only_temporary_file_system_property(&root));
     }
     if sandbox.kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace {
         command.args([
@@ -6278,7 +6424,9 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
         ));
 
     for root in &sandbox.hidden_roots {
-        command.arg(systemd_path_property("InaccessiblePaths=", root, false));
+        if !protect_home.covered_hidden_roots.contains(root) {
+            command.arg(systemd_path_property("InaccessiblePaths=", root, false));
+        }
     }
     for path in known_sensitive_socket_paths() {
         command.arg(systemd_path_property("InaccessiblePaths=", &path, true));
@@ -6356,15 +6504,23 @@ fn verify_systemd_capability_boundary(
 }
 
 #[cfg(target_os = "linux")]
+fn verify_protect_home_tmpfs_property(
+    properties: &BTreeMap<String, String>,
+) -> std::io::Result<()> {
+    require_effective_property(properties, "ProtectHome", |value| value == "tmpfs", "tmpfs")
+}
+
+#[cfg(target_os = "linux")]
 fn verify_systemd_sandbox_properties(
     sandbox: &ResolvedSystemdSandbox,
     properties: &BTreeMap<String, String>,
     runtime_dir: &Path,
     effective_uid: libc::uid_t,
 ) -> std::io::Result<()> {
+    let protect_home = sandbox.protect_home_mount_plan();
+    verify_protect_home_tmpfs_property(properties)?;
     for (name, expected) in [
         ("ProtectSystem", "strict"),
-        ("ProtectHome", "tmpfs"),
         ("NoNewPrivileges", "yes"),
         ("RestrictSUIDSGID", "yes"),
         ("LockPersonality", "yes"),
@@ -6408,7 +6564,7 @@ fn verify_systemd_sandbox_properties(
     )?;
 
     verify_systemd_network_properties(sandbox.kind, properties)?;
-    verify_isolated_host_view_property(sandbox, properties)?;
+    verify_temporary_file_system_property(sandbox, &protect_home, properties)?;
 
     let limits = sandbox.resource_limits;
     for (name, expected) in [
@@ -6438,7 +6594,9 @@ fn verify_systemd_sandbox_properties(
 
     let inaccessible = property_value(properties, "InaccessiblePaths")?;
     for root in &sandbox.hidden_roots {
-        require_property_path("InaccessiblePaths", inaccessible, root)?;
+        if !protect_home.covered_hidden_roots.contains(root) {
+            require_property_path("InaccessiblePaths", inaccessible, root)?;
+        }
     }
     // Mask known same-user IPC endpoints and the Nix daemon. The complete runtime root cannot be
     // masked because it contains systemd's unit-lifetime guardian directory; AF_UNIX/socket
@@ -6550,9 +6708,11 @@ fn verify_exact_systemd_path_properties(
         return Ok(());
     }
 
+    let protect_home = sandbox.protect_home_mount_plan();
     let mut inaccessible = sandbox
         .hidden_roots
         .iter()
+        .filter(|root| !protect_home.covered_hidden_roots.contains(*root))
         .cloned()
         .collect::<BTreeSet<_>>();
     inaccessible.extend(known_sensitive_socket_paths());
@@ -6629,33 +6789,46 @@ fn verify_exact_systemd_path_properties(
 }
 
 #[cfg(target_os = "linux")]
-fn is_exact_isolated_host_view_property(value: &str) -> bool {
-    let mut entries = value.split_whitespace();
-    entries.next() == Some("/:ro") && entries.next().is_none()
-}
-
-#[cfg(target_os = "linux")]
-fn verify_isolated_host_view_property(
+fn verify_temporary_file_system_property(
     sandbox: &ResolvedSystemdSandbox,
+    protect_home: &ProtectHomeMountPlan,
     properties: &BTreeMap<String, String>,
 ) -> std::io::Result<()> {
     let value = property_value(properties, "TemporaryFileSystem")?;
-    if !sandbox.isolated_host_view {
-        return if value.trim().is_empty() {
-            Ok(())
-        } else {
-            Err(std::io::Error::new(
+    let expected = sandbox.temporary_file_system_roots(protect_home);
+    let mut actual = BTreeSet::new();
+    for entry in value.split_whitespace() {
+        let mut fields = entry.split(':');
+        let path = fields.next().unwrap_or_default();
+        let options = fields.next();
+        if path.is_empty()
+            || options != Some("ro")
+            || fields.next().is_some()
+            || !Path::new(path).is_absolute()
+            || Path::new(path).components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir
+                        | std::path::Component::ParentDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+            || !actual.insert(PathBuf::from(path))
+        {
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "effective TemporaryFileSystem unexpectedly changed the ordinary sandbox root",
-            ))
-        };
+                format!("effective TemporaryFileSystem entry was not a unique normalized absolute path with exact read-only options: {entry:?}"),
+            ));
+        }
     }
-    if is_exact_isolated_host_view_property(value) {
+    if actual == expected {
         Ok(())
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "effective TemporaryFileSystem did not exactly match the isolated read-only root",
+            format!(
+                "effective TemporaryFileSystem set differed from the exact required read-only tmpfs roots: expected {expected:?}, observed {actual:?}"
+            ),
         ))
     }
 }
@@ -6754,6 +6927,35 @@ fn verify_sandbox_mount_report(path: &Path, checks: &[SandboxMountCheck]) -> std
             }
             continue;
         }
+        if check.access == SandboxMountAccess::ProtectHomeRoot {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() != 4
+                || fields[0] != "protect-home-root"
+                || fields[2] != "tmpfs"
+                || !fields[3].split(',').any(|option| option == "ro")
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "ProtectHome root was not an isolated read-only tmpfs: {}",
+                        check.path.display()
+                    ),
+                ));
+            }
+            continue;
+        }
+        if check.access == SandboxMountAccess::ProtectHomeHidden {
+            if line != "protect-home-hidden" {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "ProtectHome-covered sandbox path remained reachable: {}",
+                        check.path.display()
+                    ),
+                ));
+            }
+            continue;
+        }
         if check.access == SandboxMountAccess::IsolatedRoot {
             let fields = line.split_whitespace().collect::<Vec<_>>();
             if fields.len() != 4
@@ -6821,6 +7023,8 @@ fn verify_sandbox_mount_report(path: &Path, checks: &[SandboxMountCheck]) -> std
             SandboxMountAccess::ReadWrite => "rw",
             SandboxMountAccess::PrivateRuntime => "rw",
             SandboxMountAccess::Inaccessible => continue,
+            SandboxMountAccess::ProtectHomeRoot => continue,
+            SandboxMountAccess::ProtectHomeHidden => continue,
             SandboxMountAccess::IsolatedRoot => continue,
         };
         if !options.contains(&expected) {
@@ -7146,6 +7350,13 @@ fn systemd_path_property(name: &str, path: &Path, optional: bool) -> OsString {
         property.push("-");
     }
     property.push(path.as_os_str());
+    property
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_read_only_temporary_file_system_property(path: &Path) -> OsString {
+    let mut property = systemd_path_property("TemporaryFileSystem=", path, false);
+    property.push(":ro");
     property
 }
 
@@ -7698,6 +7909,8 @@ impl SystemdUnit {
                             "inaccessible-optional"
                         }
                         SandboxMountAccess::Inaccessible => "inaccessible-required",
+                        SandboxMountAccess::ProtectHomeRoot => "protect-home-root",
+                        SandboxMountAccess::ProtectHomeHidden => "protect-home-hidden",
                         SandboxMountAccess::IsolatedRoot => "isolated-root",
                     })
                     .arg(&check.path);
@@ -11049,6 +11262,386 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn protect_home_tmpfs_coverage_is_component_aware_and_requires_disjoint_visibility() {
+        for (hidden, expected) in [
+            ("/root/private", Some(Path::new("/root"))),
+            ("/home/alice/private", Some(Path::new("/home"))),
+            ("/run/user/1000/private", Some(Path::new("/run/user"))),
+        ] {
+            assert_eq!(
+                protect_home_tmpfs_covering_root(Path::new(hidden), std::iter::empty::<&Path>()),
+                expected,
+                "unexpected ProtectHome coverage for {hidden}"
+            );
+        }
+
+        for hidden in [
+            "/root",
+            "/home",
+            "/run/user",
+            "/rooted/private",
+            "/homeward/private",
+            "/run/users/private",
+            "/srv/private",
+            "root/private",
+            "/root/../srv/private",
+        ] {
+            assert_eq!(
+                protect_home_tmpfs_covering_root(Path::new(hidden), std::iter::empty::<&Path>()),
+                None,
+                "non-covered path was classified beneath ProtectHome: {hidden}"
+            );
+        }
+
+        let hidden = Path::new("/root/project/primary");
+        assert_eq!(
+            protect_home_tmpfs_covering_root(
+                hidden,
+                [Path::new("/root/project/review")].into_iter()
+            ),
+            Some(Path::new("/root")),
+            "a disjoint sibling bind must not defeat ProtectHome coverage"
+        );
+        for visible in [
+            Path::new("/root/project"),
+            hidden,
+            Path::new("/root/project/primary/tool"),
+        ] {
+            assert_eq!(
+                protect_home_tmpfs_covering_root(hidden, [visible].into_iter()),
+                None,
+                "overlapping visible path must retain the explicit mask: {}",
+                visible.display()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn protect_home_tmpfs_mount_plan_omits_only_covered_required_masks() {
+        let workspace = env::current_dir().expect("current worktree");
+        let reexposed_hidden = workspace.join("synthetic-hidden-root");
+        let hidden_roots = vec![
+            PathBuf::from("/root/covered-a"),
+            PathBuf::from("/root/covered-b"),
+            PathBuf::from("/home/alice/covered"),
+            PathBuf::from("/run/user/1000/covered"),
+            PathBuf::from("/srv/required-mask"),
+            PathBuf::from("/root"),
+            PathBuf::from("/rooted/not-covered"),
+            reexposed_hidden.clone(),
+        ];
+        let checks = build_sandbox_mount_checks(SandboxMountPaths {
+            workspace_root: &workspace,
+            workspace_access: WorkspaceAccess::ReadOnly,
+            visible_read_only_roots: &[],
+            visible_read_only_files: &[],
+            visible_read_write_roots: &[],
+            visible_read_write_files: &[],
+            writable_artifact_roots: &[],
+            hidden_roots: &hidden_roots,
+            isolated_host_view: false,
+        })
+        .expect("build ProtectHome-aware mount checks");
+
+        for covering_root in ["/root", "/home", "/run/user"] {
+            assert_eq!(
+                checks
+                    .iter()
+                    .filter(|check| {
+                        check.path == Path::new(covering_root)
+                            && check.access == SandboxMountAccess::ProtectHomeRoot
+                            && !check.optional
+                    })
+                    .count(),
+                1,
+                "covering root evidence must be required and deduplicated"
+            );
+        }
+        for hidden in &hidden_roots[..4] {
+            assert!(checks.iter().any(|check| {
+                check.path == *hidden
+                    && check.access == SandboxMountAccess::ProtectHomeHidden
+                    && !check.optional
+            }));
+            assert!(!checks.iter().any(|check| {
+                check.path == *hidden && check.access == SandboxMountAccess::Inaccessible
+            }));
+        }
+        for hidden in &hidden_roots[4..] {
+            assert!(checks.iter().any(|check| {
+                check.path == *hidden
+                    && check.access == SandboxMountAccess::Inaccessible
+                    && !check.optional
+            }));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn protect_home_tmpfs_classification_keeps_symlink_and_missing_roots_fail_closed() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let hidden = temp.path().join("hidden");
+        let hidden_alias = temp.path().join("hidden-alias");
+        let missing_hidden = temp.path().join("missing-hidden-root");
+        fs::create_dir(&workspace).expect("workspace");
+        fs::create_dir(&hidden).expect("hidden root");
+        symlink(&hidden, &hidden_alias).expect("hidden-root alias");
+
+        for (candidate, expected) in [
+            (&hidden_alias, "may not traverse a symlink ancestor"),
+            (&missing_hidden, "failed to inspect hidden root ancestor"),
+        ] {
+            let profile =
+                StrictOfflineWorkspaceProfile::read_only(&workspace).with_hidden_root(candidate);
+            let spec = ProcessSpec::direct(
+                "canonical hidden-root fixture",
+                PathBuf::from("/bin/true"),
+                Vec::<OsString>::new(),
+                &workspace,
+                128,
+            )
+            .with_side_effect_confinement(
+                SideEffectConfinementProfile::StrictOfflineWorkspace(profile),
+            );
+            let error = match resolve_systemd_sandbox(&spec) {
+                Err(error) => error,
+                Ok(_) => panic!(
+                    "unsafe hidden root unexpectedly resolved: {}",
+                    candidate.display()
+                ),
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected hidden-root resolution error: {error}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn protect_home_tmpfs_property_and_exact_mask_set_fail_closed() {
+        let mut property = BTreeMap::from([("ProtectHome".to_string(), "tmpfs".to_string())]);
+        verify_protect_home_tmpfs_property(&property).expect("exact ProtectHome tmpfs");
+        for ineffective in ["yes", "read-only", "false", ""] {
+            property.insert("ProtectHome".to_string(), ineffective.to_string());
+            assert!(
+                verify_protect_home_tmpfs_property(&property).is_err(),
+                "ineffective ProtectHome value was accepted: {ineffective:?}"
+            );
+        }
+        assert!(verify_protect_home_tmpfs_property(&BTreeMap::new()).is_err());
+
+        let mut sandbox = ResolvedSystemdSandbox {
+            kind: SideEffectConfinementProfileKind::ExternalCodex,
+            workspace_root: PathBuf::from("/worktree"),
+            current_dir: PathBuf::from("/worktree"),
+            workspace_access: WorkspaceAccess::ReadWrite,
+            visible_read_only_roots: Vec::new(),
+            visible_read_only_files: Vec::new(),
+            visible_read_write_roots: Vec::new(),
+            visible_read_write_files: Vec::new(),
+            external_codex_writable_file_capabilities: Vec::new(),
+            writable_artifact_roots: Vec::new(),
+            hidden_roots: vec![
+                PathBuf::from("/root/covered"),
+                PathBuf::from("/srv/required-mask"),
+            ],
+            isolated_host_view: false,
+            resource_limits: ProcessResourceLimits::default(),
+            path_identities: Vec::new(),
+            mount_checks: Vec::new(),
+        };
+        let runtime = Path::new("/run/maco-process");
+        let protect_home = sandbox.protect_home_mount_plan();
+        assert_eq!(
+            protect_home.covering_roots,
+            BTreeSet::from([PathBuf::from("/root")])
+        );
+        let temporary_file_system =
+            |value: &str| BTreeMap::from([("TemporaryFileSystem".to_string(), value.to_string())]);
+        verify_temporary_file_system_property(
+            &sandbox,
+            &protect_home,
+            &temporary_file_system("/root:ro"),
+        )
+        .expect("covered hidden root requires an exact read-only tmpfs");
+        for drift in [
+            "",
+            "/root:rw",
+            "/root:ro,rw",
+            "/root:ro,nodev",
+            "/root:ro /root:ro",
+            "/root:ro /unexpected:ro",
+            "/root/../srv:ro",
+            "root:ro",
+            "/root",
+        ] {
+            assert!(
+                verify_temporary_file_system_property(
+                    &sandbox,
+                    &protect_home,
+                    &temporary_file_system(drift),
+                )
+                .is_err(),
+                "TemporaryFileSystem drift was accepted: {drift:?}"
+            );
+        }
+
+        sandbox.isolated_host_view = true;
+        verify_temporary_file_system_property(
+            &sandbox,
+            &protect_home,
+            &temporary_file_system("/root:ro /:ro"),
+        )
+        .expect("isolated root and ProtectHome cover compose independent read-only tmpfs roots");
+        for drift in [
+            "/:ro",
+            "/root:ro",
+            "/:ro /root:ro /tmp:ro",
+            "/:ro /root:ro /root:ro",
+        ] {
+            assert!(
+                verify_temporary_file_system_property(
+                    &sandbox,
+                    &protect_home,
+                    &temporary_file_system(drift),
+                )
+                .is_err(),
+                "combined isolated/ProtectHome tmpfs drift was accepted: {drift:?}"
+            );
+        }
+        let mut isolated_command = Command::new("systemd-run");
+        apply_systemd_sandbox_properties(&mut isolated_command, &sandbox);
+        let isolated_arguments = isolated_command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<BTreeSet<_>>();
+        assert!(isolated_arguments.contains("--property=TemporaryFileSystem=/:ro"));
+        assert!(isolated_arguments.contains("--property=TemporaryFileSystem=/root:ro"));
+        sandbox.isolated_host_view = false;
+
+        let mut inaccessible = BTreeSet::from([PathBuf::from("/srv/required-mask")]);
+        inaccessible.extend(known_sensitive_socket_paths());
+        let exact = BTreeMap::from([
+            (
+                "InaccessiblePaths".to_string(),
+                joined_property_paths(&inaccessible),
+            ),
+            ("ReadOnlyPaths".to_string(), String::new()),
+            ("BindReadOnlyPaths".to_string(), String::new()),
+            (
+                "ReadWritePaths".to_string(),
+                "/run/maco-process /worktree".to_string(),
+            ),
+            (
+                "BindPaths".to_string(),
+                "/worktree /run/maco-process".to_string(),
+            ),
+        ]);
+        verify_exact_systemd_path_properties(&sandbox, &exact, runtime)
+            .expect("covered hidden root omitted from exact inaccessible set");
+
+        let mut impossible_mask = exact.clone();
+        impossible_mask
+            .get_mut("InaccessiblePaths")
+            .expect("inaccessible fixture")
+            .push_str(" /root/covered");
+        assert!(
+            verify_exact_systemd_path_properties(&sandbox, &impossible_mask, runtime).is_err(),
+            "an impossible covered descendant mask must be rejected as property drift"
+        );
+
+        let mut omitted_required_mask = exact;
+        let sensitive_paths = known_sensitive_socket_paths()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        omitted_required_mask.insert(
+            "InaccessiblePaths".to_string(),
+            joined_property_paths(&sensitive_paths),
+        );
+        assert!(
+            verify_exact_systemd_path_properties(&sandbox, &omitted_required_mask, runtime)
+                .is_err(),
+            "non-covered hidden root must remain in the exact inaccessible set"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn protect_home_tmpfs_command_and_guardian_report_require_both_proofs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut sandbox = program_visibility_sandbox(Path::new("/worktree"));
+        sandbox.hidden_roots = vec![
+            PathBuf::from("/root/covered"),
+            PathBuf::from("/srv/required-mask"),
+        ];
+        let mut command = Command::new("systemd-run");
+        apply_systemd_sandbox_properties(&mut command, &sandbox);
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<BTreeSet<_>>();
+        assert!(arguments.contains("--property=ProtectHome=tmpfs"));
+        assert!(arguments.contains("--property=TemporaryFileSystem=/root:ro"));
+        assert!(arguments.contains("--property=InaccessiblePaths=/srv/required-mask"));
+        assert!(!arguments.contains("--property=InaccessiblePaths=/root/covered"));
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let report = temp.path().join("report");
+        fs::write(
+            &report,
+            "security 0000000000000000 0000000000000000 0000000000000000 0000000000000000 1 2\nprotect-home-root tmpfs tmpfs ro,nodev\nprotect-home-hidden\ninaccessible\n",
+        )
+        .expect("write report");
+        fs::set_permissions(&report, fs::Permissions::from_mode(0o600)).expect("report mode");
+        let checks = vec![
+            SandboxMountCheck {
+                path: PathBuf::from("/root"),
+                device: 0,
+                inode: 0,
+                access: SandboxMountAccess::ProtectHomeRoot,
+                optional: false,
+            },
+            SandboxMountCheck {
+                path: PathBuf::from("/root/covered"),
+                device: 0,
+                inode: 0,
+                access: SandboxMountAccess::ProtectHomeHidden,
+                optional: false,
+            },
+            SandboxMountCheck {
+                path: PathBuf::from("/srv/required-mask"),
+                device: 0,
+                inode: 0,
+                access: SandboxMountAccess::Inaccessible,
+                optional: false,
+            },
+        ];
+        verify_sandbox_mount_report(&report, &checks)
+            .expect("ProtectHome and inaccessible guardian evidence");
+
+        for invalid_report in [
+            "security 0000000000000000 0000000000000000 0000000000000000 0000000000000000 1 2\nprotect-home-root host ext4 ro,nodev\nprotect-home-hidden\ninaccessible\n",
+            "security 0000000000000000 0000000000000000 0000000000000000 0000000000000000 1 2\nprotect-home-root tmpfs tmpfs rw,nodev\nprotect-home-hidden\ninaccessible\n",
+            "security 0000000000000000 0000000000000000 0000000000000000 0000000000000000 1 2\nprotect-home-root tmpfs tmpfs ro,nodev\ninaccessible\ninaccessible\n",
+        ] {
+            fs::write(&report, invalid_report).expect("replace report");
+            assert!(verify_sandbox_mount_report(&report, &checks).is_err());
+        }
+        assert!(
+            SYSTEMD_GUARDIAN_SCRIPT.contains("ProtectHome-covered hidden path remained reachable")
+        );
+        assert!(SYSTEMD_GUARDIAN_SCRIPT.contains("ProtectHome root was not backed by tmpfs"));
+        assert!(SYSTEMD_GUARDIAN_SCRIPT.contains("ProtectHome root was not read-only"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn trusted_network_properties_require_exact_ip_families_without_private_network() {
         let mut properties = BTreeMap::from([
             (
@@ -11940,11 +12533,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn isolated_root_property_requires_exact_single_read_only_root() {
+        let mut sandbox = program_visibility_sandbox(Path::new("/workspace"));
+        sandbox.isolated_host_view = true;
+        let protect_home = sandbox.protect_home_mount_plan();
         for value in ["/:ro", "  /:ro\n"] {
-            assert!(
-                is_exact_isolated_host_view_property(value),
-                "expected exact isolated root property: {value:?}"
-            );
+            let properties =
+                BTreeMap::from([("TemporaryFileSystem".to_string(), value.to_string())]);
+            verify_temporary_file_system_property(&sandbox, &protect_home, &properties)
+                .unwrap_or_else(|error| {
+                    panic!("expected exact isolated root property {value:?}: {error}")
+                });
         }
 
         for value in [
@@ -11960,8 +12558,11 @@ mod tests {
             "/:",
             "/",
         ] {
+            let properties =
+                BTreeMap::from([("TemporaryFileSystem".to_string(), value.to_string())]);
             assert!(
-                !is_exact_isolated_host_view_property(value),
+                verify_temporary_file_system_property(&sandbox, &protect_home, &properties)
+                    .is_err(),
                 "unexpectedly accepted isolated root property: {value:?}"
             );
         }
@@ -11989,10 +12590,13 @@ mod tests {
         };
         let mut properties =
             BTreeMap::from([("TemporaryFileSystem".to_string(), "/:ro".to_string())]);
-        verify_isolated_host_view_property(&sandbox, &properties)
+        let protect_home = sandbox.protect_home_mount_plan();
+        verify_temporary_file_system_property(&sandbox, &protect_home, &properties)
             .expect("exact isolated root property");
         properties.insert("TemporaryFileSystem".to_string(), "/tmp:ro".to_string());
-        assert!(verify_isolated_host_view_property(&sandbox, &properties).is_err());
+        assert!(
+            verify_temporary_file_system_property(&sandbox, &protect_home, &properties).is_err()
+        );
 
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().expect("tempdir");
