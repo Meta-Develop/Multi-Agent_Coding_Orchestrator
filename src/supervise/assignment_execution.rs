@@ -176,6 +176,66 @@ fn review_loop_validation_floor(
     }
 }
 
+pub(super) fn lock_validation_floor_failure(
+    child_report: &mut OrchestratorReviewReport,
+    blocker: GateApplyBlocker,
+    report_path: &Path,
+) {
+    child_report.status = ReviewStatus::Failed;
+    child_report.accepted = false;
+    child_report.rejected = true;
+    child_report.findings.push(Finding {
+        severity: FindingSeverity::Error,
+        message: format!("non-negotiable validation floor was not satisfied: {blocker:?}"),
+        paths: vec![report_path.to_path_buf()],
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn apply_validation_floor_gate(
+    blocker: GateApplyBlocker,
+    child_report: &mut OrchestratorReviewReport,
+    report_path: &Path,
+    outcome: &mut AssignmentExecutionOutcome,
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    assignment: &OrchestratorAssignment,
+    journal_parent_id: &str,
+    retry_feedback: &mut Option<ChildAttemptCorrection>,
+) -> Result<bool> {
+    let correction_correlation_id = outcome
+        .gate_tracker
+        .as_ref()
+        .context("gate correction tracker was not initialized")?
+        .correlation_id_for_observation(&assignment.id);
+    let denial = GateDenial::new(
+        correction_correlation_id,
+        GateDenialReason::ValidationRepair { blocker },
+        VerifiedGateContext::new(
+            &assignment.id,
+            GateCheckSource::Validation,
+            &assignment.assigned_paths,
+        )?,
+    )
+    .context("failed to construct validation gate denial")?;
+    let authorized_denial = outcome
+        .gate_tracker
+        .as_mut()
+        .context("gate correction tracker was not initialized")?
+        .authorize(
+            denial,
+            artifacts,
+            &assignment.id,
+            journal_parent_id,
+            &mut outcome.health_signals,
+        )?;
+    if let Some(authorized_denial) = authorized_denial {
+        *retry_feedback = Some(ChildAttemptCorrection::Gate(authorized_denial));
+        return Ok(true);
+    }
+    lock_validation_floor_failure(child_report, blocker, report_path);
+    Ok(false)
+}
+
 fn locked_parent_review_accepted(child_report: &OrchestratorReviewReport) -> bool {
     child_report
         .review_lens_aggregate
@@ -237,6 +297,14 @@ pub(super) fn suppress_review_loop_retry_if_threshold(
     denial: &GateDenial,
 ) -> Result<bool> {
     if !threshold_reached {
+        return Ok(false);
+    }
+    let retry_available = outcome
+        .gate_tracker
+        .as_ref()
+        .context("gate correction tracker was not initialized")?
+        .could_authorize_retry(denial);
+    if !retry_available {
         return Ok(false);
     }
     review_loop_tracker
@@ -1804,35 +1872,17 @@ fn decide_child_attempt(
         None
     };
     if report_shape_problems.is_empty() {
-        if let Some(blocker) = validation_blocker.filter(|_| report_failed(&attempt_report)) {
-            let correction_correlation_id = outcome
-                .gate_tracker
-                .as_ref()
-                .context("gate correction tracker was not initialized")?
-                .correlation_id_for_observation(&assignment.id);
-            let denial = GateDenial::new(
-                correction_correlation_id,
-                GateDenialReason::ValidationRepair { blocker },
-                VerifiedGateContext::new(
-                    &assignment.id,
-                    GateCheckSource::Validation,
-                    &assignment.assigned_paths,
-                )?,
-            )
-            .context("failed to construct validation gate denial")?;
-            let authorized_denial = outcome
-                .gate_tracker
-                .as_mut()
-                .context("gate correction tracker was not initialized")?
-                .authorize(
-                    denial,
-                    artifacts,
-                    &assignment.id,
-                    journal_parent_id,
-                    &mut outcome.health_signals,
-                )?;
-            if let Some(authorized_denial) = authorized_denial {
-                *retry_feedback = Some(ChildAttemptCorrection::Gate(authorized_denial));
+        if let Some(blocker) = validation_blocker {
+            if apply_validation_floor_gate(
+                blocker,
+                &mut attempt_report,
+                &attempt_artifacts.raw_report_relative,
+                outcome,
+                artifacts,
+                assignment,
+                journal_parent_id,
+                retry_feedback,
+            )? {
                 return Ok(ChildAttemptDisposition::Retry);
             }
         } else if matches!(
@@ -2582,6 +2632,7 @@ fn decide_parent_auditor_gate(
     auditor_sandbox_denied: bool,
     auditor_environment_blocked: bool,
     pre_auditor_candidate: Option<SupervisorCandidateInspection>,
+    current_parent_audit_start: usize,
     mut child_report: OrchestratorReviewReport,
     mut review_loop_tracker: Option<&mut ReviewLoopGuardTracker>,
     retry_feedback: &mut Option<ChildAttemptCorrection>,
@@ -2609,12 +2660,18 @@ fn decide_parent_auditor_gate(
     let evidence_only_rejection = parent_auditor_failed
         && auditor_rejection_kind == Some(AuditorRejectionKind::EvidenceQuality);
     let review_loop_threshold_reached = match review_loop_tracker.as_deref_mut() {
-        Some(tracker) => tracker.observe_real_parent_review(
-            artifacts,
-            assignment,
-            journal_parent_id,
-            &child_report.audit_reports,
-        )?,
+        Some(tracker) => {
+            let current_parent_audits = child_report
+                .audit_reports
+                .get(current_parent_audit_start..)
+                .context("parent-auditor report boundary exceeded the collected report list")?;
+            tracker.observe_real_parent_review(
+                artifacts,
+                assignment,
+                journal_parent_id,
+                current_parent_audits,
+            )?
+        }
         None => false,
     };
     if parent_auditor_repair_eligible(
@@ -3044,6 +3101,7 @@ fn execute_supervisor_assignment_inner(
             write_child_report(writer, &final_report_relative, &child_report)
         })?;
 
+        let current_parent_audit_start = child_report.audit_reports.len();
         let mut assignment_containment_verified = child_containment_verified;
         let mut auditor_primary_integrity_failed = false;
         let mut auditor_sandbox_denied = false;
@@ -3233,6 +3291,7 @@ fn execute_supervisor_assignment_inner(
             auditor_sandbox_denied,
             auditor_environment_blocked,
             pre_auditor_candidate,
+            current_parent_audit_start,
             child_report,
             review_loop_tracker.as_mut(),
             &mut retry_feedback,
@@ -3675,6 +3734,7 @@ mod decomposition_tests {
             prepared_auditor.auditor_command.machine_global_retention,
             options.machine_global_retention
         );
+        let current_parent_audit_start = child_report.audit_reports.len();
         let auditor_collection = dispatch_and_collect_parent_auditor(
             &context,
             &mut outcome,
@@ -3700,6 +3760,7 @@ mod decomposition_tests {
             auditor_collection.sandbox_denied,
             auditor_collection.environment_blocked,
             None,
+            current_parent_audit_start,
             child_report,
             None,
             &mut retry_feedback,

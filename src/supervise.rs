@@ -3796,6 +3796,17 @@ impl GateCorrectionTracker {
             .unwrap_or_else(|| gate_correlation_id(entity_id, self.denials.len().saturating_add(1)))
     }
 
+    fn could_authorize_retry(&self, denial: &GateDenial) -> bool {
+        let denial_can_begin = self
+            .active
+            .as_ref()
+            .map(|active| active.denial.denial_id == denial.denial_id)
+            .unwrap_or(true);
+        denial_can_begin
+            && denial.retryability == GateRetryability::RetryAfterCorrection
+            && self.used < self.budget
+    }
+
     fn authorize(
         &mut self,
         denial: GateDenial,

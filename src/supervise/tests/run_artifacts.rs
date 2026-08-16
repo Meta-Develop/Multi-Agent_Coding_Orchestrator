@@ -723,9 +723,6 @@ fn resume_refuses_threshold_stop_without_assignment_completion_as_uncertain() {
             ledger.report().expect("uncertain assignment budget"),
         )
         .expect("checkpoint uncertain assignment start");
-    checkpoint
-        .dispatch_started(false, &assignment.id, 1)
-        .expect("checkpoint child dispatch start");
     let mut orchestration_journal = Some(OrchestrationEventJournal::new(
         "authenticated-resume-repository",
         run_id.as_str(),
