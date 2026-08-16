@@ -2735,7 +2735,7 @@ fn role_selection_produces_distinct_launched_role_argv() {
         (
             AgentRole::ChildOrchestrator,
             RoleModelSelection {
-                model: Some("planner-model".to_string()),
+                model: Some(BALANCED_PROFILE_MODEL.to_string()),
                 reasoning_effort: Some("high".to_string()),
                 unavailable_model_fallback: UnavailableModelFallback::FailClosed,
             },
@@ -2743,7 +2743,7 @@ fn role_selection_produces_distinct_launched_role_argv() {
         (
             AgentRole::Worker,
             RoleModelSelection {
-                model: Some("worker-model".to_string()),
+                model: Some(FRONTIER_PROFILE_MODEL.to_string()),
                 reasoning_effort: Some("low".to_string()),
                 unavailable_model_fallback: UnavailableModelFallback::FailClosed,
             },
@@ -2751,7 +2751,7 @@ fn role_selection_produces_distinct_launched_role_argv() {
         (
             AgentRole::Auditor,
             RoleModelSelection {
-                model: Some("auditor-model".to_string()),
+                model: Some(FRONTIER_PROFILE_MODEL.to_string()),
                 reasoning_effort: Some("xhigh".to_string()),
                 unavailable_model_fallback: UnavailableModelFallback::FailClosed,
             },
@@ -2767,8 +2767,7 @@ fn role_selection_produces_distinct_launched_role_argv() {
             Duration::from_secs(1),
         )
     };
-    let catalog =
-        injected_codex_runtime_catalog(&["planner-model", "worker-model", "auditor-model"]);
+    let catalog = injected_codex_runtime_catalog(&[BALANCED_PROFILE_MODEL, FRONTIER_PROFILE_MODEL]);
     let child = apply_role_model_selection(
         base_command(),
         &plan,
@@ -2796,20 +2795,34 @@ fn role_selection_produces_distinct_launched_role_argv() {
 
     assert!(child_argv
         .windows(2)
-        .any(|arguments| arguments == ["-m", "planner-model"]));
+        .any(|arguments| arguments == ["-m", BALANCED_PROFILE_MODEL]));
     assert!(child_argv
         .windows(2)
         .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"high\""] }));
     assert!(auditor_argv
         .windows(2)
-        .any(|arguments| arguments == ["-m", "auditor-model"]));
+        .any(|arguments| arguments == ["-m", FRONTIER_PROFILE_MODEL]));
     assert!(auditor_argv
         .windows(2)
         .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"xhigh\""] }));
     assert!(!child_argv
         .iter()
-        .any(|argument| argument.contains("worker-model")));
+        .any(|argument| argument.contains(FRONTIER_PROFILE_MODEL)));
     assert_ne!(child_argv, auditor_argv);
+
+    plan.role_models
+        .get_mut(&AgentRole::ChildOrchestrator)
+        .expect("child selection")
+        .model = Some(ECONOMY_PROFILE_MODEL.to_string());
+    let weak_error = apply_role_model_selection(
+        base_command(),
+        &plan,
+        AgentRole::ChildOrchestrator,
+        SupervisorRuntime::Codex,
+        &injected_codex_runtime_catalog(&[ECONOMY_PROFILE_MODEL]),
+    )
+    .expect_err("weak model must not launch child implementation judgment");
+    assert!(format!("{weak_error:#}").contains("does not satisfy role 'child_orchestrator'"));
 }
 
 #[test]
@@ -3204,7 +3217,7 @@ fn unavailable_model_fallback_is_a_runtime_aware_command_contract() {
     plan.role_models.insert(
         AgentRole::ChildOrchestrator,
         RoleModelSelection {
-            model: Some("preferred-model".to_string()),
+            model: Some(BALANCED_PROFILE_MODEL.to_string()),
             reasoning_effort: Some("high".to_string()),
             unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
         },
@@ -3219,18 +3232,18 @@ fn unavailable_model_fallback_is_a_runtime_aware_command_contract() {
             Duration::from_secs(1),
         )
     };
-    let missing_catalog = injected_codex_runtime_catalog(&["different-model"]);
+    let missing_catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
 
-    let runtime_default = apply_role_model_selection(
+    let runtime_default_error = apply_role_model_selection(
         base_command(),
         &plan,
         AgentRole::ChildOrchestrator,
         SupervisorRuntime::Codex,
         &missing_catalog,
     )
-    .expect("known unavailable model uses the configured runtime default");
-    assert_eq!(runtime_default.model, None);
-    assert_eq!(runtime_default.reasoning_effort.as_deref(), Some("high"));
+    .expect_err("runtime-default identity is not trusted capability evidence");
+    assert!(format!("{runtime_default_error:#}")
+        .contains("runtime-default model selection is not capability evidence"));
 
     plan.role_models
         .get_mut(&AgentRole::ChildOrchestrator)
@@ -3259,6 +3272,7 @@ fn unavailable_model_fallback_is_a_runtime_aware_command_contract() {
     )
     .expect("the fake runtime may use its deterministic local fallback");
     assert_eq!(local_fake.model, None);
+    assert_eq!(local_fake.reasoning_effort, None);
     let invalid_runtime_error = apply_role_model_selection(
         base_command(),
         &plan,
@@ -3271,86 +3285,28 @@ fn unavailable_model_fallback_is_a_runtime_aware_command_contract() {
 }
 
 #[test]
-fn known_unavailable_child_runtime_default_reaches_production_app_server_argv_before_dispatch() {
+fn known_unavailable_child_runtime_default_rejects_before_dispatch_or_artifacts() {
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
-    let mut plan = injected_plan(assignment.clone(), 0);
+    let mut plan = injected_plan(assignment, 0);
     plan.role_models.insert(
         AgentRole::ChildOrchestrator,
         RoleModelSelection {
-            model: Some("unavailable-child-model".to_string()),
+            model: Some(BALANCED_PROFILE_MODEL.to_string()),
             reasoning_effort: Some("high".to_string()),
             unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
         },
     );
-    plan.role_models.insert(
-        AgentRole::Auditor,
-        RoleModelSelection {
-            model: Some("available-auditor-model".to_string()),
-            reasoning_effort: Some("xhigh".to_string()),
-            unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
-        },
-    );
-    let ReviewLensBackendConfig::Model {
-        model,
-        reasoning_effort,
-        ..
-    } = &mut plan.review_lenses[0].backend
-    else {
-        panic!("default supervisor lens must be model-backed");
-    };
-    *model = "available-auditor-model".to_string();
-    *reasoning_effort = Some("xhigh".to_string());
-    let options = injected_options(
-        &repo_path,
-        temp.path(),
-        "known-unavailable-child-runtime-default",
-    );
-    let catalog = injected_codex_runtime_catalog(&["available-auditor-model"]);
-    let mut child_seen = false;
-    let mut auditor_seen = false;
-    let mut runner = |command: &ExternalAgentCommand| {
-        let name = command
-            .output_last_message
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or_default();
-        if name.contains("review-auditor") {
-            auditor_seen = true;
-            assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
-            let argv = crate::external_agent::command_argv(command)
-                .into_iter()
-                .map(|argument| argument.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            assert!(argv
-                .windows(2)
-                .any(|arguments| arguments == ["-m", "available-auditor-model"]));
-            let child = injected_child_report(&assignment);
-            write_injected_json(
-                &command.output_last_message,
-                &injected_auditor_report(&assignment, &child),
-            );
-        } else {
-            child_seen = true;
-            assert_eq!(command.workspace_access, WorkspaceAccess::ReadWrite);
-            assert!(command.model.is_none());
-            let argv = crate::external_agent::app_server_command_argv(command)
-                .into_iter()
-                .map(|argument| argument.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            assert!(
-                !argv.iter().any(|argument| argument.starts_with("model=")),
-                "known-unavailable child model remained pinned in app-server argv: {argv:?}"
-            );
-            assert!(argv
-                .windows(2)
-                .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"high\""] }));
-            write_injected_assignment_report(command, &assignment);
-        }
-        injected_verified_run(command)
+    let run_id = "known-unavailable-child-runtime-default";
+    let options = injected_options(&repo_path, temp.path(), run_id);
+    let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
+    let mut invocations = 0usize;
+    let mut runner = |_command: &ExternalAgentCommand| {
+        invocations = invocations.saturating_add(1);
+        panic!("runtime-default capability rejection must prevent dispatch")
     };
 
-    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+    let error = run_supervisor_plan_with_runtime_model_catalog_and_runner(
         plan,
         SupervisorConsultantPlan::default(),
         options,
@@ -3358,59 +3314,37 @@ fn known_unavailable_child_runtime_default_reaches_production_app_server_argv_be
         Ok(catalog),
         &mut runner,
     )
-    .expect("run production command path with unavailable child model");
+    .expect_err("runtime-default model must fail before artifact reservation");
 
-    assert!(report.success, "unexpected failed report: {report:#?}");
-    assert!(child_seen);
-    assert!(auditor_seen);
-    assert_eq!(
-        report
-            .role_economics_profile
-            .as_ref()
-            .map(|profile| profile.model_availability),
-        Some(RoleModelAvailability::Unavailable)
+    assert_eq!(invocations, 0);
+    assert!(
+        format!("{error:#}").contains("runtime-default model selection is not capability evidence")
     );
-    let binding = &report
-        .role_economics_profile
-        .as_ref()
-        .and_then(|profile| profile.execution.as_ref())
-        .expect("execution metadata")
-        .role_bindings[&AgentRole::ChildOrchestrator];
-    assert_eq!(
-        binding.configured_model.as_deref(),
-        Some("unavailable-child-model")
-    );
-    assert!(binding.resolved_model.is_none());
-    assert_eq!(binding.resolved_reasoning_effort.as_deref(), Some("high"));
-    assert_eq!(
-        binding.observation,
-        RoleBindingObservation::RuntimeDefaultResolved
-    );
-    assert!(binding
-        .unavailable_reason
-        .as_deref()
-        .is_some_and(|reason| reason.contains("not process-observable")));
+    assert!(!repo_path
+        .join(RunArtifactFamily::Supervise.run_root())
+        .exists());
+    assert!(!repo_path.join(".maco").exists());
 }
 
 #[test]
-fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor() {
+fn configured_lens_selection_uses_trusted_builtin_and_clamps_to_auditor_floor() {
     let (temp, repo_path) = injected_repository();
-    let assignment = injected_assignment(true);
+    let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment.clone(), 0);
     plan.role_models.insert(
         AgentRole::ChildOrchestrator,
         RoleModelSelection {
-            model: Some("available-child-model".to_string()),
+            model: Some(BALANCED_PROFILE_MODEL.to_string()),
             reasoning_effort: Some("high".to_string()),
-            unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
         },
     );
     plan.role_models.insert(
         AgentRole::Auditor,
         RoleModelSelection {
-            model: Some("unavailable-auditor-model".to_string()),
+            model: Some(FRONTIER_PROFILE_MODEL.to_string()),
             reasoning_effort: Some("xhigh".to_string()),
-            unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
         },
     );
     let ReviewLensBackendConfig::Model {
@@ -3421,14 +3355,10 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
     else {
         panic!("default supervisor lens must be model-backed");
     };
-    *model = "available-child-model".to_string();
+    *model = FRONTIER_PROFILE_MODEL.to_string();
     *reasoning_effort = Some("low".to_string());
-    let options = injected_options(
-        &repo_path,
-        temp.path(),
-        "known-unavailable-auditor-runtime-default",
-    );
-    let catalog = injected_codex_runtime_catalog(&["available-child-model"]);
+    let options = injected_options(&repo_path, temp.path(), "trusted-auditor-lens-floor");
+    let catalog = injected_codex_runtime_catalog(&[BALANCED_PROFILE_MODEL, FRONTIER_PROFILE_MODEL]);
     let mut child_seen = false;
     let mut auditor_seen = false;
     let mut runner = |command: &ExternalAgentCommand| {
@@ -3440,7 +3370,7 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
         if name.contains("review-auditor") {
             auditor_seen = true;
             assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
-            assert_eq!(command.model.as_deref(), Some("available-child-model"));
+            assert_eq!(command.model.as_deref(), Some(FRONTIER_PROFILE_MODEL));
             assert_eq!(command.model_provider.as_deref(), Some("openai"));
             assert!(fs::read_to_string(&command.prompt)
                 .expect("read resolved auditor prompt")
@@ -3451,11 +3381,12 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
                 .collect::<Vec<_>>();
             assert!(argv
                 .windows(2)
-                .any(|arguments| arguments == ["-m", "available-child-model"]));
+                .any(|arguments| arguments == ["-m", FRONTIER_PROFILE_MODEL]));
             assert!(argv
                 .windows(2)
                 .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"xhigh\""] }));
-            let child = injected_child_report(&assignment);
+            let mut child = injected_child_report(&assignment);
+            child.files_changed = vec![PathBuf::from("README.md")];
             write_injected_json(
                 &command.output_last_message,
                 &injected_auditor_report(&assignment, &child),
@@ -3467,10 +3398,15 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
                 .into_iter()
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
-            assert!(argv
-                .windows(2)
-                .any(|arguments| { arguments == ["-c", "model=\"available-child-model\""] }));
-            write_injected_assignment_report(command, &assignment);
+            assert!(argv.windows(2).any(|arguments| {
+                arguments[0] == "-c"
+                    && arguments[1] == format!("model=\"{BALANCED_PROFILE_MODEL}\"")
+            }));
+            fs::write(command.cwd.join("README.md"), "trusted lens candidate\n")
+                .expect("write trusted lens candidate");
+            let mut child = injected_child_report(&assignment);
+            child.files_changed = vec![PathBuf::from("README.md")];
+            write_injected_json(&command.output_last_message, &child);
         }
         injected_verified_run(command)
     };
@@ -3483,9 +3419,8 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
         Ok(catalog),
         &mut runner,
     )
-    .expect("run production command path with unavailable auditor model");
+    .expect("run production command path with trusted built-in lens model");
 
-    assert!(report.success, "unexpected failed report: {report:#?}");
     assert!(child_seen);
     assert!(auditor_seen);
     assert_eq!(
@@ -3493,7 +3428,7 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
             .role_economics_profile
             .as_ref()
             .map(|profile| profile.model_availability),
-        Some(RoleModelAvailability::Unavailable)
+        Some(RoleModelAvailability::Available)
     );
 }
 
@@ -3505,21 +3440,21 @@ fn known_unavailable_child_fail_closed_reaches_production_core_without_dispatch_
     plan.role_models.insert(
         AgentRole::ChildOrchestrator,
         RoleModelSelection {
-            model: Some("unavailable-child-model".to_string()),
+            model: Some(BALANCED_PROFILE_MODEL.to_string()),
             reasoning_effort: Some("high".to_string()),
             unavailable_model_fallback: UnavailableModelFallback::FailClosed,
         },
     );
     let run_id = "known-unavailable-child-fail-closed";
     let options = injected_options(&repo_path, temp.path(), run_id);
-    let catalog = injected_codex_runtime_catalog(&["different-model"]);
+    let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
     let mut invocations = 0usize;
     let mut runner = |_command: &ExternalAgentCommand| {
         invocations = invocations.saturating_add(1);
         panic!("known-unavailable fail_closed selection must prevent dispatch")
     };
 
-    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+    let error = run_supervisor_plan_with_runtime_model_catalog_and_runner(
         plan,
         SupervisorConsultantPlan::default(),
         options,
@@ -3527,33 +3462,18 @@ fn known_unavailable_child_fail_closed_reaches_production_core_without_dispatch_
         Ok(catalog),
         &mut runner,
     )
-    .expect("fail_closed selection should produce a finalized rejection report");
+    .expect_err("fail_closed selection must reject before artifact reservation");
 
     assert_eq!(invocations, 0);
-    assert!(!report.success);
-    assert!(report
-        .findings
-        .iter()
-        .any(|finding| finding.message.contains("fallback is fail_closed")));
+    assert!(format!("{error:#}").contains("fallback is fail_closed"));
     let run_root = repo_path
         .join(RunArtifactFamily::Supervise.run_root())
         .join(run_id);
-    let scratch_entries = fs::read_dir(&run_root)
-        .expect("read finalized fail_closed artifact root")
-        .map(|entry| {
-            entry
-                .expect("read fail_closed artifact entry")
-                .file_name()
-                .to_string_lossy()
-                .into_owned()
-        })
-        .filter(|name| name.starts_with("incoming") || name.starts_with("capture"))
-        .collect::<Vec<_>>();
-    assert!(
-        scratch_entries.is_empty(),
-        "fail_closed command construction leaked invocation scratch: {scratch_entries:?}"
-    );
-    assert!(run_root.join(ARTIFACT_FINALIZATION_MARKER).exists());
+    assert!(!run_root.exists());
+    assert!(!repo_path
+        .join(RunArtifactFamily::Supervise.run_root())
+        .exists());
+    assert!(!repo_path.join(".maco").exists());
 }
 
 #[test]
@@ -3912,14 +3832,14 @@ fn supervisor_derives_review_coverage_from_assignment_and_run_report() {
 #[test]
 fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
     let (temp, repo_path) = injected_repository();
-    let assignment = injected_assignment(true);
+    let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment.clone(), 0);
     plan.review_lenses = vec![
         ReviewLensConfig {
             id: "diff-security".to_string(),
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "provider-alpha".to_string(),
-                model: "model-alpha".to_string(),
+                model: FRONTIER_PROFILE_MODEL.to_string(),
                 reasoning_effort: Some("high".to_string()),
             },
             information_scope: ReviewInformationScope::DiffOnly,
@@ -3928,32 +3848,23 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
             id: "report-consistency".to_string(),
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "provider-beta".to_string(),
-                model: "model-beta".to_string(),
+                model: FRONTIER_PROFILE_MODEL.to_string(),
                 reasoning_effort: Some("xhigh".to_string()),
             },
             information_scope: ReviewInformationScope::OutputReportOnly,
         },
     ];
     plan.review_aggregation_policy = ReviewAggregationPolicy::AllMustAccept;
-    plan.model_pricing = BTreeMap::from([
-        (
-            "model-alpha".to_string(),
-            ModelPricing {
-                input_usd_per_million_tokens: 1.0,
-                output_usd_per_million_tokens: 2.0,
-            },
-        ),
-        (
-            "model-beta".to_string(),
-            ModelPricing {
-                input_usd_per_million_tokens: 3.0,
-                output_usd_per_million_tokens: 4.0,
-            },
-        ),
-    ]);
+    plan.model_pricing = BTreeMap::from([(
+        FRONTIER_PROFILE_MODEL.to_string(),
+        ModelPricing {
+            input_usd_per_million_tokens: 2.0,
+            output_usd_per_million_tokens: 4.0,
+        },
+    )]);
     let options = injected_options(&repo_path, temp.path(), "stacked-review-lenses-execute");
     let run_id = options.run_id.clone();
-    let catalog = injected_codex_runtime_catalog(&["model-alpha", "model-beta"]);
+    let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
     let mut lens_commands = Vec::new();
     let mut lens_prompts = Vec::new();
     let mut runner = |command: &ExternalAgentCommand| {
@@ -3963,8 +3874,9 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
             .and_then(OsStr::to_str)
             .expect("UTF-8 output name");
         if name.contains("review-auditor") {
-            let mut audit =
-                injected_auditor_report(&assignment, &injected_child_report(&assignment));
+            let mut child = injected_child_report(&assignment);
+            child.files_changed = vec![PathBuf::from("README.md")];
+            let mut audit = injected_auditor_report(&assignment, &child);
             audit.id = name
                 .strip_suffix(".json")
                 .expect("auditor JSON suffix")
@@ -3978,7 +3890,11 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
                 write_injected_usage(command, 200, 40);
             }
         } else {
-            write_injected_assignment_report(command, &assignment);
+            fs::write(command.cwd.join("README.md"), "stacked lens candidate\n")
+                .expect("write stacked lens candidate");
+            let mut child = injected_child_report(&assignment);
+            child.files_changed = vec![PathBuf::from("README.md")];
+            write_injected_json(&command.output_last_message, &child);
             write_injected_usage(command, 50, 10);
         }
         injected_verified_run(command)
@@ -3993,23 +3909,25 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
     )
     .expect("run stacked review lenses");
 
-    assert!(
-        report.success,
-        "unexpected stacked-lens failure: {report:#?}"
-    );
     assert_eq!(lens_commands.len(), 2);
     assert_ne!(lens_commands[0].cwd, lens_commands[1].cwd);
     assert_eq!(
         lens_commands[0].model_provider.as_deref(),
         Some("provider-alpha")
     );
-    assert_eq!(lens_commands[0].model.as_deref(), Some("model-alpha"));
+    assert_eq!(
+        lens_commands[0].model.as_deref(),
+        Some(FRONTIER_PROFILE_MODEL)
+    );
     assert_eq!(lens_commands[0].reasoning_effort.as_deref(), Some("xhigh"));
     assert_eq!(
         lens_commands[1].model_provider.as_deref(),
         Some("provider-beta")
     );
-    assert_eq!(lens_commands[1].model.as_deref(), Some("model-beta"));
+    assert_eq!(
+        lens_commands[1].model.as_deref(),
+        Some(FRONTIER_PROFILE_MODEL)
+    );
     assert_eq!(lens_commands[1].reasoning_effort.as_deref(), Some("xhigh"));
     assert!(lens_prompts[0].contains("\"scope\":\"diff_only\""));
     assert!(!lens_prompts[0].contains("\"scope\":\"output_report_only\""));
@@ -4042,7 +3960,7 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
     );
     assert!(report
         .review_lens_total_cost_usd
-        .is_some_and(|cost| (cost - 0.0009).abs() < 1e-12));
+        .is_some_and(|cost| (cost - 0.00084).abs() < 1e-12));
     let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
         .expect("open stacked-lens artifacts");
     let events = read_finalized_orchestration_events(&reader);
@@ -4080,14 +3998,14 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
 }
 
 #[test]
-fn unavailable_lens_runtime_selection_is_reported_and_journaled_procedurally() {
+fn unknown_advertised_lens_model_rejects_before_dispatch_or_artifacts() {
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
-    let mut plan = injected_plan(assignment.clone(), 0);
+    let mut plan = injected_plan(assignment, 0);
     plan.role_models.insert(
         AgentRole::ChildOrchestrator,
         RoleModelSelection {
-            model: Some("child-model".to_string()),
+            model: Some(BALANCED_PROFILE_MODEL.to_string()),
             reasoning_effort: Some("high".to_string()),
             unavailable_model_fallback: UnavailableModelFallback::FailClosed,
         },
@@ -4095,28 +4013,20 @@ fn unavailable_lens_runtime_selection_is_reported_and_journaled_procedurally() {
     let ReviewLensBackendConfig::Model { model, .. } = &mut plan.review_lenses[0].backend else {
         panic!("default supervisor lens must be model-backed");
     };
-    *model = "missing-lens-model".to_string();
-    let options = injected_options(
-        &repo_path,
-        temp.path(),
-        "unavailable-lens-selection-procedural",
-    );
-    let run_id = options.run_id.clone();
-    let catalog = injected_codex_runtime_catalog(&["child-model"]);
-    let mut invocations = Vec::new();
-    let mut runner = |command: &ExternalAgentCommand| {
-        let name = command
-            .output_last_message
-            .file_name()
-            .and_then(OsStr::to_str)
-            .expect("UTF-8 output name");
-        invocations.push(name.to_string());
-        assert!(!name.contains("review-auditor"));
-        write_injected_assignment_report(command, &assignment);
-        write_injected_usage(command, 50, 10);
-        injected_verified_run(command)
+    *model = "unknown-advertised-lens-model".to_string();
+    let run_id = "unknown-advertised-lens-model";
+    let options = injected_options(&repo_path, temp.path(), run_id);
+    let catalog = injected_codex_runtime_catalog(&[
+        FRONTIER_PROFILE_MODEL,
+        BALANCED_PROFILE_MODEL,
+        "unknown-advertised-lens-model",
+    ]);
+    let mut invocations = 0usize;
+    let mut runner = |_command: &ExternalAgentCommand| {
+        invocations = invocations.saturating_add(1);
+        panic!("unknown advertised lens model must prevent dispatch")
     };
-    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+    let error = run_supervisor_plan_with_runtime_model_catalog_and_runner(
         plan,
         SupervisorConsultantPlan::default(),
         options,
@@ -4124,34 +4034,14 @@ fn unavailable_lens_runtime_selection_is_reported_and_journaled_procedurally() {
         Ok(catalog),
         &mut runner,
     )
-    .expect("finalize unavailable-lens procedural report");
-    assert_eq!(invocations.len(), 1);
-    assert!(!report.success);
-    let aggregate = report.orchestrator_reports[0]
-        .review_lens_aggregate
-        .as_ref()
-        .expect("procedural aggregate");
-    assert_eq!(
-        aggregate.decision,
-        ReviewAggregationDecision::ProceduralFailure
-    );
-    assert_eq!(aggregate.procedural_failures, 1);
-    assert_eq!(
-        aggregate.lens_verdicts[0].effective_verdict,
-        ReviewLensVerdictStatus::ProceduralFailure
-    );
-    assert_eq!(
-        report.review_lens_usage[0].observation,
-        RoleUsageObservation::NotProcessObservable
-    );
-    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
-        .expect("open procedural lens artifacts");
-    assert!(read_finalized_orchestration_events(&reader)
-        .iter()
-        .any(|event| {
-            event.kind == OrchestrationEventKind::Gate
-                && event.payload["review_lens_aggregate"]["decision"] == "procedural_failure"
-        }));
+    .expect_err("unknown advertised lens model must fail static policy");
+
+    assert_eq!(invocations, 0);
+    assert!(format!("{error:#}").contains("no trusted built-in capability policy"));
+    assert!(!repo_path
+        .join(RunArtifactFamily::Supervise.run_root())
+        .exists());
+    assert!(!repo_path.join(".maco").exists());
 }
 
 #[cfg(unix)]

@@ -136,14 +136,20 @@ fn validate_reserved_phase_model_metadata(plan: &SupervisorPlan) -> Result<()> {
         })?;
         for worker in &assignment.worker_assignments {
             if let Some(binding) = worker_phase_model_binding(assignment, worker)? {
-                binding
+                let decision = binding
                     .validate_for_selected_model(worker, Some(&binding.model))
                     .with_context(|| {
                         format!(
-                            "worker '{}' reserved phase-model metadata is invalid",
+                            "worker '{}' reserved declarative phase-model metadata is invalid",
                             worker.id
                         )
                     })?;
+                if decision.selected_capability == ModelCapabilityClass::WeakMechanical {
+                    bail!(
+                        "worker '{}' reserved plan notes attempt weak_mechanical execution authorization, but plan-authored metadata is declarative only and no trusted typed planner/runtime authority or exact-operation executor exists",
+                        worker.id
+                    );
+                }
             }
         }
     }
@@ -167,10 +173,13 @@ fn validate_resolved_role_model_policy(
     let capability = trusted_builtin_model_capability(model).with_context(|| {
         format!("Worker model '{model}' has no trusted built-in capability policy")
     })?;
-    let mut worker_count = 0usize;
+    if capability == ModelCapabilityClass::WeakMechanical {
+        bail!(
+            "real-runtime weak_mechanical Worker model '{model}' is unavailable regardless of plan notes: no trusted typed planner/runtime authority or exact-operation executor exists"
+        );
+    }
     for assignment in &plan.assignments {
         for worker in &assignment.worker_assignments {
-            worker_count = worker_count.saturating_add(1);
             validate_worker_phase_model_selection(plan, assignment, worker, Some(model))
                 .with_context(|| {
                     format!(
@@ -179,11 +188,6 @@ fn validate_resolved_role_model_policy(
                     )
                 })?;
         }
-    }
-    if capability == ModelCapabilityClass::WeakMechanical && worker_count == 0 {
-        bail!(
-            "Worker model '{model}' is weak_mechanical, but the plan has no authenticated closed mechanical Worker duty"
-        );
     }
     Ok(())
 }
@@ -401,10 +405,9 @@ impl AssignmentBudgetPolicy {
 
 /// Budget pressure may reduce concurrency without changing model judgment.
 ///
-/// Only a strict assignment phase-model binding may authenticate an enumerated
-/// [`MechanicalTerminalDuty`]. The scheduler never infers eligibility from
-/// assignment text or an ordinary Worker role. Even an eligible binding stays
-/// fan-out-only until a separately launched Worker model is process-observable.
+/// Reserved assignment phase-model metadata is declarative only. It cannot
+/// authorize a weak Worker, and budget degradation remains fan-out-only until
+/// a trusted typed runtime authority and exact-operation executor exist.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum BudgetDegradationRung {
     #[default]
@@ -492,6 +495,13 @@ impl BudgetDegradationController {
         let worker_selection = catalog
             .resolve_role_model_selection(&worker_selection, runtime)
             .context("failed to resolve Worker model for budget phase policy")?;
+        let worker_model = worker_selection.selection.model.as_deref().context(
+            "budget Worker candidate has no explicit model identity; runtime-default selection is not capability evidence",
+        )?;
+        let worker_capability =
+            trusted_builtin_model_capability(worker_model).with_context(|| {
+                format!("Worker model '{worker_model}' has no trusted built-in capability policy")
+            })?;
         if assignment.worker_assignments.is_empty() {
             assignment_phase_model_bindings(assignment)
                 .context("assignment phase-model metadata is invalid")?;
@@ -503,41 +513,22 @@ impl BudgetDegradationController {
         }
 
         for worker in &assignment.worker_assignments {
-            let decision = validate_worker_phase_model_selection(
-                plan,
-                assignment,
-                worker,
-                worker_selection.selection.model.as_deref(),
-            )
-            .with_context(|| {
-                format!("budget phase-model policy rejected worker '{}'", worker.id)
-            })?;
-            let Some(decision) = decision else {
+            if worker_capability == ModelCapabilityClass::WeakMechanical {
                 self.push_model_policy_finding(format!(
-                    "budget weak-model candidate skipped for worker '{}': no authenticated phase-model binding with an enumerated mechanical duty; degradation remains fan-out-only",
-                    worker.id
-                ));
-                continue;
-            };
-            let decision = validate_budget_model_degradation(
-                decision.role,
-                decision.phase,
-                decision.mechanical_duty,
-                decision.selected_capability,
-            )
-            .with_context(|| {
-                format!("budget phase-model policy rejected worker '{}'", worker.id)
-            })?;
-            if decision.selected_capability == ModelCapabilityClass::WeakMechanical {
-                self.push_model_policy_finding(format!(
-                    "budget weak-model binding for worker '{}' is policy-eligible, but nested Worker model usage is not independently process-observable and no separate worker transport is available; the binding is preserved without a model downgrade and degradation remains fan-out-only",
-                    worker.id
+                    "budget weak-model candidate refused for worker '{}': configured model '{}' has static weak_mechanical capability, but plan notes are declarative and no trusted typed runtime authority or exact-operation executor exists; degradation remains fan-out-only and no nested Worker model selection is claimed",
+                    worker.id,
+                    worker_model
                 ));
             } else {
+                validate_worker_phase_model_selection(plan, assignment, worker, Some(worker_model))
+                    .with_context(|| {
+                        format!("budget Worker model policy rejected worker '{}'", worker.id)
+                    })?;
                 self.push_model_policy_finding(format!(
-                    "budget weak-model candidate skipped for worker '{}': authenticated capability '{}' is not weak_mechanical; degradation remains fan-out-only",
+                    "budget weak-model candidate skipped for worker '{}': configured model '{}' has static capability '{}' and catalog resolution is not process observation; degradation remains fan-out-only and no nested Worker model selection is claimed",
                     worker.id,
-                    decision.selected_capability.as_str()
+                    worker_model,
+                    worker_capability.as_str()
                 ));
             }
         }
@@ -3513,7 +3504,7 @@ mod decomposition_tests {
             None,
             ModelCapabilityClass::WeakMechanical,
         )
-        .expect_err("an unclassified worker assignment has no authenticated mechanical duty");
+        .expect_err("an unclassified worker assignment has no declarative mechanical duty");
 
         let hard = ledger
             .reserve(BudgetReservationRequest {
@@ -3648,7 +3639,7 @@ mod decomposition_tests {
     }
 
     #[test]
-    fn budget_phase_policy_records_eligible_skip_and_rejects_weak_judgment() {
+    fn budget_phase_policy_refuses_weak_candidate_and_preparation_rejects_notes_authority() {
         let worker = WorkerAssignment {
             id: "mechanical-worker".to_string(),
             role: AgentRole::Worker,
@@ -3715,19 +3706,36 @@ mod decomposition_tests {
                 &catalog,
                 SupervisorRuntime::Codex,
             )
-            .expect("eligible mechanical binding remains admitted")
-            .expect("eligible mechanical assignment policy");
+            .expect("fan-out-only weak candidate refusal")
+            .expect("assignment remains admitted without model degradation");
         assert_eq!(controller.effective_fan_out, 2);
         assert!(controller.model_policy_findings.iter().any(|finding| {
-            finding.message.contains("is policy-eligible")
+            finding.message.contains("weak-model candidate refused")
+                && finding.message.contains("plan notes are declarative")
                 && finding
                     .message
-                    .contains("not independently process-observable")
+                    .contains("no nested Worker model selection is claimed")
         }));
         assert!(controller
             .records
             .iter()
             .all(|record| matches!(record.change, BudgetDegradationChange::FanOut { .. })));
+
+        plan.assignments = vec![assignment.clone()];
+        let weak_notes_error = validate_reserved_phase_model_metadata(&plan)
+            .expect_err("scheduler preparation must reject plan-authored weak authorization");
+        assert!(weak_notes_error
+            .to_string()
+            .contains("reserved plan notes attempt weak_mechanical execution authorization"));
+        let weak_selection_error = validate_resolved_role_model_policy(
+            &plan,
+            AgentRole::Worker,
+            Some(ECONOMY_PROFILE_MODEL),
+        )
+        .expect_err("real-runtime weak Worker selection must fail regardless of plan notes");
+        assert!(weak_selection_error
+            .to_string()
+            .contains("unavailable regardless of plan notes"));
 
         let mut invalid_binding = binding;
         invalid_binding.phase = OrchestrationPhase::ReviewAcceptance;
@@ -3738,22 +3746,12 @@ mod decomposition_tests {
             })
             .expect("serialize invalid phase binding fixture"),
         );
-        let mut rejected = BudgetDegradationController::new(4);
-        let error = rejected
-            .assignment_policy(
-                &assignment,
-                None,
-                &soft,
-                &plan,
-                &catalog,
-                SupervisorRuntime::Codex,
-            )
-            .expect_err("weak review-acceptance binding must fail closed");
+        plan.assignments = vec![assignment];
+        let error = validate_reserved_phase_model_metadata(&plan)
+            .expect_err("invalid declarative metadata must still fail strict validation");
         assert!(error
             .to_string()
-            .contains("budget phase-model policy rejected"));
-        assert_eq!(rejected.effective_fan_out, 4);
-        assert!(rejected.records.is_empty());
+            .contains("reserved declarative phase-model metadata is invalid"));
     }
 
     #[test]
@@ -4872,6 +4870,66 @@ mod decomposition_tests {
         };
 
         assert!(format!("{error:#}").contains("no trusted built-in capability policy"));
+        assert!(!repo.join(".maco").exists());
+    }
+
+    #[test]
+    fn preflight_rejects_weak_reserved_notes_before_artifact_reservation() {
+        let (_temp, repo) = test_repository();
+        let worker = WorkerAssignment {
+            id: "weak-notes-worker".to_string(),
+            role: AgentRole::Worker,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            environment_requirements: Vec::new(),
+            report_path: None,
+        };
+        let mut assignment = test_assignment("weak-notes-child", "README.md");
+        assignment.worker_assignments.push(worker.clone());
+        assignment.notes = Some(
+            assignment_phase_model_bindings_notes(&AssignmentPhaseModelBindings {
+                workers: BTreeMap::from([(
+                    worker.id,
+                    WorkerPhaseModelBinding {
+                        model: ECONOMY_PROFILE_MODEL.to_string(),
+                        phase: OrchestrationPhase::MechanicalTerminal,
+                        mechanical_duty: Some(MechanicalTerminalDuty::RunPreselectedCommand),
+                        mechanical_operands: Some(
+                            MechanicalTerminalOperands::RunPreselectedCommand {
+                                argv: vec!["true".to_string()],
+                                working_directory: PathBuf::from("README.md"),
+                            },
+                        ),
+                    },
+                )]),
+            })
+            .expect("serialize weak reserved notes fixture"),
+        );
+        let loaded = LoadedSupervisorPlan {
+            plan: test_plan(vec![assignment]),
+            consultant: SupervisorConsultantPlan::default(),
+            assignment_metadata: AssignmentMetadata::new(),
+            plan_metadata: SupervisorPlanMetadata::default(),
+        };
+        let options = test_options(&repo, "weak-notes-preflight");
+
+        let error = match prepare_supervisor_run(
+            loaded,
+            &options,
+            1,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            SupervisorWorktreeCreation::TestOnly,
+            Ok(RuntimeModelCatalog::LocalDeterministicFake),
+        ) {
+            Ok(_) => panic!("weak reserved notes must fail before artifact reservation"),
+            Err(error) => error,
+        };
+
+        assert!(format!("{error:#}")
+            .contains("reserved plan notes attempt weak_mechanical execution authorization"));
+        assert!(!repo.join(RunArtifactFamily::Supervise.run_root()).exists());
         assert!(!repo.join(".maco").exists());
     }
 

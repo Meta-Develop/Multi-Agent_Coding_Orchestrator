@@ -1366,8 +1366,8 @@ pub const ASSIGNMENT_PHASE_MODEL_BINDINGS_NOTES_PREFIX: &str = "maco-phase-model
 ///
 /// The reserved prefix keeps ordinary legacy notes unchanged while allowing a
 /// strict, backward-compatible payload without adding fields to the ordinary
-/// plan structs. The payload is trusted only after exact worker-id and model
-/// selection validation; free-form task or note text is never classified.
+/// plan structs. This payload is always declarative and untrusted: parsing and
+/// validating it never grants execution, degradation, or prompt authority.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssignmentPhaseModelBindings {
@@ -1387,9 +1387,10 @@ pub fn assignment_phase_model_bindings_notes(
     ))
 }
 
-/// One terminal Worker duty bound to an exact model selection and exact
-/// operands. Model capability is deliberately absent: only immutable built-in
-/// policy may classify a model slug.
+/// One declarative terminal Worker duty associated with an exact model
+/// selection and exact operands. Model capability is deliberately absent:
+/// only immutable built-in policy may classify a model slug, and this
+/// plan-authored value never authorizes execution.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerPhaseModelBinding {
@@ -1410,7 +1411,7 @@ impl WorkerPhaseModelBinding {
             .context("worker phase-model binding requires an explicit resolved Worker model")?;
         if selected_model != self.model {
             bail!(
-                "worker phase-model binding authorizes model '{}', but runtime selection resolved '{}'",
+                "worker phase-model binding declares model '{}', but runtime selection resolved '{}'",
                 self.model,
                 selected_model
             );
@@ -1515,19 +1516,21 @@ fn validate_worker_phase_model_selection(
             })
         })
         .transpose()?;
-    let Some(binding) = worker_phase_model_binding(assignment, worker)? else {
-        if selected_capability == Some(ModelCapabilityClass::WeakMechanical) {
-            bail!(
-                "Worker model '{}' is trusted only for weak_mechanical work, but worker '{}' has no authenticated mechanical phase-model binding",
-                selected_model.unwrap_or("<runtime default>"),
-                worker.id
-            );
-        }
-        return Ok(None);
-    };
-    binding
-        .validate_for_selected_model(worker, selected_model)
-        .map(Some)
+    if let Some(binding) = worker_phase_model_binding(assignment, worker)? {
+        binding
+            .validate_for_selected_model(worker, selected_model)
+            .context("declarative worker phase-model metadata is invalid")?;
+    }
+    if selected_capability == Some(ModelCapabilityClass::WeakMechanical) {
+        bail!(
+            "real-runtime weak_mechanical Worker model '{}' is unavailable for worker '{}': no trusted typed planner/runtime authority or exact-operation executor exists, and assignment notes are declarative metadata only",
+            selected_model.unwrap_or("<runtime default>"),
+            worker.id
+        );
+    }
+    // Reserved plan notes are retained for strict compatibility validation only. A future trusted
+    // typed runtime authority may return an execution decision here; plan-authored metadata cannot.
+    Ok(None)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1812,6 +1815,7 @@ pub enum ModelCapabilityClass {
 pub enum OrchestrationPhase {
     Discovery,
     Triage,
+    Diagnosis,
     Planning,
     MechanicalTerminal,
     Implementation,
@@ -1828,6 +1832,7 @@ impl OrchestrationPhase {
             Self::MechanicalTerminal => ModelCapabilityClass::WeakMechanical,
             Self::Discovery
             | Self::Triage
+            | Self::Diagnosis
             | Self::Planning
             | Self::Implementation
             | Self::ValidationInterpretation
@@ -2163,6 +2168,7 @@ impl OrchestrationPhase {
         match self {
             Self::Discovery => "discovery",
             Self::Triage => "triage",
+            Self::Diagnosis => "diagnosis",
             Self::Planning => "planning",
             Self::MechanicalTerminal => "mechanical_terminal",
             Self::Implementation => "implementation",
@@ -2284,11 +2290,8 @@ mod phase_model_policy_tests {
     }
 
     #[test]
-    fn shared_weak_worker_model_requires_every_worker_to_be_mechanically_bound() {
+    fn weak_worker_model_is_rejected_even_with_declarative_mechanical_metadata() {
         let mut assignment = worker_assignment_with_notes(None);
-        let mut unbound_worker = assignment.worker_assignments[0].clone();
-        unbound_worker.id = "worker-unbound".to_string();
-        assignment.worker_assignments.push(unbound_worker.clone());
         assignment.notes = Some(
             assignment_phase_model_bindings_notes(&AssignmentPhaseModelBindings {
                 workers: BTreeMap::from([(
@@ -2300,7 +2303,7 @@ mod phase_model_policy_tests {
                         mechanical_operands: Some(
                             MechanicalTerminalOperands::RunPreselectedCommand {
                                 argv: vec!["cargo".to_string(), "check".to_string()],
-                                working_directory: PathBuf::from("src"),
+                                working_directory: PathBuf::from("src/lib.rs"),
                             },
                         ),
                     },
@@ -2327,13 +2330,11 @@ mod phase_model_policy_tests {
         let error = validate_worker_phase_model_selection(
             &plan,
             &assignment,
-            &unbound_worker,
+            &assignment.worker_assignments[0],
             Some(ECONOMY_PROFILE_MODEL),
         )
-        .expect_err("shared weak Worker model must not reach an unbound Worker");
-        assert!(error
-            .to_string()
-            .contains("has no authenticated mechanical phase-model binding"));
+        .expect_err("plan notes must not authorize a weak real-runtime Worker");
+        assert!(format!("{error:#}").contains("assignment notes are declarative metadata only"));
     }
 
     #[test]
@@ -2428,7 +2429,7 @@ mod phase_model_policy_tests {
             Some(ECONOMY_PROFILE_MODEL),
         )
         .expect_err("weak binding without exact operands must fail closed");
-        assert!(error.to_string().contains("requires typed exact operands"));
+        assert!(format!("{error:#}").contains("requires typed exact operands"));
     }
 
     #[test]
@@ -2466,6 +2467,7 @@ mod phase_model_policy_tests {
         let general_judgment = [
             OrchestrationPhase::Discovery,
             OrchestrationPhase::Triage,
+            OrchestrationPhase::Diagnosis,
             OrchestrationPhase::Planning,
             OrchestrationPhase::Implementation,
             OrchestrationPhase::ValidationInterpretation,
@@ -2543,6 +2545,7 @@ mod phase_model_policy_tests {
         for phase in [
             OrchestrationPhase::Discovery,
             OrchestrationPhase::Triage,
+            OrchestrationPhase::Diagnosis,
             OrchestrationPhase::Implementation,
             OrchestrationPhase::Merge,
             OrchestrationPhase::ReviewAcceptance,
