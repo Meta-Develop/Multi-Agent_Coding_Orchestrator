@@ -12350,7 +12350,8 @@ mod tests {
             return;
         }
 
-        let test_binary = env::current_exe().expect("current test executable");
+        let test_binary = fs::canonicalize(env::current_exe().expect("current test executable"))
+            .expect("canonical current test executable");
         let test_output_root = test_binary
             .parent()
             .and_then(Path::parent)
@@ -12421,12 +12422,13 @@ mod tests {
             .with_visible_read_only_root(workspace.join(".agents"))
             .with_visible_read_only_file(&git_marker)
             .with_visible_read_only_file(&ignore_control)
+            .with_visible_read_only_file(&test_binary)
             .with_writable_artifact_root(&incoming)
             .with_hidden_root(&primary);
         let output = run_process(
             ProcessSpec::direct(
                 "ExternalCodex live write-boundary probe",
-                env::current_exe().expect("current test executable"),
+                test_binary,
                 [
                     OsString::from("--exact"),
                     OsString::from(
@@ -12443,7 +12445,19 @@ mod tests {
         )
         .expect("run ExternalCodex live write-boundary probe");
 
-        assert!(output.status.is_some_and(|status| status.success()));
+        assert!(
+            output.status.is_some_and(|status| status.success()),
+            "ExternalCodex child failed: status={:?}; timed_out={}; duration={:?}; process_tree={:?}; side_effects={:?}; process_error={:?}; stdin_error={:?}; stdout={:?}; stderr={:?}",
+            output.status,
+            output.timed_out,
+            output.duration,
+            output.process_tree,
+            output.side_effects,
+            output.process_error,
+            output.stdin_error,
+            String::from_utf8_lossy(output.stdout.as_bytes()),
+            String::from_utf8_lossy(output.stderr.as_bytes()),
+        );
         assert!(output.safety_evidence_verified());
         assert_eq!(
             output.side_effects,
