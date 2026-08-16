@@ -23,6 +23,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     path::PathBuf,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 
@@ -1643,17 +1644,162 @@ pub struct GatePolicyTrialObservation {
     pub cost_microusd: Option<u64>,
 }
 
-/// Project one locally executed production pre-action-review decision into the typed trial wire.
-/// This binds reviewer semantics only; it does not claim a provider, external process, token, or
-/// cost observation. Callers remain responsible for placing it in the exact declared matrix.
-pub fn gate_policy_observation_from_pre_action_review(
-    case_digest: String,
-    profile_id: String,
-    repetition: u32,
+pub const GATE_POLICY_FAKE_PROMPT_OVERRIDE_PREFIX: &str =
+    "maco-gate-policy-deterministic-fake-prompt-v";
+
+/// Exact deterministic-fake classifier configuration derived from one validated trial profile.
+/// Backend and model identifiers remain synthetic labels; this type cannot represent provider or
+/// external-process execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GatePolicyFakeClassifierConfiguration {
+    backend_id: String,
+    model_id: String,
+    reasoning_effort: String,
+    prompt_override: String,
+}
+
+impl GatePolicyFakeClassifierConfiguration {
+    pub fn backend_id(&self) -> &str {
+        &self.backend_id
+    }
+
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    pub fn reasoning_effort(&self) -> &str {
+        &self.reasoning_effort
+    }
+
+    pub fn prompt_override(&self) -> &str {
+        &self.prompt_override
+    }
+}
+
+/// Complete retained result of one production pre-action-review call driven by an in-process
+/// deterministic fake classifier. The evidence tag prevents this record from being interpreted as
+/// fake-provider or real-provider execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GatePolicyFakePreActionReviewRecord {
+    corpus_binding_digest: String,
+    trial_plan_binding_digest: String,
+    evidence: GatePolicyTrialEvidence,
+    classifier_configuration: GatePolicyFakeClassifierConfiguration,
+    whole_call_limit_ms: u64,
+    observation: GatePolicyTrialObservation,
+}
+
+impl GatePolicyFakePreActionReviewRecord {
+    pub fn evidence(&self) -> GatePolicyTrialEvidence {
+        self.evidence
+    }
+
+    pub fn classifier_configuration(&self) -> &GatePolicyFakeClassifierConfiguration {
+        &self.classifier_configuration
+    }
+
+    pub fn whole_call_limit_ms(&self) -> u64 {
+        self.whole_call_limit_ms
+    }
+
+    pub fn observation(&self) -> &GatePolicyTrialObservation {
+        &self.observation
+    }
+}
+
+pub struct GatePolicyFakePreActionReviewInput<'a> {
+    pub corpus: &'a GatePolicyCorpus,
+    pub trial_plan: &'a GatePolicyTrialPlan,
+    pub profile_id: &'a str,
+    pub case_digest: String,
+    pub repetition: u32,
+    pub context: &'a crate::pre_action_review::ReviewContext,
+    pub approval_request: &'a crate::pre_action_review::ApprovalReviewRequest,
+    pub whole_call_limit: Duration,
+}
+
+/// Evaluation-only in-process classifier boundary. The production helper supplies the exact
+/// profile-derived configuration on every invocation, so a fake cannot silently reuse one profile
+/// while the retained observation names another.
+pub trait GatePolicyDeterministicFakeClassifier {
+    fn classify(
+        &mut self,
+        configuration: &GatePolicyFakeClassifierConfiguration,
+        request: &crate::pre_action_review::RedactedClassifierRequest,
+        timeout: Duration,
+    ) -> crate::pre_action_review::ClassifierCall;
+}
+
+struct ProfileBoundGatePolicyFakeClassifier<'a> {
+    configuration: &'a GatePolicyFakeClassifierConfiguration,
+    classifier: &'a mut dyn GatePolicyDeterministicFakeClassifier,
+}
+
+impl crate::pre_action_review::AmbiguousActionClassifier
+    for ProfileBoundGatePolicyFakeClassifier<'_>
+{
+    fn classify(
+        &mut self,
+        request: &crate::pre_action_review::RedactedClassifierRequest,
+        timeout: Duration,
+    ) -> crate::pre_action_review::ClassifierCall {
+        self.classifier
+            .classify(self.configuration, request, timeout)
+    }
+}
+
+fn gate_policy_fake_classifier_configuration(
+    profile: &GatePolicyTrialProfile,
+) -> Result<GatePolicyFakeClassifierConfiguration, EvaluationError> {
+    validate_trial_text("profile.id", &profile.id)?;
+    validate_trial_text("profile.backend_id", &profile.backend_id)?;
+    validate_trial_text("profile.model_id", &profile.model_id)?;
+    validate_trial_text("profile.reasoning_effort", &profile.reasoning_effort)?;
+    if profile.prompt_version == 0 || profile.policy_version == 0 {
+        return Err(invalid_gate_trial(
+            "profile",
+            "prompt_version and policy_version must be nonzero",
+        ));
+    }
+    Ok(GatePolicyFakeClassifierConfiguration {
+        backend_id: profile.backend_id.clone(),
+        model_id: profile.model_id.clone(),
+        reasoning_effort: profile.reasoning_effort.clone(),
+        prompt_override: format!(
+            "{GATE_POLICY_FAKE_PROMPT_OVERRIDE_PREFIX}{}",
+            profile.prompt_version
+        ),
+    })
+}
+
+fn validated_gate_policy_fake_profile<'a>(
+    corpus: &GatePolicyCorpus,
+    plan: &'a GatePolicyTrialPlan,
+    profile_id: &str,
+) -> Result<&'a GatePolicyTrialProfile, EvaluationError> {
+    plan.validate_against(corpus)?;
+    validate_trial_text("profile_id", profile_id)?;
+    plan.profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| {
+            invalid_gate_trial(
+                "profile_id",
+                "is not an exact member of the validated gate-policy trial plan",
+            )
+        })
+}
+
+#[derive(Debug)]
+struct GatePolicyPreActionProjection {
+    raw_outcome: GatePolicyRawOutcome,
+    failure_evidence: Option<GatePolicyFailureEvidence>,
+}
+
+fn project_gate_policy_pre_action_review(
     outcome: &crate::pre_action_review::ReviewOutcome,
-    whole_call_latency_ms: u64,
     classifier_timeout_ms: u64,
-) -> Result<GatePolicyTrialObservation, EvaluationError> {
+) -> Result<GatePolicyPreActionProjection, EvaluationError> {
     use crate::{
         gate_denial::{ApprovalReviewDenial, GateDenialReason},
         pre_action_review::ReviewOutcome,
@@ -1666,7 +1812,8 @@ pub fn gate_policy_observation_from_pre_action_review(
         }
         ReviewOutcome::Denied { denial, .. } => match &denial.reason {
             GateDenialReason::ApprovalReview {
-                denial: ApprovalReviewDenial::ClassifierTimeout
+                denial:
+                    ApprovalReviewDenial::ClassifierTimeout
                     | ApprovalReviewDenial::LatencyBudgetExceeded,
             } => (
                 GatePolicyRawOutcome::ClassifierTimeout,
@@ -1701,13 +1848,106 @@ pub fn gate_policy_observation_from_pre_action_review(
             ),
         },
     };
-    let observation = GatePolicyTrialObservation {
-        case_digest,
-        profile_id,
-        repetition,
+    validate_gate_policy_failure_evidence(raw_outcome, failure_evidence.as_ref())?;
+    Ok(GatePolicyPreActionProjection {
         raw_outcome,
-        effective_decision: raw_outcome.effective_decision(),
         failure_evidence,
+    })
+}
+
+fn duration_millis_ceil(duration: Duration) -> Result<u64, EvaluationError> {
+    let fractional_millisecond = !duration.subsec_nanos().is_multiple_of(1_000_000);
+    let millis = duration
+        .as_millis()
+        .checked_add(u128::from(fractional_millisecond))
+        .ok_or_else(|| invalid_gate_trial("whole_call_latency", "millisecond value overflow"))?;
+    u64::try_from(millis)
+        .map_err(|_| invalid_gate_trial("whole_call_latency", "millisecond value exceeds u64"))
+}
+
+/// Run one profile-bound deterministic-fake classification through the production pre-action
+/// reviewer. Timing begins before configuration binding and ends after outcome projection. The
+/// caller supplies a limit, never an observed latency; an over-limit call returns no record.
+pub fn run_gate_policy_fake_pre_action_review(
+    input: GatePolicyFakePreActionReviewInput<'_>,
+    reviewer: &mut crate::pre_action_review::PreActionReviewer,
+    classifier: &mut dyn GatePolicyDeterministicFakeClassifier,
+) -> Result<GatePolicyFakePreActionReviewRecord, EvaluationError> {
+    let started = Instant::now();
+    if input.whole_call_limit.is_zero() {
+        return Err(invalid_gate_trial(
+            "whole_call_limit",
+            "must be greater than zero",
+        ));
+    }
+    let profile =
+        validated_gate_policy_fake_profile(input.corpus, input.trial_plan, input.profile_id)?;
+    let expected_configuration = gate_policy_fake_classifier_configuration(profile)?;
+    validate_trial_text("case_digest", &input.case_digest)?;
+    if !input
+        .corpus
+        .cases
+        .iter()
+        .any(|case| case.semantic_digest == input.case_digest)
+    {
+        return Err(invalid_gate_trial(
+            "case_digest",
+            "is not an exact member of the validated gate-policy corpus",
+        ));
+    }
+    if input.repetition >= input.trial_plan.repetitions {
+        return Err(invalid_gate_trial(
+            "repetition",
+            "is outside the validated gate-policy trial plan",
+        ));
+    }
+    let whole_call_limit_ms = duration_millis_ceil(input.whole_call_limit)?;
+    let trial_wall_time_ms = input
+        .trial_plan
+        .limits
+        .wall_time_seconds
+        .checked_mul(1_000)
+        .ok_or_else(|| invalid_gate_trial("plan.limits", "wall-time milliseconds overflow"))?;
+    if whole_call_limit_ms > trial_wall_time_ms {
+        return Err(invalid_gate_trial(
+            "whole_call_limit",
+            "exceeds the validated trial wall-time limit",
+        ));
+    }
+    let trial_plan_binding_digest = gate_trial_plan_binding_digest(input.trial_plan)?;
+    let classifier_timeout_ms = reviewer.metrics().classifier_latency.budget.timeout_ms();
+    let mut bound_classifier = ProfileBoundGatePolicyFakeClassifier {
+        configuration: &expected_configuration,
+        classifier,
+    };
+    let outcome = reviewer
+        .review(
+            input.context,
+            input.approval_request,
+            Some(&mut bound_classifier),
+        )
+        .map_err(|_| {
+            invalid_gate_trial(
+                "pre_action_review",
+                "production pre-action reviewer failed before observation retention",
+            )
+        })?;
+    let projection = project_gate_policy_pre_action_review(&outcome, classifier_timeout_ms)?;
+    let elapsed = started.elapsed();
+    if elapsed > input.whole_call_limit {
+        return Err(invalid_gate_trial(
+            "whole_call_latency",
+            "exceeded the declared whole-call limit after reviewer execution and projection; no observation was retained",
+        ));
+    }
+    let whole_call_latency_ms = duration_millis_ceil(elapsed)?;
+    let observation = GatePolicyTrialObservation {
+        case_digest: input.case_digest,
+        profile_id: profile.id.clone(),
+        repetition: input.repetition,
+        raw_outcome: projection.raw_outcome,
+        effective_decision: projection.raw_outcome.effective_decision(),
+        failure_evidence: projection.failure_evidence,
         latency_ms: whole_call_latency_ms,
         usage: None,
         cost_microusd: None,
@@ -1726,7 +1966,202 @@ pub fn gate_policy_observation_from_pre_action_review(
             ));
         }
     }
-    Ok(observation)
+    Ok(GatePolicyFakePreActionReviewRecord {
+        corpus_binding_digest: input.corpus.binding_digest.clone(),
+        trial_plan_binding_digest,
+        evidence: GatePolicyTrialEvidence::DeterministicSyntheticFakeOnly,
+        classifier_configuration: expected_configuration,
+        whole_call_limit_ms,
+        observation,
+    })
+}
+
+/// Opaque aggregation of production-reviewer calls made with deterministic fake classifiers.
+/// This is intentionally distinct from `GatePolicyTrialResults`, whose public observations are
+/// manually authored synthetic declarations. It cannot be deserialized into measured authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GatePolicyMeasuredFakeReviewResults {
+    corpus_binding_digest: String,
+    trial_plan_binding_digest: String,
+    evidence: GatePolicyTrialEvidence,
+    whole_call_limit_ms: u64,
+    records: Vec<GatePolicyFakePreActionReviewRecord>,
+}
+
+impl GatePolicyMeasuredFakeReviewResults {
+    pub fn corpus_binding_digest(&self) -> &str {
+        &self.corpus_binding_digest
+    }
+
+    pub fn trial_plan_binding_digest(&self) -> &str {
+        &self.trial_plan_binding_digest
+    }
+
+    pub fn evidence(&self) -> GatePolicyTrialEvidence {
+        self.evidence
+    }
+
+    pub fn whole_call_limit_ms(&self) -> u64 {
+        self.whole_call_limit_ms
+    }
+
+    pub fn records(&self) -> &[GatePolicyFakePreActionReviewRecord] {
+        &self.records
+    }
+}
+
+/// Validate and canonically aggregate reviewer-measured deterministic-fake records. Every record
+/// is rebound to the exact corpus, plan, profile-derived classifier configuration, call limit,
+/// and case/profile/repetition identity before it is retained.
+pub fn aggregate_gate_policy_measured_fake_pre_action_reviews(
+    corpus: &GatePolicyCorpus,
+    plan: &GatePolicyTrialPlan,
+    records: &[GatePolicyFakePreActionReviewRecord],
+) -> Result<GatePolicyMeasuredFakeReviewResults, EvaluationError> {
+    plan.validate_against(corpus)?;
+    if records.is_empty() {
+        return Err(invalid_gate_trial(
+            "measured_records",
+            "must contain at least one production-reviewer call",
+        ));
+    }
+    let max_dispatches = usize::try_from(plan.limits.max_dispatches)
+        .map_err(|_| invalid_gate_trial("plan.limits.max_dispatches", "exceeds usize"))?;
+    if records.len() > max_dispatches {
+        return Err(invalid_gate_trial(
+            "measured_records",
+            "exceeds the validated trial dispatch limit",
+        ));
+    }
+    let plan_binding_digest = gate_trial_plan_binding_digest(plan)?;
+    let wall_time_ms = plan
+        .limits
+        .wall_time_seconds
+        .checked_mul(1_000)
+        .ok_or_else(|| invalid_gate_trial("plan.limits", "wall-time milliseconds overflow"))?;
+    let expected_limit_ms = records[0].whole_call_limit_ms;
+    if expected_limit_ms == 0 || expected_limit_ms > wall_time_ms {
+        return Err(invalid_gate_trial(
+            "measured_records.whole_call_limit_ms",
+            "must be nonzero and within the validated trial wall-time limit",
+        ));
+    }
+
+    let profiles = plan
+        .profiles
+        .iter()
+        .map(|profile| (profile.id.as_str(), profile))
+        .collect::<BTreeMap<_, _>>();
+    let cases = corpus
+        .cases
+        .iter()
+        .map(|case| case.semantic_digest.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut canonical = records.to_vec();
+    canonical.sort_by(|left, right| {
+        (
+            &left.observation.case_digest,
+            &left.observation.profile_id,
+            left.observation.repetition,
+        )
+            .cmp(&(
+                &right.observation.case_digest,
+                &right.observation.profile_id,
+                right.observation.repetition,
+            ))
+    });
+    let mut seen = BTreeSet::new();
+    let mut total_latency_ms = 0_u64;
+    for record in &canonical {
+        if record.corpus_binding_digest != corpus.binding_digest
+            || record.trial_plan_binding_digest != plan_binding_digest
+            || record.evidence != GatePolicyTrialEvidence::DeterministicSyntheticFakeOnly
+        {
+            return Err(invalid_gate_trial(
+                "measured_records.binding",
+                "does not match the exact validated corpus, plan, and synthetic evidence class",
+            ));
+        }
+        if record.whole_call_limit_ms != expected_limit_ms {
+            return Err(invalid_gate_trial(
+                "measured_records.whole_call_limit_ms",
+                "must be identical across one measured aggregation",
+            ));
+        }
+        let observation = &record.observation;
+        let profile = profiles
+            .get(observation.profile_id.as_str())
+            .ok_or_else(|| invalid_gate_trial("measured_records.profile_id", "is not in plan"))?;
+        if record.classifier_configuration != gate_policy_fake_classifier_configuration(profile)? {
+            return Err(invalid_gate_trial(
+                "measured_records.classifier_configuration",
+                "does not match the exact validated profile member",
+            ));
+        }
+        if !cases.contains(observation.case_digest.as_str())
+            || observation.repetition >= plan.repetitions
+            || !seen.insert((
+                observation.case_digest.clone(),
+                observation.profile_id.clone(),
+                observation.repetition,
+            ))
+        {
+            return Err(invalid_gate_trial(
+                "measured_records.observation_identity",
+                "is outside or duplicates the validated case/profile/repetition matrix",
+            ));
+        }
+        if observation.effective_decision != observation.raw_outcome.effective_decision()
+            || observation.usage.is_some()
+            || observation.cost_microusd.is_some()
+            || observation.latency_ms > record.whole_call_limit_ms
+        {
+            return Err(invalid_gate_trial(
+                "measured_records.observation",
+                "contains a forged decision, economics, or whole-call latency",
+            ));
+        }
+        validate_gate_policy_failure_evidence(
+            observation.raw_outcome,
+            observation.failure_evidence.as_ref(),
+        )?;
+        if let Some(GatePolicyFailureEvidence::ClassifierTimeout { timeout_ms }) =
+            observation.failure_evidence.as_ref()
+        {
+            if *timeout_ms > observation.latency_ms {
+                return Err(invalid_gate_trial(
+                    "measured_records.failure_evidence.timeout_ms",
+                    "cannot exceed the measured whole-call latency",
+                ));
+            }
+        }
+        if let Some(evidence) = &observation.failure_evidence {
+            if redact_gate_policy_failure_evidence(evidence.clone(), &Redactor::new())? != *evidence
+            {
+                return Err(invalid_gate_trial(
+                    "measured_records.failure_evidence",
+                    "is not default-redaction idempotent",
+                ));
+            }
+        }
+        total_latency_ms = total_latency_ms
+            .checked_add(observation.latency_ms)
+            .ok_or_else(|| invalid_gate_trial("measured_records.latency_ms", "total overflow"))?;
+    }
+    if total_latency_ms > wall_time_ms {
+        return Err(invalid_gate_trial(
+            "measured_records.latency_ms",
+            "checked total exceeds the validated trial wall-time limit",
+        ));
+    }
+
+    Ok(GatePolicyMeasuredFakeReviewResults {
+        corpus_binding_digest: corpus.binding_digest.clone(),
+        trial_plan_binding_digest: plan_binding_digest,
+        evidence: GatePolicyTrialEvidence::DeterministicSyntheticFakeOnly,
+        whole_call_limit_ms: expected_limit_ms,
+        records: canonical,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1823,8 +2258,10 @@ impl GatePolicyTrialResults {
     }
 }
 
-/// Aggregate already-produced fake observations. This function never launches a provider, command,
-/// or process and never upgrades dispatched intent into observed execution.
+/// Aggregate manually authored synthetic observation declarations. This function cannot accept
+/// opaque production-reviewer measurement records, never launches a provider, command, or process,
+/// and never upgrades dispatched intent into observed execution. Measured deterministic-fake
+/// reviewer calls use `aggregate_gate_policy_measured_fake_pre_action_reviews` instead.
 pub fn aggregate_gate_policy_trial(
     corpus: &GatePolicyCorpus,
     plan: &GatePolicyTrialPlan,
@@ -1925,13 +2362,13 @@ fn aggregate_gate_policy_trial_inner(
         if let Some(GatePolicyFailureEvidence::ClassifierTimeout { timeout_ms }) =
             observation.failure_evidence.as_ref()
         {
-            // `latency_ms` is the retained whole-call interval, from immediately before the
-            // classifier invocation until its terminal response or failure. A timeout threshold
-            // cannot exceed that observed interval.
+            // `latency_ms` is a declared synthetic interval in this declaration-only aggregation,
+            // not observed or measured classifier timing. A declared timeout threshold cannot
+            // exceed that declared synthetic interval.
             if *timeout_ms > observation.latency_ms {
                 return Err(invalid_gate_trial(
                     "observations.failure_evidence.timeout_ms",
-                    "cannot exceed the retained whole-call latency_ms",
+                    "cannot exceed the declared synthetic latency_ms interval",
                 ));
             }
         }
@@ -3140,6 +3577,7 @@ impl ImplementationGradingAddendum {
     /// Fail-closed validation over every object referenced by a grading addendum. Callers should
     /// prefer this entry point whenever all source artifacts are available so no cross-document
     /// binding can be accidentally omitted.
+    #[allow(clippy::too_many_arguments)] // Exact source documents stay separate to prevent partial validation.
     pub fn validate_complete(
         &self,
         manifest: &EvaluationManifest,
@@ -4482,10 +4920,13 @@ fn require_only_json_fields<'a>(
     context: &str,
     allowed: &[&str],
 ) -> Result<&'a serde_json::Map<String, Value>, String> {
-    let object = value.as_object().ok_or_else(|| {
-        format!("invalid_supervisor_artifact: {context} must be an object")
-    })?;
-    if let Some(unexpected) = object.keys().find(|field| !allowed.contains(&field.as_str())) {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("invalid_supervisor_artifact: {context} must be an object"))?;
+    if let Some(unexpected) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
         return Err(format!(
             "invalid_supervisor_artifact: {context} contains unknown field '{unexpected}'"
         ));
@@ -7419,19 +7860,31 @@ mod tests {
 
     #[derive(Debug)]
     struct RecordingAmbiguousActionClassifier {
-        responses: std::collections::VecDeque<crate::pre_action_review::ClassifierCall>,
-        observed: Vec<crate::pre_action_review::RedactedClassifierRequest>,
+        responses: std::collections::VecDeque<(
+            crate::pre_action_review::ClassifierCall,
+            std::time::Duration,
+        )>,
+        observed: Vec<(
+            GatePolicyFakeClassifierConfiguration,
+            crate::pre_action_review::RedactedClassifierRequest,
+        )>,
     }
 
-    impl crate::pre_action_review::AmbiguousActionClassifier for RecordingAmbiguousActionClassifier {
+    impl GatePolicyDeterministicFakeClassifier for RecordingAmbiguousActionClassifier {
         fn classify(
             &mut self,
+            configuration: &GatePolicyFakeClassifierConfiguration,
             request: &crate::pre_action_review::RedactedClassifierRequest,
             _timeout: std::time::Duration,
         ) -> crate::pre_action_review::ClassifierCall {
-            self.observed.push(request.clone());
+            self.observed.push((configuration.clone(), request.clone()));
             match self.responses.pop_front() {
-                Some(response) => response,
+                Some((response, delay)) => {
+                    if !delay.is_zero() {
+                        std::thread::sleep(delay);
+                    }
+                    response
+                }
                 None => crate::pre_action_review::ClassifierCall {
                     response: Err(crate::pre_action_review::ClassifierCallFailure::ProtocolError),
                     elapsed: std::time::Duration::ZERO,
@@ -7470,17 +7923,34 @@ mod tests {
         )
         .expect("construct ambiguous pre-action request")
     }
-
     #[test]
-    fn real_pre_action_reviewer_exercises_redacted_in_process_classifier_outcomes() {
-        use crate::{
-            gate_denial::{ApprovalReviewDenial, GateDenialReason},
-            pre_action_review::{
-                ActionDescriptor, ApprovalReviewRequest, BlastRadius, ClassifierCall,
-                ClassifierCallFailure, CommandClass, CommandInvocation, DecisionSource, PathAccess,
-                PermissionRequest, PreActionReviewer, RepoPathRule, ReviewContext, ReviewOutcome,
-            },
+    fn profile_bound_fake_pre_action_review_covers_outcomes_and_whole_call_limits() {
+        use crate::pre_action_review::{
+            ClassifierCall, ClassifierCallFailure, LatencyBudget, PreActionReviewer, RepoPathRule,
+            ReviewContext,
         };
+
+        let corpus = gate_corpus();
+        let mut plan = gate_trial_plan(&corpus, 1);
+        plan.profiles[1].backend_id = "synthetic-backend-b".to_string();
+        plan.validate_against(&corpus)
+            .expect("validate genuinely distinct fake classifier profiles");
+        let profile_a = &plan.profiles[0];
+        let profile_b = &plan.profiles[1];
+        let configuration_a = gate_policy_fake_classifier_configuration(profile_a)
+            .expect("bind fake classifier profile A");
+        let configuration_b = gate_policy_fake_classifier_configuration(profile_b)
+            .expect("bind fake classifier profile B");
+        assert_ne!(configuration_a.backend_id(), configuration_b.backend_id());
+        assert_ne!(configuration_a.model_id(), configuration_b.model_id());
+        assert_ne!(
+            configuration_a.reasoning_effort(),
+            configuration_b.reasoning_effort()
+        );
+        assert_ne!(
+            configuration_a.prompt_override(),
+            configuration_b.prompt_override()
+        );
 
         let raw_secret = "evaluation-classifier-secret";
         let context = ReviewContext::new(
@@ -7492,153 +7962,127 @@ mod tests {
         )
         .expect("construct redacted classifier context");
         let responses = [
-            ClassifierCall {
-                response: Ok(r#"{"version":1,"verdict":"allow"}"#.to_string()),
-                elapsed: std::time::Duration::from_millis(1),
-            },
-            ClassifierCall {
-                response: Ok(r#"{"version":1,"verdict":"human_review"}"#.to_string()),
-                elapsed: std::time::Duration::from_millis(1),
-            },
-            ClassifierCall {
-                response: Ok(r#"{"version":1,"verdict":"deny"}"#.to_string()),
-                elapsed: std::time::Duration::from_millis(1),
-            },
-            ClassifierCall {
-                response: Err(ClassifierCallFailure::Timeout),
-                elapsed: std::time::Duration::from_millis(1),
-            },
-            ClassifierCall {
-                response: Ok(r#"{"version":1,"verdict":not-json}"#.to_string()),
-                elapsed: std::time::Duration::from_millis(1),
-            },
-            ClassifierCall {
-                response: Err(ClassifierCallFailure::ProtocolError),
-                elapsed: std::time::Duration::from_millis(1),
-            },
+            (
+                ClassifierCall {
+                    response: Ok(r#"{"version":1,"verdict":"allow"}"#.to_string()),
+                    elapsed: Duration::from_millis(1),
+                },
+                Duration::ZERO,
+            ),
+            (
+                ClassifierCall {
+                    response: Ok(r#"{"version":1,"verdict":"human_review"}"#.to_string()),
+                    elapsed: Duration::from_millis(1),
+                },
+                Duration::ZERO,
+            ),
+            (
+                ClassifierCall {
+                    response: Ok(r#"{"version":1,"verdict":"deny"}"#.to_string()),
+                    elapsed: Duration::from_millis(1),
+                },
+                Duration::ZERO,
+            ),
+            (
+                ClassifierCall {
+                    response: Ok(r#"{"version":1,"verdict":not-json}"#.to_string()),
+                    elapsed: Duration::from_millis(1),
+                },
+                Duration::ZERO,
+            ),
+            (
+                ClassifierCall {
+                    response: Err(ClassifierCallFailure::ProtocolError),
+                    elapsed: Duration::from_millis(1),
+                },
+                Duration::ZERO,
+            ),
+            (
+                ClassifierCall {
+                    response: Err(ClassifierCallFailure::Timeout),
+                    elapsed: Duration::from_millis(20),
+                },
+                Duration::from_millis(20),
+            ),
         ];
         let mut classifier = RecordingAmbiguousActionClassifier {
             responses: responses.into_iter().collect(),
             observed: Vec::new(),
         };
-        let mut reviewer = PreActionReviewer::default();
-        let expected_denials = [
-            ApprovalReviewDenial::ClassifierDenied,
-            ApprovalReviewDenial::ClassifierTimeout,
-            ApprovalReviewDenial::ClassifierMalformedResponse,
-            ApprovalReviewDenial::ClassifierProtocolError,
+        let mut reviewer =
+            PreActionReviewer::new(LatencyBudget::new(5, 20, 20).expect("fake reviewer budget"));
+        let expected_outcomes = [
+            GatePolicyRawOutcome::Allowed,
+            GatePolicyRawOutcome::HumanReview,
+            GatePolicyRawOutcome::GateDenied,
+            GatePolicyRawOutcome::ClassifierParseFailure,
+            GatePolicyRawOutcome::ClassifierProtocolFailure,
+            GatePolicyRawOutcome::ClassifierTimeout,
         ];
-
-        let allowed = reviewer
-            .review(
-                &context,
-                &ambiguous_pre_action_request("allow", raw_secret),
-                Some(&mut classifier),
-            )
-            .expect("review classifier allow response");
-        assert_eq!(
-            allowed,
-            ReviewOutcome::Allowed {
-                source: DecisionSource::Classifier,
-            }
-        );
-        assert_eq!(
-            gate_policy_observation_from_pre_action_review(
-                test_sha256('a'),
-                "fake-classifier-profile".to_string(),
-                0,
-                &allowed,
-                1,
-                50,
-            )
-            .expect("map classifier allow into typed trial observation")
-            .raw_outcome,
-            GatePolicyRawOutcome::Allowed
-        );
-
-        let human_review = reviewer
-            .review(
-                &context,
-                &ambiguous_pre_action_request("human-review", raw_secret),
-                Some(&mut classifier),
-            )
-            .expect("review classifier human-review response");
-        let ReviewOutcome::HumanInterventionRequired {
-            source,
-            ref denial,
-        } = human_review
-        else {
-            panic!("classifier human_review response must require human intervention");
-        };
-        assert_eq!(source, DecisionSource::Classifier);
-        assert_eq!(
-            denial.reason,
-            GateDenialReason::ApprovalReview {
-                denial: ApprovalReviewDenial::HumanReviewRequired,
-            }
-        );
-        assert_eq!(
-            gate_policy_observation_from_pre_action_review(
-                test_sha256('b'),
-                "fake-classifier-profile".to_string(),
-                0,
-                &human_review,
-                1,
-                50,
-            )
-            .expect("map classifier human review into typed trial observation")
-            .raw_outcome,
-            GatePolicyRawOutcome::HumanReview
-        );
-
-        for (id, expected) in ["deny", "timeout", "malformed", "protocol"]
-            .into_iter()
-            .zip(expected_denials)
-        {
-            let outcome = reviewer
-                .review(
-                    &context,
-                    &ambiguous_pre_action_request(id, raw_secret),
-                    Some(&mut classifier),
-                )
-                .expect("review fail-closed classifier response");
-            let mapped = gate_policy_observation_from_pre_action_review(
-                test_sha256('c'),
-                "fake-classifier-profile".to_string(),
-                0,
-                &outcome,
-                50,
-                50,
-            )
-            .expect("map classifier denial into typed trial observation");
-            assert_eq!(
-                mapped.raw_outcome,
-                match expected {
-                    ApprovalReviewDenial::ClassifierDenied => GatePolicyRawOutcome::GateDenied,
-                    ApprovalReviewDenial::ClassifierTimeout => {
-                        GatePolicyRawOutcome::ClassifierTimeout
-                    }
-                    ApprovalReviewDenial::ClassifierMalformedResponse => {
-                        GatePolicyRawOutcome::ClassifierParseFailure
-                    }
-                    ApprovalReviewDenial::ClassifierProtocolError => {
-                        GatePolicyRawOutcome::ClassifierProtocolFailure
-                    }
-                    _ => unreachable!("fixed expected classifier denial vocabulary"),
-                }
-            );
-            let ReviewOutcome::Denied { source, denial } = outcome else {
-                panic!("classifier {id} response must fail closed as a denial");
+        let mut retained = Vec::new();
+        for (index, expected) in expected_outcomes.into_iter().enumerate() {
+            let (profile, configuration) = if index < 3 {
+                (profile_a, &configuration_a)
+            } else {
+                (profile_b, &configuration_b)
             };
-            assert_eq!(source, DecisionSource::Classifier);
+            let record = run_gate_policy_fake_pre_action_review(
+                GatePolicyFakePreActionReviewInput {
+                    corpus: &corpus,
+                    trial_plan: &plan,
+                    profile_id: &profile.id,
+                    case_digest: corpus.cases[index].semantic_digest.clone(),
+                    repetition: 0,
+                    context: &context,
+                    approval_request: &ambiguous_pre_action_request(
+                        &format!("outcome-{index}"),
+                        raw_secret,
+                    ),
+                    whole_call_limit: Duration::from_millis(200),
+                },
+                &mut reviewer,
+                &mut classifier,
+            )
+            .expect("run profile-bound fake classifier through production reviewer");
             assert_eq!(
-                denial.reason,
-                GateDenialReason::ApprovalReview { denial: expected }
+                record.evidence(),
+                GatePolicyTrialEvidence::DeterministicSyntheticFakeOnly
             );
+            assert_eq!(record.classifier_configuration(), configuration);
+            assert_eq!(record.observation().profile_id, profile.id);
+            assert_eq!(record.observation().raw_outcome, expected);
+            assert_eq!(
+                record.observation().effective_decision,
+                expected.effective_decision()
+            );
+            assert!(record.observation().latency_ms > 0);
+            assert!(record.observation().usage.is_none());
+            assert!(record.observation().cost_microusd.is_none());
+            retained.push(record);
         }
 
-        assert_eq!(classifier.observed.len(), 6);
-        for observed in &classifier.observed {
+        assert!(matches!(
+            retained[3].observation().failure_evidence.as_ref(),
+            Some(GatePolicyFailureEvidence::ClassifierParseFailure { .. })
+        ));
+        assert!(matches!(
+            retained[4].observation().failure_evidence.as_ref(),
+            Some(GatePolicyFailureEvidence::ClassifierProtocolFailure { .. })
+        ));
+        assert!(matches!(
+            retained[5].observation().failure_evidence.as_ref(),
+            Some(GatePolicyFailureEvidence::ClassifierTimeout { timeout_ms: 20 })
+        ));
+        assert_eq!(classifier.observed.len(), expected_outcomes.len());
+        for (index, (configuration, observed)) in classifier.observed.iter().enumerate() {
+            assert_eq!(
+                configuration,
+                if index < 3 {
+                    &configuration_a
+                } else {
+                    &configuration_b
+                }
+            );
             let encoded = serde_json::to_string(observed)
                 .expect("serialize classifier-visible redacted request");
             assert!(!encoded.contains(raw_secret));
@@ -7646,67 +8090,126 @@ mod tests {
             assert_eq!(observed.action.arguments, vec!["<redacted:argument>"; 3]);
         }
 
-        let classifier_call_count = classifier.observed.len();
-        let safe_command = CommandInvocation::new("evaluation-safe-read", ["src/evaluation.rs"])
-            .expect("construct deterministic safe command");
-        let safe_action = ActionDescriptor::command(
-            safe_command,
-            CommandClass::ReadOnly,
-            BlastRadius::SingleClaimedPath,
-            [PathAccess::read("src/evaluation.rs").expect("construct safe read path")],
-            true,
-        )
-        .expect("construct deterministic safe action");
-        let safe_request = ApprovalReviewRequest::new(
-            "evaluation-safe-request",
-            "evaluation-safe-correlation",
-            safe_action,
-            PermissionRequest::within_ceiling(),
-        )
-        .expect("construct deterministic safe request");
+        let aggregated =
+            aggregate_gate_policy_measured_fake_pre_action_reviews(&corpus, &plan, &retained)
+                .expect("aggregate opaque reviewer-measured records");
+        assert_eq!(aggregated.corpus_binding_digest(), corpus.binding_digest);
+        assert_eq!(aggregated.records().len(), retained.len());
+        assert_eq!(aggregated.whole_call_limit_ms(), 200);
         assert_eq!(
-            reviewer
-                .review(&context, &safe_request, Some(&mut classifier))
-                .expect("review deterministic safe request"),
-            ReviewOutcome::Allowed {
-                source: DecisionSource::DeterministicAllow,
-            }
+            aggregated.evidence(),
+            GatePolicyTrialEvidence::DeterministicSyntheticFakeOnly
         );
-        assert_eq!(classifier.observed.len(), classifier_call_count);
 
-        let forbidden_command = CommandInvocation::new("evaluation-destructive", ["--delete"])
-            .expect("construct deterministic forbidden command");
-        let forbidden_action = ActionDescriptor::command(
-            forbidden_command,
-            CommandClass::DestructiveWorkspace,
-            BlastRadius::SingleClaimedPath,
-            [PathAccess::delete("src/evaluation.rs").expect("construct forbidden delete path")],
-            true,
+        let mut forged_configuration = retained.clone();
+        forged_configuration[0]
+            .classifier_configuration
+            .prompt_override
+            .push_str("-forged");
+        let forged_configuration_error = aggregate_gate_policy_measured_fake_pre_action_reviews(
+            &corpus,
+            &plan,
+            &forged_configuration,
         )
-        .expect("construct deterministic forbidden action");
-        let forbidden_request = ApprovalReviewRequest::new(
-            "evaluation-forbidden-request",
-            "evaluation-forbidden-correlation",
-            forbidden_action,
-            PermissionRequest::within_ceiling(),
+        .expect_err("tampered classifier configuration must not aggregate");
+        assert!(forged_configuration_error
+            .to_string()
+            .contains("classifier_configuration"));
+
+        let mut forged_latency = retained.clone();
+        forged_latency[0].observation.latency_ms =
+            forged_latency[0].whole_call_limit_ms.saturating_add(1);
+        let forged_latency_error =
+            aggregate_gate_policy_measured_fake_pre_action_reviews(&corpus, &plan, &forged_latency)
+                .expect_err("tampered whole-call latency must not aggregate");
+        assert!(forged_latency_error
+            .to_string()
+            .contains("forged decision, economics, or whole-call latency"));
+
+        let observed_before_invalid_plan = classifier.observed.len();
+        let mut invalid_policy_plan = plan.clone();
+        invalid_policy_plan.profiles[0].policy_version = corpus.policy_version.saturating_add(1);
+        let invalid_policy_error = run_gate_policy_fake_pre_action_review(
+            GatePolicyFakePreActionReviewInput {
+                corpus: &corpus,
+                trial_plan: &invalid_policy_plan,
+                profile_id: &plan.profiles[0].id,
+                case_digest: corpus.cases[0].semantic_digest.clone(),
+                repetition: 0,
+                context: &context,
+                approval_request: &ambiguous_pre_action_request("invalid-policy", raw_secret),
+                whole_call_limit: Duration::from_millis(200),
+            },
+            &mut reviewer,
+            &mut classifier,
         )
-        .expect("construct deterministic forbidden request");
-        let forbidden = reviewer
-            .review(&context, &forbidden_request, Some(&mut classifier))
-            .expect("review deterministic forbidden request");
-        let ReviewOutcome::Denied { source, denial } = forbidden else {
-            panic!("deterministically forbidden request must be denied");
+        .expect_err("policy-version mismatch must fail before classifier invocation");
+        assert!(invalid_policy_error.to_string().contains("policy_version"));
+        assert_eq!(classifier.observed.len(), observed_before_invalid_plan);
+
+        let nonmember_error = run_gate_policy_fake_pre_action_review(
+            GatePolicyFakePreActionReviewInput {
+                corpus: &corpus,
+                trial_plan: &plan,
+                profile_id: "not-a-plan-member",
+                case_digest: corpus.cases[0].semantic_digest.clone(),
+                repetition: 0,
+                context: &context,
+                approval_request: &ambiguous_pre_action_request("nonmember", raw_secret),
+                whole_call_limit: Duration::from_millis(200),
+            },
+            &mut reviewer,
+            &mut classifier,
+        )
+        .expect_err("nonmember profile must fail before classifier invocation");
+        assert!(nonmember_error.to_string().contains("exact member"));
+        assert_eq!(classifier.observed.len(), observed_before_invalid_plan);
+
+        let mut slow_classifier = RecordingAmbiguousActionClassifier {
+            responses: [(
+                ClassifierCall {
+                    response: Ok(r#"{"version":1,"verdict":"allow"}"#.to_string()),
+                    elapsed: Duration::ZERO,
+                },
+                Duration::from_millis(5),
+            )]
+            .into_iter()
+            .collect(),
+            observed: Vec::new(),
         };
-        assert_eq!(source, DecisionSource::DeterministicDeny);
-        assert_eq!(
-            denial.reason,
-            GateDenialReason::ApprovalReview {
-                denial: ApprovalReviewDenial::DestructiveWorkspaceOperation,
-            }
+        let mut slow_reviewer = PreActionReviewer::new(
+            LatencyBudget::new(25, 50, 100).expect("slow fake reviewer budget"),
         );
-        assert_eq!(classifier.observed.len(), classifier_call_count);
+        let mut over_limit_retained = Vec::new();
+        match run_gate_policy_fake_pre_action_review(
+            GatePolicyFakePreActionReviewInput {
+                corpus: &corpus,
+                trial_plan: &plan,
+                profile_id: &plan.profiles[0].id,
+                case_digest: corpus.cases[0].semantic_digest.clone(),
+                repetition: 0,
+                context: &context,
+                approval_request: &ambiguous_pre_action_request("whole-call-limit", raw_secret),
+                whole_call_limit: Duration::from_millis(1),
+            },
+            &mut slow_reviewer,
+            &mut slow_classifier,
+        ) {
+            Ok(record) => over_limit_retained.push(record),
+            Err(error) => assert!(error
+                .to_string()
+                .contains("exceeded the declared whole-call limit")),
+        }
+        assert_eq!(
+            slow_classifier.observed.len(),
+            1,
+            "post-call enforcement must exercise the production reviewer"
+        );
+        assert!(
+            over_limit_retained.is_empty(),
+            "an over-limit call must not retain a trial observation"
+        );
     }
-
     fn grader_findings(passed: bool) -> Vec<ImplementationGraderAxisFinding> {
         required_grader_axes()
             .into_iter()
@@ -7748,10 +8251,7 @@ mod tests {
                 evidence: GatePolicyTrialEvidence::DeterministicSyntheticFakeOnly,
                 process_observed: false,
                 eligible_for_production_default: false,
-                evidence_digest: format!(
-                    "sha256:{}",
-                    sha256_hex(evidence_material.as_bytes())
-                ),
+                evidence_digest: format!("sha256:{}", sha256_hex(evidence_material.as_bytes())),
                 evidence_material,
             },
             resulting_candidate_validation_binding: matches!(
@@ -8169,8 +8669,7 @@ mod tests {
 
         let mut label = human_outcome(HumanExperimentOutcome::Rejected);
         label.provenance.evidence_material = canary.to_string();
-        label.provenance.evidence_digest =
-            format!("sha256:{}", sha256_hex(canary.as_bytes()));
+        label.provenance.evidence_digest = format!("sha256:{}", sha256_hex(canary.as_bytes()));
         assert!(validate_grading_outcome(&label, &grading.run_binding, true).is_err());
     }
 
@@ -8380,9 +8879,7 @@ mod tests {
         let mut understated_timeout = complete_gate_observations(&corpus, &plan);
         let timeout = understated_timeout
             .iter_mut()
-            .find(|observation| {
-                observation.raw_outcome == GatePolicyRawOutcome::ClassifierTimeout
-            })
+            .find(|observation| observation.raw_outcome == GatePolicyRawOutcome::ClassifierTimeout)
             .expect("classifier timeout fixture");
         timeout.latency_ms = 49;
         assert!(aggregate_gate_policy_trial(
@@ -8415,8 +8912,7 @@ mod tests {
         {
             observation.raw_outcome = GatePolicyRawOutcome::GateDenied;
             observation.effective_decision = GatePolicyDecision::Block;
-            observation.failure_evidence =
-                test_failure_evidence(GatePolicyRawOutcome::GateDenied);
+            observation.failure_evidence = test_failure_evidence(GatePolicyRawOutcome::GateDenied);
         }
         assert!(aggregate_gate_policy_trial(
             &corpus,
@@ -9045,7 +9541,12 @@ mod tests {
             "different self-consistent task prose".to_string();
         substituted_task.blinded_grader_input.task_material_digest = format!(
             "sha256:{}",
-            sha256_hex(substituted_task.blinded_grader_input.task_material.as_bytes())
+            sha256_hex(
+                substituted_task
+                    .blinded_grader_input
+                    .task_material
+                    .as_bytes()
+            )
         );
         refresh_test_assignment_provenance(&mut substituted_task);
         substituted_task
@@ -9208,7 +9709,8 @@ mod tests {
             let mut document: Value =
                 serde_json::from_slice(SUPERVISOR_EXECUTION_V2).expect("parse supervisor fixture");
             mutate(&mut document);
-            let bytes = serde_json::to_vec(&document).expect("serialize mutated supervisor fixture");
+            let bytes =
+                serde_json::to_vec(&document).expect("serialize mutated supervisor fixture");
             let error = observed_dispatch_record_from_supervisor_final_json(&bytes)
                 .expect_err("unknown consumed source field must fail closed");
             assert!(error.contains("unknown field"), "unexpected error: {error}");
