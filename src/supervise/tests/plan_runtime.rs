@@ -1,4 +1,9 @@
 use super::*;
+use crate::{
+    llm::FakeProvider,
+    planning::{ProviderPlanningConfig, ProviderRecursiveTaskPlan, ProviderTaskAssignmentTree},
+    supervise::plan_api::normalize_task_execution_feedback_from_supervisor_final_report_for_test as normalize_task_execution_feedback_from_supervisor_final_report,
+};
 
 #[test]
 fn authored_serial_plan_reports_independent_scope_width_warning() {
@@ -431,6 +436,832 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
     )
     .expect("renormalize generated plan");
     assert_eq!(renormalized, document);
+}
+
+fn provider_planning_node(
+    id: &str,
+    task: &str,
+    fragment_ids: &[&str],
+    path: &str,
+    child_assignments: Vec<ProviderTaskAssignmentTree>,
+) -> ProviderTaskAssignmentTree {
+    let module = Path::new(path)
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .expect("provider test path has a UTF-8 file stem");
+    let is_leaf = child_assignments.is_empty();
+    let assigned_paths = if is_leaf {
+        vec![PathBuf::from(path)]
+    } else {
+        child_assignments
+            .iter()
+            .flat_map(|child| child.assigned_paths.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+    let semantic_symbols = if is_leaf {
+        vec![format!("crate::{module}::{module}")]
+    } else {
+        child_assignments
+            .iter()
+            .flat_map(|child| child.semantic_symbols.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+    let semantic_modules = if is_leaf {
+        vec![format!("crate::{module}")]
+    } else {
+        child_assignments
+            .iter()
+            .flat_map(|child| child.semantic_modules.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+    ProviderTaskAssignmentTree {
+        id: id.to_string(),
+        task: task.to_string(),
+        fragment_ids: fragment_ids
+            .iter()
+            .map(|fragment_id| (*fragment_id).to_string())
+            .collect(),
+        assigned_paths,
+        semantic_symbols,
+        semantic_modules,
+        child_assignments,
+    }
+}
+
+fn provider_traceability(
+    assignment_id: &str,
+    parent_assignment_id: Option<&str>,
+    depth: u8,
+    flattened_index: usize,
+    fragment_ids: &[&str],
+    path: &str,
+    report_status: Option<ReviewStatus>,
+) -> AssignmentTraceability {
+    AssignmentTraceability {
+        assignment_id: assignment_id.to_string(),
+        parent_assignment_id: parent_assignment_id.map(str::to_string),
+        depth,
+        flattened_index,
+        spec_fragment_ids: fragment_ids
+            .iter()
+            .map(|fragment_id| (*fragment_id).to_string())
+            .collect(),
+        assigned_paths: vec![PathBuf::from(path)],
+        produced_changed_paths: Vec::new(),
+        produced_diff_binding: None,
+        report_status,
+    }
+}
+
+fn persist_provider_supervisor_artifact(
+    repo: &Path,
+    artifact_run_id: &RunId,
+    document: &Value,
+    report: &SupervisorFinalReport,
+    finalize: bool,
+) {
+    let mut writer = ArtifactRunWriter::reserve(
+        repo,
+        RunArtifactFamily::Supervise,
+        artifact_run_id.clone(),
+        "provider-planning-feedback-test",
+    )
+    .expect("reserve provider supervisor artifact");
+    writer
+        .write_json(
+            "assignments/supervisor-plan.json",
+            document,
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .expect("write bound provider supervisor plan");
+    write_final_report(&mut writer, report).expect("write provider supervisor final report");
+    if finalize {
+        writer
+            .finalize(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                false,
+            )
+            .expect("finalize provider supervisor artifact");
+    }
+}
+
+#[test]
+fn provider_recursive_plan_lowers_and_finalized_feedback_drives_remaining_tree() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    Repository::init(repo).expect("initialize repository");
+    fs::create_dir_all(repo.join("src")).expect("create src");
+    fs::write(repo.join("src/root.rs"), "pub fn root() {}\n").expect("write root");
+    fs::write(repo.join("src/alpha.rs"), "pub fn alpha() {}\n").expect("write alpha");
+    fs::write(repo.join("src/beta.rs"), "pub fn beta() {}\n").expect("write beta");
+
+    let initial = ProviderRecursiveTaskPlan {
+        assignments: vec![provider_planning_node(
+            "provider-root",
+            "Coordinate the two disjoint implementation leaves.",
+            &["fragment-001", "fragment-002"],
+            "src/root.rs",
+            vec![
+                provider_planning_node(
+                    "provider-alpha",
+                    "Implement alpha.",
+                    &["fragment-001"],
+                    "src/alpha.rs",
+                    Vec::new(),
+                ),
+                provider_planning_node(
+                    "provider-beta",
+                    "Implement beta.",
+                    &["fragment-002"],
+                    "src/beta.rs",
+                    Vec::new(),
+                ),
+            ],
+        )],
+    };
+    let revised = ProviderRecursiveTaskPlan {
+        assignments: vec![provider_planning_node(
+            "remaining-root",
+            "Coordinate the revised remaining beta work.",
+            &["fragment-002"],
+            "src/root.rs",
+            vec![provider_planning_node(
+                "provider-beta-revised",
+                "Revise beta using execution feedback.",
+                &["fragment-002"],
+                "src/beta.rs",
+                Vec::new(),
+            )],
+        )],
+    };
+    let mut provider = FakeProvider::new("fake-planner", "fake-model");
+    provider
+        .push_json_response("plan-runtime-proposal", &initial)
+        .expect("serialize initial provider plan");
+    provider
+        .push_response(
+            "plan-runtime-replan-01",
+            crate::llm::WorkProposal::summary("malformed recursive replan"),
+        )
+        .push_json_response("plan-runtime-replan-02", &revised)
+        .expect("serialize revised provider plan");
+    let config = ProviderPlanningConfig::new("plan-runtime", "fake-model")
+        .with_max_child_assignments(3)
+        .with_max_depth(2);
+    let spec = "- Implement alpha in src/alpha.rs.\n- Implement beta in src/beta.rs.";
+    let mut session =
+        planning::propose_task_decomposition_with_provider(repo, "", spec, &mut provider, &config)
+            .expect("validated recursive provider plan");
+    let heuristic_session =
+        planning::propose_task_decomposition_with_optional_provider(repo, "", spec, None, &config)
+            .expect("heuristic planning session");
+    assert!(bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &heuristic_session,
+        RunId::new("heuristic-binding-refusal").expect("valid refusal run id"),
+    )
+    .expect_err("heuristic session must not receive provider execution binding")
+    .to_string()
+    .contains("requires a provider planning session"));
+
+    let run_id = RunId::new("provider-planning-feedback").expect("valid run id");
+    let bound =
+        bind_provider_task_planning_session_to_supervisor_run("", spec, &session, run_id.clone())
+            .expect("lower and bind initial provider tree");
+    assert_eq!(bound.execution_binding.run_id(), &run_id);
+    assert_eq!(bound.plan.max_depth, 3);
+    assert_eq!(bound.plan.max_child_assignments, 3);
+    assert_eq!(bound.plan.assignments.len(), 3);
+    let initial_document = bound.document.clone();
+    assert_eq!(initial_document["max_depth"], 3);
+    assert_eq!(initial_document["max_child_assignments"], 3);
+    assert_eq!(
+        initial_document["spec_fragment_ids"],
+        json!(["fragment-001", "fragment-002"])
+    );
+    assert_eq!(
+        initial_document["assignments"]
+            .as_array()
+            .expect("initial assignments")
+            .iter()
+            .map(|assignment| assignment["id"].as_str().expect("assignment id"))
+            .collect::<Vec<_>>(),
+        vec!["provider-root", "provider-alpha", "provider-beta"]
+    );
+    assert!(initial_document["assignments"][0]["worker_assignments"]
+        .as_array()
+        .expect("internal workers")
+        .is_empty());
+    assert!(initial_document["assignments"][0]
+        .get("spec_fragment_ids")
+        .is_none());
+    assert_eq!(
+        initial_document["assignments"][0]["semantic_symbols"],
+        json!(["crate::alpha::alpha", "crate::beta::beta"])
+    );
+    assert_eq!(
+        initial_document["assignments"][0]["semantic_modules"],
+        json!(["crate::alpha", "crate::beta"])
+    );
+    for leaf_index in [1usize, 2] {
+        let leaf = &initial_document["assignments"][leaf_index];
+        assert_eq!(
+            leaf["worker_assignments"]
+                .as_array()
+                .expect("leaf workers")
+                .len(),
+            1
+        );
+        assert_eq!(
+            leaf["worker_assignments"][0]["assigned_paths"],
+            leaf["assigned_paths"]
+        );
+        assert_eq!(leaf["worker_assignments"][0]["task"], leaf["task"]);
+    }
+    assert_eq!(
+        initial_document["assignment_schedule"],
+        json!([
+            {
+                "assignment_id": "provider-root",
+                "depth": 2,
+                "flattened_index": 0
+            },
+            {
+                "assignment_id": "provider-alpha",
+                "parent_assignment_id": "provider-root",
+                "depth": 3,
+                "flattened_index": 1
+            },
+            {
+                "assignment_id": "provider-beta",
+                "parent_assignment_id": "provider-root",
+                "depth": 3,
+                "flattened_index": 2
+            }
+        ])
+    );
+    let parsed_initial = parse_supervisor_plan_with_consultant(&initial_document.to_string())
+        .expect("round-trip initial provider plan");
+    let renormalized_initial = supervisor_plan_value(
+        &parsed_initial.plan,
+        &parsed_initial.consultant,
+        &parsed_initial.assignment_metadata,
+        &parsed_initial.plan_metadata,
+    )
+    .expect("renormalize initial provider plan");
+    assert_eq!(renormalized_initial, initial_document);
+
+    let mut report = artifact_test_final_report(&run_id);
+    report.assigned_paths = vec![PathBuf::from("src/alpha.rs"), PathBuf::from("src/beta.rs")];
+    report.semantic_symbols = vec![
+        "crate::alpha::alpha".to_string(),
+        "crate::beta::beta".to_string(),
+    ];
+    report.semantic_modules = vec!["crate::alpha".to_string(), "crate::beta".to_string()];
+    report.assignment_traceability = vec![
+        provider_traceability(
+            "provider-root",
+            None,
+            2,
+            0,
+            &[],
+            "src/root.rs",
+            Some(ReviewStatus::Succeeded),
+        ),
+        provider_traceability(
+            "provider-alpha",
+            Some("provider-root"),
+            3,
+            1,
+            &["fragment-001"],
+            "src/alpha.rs",
+            Some(ReviewStatus::Succeeded),
+        ),
+        provider_traceability(
+            "provider-beta",
+            Some("provider-root"),
+            3,
+            2,
+            &["fragment-002"],
+            "src/beta.rs",
+            Some(ReviewStatus::Failed),
+        ),
+    ];
+    report.assignment_traceability[0].assigned_paths =
+        vec![PathBuf::from("src/alpha.rs"), PathBuf::from("src/beta.rs")];
+    let beta_gap = SupervisorCoverageGap {
+        kind: CoverageGapKind::NoProducedChanges,
+        spec_fragment_id: Some("fragment-002".to_string()),
+        assignment_id: Some("provider-beta".to_string()),
+        message: "beta produced no accepted changes".to_string(),
+    };
+    report.coverage_gaps = vec![beta_gap.clone(), beta_gap.clone()];
+
+    persist_provider_supervisor_artifact(repo, &run_id, &initial_document, &report, true);
+    let feedback = task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &bound.execution_binding,
+    )
+    .expect("adapt authenticated finalized report feedback");
+    assert_eq!(feedback.completed_assignment_ids, vec!["provider-alpha"]);
+    assert_eq!(feedback.failed_assignment_ids, vec!["provider-beta"]);
+    assert_eq!(feedback.coverage_gap_fragment_ids, vec!["fragment-002"]);
+    assert!(feedback.notes.is_empty());
+
+    let provider_calls_before_bounded_feedback = provider.calls().len();
+    let repeated_gap_run_id =
+        RunId::new("provider-feedback-repeated-gaps").expect("valid repeated-gap run id");
+    let repeated_gap_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &session,
+        repeated_gap_run_id.clone(),
+    )
+    .expect("bind repeated-gap provider run");
+    let mut repeated_gap_report = report.clone();
+    repeated_gap_report.run_id = repeated_gap_run_id.clone();
+    repeated_gap_report.coverage_gaps = vec![beta_gap.clone(); 129];
+    persist_provider_supervisor_artifact(
+        repo,
+        &repeated_gap_run_id,
+        &repeated_gap_bound.document,
+        &repeated_gap_report,
+        true,
+    );
+    assert!(
+        replan_provider_task_planning_session_from_authenticated_supervisor_run(
+            repo,
+            "",
+            spec,
+            &mut session,
+            &repeated_gap_bound.execution_binding,
+            &mut provider,
+            &config,
+        )
+        .expect_err("raw repeated coverage gaps must exceed the feedback item bound")
+        .to_string()
+        .contains("items but at most 128")
+    );
+    assert_eq!(session.replans_used(), 0);
+    assert_eq!(
+        provider.calls().len(),
+        provider_calls_before_bounded_feedback
+    );
+
+    let padded_gap_run_id =
+        RunId::new("provider-feedback-padded-gap").expect("valid padded-gap run id");
+    let padded_gap_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &session,
+        padded_gap_run_id.clone(),
+    )
+    .expect("bind padded-gap provider run");
+    let mut padded_gap_report = report.clone();
+    padded_gap_report.run_id = padded_gap_run_id.clone();
+    padded_gap_report.coverage_gaps = vec![SupervisorCoverageGap {
+        spec_fragment_id: Some(format!("{}fragment-002", " ".repeat(16 * 1024 + 1))),
+        ..beta_gap.clone()
+    }];
+    persist_provider_supervisor_artifact(
+        repo,
+        &padded_gap_run_id,
+        &padded_gap_bound.document,
+        &padded_gap_report,
+        true,
+    );
+    assert!(
+        replan_provider_task_planning_session_from_authenticated_supervisor_run(
+            repo,
+            "",
+            spec,
+            &mut session,
+            &padded_gap_bound.execution_binding,
+            &mut provider,
+            &config,
+        )
+        .expect_err("raw whitespace-padded coverage gap must exceed the byte bound")
+        .to_string()
+        .contains("item contains")
+    );
+    assert_eq!(session.replans_used(), 0);
+    assert_eq!(
+        provider.calls().len(),
+        provider_calls_before_bounded_feedback
+    );
+
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "different goal",
+        spec,
+        &session,
+        &bound.execution_binding,
+    )
+    .expect_err("changed goal must invalidate execution binding")
+    .to_string()
+    .contains("does not match the current session and normalized plan"));
+
+    let missing_run_id = RunId::new("provider-feedback-missing").expect("valid missing run id");
+    let missing_bound =
+        bind_provider_task_planning_session_to_supervisor_run("", spec, &session, missing_run_id)
+            .expect("bind missing provider run");
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &missing_bound.execution_binding,
+    )
+    .expect_err("missing artifact must fail")
+    .to_string()
+    .contains("not an authenticated finalized artifact"));
+
+    let unfinalized_run_id =
+        RunId::new("provider-feedback-unfinalized").expect("valid unfinalized run id");
+    let unfinalized_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &session,
+        unfinalized_run_id.clone(),
+    )
+    .expect("bind unfinalized provider run");
+    let mut unfinalized_report = report.clone();
+    unfinalized_report.run_id = unfinalized_run_id.clone();
+    persist_provider_supervisor_artifact(
+        repo,
+        &unfinalized_run_id,
+        &unfinalized_bound.document,
+        &unfinalized_report,
+        false,
+    );
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &unfinalized_bound.execution_binding,
+    )
+    .expect_err("unfinalized artifact must fail")
+    .to_string()
+    .contains("not an authenticated finalized artifact"));
+
+    let nonterminal_report_run_id =
+        RunId::new("provider-feedback-nonterminal-report").expect("valid nonterminal run id");
+    let nonterminal_report_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &session,
+        nonterminal_report_run_id.clone(),
+    )
+    .expect("bind nonterminal-report provider run");
+    let mut nonterminal_report = report.clone();
+    nonterminal_report.run_id = nonterminal_report_run_id.clone();
+    nonterminal_report.run_lifecycle = SupervisorRunLifecycle::Active;
+    persist_provider_supervisor_artifact(
+        repo,
+        &nonterminal_report_run_id,
+        &nonterminal_report_bound.document,
+        &nonterminal_report,
+        true,
+    );
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &nonterminal_report_bound.execution_binding,
+    )
+    .expect_err("authenticated nonterminal report must fail")
+    .to_string()
+    .contains("requires a finalized report"));
+
+    let mismatched_report_run_id =
+        RunId::new("provider-feedback-report-id").expect("valid report-id run id");
+    let mismatched_report_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &session,
+        mismatched_report_run_id.clone(),
+    )
+    .expect("bind report-id provider run");
+    let mut mismatched_report = report.clone();
+    mismatched_report.run_id =
+        RunId::new("different-provider-report-id").expect("valid different report id");
+    persist_provider_supervisor_artifact(
+        repo,
+        &mismatched_report_run_id,
+        &mismatched_report_bound.document,
+        &mismatched_report,
+        true,
+    );
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &mismatched_report_bound.execution_binding,
+    )
+    .expect_err("mismatched authenticated report run id must fail")
+    .to_string()
+    .contains("does not match bound run"));
+
+    let mismatched_plan_run_id =
+        RunId::new("provider-feedback-plan-id").expect("valid plan-id run id");
+    let mismatched_plan_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &session,
+        mismatched_plan_run_id.clone(),
+    )
+    .expect("bind plan-id provider run");
+    let mut mismatched_document = mismatched_plan_bound.document.clone();
+    mismatched_document["task"] = json!("stale normalized provider task");
+    let mut mismatched_plan_report = report.clone();
+    mismatched_plan_report.run_id = mismatched_plan_run_id.clone();
+    persist_provider_supervisor_artifact(
+        repo,
+        &mismatched_plan_run_id,
+        &mismatched_document,
+        &mismatched_plan_report,
+        true,
+    );
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &mismatched_plan_bound.execution_binding,
+    )
+    .expect_err("mismatched authenticated normalized plan must fail")
+    .to_string()
+    .contains("normalized plan does not match"));
+
+    let mut invalid = report.clone();
+    invalid.assigned_paths.pop();
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("stale aggregate paths must fail")
+            .to_string()
+            .contains("aggregate path or semantic scope")
+    );
+
+    let mut invalid = report.clone();
+    invalid.semantic_symbols[0] = "crate::invented::symbol".to_string();
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("stale aggregate symbols must fail")
+            .to_string()
+            .contains("aggregate path or semantic scope")
+    );
+
+    let mut invalid = report.clone();
+    invalid.semantic_modules[0] = "crate::invented".to_string();
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("stale aggregate modules must fail")
+            .to_string()
+            .contains("aggregate path or semantic scope")
+    );
+
+    let mut invalid = report.clone();
+    invalid.run_lifecycle = SupervisorRunLifecycle::Active;
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("nonfinalized report must fail")
+            .to_string()
+            .contains("finalized")
+    );
+
+    let mut invalid = report.clone();
+    invalid.assignment_traceability.remove(0);
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("missing internal node trace must fail")
+            .to_string()
+            .contains("provider tree node 'provider-root'")
+    );
+
+    for internal_status in [
+        Some(ReviewStatus::Pending),
+        Some(ReviewStatus::Failed),
+        Some(ReviewStatus::Rejected),
+        Some(ReviewStatus::Missing),
+        None,
+    ] {
+        let mut invalid = report.clone();
+        invalid.assignment_traceability[0].report_status = internal_status;
+        assert!(
+            normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+                .expect_err("nonsuccess internal node must fail")
+                .to_string()
+                .contains("internal provider node 'provider-root' is not terminal succeeded")
+        );
+    }
+
+    let mut invalid = report.clone();
+    invalid.assignment_traceability[2].report_status = Some(ReviewStatus::Pending);
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("pending leaf must fail")
+            .to_string()
+            .contains("pending")
+    );
+
+    for failed_status in [
+        Some(ReviewStatus::Failed),
+        Some(ReviewStatus::Rejected),
+        Some(ReviewStatus::Missing),
+        None,
+    ] {
+        let mut terminal_failure = report.clone();
+        terminal_failure.assignment_traceability[2].report_status = failed_status;
+        let normalized = normalize_task_execution_feedback_from_supervisor_final_report(
+            &session,
+            &terminal_failure,
+        )
+        .expect("terminal nonsuccess maps to failed feedback");
+        assert_eq!(normalized.failed_assignment_ids, vec!["provider-beta"]);
+    }
+
+    let mut invalid = report.clone();
+    invalid
+        .assignment_traceability
+        .push(invalid.assignment_traceability[2].clone());
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("duplicate report id must fail")
+            .to_string()
+            .contains("repeats provider assignment")
+    );
+
+    let mut invalid = report.clone();
+    invalid.assignment_traceability[2].assignment_id = "invented-provider-id".to_string();
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("unknown report id must fail")
+            .to_string()
+            .contains("unknown provider assignment")
+    );
+
+    let mut invalid = report.clone();
+    invalid.assignment_traceability.pop();
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("missing leaf report must fail")
+            .to_string()
+            .contains("no traceability row")
+    );
+
+    let mut invalid = report.clone();
+    invalid.assignment_traceability[2].depth = 2;
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("mismatched provider schedule must fail")
+            .to_string()
+            .contains("schedule and scope")
+    );
+
+    let mut invalid = report.clone();
+    invalid.assignment_traceability[2].spec_fragment_ids = vec!["invented-fragment".to_string()];
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("unknown trace fragment must fail")
+            .to_string()
+            .contains("unknown current fragment")
+    );
+
+    let mut invalid = report.clone();
+    invalid.coverage_gaps[0].spec_fragment_id = Some("invented-fragment".to_string());
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("unknown gap fragment must fail")
+            .to_string()
+            .contains("unknown current fragment")
+    );
+
+    let mut invalid = report.clone();
+    invalid.coverage_gaps = vec![SupervisorCoverageGap {
+        kind: CoverageGapKind::NoProducedChanges,
+        spec_fragment_id: None,
+        assignment_id: None,
+        message: "fragmentless global gap".to_string(),
+    }];
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("fragmentless global gap must fail")
+            .to_string()
+            .contains("fragmentless coverage gap")
+    );
+
+    let mut invalid = report.clone();
+    invalid.coverage_gaps.push(SupervisorCoverageGap {
+        kind: CoverageGapKind::MissingAssignmentReport,
+        spec_fragment_id: None,
+        assignment_id: Some("provider-root".to_string()),
+        message: "internal report missing".to_string(),
+    });
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("fragmentless internal missing-report gap must fail")
+            .to_string()
+            .contains("fragmentless coverage gap")
+    );
+
+    let mut invalid = report.clone();
+    invalid.assignment_traceability[2].report_status = Some(ReviewStatus::Succeeded);
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("succeeded fragment gap contradiction must fail")
+            .to_string()
+            .contains("succeeded fragment")
+    );
+
+    let proposal_before_invalid_attempt = session.proposal().clone();
+    replan_provider_task_planning_session_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &mut session,
+        &bound.execution_binding,
+        &mut provider,
+        &config,
+    )
+    .expect_err("invalid authenticated re-plan proposal must fail closed");
+    assert_eq!(session.replans_used(), 1);
+    assert_eq!(session.proposal(), &proposal_before_invalid_attempt);
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &bound.execution_binding,
+    )
+    .expect_err("stale session binding must fail")
+    .to_string()
+    .contains("does not match the current session and normalized plan"));
+    let rebound =
+        bind_provider_task_planning_session_to_supervisor_run("", spec, &session, run_id.clone())
+            .expect("rebind unchanged valid tree after consumed invalid attempt");
+    replan_provider_task_planning_session_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &mut session,
+        &rebound.execution_binding,
+        &mut provider,
+        &config,
+    )
+    .expect("authenticated finalized feedback re-plans remaining provider work");
+    assert_eq!(session.replans_used(), planning::MAX_PROVIDER_REPLANS);
+    let revised_document = supervisor_plan_document_from_task_planning_session("", spec, &session)
+        .expect("lower revised remaining tree");
+    assert_eq!(revised_document["max_depth"], 3);
+    assert_eq!(revised_document["max_child_assignments"], 2);
+    assert_eq!(
+        revised_document["spec_fragment_ids"],
+        json!(["fragment-002"])
+    );
+    assert!(revised_document.get("coverage_gaps").is_none());
+    assert_eq!(
+        revised_document["assignments"]
+            .as_array()
+            .expect("revised assignments")
+            .iter()
+            .map(|assignment| assignment["id"].as_str().expect("assignment id"))
+            .collect::<Vec<_>>(),
+        vec!["remaining-root", "provider-beta-revised"]
+    );
+    assert_eq!(
+        revised_document["assignment_schedule"],
+        json!([
+            {
+                "assignment_id": "remaining-root",
+                "depth": 2,
+                "flattened_index": 0
+            },
+            {
+                "assignment_id": "provider-beta-revised",
+                "parent_assignment_id": "remaining-root",
+                "depth": 3,
+                "flattened_index": 1
+            }
+        ])
+    );
+    assert!(revised_document["assignments"]
+        .as_array()
+        .expect("revised assignments")
+        .iter()
+        .all(|assignment| assignment["id"] != "provider-alpha"));
 }
 
 #[test]
