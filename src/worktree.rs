@@ -3390,9 +3390,11 @@ impl WorktreeGuardMode {
 struct WorktreeGuardLayout {
     worktree_path: PathBuf,
     git_dir: PathBuf,
+    bound_git_dir: PathBuf,
     common_dir: PathBuf,
     root: PathBuf,
     hooks: PathBuf,
+    bound_hooks: PathBuf,
     config: PathBuf,
     include_level: WorktreeGuardIncludeLevel,
     include_config: PathBuf,
@@ -3685,12 +3687,22 @@ fn uninstall_worktree_guard(
 fn uninstall_bound_managed_worktree_guard(
     repo: &Repository,
     binding: &ManagedWorktreeBinding,
+    metadata_dir: &Path,
 ) -> Result<WorktreeGuardReport> {
-    let git_dir = fs::canonicalize(&binding.metadata_dir)
+    if identity_for_path(metadata_dir)? != binding.metadata_dir_identity {
+        bail!("bound managed Git directory changed before guard removal");
+    }
+    let git_dir = fs::canonicalize(metadata_dir)
         .context("failed to resolve bound managed Git directory for guard removal")?;
     let common_dir = fs::canonicalize(repo.commondir())
         .context("failed to resolve common Git directory for guard removal")?;
-    let layout = worktree_guard_layout_from_parts(repo, binding.path.clone(), git_dir, common_dir)?;
+    let layout = worktree_guard_layout_from_bound_parts(
+        repo,
+        binding.path.clone(),
+        git_dir,
+        binding.metadata_dir.clone(),
+        common_dir,
+    )?;
     uninstall_worktree_guard_with_layout(
         layout,
         WorktreeGuardMode::Managed {
@@ -3999,7 +4011,7 @@ fn verify_worktree_guard(
         .context("failed to load effective guard configuration")?
         .get_path("core.hooksPath")
         .context("installed guard is not the effective core.hooksPath")?;
-    if effective_hooks != layout.hooks {
+    if effective_hooks != layout.bound_hooks {
         bail!("installed guard is not the effective core.hooksPath");
     }
     Ok(worktree_guard_report(
@@ -4054,7 +4066,7 @@ fn verify_owned_worktree_guard(
     validate_guard_tree_entries(layout, false)?;
     require_regular_guard_file(&layout.config)?;
     if fs::read(&layout.config).context("failed to read MACO worktree guard config")?
-        != expected_guard_config_bytes(&layout.hooks)?
+        != expected_guard_config_bytes(&layout.bound_hooks)?
     {
         bail!("guard config content changed");
     }
@@ -4063,7 +4075,7 @@ fn verify_owned_worktree_guard(
     let configured_hooks = config
         .get_path("core.hooksPath")
         .context("guard config has no core.hooksPath")?;
-    if configured_hooks != layout.hooks {
+    if configured_hooks != layout.bound_hooks {
         bail!("guard config points to an unexpected hooks directory");
     }
     let previous_hooks = EffectivePriorHookPaths {
@@ -4243,9 +4255,29 @@ fn worktree_guard_layout_from_parts(
     git_dir: PathBuf,
     common_dir: PathBuf,
 ) -> Result<WorktreeGuardLayout> {
+    worktree_guard_layout_from_bound_parts(
+        repo,
+        worktree_path,
+        git_dir.clone(),
+        git_dir,
+        common_dir,
+    )
+}
+
+#[cfg(unix)]
+fn worktree_guard_layout_from_bound_parts(
+    repo: &Repository,
+    worktree_path: PathBuf,
+    git_dir: PathBuf,
+    bound_git_dir: PathBuf,
+    common_dir: PathBuf,
+) -> Result<WorktreeGuardLayout> {
     let root = git_dir.join(WORKTREE_GUARD_DIRECTORY);
     let hooks = root.join("hooks");
+    let bound_root = bound_git_dir.join(WORKTREE_GUARD_DIRECTORY);
+    let bound_hooks = bound_root.join("hooks");
     let config = root.join("config");
+    let bound_config = bound_root.join("config");
     let current_include_level = guard_include_level(repo)?;
     let include_level = match fs::symlink_metadata(root.join("include-level")) {
         Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_file() => {
@@ -4297,21 +4329,27 @@ fn worktree_guard_layout_from_parts(
             return Err(error).context("failed to inspect guard include-config-created state")
         }
     };
-    let include_base = include_config
+    let bound_include_config = match include_level {
+        WorktreeGuardIncludeLevel::Local => common_dir.join("config"),
+        WorktreeGuardIncludeLevel::Worktree => bound_git_dir.join("config.worktree"),
+    };
+    let bound_include_base = bound_include_config
         .parent()
-        .context("guard include configuration has no parent")?;
-    let relative_config = config
-        .strip_prefix(include_base)
+        .context("bound guard include configuration has no parent")?;
+    let relative_config = bound_config
+        .strip_prefix(bound_include_base)
         .context("guard config is not beneath its selected Git configuration level")?;
     let config_text = guard_config_path_text(relative_config, "relative guard config")?.to_string();
-    let include_condition = guard_include_condition(&git_dir, &common_dir)?;
+    let include_condition = guard_include_condition(&bound_git_dir, &common_dir)?;
     let include_key = format!("includeIf.gitdir:{include_condition}.path");
     Ok(WorktreeGuardLayout {
         worktree_path,
         git_dir,
+        bound_git_dir,
         common_dir,
         root,
         hooks,
+        bound_hooks,
         config,
         include_level,
         include_config,
@@ -4381,7 +4419,7 @@ fn require_guard_mode_matches_worktree(
     layout: &WorktreeGuardLayout,
     mode: &WorktreeGuardMode,
 ) -> Result<()> {
-    let is_primary = layout.git_dir == layout.common_dir;
+    let is_primary = layout.bound_git_dir == layout.common_dir;
     match (mode, is_primary) {
         (WorktreeGuardMode::Primary, true) | (WorktreeGuardMode::Managed { .. }, false) => Ok(()),
         (WorktreeGuardMode::Primary, false) => {
@@ -4416,7 +4454,7 @@ fn effective_hook_paths_before_guard(
         },
         Some(configured) => EffectivePriorHookPaths {
             worktree_hooks: layout.worktree_path.join(&configured),
-            git_dir_hooks: layout.git_dir.join(configured),
+            git_dir_hooks: layout.bound_git_dir.join(configured),
             human_v3_commit_msg: false,
             human_v3_pre_push: false,
         },
@@ -4436,7 +4474,7 @@ fn effective_hook_paths_before_guard(
         {
             bail!("existing hooks path contains an unsupported line break");
         }
-        if resolved == &layout.hooks {
+        if resolved == &layout.bound_hooks {
             bail!("existing hooks path already points at unowned MACO guard state");
         }
     }
@@ -4469,7 +4507,7 @@ fn ensure_guard_state(
         "expected-branch",
         mode.expected_branch().unwrap_or_default(),
     )?;
-    ensure_guard_path_line_at(root, "git-dir", &layout.git_dir)?;
+    ensure_guard_path_line_at(root, "git-dir", &layout.bound_git_dir)?;
     ensure_guard_path_line_at(root, "previous-hooks-path", &previous_hooks.worktree_hooks)?;
     ensure_guard_path_line_at(
         root,
@@ -5192,7 +5230,7 @@ fn same_prior_hook_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
 
 #[cfg(unix)]
 fn write_guard_config(layout: &WorktreeGuardLayout, root: &File) -> Result<()> {
-    let expected = expected_guard_config_bytes(&layout.hooks)?;
+    let expected = expected_guard_config_bytes(&layout.bound_hooks)?;
     ensure_guard_file_bytes_at(root, "config", &expected).map(|_| ())
 }
 
@@ -5963,7 +6001,7 @@ fn mutate_guard_include_fragment(_layout: &WorktreeGuardLayout, _add: bool) -> R
 
 #[cfg(unix)]
 fn expected_guard_include_fragment(layout: &WorktreeGuardLayout) -> Result<Vec<u8>> {
-    let condition = guard_include_condition(&layout.git_dir, &layout.common_dir)?;
+    let condition = guard_include_condition(&layout.bound_git_dir, &layout.common_dir)?;
     let mut fragment = b"\n[includeIf \"gitdir:".to_vec();
     append_git_config_quoted(&mut fragment, condition.as_bytes())?;
     fragment.extend_from_slice(b"\"]\n\tpath = \"");
@@ -6010,7 +6048,7 @@ fn require_guard_state(layout: &WorktreeGuardLayout, mode: &WorktreeGuardMode) -
         bail!("worktree guard expected branch does not match managed identity");
     }
     let observed_git_dir = read_guard_path_line(&layout.root.join("git-dir"))?;
-    if observed_git_dir != layout.git_dir {
+    if observed_git_dir != layout.bound_git_dir {
         bail!("worktree guard Git-directory binding changed");
     }
     let observed_common = read_guard_path_line(&layout.root.join("common-dir"))?;
@@ -6018,12 +6056,12 @@ fn require_guard_state(layout: &WorktreeGuardLayout, mode: &WorktreeGuardMode) -
         bail!("worktree guard common-directory binding changed");
     }
     let previous_hooks = read_guard_path_line(&layout.root.join("previous-hooks-path"))?;
-    if previous_hooks == layout.hooks {
+    if previous_hooks == layout.bound_hooks {
         bail!("worktree guard previous hook path loops back to itself");
     }
     let previous_git_dir_hooks =
         read_guard_path_line(&layout.root.join("previous-git-dir-hooks-path"))?;
-    if previous_git_dir_hooks == layout.hooks {
+    if previous_git_dir_hooks == layout.bound_hooks {
         bail!("worktree guard previous Git-directory hook path loops back to itself");
     }
     for state in ["human-v3-chained-commit-msg", "human-v3-chained-pre-push"] {
@@ -6243,7 +6281,7 @@ fn worktree_guard_report(
     WorktreeGuardReport {
         status,
         worktree_path: layout.worktree_path.clone(),
-        hooks_path: layout.hooks.clone(),
+        hooks_path: layout.bound_hooks.clone(),
         mode: mode.label().to_string(),
         expected_branch: mode.expected_branch().map(ToOwned::to_owned),
     }
@@ -12446,13 +12484,6 @@ fn recover_remove_operation(
             &worktree_quarantine,
             worktree_quarantine_identity,
         )?;
-        #[cfg(unix)]
-        uninstall_bound_managed_worktree_guard(repo, &binding).with_context(|| {
-            format!(
-                "failed to restore prior hooks after quarantining managed lane '{}'",
-                operation.name
-            )
-        })?;
         let metadata_quarantine = operation_metadata_quarantine_path(&operation)?;
         let metadata_exists = path_entry_exists(&binding.metadata_dir)?;
         let metadata_quarantine_exists = path_entry_exists(&metadata_quarantine)?;
@@ -12465,7 +12496,28 @@ fn recover_remove_operation(
         if metadata_exists {
             verify_metadata_binding_after_worktree_removal(&store.repository, &binding)?;
             ensure_removal_worktree_lock(repo, &binding)?;
+        } else {
+            quarantine_bound_directory(
+                &store.repository.common_dir.join("worktrees"),
+                &binding.metadata_dir,
+                &metadata_quarantine,
+                &binding.metadata_dir_identity,
+            )?;
         }
+        let guard_metadata_dir = if metadata_exists {
+            &binding.metadata_dir
+        } else {
+            &metadata_quarantine
+        };
+        #[cfg(unix)]
+        uninstall_bound_managed_worktree_guard(repo, &binding, guard_metadata_dir).with_context(
+            || {
+                format!(
+                    "failed to restore prior hooks after quarantining managed lane '{}'",
+                    operation.name
+                )
+            },
+        )?;
         let metadata_root = store.repository.common_dir.join("worktrees");
         let quarantined = quarantine_bound_directory(
             &metadata_root,
