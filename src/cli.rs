@@ -40,6 +40,9 @@ pub struct Cli {
 
 impl Cli {
     pub fn run(self) -> Result<()> {
+        crate::git_repository::configure_libgit2_repository_extensions()
+            .context("failed to configure supported Git repository extensions")?;
+
         match self.command {
             Command::Init(args) => {
                 let info = WorktreeManager::init_repository(args.repo, &args.initial_branch)?;
