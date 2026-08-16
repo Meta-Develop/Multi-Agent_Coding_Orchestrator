@@ -62,6 +62,12 @@ pub(crate) struct AuthenticatedSnapshot<T> {
     pub value: T,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExistingAuthenticatedSnapshot<T> {
+    pub identity: JournalIdentity,
+    pub snapshot: AuthenticatedSnapshot<T>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotLocator {
@@ -382,6 +388,18 @@ where
         authenticator: RepositoryAuthenticator,
         logical_id: &str,
     ) -> Result<AuthenticatedSnapshot<T>> {
+        Ok(Self::read_existing_current_with_identity(authenticator, logical_id)?.snapshot)
+    }
+
+    /// Identical to [`Self::read_existing_current`], while retaining the exact
+    /// authenticated journal identity selected by the signed locator. State
+    /// consumers use this to bind an already-active legacy retirement marker
+    /// to the same immutable snapshot generation without opening a recovery
+    /// capable store.
+    pub(crate) fn read_existing_current_with_identity(
+        authenticator: RepositoryAuthenticator,
+        logical_id: &str,
+    ) -> Result<ExistingAuthenticatedSnapshot<T>> {
         validate_logical_id::<S>(logical_id)?;
         let store_root = AuthenticatedStateJournal::<S>::existing_root(&authenticator)?;
         let store_lock = BoundStateLock::try_acquire_existing_exclusive(
@@ -417,9 +435,13 @@ where
             authenticator,
             &locator.active_identity,
         )?;
+        let identity = journal.identity().clone();
         let current = exact_current_from_journal::<S, T>(&journal, &locator)?;
         store_lock.verify(&store_root)?;
-        Ok(current)
+        Ok(ExistingAuthenticatedSnapshot {
+            identity,
+            snapshot: current,
+        })
     }
 
     fn from_journal(
