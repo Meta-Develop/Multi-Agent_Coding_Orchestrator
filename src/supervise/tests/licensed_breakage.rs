@@ -461,11 +461,15 @@ fn generated_follow_up_plan_inherits_gate_context_and_closes_budget() {
     source_budget
         .role_token_reservations
         .insert(AgentRole::GateClassifier, 17);
+    let review_loop_guard = ReviewLoopGuardConfig {
+        max_low_severity: ReviewLoopLowSeverity::Warning,
+        consecutive_low_severity_cycles: 2,
+    };
 
     let tasks = generated_licensed_follow_up_tasks(
         &source_plan,
         &source_consultant,
-        None,
+        Some(review_loop_guard),
         &source_budget,
         &assignment,
         &report,
@@ -498,6 +502,11 @@ fn generated_follow_up_plan_inherits_gate_context_and_closes_budget() {
     assert_eq!(generated.role_models, source_plan.role_models);
     assert_eq!(generated.model_pricing, source_plan.model_pricing);
     assert_eq!(generated.review_lenses, source_plan.review_lenses);
+    assert_eq!(
+        generated_follow_up_review_loop_guard(&generated.generated_follow_up)
+            .expect("decode generated review-loop guard"),
+        Some(review_loop_guard)
+    );
     assert_eq!(
         generated.review_aggregation_policy,
         source_plan.review_aggregation_policy
@@ -539,6 +548,10 @@ fn generated_follow_up_plan_inherits_gate_context_and_closes_budget() {
     );
     assert_eq!(loaded.plan.role_models, source_plan.role_models);
     assert_eq!(loaded.plan.model_pricing, source_plan.model_pricing);
+    assert_eq!(
+        loaded.plan_metadata.review_loop_guard,
+        Some(review_loop_guard)
+    );
     assert_eq!(
         loaded.plan_metadata.run_budget.limits.soft_cost_usd,
         Some(25.0)
