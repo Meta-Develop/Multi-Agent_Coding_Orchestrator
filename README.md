@@ -167,8 +167,10 @@ Known limitations and roadmap for 0.3.0:
    conflict path cannot be resolved; Git safety checks remain authoritative.
 2. Goal/spec planning now proposes independent supervisor assignments with path
    and Rust semantic scopes. The proposal remains conservative and Rust-first;
-   richer semantic planning, broader language adapters, and automatic refinement
-   remain post-0.3.0 work. Runtime claim gates remain authoritative.
+   richer semantic planning, broader language adapters, and an automatic live
+   scheduler/replanning loop remain post-0.3.0 work. The library boundary does
+   support bounded provider-neutral feedback replanning, described below.
+   Runtime claim gates remain authoritative.
 3. PR and issue publication are intentionally narrow. The fake forge is
    deterministic and local-only. GitHub publication is opt-in with explicit
    `--forge github` and shells out to local `git` and `gh`; tests cover the
@@ -1247,8 +1249,36 @@ goal-to-integration, use the v1 outcome and dispatch-count fields, enforce
 the same limits and held-out grading contract, and emit schema-compatible run
 and Pareto results without replacing these phase-A fixtures. The phase-A
 fixtures do not claim that command exists.
-Gate-policy/classifier corpus experiments remain separate and depend on the
-Issue #28 production broker path.
+
+The same directory also contains additive Issue #26 gate-policy fixtures; the
+six historical model-mix fixture files above remain byte-for-byte compatibility
+bound. Strict, duplicate-key-refusing schemas materialize 17 allowlisted raw
+rows into a redacted-before-deduplication corpus of 16 cases covering every
+required positive, human-review, denial, classifier-failure, environment, and
+anti-reward-hacking category. The trial plan declares two synthetic profiles
+and two repetitions. Its 64 observations and 32 exact aggregates retain every
+terminal outcome, including timeout, parse, protocol, malformed-tool,
+environment, sandbox, gate-denial, deferred-edit, and reward-hacking failures.
+The separately bound implementation-grading and human-label fixtures require
+complete held-out, blinded-grader, disagreement, anti-reward-hacking,
+assignment/outcome provenance, and accepted/rejected/modified label coverage.
+
+An evaluation-only adapter can drive the production `PreActionReviewer` with a
+deterministic in-process fake classifier. It derives the backend, model,
+reasoning-effort, and prompt override from the exact validated profile rather
+than accepting caller-authored classifier identity. Whole-call timing begins
+before profile/configuration binding and ends after reviewer execution and
+outcome projection; a post-return overrun is refused without retaining an
+observation. The resulting measured records are opaque, serialization-only
+values rebound to the corpus, plan, profile, case, repetition, and common call
+limit before aggregation, so callers cannot deserialize fabricated measurements
+into that authority.
+
+Both the committed gate-policy results and the reviewer adapter are explicitly
+deterministic synthetic/fake evidence. They execute no provider, external
+process, held-out command, real grader, or real experiment; their fake model
+labels and synthetic costs are incomparable with production economics and are
+ineligible for a production/default decision.
 
 ### Provisional named effort default
 
@@ -1258,15 +1288,17 @@ default model binding is the single standard slug `gpt-5.6-sol`; cheaper model
 tiers are not availability substitutes in the default profile. The effort
 fallbacks remain `xhigh` for the supervisor, child orchestrator, and auditor,
 `medium` for workers, and `high` for the gate classifier. A per-role
-`role_models` entry can still replace authored role data, but the acceptance
-gate and review-auditor hard floors remain enforced.
+`role_models` entry can still replace authored role data, but real-runtime
+selection must satisfy the immutable built-in capability policy and the
+acceptance-gate and review-auditor hard floors.
 
 Each default role selection retains the ordered-catalog data shape and typed
 resolution observations. Its ordinary availability `models` list is empty, so
 the default path never silently substitutes a cheaper slug. The separately
-named `budget_degrade_models` list remains available only to the Issue #78
-budget-pressure ladder. MACO consults the authenticated runtime catalog once;
-when `gpt-5.6-sol` is present, every default role resolves to it.
+named `budget_degrade_models` list remains readable configuration data, but the
+current budget-pressure policy does not select from it. MACO consults the
+authenticated runtime catalog once; when `gpt-5.6-sol` is present, every
+default role resolves to it.
 
 The chain is ordinary plan/profile data and round-trips without a code-shape
 change:
@@ -1298,32 +1330,30 @@ gate-classifier, and review-auditor duties; gate-classifier duties clamp at
 `resolution_observation=hard_floor_clamped` rather than silently rewriting the
 authored request.
 
-The availability fallback order and the economics downgrade order are distinct
-data. `models` answers which advertised model may substitute when the primary
-is absent. `budget_degrade_models` is a monotone cheaper-tier list consulted
-only after a run crosses a soft budget ceiling; an arbitrary plan fallback is
-never assumed to be cheaper.
+The availability fallback order and the legacy economics-downgrade list remain
+distinct data. `models` answers which advertised, trusted built-in model may
+substitute when the primary is absent. `budget_degrade_models` does not grant
+model-selection authority and is not applied by the current fan-out-only
+budget-pressure policy.
 
 ### Budget-pressure degradation
 
 The scheduler consumes `BudgetAction::Degrade` before admitting new work. On
 successive admissions while a soft token or cost ceiling remains reached it
-lowers the assignment-resolved child-orchestrator reasoning effort, selects the first
-runtime-advertised entry from that role's `budget_degrade_models`, and halves
-the remaining fan-out bound (never below one). A hard ceiling still halts new
-dispatch and drains already-started assignments. Concurrent admission waits
-until each newly spawned assignment has either committed its child budget
-reservation or completed without one, so the next policy decision cannot race
-past an invisible reservation.
+halves the remaining fan-out bound, never below one. It does not lower a
+judgment model or reasoning effort and does not select a nested Worker model.
+A hard ceiling still halts new dispatch and drains already-started assignments.
+Concurrent admission waits until each newly spawned assignment has either
+committed its child budget reservation or completed without one, so the next
+policy decision cannot race past an invisible reservation.
 
 Every applied rung is retained in
 `role_economics_profile.execution.budget_degradations` with the assignment ID,
-budget reasons, typed before/after change, and the full effective child model,
-effort, and fan-out. `observation=admission_policy_resolved` deliberately says
-that this is scheduler admission evidence; `commands_run` remains the process
-evidence for a dispatch that actually started. When assignments use different
-bindings, the aggregate child role binding is marked `assignment_specific`
-instead of claiming one model or effort for the whole run.
+budget reasons, typed fan-out before/after change, and the unchanged effective
+child model and effort. `observation=admission_policy_resolved` deliberately
+says that this is scheduler admission evidence; it is not evidence that a
+nested Worker model was selected or observed. `commands_run` remains the
+process evidence for a dispatch that actually started.
 
 ### CLI run ceilings
 
@@ -1344,20 +1374,28 @@ remaining duration are retained in `supervisor-final.json`.
 
 Autopilot propagates these limits to its source and generated follow-up
 supervise dispatches. Each supervise run still owns an independent in-memory
-ledger. A durable workspace/machine ledger across runs and integration with
-provider rate-limit signals remain deliberately deferred behind the real
-provider boundary (#77); the attachment seams are supervisor ledger creation
-and the autopilot/inbox dispatch boundary.
+ledger. Issue #79 durable per-run/workspace quota is absent: the rejected
+partial implementation was discarded rather than leaving an unsafe namespace,
+CLI, reservation, settlement, or report path active. Phase-2 integration must
+first provide stable rate-limit observations through the exec-provider
+transport and extend the lifecycle-owned strict schema in
+`src/supervise/schema_artifacts.rs`; those two seams are intentionally outside
+this planning-cluster increment. Until then, there is no durable same-run-id
+reservation/settlement authority across restarts and no durable quota report to
+interpret as verified state.
 
 On the production Codex path, the no-override child-orchestrator and auditor
 commands are constructed with the profile's explicit model and resolved
-assignment effort. Worker selection remains declarative data in the child
-orchestrator prompt because nested workers are not launched as separately
-process-observable commands; it is not per-worker model or usage evidence. The
-supervisor entry completes the reported role profile rather than claiming that
-the running supervisor launches itself. The `gate_classifier` entry currently
-has only the deterministic-fake evaluation boundary described above; Issue
-#28's writable production gate remains deferred.
+assignment effort. Nested Workers are not launched as separately
+process-observable commands, so Worker model entries remain planning/reporting
+data rather than observed per-worker model or usage evidence. Reserved
+phase/model data in assignment `notes` is strict declarative compatibility
+metadata only: it is validated before artifacts, stripped from launched task
+prompts, and cannot authorize a weak model, duty, or operands. The supervisor
+entry completes the reported role profile rather than claiming that the running
+supervisor launches itself. The `gate_classifier` entry currently has only the
+deterministic-fake evaluation boundary described above; Issue #28's writable
+production gate remains deferred.
 
 Before a verified Codex run schedules any assignment, MACO invokes the trusted
 system Codex CLI's non-bundled `codex debug models` command exactly once. The
@@ -1376,9 +1414,18 @@ before budget reservation and spawn-event dispatch:
 
 | Configured fallback | Known-unavailable behavior |
 | --- | --- |
-| `runtime_default` | Clear the explicit model while preserving the configured reasoning effort, allowing the runtime to choose its default model. |
+| `runtime_default` | Resolution may clear the configured slug, but every real role then fails closed before dispatch because an unobserved runtime default is not trusted capability evidence. |
 | `fail_closed` | Refuse the selection rather than dispatch with another model. |
 | `local_deterministic_fake` | Use the deterministic local fallback only with the Fake runtime; reject it for Codex. |
+
+Capability is derived only from exact immutable built-in slug mappings, never
+from plan-authored assertions or catalog presence. Unknown slugs and
+runtime-default identities fail closed. Discovery, triage, diagnosis, planning,
+implementation, validation interpretation, merge, gate classification, review,
+and audit all exclude weak models. The closed mechanical-terminal duty and
+operand types describe the only eventual weak-model-eligible shape, but real
+weak-Worker execution is currently unavailable because no trusted typed
+planner/runtime authority or exact-operation executor exists.
 
 The Fake runtime performs no catalog command and treats configured provider
 models as unavailable, so its declared local fallback remains local. The Codex
@@ -1387,12 +1434,12 @@ therefore membership is runtime-advertised availability at preflight time, not
 proof of a fresh entitlement check or a guarantee that a later provider launch
 will succeed. MACO does not retry by cycling model names.
 
-The single-slug model binding follows the evidence-backed cost-per-accepted-task
-decision. Assignment-level effort matching is operationally selected but has
-not yet been evaluated with real-provider resolved-effort telemetry, so the
-combined profile remains `production_eligible=false`. Genuine Issue #26
-evidence is required before its effort policy can be qualified for production
-or revised on empirical grounds.
+The single-slug binding and assignment-level effort policy remain provisional.
+They have not been evaluated with real-provider resolved-effort telemetry or a
+real experiment, so the combined profile remains
+`production_eligible=false`. Genuine provider-backed Issue #26 evidence is
+required before this policy can be qualified for production or revised on
+empirical grounds.
 
 ### Platform boundary
 
@@ -2641,14 +2688,33 @@ Library callers may opt into provider-backed proposal through
 `propose_task_decomposition_with_optional_provider`. With no provider, that API
 uses the same deterministic heuristic planner described above. With a provider,
 the response must be a `ProviderTaskPlan` JSON object in the existing
-provider-neutral `WorkProposal.summary`; commands and patches are rejected, and
-fragment references, inventoried file paths, structural bounds, and assignment
-disjointness are validated before the proposal is accepted. A
-`TaskPlanningSession` can feed completed/failed assignments, coverage gaps, and
-bounded notes into at most two provider re-plan attempts. Invalid responses and
-failed provider calls count against that cap. The local `FakeProvider` exercises
-this boundary; no network provider is configured or selected by supervise, so
-the CLI remains heuristic/offline by default.
+provider-neutral `WorkProposal.summary`; unknown fields, commands, and patches
+are rejected. Deterministic validation is authoritative: it checks complete
+repository/spec inventories, global assignment and fragment identities,
+recursive depth/width/item/byte bounds, path/module/symbol disjointness,
+completed-scope exclusion, and exact leaf-versus-internal fragment coverage
+unions before accepting a proposal. A `TaskPlanningSession` can feed bounded
+completed/failed assignments, coverage gaps, and notes into at most two
+provider re-plan attempts. Invalid responses and provider failures consume an
+attempt without mutating the last valid plan; exhaustion is final for that
+session.
+
+The supervisor lowering API can bind a provider session to one run using a
+fresh session nonce plus exact provider, model, session-authority, normalized
+plan, and combined authority digests. The binding is embedded in the normalized
+plan that the ordinary authenticated supervisor artifacts persist. Feedback is
+accepted only from the matching finalized authenticated run/report/checkpoint
+chain, and only when the exact bound plan appeared in the pre-dispatch
+assignment artifact before the first child or auditor dispatch. A missing,
+late, replaced, duplicated, or same-run-id-colliding binding fails closed before
+feedback can reach the provider.
+
+The local `FakeProvider` exercises proposal, recursive replanning, and this
+authenticated execution-feedback boundary. There is no automatic live
+scheduler/replanning loop, no network provider configured or selected by
+supervise, no whole-call planning timeout, and no crash-resumable form of the
+in-memory `TaskPlanningSession`; the CLI therefore remains heuristic/offline by
+default.
 
 The emitted document is directly usable as a supervisor plan and preserves
 lowering traceability through top-level `spec_fragment_ids`, per-assignment
