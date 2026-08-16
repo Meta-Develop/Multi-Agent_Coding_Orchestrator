@@ -522,6 +522,10 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 || loaded.consultant != supervisor_plan.consultant
                 || loaded.assignment_metadata.suitability
                     != supervisor_plan.effective_assignment_suitability()
+                || loaded.assignment_metadata.suitability_sources.values().any(|source| {
+                    *source
+                        != AssignmentSuitabilityAssessmentSource::GeneratedFollowUpAuthority
+                })
                 || loaded.plan_metadata.assignment_schedule != supervisor_plan.assignment_schedule
                 || loaded.plan_metadata.run_budget != supervisor_plan.run_budget
                 || loaded.plan_metadata.generated_follow_up

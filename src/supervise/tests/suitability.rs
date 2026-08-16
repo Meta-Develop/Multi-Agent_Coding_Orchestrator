@@ -13,39 +13,110 @@ fn suitability_test_plan(assignments: serde_json::Value, max_depth: u8) -> serde
     })
 }
 
-fn snapshot_regular_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-    fn collect(root: &Path, current: &Path, snapshot: &mut BTreeMap<PathBuf, Vec<u8>>) {
-        let Ok(entries) = fs::read_dir(current) else {
-            return;
-        };
-        let mut entries = entries
-            .filter_map(std::result::Result::ok)
-            .collect::<Vec<_>>();
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                collect(root, &path, snapshot);
-            } else if file_type.is_file() {
-                let relative = path
-                    .strip_prefix(root)
-                    .unwrap_or(path.as_path())
-                    .to_path_buf();
-                snapshot.insert(relative, fs::read(&path).unwrap_or_default());
-            }
-        }
-    }
-
-    let mut snapshot = BTreeMap::new();
-    collect(root, root, &mut snapshot);
-    snapshot
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ByteTreeEntry {
+    Directory,
+    File(Vec<u8>),
+    Symlink(PathBuf),
+    Other,
 }
 
-fn relative_regular_files(root: &Path) -> BTreeSet<PathBuf> {
-    snapshot_regular_files(root).into_keys().collect()
+fn snapshot_byte_tree(root: &Path) -> Result<Option<BTreeMap<PathBuf, ByteTreeEntry>>> {
+    fn collect(
+        root: &Path,
+        current: &Path,
+        snapshot: &mut BTreeMap<PathBuf, ByteTreeEntry>,
+    ) -> Result<()> {
+        let metadata = fs::symlink_metadata(current)
+            .with_context(|| format!("failed to inspect byte-tree entry {}", current.display()))?;
+        let relative = current
+            .strip_prefix(root)
+            .with_context(|| {
+                format!(
+                    "byte-tree entry {} escaped root {}",
+                    current.display(),
+                    root.display()
+                )
+            })?
+            .to_path_buf();
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
+            snapshot.insert(relative, ByteTreeEntry::Directory);
+            let entries = fs::read_dir(current).with_context(|| {
+                format!("failed to read byte-tree directory {}", current.display())
+            })?;
+            let mut entries = entries
+                .collect::<std::io::Result<Vec<_>>>()
+                .with_context(|| {
+                    format!(
+                        "failed to enumerate byte-tree directory {}",
+                        current.display()
+                    )
+                })?;
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                collect(root, &entry.path(), snapshot)?;
+            }
+        } else if file_type.is_file() {
+            snapshot.insert(
+                relative,
+                ByteTreeEntry::File(fs::read(current).with_context(|| {
+                    format!("failed to read byte-tree file {}", current.display())
+                })?),
+            );
+        } else if file_type.is_symlink() {
+            snapshot.insert(
+                relative,
+                ByteTreeEntry::Symlink(fs::read_link(current).with_context(|| {
+                    format!("failed to read byte-tree symlink {}", current.display())
+                })?),
+            );
+        } else {
+            snapshot.insert(relative, ByteTreeEntry::Other);
+        }
+        Ok(())
+    }
+
+    match fs::symlink_metadata(root) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect byte-tree root {}", root.display()))
+        }
+    }
+    let mut snapshot = BTreeMap::new();
+    collect(root, root, &mut snapshot)?;
+    Ok(Some(snapshot))
+}
+
+fn snapshot_git_mutation_surfaces(
+    common_dir: &Path,
+) -> Result<BTreeMap<PathBuf, Option<BTreeMap<PathBuf, ByteTreeEntry>>>> {
+    [
+        "HEAD",
+        "index",
+        "config",
+        "packed-refs",
+        "refs",
+        "logs",
+        "worktrees",
+    ]
+    .into_iter()
+    .map(|relative| {
+        let relative = PathBuf::from(relative);
+        let snapshot = snapshot_byte_tree(&common_dir.join(&relative))?;
+        Ok((relative, snapshot))
+    })
+    .collect()
+}
+
+fn relative_regular_files(root: &Path) -> Result<BTreeSet<PathBuf>> {
+    Ok(snapshot_byte_tree(root)?
+        .with_context(|| format!("byte-tree root {} did not exist", root.display()))?
+        .into_iter()
+        .filter_map(|(path, entry)| matches!(entry, ByteTreeEntry::File(_)).then_some(path))
+        .collect())
 }
 
 #[test]
@@ -53,78 +124,119 @@ fn parked_assignment_is_classified_before_claim_worktree_checkpoint_or_dispatch(
     let (temp, repo) = injected_repository();
     let loaded = parse_supervisor_plan_with_consultant(
         &serde_json::to_string(&suitability_test_plan(
-            json!([{
-                "id": "parked-parent",
-                "assigned_paths": ["README.md"],
-                "suitability": {
-                    "classification": "unclear",
-                    "bounded_scope": true,
-                    "max_scope_paths": 8,
-                    "verification_path": "supervisor_validation_floor",
-                    "autonomous_completion": true,
-                    "rationale": "operator decision is required before this assignment may claim resources"
+            json!([
+                {
+                    "id": "parked-parent",
+                    "assigned_paths": ["README.md"],
+                    "suitability": {
+                        "classification": "unclear",
+                        "bounded_scope": true,
+                        "max_scope_paths": 8,
+                        "verification_path": "supervisor_validation_floor",
+                        "autonomous_completion": true,
+                        "rationale": "operator decision is required before this assignment may claim resources"
+                    },
+                    "child_assignments": [{
+                        "id": "suppressed-descendant",
+                        "assigned_paths": ["README.md"]
+                    }]
                 },
-                "child_assignments": [{
-                    "id": "suppressed-descendant",
-                    "assigned_paths": ["README.md"]
-                }]
-            }]),
+                {
+                    "id": "refused-duplicate",
+                    "assigned_paths": ["docs/refused.md"],
+                    "suitability": {
+                        "classification": "duplicate",
+                        "bounded_scope": true,
+                        "max_scope_paths": 8,
+                        "verification_path": "supervisor_validation_floor",
+                        "autonomous_completion": true,
+                        "rationale": "this assignment duplicates already planned work"
+                    }
+                }
+            ]),
             3,
         ))
         .expect("serialize parked suitability plan"),
     )
     .expect("parse parked suitability plan");
 
-    let sync_store = SyncStore::open(&repo).expect("initialize authenticated claims state");
-    let semantic_store =
-        SemanticIntentStore::open(&repo).expect("initialize authenticated semantic state");
-    assert!(sync_store
-        .snapshot()
-        .expect("initial claims snapshot")
-        .is_empty());
-    assert!(semantic_store
-        .snapshot()
-        .expect("initial semantic snapshot")
-        .is_empty());
-    let claims_root = sync_store
-        .state_path()
-        .parent()
-        .expect("claims state parent")
-        .join("authenticated-claims-state-v1");
-    let semantic_root = semantic_store
-        .state_path()
-        .parent()
-        .expect("semantic state parent")
-        .join("authenticated-semantic-state-v1");
-    let claims_before = snapshot_regular_files(&claims_root);
-    let semantic_before = snapshot_regular_files(&semantic_root);
-    drop(sync_store);
-    drop(semantic_store);
-
-    let manager = WorktreeManager::new(&repo);
-    assert!(manager
-        .list()
-        .expect("initial managed worktrees")
-        .is_empty());
     let git = crate::git_repository::open(&repo).expect("open injected Git repository");
+    let authenticated_state_root = git.commondir().join("maco/state");
+    let claims_root = authenticated_state_root.join("authenticated-claims-state-v1");
+    let semantic_root = authenticated_state_root.join("authenticated-semantic-state-v1");
+    let field_guide_root = authenticated_state_root.join("authenticated-field-guide-state-v1");
+    let managed_registry_root = authenticated_state_root.join("authenticated-managed-worktrees-v1");
+    let execution_state_lock_paths = [
+        authenticated_state_root.join(".authenticated-claims.lock"),
+        authenticated_state_root.join(".authenticated-semantic.lock"),
+        authenticated_state_root.join(".authenticated-field-guide.lock"),
+        authenticated_state_root.join(".authenticated-managed-worktrees.lock"),
+    ];
+    let claims_before = snapshot_byte_tree(&claims_root).expect("snapshot claims byte tree");
+    let semantic_before =
+        snapshot_byte_tree(&semantic_root).expect("snapshot semantic-intent byte tree");
+    let field_guide_before =
+        snapshot_byte_tree(&field_guide_root).expect("snapshot field-guide byte tree");
+    let managed_registry_before =
+        snapshot_byte_tree(&managed_registry_root).expect("snapshot managed-worktree registry");
+    let execution_state_locks_before = execution_state_lock_paths
+        .iter()
+        .map(|path| snapshot_byte_tree(path).expect("snapshot execution-state lock"))
+        .collect::<Vec<_>>();
+    let git_mutation_surfaces_before =
+        snapshot_git_mutation_surfaces(git.commondir()).expect("snapshot Git mutation surfaces");
     let head_before = current_head_oid(&repo).expect("capture initial HEAD");
     let index_before = fs::read(git.path().join("index")).expect("capture initial index bytes");
     let readme_before = fs::read(repo.join("README.md")).expect("capture initial tracked file");
     let primary_before = verified_whole_primary_snapshot_sha256(&repo)
         .expect("capture initial whole-primary digest");
 
+    let run_id = RunId::new("preclaim-suitability-parked").expect("valid run id");
+    let run_root = repo.join(".maco/o2/runs").join(run_id.as_str());
+    let checkpoint_run_root = authenticated_state_root
+        .join(crate::state_journal::JOURNAL_ROOT_NAME)
+        .join(run_id.as_str());
+    let classification_run_root = run_root.clone();
+    let classification_checkpoint_root = checkpoint_run_root.clone();
+    let classification_claims_root = claims_root.clone();
+    let classification_semantic_root = semantic_root.clone();
+    let classification_field_guide_root = field_guide_root.clone();
+    let classification_managed_root = managed_registry_root.clone();
+    set_after_assignment_suitability_classification_hook(move |outcomes| {
+        assert!(!outcomes.is_empty());
+        assert!(outcomes
+            .iter()
+            .all(|outcome| { outcome.disposition != AssignmentSuitabilityDisposition::Admitted }));
+        for path in [
+            &classification_run_root,
+            &classification_checkpoint_root,
+            &classification_claims_root,
+            &classification_semantic_root,
+            &classification_field_guide_root,
+            &classification_managed_root,
+        ] {
+            assert!(
+                !path.exists(),
+                "suitability classification ran after mutation-capable state creation: {}",
+                path.display()
+            );
+        }
+    });
+    set_before_scheduler_execution_state_initialization_hook(|| {
+        panic!("a wholly non-admitted plan reached execution-state initialization")
+    });
     let runner_calls = AtomicUsize::new(0);
     let mut runner = |_command: &ExternalAgentCommand, _review: bool| {
         runner_calls.fetch_add(1, Ordering::SeqCst);
         panic!("a parked assignment must never reach the child or auditor runner")
     };
-    let run_id = RunId::new("preclaim-suitability-parked").expect("valid run id");
     let report = run_loaded_supervisor_plan_with_runner(
         loaded,
         injected_options(&repo, temp.path(), run_id.as_str()),
         &mut runner,
     )
     .expect("finalize parked suitability outcome");
+    clear_before_scheduler_execution_state_initialization_hook();
 
     assert!(!report.success);
     assert!(report
@@ -139,8 +251,27 @@ fn parked_assignment_is_classified_before_claim_worktree_checkpoint_or_dispatch(
     assert_eq!(parked.len(), 1);
     assert_eq!(parked[0].assignment_id, "parked-parent");
     assert_eq!(
+        parked[0].assessment_source,
+        AssignmentSuitabilityAssessmentSource::ExplicitAssignmentAuthority
+    );
+    assert_eq!(
         parked[0].reasons,
         vec![AssignmentSuitabilityReason::ClassificationUnclear]
+    );
+    let refused = report
+        .assignment_suitability_outcomes
+        .iter()
+        .filter(|outcome| outcome.disposition == AssignmentSuitabilityDisposition::Refused)
+        .collect::<Vec<_>>();
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].assignment_id, "refused-duplicate");
+    assert_eq!(
+        refused[0].assessment_source,
+        AssignmentSuitabilityAssessmentSource::ExplicitAssignmentAuthority
+    );
+    assert_eq!(
+        refused[0].reasons,
+        vec![AssignmentSuitabilityReason::ClassificationDuplicate]
     );
     assert!(report.orchestrator_reports.is_empty());
     assert!(report.commands_run.is_empty());
@@ -160,30 +291,46 @@ fn parked_assignment_is_classified_before_claim_worktree_checkpoint_or_dispatch(
     assert_eq!(execution.completed_assignment_count, 0);
 
     assert_eq!(
-        SyncStore::open(&repo)
-            .expect("reopen claims after parked run")
-            .snapshot()
-            .expect("claims after parked run"),
-        Vec::new()
+        snapshot_byte_tree(&claims_root).expect("resnapshot claims byte tree"),
+        claims_before,
+        "the refusal path created authenticated claim state"
     );
     assert_eq!(
-        SemanticIntentStore::open(&repo)
-            .expect("reopen semantic state after parked run")
-            .snapshot()
-            .expect("semantic state after parked run"),
-        Vec::new()
+        snapshot_byte_tree(&semantic_root).expect("resnapshot semantic-intent byte tree"),
+        semantic_before,
+        "the refusal path created authenticated semantic-intent state"
     );
-    assert_eq!(snapshot_regular_files(&claims_root), claims_before);
-    assert_eq!(snapshot_regular_files(&semantic_root), semantic_before);
-    assert!(manager
-        .list()
-        .expect("managed worktrees after parked run")
-        .is_empty());
+    assert_eq!(
+        snapshot_byte_tree(&field_guide_root).expect("resnapshot field-guide byte tree"),
+        field_guide_before,
+        "the refusal path created authenticated field-guide state"
+    );
+    assert_eq!(
+        snapshot_byte_tree(&managed_registry_root).expect("resnapshot managed-worktree registry"),
+        managed_registry_before,
+        "the refusal path created authenticated managed-worktree state"
+    );
+    assert_eq!(
+        execution_state_lock_paths
+            .iter()
+            .map(|path| snapshot_byte_tree(path).expect("resnapshot execution-state lock"))
+            .collect::<Vec<_>>(),
+        execution_state_locks_before,
+        "the refusal path acquired an execution-state lock"
+    );
+    assert_eq!(
+        snapshot_git_mutation_surfaces(git.commondir()).expect("resnapshot Git mutation surfaces"),
+        git_mutation_surfaces_before,
+        "Git HEAD/index/config/ref/log/worktree metadata changed before the suitability refusal"
+    );
     assert!(git
         .find_branch("maco/parked-parent", git2::BranchType::Local)
         .is_err());
     assert!(git
         .find_branch("maco/suppressed-descendant", git2::BranchType::Local)
+        .is_err());
+    assert!(git
+        .find_branch("maco/refused-duplicate", git2::BranchType::Local)
         .is_err());
     assert_eq!(
         current_head_oid(&repo).expect("HEAD after parked run"),
@@ -221,31 +368,18 @@ fn parked_assignment_is_classified_before_claim_worktree_checkpoint_or_dispatch(
         .expect("durable scheduler closure");
     assert_eq!(
         scheduler_closed.payload["pending_assignments"],
-        json!(["parked-parent", "suppressed-descendant"])
+        json!([
+            "parked-parent",
+            "suppressed-descendant",
+            "refused-duplicate"
+        ])
     );
 
     let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
         .expect("open parked run artifacts");
-    let events = read_finalized_orchestration_events(&reader);
-    assert!(events.iter().any(|event| {
-        event.kind == OrchestrationEventKind::Gate
-            && event.node == "parked-parent"
-            && event.payload["gate"] == "assignment_suitability"
-            && event.payload["outcome"]["disposition"] == "parked"
-    }));
-    assert!(events.iter().any(|event| {
-        event.kind == OrchestrationEventKind::Reject
-            && event.node == "suppressed-descendant"
-            && event.payload["status"] == "suppressed"
-            && event.payload["parent_assignment_id"] == "parked-parent"
-    }));
-    assert!(!events.iter().any(|event| {
-        matches!(
-            event.kind,
-            OrchestrationEventKind::Spawn | OrchestrationEventKind::Claim
-        )
-    }));
-    let artifact_files = relative_regular_files(&repo.join(".maco/o2/runs").join(run_id.as_str()));
+    assert!(!reader.run_dir().join(ORCHESTRATION_EVENT_PATH).exists());
+    let artifact_files = relative_regular_files(&repo.join(".maco/o2/runs").join(run_id.as_str()))
+        .expect("snapshot finalized run-owned artifact files");
     assert!(!artifact_files.iter().any(|path| {
         let path = path.to_string_lossy();
         path.contains("assignments/") && path.ends_with(".prompt.md")
@@ -269,6 +403,50 @@ fn suitability_legacy_default_recursive_roundtrip_and_bounds_are_strict() {
     assert_eq!(
         legacy.assignment_metadata.suitability("legacy"),
         AssignmentSuitabilityConfig::default()
+    );
+    assert_eq!(
+        legacy.assignment_metadata.suitability_source("legacy"),
+        AssignmentSuitabilityAssessmentSource::HistoricalCompatibilityDefault
+    );
+    let normalized_legacy = supervisor_plan_value(
+        &legacy.plan,
+        &legacy.consultant,
+        &legacy.assignment_metadata,
+        &legacy.plan_metadata,
+    )
+    .expect("normalize historical plan without fabricating explicit authority");
+    assert!(normalized_legacy["assignments"][0]
+        .get("suitability")
+        .is_none());
+
+    // Historical plans commonly used one broad directory claim. Keep that
+    // input dispatch-compatible, but report that its optimistic default is a
+    // compatibility decision rather than explicit operator classification.
+    let broad_legacy = parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&suitability_test_plan(
+            json!([{"id": "broad-legacy", "assigned_paths": ["src"]}]),
+            2,
+        ))
+        .expect("serialize broad historical plan"),
+    )
+    .expect("broad historical plan remains readable");
+    let broad_outcome = broad_legacy
+        .assignment_metadata
+        .suitability("broad-legacy")
+        .outcome(
+            "broad-legacy",
+            broad_legacy.plan.assignments[0].assigned_paths.len(),
+            broad_legacy
+                .assignment_metadata
+                .suitability_source("broad-legacy"),
+        );
+    assert_eq!(
+        broad_outcome.assessment_source,
+        AssignmentSuitabilityAssessmentSource::HistoricalCompatibilityDefault
+    );
+    assert_eq!(
+        broad_outcome.disposition,
+        AssignmentSuitabilityDisposition::Admitted
     );
 
     let configured_value = suitability_test_plan(
@@ -316,6 +494,17 @@ fn suitability_legacy_default_recursive_roundtrip_and_bounds_are_strict() {
         reloaded.assignment_metadata.suitability,
         configured.assignment_metadata.suitability
     );
+    assert_eq!(
+        reloaded.assignment_metadata.suitability_sources,
+        configured.assignment_metadata.suitability_sources
+    );
+    assert!(configured
+        .assignment_metadata
+        .suitability_sources
+        .values()
+        .all(
+            |source| *source == AssignmentSuitabilityAssessmentSource::ExplicitAssignmentAuthority
+        ));
     assert_eq!(
         reloaded
             .assignment_metadata
@@ -381,6 +570,9 @@ fn suitability_legacy_default_recursive_roundtrip_and_bounds_are_strict() {
         .outcome(
             "legacy-over-limit",
             over_limit.plan.assignments[0].assigned_paths.len(),
+            over_limit
+                .assignment_metadata
+                .suitability_source("legacy-over-limit"),
         );
     assert_eq!(
         outcome.disposition,
@@ -397,7 +589,11 @@ fn suitability_legacy_default_recursive_roundtrip_and_bounds_are_strict() {
         rationale: Some("operator triage identified a duplicate assignment".to_string()),
         ..AssignmentSuitabilityConfig::default()
     }
-    .outcome("duplicate", 1);
+    .outcome(
+        "duplicate",
+        1,
+        AssignmentSuitabilityAssessmentSource::ExplicitAssignmentAuthority,
+    );
     assert_eq!(
         refused.disposition,
         AssignmentSuitabilityDisposition::Refused
@@ -406,18 +602,39 @@ fn suitability_legacy_default_recursive_roundtrip_and_bounds_are_strict() {
         refused.reasons,
         vec![AssignmentSuitabilityReason::ClassificationDuplicate]
     );
+
+    let mut rationale_config = AssignmentSuitabilityConfig::default();
+    rationale_config.rationale = Some("界".repeat(MAX_ASSIGNMENT_SUITABILITY_RATIONALE_CHARS));
+    rationale_config
+        .validate("unicode-rationale-at-limit")
+        .expect("runtime bound counts Unicode characters like JSON Schema maxLength");
+    rationale_config.rationale =
+        Some("界".repeat(MAX_ASSIGNMENT_SUITABILITY_RATIONALE_CHARS.saturating_add(1)));
+    assert!(rationale_config
+        .validate("unicode-rationale-over-limit")
+        .is_err());
+    for invalid_rationale in [" leading", "trailing ", "embedded\u{0007}control"] {
+        rationale_config.rationale = Some(invalid_rationale.to_string());
+        assert!(rationale_config.validate("invalid-rationale").is_err());
+    }
 }
 
 #[test]
 fn suitability_schema_is_strict_bounded_and_report_field_is_backward_readable() {
     let schema = supervisor_final_report_schema_value();
-    assert!(schema["required"]
+    assert!(!schema["required"]
         .as_array()
         .is_some_and(|required| required
             .iter()
             .any(|field| field == "assignment_suitability_outcomes")));
+    assert!(schema["properties"]
+        .get("assignment_suitability_outcomes")
+        .is_some());
     let outcome = &schema["properties"]["assignment_suitability_outcomes"]["items"];
     assert_eq!(outcome["additionalProperties"], false);
+    assert!(outcome["required"]
+        .as_array()
+        .is_some_and(|required| required.iter().any(|field| field == "assessment_source")));
     assert_eq!(
         outcome["properties"]["reasons"]["maxItems"],
         MAX_ASSIGNMENT_SUITABILITY_REASONS
@@ -430,6 +647,23 @@ fn suitability_schema_is_strict_bounded_and_report_field_is_backward_readable() 
     assert_eq!(
         outcome["properties"]["axes"]["properties"]["max_scope_paths"]["maximum"],
         MAX_SUPERVISOR_ASSIGNMENT_SCOPE_PATHS
+    );
+    assert_eq!(
+        outcome["properties"]["rationale"]["maxLength"],
+        MAX_ASSIGNMENT_SUITABILITY_RATIONALE_CHARS
+    );
+    assert_eq!(
+        outcome["properties"]["rationale"]["pattern"],
+        ASSIGNMENT_SUITABILITY_RATIONALE_PATTERN
+    );
+    let config_schema = assignment_suitability_config_schema_value();
+    assert_eq!(
+        config_schema["properties"]["rationale"]["maxLength"],
+        MAX_ASSIGNMENT_SUITABILITY_RATIONALE_CHARS
+    );
+    assert_eq!(
+        config_schema["allOf"][0]["then"]["required"],
+        json!(["rationale"])
     );
     let generated_plan_schema = &schema["properties"]["generated_follow_up_tasks"]["items"]
         ["properties"]["supervisor_plan"];
@@ -491,13 +725,41 @@ fn suitability_schema_is_strict_bounded_and_report_field_is_backward_readable() 
             operator_defaults: generated_follow_up_operator_defaults(),
         },
     };
-    let generated_json = serde_json::to_value(&generated).expect("serialize generated plan");
+    let generated_bytes = serde_json::to_vec(&generated).expect("serialize generated plan");
+    let generated_json: serde_json::Value =
+        serde_json::from_slice(&generated_bytes).expect("decode generated plan JSON fixture");
     assert!(generated_json.get("assignment_suitability").is_none());
+    let generated_roundtrip: GeneratedFollowUpSupervisorPlan =
+        serde_json::from_slice(&generated_bytes).expect("decode historical generated plan");
+    assert_eq!(
+        serde_json::to_vec(&generated_roundtrip).expect("reserialize historical generated plan"),
+        generated_bytes,
+        "generated plan canonical bytes must not change for authenticated queue replay"
+    );
     validate_generated_follow_up_plan_document(&generated)
-        .expect("generated plan reloads through the ordinary loader's typed default");
+        .expect("generated plan reloads through construction-derived suitability authority");
     assert_eq!(
         generated.effective_assignment_suitability(),
-        BTreeMap::from([(assignment_id, AssignmentSuitabilityConfig::default())])
+        BTreeMap::from([(
+            assignment_id.clone(),
+            AssignmentSuitabilityConfig::default()
+        )])
+    );
+    let generated_loaded = parse_supervisor_plan_with_consultant(
+        std::str::from_utf8(&generated_bytes).expect("generated plan JSON is UTF-8"),
+    )
+    .expect("ordinary loader consumes historical generated plan");
+    assert_eq!(
+        generated_loaded
+            .assignment_metadata
+            .suitability(&generated.assignments[0].id),
+        AssignmentSuitabilityConfig::default()
+    );
+    assert_eq!(
+        generated_loaded
+            .assignment_metadata
+            .suitability_source(&generated.assignments[0].id),
+        AssignmentSuitabilityAssessmentSource::GeneratedFollowUpAuthority
     );
 
     let run_id = RunId::new("legacy-suitability-report").expect("valid legacy report id");
@@ -510,4 +772,25 @@ fn suitability_schema_is_strict_bounded_and_report_field_is_backward_readable() 
     let decoded: SupervisorFinalReport =
         serde_json::from_value(legacy_report).expect("read historical final report");
     assert!(decoded.assignment_suitability_outcomes.is_empty());
+
+    let mut pre_source_report = serde_json::to_value(artifact_test_final_report(&run_id))
+        .expect("serialize pre-assessment-source report fixture");
+    let mut pre_source_outcome =
+        serde_json::to_value(AssignmentSuitabilityConfig::default().outcome(
+            "legacy-report-assignment",
+            1,
+            AssignmentSuitabilityAssessmentSource::ExplicitAssignmentAuthority,
+        ))
+        .expect("serialize pre-assessment-source outcome fixture");
+    pre_source_outcome
+        .as_object_mut()
+        .expect("pre-assessment-source outcome object")
+        .remove("assessment_source");
+    pre_source_report["assignment_suitability_outcomes"] = json!([pre_source_outcome]);
+    let decoded_pre_source: SupervisorFinalReport = serde_json::from_value(pre_source_report)
+        .expect("read historical outcome without assessment source");
+    assert_eq!(
+        decoded_pre_source.assignment_suitability_outcomes[0].assessment_source,
+        AssignmentSuitabilityAssessmentSource::HistoricalCompatibilityDefault
+    );
 }

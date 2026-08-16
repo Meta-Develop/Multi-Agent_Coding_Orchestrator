@@ -683,6 +683,14 @@ fn run_follow_up_supervisor_loaded_plan(
     let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
     validate_max_concurrent_children(max_concurrent_children)?;
     let repo = discover_repo_root(&options.repo)?;
+    if supervisor_plan_is_wholly_non_admitted(&loaded) {
+        return finalize_wholly_non_admitted_supervisor_plan(
+            loaded,
+            options,
+            max_concurrent_children,
+            external_runner,
+        );
+    }
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
     let runtime_model_catalog = match runtime_catalog {

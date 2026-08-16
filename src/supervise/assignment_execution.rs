@@ -305,6 +305,9 @@ fn prepare_assignment_execution<'a>(
             SupervisorWorktreeCreation::PrimaryWorktree => {
                 bail!("primary-worktree execution does not create a managed child worktree")
             }
+            SupervisorWorktreeCreation::SuitabilityRefusalOnly => {
+                bail!("suitability-refusal-only execution cannot create a child worktree")
+            }
             #[cfg(test)]
             SupervisorWorktreeCreation::TestOnly => manager.create_for_test(create_options),
         };

@@ -39,8 +39,7 @@ pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
         "title": "SupervisorFinalReport",
         "type": "object",
         "required": [
-            "version", "role_economics_profile", "role_usage", "usage_complete",
-            "assignment_suitability_outcomes"
+            "version", "role_economics_profile", "role_usage", "usage_complete"
         ],
         "properties": {
             "version": {"type": "integer", "const": SUPERVISOR_SCHEMA_VERSION},
@@ -98,7 +97,7 @@ pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
     })
 }
 
-fn assignment_suitability_config_schema_value() -> serde_json::Value {
+pub(super) fn assignment_suitability_config_schema_value() -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -106,6 +105,17 @@ fn assignment_suitability_config_schema_value() -> serde_json::Value {
             "classification", "bounded_scope", "max_scope_paths",
             "verification_path", "autonomous_completion"
         ],
+        "allOf": [{
+            "if": {
+                "anyOf": [
+                    {"properties": {"classification": {"not": {"const": "viable"}}}},
+                    {"properties": {"bounded_scope": {"const": false}}},
+                    {"properties": {"verification_path": {"const": null}}},
+                    {"properties": {"autonomous_completion": {"const": false}}}
+                ]
+            },
+            "then": {"required": ["rationale"]}
+        }],
         "properties": {
             "classification": {
                 "type": "string",
@@ -125,7 +135,8 @@ fn assignment_suitability_config_schema_value() -> serde_json::Value {
             "rationale": {
                 "type": "string",
                 "minLength": 1,
-                "maxLength": MAX_ASSIGNMENT_SUITABILITY_RATIONALE_BYTES
+                "maxLength": MAX_ASSIGNMENT_SUITABILITY_RATIONALE_CHARS,
+                "pattern": ASSIGNMENT_SUITABILITY_RATIONALE_PATTERN
             }
         }
     })
@@ -134,15 +145,28 @@ fn assignment_suitability_config_schema_value() -> serde_json::Value {
 fn assignment_suitability_outcomes_schema_value() -> serde_json::Value {
     json!({
         "type": "array",
+        "maxItems": MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES,
         "items": {
             "type": "object",
             "additionalProperties": false,
             "required": [
-                "assignment_id", "classification", "disposition", "verification_path",
-                "axes", "reasons"
+                "assignment_id", "assessment_source", "classification", "disposition",
+                "verification_path", "axes", "reasons"
             ],
             "properties": {
-                "assignment_id": {"type": "string", "minLength": 1},
+                "assignment_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_SUPERVISOR_ASSIGNMENT_ID_BYTES
+                },
+                "assessment_source": {
+                    "type": "string",
+                    "enum": [
+                        "historical_compatibility_default", "explicit_assignment_authority",
+                        "generated_planner_authority",
+                        "generated_follow_up_authority"
+                    ]
+                },
                 "classification": assignment_suitability_config_schema_value()["properties"]["classification"].clone(),
                 "disposition": {"type": "string", "enum": ["admitted", "parked", "refused"]},
                 "verification_path": assignment_suitability_config_schema_value()["properties"]["verification_path"].clone(),
@@ -158,7 +182,8 @@ fn assignment_suitability_outcomes_schema_value() -> serde_json::Value {
                         "bounded_scope": {"type": "boolean"},
                         "scope_path_count": {
                             "type": "integer",
-                            "minimum": 1
+                            "minimum": 1,
+                            "maximum": MAX_SUPERVISOR_ASSIGNMENT_INPUT_PATHS
                         },
                         "max_scope_paths": {
                             "type": "integer",
@@ -187,7 +212,8 @@ fn assignment_suitability_outcomes_schema_value() -> serde_json::Value {
                 "rationale": {
                     "type": "string",
                     "minLength": 1,
-                    "maxLength": MAX_ASSIGNMENT_SUITABILITY_RATIONALE_BYTES
+                    "maxLength": MAX_ASSIGNMENT_SUITABILITY_RATIONALE_CHARS,
+                    "pattern": ASSIGNMENT_SUITABILITY_RATIONALE_PATTERN
                 }
             }
         }

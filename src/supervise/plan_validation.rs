@@ -172,6 +172,9 @@ pub(super) fn validate_supervisor_plan(
     if plan.max_child_assignments == 0 {
         bail!("max_child_assignments must be at least 1 (legacy max_child_processes is accepted as an alias)");
     }
+    if plan.max_child_assignments > MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES {
+        bail!("max_child_assignments must be at most {MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES}");
+    }
     if plan.max_child_retries > MAX_CHILD_RETRIES_LIMIT {
         bail!(
             "max_child_retries must be at most {}",
@@ -277,11 +280,19 @@ pub(super) fn validate_supervisor_plan(
             plan.max_child_assignments
         );
     }
+    if plan.assignments.len() > MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES {
+        bail!("supervisor plan exceeds its {MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES}-assignment limit");
+    }
     if metadata.assignment_schedule.len() != plan.assignments.len() {
         bail!("assignment schedule does not cover every flattened assignment");
     }
     let mut seen = BTreeSet::new();
     for (index, assignment) in plan.assignments.iter_mut().enumerate() {
+        if assignment.id.len() > MAX_SUPERVISOR_ASSIGNMENT_ID_BYTES {
+            bail!(
+                "supervisor assignment id exceeds {MAX_SUPERVISOR_ASSIGNMENT_ID_BYTES} ASCII bytes"
+            );
+        }
         assignment.id = normalize_agent_id(&assignment.id)?;
         if !seen.insert(assignment.id.clone()) {
             bail!("duplicate orchestrator assignment id '{}'", assignment.id);
@@ -289,6 +300,12 @@ pub(super) fn validate_supervisor_plan(
         if assignment.role != AgentRole::ChildOrchestrator {
             bail!(
                 "assignment '{}' role must be child_orchestrator",
+                assignment.id
+            );
+        }
+        if assignment.assigned_paths.len() > MAX_SUPERVISOR_ASSIGNMENT_INPUT_PATHS {
+            bail!(
+                "assignment '{}' exceeds its {MAX_SUPERVISOR_ASSIGNMENT_INPUT_PATHS}-path input limit",
                 assignment.id
             );
         }

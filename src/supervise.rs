@@ -234,9 +234,13 @@ const MAX_NESTED_REPOSITORY_DEPTH: usize = 32;
 const MAX_DIRECTORY_FINGERPRINT_DEPTH: usize = 256;
 const MAX_PRIMARY_WORKTREE_CLAIM_PATHS: usize = 16;
 const MAX_PRIMARY_WORKTREE_SCOPE_BYTES: usize = 1024 * 1024;
-const MAX_ASSIGNMENT_SUITABILITY_RATIONALE_BYTES: usize = 2 * 1024;
+const MAX_ASSIGNMENT_SUITABILITY_RATIONALE_CHARS: usize = 2 * 1024;
 const MAX_ASSIGNMENT_SUITABILITY_REASONS: usize = 4;
 const MAX_SUPERVISOR_ASSIGNMENT_SCOPE_PATHS: usize = 256;
+const MAX_SUPERVISOR_ASSIGNMENT_INPUT_PATHS: usize = 4096;
+const MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES: usize = 4096;
+const MAX_SUPERVISOR_ASSIGNMENT_ID_BYTES: usize = 64;
+const ASSIGNMENT_SUITABILITY_RATIONALE_PATTERN: &str = r"^[^\u0000-\u001F\u007F-\u009F\s](?:[^\u0000-\u001F\u007F-\u009F]*[^\u0000-\u001F\u007F-\u009F\s])?$";
 const BREAKER_RECOVERY_GUIDANCE: &str = "inspect the breaker window and child evidence, correct the repeated coordination failure, then start a new supervise run; pending assignments were not launched";
 const LOCAL_RUNTIME_ROOTS: &[&[u8]] = &[
     b".maco",
@@ -1303,6 +1307,16 @@ pub enum AssignmentVerificationPath {
     SupervisorValidationFloor,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentSuitabilityAssessmentSource {
+    #[default]
+    HistoricalCompatibilityDefault,
+    ExplicitAssignmentAuthority,
+    GeneratedPlannerAuthority,
+    GeneratedFollowUpAuthority,
+}
+
 /// Strict assignment-local authority consumed by the pre-claim gate.
 ///
 /// Historical plans omit this object and receive the deliberate legacy-safe
@@ -1344,7 +1358,7 @@ impl AssignmentSuitabilityConfig {
         if let Some(rationale) = self.rationale.as_deref() {
             if rationale.is_empty()
                 || rationale.trim() != rationale
-                || rationale.len() > MAX_ASSIGNMENT_SUITABILITY_RATIONALE_BYTES
+                || rationale.chars().count() > MAX_ASSIGNMENT_SUITABILITY_RATIONALE_CHARS
                 || rationale.chars().any(char::is_control)
             {
                 bail!(
@@ -1371,6 +1385,7 @@ impl AssignmentSuitabilityConfig {
         &self,
         assignment_id: &str,
         scope_path_count: usize,
+        assessment_source: AssignmentSuitabilityAssessmentSource,
     ) -> AssignmentSuitabilityOutcome {
         let within_scope_path_limit =
             scope_path_count > 0 && scope_path_count <= self.max_scope_paths;
@@ -1429,6 +1444,7 @@ impl AssignmentSuitabilityConfig {
         }
         AssignmentSuitabilityOutcome {
             assignment_id: assignment_id.to_string(),
+            assessment_source,
             classification: self.classification,
             disposition,
             verification_path: self.verification_path,
@@ -1475,6 +1491,8 @@ pub struct AssignmentSuitabilityAxisResults {
 #[serde(deny_unknown_fields)]
 pub struct AssignmentSuitabilityOutcome {
     pub assignment_id: String,
+    #[serde(default)]
+    pub assessment_source: AssignmentSuitabilityAssessmentSource,
     pub classification: AssignmentSuitabilityClassification,
     pub disposition: AssignmentSuitabilityDisposition,
     pub verification_path: Option<AssignmentVerificationPath>,
@@ -1489,6 +1507,7 @@ struct AssignmentMetadata {
     workers: BTreeMap<(String, String), WorkerAssignmentMetadata>,
     reasoning_efforts: BTreeMap<String, ReasoningEffort>,
     suitability: BTreeMap<String, AssignmentSuitabilityConfig>,
+    suitability_sources: BTreeMap<String, AssignmentSuitabilityAssessmentSource>,
 }
 
 impl AssignmentMetadata {
@@ -1524,7 +1543,10 @@ impl AssignmentMetadata {
         &mut self,
         assignment_id: String,
         suitability: AssignmentSuitabilityConfig,
+        source: AssignmentSuitabilityAssessmentSource,
     ) -> Option<AssignmentSuitabilityConfig> {
+        self.suitability_sources
+            .insert(assignment_id.clone(), source);
         self.suitability.insert(assignment_id, suitability)
     }
 
@@ -1535,11 +1557,20 @@ impl AssignmentMetadata {
             .unwrap_or_default()
     }
 
+    fn suitability_source(&self, assignment_id: &str) -> AssignmentSuitabilityAssessmentSource {
+        self.suitability_sources
+            .get(assignment_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
     fn retain_assignment(&mut self, assignment_id: &str) {
         self.workers.retain(|(owner, _), _| owner == assignment_id);
         self.reasoning_efforts
             .retain(|owner, _| owner == assignment_id);
         self.suitability.retain(|owner, _| owner == assignment_id);
+        self.suitability_sources
+            .retain(|owner, _| owner == assignment_id);
     }
 }
 
@@ -1549,6 +1580,7 @@ impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMe
             workers,
             reasoning_efforts: BTreeMap::new(),
             suitability: BTreeMap::new(),
+            suitability_sources: BTreeMap::new(),
         }
     }
 }
@@ -1737,9 +1769,6 @@ impl GeneratedFollowUpSupervisorPlan {
     }
 
     fn effective_assignment_suitability(&self) -> BTreeMap<String, AssignmentSuitabilityConfig> {
-        // Generated follow-ups are newly authored assignments and carry no
-        // source-assignment suitability authority. The ordinary loader applies
-        // this same typed legacy default before their pre-claim gate.
         self.assignments
             .iter()
             .map(|assignment| {
@@ -2769,11 +2798,22 @@ fn run_supervisor_plan_file_with_runner(
         );
     }
     let repo = discover_repo_root(&options.repo)?;
+    let serialized_runner = Mutex::new(external_runner);
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    if supervisor_plan_is_wholly_non_admitted(&loaded) {
+        return finalize_wholly_non_admitted_supervisor_plan(
+            loaded,
+            options,
+            1,
+            &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+                Ok(mut runner) => runner(command),
+                Err(poisoned) => poisoned.into_inner()(command),
+            },
+        );
+    }
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
-    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
     let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
-    let serialized_runner = Mutex::new(external_runner);
     run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
@@ -3578,6 +3618,11 @@ enum SupervisorWorktreeCreation<'a> {
     Bound(&'a RepositoryCleanlinessCapability),
     ExistingOnly,
     PrimaryWorktree,
+    /// A wholly non-admitted plan may materialize its typed refusal report
+    /// without acquiring any worktree-creation capability. The scheduler
+    /// rejects this mode unless every assignment was already classified as
+    /// parked or refused.
+    SuitabilityRefusalOnly,
     #[cfg(test)]
     TestOnly,
 }
