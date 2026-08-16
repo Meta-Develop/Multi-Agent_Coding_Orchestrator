@@ -685,16 +685,16 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn recursive_physical_inventory(
-        root: &Path,
-    ) -> Result<BTreeMap<PathBuf, (u32, u64, u64, Vec<u8>)>> {
+    type PhysicalInventoryEntry = (u32, u64, u64, Vec<u8>);
+
+    #[cfg(unix)]
+    type PhysicalInventory = BTreeMap<PathBuf, PhysicalInventoryEntry>;
+
+    #[cfg(unix)]
+    fn recursive_physical_inventory(root: &Path) -> Result<PhysicalInventory> {
         use std::os::unix::fs::MetadataExt;
 
-        fn visit(
-            root: &Path,
-            current: &Path,
-            output: &mut BTreeMap<PathBuf, (u32, u64, u64, Vec<u8>)>,
-        ) -> Result<()> {
+        fn visit(root: &Path, current: &Path, output: &mut PhysicalInventory) -> Result<()> {
             for entry in fs::read_dir(current)? {
                 let entry = entry?;
                 let path = entry.path();
@@ -760,22 +760,20 @@ mod tests {
 
         fn assert_quiet(&self) -> Result<()> {
             let mut buffer = [0_u8; 16 * 1024];
-            loop {
-                // SAFETY: buffer is writable for its full length and fd stays
-                // open for this method's complete duration.
-                let read = unsafe { libc::read(self.fd, buffer.as_mut_ptr().cast(), buffer.len()) };
-                if read > 0 {
-                    bail!("existing-only revalidation emitted a state-tree mutation event");
-                }
-                if read == 0 {
-                    return Ok(());
-                }
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::WouldBlock {
-                    return Ok(());
-                }
-                return Err(error).context("drain inotify state mutation tripwire");
+            // SAFETY: buffer is writable for its full length and fd stays
+            // open for this method's complete duration.
+            let read = unsafe { libc::read(self.fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if read > 0 {
+                bail!("existing-only revalidation emitted a state-tree mutation event");
             }
+            if read == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(());
+            }
+            Err(error).context("drain inotify state mutation tripwire")
         }
     }
 
