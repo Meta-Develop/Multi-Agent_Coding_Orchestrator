@@ -16,17 +16,24 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{cmp::Ordering, collections::BTreeSet};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+};
 
 const MAX_REVIEW_LOOP_ATTEMPTS: usize = 8;
 const MAX_CHECK_NAME_BYTES: usize = 256;
 const MAX_ATTEMPT_ID_BYTES: usize = 128;
 const MAX_DISPOSITION_SUMMARY_BYTES: usize = 8 * 1024;
+const MAX_DISPOSITION_RECORD_BYTES: usize = 16 * 1024;
+const MAX_FROZEN_SNAPSHOT_RECORD_BYTES: usize = 768 * 1024;
+const MAX_REVIEW_LOOP_STATE_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const REVIEW_SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"MACO\0review-loop-snapshot\0v1\0";
 const POLICY_DIGEST_DOMAIN: &[u8] = b"MACO\0review-loop-policy\0v1\0";
 const DISPOSITION_DIGEST_DOMAIN: &[u8] = b"MACO\0review-disposition\0v1\0";
 const READINESS_DIGEST_DOMAIN: &[u8] = b"MACO\0review-readiness\0v1\0";
 const REVIEW_LOOP_STATE_DIGEST_DOMAIN: &[u8] = b"MACO\0review-loop-state\0v1\0";
+const REVIEW_LOOP_ATTEMPT_ID_DOMAIN: &[u8] = b"MACO\0review-loop-attempt-id\0v1\0";
 const PUBLICATION_EFFECT_DIGEST_DOMAIN: &[u8] = b"MACO\0review-disposition-publication\0v1\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,9 +45,17 @@ pub enum TrustedActorRole {
 
 /// An exact provider identity. A reported actor kind is trusted only when all
 /// three fields match a policy entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrustedActorIdentity {
+    provider_actor_id: ProviderObjectId,
+    canonical_handle: String,
+    expected_kind: ReportedActorKind,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustedActorIdentityWire {
     provider_actor_id: ProviderObjectId,
     canonical_handle: String,
     expected_kind: ReportedActorKind,
@@ -134,9 +149,31 @@ impl TrustedActorIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl<'de> Deserialize<'de> for TrustedActorIdentity {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = TrustedActorIdentityWire::deserialize(deserializer)?;
+        Self::new(
+            wire.provider_actor_id,
+            wire.canonical_handle,
+            wire.expected_kind,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrustedActorBinding {
+    identity: TrustedActorIdentity,
+    role: TrustedActorRole,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustedActorBindingWire {
     identity: TrustedActorIdentity,
     role: TrustedActorRole,
 }
@@ -168,9 +205,26 @@ impl TrustedActorBinding {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl<'de> Deserialize<'de> for TrustedActorBinding {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = TrustedActorBindingWire::deserialize(deserializer)?;
+        Self::new(wire.identity, wire.role).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequiredCheck {
+    name: String,
+    trusted_actors: Vec<TrustedActorIdentity>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequiredCheckWire {
     name: String,
     trusted_actors: Vec<TrustedActorIdentity>,
 }
@@ -229,6 +283,16 @@ impl RequiredCheck {
             bail!("required check is not canonical");
         }
         Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for RequiredCheck {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = RequiredCheckWire::deserialize(deserializer)?;
+        Self::new(wire.name, wire.trusted_actors).map_err(serde::de::Error::custom)
     }
 }
 
@@ -360,7 +424,11 @@ struct FrozenReviewSnapshotWire {
 }
 
 impl FrozenReviewSnapshot {
-    pub fn observe<T>(transport: &T, item: &ForgeItem) -> Result<Self>
+    pub fn observe<T>(
+        transport: &T,
+        item: &ForgeItem,
+        trusted_not_after: &ForgeTimestamp,
+    ) -> Result<Self>
     where
         T: ForgeTransport + ?Sized,
     {
@@ -375,10 +443,14 @@ impl FrozenReviewSnapshot {
                 bail!("forge transport returned the wrong observation kind")
             }
         };
-        Self::freeze(item, snapshot)
+        Self::freeze(item, snapshot, trusted_not_after)
     }
 
-    pub fn freeze(item: &ForgeItem, snapshot: PullRequestReviewSnapshot) -> Result<Self> {
+    fn freeze(
+        item: &ForgeItem,
+        snapshot: PullRequestReviewSnapshot,
+        trusted_not_after: &ForgeTimestamp,
+    ) -> Result<Self> {
         if item.kind() != ForgeItemKind::PullRequest
             || snapshot.item() != item
             || snapshot.item().provider_item_id() != item.provider_item_id()
@@ -386,6 +458,9 @@ impl FrozenReviewSnapshot {
             || snapshot.item().base_oid() != item.base_oid()
         {
             bail!("review snapshot does not bind the exact requested PR item, head, and base");
+        }
+        if snapshot.observed_at() > trusted_not_after {
+            bail!("review snapshot observation is later than its trusted cutoff");
         }
         let snapshot = canonicalize_snapshot(snapshot)?;
         Ok(Self {
@@ -414,11 +489,29 @@ impl FrozenReviewSnapshot {
         &self.canonical_sha256
     }
 
+    pub fn restore_json(encoded: &[u8], trusted_not_after: &ForgeTimestamp) -> Result<Self> {
+        if encoded.len() > MAX_FROZEN_SNAPSHOT_RECORD_BYTES || encoded.contains(&0) {
+            bail!("serialized frozen snapshot is malformed or exceeds its byte bound");
+        }
+        let wire = serde_json::from_slice::<FrozenReviewSnapshotWire>(encoded)
+            .context("serialized frozen snapshot is not strict valid JSON")?;
+        Self::from_wire(wire, trusted_not_after)
+    }
+
+    pub fn validate_not_after(&self, trusted_not_after: &ForgeTimestamp) -> Result<()> {
+        if self.observed_at() > trusted_not_after {
+            bail!("frozen review snapshot is later than its trusted cutoff");
+        }
+        Ok(())
+    }
+
     pub fn triage(&self, policy: &ReviewLoopPolicy) -> ReviewTriage {
         let mut blockers = Vec::new();
         let mut blocking_human_feedback = Vec::new();
         let mut bot_advisories = Vec::new();
         let mut approving_humans = BTreeSet::new();
+        let mut approval_review_ids = BTreeSet::new();
+        let mut trusted_human_reviews = BTreeMap::<TrustedActorIdentity, Vec<&ForgeReview>>::new();
 
         if !self.snapshot.threads().is_empty() {
             blockers.push(ReadinessBlocker::UnsupportedThreadCurrencyMetadata);
@@ -440,17 +533,66 @@ impl FrozenReviewSnapshot {
                         TrustedActorIdentity::from_observed(review.author()),
                     ),
                 )),
-                Some(TrustedActorRole::HumanBlocking) => match review.state() {
-                    ForgeReviewState::Approved => {
-                        approving_humans.insert(review.author().provider_actor_id().clone());
-                    }
-                    ForgeReviewState::ChangesRequested | ForgeReviewState::Commented => {
-                        blockers.push(ReadinessBlocker::BlockingHumanFeedback(identity.clone()));
-                        blocking_human_feedback.push(feedback);
-                    }
-                    ForgeReviewState::Dismissed | ForgeReviewState::Pending => {}
-                },
+                Some(TrustedActorRole::HumanBlocking) => trusted_human_reviews
+                    .entry(TrustedActorIdentity::from_observed(review.author()))
+                    .or_default()
+                    .push(review),
                 Some(TrustedActorRole::BotAdvisory) => bot_advisories.push(feedback),
+            }
+        }
+
+        for (actor, reviews) in trusted_human_reviews {
+            let Some(latest_submitted_at) = reviews
+                .iter()
+                .map(|review| review.submitted_at().clone())
+                .max()
+            else {
+                continue;
+            };
+            let latest = reviews
+                .into_iter()
+                .filter(|review| review.submitted_at() == &latest_submitted_at)
+                .collect::<Vec<_>>();
+            let Some(latest_state) = latest.first().map(|review| review.state()) else {
+                continue;
+            };
+            if latest.iter().any(|review| review.state() != latest_state) {
+                blockers.push(ReadinessBlocker::AmbiguousHumanReviewCurrency(
+                    AmbiguousHumanReviewCurrency::new(
+                        actor,
+                        latest_submitted_at,
+                        latest
+                            .iter()
+                            .map(|review| review.provider_review_id().clone())
+                            .collect(),
+                    ),
+                ));
+                continue;
+            }
+            match latest_state {
+                ForgeReviewState::Approved => {
+                    approving_humans.insert(actor.provider_actor_id().clone());
+                    approval_review_ids.extend(
+                        latest
+                            .iter()
+                            .map(|review| review.provider_review_id().clone()),
+                    );
+                }
+                ForgeReviewState::ChangesRequested | ForgeReviewState::Commented => {
+                    for review in latest {
+                        let identity =
+                            ReviewFeedbackIdentity::review(review.provider_review_id().clone());
+                        blockers.push(ReadinessBlocker::BlockingHumanFeedback(identity.clone()));
+                        blocking_human_feedback.push(TriagedFeedback::new(
+                            identity,
+                            actor.clone(),
+                            FeedbackKind::Review {
+                                state: review.state(),
+                            },
+                        ));
+                    }
+                }
+                ForgeReviewState::Dismissed | ForgeReviewState::Pending => {}
             }
         }
 
@@ -478,22 +620,18 @@ impl FrozenReviewSnapshot {
             blocking_human_feedback,
             bot_advisories,
             approval_count,
+            approval_review_ids: approval_review_ids.into_iter().collect(),
         }
     }
-}
 
-impl<'de> Deserialize<'de> for FrozenReviewSnapshot {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let wire = FrozenReviewSnapshotWire::deserialize(deserializer)?;
+    fn from_wire(
+        wire: FrozenReviewSnapshotWire,
+        trusted_not_after: &ForgeTimestamp,
+    ) -> Result<Self> {
         let item = wire.snapshot.item().clone();
-        let frozen = Self::freeze(&item, wire.snapshot).map_err(serde::de::Error::custom)?;
+        let frozen = Self::freeze(&item, wire.snapshot, trusted_not_after)?;
         if frozen.canonical_sha256 != wire.canonical_sha256 {
-            return Err(serde::de::Error::custom(
-                "frozen review snapshot canonical digest does not match",
-            ));
+            bail!("frozen review snapshot canonical digest does not match");
         }
         Ok(frozen)
     }
@@ -685,21 +823,21 @@ impl ReviewFeedbackIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "source", content = "identity", rename_all = "snake_case")]
 pub enum ActorEvidenceIdentity {
     Feedback(ReviewFeedbackIdentity),
     Check(ProviderObjectId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FeedbackKind {
     Review { state: ForgeReviewState },
     ThreadComment { thread_resolved: bool },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TriagedFeedback {
     identity: ReviewFeedbackIdentity,
@@ -733,7 +871,7 @@ impl TriagedFeedback {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UntrustedActorBlocker {
     source: ActorEvidenceIdentity,
@@ -757,7 +895,7 @@ impl UntrustedActorBlocker {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckFailure {
     name: String,
@@ -798,7 +936,7 @@ impl CheckFailure {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AmbiguousCheck {
     name: String,
@@ -822,7 +960,42 @@ impl AmbiguousCheck {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AmbiguousHumanReviewCurrency {
+    actor: TrustedActorIdentity,
+    submitted_at: ForgeTimestamp,
+    provider_review_ids: Vec<ProviderObjectId>,
+}
+
+impl AmbiguousHumanReviewCurrency {
+    fn new(
+        actor: TrustedActorIdentity,
+        submitted_at: ForgeTimestamp,
+        mut provider_review_ids: Vec<ProviderObjectId>,
+    ) -> Self {
+        provider_review_ids.sort();
+        Self {
+            actor,
+            submitted_at,
+            provider_review_ids,
+        }
+    }
+
+    pub fn actor(&self) -> &TrustedActorIdentity {
+        &self.actor
+    }
+
+    pub fn submitted_at(&self) -> &ForgeTimestamp {
+        &self.submitted_at
+    }
+
+    pub fn provider_review_ids(&self) -> &[ProviderObjectId] {
+        &self.provider_review_ids
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalShortfall {
     required: usize,
@@ -843,10 +1016,12 @@ impl ApprovalShortfall {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "blocker", content = "details", rename_all = "snake_case")]
 pub enum ReadinessBlocker {
+    AttemptLimitExhausted { max_attempts: usize },
     UnsupportedThreadCurrencyMetadata,
+    AmbiguousHumanReviewCurrency(AmbiguousHumanReviewCurrency),
     UntrustedActor(UntrustedActorBlocker),
     BlockingHumanFeedback(ReviewFeedbackIdentity),
     MissingCheck(String),
@@ -855,13 +1030,14 @@ pub enum ReadinessBlocker {
     InsufficientApproval(ApprovalShortfall),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewTriage {
     blockers: Vec<ReadinessBlocker>,
     blocking_human_feedback: Vec<TriagedFeedback>,
     bot_advisories: Vec<TriagedFeedback>,
     approval_count: usize,
+    approval_review_ids: Vec<ProviderObjectId>,
 }
 
 impl ReviewTriage {
@@ -881,6 +1057,10 @@ impl ReviewTriage {
         self.approval_count
     }
 
+    pub fn approval_review_ids(&self) -> &[ProviderObjectId] {
+        &self.approval_review_ids
+    }
+
     pub fn is_ready(&self) -> bool {
         self.blockers.is_empty()
     }
@@ -898,6 +1078,19 @@ pub enum DispositionDecision {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifiedDisposition {
+    snapshot_sha256: String,
+    head_oid: String,
+    base_oid: String,
+    feedback_identity: ReviewFeedbackIdentity,
+    actor: TrustedActorIdentity,
+    decision: DispositionDecision,
+    summary: String,
+    record_sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedDispositionWire {
     snapshot_sha256: String,
     head_oid: String,
     base_oid: String,
@@ -988,8 +1181,22 @@ impl VerifiedDisposition {
         &self.record_sha256
     }
 
+    /// Restores a durable disposition only when its exact frozen source is
+    /// supplied again. Standalone serde deserialization is deliberately not
+    /// implemented because a self-hash cannot prove source membership.
+    pub fn restore_json(snapshot: &FrozenReviewSnapshot, encoded: &[u8]) -> Result<Self> {
+        if encoded.len() > MAX_DISPOSITION_RECORD_BYTES || encoded.contains(&0) {
+            bail!("serialized disposition is malformed or exceeds its byte bound");
+        }
+        let wire = serde_json::from_slice::<VerifiedDispositionWire>(encoded)
+            .context("serialized disposition is not strict valid JSON")?;
+        let value = Self::from_wire(wire)?;
+        value.validate_against(snapshot)?;
+        Ok(value)
+    }
+
     pub fn validate_against(&self, snapshot: &FrozenReviewSnapshot) -> Result<()> {
-        validate_disposition_summary(&self.summary)?;
+        self.validate_record()?;
         if self.snapshot_sha256 != snapshot.canonical_sha256()
             || Some(self.head_oid.as_str()) != snapshot.item().head_oid()
             || Some(self.base_oid.as_str()) != snapshot.item().base_oid()
@@ -1000,6 +1207,20 @@ impl VerifiedDisposition {
         if !self.actor.matches(observed_actor) {
             bail!("disposition actor does not exactly match the frozen feedback actor");
         }
+        Ok(())
+    }
+
+    fn validate_record(&self) -> Result<()> {
+        validate_sha256(&self.snapshot_sha256, "disposition snapshot digest")?;
+        validate_git_oid(&self.head_oid, "disposition head OID")?;
+        validate_git_oid(&self.base_oid, "disposition base OID")?;
+        self.feedback_identity.validate()?;
+        self.actor.validate()?;
+        if self.feedback_identity.provider_id() != self.actor.provider_actor_id().provider_id() {
+            bail!("disposition feedback and actor providers do not match");
+        }
+        validate_disposition_summary(&self.summary)?;
+        validate_sha256(&self.record_sha256, "disposition record digest")?;
         if self.record_sha256 != self.compute_record_sha256()? {
             bail!("disposition record digest does not match its canonical fields");
         }
@@ -1021,6 +1242,77 @@ impl VerifiedDisposition {
             "verified review disposition",
         )
     }
+
+    fn from_wire(wire: VerifiedDispositionWire) -> Result<Self> {
+        let value = Self {
+            snapshot_sha256: wire.snapshot_sha256,
+            head_oid: wire.head_oid,
+            base_oid: wire.base_oid,
+            feedback_identity: wire.feedback_identity,
+            actor: wire.actor,
+            decision: wire.decision,
+            summary: wire.summary,
+            record_sha256: wire.record_sha256,
+        };
+        value.validate_record()?;
+        Ok(value)
+    }
+}
+
+impl ReviewFeedbackIdentity {
+    fn provider_id(&self) -> &str {
+        match self {
+            Self::Review { provider_review_id } => provider_review_id.provider_id(),
+            Self::ThreadComment {
+                provider_thread_id, ..
+            } => provider_thread_id.provider_id(),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Review { provider_review_id }
+                if provider_review_id.kind() == ProviderObjectKind::Review =>
+            {
+                Ok(())
+            }
+            Self::ThreadComment {
+                provider_thread_id,
+                provider_comment_id,
+            } if provider_thread_id.kind() == ProviderObjectKind::ReviewThread
+                && provider_comment_id.kind() == ProviderObjectKind::Comment
+                && provider_thread_id.provider_id() == provider_comment_id.provider_id() =>
+            {
+                Ok(())
+            }
+            Self::Review { .. } => bail!("disposition review identity has the wrong object kind"),
+            Self::ThreadComment { .. } => {
+                bail!("disposition thread/comment identity is malformed or provider-mismatched")
+            }
+        }
+    }
+}
+
+fn validate_sha256(value: &str, label: &str) -> Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("{label} must be an exact lowercase SHA-256 digest");
+    }
+    Ok(())
+}
+
+fn validate_git_oid(value: &str, label: &str) -> Result<()> {
+    if !matches!(value.len(), 40 | 64)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("{label} must be an exact lowercase 40- or 64-hex OID");
+    }
+    Ok(())
 }
 
 fn validate_disposition_summary(summary: &str) -> Result<()> {
@@ -1066,10 +1358,71 @@ fn actor_for_feedback<'a>(
     }
 }
 
+fn validate_disposition_set(
+    snapshot: &FrozenReviewSnapshot,
+    dispositions: &[VerifiedDisposition],
+) -> Result<()> {
+    let mut identities = BTreeSet::new();
+    let mut digests = BTreeSet::new();
+    for disposition in dispositions {
+        disposition.validate_against(snapshot)?;
+        if !identities.insert(disposition.feedback_identity().clone())
+            || !digests.insert(disposition.record_sha256())
+        {
+            bail!("review-loop disposition was duplicated or replayed");
+        }
+    }
+    Ok(())
+}
+
+fn validate_blocking_feedback_coverage(
+    snapshot: &FrozenReviewSnapshot,
+    policy: &ReviewLoopPolicy,
+    dispositions: &[VerifiedDisposition],
+) -> Result<()> {
+    let triage = validate_actionable_disposition_set(snapshot, policy, dispositions)?;
+    let disposition_by_identity = dispositions
+        .iter()
+        .map(|disposition| (disposition.feedback_identity(), disposition))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for feedback in triage.blocking_human_feedback() {
+        let disposition = disposition_by_identity
+            .get(feedback.identity())
+            .context("blocking human feedback omitted its required verified disposition")?;
+        if disposition.decision() != DispositionDecision::Addressed {
+            bail!("blocking human feedback must be addressed before refresh");
+        }
+    }
+    Ok(())
+}
+
+fn validate_actionable_disposition_set(
+    snapshot: &FrozenReviewSnapshot,
+    policy: &ReviewLoopPolicy,
+    dispositions: &[VerifiedDisposition],
+) -> Result<ReviewTriage> {
+    validate_disposition_set(snapshot, dispositions)?;
+    let triage = snapshot.triage(policy);
+    let allowed_identities = triage
+        .blocking_human_feedback()
+        .iter()
+        .chain(triage.bot_advisories())
+        .map(|feedback| feedback.identity())
+        .collect::<BTreeSet<_>>();
+    if dispositions
+        .iter()
+        .any(|disposition| !allowed_identities.contains(disposition.feedback_identity()))
+    {
+        bail!("disposition does not identify actionable blocking-human or advisory-bot feedback");
+    }
+    Ok(triage)
+}
+
 /// Builds the only mutation emitted by the review loop: one deterministic,
 /// PR-level append-comment effect containing verified dispositions.
 pub fn build_pull_request_disposition_publication(
     snapshot: &FrozenReviewSnapshot,
+    policy: &ReviewLoopPolicy,
     publisher: ForgeActor,
     dispositions: &[VerifiedDisposition],
 ) -> Result<ForgeEffectRequest> {
@@ -1081,15 +1434,7 @@ pub fn build_pull_request_disposition_publication(
     }
     let mut ordered = dispositions.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| left.record_sha256.cmp(&right.record_sha256));
-    if ordered
-        .windows(2)
-        .any(|pair| pair[0].feedback_identity == pair[1].feedback_identity)
-    {
-        bail!("PR disposition publication contains duplicate feedback identities");
-    }
-    for disposition in &ordered {
-        disposition.validate_against(snapshot)?;
-    }
+    validate_actionable_disposition_set(snapshot, policy, dispositions)?;
 
     let mut body = format!(
         "Review-loop dispositions for head `{}` (snapshot `{}`):\n",
@@ -1212,7 +1557,7 @@ impl ReadinessEvidence {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadinessAuthority {
     ReviewLoopOnlyNotMergePermission,
@@ -1268,6 +1613,22 @@ impl ReviewLoopReadinessProof {
             }
         }
     }
+
+    /// Validates a proof produced after one or more head-changing refreshes.
+    /// Historical dispositions are checked through the state's retained
+    /// frozen-source chain rather than against the current snapshot.
+    pub fn validate_against_state(&self, state: &ReviewLoopState) -> Result<()> {
+        state.validate_record()?;
+        match state.readiness()? {
+            ReviewLoopReadinessEvaluation::Ready(current) if current == *self => Ok(()),
+            ReviewLoopReadinessEvaluation::Ready(_) => {
+                bail!("readiness proof does not match the durable review-loop state")
+            }
+            ReviewLoopReadinessEvaluation::Blocked(_) => {
+                bail!("durable review-loop state is blocked")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1299,9 +1660,7 @@ pub fn evaluate_review_loop_readiness(
     policy: &ReviewLoopPolicy,
     dispositions: &[VerifiedDisposition],
 ) -> Result<ReviewLoopReadinessEvaluation> {
-    for disposition in dispositions {
-        disposition.validate_against(snapshot)?;
-    }
+    validate_actionable_disposition_set(snapshot, policy, dispositions)?;
     evaluate_readiness_with_disposition_digests(
         snapshot,
         policy,
@@ -1343,17 +1702,7 @@ fn evaluate_readiness_with_disposition_digests(
     }
     successful_check_ids.sort();
 
-    let mut approval_review_ids = snapshot
-        .snapshot()
-        .reviews()
-        .iter()
-        .filter(|review| {
-            review.state() == ForgeReviewState::Approved
-                && policy.feedback_role(review.author()) == Some(TrustedActorRole::HumanBlocking)
-        })
-        .map(|review| review.provider_review_id().clone())
-        .collect::<Vec<_>>();
-    approval_review_ids.sort();
+    let approval_review_ids = triage.approval_review_ids().to_vec();
 
     let evidence = ReadinessEvidence {
         snapshot_sha256: snapshot.canonical_sha256().to_owned(),
@@ -1400,6 +1749,21 @@ fn evaluate_readiness_with_disposition_digests(
     }
 }
 
+fn phase_for_evidence(
+    snapshot: &FrozenReviewSnapshot,
+    policy: &ReviewLoopPolicy,
+    attempt_count: usize,
+    disposition_sha256s: Vec<String>,
+) -> Result<ReviewLoopPhase> {
+    match evaluate_readiness_with_disposition_digests(snapshot, policy, disposition_sha256s)? {
+        ReviewLoopReadinessEvaluation::Ready(_) => Ok(ReviewLoopPhase::Ready),
+        ReviewLoopReadinessEvaluation::Blocked(_) if attempt_count >= policy.max_attempts() => {
+            Ok(ReviewLoopPhase::Exhausted)
+        }
+        ReviewLoopReadinessEvaluation::Blocked(_) => Ok(ReviewLoopPhase::Active),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewLoopPhase {
@@ -1413,7 +1777,17 @@ pub enum ReviewLoopPhase {
 pub struct ReviewLoopAttempt {
     sequence: usize,
     attempt_id: String,
-    prior_snapshot_sha256: String,
+    prior_snapshot: FrozenReviewSnapshot,
+    refreshed_snapshot_sha256: String,
+    disposition_sha256s: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewLoopAttemptWire {
+    sequence: usize,
+    attempt_id: String,
+    prior_snapshot: FrozenReviewSnapshotWire,
     refreshed_snapshot_sha256: String,
     disposition_sha256s: Vec<String>,
 }
@@ -1428,7 +1802,7 @@ impl ReviewLoopAttempt {
     }
 
     pub fn prior_snapshot_sha256(&self) -> &str {
-        &self.prior_snapshot_sha256
+        self.prior_snapshot.canonical_sha256()
     }
 
     pub fn refreshed_snapshot_sha256(&self) -> &str {
@@ -1437,6 +1811,43 @@ impl ReviewLoopAttempt {
 
     pub fn disposition_sha256s(&self) -> &[String] {
         &self.disposition_sha256s
+    }
+
+    fn validate_record(&self) -> Result<()> {
+        if self.sequence == 0 || self.sequence > MAX_REVIEW_LOOP_ATTEMPTS {
+            bail!("review-loop attempt sequence is outside its bounded range");
+        }
+        validate_attempt_id(&self.attempt_id)?;
+        validate_sha256(
+            &self.refreshed_snapshot_sha256,
+            "refreshed review snapshot digest",
+        )?;
+        let mut prior = None;
+        for digest in &self.disposition_sha256s {
+            validate_sha256(digest, "attempt disposition digest")?;
+            if prior.as_ref().is_some_and(|previous| *previous >= digest) {
+                bail!("attempt disposition digests are duplicated or non-canonical");
+            }
+            prior = Some(digest);
+        }
+        Ok(())
+    }
+}
+
+impl ReviewLoopAttempt {
+    fn from_wire(wire: ReviewLoopAttemptWire, trusted_not_after: &ForgeTimestamp) -> Result<Self> {
+        let value = Self {
+            sequence: wire.sequence,
+            attempt_id: wire.attempt_id,
+            prior_snapshot: FrozenReviewSnapshot::from_wire(
+                wire.prior_snapshot,
+                trusted_not_after,
+            )?,
+            refreshed_snapshot_sha256: wire.refreshed_snapshot_sha256,
+            disposition_sha256s: wire.disposition_sha256s,
+        };
+        value.validate_record()?;
+        Ok(value)
     }
 }
 
@@ -1453,6 +1864,19 @@ pub struct ReviewLoopState {
     state_sha256: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewLoopStateWire {
+    policy: ReviewLoopPolicy,
+    policy_sha256: String,
+    current_snapshot: FrozenReviewSnapshotWire,
+    attempts: Vec<ReviewLoopAttemptWire>,
+    dispositions: Vec<VerifiedDispositionWire>,
+    phase: ReviewLoopPhase,
+    predecessor_state_sha256: Option<String>,
+    state_sha256: String,
+}
+
 #[derive(Serialize)]
 struct ReviewLoopStateDigestPayload<'a> {
     policy_sha256: &'a str,
@@ -1463,17 +1887,67 @@ struct ReviewLoopStateDigestPayload<'a> {
     predecessor_state_sha256: Option<&'a str>,
 }
 
+fn compute_review_loop_state_sha256(
+    policy_sha256: &str,
+    current_snapshot: &FrozenReviewSnapshot,
+    attempts: &[ReviewLoopAttempt],
+    disposition_sha256s: Vec<&str>,
+    phase: ReviewLoopPhase,
+    predecessor_state_sha256: Option<&str>,
+) -> Result<String> {
+    canonical_digest(
+        REVIEW_LOOP_STATE_DIGEST_DOMAIN,
+        &ReviewLoopStateDigestPayload {
+            policy_sha256,
+            current_snapshot_sha256: current_snapshot.canonical_sha256(),
+            attempts,
+            disposition_sha256s,
+            phase,
+            predecessor_state_sha256,
+        },
+        "review-loop state",
+    )
+}
+
+#[derive(Serialize)]
+struct ReviewLoopAttemptIdPayload<'a> {
+    policy_sha256: &'a str,
+    prior_snapshot_sha256: &'a str,
+    refreshed_snapshot_sha256: &'a str,
+    sequence: usize,
+    disposition_sha256s: &'a [String],
+}
+
+fn derive_attempt_id(
+    policy_sha256: &str,
+    prior_snapshot: &FrozenReviewSnapshot,
+    refreshed_snapshot: &FrozenReviewSnapshot,
+    sequence: usize,
+    disposition_sha256s: &[String],
+) -> Result<String> {
+    let digest = canonical_digest(
+        REVIEW_LOOP_ATTEMPT_ID_DOMAIN,
+        &ReviewLoopAttemptIdPayload {
+            policy_sha256,
+            prior_snapshot_sha256: prior_snapshot.canonical_sha256(),
+            refreshed_snapshot_sha256: refreshed_snapshot.canonical_sha256(),
+            sequence,
+            disposition_sha256s,
+        },
+        "review-loop attempt identity",
+    )?;
+    Ok(format!("attempt:{digest}"))
+}
+
 impl ReviewLoopState {
-    pub fn new(policy: ReviewLoopPolicy, current_snapshot: FrozenReviewSnapshot) -> Result<Self> {
+    pub fn new(
+        policy: ReviewLoopPolicy,
+        current_snapshot: FrozenReviewSnapshot,
+        trusted_not_after: &ForgeTimestamp,
+    ) -> Result<Self> {
+        current_snapshot.validate_not_after(trusted_not_after)?;
         let policy_sha256 = policy.canonical_sha256()?;
-        let phase = match evaluate_readiness_with_disposition_digests(
-            &current_snapshot,
-            &policy,
-            Vec::new(),
-        )? {
-            ReviewLoopReadinessEvaluation::Ready(_) => ReviewLoopPhase::Ready,
-            ReviewLoopReadinessEvaluation::Blocked(_) => ReviewLoopPhase::Active,
-        };
+        let phase = phase_for_evidence(&current_snapshot, &policy, 0, Vec::new())?;
         let mut value = Self {
             policy,
             policy_sha256,
@@ -1485,7 +1959,17 @@ impl ReviewLoopState {
             state_sha256: String::new(),
         };
         value.state_sha256 = value.compute_state_sha256()?;
+        value.validate_record()?;
         Ok(value)
+    }
+
+    pub fn restore_json(encoded: &[u8], trusted_not_after: &ForgeTimestamp) -> Result<Self> {
+        if encoded.len() > MAX_REVIEW_LOOP_STATE_RECORD_BYTES || encoded.contains(&0) {
+            bail!("serialized review-loop state is malformed or exceeds its byte bound");
+        }
+        let wire = serde_json::from_slice::<ReviewLoopStateWire>(encoded)
+            .context("serialized review-loop state is not strict valid JSON")?;
+        Self::from_wire(wire, trusted_not_after)
     }
 
     pub fn policy(&self) -> &ReviewLoopPolicy {
@@ -1521,54 +2005,61 @@ impl ReviewLoopState {
     }
 
     pub fn readiness(&self) -> Result<ReviewLoopReadinessEvaluation> {
-        evaluate_readiness_with_disposition_digests(
+        let mut evaluation = evaluate_readiness_with_disposition_digests(
             &self.current_snapshot,
             &self.policy,
             self.dispositions
                 .iter()
                 .map(|disposition| disposition.record_sha256().to_owned())
                 .collect(),
-        )
+        )?;
+        if self.phase == ReviewLoopPhase::Exhausted {
+            match &mut evaluation {
+                ReviewLoopReadinessEvaluation::Blocked(blocked) => {
+                    blocked
+                        .blockers
+                        .push(ReadinessBlocker::AttemptLimitExhausted {
+                            max_attempts: self.policy.max_attempts(),
+                        });
+                }
+                ReviewLoopReadinessEvaluation::Ready(_) => {
+                    bail!("exhausted review-loop state contains ready evidence")
+                }
+            }
+        }
+        Ok(evaluation)
     }
 
     pub fn refresh<T>(
         &self,
         transport: &T,
         current_item: &ForgeItem,
-        sequence: usize,
-        attempt_id: impl Into<String>,
+        trusted_not_after: &ForgeTimestamp,
         dispositions: Vec<VerifiedDisposition>,
     ) -> Result<Self>
     where
         T: ForgeTransport + ?Sized,
     {
-        let refreshed = FrozenReviewSnapshot::observe(transport, current_item)?;
-        self.refresh_with_snapshot(current_item, refreshed, sequence, attempt_id, dispositions)
+        let refreshed = FrozenReviewSnapshot::observe(transport, current_item, trusted_not_after)?;
+        self.refresh_with_snapshot(current_item, refreshed, trusted_not_after, dispositions)
     }
 
-    pub fn refresh_with_snapshot(
+    fn refresh_with_snapshot(
         &self,
         current_item: &ForgeItem,
         refreshed: FrozenReviewSnapshot,
-        sequence: usize,
-        attempt_id: impl Into<String>,
+        trusted_not_after: &ForgeTimestamp,
         mut dispositions: Vec<VerifiedDisposition>,
     ) -> Result<Self> {
         if self.phase != ReviewLoopPhase::Active {
             bail!("terminal review-loop state cannot be refreshed");
         }
-        if sequence != self.attempts.len() + 1 {
-            bail!("review-loop attempt sequence is not the next sequential value");
-        }
-        let attempt_id = attempt_id.into();
-        validate_attempt_id(&attempt_id)?;
-        if self
+        let sequence = self
             .attempts
-            .iter()
-            .any(|attempt| attempt.attempt_id == attempt_id)
-        {
-            bail!("review-loop attempt id was replayed");
-        }
+            .len()
+            .checked_add(1)
+            .context("review-loop attempt sequence overflowed")?;
+        refreshed.validate_not_after(trusted_not_after)?;
         if refreshed.item() != current_item {
             bail!("refreshed snapshot is not bound to the declared current PR head and base");
         }
@@ -1580,19 +2071,21 @@ impl ReviewLoopState {
         }
 
         dispositions.sort_by(|left, right| left.record_sha256.cmp(&right.record_sha256));
-        for disposition in &dispositions {
-            disposition.validate_against(&self.current_snapshot)?;
-        }
-        if dispositions
-            .windows(2)
-            .any(|pair| pair[0].feedback_identity == pair[1].feedback_identity)
-            || dispositions.iter().any(|candidate| {
-                self.dispositions.iter().any(|existing| {
-                    existing.feedback_identity == candidate.feedback_identity
-                        || existing.record_sha256 == candidate.record_sha256
-                })
-            })
-        {
+        validate_blocking_feedback_coverage(&self.current_snapshot, &self.policy, &dispositions)?;
+        let mut all_feedback_identities = self
+            .dispositions
+            .iter()
+            .map(|disposition| disposition.feedback_identity().clone())
+            .collect::<BTreeSet<_>>();
+        let mut all_disposition_digests = self
+            .dispositions
+            .iter()
+            .map(|disposition| disposition.record_sha256())
+            .collect::<BTreeSet<_>>();
+        if dispositions.iter().any(|candidate| {
+            !all_feedback_identities.insert(candidate.feedback_identity().clone())
+                || !all_disposition_digests.insert(candidate.record_sha256())
+        }) {
             bail!("review-loop disposition was duplicated or replayed");
         }
 
@@ -1600,10 +2093,24 @@ impl ReviewLoopState {
             .iter()
             .map(|disposition| disposition.record_sha256().to_owned())
             .collect::<Vec<_>>();
+        let attempt_id = derive_attempt_id(
+            &self.policy_sha256,
+            &self.current_snapshot,
+            &refreshed,
+            sequence,
+            &disposition_sha256s,
+        )?;
+        if self
+            .attempts
+            .iter()
+            .any(|attempt| attempt.attempt_id == attempt_id)
+        {
+            bail!("review-loop attempt id was replayed");
+        }
         let attempt = ReviewLoopAttempt {
             sequence,
             attempt_id,
-            prior_snapshot_sha256: self.current_snapshot.canonical_sha256().to_owned(),
+            prior_snapshot: self.current_snapshot.clone(),
             refreshed_snapshot_sha256: refreshed.canonical_sha256().to_owned(),
             disposition_sha256s,
         };
@@ -1613,23 +2120,15 @@ impl ReviewLoopState {
         all_dispositions.extend(dispositions);
         all_dispositions.sort_by(|left, right| left.record_sha256.cmp(&right.record_sha256));
 
-        let current_readiness = evaluate_readiness_with_disposition_digests(
+        let phase = phase_for_evidence(
             &refreshed,
             &self.policy,
+            attempts.len(),
             all_dispositions
                 .iter()
                 .map(|disposition| disposition.record_sha256().to_owned())
                 .collect(),
         )?;
-        let phase = match current_readiness {
-            ReviewLoopReadinessEvaluation::Ready(_) => ReviewLoopPhase::Ready,
-            ReviewLoopReadinessEvaluation::Blocked(_)
-                if attempts.len() >= self.policy.max_attempts() =>
-            {
-                ReviewLoopPhase::Exhausted
-            }
-            ReviewLoopReadinessEvaluation::Blocked(_) => ReviewLoopPhase::Active,
-        };
         let mut next = Self {
             policy: self.policy.clone(),
             policy_sha256: self.policy_sha256.clone(),
@@ -1641,26 +2140,233 @@ impl ReviewLoopState {
             state_sha256: String::new(),
         };
         next.state_sha256 = next.compute_state_sha256()?;
+        next.validate_record()?;
         Ok(next)
     }
 
-    fn compute_state_sha256(&self) -> Result<String> {
-        canonical_digest(
-            REVIEW_LOOP_STATE_DIGEST_DOMAIN,
-            &ReviewLoopStateDigestPayload {
-                policy_sha256: &self.policy_sha256,
-                current_snapshot_sha256: self.current_snapshot.canonical_sha256(),
-                attempts: &self.attempts,
-                disposition_sha256s: self
-                    .dispositions
+    fn validate_record(&self) -> Result<()> {
+        validate_sha256(&self.policy_sha256, "review-loop policy digest")?;
+        if self.policy_sha256 != self.policy.canonical_sha256()? {
+            bail!("review-loop state policy digest does not match its policy");
+        }
+        if self.attempts.len() > self.policy.max_attempts() {
+            bail!("review-loop state exceeds its configured attempt bound");
+        }
+        match (self.attempts.is_empty(), &self.predecessor_state_sha256) {
+            (true, None) => {}
+            (false, Some(digest)) => {
+                validate_sha256(digest, "predecessor review-loop state digest")?
+            }
+            _ => bail!("review-loop state predecessor linkage conflicts with its attempts"),
+        }
+
+        let mut disposition_by_digest = std::collections::BTreeMap::new();
+        let mut feedback_identities = BTreeSet::new();
+        let mut previous_disposition_digest: Option<&str> = None;
+        for disposition in &self.dispositions {
+            disposition.validate_record()?;
+            if previous_disposition_digest
+                .as_ref()
+                .is_some_and(|previous| *previous >= disposition.record_sha256())
+                || disposition_by_digest
+                    .insert(disposition.record_sha256(), disposition)
+                    .is_some()
+                || !feedback_identities.insert(disposition.feedback_identity())
+            {
+                bail!("review-loop state dispositions are duplicated or non-canonical");
+            }
+            previous_disposition_digest = Some(disposition.record_sha256());
+        }
+
+        let mut attempt_ids = BTreeSet::new();
+        let mut assigned_disposition_digests = BTreeSet::new();
+        for (index, attempt) in self.attempts.iter().enumerate() {
+            attempt.validate_record()?;
+            if attempt.sequence != index + 1 || !attempt_ids.insert(attempt.attempt_id()) {
+                bail!("review-loop attempt sequence or stable identity was replayed");
+            }
+            if !same_logical_pull_request(
+                attempt.prior_snapshot.item(),
+                self.current_snapshot.item(),
+            ) {
+                bail!("durable review-loop history changed the logical pull request");
+            }
+            if let Some(previous) = index
+                .checked_sub(1)
+                .and_then(|previous_index| self.attempts.get(previous_index))
+            {
+                if previous.refreshed_snapshot_sha256 != attempt.prior_snapshot.canonical_sha256() {
+                    bail!("durable review-loop snapshot digest chain is broken");
+                }
+            }
+            let refreshed = self
+                .attempts
+                .get(index + 1)
+                .map(|next| &next.prior_snapshot)
+                .unwrap_or(&self.current_snapshot);
+            if attempt.refreshed_snapshot_sha256 != refreshed.canonical_sha256()
+                || refreshed.observed_at() <= attempt.prior_snapshot.observed_at()
+                || !same_logical_pull_request(attempt.prior_snapshot.item(), refreshed.item())
+            {
+                bail!("durable review-loop refresh evidence is stale or chain-mismatched");
+            }
+            let expected_attempt_id = derive_attempt_id(
+                &self.policy_sha256,
+                &attempt.prior_snapshot,
+                refreshed,
+                attempt.sequence,
+                &attempt.disposition_sha256s,
+            )?;
+            if attempt.attempt_id != expected_attempt_id {
+                bail!("review-loop attempt identity is not deterministically bound");
+            }
+
+            let mut attempt_dispositions = Vec::new();
+            for digest in attempt.disposition_sha256s() {
+                if !assigned_disposition_digests.insert(digest.as_str()) {
+                    bail!("durable review-loop disposition digest was replayed");
+                }
+                let disposition = disposition_by_digest
+                    .get(digest.as_str())
+                    .context("review-loop attempt references an absent disposition")?;
+                disposition.validate_against(&attempt.prior_snapshot)?;
+                attempt_dispositions.push((*disposition).clone());
+            }
+            validate_blocking_feedback_coverage(
+                &attempt.prior_snapshot,
+                &self.policy,
+                &attempt_dispositions,
+            )?;
+        }
+        if assigned_disposition_digests.len() != disposition_by_digest.len() {
+            bail!("review-loop state contains a disposition outside its attempt history");
+        }
+
+        validate_sha256(&self.state_sha256, "review-loop state digest")?;
+
+        let initial_snapshot = self
+            .attempts
+            .first()
+            .map(|attempt| &attempt.prior_snapshot)
+            .unwrap_or(&self.current_snapshot);
+        let initial_phase = phase_for_evidence(initial_snapshot, &self.policy, 0, Vec::new())?;
+        let mut reconstructed_digest = compute_review_loop_state_sha256(
+            &self.policy_sha256,
+            initial_snapshot,
+            &[],
+            Vec::new(),
+            initial_phase,
+            None,
+        )?;
+        if self.attempts.is_empty() {
+            if self.phase != initial_phase || self.state_sha256 != reconstructed_digest {
+                bail!("initial review-loop state conflicts with its reconstructed evidence");
+            }
+            self.validate_serialized_size()?;
+            return Ok(());
+        }
+
+        let mut accumulated_dispositions = Vec::new();
+        let mut predecessor_phase = initial_phase;
+        for (index, attempt) in self.attempts.iter().enumerate() {
+            if predecessor_phase != ReviewLoopPhase::Active {
+                bail!("terminal review-loop prefix cannot have a successor attempt");
+            }
+            for digest in attempt.disposition_sha256s() {
+                let disposition = disposition_by_digest
+                    .get(digest.as_str())
+                    .context("review-loop reconstruction omitted an attempt disposition")?;
+                accumulated_dispositions.push(*disposition);
+            }
+            accumulated_dispositions
+                .sort_by(|left, right| left.record_sha256().cmp(right.record_sha256()));
+            let refreshed = self
+                .attempts
+                .get(index + 1)
+                .map(|next| &next.prior_snapshot)
+                .unwrap_or(&self.current_snapshot);
+            let reconstructed_phase = phase_for_evidence(
+                refreshed,
+                &self.policy,
+                index + 1,
+                accumulated_dispositions
+                    .iter()
+                    .map(|disposition| disposition.record_sha256().to_owned())
+                    .collect(),
+            )?;
+            let predecessor = reconstructed_digest;
+            reconstructed_digest = compute_review_loop_state_sha256(
+                &self.policy_sha256,
+                refreshed,
+                &self.attempts[..=index],
+                accumulated_dispositions
                     .iter()
                     .map(|disposition| disposition.record_sha256())
                     .collect(),
-                phase: self.phase,
-                predecessor_state_sha256: self.predecessor_state_sha256.as_deref(),
-            },
-            "review-loop state",
+                reconstructed_phase,
+                Some(&predecessor),
+            )?;
+            predecessor_phase = reconstructed_phase;
+            if index + 1 == self.attempts.len()
+                && (self.predecessor_state_sha256.as_deref() != Some(predecessor.as_str())
+                    || self.phase != reconstructed_phase
+                    || self.state_sha256 != reconstructed_digest)
+            {
+                bail!("review-loop predecessor or final state digest chain is not reconstructible");
+            }
+        }
+        self.validate_serialized_size()?;
+        Ok(())
+    }
+
+    fn validate_serialized_size(&self) -> Result<()> {
+        let encoded =
+            serde_json::to_vec(self).context("failed to size durable review-loop state")?;
+        if encoded.len() > MAX_REVIEW_LOOP_STATE_RECORD_BYTES {
+            bail!("durable review-loop state exceeds its serialized byte bound");
+        }
+        Ok(())
+    }
+
+    fn compute_state_sha256(&self) -> Result<String> {
+        compute_review_loop_state_sha256(
+            &self.policy_sha256,
+            &self.current_snapshot,
+            &self.attempts,
+            self.dispositions
+                .iter()
+                .map(|disposition| disposition.record_sha256())
+                .collect(),
+            self.phase,
+            self.predecessor_state_sha256.as_deref(),
         )
+    }
+
+    fn from_wire(wire: ReviewLoopStateWire, trusted_not_after: &ForgeTimestamp) -> Result<Self> {
+        let current_snapshot =
+            FrozenReviewSnapshot::from_wire(wire.current_snapshot, trusted_not_after)?;
+        let attempts = wire
+            .attempts
+            .into_iter()
+            .map(|attempt| ReviewLoopAttempt::from_wire(attempt, trusted_not_after))
+            .collect::<Result<Vec<_>>>()?;
+        let dispositions = wire
+            .dispositions
+            .into_iter()
+            .map(VerifiedDisposition::from_wire)
+            .collect::<Result<Vec<_>>>()?;
+        let value = Self {
+            policy: wire.policy,
+            policy_sha256: wire.policy_sha256,
+            current_snapshot,
+            attempts,
+            dispositions,
+            phase: wire.phase,
+            predecessor_state_sha256: wire.predecessor_state_sha256,
+            state_sha256: wire.state_sha256,
+        };
+        value.validate_record()?;
+        Ok(value)
     }
 }
 
@@ -1830,6 +2536,7 @@ mod tests {
 
     fn observe(snapshot: PullRequestReviewSnapshot) -> FrozenReviewSnapshot {
         let item = snapshot.item().clone();
+        let trusted_not_after = snapshot.observed_at().clone();
         let request = ForgeObservationRequest::pull_request_review_snapshot(item.clone())
             .expect("valid observation request");
         let mut transport = FakeForgeTransport::new();
@@ -1839,7 +2546,8 @@ mod tests {
                 ForgeObservation::PullRequestReviewSnapshot(snapshot),
             )
             .expect("register exact observation");
-        FrozenReviewSnapshot::observe(&transport, &item).expect("freeze observed snapshot")
+        FrozenReviewSnapshot::observe(&transport, &item, &trusted_not_after)
+            .expect("freeze observed snapshot")
     }
 
     fn blocking_frozen_at(
@@ -2054,6 +2762,193 @@ mod tests {
     }
 
     #[test]
+    fn latest_trusted_human_review_wins_and_equal_time_conflict_is_ambiguous() {
+        let human = actor("actor:human", "alice", ReportedActorKind::Human);
+        let bot = actor("actor:bot", "review-bot", ReportedActorKind::Bot);
+        let check_actor = actor("actor:checks", "checks-bot", ReportedActorKind::Bot);
+        let policy = policy(&human, &bot, &check_actor);
+        let observed_at = timestamp_at("2026-08-16T06:02:00Z");
+        let snapshot_for = |reviews: Vec<ForgeReview>| {
+            observe(
+                PullRequestReviewSnapshot::new(
+                    item(),
+                    observed_at.clone(),
+                    reviews,
+                    Vec::new(),
+                    vec![check_at(
+                        "check:currency",
+                        check_actor.clone(),
+                        HEAD,
+                        observed_at.clone(),
+                    )],
+                )
+                .expect("valid review-currency snapshot"),
+            )
+        };
+
+        let later_approval = snapshot_for(vec![
+            review_at(
+                "review:older-change",
+                human.clone(),
+                ForgeReviewState::ChangesRequested,
+                HEAD,
+                timestamp_at("2026-08-16T06:00:00Z"),
+            ),
+            review_at(
+                "review:latest-approval",
+                human.clone(),
+                ForgeReviewState::Approved,
+                HEAD,
+                timestamp_at("2026-08-16T06:01:00Z"),
+            ),
+        ]);
+        let approval_triage = later_approval.triage(&policy);
+        assert!(approval_triage.is_ready());
+        assert_eq!(
+            approval_triage.approval_review_ids(),
+            &[object(ProviderObjectKind::Review, "review:latest-approval")]
+        );
+
+        let later_change = snapshot_for(vec![
+            review_at(
+                "review:older-approval",
+                human.clone(),
+                ForgeReviewState::Approved,
+                HEAD,
+                timestamp_at("2026-08-16T06:00:00Z"),
+            ),
+            review_at(
+                "review:latest-change",
+                human.clone(),
+                ForgeReviewState::ChangesRequested,
+                HEAD,
+                timestamp_at("2026-08-16T06:01:00Z"),
+            ),
+        ]);
+        assert!(later_change.triage(&policy).blockers().iter().any(|blocker| {
+            matches!(blocker, ReadinessBlocker::BlockingHumanFeedback(identity)
+                if identity.provider_review_id().is_some_and(|id| id.stable_id() == "review:latest-change"))
+        }));
+
+        let equal_time_conflict = snapshot_for(vec![
+            review_at(
+                "review:equal-approval",
+                human.clone(),
+                ForgeReviewState::Approved,
+                HEAD,
+                timestamp_at("2026-08-16T06:01:00Z"),
+            ),
+            review_at(
+                "review:equal-change",
+                human,
+                ForgeReviewState::ChangesRequested,
+                HEAD,
+                timestamp_at("2026-08-16T06:01:00Z"),
+            ),
+        ]);
+        let ambiguous = equal_time_conflict.triage(&policy);
+        assert_eq!(ambiguous.approval_count(), 0);
+        assert!(ambiguous.blockers().iter().any(|blocker| matches!(
+            blocker,
+            ReadinessBlocker::AmbiguousHumanReviewCurrency(details)
+                if details.provider_review_ids().len() == 2
+        )));
+    }
+
+    #[test]
+    fn publication_and_readiness_reject_non_actionable_feedback_dispositions() {
+        let human = actor("actor:human", "alice", ReportedActorKind::Human);
+        let publisher = actor("actor:bot", "review-loop", ReportedActorKind::Bot);
+        let check_actor = actor("actor:checks", "checks-bot", ReportedActorKind::Bot);
+        let policy = policy(&human, &publisher, &check_actor);
+        for (state, suffix) in [
+            (ForgeReviewState::Approved, "approved"),
+            (ForgeReviewState::Dismissed, "dismissed"),
+            (ForgeReviewState::Pending, "pending"),
+        ] {
+            let frozen = observe(
+                PullRequestReviewSnapshot::new(
+                    item(),
+                    timestamp(),
+                    vec![review(&format!("review:{suffix}"), human.clone(), state)],
+                    Vec::new(),
+                    vec![check("check:actionable", check_actor.clone())],
+                )
+                .expect("valid non-actionable review snapshot"),
+            );
+            let disposition = VerifiedDisposition::new(
+                &frozen,
+                ReviewFeedbackIdentity::review(object(
+                    ProviderObjectKind::Review,
+                    &format!("review:{suffix}"),
+                )),
+                identity(&human),
+                DispositionDecision::Addressed,
+                "This review state is not actionable feedback.",
+            )
+            .expect("source-bound but non-actionable disposition");
+            assert!(evaluate_review_loop_readiness(
+                &frozen,
+                &policy,
+                std::slice::from_ref(&disposition),
+            )
+            .is_err());
+            assert!(build_pull_request_disposition_publication(
+                &frozen,
+                &policy,
+                publisher.clone(),
+                &[disposition],
+            )
+            .is_err());
+        }
+
+        let resolved_comment = comment("comment:resolved", human.clone());
+        let resolved = observe(
+            PullRequestReviewSnapshot::new(
+                item(),
+                timestamp(),
+                vec![review(
+                    "review:resolved-approval",
+                    human.clone(),
+                    ForgeReviewState::Approved,
+                )],
+                vec![ForgeReviewThread::new(
+                    object(ProviderObjectKind::ReviewThread, "thread:resolved"),
+                    true,
+                    vec![resolved_comment],
+                )
+                .expect("valid resolved thread")],
+                vec![check("check:resolved", check_actor)],
+            )
+            .expect("valid resolved-thread snapshot"),
+        );
+        let resolved_disposition = VerifiedDisposition::new(
+            &resolved,
+            ReviewFeedbackIdentity::thread_comment(
+                object(ProviderObjectKind::ReviewThread, "thread:resolved"),
+                object(ProviderObjectKind::Comment, "comment:resolved"),
+            ),
+            identity(&human),
+            DispositionDecision::Addressed,
+            "Resolved human comments are not actionable.",
+        )
+        .expect("source-bound resolved disposition");
+        assert!(evaluate_review_loop_readiness(
+            &resolved,
+            &policy,
+            std::slice::from_ref(&resolved_disposition),
+        )
+        .is_err());
+        assert!(build_pull_request_disposition_publication(
+            &resolved,
+            &policy,
+            publisher,
+            &[resolved_disposition],
+        )
+        .is_err());
+    }
+
+    #[test]
     fn any_thread_emits_unsupported_currency_metadata_blocker() {
         let human = actor("actor:human", "alice", ReportedActorKind::Human);
         let bot = actor("actor:bot", "review-bot", ReportedActorKind::Bot);
@@ -2085,6 +2980,95 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_trusted_human_thread_is_blocking_and_requires_exact_addressed_coverage() {
+        let human = actor("actor:human", "alice", ReportedActorKind::Human);
+        let bot = actor("actor:bot", "review-bot", ReportedActorKind::Bot);
+        let check_actor = actor("actor:checks", "checks-bot", ReportedActorKind::Bot);
+        let thread_id = object(ProviderObjectKind::ReviewThread, "thread:unresolved-human");
+        let comment_id = object(ProviderObjectKind::Comment, "comment:unresolved-human");
+        let feedback_identity =
+            ReviewFeedbackIdentity::thread_comment(thread_id.clone(), comment_id.clone());
+        let frozen = observe(
+            PullRequestReviewSnapshot::new(
+                item(),
+                timestamp(),
+                vec![review(
+                    "review:thread-approval",
+                    human.clone(),
+                    ForgeReviewState::Approved,
+                )],
+                vec![ForgeReviewThread::new(
+                    thread_id,
+                    false,
+                    vec![comment("comment:unresolved-human", human.clone())],
+                )
+                .expect("valid unresolved human thread")],
+                vec![check("check:unresolved-human", check_actor.clone())],
+            )
+            .expect("valid unresolved-human snapshot"),
+        );
+        let policy = policy(&human, &bot, &check_actor);
+        let triage = frozen.triage(&policy);
+        assert!(triage
+            .blockers()
+            .iter()
+            .any(|blocker| matches!(blocker, ReadinessBlocker::UnsupportedThreadCurrencyMetadata)));
+        assert!(triage.blockers().iter().any(|blocker| matches!(
+            blocker,
+            ReadinessBlocker::BlockingHumanFeedback(identity) if identity == &feedback_identity
+        )));
+        assert_eq!(triage.blocking_human_feedback().len(), 1);
+        assert_eq!(
+            triage.blocking_human_feedback()[0].identity(),
+            &feedback_identity
+        );
+
+        let state = ReviewLoopState::new(policy, frozen.clone(), &timestamp())
+            .expect("active unresolved-thread state");
+        let refreshed = ready_frozen_at(
+            item(),
+            timestamp_at("2026-08-16T01:03:00Z"),
+            &human,
+            &check_actor,
+            "thread-resolved-refresh",
+        );
+        let refreshed_item = refreshed.item().clone();
+        let deferred = VerifiedDisposition::new(
+            &frozen,
+            feedback_identity.clone(),
+            identity(&human),
+            DispositionDecision::Deferred,
+            "Deferred is not trusted human coverage.",
+        )
+        .expect("source-bound deferred disposition");
+        assert!(state
+            .refresh_with_snapshot(
+                &refreshed_item,
+                refreshed.clone(),
+                &timestamp_at("2026-08-16T01:03:00Z"),
+                vec![deferred],
+            )
+            .is_err());
+        let addressed = VerifiedDisposition::new(
+            &frozen,
+            feedback_identity,
+            identity(&human),
+            DispositionDecision::Addressed,
+            "Addressed the exact unresolved thread comment.",
+        )
+        .expect("source-bound addressed disposition");
+        let ready = state
+            .refresh_with_snapshot(
+                &refreshed_item,
+                refreshed,
+                &timestamp_at("2026-08-16T01:03:00Z"),
+                vec![addressed],
+            )
+            .expect("exact addressed coverage permits refresh");
+        assert_eq!(ready.phase(), ReviewLoopPhase::Ready);
+    }
+
+    #[test]
     fn durable_deserialization_rejects_unknown_fields_and_tampered_snapshot_digest() {
         let human = actor("actor:human", "alice", ReportedActorKind::Human);
         let bot = actor("actor:bot", "review-bot", ReportedActorKind::Bot);
@@ -2100,14 +3084,60 @@ mod tests {
         let frozen = ready_frozen_at(item(), timestamp(), &human, &check_actor, "ready");
         let mut tampered = serde_json::to_value(&frozen).expect("serialize frozen snapshot");
         tampered["canonical_sha256"] = serde_json::json!("0".repeat(64));
-        assert!(serde_json::from_value::<FrozenReviewSnapshot>(tampered).is_err());
+        assert!(FrozenReviewSnapshot::restore_json(
+            &serde_json::to_vec(&tampered).expect("serialize tampered snapshot"),
+            &timestamp(),
+        )
+        .is_err());
 
         let mut unknown = serde_json::to_value(&frozen).expect("serialize frozen snapshot");
         unknown
             .as_object_mut()
             .expect("frozen object")
             .insert("unexpected".to_owned(), serde_json::json!(true));
-        assert!(serde_json::from_value::<FrozenReviewSnapshot>(unknown).is_err());
+        assert!(FrozenReviewSnapshot::restore_json(
+            &serde_json::to_vec(&unknown).expect("serialize unknown-field snapshot"),
+            &timestamp(),
+        )
+        .is_err());
+
+        let mut malformed_identity =
+            serde_json::to_value(identity(&human)).expect("serialize trusted identity");
+        malformed_identity["provider_actor_id"]["kind"] = serde_json::json!("comment");
+        assert!(serde_json::from_value::<TrustedActorIdentity>(malformed_identity).is_err());
+        let valid_binding =
+            TrustedActorBinding::new(identity(&human), TrustedActorRole::HumanBlocking)
+                .expect("valid direct binding");
+        let mut malformed_binding =
+            serde_json::to_value(valid_binding).expect("serialize trusted binding");
+        malformed_binding["role"] = serde_json::json!("bot_advisory");
+        assert!(serde_json::from_value::<TrustedActorBinding>(malformed_binding).is_err());
+        let valid_required = RequiredCheck::new("ci/direct", vec![identity(&check_actor)])
+            .expect("valid direct required check");
+        let mut malformed_required =
+            serde_json::to_value(valid_required).expect("serialize required check");
+        let duplicate_actor = malformed_required["trusted_actors"][0].clone();
+        malformed_required["trusted_actors"]
+            .as_array_mut()
+            .expect("trusted actor array")
+            .push(duplicate_actor);
+        assert!(serde_json::from_value::<RequiredCheck>(malformed_required).is_err());
+
+        let future = ready_frozen_at(
+            item(),
+            timestamp_at("2099-08-16T01:02:03Z"),
+            &human,
+            &check_actor,
+            "future",
+        );
+        let future_encoded = serde_json::to_vec(&future).expect("serialize future snapshot");
+        assert!(FrozenReviewSnapshot::restore_json(&future_encoded, &timestamp()).is_err());
+        assert!(ReviewLoopState::new(policy, future, &timestamp()).is_err());
+        assert!(FrozenReviewSnapshot::restore_json(
+            &vec![b' '; MAX_FROZEN_SNAPSHOT_RECORD_BYTES + 1],
+            &timestamp(),
+        )
+        .is_err());
     }
 
     #[test]
@@ -2139,7 +3169,68 @@ mod tests {
     }
 
     #[test]
-    fn state_rejects_duplicate_dispositions_nonsequential_attempts_and_replay() {
+    fn disposition_restore_is_contextual_and_duplicate_identities_fail_closed() {
+        let human = actor("actor:human", "alice", ReportedActorKind::Human);
+        let publisher = actor("actor:publisher", "review-loop", ReportedActorKind::Bot);
+        let check_actor = actor("actor:checks", "checks-bot", ReportedActorKind::Bot);
+        let frozen = blocking_frozen_at(item(), timestamp(), &human, &check_actor, "durable");
+        let feedback_identity =
+            ReviewFeedbackIdentity::review(object(ProviderObjectKind::Review, "review:durable"));
+        let first = VerifiedDisposition::new(
+            &frozen,
+            feedback_identity.clone(),
+            identity(&human),
+            DispositionDecision::Addressed,
+            "Applied the requested correction.",
+        )
+        .expect("valid first disposition");
+        let second = VerifiedDisposition::new(
+            &frozen,
+            feedback_identity,
+            identity(&human),
+            DispositionDecision::Deferred,
+            "Conflicting record for the same feedback identity.",
+        )
+        .expect("individually valid colliding disposition");
+
+        let encoded = serde_json::to_vec(&first).expect("serialize disposition");
+        assert_eq!(
+            VerifiedDisposition::restore_json(&frozen, &encoded)
+                .expect("restore against exact frozen source"),
+            first
+        );
+        let other = blocking_frozen_at(
+            item(),
+            timestamp_at("2026-08-16T01:02:04Z"),
+            &human,
+            &check_actor,
+            "other",
+        );
+        assert!(VerifiedDisposition::restore_json(&other, &encoded).is_err());
+
+        let mut tampered = serde_json::to_value(&first).expect("serialize disposition value");
+        tampered["record_sha256"] = serde_json::json!("0".repeat(64));
+        assert!(VerifiedDisposition::restore_json(
+            &frozen,
+            &serde_json::to_vec(&tampered).expect("serialize tampered disposition"),
+        )
+        .is_err());
+        let policy = policy(&human, &publisher, &check_actor);
+        assert!(
+            evaluate_review_loop_readiness(&frozen, &policy, &[first.clone(), second.clone()])
+                .is_err()
+        );
+        assert!(build_pull_request_disposition_publication(
+            &frozen,
+            &policy,
+            publisher,
+            &[first, second],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn state_requires_complete_addressed_coverage_and_rejects_duplicate_dispositions() {
         let human = actor("actor:human", "alice", ReportedActorKind::Human);
         let bot = actor("actor:bot", "review-bot", ReportedActorKind::Bot);
         let check_actor = actor("actor:checks", "checks-bot", ReportedActorKind::Bot);
@@ -2158,8 +3249,12 @@ mod tests {
             "Implemented the requested change.",
         )
         .expect("valid disposition");
-        let state = ReviewLoopState::new(policy(&human, &bot, &check_actor), first)
-            .expect("active review loop");
+        let state = ReviewLoopState::new(
+            policy(&human, &bot, &check_actor),
+            first,
+            &timestamp_at("2026-08-16T01:00:00Z"),
+        )
+        .expect("active review loop");
         let second = blocking_frozen_at(
             item(),
             timestamp_at("2026-08-16T01:01:00Z"),
@@ -2168,28 +3263,33 @@ mod tests {
             "two",
         );
         let second_item = second.item().clone();
+        let cutoff = timestamp_at("2026-08-16T01:01:01Z");
 
         assert!(state
-            .refresh_with_snapshot(
-                &second_item,
-                second.clone(),
-                2,
-                "attempt:wrong-sequence",
-                Vec::new(),
-            )
+            .refresh_with_snapshot(&second_item, second.clone(), &cutoff, Vec::new())
+            .is_err());
+        let not_addressed = VerifiedDisposition::new(
+            state.current_snapshot(),
+            ReviewFeedbackIdentity::review(object(ProviderObjectKind::Review, "review:one")),
+            identity(&human),
+            DispositionDecision::Deferred,
+            "This cannot waive trusted human-blocking feedback.",
+        )
+        .expect("valid but non-addressing disposition");
+        assert!(state
+            .refresh_with_snapshot(&second_item, second.clone(), &cutoff, vec![not_addressed],)
             .is_err());
         assert!(state
             .refresh_with_snapshot(
                 &second_item,
                 second.clone(),
-                1,
-                "attempt:duplicate-disposition",
+                &cutoff,
                 vec![disposition.clone(), disposition.clone()],
             )
             .is_err());
 
         let next = state
-            .refresh_with_snapshot(&second_item, second, 1, "attempt:one", vec![disposition])
+            .refresh_with_snapshot(&second_item, second, &cutoff, vec![disposition])
             .expect("first sequential refresh");
         assert_eq!(next.attempts()[0].sequence(), 1);
         assert_eq!(next.predecessor_state_sha256(), Some(state.state_sha256()));
@@ -2202,7 +3302,12 @@ mod tests {
         );
         let third_item = third.item().clone();
         assert!(next
-            .refresh_with_snapshot(&third_item, third, 2, "attempt:one", Vec::new())
+            .refresh_with_snapshot(
+                &third_item,
+                third,
+                &timestamp_at("2026-08-16T01:02:01Z"),
+                Vec::new(),
+            )
             .is_err());
     }
 
@@ -2218,8 +3323,23 @@ mod tests {
             &check_actor,
             "exhaust-one",
         );
-        let state = ReviewLoopState::new(policy_with_max(&human, &bot, &check_actor, 1), first)
-            .expect("active review loop");
+        let disposition = VerifiedDisposition::new(
+            &first,
+            ReviewFeedbackIdentity::review(object(
+                ProviderObjectKind::Review,
+                "review:exhaust-one",
+            )),
+            identity(&human),
+            DispositionDecision::Addressed,
+            "Applied the final bounded attempt.",
+        )
+        .expect("valid final disposition");
+        let state = ReviewLoopState::new(
+            policy_with_max(&human, &bot, &check_actor, 1),
+            first,
+            &timestamp_at("2026-08-16T02:00:00Z"),
+        )
+        .expect("active review loop");
         let second = blocking_frozen_at(
             item(),
             timestamp_at("2026-08-16T02:01:00Z"),
@@ -2229,15 +3349,27 @@ mod tests {
         );
         let second_item = second.item().clone();
         let exhausted = state
-            .refresh_with_snapshot(&second_item, second.clone(), 1, "attempt:final", Vec::new())
+            .refresh_with_snapshot(
+                &second_item,
+                second.clone(),
+                &timestamp_at("2026-08-16T02:01:01Z"),
+                vec![disposition],
+            )
             .expect("bounded refresh");
         assert_eq!(exhausted.phase(), ReviewLoopPhase::Exhausted);
+        assert!(matches!(
+            exhausted.readiness().expect("typed exhausted readiness"),
+            ReviewLoopReadinessEvaluation::Blocked(blocked)
+                if blocked.blockers().iter().any(|blocker| matches!(
+                    blocker,
+                    ReadinessBlocker::AttemptLimitExhausted { max_attempts: 1 }
+                ))
+        ));
         assert!(exhausted
             .refresh_with_snapshot(
                 &second_item,
                 second,
-                2,
-                "attempt:after-terminal",
+                &timestamp_at("2026-08-16T02:01:01Z"),
                 Vec::new(),
             )
             .is_err());
@@ -2263,8 +3395,12 @@ mod tests {
             "Updated the implementation for the new head.",
         )
         .expect("valid disposition");
-        let state = ReviewLoopState::new(policy(&human, &bot, &check_actor), first)
-            .expect("active review loop");
+        let state = ReviewLoopState::new(
+            policy(&human, &bot, &check_actor),
+            first,
+            &timestamp_at("2026-08-16T03:00:00Z"),
+        )
+        .expect("active review loop");
         let current_item = item_at(HEAD_2, BASE_2, "revision:2");
         let current = ready_frozen_at(
             current_item.clone(),
@@ -2277,21 +3413,38 @@ mod tests {
             .refresh_with_snapshot(
                 &current_item,
                 current.clone(),
-                1,
-                "attempt:new-head",
+                &timestamp_at("2026-08-16T03:01:01Z"),
                 vec![disposition],
             )
             .expect("exact current refresh");
         assert_eq!(next.phase(), ReviewLoopPhase::Ready);
         assert_eq!(next.current_snapshot().item().head_oid(), Some(HEAD_2));
         assert_eq!(next.current_snapshot().item().base_oid(), Some(BASE_2));
+        let expected_attempt_id = derive_attempt_id(
+            next.policy_sha256(),
+            state.current_snapshot(),
+            next.current_snapshot(),
+            1,
+            next.attempts()[0].disposition_sha256s(),
+        )
+        .expect("deterministic attempt identity");
+        assert_eq!(next.attempts()[0].attempt_id(), expected_attempt_id);
+        let proof = match next.readiness().expect("ready state evaluation") {
+            ReviewLoopReadinessEvaluation::Ready(proof) => proof,
+            ReviewLoopReadinessEvaluation::Blocked(_) => panic!("refreshed evidence is ready"),
+        };
+        proof
+            .validate_against_state(&next)
+            .expect("proof validates through retained history");
+        assert!(proof
+            .validate_against(next.current_snapshot(), next.policy(), next.dispositions(),)
+            .is_err());
 
         assert!(state
             .refresh_with_snapshot(
                 state.current_snapshot().item(),
                 current.clone(),
-                1,
-                "attempt:wrong-current",
+                &timestamp_at("2026-08-16T03:01:01Z"),
                 Vec::new(),
             )
             .is_err());
@@ -2303,8 +3456,267 @@ mod tests {
             "same-time",
         );
         assert!(state
-            .refresh_with_snapshot(&current_item, not_later, 1, "attempt:not-later", Vec::new())
+            .refresh_with_snapshot(
+                &current_item,
+                not_later,
+                &timestamp_at("2026-08-16T03:01:01Z"),
+                Vec::new(),
+            )
             .is_err());
+    }
+
+    #[test]
+    fn state_round_trip_revalidates_history_and_transport_refresh_rejects_future_observation() {
+        let human = actor("actor:human", "alice", ReportedActorKind::Human);
+        let bot = actor("actor:bot", "review-bot", ReportedActorKind::Bot);
+        let check_actor = actor("actor:checks", "checks-bot", ReportedActorKind::Bot);
+        let first = blocking_frozen_at(
+            item(),
+            timestamp_at("2026-08-16T05:00:00Z"),
+            &human,
+            &check_actor,
+            "transport-one",
+        );
+        let disposition = VerifiedDisposition::new(
+            &first,
+            ReviewFeedbackIdentity::review(object(
+                ProviderObjectKind::Review,
+                "review:transport-one",
+            )),
+            identity(&human),
+            DispositionDecision::Addressed,
+            "Addressed before transport-backed refresh.",
+        )
+        .expect("valid transport disposition");
+        let state = ReviewLoopState::new(
+            policy(&human, &bot, &check_actor),
+            first,
+            &timestamp_at("2026-08-16T05:00:00Z"),
+        )
+        .expect("active transport state");
+        let current_item = item_at(HEAD_2, BASE_2, "revision:transport-two");
+        let refreshed = ready_frozen_at(
+            current_item.clone(),
+            timestamp_at("2026-08-16T05:01:00Z"),
+            &human,
+            &check_actor,
+            "transport-two",
+        );
+        let request = ForgeObservationRequest::pull_request_review_snapshot(current_item.clone())
+            .expect("transport observation request");
+        let mut transport = FakeForgeTransport::new();
+        transport
+            .register_observation(
+                request,
+                ForgeObservation::PullRequestReviewSnapshot(refreshed.snapshot().clone()),
+            )
+            .expect("register transport refresh");
+
+        assert!(state
+            .refresh(
+                &transport,
+                &current_item,
+                &timestamp_at("2026-08-16T05:00:59Z"),
+                vec![disposition.clone()],
+            )
+            .is_err());
+        let ready = state
+            .refresh(
+                &transport,
+                &current_item,
+                &timestamp_at("2026-08-16T05:01:00Z"),
+                vec![disposition],
+            )
+            .expect("transport-backed refresh at trusted cutoff");
+
+        let encoded_bytes = serde_json::to_vec(&ready).expect("serialize durable state");
+        let restored =
+            ReviewLoopState::restore_json(&encoded_bytes, &timestamp_at("2026-08-16T05:01:00Z"))
+                .expect("restore validated state history");
+        assert_eq!(restored, ready);
+        assert!(ReviewLoopState::restore_json(
+            &encoded_bytes,
+            &timestamp_at("2026-08-16T05:00:59Z"),
+        )
+        .is_err());
+
+        let encoded = serde_json::to_value(&ready).expect("serialize state value");
+        let mut tampered_attempt = encoded.clone();
+        tampered_attempt["attempts"][0]["attempt_id"] =
+            serde_json::json!(format!("attempt:{}", "0".repeat(64)));
+        assert!(ReviewLoopState::restore_json(
+            &serde_json::to_vec(&tampered_attempt).expect("serialize tampered attempt"),
+            &timestamp_at("2026-08-16T05:01:00Z"),
+        )
+        .is_err());
+        let mut tampered_chain = encoded.clone();
+        tampered_chain["attempts"][0]["refreshed_snapshot_sha256"] =
+            serde_json::json!("0".repeat(64));
+        assert!(ReviewLoopState::restore_json(
+            &serde_json::to_vec(&tampered_chain).expect("serialize tampered chain"),
+            &timestamp_at("2026-08-16T05:01:00Z"),
+        )
+        .is_err());
+
+        let mut tampered_predecessor = ready.clone();
+        tampered_predecessor.predecessor_state_sha256 = Some("0".repeat(64));
+        tampered_predecessor.state_sha256 = tampered_predecessor
+            .compute_state_sha256()
+            .expect("recompute self-consistent final digest");
+        assert!(ReviewLoopState::restore_json(
+            &serde_json::to_vec(&tampered_predecessor)
+                .expect("serialize predecessor-tampered state"),
+            &timestamp_at("2026-08-16T05:01:00Z"),
+        )
+        .is_err());
+        assert!(ReviewLoopState::restore_json(
+            &vec![b' '; MAX_REVIEW_LOOP_STATE_RECORD_BYTES + 1],
+            &timestamp_at("2026-08-16T05:01:00Z"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn durable_restore_rejects_successors_after_ready_prefixes() {
+        let human = actor("actor:human", "alice", ReportedActorKind::Human);
+        let bot = actor("actor:bot", "review-bot", ReportedActorKind::Bot);
+        let check_actor = actor("actor:checks", "checks-bot", ReportedActorKind::Bot);
+        let policy = policy(&human, &bot, &check_actor);
+
+        let initially_ready = ready_frozen_at(
+            item(),
+            timestamp_at("2026-08-16T07:10:00Z"),
+            &human,
+            &check_actor,
+            "initially-ready",
+        );
+        let initial_state = ReviewLoopState::new(
+            policy.clone(),
+            initially_ready.clone(),
+            &timestamp_at("2026-08-16T07:10:00Z"),
+        )
+        .expect("valid initially ready state");
+        assert_eq!(initial_state.phase(), ReviewLoopPhase::Ready);
+        let successor = ready_frozen_at(
+            item(),
+            timestamp_at("2026-08-16T07:11:00Z"),
+            &human,
+            &check_actor,
+            "illegal-ready-successor",
+        );
+        let attempt_id = derive_attempt_id(
+            initial_state.policy_sha256(),
+            &initially_ready,
+            &successor,
+            1,
+            &[],
+        )
+        .expect("deterministic illegal attempt id");
+        let attempt = ReviewLoopAttempt {
+            sequence: 1,
+            attempt_id,
+            prior_snapshot: initially_ready,
+            refreshed_snapshot_sha256: successor.canonical_sha256().to_owned(),
+            disposition_sha256s: Vec::new(),
+        };
+        let mut crafted = ReviewLoopState {
+            policy: policy.clone(),
+            policy_sha256: initial_state.policy_sha256().to_owned(),
+            current_snapshot: successor,
+            attempts: vec![attempt],
+            dispositions: Vec::new(),
+            phase: ReviewLoopPhase::Ready,
+            predecessor_state_sha256: Some(initial_state.state_sha256().to_owned()),
+            state_sha256: String::new(),
+        };
+        crafted.state_sha256 = crafted
+            .compute_state_sha256()
+            .expect("recompute crafted final digest");
+        assert!(ReviewLoopState::restore_json(
+            &serde_json::to_vec(&crafted).expect("serialize crafted ready successor"),
+            &timestamp_at("2026-08-16T07:11:00Z"),
+        )
+        .is_err());
+
+        let blocking = blocking_frozen_at(
+            item(),
+            timestamp_at("2026-08-16T07:00:00Z"),
+            &human,
+            &check_actor,
+            "active-before-ready",
+        );
+        let disposition = VerifiedDisposition::new(
+            &blocking,
+            ReviewFeedbackIdentity::review(object(
+                ProviderObjectKind::Review,
+                "review:active-before-ready",
+            )),
+            identity(&human),
+            DispositionDecision::Addressed,
+            "Addressed before the valid ready transition.",
+        )
+        .expect("valid prefix disposition");
+        let active = ReviewLoopState::new(policy, blocking, &timestamp_at("2026-08-16T07:00:00Z"))
+            .expect("valid active prefix");
+        let middle = ready_frozen_at(
+            item(),
+            timestamp_at("2026-08-16T07:01:00Z"),
+            &human,
+            &check_actor,
+            "middle-ready",
+        );
+        let middle_item = middle.item().clone();
+        let middle_state = active
+            .refresh_with_snapshot(
+                &middle_item,
+                middle,
+                &timestamp_at("2026-08-16T07:01:00Z"),
+                vec![disposition],
+            )
+            .expect("valid transition into ready prefix");
+        let final_snapshot = ready_frozen_at(
+            item(),
+            timestamp_at("2026-08-16T07:02:00Z"),
+            &human,
+            &check_actor,
+            "illegal-middle-successor",
+        );
+        let second_attempt_id = derive_attempt_id(
+            middle_state.policy_sha256(),
+            middle_state.current_snapshot(),
+            &final_snapshot,
+            2,
+            &[],
+        )
+        .expect("deterministic second illegal attempt id");
+        let second_attempt = ReviewLoopAttempt {
+            sequence: 2,
+            attempt_id: second_attempt_id,
+            prior_snapshot: middle_state.current_snapshot().clone(),
+            refreshed_snapshot_sha256: final_snapshot.canonical_sha256().to_owned(),
+            disposition_sha256s: Vec::new(),
+        };
+        let mut attempts = middle_state.attempts().to_vec();
+        attempts.push(second_attempt);
+        let mut crafted_after_middle = ReviewLoopState {
+            policy: middle_state.policy().clone(),
+            policy_sha256: middle_state.policy_sha256().to_owned(),
+            current_snapshot: final_snapshot,
+            attempts,
+            dispositions: middle_state.dispositions().to_vec(),
+            phase: ReviewLoopPhase::Ready,
+            predecessor_state_sha256: Some(middle_state.state_sha256().to_owned()),
+            state_sha256: String::new(),
+        };
+        crafted_after_middle.state_sha256 = crafted_after_middle
+            .compute_state_sha256()
+            .expect("recompute crafted intermediate-successor digest");
+        assert!(ReviewLoopState::restore_json(
+            &serde_json::to_vec(&crafted_after_middle)
+                .expect("serialize crafted intermediate successor"),
+            &timestamp_at("2026-08-16T07:02:00Z"),
+        )
+        .is_err());
     }
 
     #[test]
@@ -2389,9 +3801,14 @@ mod tests {
             "Applied and validated the requested change.",
         )
         .expect("valid disposition");
-        let request =
-            build_pull_request_disposition_publication(&frozen, publisher.clone(), &[disposition])
-                .expect("typed PR comment effect");
+        let policy = policy(&human, &publisher, &check_actor);
+        let request = build_pull_request_disposition_publication(
+            &frozen,
+            &policy,
+            publisher.clone(),
+            &[disposition],
+        )
+        .expect("typed PR comment effect");
         assert!(matches!(request, ForgeEffectRequest::AppendComment(_)));
 
         let transport = FakeForgeTransport::new();
