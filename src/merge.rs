@@ -2087,7 +2087,7 @@ struct CandidateRepositorySnapshot {
 
 struct TemporaryIndex {
     directory: PathBuf,
-    alternate_object_directory: PathBuf,
+    visible_object_directories: Vec<PathBuf>,
     _runtime_directory: Option<PrivateRuntimeDirectory>,
 }
 
@@ -5324,8 +5324,27 @@ fn snapshot_worktree_candidate_from_base(
     head: Option<Oid>,
     base_commit: Option<Oid>,
 ) -> Result<CapturedWorktreeTree> {
+    snapshot_worktree_candidate_from_base_with_visible_objects(
+        repo,
+        worktree_path,
+        head,
+        base_commit,
+        &[],
+    )
+}
+
+fn snapshot_worktree_candidate_from_base_with_visible_objects(
+    repo: &Repository,
+    worktree_path: &Path,
+    head: Option<Oid>,
+    base_commit: Option<Oid>,
+    additional_visible_object_directories: &[PathBuf],
+) -> Result<CapturedWorktreeTree> {
     enforce_candidate_capture_quota(repo, worktree_path)?;
-    let index = TemporaryIndex::create(repo.commondir())?;
+    let mut index = TemporaryIndex::create(repo.commondir())?;
+    for directory in additional_visible_object_directories {
+        index.add_visible_object_directory(directory)?;
+    }
     let head_text = head.map(|oid| oid.to_string());
     let read_tree_args = match head_text.as_deref() {
         Some(oid) => vec!["read-tree", oid],
@@ -5616,7 +5635,7 @@ impl TemporaryIndex {
         match result {
             Ok(()) => Ok(Self {
                 directory: directory.to_path_buf(),
-                alternate_object_directory,
+                visible_object_directories: vec![alternate_object_directory],
                 _runtime_directory: runtime_directory,
             }),
             Err(error) => Err(std::io::Error::other(error.to_string())),
@@ -5628,6 +5647,19 @@ impl TemporaryIndex {
             worktree_path,
             operation.iter().map(OsString::from).collect(),
         )
+    }
+
+    fn add_visible_object_directory(&mut self, directory: &Path) -> Result<()> {
+        let directory = fs::canonicalize(directory).with_context(|| {
+            format!(
+                "failed to resolve additional Git object directory {}",
+                directory.display()
+            )
+        })?;
+        if !self.visible_object_directories.contains(&directory) {
+            self.visible_object_directories.push(directory);
+        }
+        Ok(())
     }
 
     fn command_args_os(&self, worktree_path: &Path, operation: Vec<OsString>) -> Vec<OsString> {
@@ -7762,7 +7794,13 @@ impl CandidateValidationSandbox {
         let base = collection_base_oid(&preview.candidate.metadata)?;
         capture_two_matching(|| {
             let head = head_oid(&repo).context("failed to read validation sandbox HEAD")?;
-            let captured = snapshot_worktree_candidate_from_base(&repo, self.path(), head, base)?;
+            let captured = snapshot_worktree_candidate_from_base_with_visible_objects(
+                &repo,
+                self.path(),
+                head,
+                base,
+                &self.git_context.visible_object_directories,
+            )?;
             let binding =
                 candidate_validation_binding(&preview.candidate.metadata, &captured.raw_diff)?;
             let repository =
@@ -9312,9 +9350,11 @@ fn run_isolated_git_process_os(
     stdin: StdinMode,
     label: &str,
 ) -> Result<GitCommandOutput> {
-    let profile = StrictOfflineWorkspaceProfile::read_write(worktree_path)
-        .with_writable_artifact_root(&context.directory)
-        .with_visible_read_only_root(&context.alternate_object_directory);
+    let mut profile = StrictOfflineWorkspaceProfile::read_write(worktree_path)
+        .with_writable_artifact_root(&context.directory);
+    for directory in &context.visible_object_directories {
+        profile = profile.with_visible_read_only_root(directory);
+    }
     run_required_direct(
         label,
         resolve_trusted_executable("git")?,
