@@ -418,6 +418,50 @@ fn suitability_legacy_default_recursive_roundtrip_and_bounds_are_strict() {
     assert!(normalized_legacy["assignments"][0]
         .get("suitability")
         .is_none());
+    assert!(normalized_legacy["assignments"][0]
+        .get("suitability_assessment_source")
+        .is_none());
+
+    let (_planner_temp, planner_repo) = injected_repository();
+    let planned = supervisor_plan_and_consultant_from_goal_spec(
+        &planner_repo,
+        "Update the repository overview",
+        "- Update README.md with the bounded lifecycle note.",
+        None,
+    )
+    .expect("generate a goal/spec supervisor plan");
+    assert!(!planned.plan.assignments.is_empty());
+    assert!(planned
+        .assignment_metadata
+        .suitability_sources
+        .values()
+        .all(|source| {
+            *source == AssignmentSuitabilityAssessmentSource::GeneratedPlannerAuthority
+        }));
+    let normalized_planned = supervisor_plan_value(
+        &planned.plan,
+        &planned.consultant,
+        &planned.assignment_metadata,
+        &planned.plan_metadata,
+    )
+    .expect("normalize generated planner authority");
+    assert!(normalized_planned["assignments"]
+        .as_array()
+        .expect("normalized generated assignments")
+        .iter()
+        .all(|assignment| {
+            assignment["suitability_assessment_source"] == "generated_planner_authority"
+                && assignment.get("suitability").is_none()
+        }));
+    let reloaded_planned = parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&normalized_planned)
+            .expect("serialize normalized generated planner authority"),
+    )
+    .expect("reload generated planner authority");
+    assert_eq!(
+        reloaded_planned.assignment_metadata.suitability_sources,
+        planned.assignment_metadata.suitability_sources
+    );
 
     // Historical plans commonly used one broad directory claim. Keep that
     // input dispatch-compatible, but report that its optimistic default is a
@@ -553,6 +597,53 @@ fn suitability_legacy_default_recursive_roundtrip_and_bounds_are_strict() {
     )
     .is_err());
 
+    let forged_source = suitability_test_plan(
+        json!([{
+            "id": "forged-source",
+            "assigned_paths": ["README.md"],
+            "suitability_assessment_source": "historical_compatibility_default"
+        }]),
+        2,
+    );
+    assert!(parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&forged_source).expect("serialize forged source plan")
+    )
+    .is_err());
+
+    let mut excessive_capacity = suitability_test_plan(
+        json!([{"id": "bounded-count", "assigned_paths": ["README.md"]}]),
+        2,
+    );
+    excessive_capacity["max_child_assignments"] =
+        json!(MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES.saturating_add(1));
+    assert!(parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&excessive_capacity).expect("serialize excessive capacity plan")
+    )
+    .is_err());
+
+    let oversized_id = "a".repeat(MAX_SUPERVISOR_ASSIGNMENT_ID_BYTES.saturating_add(1));
+    let oversized_id_plan = suitability_test_plan(
+        json!([{"id": oversized_id, "assigned_paths": ["README.md"]}]),
+        2,
+    );
+    assert!(parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&oversized_id_plan).expect("serialize oversized id plan")
+    )
+    .is_err());
+
+    let excessive_input_paths = (0..=MAX_SUPERVISOR_ASSIGNMENT_INPUT_PATHS)
+        .map(|index| format!("bounded-input/{index}.rs"))
+        .collect::<Vec<_>>();
+    let excessive_input_paths_plan = suitability_test_plan(
+        json!([{"id": "excessive-input-paths", "assigned_paths": excessive_input_paths}]),
+        2,
+    );
+    assert!(parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&excessive_input_paths_plan)
+            .expect("serialize excessive input paths plan")
+    )
+    .is_err());
+
     let over_limit_paths = (0..=MAX_SUPERVISOR_ASSIGNMENT_SCOPE_PATHS)
         .map(|index| format!("scope/{index}.rs"))
         .collect::<Vec<_>>();
@@ -631,6 +722,10 @@ fn suitability_schema_is_strict_bounded_and_report_field_is_backward_readable() 
         .get("assignment_suitability_outcomes")
         .is_some());
     let outcome = &schema["properties"]["assignment_suitability_outcomes"]["items"];
+    assert_eq!(
+        schema["properties"]["assignment_suitability_outcomes"]["maxItems"],
+        MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES
+    );
     assert_eq!(outcome["additionalProperties"], false);
     assert!(outcome["required"]
         .as_array()
@@ -639,10 +734,13 @@ fn suitability_schema_is_strict_bounded_and_report_field_is_backward_readable() 
         outcome["properties"]["reasons"]["maxItems"],
         MAX_ASSIGNMENT_SUITABILITY_REASONS
     );
-    assert!(
-        outcome["properties"]["axes"]["properties"]["scope_path_count"]
-            .get("maximum")
-            .is_none()
+    assert_eq!(
+        outcome["properties"]["assignment_id"]["maxLength"],
+        MAX_SUPERVISOR_ASSIGNMENT_ID_BYTES
+    );
+    assert_eq!(
+        outcome["properties"]["axes"]["properties"]["scope_path_count"]["maximum"],
+        MAX_SUPERVISOR_ASSIGNMENT_INPUT_PATHS
     );
     assert_eq!(
         outcome["properties"]["axes"]["properties"]["max_scope_paths"]["maximum"],
