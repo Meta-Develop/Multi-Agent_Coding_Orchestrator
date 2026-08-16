@@ -1,0 +1,12 @@
+{
+  "root": "/workspace/repository",
+  "entries": [
+    {
+      "path": "src",
+      "kind": "directory",
+      "size_bytes": 128,
+      "category": "directory",
+      "git_status": "directory"
+    }
+  ]
+}

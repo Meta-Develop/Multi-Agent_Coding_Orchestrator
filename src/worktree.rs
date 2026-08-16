@@ -33,6 +33,8 @@ use crate::{
     sync_store::{LockedClaimsSnapshot, SyncStore},
 };
 use anyhow::{bail, Context, Result};
+#[cfg(unix)]
+use git2::ConfigLevel;
 use git2::{
     Branch, BranchType, ErrorCode, ObjectType, Oid, Repository, RepositoryInitOptions, Status,
     StatusOptions, Transaction, WorktreeAddOptions, WorktreeLockStatus, WorktreePruneOptions,
@@ -40,22 +42,160 @@ use git2::{
 use serde::{Deserialize, Serialize, Serializer};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::{OsStr, OsString},
-    fs,
+    ffi::{CString, OsStr, OsString},
+    fs::{self, File},
     io::ErrorKind,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
-#[cfg(target_os = "linux")]
-use std::io::Read;
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::MetadataExt;
-
+#[cfg(unix)]
+use std::io::{Read, Seek, SeekFrom};
 const DEFAULT_BRANCH_PREFIX: &str = "maco";
+#[cfg(unix)]
+const WORKTREE_GUARD_ASSET: &[u8] = include_bytes!("../assets/maco-worktree-guard.sh");
+#[cfg(unix)]
+const WORKTREE_GUARD_DIRECTORY: &str = "maco-worktree-guard";
+#[cfg(unix)]
+const WORKTREE_GUARD_MARKER: &str = "maco-worktree-guard-v1\n";
+#[cfg(unix)]
+const HUMAN_AUTHORSHIP_GUARD_V3_MARKER: &[u8] = b"# human-authorship-guard dispatcher v3";
+#[cfg(unix)]
+const HUMAN_AUTHORSHIP_GUARD_V3_TRAILER: &[u8] =
+    b"\n# Chained human-authorship dispatcher compatibility.\n# human-authorship-guard dispatcher v3\n";
+#[cfg(unix)]
+const HUMAN_AUTHORSHIP_COMMIT_MSG_V3: &[u8] = br##"#!/usr/bin/env bash
+# human-authorship-guard dispatcher v3
+set -euo pipefail
+self="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+previous="$self.human-authorship-previous"
+if [[ -x "$previous" ]]; then
+  "$previous" "$@"
+fi
+
+resolve_guard() {
+  local name="$1"
+  local repo_root
+  local primary
+  local common_dir
+  local fallback
+
+  repo_root="$(git rev-parse --show-toplevel)"
+  primary="$repo_root/.agents/scripts/$name"
+  if [[ -x "$primary" ]]; then
+    printf '%s\n' "$primary"
+    return 0
+  fi
+
+  if ! common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    printf 'human-authorship-guard dispatcher: cannot resolve Git common directory for %s\n' \
+      "$name" >&2
+    return 1
+  fi
+  fallback="$(dirname "$common_dir")/.agents/scripts/$name"
+  if [[ -x "$fallback" ]]; then
+    printf '%s\n' "$fallback"
+    return 0
+  fi
+
+  printf 'human-authorship-guard dispatcher: missing executable guard %s; checked %s and %s\n' \
+    "$name" "$primary" "$fallback" >&2
+  return 1
+}
+
+guard="$(resolve_guard check-human-authorship)"
+"$guard" identity 'pending author identity' "$(git var GIT_AUTHOR_IDENT)"
+"$guard" identity 'pending committer identity' "$(git var GIT_COMMITTER_IDENT)"
+exec "$guard" message "$1"
+"##;
+#[cfg(unix)]
+const HUMAN_AUTHORSHIP_PRE_PUSH_V3: &[u8] = br##"#!/usr/bin/env bash
+# human-authorship-guard dispatcher v3
+set -euo pipefail
+self="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+previous="$self.human-authorship-previous"
+input="$(mktemp)"
+trap 'rm -f "$input"' EXIT
+cat > "$input"
+if [[ -x "$previous" ]]; then
+  "$previous" "$@" < "$input"
+fi
+
+resolve_guard() {
+  local name="$1"
+  local repo_root
+  local primary
+  local common_dir
+  local fallback
+
+  repo_root="$(git rev-parse --show-toplevel)"
+  primary="$repo_root/.agents/scripts/$name"
+  if [[ -x "$primary" ]]; then
+    printf '%s\n' "$primary"
+    return 0
+  fi
+
+  if ! common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    printf 'human-authorship-guard dispatcher: cannot resolve Git common directory for %s\n' \
+      "$name" >&2
+    return 1
+  fi
+  fallback="$(dirname "$common_dir")/.agents/scripts/$name"
+  if [[ -x "$fallback" ]]; then
+    printf '%s\n' "$fallback"
+    return 0
+  fi
+
+  printf 'human-authorship-guard dispatcher: missing executable guard %s; checked %s and %s\n' \
+    "$name" "$primary" "$fallback" >&2
+  return 1
+}
+
+authorship_guard="$(resolve_guard check-human-authorship)"
+"$authorship_guard" pre-push "${1:-}" < "$input"
+private_guard="$(resolve_guard check-private-agent-paths)"
+"$private_guard" pre-push "${1:-}" < "$input"
+"##;
+#[cfg(unix)]
+const PRIOR_HOOK_MARKER_SCAN_LIMIT: u64 = 1024 * 1024;
+#[cfg(unix)]
+const WORKTREE_GUARD_HOOK_NAMES: &[&str] = &[
+    "applypatch-msg",
+    "pre-applypatch",
+    "post-applypatch",
+    "pre-commit",
+    "pre-merge-commit",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-commit",
+    "pre-rebase",
+    "post-checkout",
+    "post-merge",
+    "pre-push",
+    "pre-receive",
+    "update",
+    "proc-receive",
+    "post-receive",
+    "post-update",
+    "reference-transaction",
+    "push-to-checkout",
+    "pre-auto-gc",
+    "post-rewrite",
+    "sendemail-validate",
+    "fsmonitor-watchman",
+    "p4-changelist",
+    "p4-prepare-changelist",
+    "p4-post-changelist",
+    "p4-pre-submit",
+    "post-index-change",
+];
 const MANAGED_WORKTREE_REGISTRY_VERSION: u32 = 2;
 const MAX_WORKTREE_METADATA_BYTES: u64 = 64 * 1024;
 const MAX_AGENT_ID_BYTES: usize = 64;
@@ -172,6 +312,31 @@ pub struct WorktreeRecord {
     pub name: String,
     pub path: PathBuf,
     pub branch: String,
+}
+
+/// Observable state returned by the explicit primary-worktree guard command.
+///
+/// The guard is intentionally advisory. It protects interactive Git use by a
+/// human or rogue worker; it is not a security boundary. Trusted MACO Git
+/// operations continue to set `core.hooksPath=/dev/null`, so repository hooks
+/// cannot influence orchestration and this guard cannot constrain it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorktreeGuardReport {
+    pub status: WorktreeGuardStatus,
+    pub worktree_path: PathBuf,
+    pub hooks_path: PathBuf,
+    pub mode: String,
+    pub expected_branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeGuardStatus {
+    Installed,
+    AlreadyInstalled,
+    Verified,
+    Removed,
+    AlreadyAbsent,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -3191,6 +3356,2892 @@ impl WorktreeManager {
     fn open_repository(&self) -> Result<Repository> {
         crate::git_repository::open(&self.repo_path)
             .with_context(|| format!("failed to open repository {}", self.repo_path.display()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorktreeGuardMode {
+    Primary,
+    #[cfg(unix)]
+    Managed {
+        expected_branch: String,
+    },
+}
+
+#[cfg(unix)]
+impl WorktreeGuardMode {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Managed { .. } => "managed",
+        }
+    }
+
+    fn expected_branch(&self) -> Option<&str> {
+        match self {
+            Self::Primary => None,
+            Self::Managed { expected_branch } => Some(expected_branch),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct WorktreeGuardLayout {
+    worktree_path: PathBuf,
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+    root: PathBuf,
+    hooks: PathBuf,
+    config: PathBuf,
+    include_level: WorktreeGuardIncludeLevel,
+    include_config: PathBuf,
+    include_config_created: bool,
+    include_key: String,
+    config_text: String,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeGuardIncludeLevel {
+    Local,
+    Worktree,
+}
+
+#[cfg(unix)]
+impl WorktreeGuardIncludeLevel {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Worktree => "worktree",
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectivePriorHookPaths {
+    worktree_hooks: PathBuf,
+    git_dir_hooks: PathBuf,
+    human_v3_commit_msg: bool,
+    human_v3_pre_push: bool,
+}
+
+/// Installs the advisory guard into the selected primary checkout.
+///
+/// Primary installation is never implicit: only the explicit CLI surface
+/// calls this function. Managed lanes use the separate internal creation and
+/// supervisor bootstrap paths below. The guard composes with repository hooks
+/// by dispatching every standard hook name to its previously effective hooks
+/// directory after its own pre-commit/pre-merge/pre-push check succeeds.
+pub fn install_primary_worktree_guard(repo_path: impl AsRef<Path>) -> Result<WorktreeGuardReport> {
+    install_worktree_guard(repo_path.as_ref(), WorktreeGuardMode::Primary)
+}
+
+/// Verifies the explicit primary-worktree guard installation without changing
+/// repository or hook state.
+pub fn verify_primary_worktree_guard(repo_path: impl AsRef<Path>) -> Result<WorktreeGuardReport> {
+    let repo = crate::git_repository::open(repo_path.as_ref())
+        .with_context(|| format!("failed to open repository {}", repo_path.as_ref().display()))?;
+    verify_worktree_guard(&repo, &WorktreeGuardMode::Primary)
+}
+
+/// Removes only MACO-owned primary guard state and restores the previously
+/// effective hook resolution by deleting the exact conditional include.
+pub fn uninstall_primary_worktree_guard(
+    repo_path: impl AsRef<Path>,
+) -> Result<WorktreeGuardReport> {
+    uninstall_worktree_guard(repo_path.as_ref(), WorktreeGuardMode::Primary)
+}
+
+/// Reinstalls the guard for a registered managed lane during supervisor
+/// bootstrap. This upgrades older lanes idempotently without ever opting the
+/// primary checkout into the guard.
+#[cfg(unix)]
+pub(crate) fn ensure_registered_managed_worktree_guard(
+    worktree_path: &Path,
+) -> Result<WorktreeGuardReport> {
+    let selected = fs::canonicalize(worktree_path).with_context(|| {
+        format!(
+            "failed to resolve managed worktree {} for guard installation",
+            worktree_path.display()
+        )
+    })?;
+    let linked_repository = crate::git_repository::open(&selected).with_context(|| {
+        format!(
+            "failed to open managed worktree {} for guard installation",
+            selected.display()
+        )
+    })?;
+    let linked_workdir = linked_repository
+        .workdir()
+        .context("managed worktree guard bootstrap requires a non-bare repository")?;
+    let linked_workdir = fs::canonicalize(linked_workdir)
+        .context("failed to resolve managed worktree repository root")?;
+    if linked_workdir != selected {
+        bail!("managed worktree guard bootstrap path is not the linked repository root");
+    }
+    let linked_git_dir = fs::canonicalize(linked_repository.path())
+        .context("failed to resolve managed worktree Git directory")?;
+    let common_dir = fs::canonicalize(linked_repository.commondir())
+        .context("failed to resolve managed worktree Git common directory")?;
+    if linked_git_dir == common_dir {
+        bail!("managed worktree guard bootstrap requires a linked worktree");
+    }
+    let primary_candidate = common_dir
+        .parent()
+        .context("managed worktree Git common directory has no primary worktree parent")?;
+    let primary_workdir = fs::canonicalize(primary_candidate)
+        .context("failed to resolve primary worktree for managed guard bootstrap")?;
+    drop(linked_repository);
+
+    // The authenticated registry is deliberately primary-worktree scoped.
+    // Opening a manager on the linked lane would hit the mutation boundary in
+    // `managed_repository_binding` before its registered identity can be
+    // checked. Re-enter through the canonical primary workdir, then require an
+    // exact verified record for the selected linked lane.
+    let manager = WorktreeManager::new(&primary_workdir);
+    let record = manager
+        .list_managed_verified()?
+        .into_iter()
+        .find_map(|record| {
+            fs::canonicalize(&record.path)
+                .ok()
+                .filter(|path| path == &selected)
+                .map(|_| record)
+        })
+        .with_context(|| {
+            format!(
+                "managed worktree {} has no verified registry identity for guard installation",
+                selected.display()
+            )
+        })?;
+    install_worktree_guard(
+        &selected,
+        WorktreeGuardMode::Managed {
+            expected_branch: record.branch,
+        },
+    )
+}
+
+#[cfg(unix)]
+fn install_managed_worktree_guard(
+    worktree_path: &Path,
+    expected_branch: &str,
+) -> Result<WorktreeGuardReport> {
+    validate_branch_name(expected_branch)?;
+    install_worktree_guard(
+        worktree_path,
+        WorktreeGuardMode::Managed {
+            expected_branch: expected_branch.to_string(),
+        },
+    )
+}
+
+#[cfg(not(unix))]
+fn install_managed_worktree_guard(_worktree_path: &Path, _expected_branch: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_worktree_guard(
+    _worktree_path: &Path,
+    _mode: WorktreeGuardMode,
+) -> Result<WorktreeGuardReport> {
+    bail!("the POSIX MACO worktree guard is unsupported on this platform")
+}
+
+#[cfg(unix)]
+fn install_worktree_guard(
+    worktree_path: &Path,
+    mode: WorktreeGuardMode,
+) -> Result<WorktreeGuardReport> {
+    let repo = crate::git_repository::open(worktree_path).with_context(|| {
+        format!(
+            "failed to open worktree {} for guard installation",
+            worktree_path.display()
+        )
+    })?;
+    repair_owned_guard_layout_prefixes(&repo)?;
+    let layout = worktree_guard_layout(&repo)?;
+    require_guard_mode_matches_worktree(&layout, &mode)?;
+    let include_values = guard_include_values(&layout)?;
+    let (root_present, root_owned) = match fs::symlink_metadata(&layout.root) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!(
+                    "MACO worktree guard path is not an owned directory: {}",
+                    layout.root.display()
+                );
+            }
+            if !path_entry_exists(&layout.root.join("marker"))? {
+                if !include_values.is_empty()
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.permissions().mode() & 0o7777 != 0o700
+                    || fs::read_dir(&layout.root)
+                        .context("failed to enumerate markerless guard root")?
+                        .next()
+                        .is_some()
+                {
+                    bail!(
+                        "MACO worktree guard directory exists without an ownership marker; refusing collision: {}",
+                        layout.root.display()
+                    );
+                }
+                // Atomic marker publication uses an unnamed file. A crash can
+                // therefore leave only this empty private directory; retrying
+                // may safely finish publication without adopting any bytes.
+                (true, false)
+            } else {
+                // The exact marker is the ownership boundary. Never repair or
+                // stamp a pre-existing markerless nonempty directory, even if
+                // it contains only expected names. Interrupted installs are
+                // resumable only after this marker was published completely.
+                require_guard_marker(&layout)?;
+                validate_guard_tree_entries(&layout, true)?;
+                (true, true)
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => (false, false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect MACO worktree guard path {}",
+                    layout.root.display()
+                )
+            })
+        }
+    };
+    let already_installed = root_owned && verify_worktree_guard(&repo, &mode).is_ok();
+
+    if !root_present {
+        if !include_values.is_empty() {
+            bail!(
+                "worktree guard include key already exists without MACO-owned state: {}",
+                layout.include_key
+            );
+        }
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+            .create(&layout.root)
+            .with_context(|| format!("failed to create guard root {}", layout.root.display()))?;
+    }
+    let root = open_guard_directory(&layout.root, "guard root")?;
+    if !root_owned {
+        create_guard_marker(&root)?;
+    }
+    verify_guard_directory_binding(&layout.root, &root, "guard root")?;
+
+    validate_guard_tree_entries(&layout, true)?;
+    let previous_hooks =
+        existing_or_effective_prior_hook_paths(&repo, &layout, &include_values, &root)?;
+    ensure_guard_state(&layout, &mode, &previous_hooks, &root)?;
+
+    let hooks = write_guard_dispatchers(&layout, &root, &previous_hooks)?;
+    write_guard_config(&layout, &root)?;
+    verify_guard_directory_binding(&layout.root, &root, "guard root")?;
+    verify_guard_directory_binding(&layout.hooks, &hooks, "guard hooks")?;
+    root.sync_all()
+        .context("failed to sync complete guard state before include activation")?;
+    ensure_guard_include(&layout)?;
+    // Config activation is the final mutation. Refuse success if either owned
+    // directory pathname was exchanged while the include was being updated.
+    verify_guard_directory_binding(&layout.root, &root, "guard root")?;
+    verify_guard_directory_binding(&layout.hooks, &hooks, "guard hooks")?;
+    let mut report = verify_worktree_guard(&repo, &mode)?;
+    report.status = if already_installed {
+        WorktreeGuardStatus::AlreadyInstalled
+    } else {
+        WorktreeGuardStatus::Installed
+    };
+    Ok(report)
+}
+
+#[cfg(not(unix))]
+fn uninstall_worktree_guard(
+    _worktree_path: &Path,
+    _mode: WorktreeGuardMode,
+) -> Result<WorktreeGuardReport> {
+    bail!("the POSIX MACO worktree guard is unsupported on this platform")
+}
+
+#[cfg(unix)]
+fn uninstall_worktree_guard(
+    worktree_path: &Path,
+    mode: WorktreeGuardMode,
+) -> Result<WorktreeGuardReport> {
+    let repo = crate::git_repository::open(worktree_path).with_context(|| {
+        format!(
+            "failed to open worktree {} for guard removal",
+            worktree_path.display()
+        )
+    })?;
+    let layout = worktree_guard_layout(&repo)?;
+    uninstall_worktree_guard_with_layout(layout, mode)
+}
+
+#[cfg(unix)]
+fn uninstall_bound_managed_worktree_guard(
+    repo: &Repository,
+    binding: &ManagedWorktreeBinding,
+) -> Result<WorktreeGuardReport> {
+    let git_dir = fs::canonicalize(&binding.metadata_dir)
+        .context("failed to resolve bound managed Git directory for guard removal")?;
+    let common_dir = fs::canonicalize(repo.commondir())
+        .context("failed to resolve common Git directory for guard removal")?;
+    let layout = worktree_guard_layout_from_parts(repo, binding.path.clone(), git_dir, common_dir)?;
+    uninstall_worktree_guard_with_layout(
+        layout,
+        WorktreeGuardMode::Managed {
+            expected_branch: binding.branch.clone(),
+        },
+    )
+}
+
+#[cfg(unix)]
+fn uninstall_worktree_guard_with_layout(
+    layout: WorktreeGuardLayout,
+    mode: WorktreeGuardMode,
+) -> Result<WorktreeGuardReport> {
+    require_guard_mode_matches_worktree(&layout, &mode)?;
+    match fs::symlink_metadata(&layout.root) {
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            if !guard_include_values(&layout)?.is_empty() {
+                bail!(
+                    "worktree guard include remains without MACO-owned state: {}",
+                    layout.include_key
+                );
+            }
+            return Ok(worktree_guard_report(
+                &layout,
+                &mode,
+                WorktreeGuardStatus::AlreadyAbsent,
+            ));
+        }
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {}
+        Ok(_) => bail!(
+            "MACO worktree guard path is not an owned directory: {}",
+            layout.root.display()
+        ),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect guard root {}", layout.root.display()))
+        }
+    }
+    if path_entry_exists(&layout.root.join("marker"))? {
+        require_guard_marker(&layout)?;
+        recover_pending_guard_config_transaction(&layout)?;
+    }
+    let include_values = guard_include_values(&layout)?;
+    if path_entry_exists(&layout.root.join("marker"))? {
+        require_guard_marker(&layout)?;
+    } else if include_values.is_empty()
+        && fs::read_dir(&layout.root)
+            .context("failed to enumerate interrupted guard removal")?
+            .next()
+            .is_none()
+    {
+        fs::remove_dir(&layout.root).context("failed to remove empty guard root")?;
+        return Ok(worktree_guard_report(
+            &layout,
+            &mode,
+            WorktreeGuardStatus::Removed,
+        ));
+    } else {
+        bail!("MACO worktree guard ownership marker is missing or changed");
+    }
+    let root = open_guard_directory(&layout.root, "guard root")?;
+    let hooks = match open_guard_directory_at(&root, "hooks", "guard hooks directory") {
+        Ok(hooks) => Some(hooks),
+        Err(error)
+            if include_values.is_empty()
+                && error
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == ErrorKind::NotFound) =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    verify_guard_directory_binding(&layout.root, &root, "guard root")?;
+    if let Some(hooks) = &hooks {
+        verify_guard_directory_binding(&layout.hooks, hooks, "guard hooks")?;
+    }
+    match include_values.as_slice() {
+        [value] if value == &layout.config_text => {
+            verify_owned_worktree_guard(&layout, &mode)?;
+            migrate_post_install_human_authorship_v3(&layout, &root)?;
+            remove_guard_include(&layout)?;
+            verify_guard_directory_binding(&layout.root, &root, "guard root")?;
+            if let Some(hooks) = &hooks {
+                verify_guard_directory_binding(&layout.hooks, hooks, "guard hooks")?;
+            }
+        }
+        [] => {
+            // The include is removed before known owned files. This is the
+            // only accepted partial-uninstall shape and makes retries safe.
+            validate_guard_tree_entries(&layout, true)?;
+        }
+        _ => bail!("refusing to remove changed or duplicated guard conditional include"),
+    }
+    remove_guard_owned_tree(&layout, &root, hooks.as_ref())?;
+    Ok(worktree_guard_report(
+        &layout,
+        &mode,
+        WorktreeGuardStatus::Removed,
+    ))
+}
+
+#[cfg(unix)]
+fn migrate_post_install_human_authorship_v3(
+    layout: &WorktreeGuardLayout,
+    root: &File,
+) -> Result<()> {
+    let previous_hooks = read_guard_path_line(&layout.root.join("previous-hooks-path"))?;
+    for hook_name in ["commit-msg", "pre-push"] {
+        let wrapper = human_authorship_v3_wrapper(hook_name)
+            .context("missing human-authorship wrapper definition")?;
+        let guard_hook = layout.hooks.join(hook_name);
+        if fs::read(&guard_hook)
+            .with_context(|| format!("failed to read guard hook {hook_name}"))?
+            != wrapper
+        {
+            continue;
+        }
+        migrate_one_human_authorship_v3(root, &previous_hooks, hook_name, wrapper)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn migrate_one_human_authorship_v3(
+    root: &File,
+    previous_hooks: &Path,
+    hook_name: &str,
+    wrapper: &[u8],
+) -> Result<()> {
+    let previous = open_or_create_prior_hooks_directory(previous_hooks)?;
+    verify_guard_directory_binding(previous_hooks, &previous, "prior hooks directory")?;
+    let backup_name = format!("{hook_name}.human-authorship-previous");
+    let phase_name = format!("human-v3-migration-{hook_name}");
+    let original_name = format!("human-v3-original-{hook_name}");
+
+    let phase_exists = guard_file_exists_at(root, &phase_name)?;
+    let original_exists = guard_file_exists_at(root, &original_name)?;
+    if !phase_exists {
+        if guard_file_exists_at(&previous, &backup_name)? {
+            bail!("human-authorship migration backup collision: {backup_name}");
+        }
+        if guard_file_exists_at(&previous, hook_name)? {
+            let original =
+                read_guard_regular_file_at(&previous, hook_name, PRIOR_HOOK_MARKER_SCAN_LIMIT)?;
+            if original == wrapper {
+                bail!("ambiguous pre-existing human-authorship wrapper at prior hook path");
+            }
+            let mode = guard_regular_mode_at(&previous, hook_name)?;
+            if original_exists {
+                if read_guard_regular_file_at(root, &original_name, PRIOR_HOOK_MARKER_SCAN_LIMIT)?
+                    != original
+                {
+                    bail!("human-authorship migration journal does not match prior hook");
+                }
+            } else {
+                publish_exact_guard_file_at(root, &original_name, &original, 0o600)?;
+            }
+            ensure_guard_line_at(root, &phase_name, &format!("present:{mode}"))?;
+        } else {
+            if original_exists {
+                bail!("orphaned human-authorship original-hook journal");
+            }
+            ensure_guard_line_at(root, &phase_name, "absent")?;
+        }
+    }
+
+    let phase = String::from_utf8(read_guard_line_at(root, &phase_name)?)
+        .context("human-authorship migration phase is not UTF-8")?;
+    match phase.as_str() {
+        "absent" => {
+            if guard_file_exists_at(root, &original_name)?
+                || guard_file_exists_at(&previous, &backup_name)?
+            {
+                bail!("absent human-authorship migration has unexpected backup state");
+            }
+            if !guard_file_exists_at(&previous, hook_name)? {
+                publish_exact_guard_file_at(&previous, hook_name, wrapper, 0o755)?;
+            }
+        }
+        value if value.starts_with("present:") => {
+            let expected_mode = value["present:".len()..]
+                .parse::<u32>()
+                .context("invalid human-authorship original hook mode")?;
+            let original =
+                read_guard_regular_file_at(root, &original_name, PRIOR_HOOK_MARKER_SCAN_LIMIT)?;
+            let target_exists = guard_file_exists_at(&previous, hook_name)?;
+            let backup_exists = guard_file_exists_at(&previous, &backup_name)?;
+            match (target_exists, backup_exists) {
+                (true, false) => {
+                    if read_guard_regular_file_at(
+                        &previous,
+                        hook_name,
+                        PRIOR_HOOK_MARKER_SCAN_LIMIT,
+                    )? != original
+                        || guard_regular_mode_at(&previous, hook_name)? != expected_mode
+                    {
+                        bail!("prior hook changed before human-authorship migration");
+                    }
+                    rename_guard_entry_noreplace_at(&previous, hook_name, &backup_name)?;
+                    previous
+                        .sync_all()
+                        .context("failed to sync preserved prior hook")?;
+                }
+                (false, true) => {}
+                (true, true)
+                    if read_guard_regular_file_at(
+                        &previous,
+                        hook_name,
+                        PRIOR_HOOK_MARKER_SCAN_LIMIT,
+                    )? == wrapper => {}
+                _ => bail!("ambiguous human-authorship migration target/backup state"),
+            }
+            if read_guard_regular_file_at(&previous, &backup_name, PRIOR_HOOK_MARKER_SCAN_LIMIT)?
+                != original
+                || guard_regular_mode_at(&previous, &backup_name)? != expected_mode
+            {
+                bail!("preserved prior hook changed during human-authorship migration");
+            }
+            if !guard_file_exists_at(&previous, hook_name)? {
+                publish_exact_guard_file_at(&previous, hook_name, wrapper, 0o755)?;
+            }
+        }
+        _ => bail!("invalid human-authorship migration phase"),
+    }
+    if read_guard_regular_file_at(&previous, hook_name, PRIOR_HOOK_MARKER_SCAN_LIMIT)? != wrapper
+        || guard_regular_mode_at(&previous, hook_name)? & 0o111 == 0
+    {
+        bail!("human-authorship wrapper migration did not persist exactly");
+    }
+    verify_guard_directory_binding(previous_hooks, &previous, "prior hooks directory")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_or_create_prior_hooks_directory(path: &Path) -> Result<File> {
+    match open_guard_directory(path, "prior hooks directory") {
+        Ok(directory) => return Ok(directory),
+        Err(error)
+            if !error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == ErrorKind::NotFound) =>
+        {
+            return Err(error)
+        }
+        Err(_) => {}
+    }
+    let parent_path = path
+        .parent()
+        .context("prior hooks directory has no parent")?;
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("prior hooks directory name is not UTF-8")?;
+    let parent = open_guard_directory(parent_path, "prior hooks parent")?;
+    let name_c = guard_component(name)?;
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name_c.as_ptr(), 0o700) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to create descriptor-relative prior hooks directory");
+    }
+    parent
+        .sync_all()
+        .context("failed to sync prior hooks parent")?;
+    let directory = open_guard_directory_at(&parent, name, "prior hooks directory")?;
+    verify_guard_directory_binding(path, &directory, "prior hooks directory")?;
+    Ok(directory)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn migrate_one_human_authorship_v3(
+    _root: &File,
+    _previous_hooks: &Path,
+    _hook_name: &str,
+    _wrapper: &[u8],
+) -> Result<()> {
+    bail!("safe human-authorship wrapper migration requires Linux renameat2")
+}
+
+#[cfg(not(unix))]
+fn verify_worktree_guard(
+    _repo: &Repository,
+    _mode: &WorktreeGuardMode,
+) -> Result<WorktreeGuardReport> {
+    bail!("the POSIX MACO worktree guard is unsupported on this platform")
+}
+
+#[cfg(unix)]
+fn verify_worktree_guard(
+    repo: &Repository,
+    mode: &WorktreeGuardMode,
+) -> Result<WorktreeGuardReport> {
+    let layout = worktree_guard_layout(repo)?;
+    require_guard_mode_matches_worktree(&layout, mode)?;
+    verify_owned_worktree_guard(&layout, mode)?;
+    verify_no_pending_guard_config_transaction(&layout)?;
+    let include_values = guard_include_values(&layout)?;
+    if include_values != [layout.config_text.clone()] {
+        bail!("guard conditional include is missing, duplicated, or changed");
+    }
+    let reopened = crate::git_repository::open(&layout.worktree_path)
+        .context("failed to reopen worktree while verifying guard")?;
+    let effective_hooks = reopened
+        .config()
+        .context("failed to load effective guard configuration")?
+        .get_path("core.hooksPath")
+        .context("installed guard is not the effective core.hooksPath")?;
+    if effective_hooks != layout.hooks {
+        bail!("installed guard is not the effective core.hooksPath");
+    }
+    Ok(worktree_guard_report(
+        &layout,
+        mode,
+        WorktreeGuardStatus::Verified,
+    ))
+}
+
+#[cfg(unix)]
+fn verify_no_pending_guard_config_transaction(layout: &WorktreeGuardLayout) -> Result<()> {
+    let root = open_guard_directory(&layout.root, "guard root")?;
+    for name in [
+        "include-config-transaction",
+        "include-config-before",
+        "include-config-after",
+        "include-config-exchanged",
+    ] {
+        if guard_file_exists_at(&root, name)? {
+            bail!("guard config transaction journal remains pending: {name}");
+        }
+    }
+    let parent_path = layout
+        .include_config
+        .parent()
+        .context("guard include configuration has no parent")?;
+    let file_name = layout
+        .include_config
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("guard include configuration name is not UTF-8")?;
+    let parent = open_guard_directory(parent_path, "guard include configuration parent")?;
+    for name in [
+        format!("{file_name}.lock"),
+        format!("{file_name}.maco-worktree-guard-rollback"),
+    ] {
+        if guard_file_exists_at(&parent, &name)? {
+            bail!("guard config transaction filesystem state remains pending: {name}");
+        }
+    }
+    verify_guard_directory_binding(&layout.root, &root, "guard root")?;
+    verify_guard_directory_binding(parent_path, &parent, "guard include configuration parent")
+}
+
+#[cfg(unix)]
+fn verify_owned_worktree_guard(
+    layout: &WorktreeGuardLayout,
+    mode: &WorktreeGuardMode,
+) -> Result<()> {
+    require_guard_marker(layout)?;
+    require_guard_state(layout, mode)?;
+    validate_guard_tree_entries(layout, false)?;
+    require_regular_guard_file(&layout.config)?;
+    if fs::read(&layout.config).context("failed to read MACO worktree guard config")?
+        != expected_guard_config_bytes(&layout.hooks)?
+    {
+        bail!("guard config content changed");
+    }
+    let config =
+        git2::Config::open(&layout.config).context("failed to open MACO worktree guard config")?;
+    let configured_hooks = config
+        .get_path("core.hooksPath")
+        .context("guard config has no core.hooksPath")?;
+    if configured_hooks != layout.hooks {
+        bail!("guard config points to an unexpected hooks directory");
+    }
+    let previous_hooks = EffectivePriorHookPaths {
+        worktree_hooks: read_guard_path_line(&layout.root.join("previous-hooks-path"))?,
+        git_dir_hooks: read_guard_path_line(&layout.root.join("previous-git-dir-hooks-path"))?,
+        human_v3_commit_msg: read_guard_text_line(
+            &layout.root.join("human-v3-chained-commit-msg"),
+        )? == "true",
+        human_v3_pre_push: read_guard_text_line(&layout.root.join("human-v3-chained-pre-push"))?
+            == "true",
+    };
+    for hook_name in WORKTREE_GUARD_HOOK_NAMES {
+        let expected = expected_guard_dispatcher_bytes(&previous_hooks, hook_name)?;
+        verify_guard_dispatcher_path(layout, hook_name, &expected)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn human_authorship_v3_wrapper(hook_name: &str) -> Option<&'static [u8]> {
+    match hook_name {
+        "commit-msg" => Some(HUMAN_AUTHORSHIP_COMMIT_MSG_V3),
+        "pre-push" => Some(HUMAN_AUTHORSHIP_PRE_PUSH_V3),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn human_authorship_backup_name(hook_name: &str) -> Option<String> {
+    human_authorship_v3_wrapper(hook_name).map(|_| format!("{hook_name}.human-authorship-previous"))
+}
+
+#[cfg(unix)]
+fn verify_guard_dispatcher_path(
+    layout: &WorktreeGuardLayout,
+    hook_name: &str,
+    expected_maco: &[u8],
+) -> Result<()> {
+    let hook = layout.hooks.join(hook_name);
+    require_regular_guard_file(&hook)?;
+    let observed =
+        fs::read(&hook).with_context(|| format!("failed to read guard hook {}", hook.display()))?;
+    if fs::metadata(&hook)?.permissions().mode() & 0o111 == 0 {
+        bail!("guard hook is not executable: {}", hook.display());
+    }
+    let backup = human_authorship_backup_name(hook_name).map(|name| layout.hooks.join(name));
+    if observed == expected_maco {
+        if let Some(backup) = &backup {
+            if path_entry_exists(backup)? {
+                bail!("ambiguous human-authorship backup exists beside MACO dispatcher");
+            }
+        }
+        return Ok(());
+    }
+    let wrapper = human_authorship_v3_wrapper(hook_name).context("guard hook content changed")?;
+    if observed != wrapper {
+        bail!("guard hook content changed: {}", hook.display());
+    }
+    let backup = backup.context("human-authorship wrapper has no backup name")?;
+    require_regular_guard_file(&backup)?;
+    if fs::read(&backup).context("failed to read human-authorship MACO backup")? != expected_maco
+        || fs::metadata(&backup)?.permissions().mode() & 0o111 == 0
+    {
+        bail!("human-authorship wrapper does not preserve the exact MACO dispatcher");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn worktree_guard_layout(repo: &Repository) -> Result<WorktreeGuardLayout> {
+    let worktree_path = repo
+        .workdir()
+        .context("worktree guard requires a non-bare repository")?;
+    let worktree_path = fs::canonicalize(worktree_path)
+        .context("failed to resolve worktree path for guard installation")?;
+    let git_dir = fs::canonicalize(repo.path())
+        .context("failed to resolve Git directory for guard installation")?;
+    let common_dir = fs::canonicalize(repo.commondir())
+        .context("failed to resolve Git common directory for guard installation")?;
+    worktree_guard_layout_from_parts(repo, worktree_path, git_dir, common_dir)
+}
+
+#[cfg(unix)]
+fn repair_owned_guard_layout_prefixes(repo: &Repository) -> Result<()> {
+    let git_dir = fs::canonicalize(repo.path())
+        .context("failed to resolve Git directory for guard state recovery")?;
+    let common_dir = fs::canonicalize(repo.commondir())
+        .context("failed to resolve common Git directory for guard state recovery")?;
+    let root_path = git_dir.join(WORKTREE_GUARD_DIRECTORY);
+    if !path_entry_exists(&root_path.join("marker"))? {
+        return Ok(());
+    }
+    let root = open_guard_directory(&root_path, "guard root")?;
+    if read_guard_regular_file_at(&root, "marker", WORKTREE_GUARD_MARKER.len() as u64)?
+        != WORKTREE_GUARD_MARKER.as_bytes()
+    {
+        bail!("MACO worktree guard ownership marker is missing or changed");
+    }
+    verify_guard_directory_binding(&root_path, &root, "guard root")?;
+    let current_level = guard_include_level(repo)?;
+    let selected_level = if guard_file_exists_at(&root, "include-level")? {
+        match repair_guard_choice_at(
+            &root,
+            "include-level",
+            &["local", "worktree"],
+            current_level.label(),
+        )?
+        .as_str()
+        {
+            "local" => WorktreeGuardIncludeLevel::Local,
+            "worktree" => WorktreeGuardIncludeLevel::Worktree,
+            _ => bail!("repaired guard include level is invalid"),
+        }
+    } else {
+        current_level
+    };
+    if guard_file_exists_at(&root, "include-config-created")? {
+        let include_config = match selected_level {
+            WorktreeGuardIncludeLevel::Local => common_dir.join("config"),
+            WorktreeGuardIncludeLevel::Worktree => git_dir.join("config.worktree"),
+        };
+        let expected = if path_entry_exists(&include_config)? {
+            "false"
+        } else {
+            "true"
+        };
+        repair_guard_choice_at(
+            &root,
+            "include-config-created",
+            &["true", "false"],
+            expected,
+        )?;
+    }
+    root.sync_all()
+        .context("failed to sync repaired guard layout state")
+}
+
+#[cfg(unix)]
+fn repair_guard_choice_at(
+    root: &File,
+    name: &str,
+    choices: &[&str],
+    fallback: &str,
+) -> Result<String> {
+    let observed = read_guard_regular_file_at(root, name, 64)?;
+    for choice in choices {
+        let mut exact = choice.as_bytes().to_vec();
+        exact.push(b'\n');
+        if observed == exact {
+            return Ok((*choice).to_string());
+        }
+    }
+    let candidates = choices
+        .iter()
+        .filter(|choice| {
+            let mut exact = choice.as_bytes().to_vec();
+            exact.push(b'\n');
+            exact.starts_with(&observed)
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    let selected = match candidates.as_slice() {
+        [selected] => *selected,
+        candidates if candidates.contains(&fallback) => fallback,
+        _ => bail!("guard layout state is changed rather than an interrupted prefix: {name}"),
+    };
+    let mut expected = selected.as_bytes().to_vec();
+    expected.push(b'\n');
+    ensure_guard_file_bytes_at(root, name, &expected)?;
+    Ok(selected.to_string())
+}
+
+#[cfg(unix)]
+fn worktree_guard_layout_from_parts(
+    repo: &Repository,
+    worktree_path: PathBuf,
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+) -> Result<WorktreeGuardLayout> {
+    let root = git_dir.join(WORKTREE_GUARD_DIRECTORY);
+    let hooks = root.join("hooks");
+    let config = root.join("config");
+    let current_include_level = guard_include_level(repo)?;
+    let include_level = match fs::symlink_metadata(root.join("include-level")) {
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_file() => {
+            match read_guard_text_line(&root.join("include-level"))?.as_str() {
+                "local" => WorktreeGuardIncludeLevel::Local,
+                "worktree" => WorktreeGuardIncludeLevel::Worktree,
+                _ => bail!("worktree guard include level is invalid"),
+            }
+        }
+        Ok(_) => bail!("worktree guard include-level state is not a regular file"),
+        Err(error) if error.kind() == ErrorKind::NotFound => current_include_level,
+        Err(error) => return Err(error).context("failed to inspect guard include-level state"),
+    };
+    let include_config = match include_level {
+        WorktreeGuardIncludeLevel::Local => common_dir.join("config"),
+        WorktreeGuardIncludeLevel::Worktree => git_dir.join("config.worktree"),
+    };
+    let observed_include_config_created = match fs::symlink_metadata(&include_config) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!(
+                    "guard include configuration is not a regular file: {}",
+                    include_config.display()
+                );
+            }
+            false
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => true,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect guard include configuration {}",
+                    include_config.display()
+                )
+            })
+        }
+    };
+    let include_config_created = match fs::symlink_metadata(root.join("include-config-created")) {
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_file() => {
+            match read_guard_text_line(&root.join("include-config-created"))?.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => bail!("worktree guard include-config-created state is invalid"),
+            }
+        }
+        Ok(_) => bail!("worktree guard include-config-created state is not a regular file"),
+        Err(error) if error.kind() == ErrorKind::NotFound => observed_include_config_created,
+        Err(error) => {
+            return Err(error).context("failed to inspect guard include-config-created state")
+        }
+    };
+    let include_base = include_config
+        .parent()
+        .context("guard include configuration has no parent")?;
+    let relative_config = config
+        .strip_prefix(include_base)
+        .context("guard config is not beneath its selected Git configuration level")?;
+    let config_text = guard_config_path_text(relative_config, "relative guard config")?.to_string();
+    let include_condition = guard_include_condition(&git_dir, &common_dir)?;
+    let include_key = format!("includeIf.gitdir:{include_condition}.path");
+    Ok(WorktreeGuardLayout {
+        worktree_path,
+        git_dir,
+        common_dir,
+        root,
+        hooks,
+        config,
+        include_level,
+        include_config,
+        include_config_created,
+        include_key,
+        config_text,
+    })
+}
+
+#[cfg(unix)]
+fn guard_include_level(repo: &Repository) -> Result<WorktreeGuardIncludeLevel> {
+    let config = repo
+        .config()
+        .context("failed to load repository configuration for guard include selection")?;
+    let local = config
+        .open_level(ConfigLevel::Local)
+        .context("failed to open local repository configuration")?;
+    match local.get_bool("extensions.worktreeConfig") {
+        Ok(true) => Ok(WorktreeGuardIncludeLevel::Worktree),
+        Ok(false) => Ok(WorktreeGuardIncludeLevel::Local),
+        Err(error) if error.code() == ErrorCode::NotFound => Ok(WorktreeGuardIncludeLevel::Local),
+        Err(error) => Err(error).context("failed to inspect extensions.worktreeConfig"),
+    }
+}
+
+#[cfg(unix)]
+fn guard_include_condition(git_dir: &Path, common_dir: &Path) -> Result<String> {
+    if let Some(text) = git_dir.to_str() {
+        if !text.contains(['\n', '\r']) {
+            return Ok(text.to_string());
+        }
+    }
+    let suffix = if git_dir == common_dir {
+        git_dir
+            .file_name()
+            .context("non-UTF-8 primary Git directory has no final component")?
+            .to_str()
+            .context("non-UTF-8 primary Git directory has no UTF-8 final component")?
+            .to_string()
+    } else {
+        git_dir
+            .strip_prefix(common_dir)
+            .context("linked Git directory is not beneath its common directory")?
+            .to_str()
+            .context("linked Git metadata suffix is not valid UTF-8")?
+            .to_string()
+    };
+    if suffix.contains(['\n', '\r']) {
+        bail!("Git-directory include suffix contains an unsupported line break");
+    }
+    Ok(format!("**/{suffix}"))
+}
+
+#[cfg(unix)]
+fn guard_config_path_text<'a>(path: &'a Path, label: &str) -> Result<&'a str> {
+    let text = path
+        .to_str()
+        .with_context(|| format!("{label} is not valid UTF-8: {}", path.display()))?;
+    if text.contains(['\n', '\r']) {
+        bail!("{label} contains an unsupported line break");
+    }
+    Ok(text)
+}
+
+#[cfg(unix)]
+fn require_guard_mode_matches_worktree(
+    layout: &WorktreeGuardLayout,
+    mode: &WorktreeGuardMode,
+) -> Result<()> {
+    let is_primary = layout.git_dir == layout.common_dir;
+    match (mode, is_primary) {
+        (WorktreeGuardMode::Primary, true) | (WorktreeGuardMode::Managed { .. }, false) => Ok(()),
+        (WorktreeGuardMode::Primary, false) => {
+            bail!("primary guard command requires the repository's primary worktree")
+        }
+        (WorktreeGuardMode::Managed { .. }, true) => {
+            bail!("managed guard installation refuses the primary worktree")
+        }
+    }
+}
+
+#[cfg(unix)]
+fn effective_hook_paths_before_guard(
+    repo: &Repository,
+    layout: &WorktreeGuardLayout,
+) -> Result<EffectivePriorHookPaths> {
+    let configured = match repo
+        .config()
+        .context("failed to load repository hook configuration")?
+        .get_path("core.hooksPath")
+    {
+        Ok(path) => Some(path),
+        Err(error) if error.code() == ErrorCode::NotFound => None,
+        Err(error) => return Err(error).context("failed to read existing core.hooksPath"),
+    };
+    let paths = match configured {
+        Some(configured) if configured.is_absolute() => EffectivePriorHookPaths {
+            worktree_hooks: configured.clone(),
+            git_dir_hooks: configured,
+            human_v3_commit_msg: false,
+            human_v3_pre_push: false,
+        },
+        Some(configured) => EffectivePriorHookPaths {
+            worktree_hooks: layout.worktree_path.join(&configured),
+            git_dir_hooks: layout.git_dir.join(configured),
+            human_v3_commit_msg: false,
+            human_v3_pre_push: false,
+        },
+        None => {
+            let default_hooks = layout.common_dir.join("hooks");
+            EffectivePriorHookPaths {
+                worktree_hooks: default_hooks.clone(),
+                git_dir_hooks: default_hooks,
+                human_v3_commit_msg: false,
+                human_v3_pre_push: false,
+            }
+        }
+    };
+    for resolved in [&paths.worktree_hooks, &paths.git_dir_hooks] {
+        if resolved.as_os_str().as_bytes().contains(&b'\n')
+            || resolved.as_os_str().as_bytes().contains(&b'\r')
+        {
+            bail!("existing hooks path contains an unsupported line break");
+        }
+        if resolved == &layout.hooks {
+            bail!("existing hooks path already points at unowned MACO guard state");
+        }
+    }
+    Ok(EffectivePriorHookPaths {
+        human_v3_commit_msg: prior_hook_contains_human_authorship_v3_marker(
+            &paths.worktree_hooks.join("commit-msg"),
+        )?,
+        human_v3_pre_push: prior_hook_contains_human_authorship_v3_marker(
+            &paths.worktree_hooks.join("pre-push"),
+        )?,
+        ..paths
+    })
+}
+
+#[cfg(unix)]
+fn ensure_guard_state(
+    layout: &WorktreeGuardLayout,
+    mode: &WorktreeGuardMode,
+    previous_hooks: &EffectivePriorHookPaths,
+    root: &File,
+) -> Result<()> {
+    if read_guard_regular_file_at(root, "marker", WORKTREE_GUARD_MARKER.len() as u64)?
+        != WORKTREE_GUARD_MARKER.as_bytes()
+    {
+        bail!("MACO worktree guard ownership marker is missing or changed");
+    }
+    ensure_guard_line_at(root, "mode", mode.label())?;
+    ensure_guard_line_at(
+        root,
+        "expected-branch",
+        mode.expected_branch().unwrap_or_default(),
+    )?;
+    ensure_guard_path_line_at(root, "git-dir", &layout.git_dir)?;
+    ensure_guard_path_line_at(root, "previous-hooks-path", &previous_hooks.worktree_hooks)?;
+    ensure_guard_path_line_at(
+        root,
+        "previous-git-dir-hooks-path",
+        &previous_hooks.git_dir_hooks,
+    )?;
+    ensure_guard_line_at(
+        root,
+        "human-v3-chained-commit-msg",
+        if previous_hooks.human_v3_commit_msg {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    ensure_guard_line_at(
+        root,
+        "human-v3-chained-pre-push",
+        if previous_hooks.human_v3_pre_push {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    ensure_guard_path_line_at(root, "common-dir", &layout.common_dir)?;
+    ensure_guard_line_at(root, "include-level", layout.include_level.label())?;
+    ensure_guard_line_at(
+        root,
+        "include-config-created",
+        if layout.include_config_created {
+            "true"
+        } else {
+            "false"
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn create_guard_marker(root: &File) -> Result<()> {
+    let dot = CString::new(".").context("invalid guard root name")?;
+    let marker = CString::new("marker").context("invalid guard marker name")?;
+    let temporary = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            dot.as_ptr(),
+            libc::O_WRONLY | libc::O_TMPFILE | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if temporary < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to create unnamed guard ownership marker");
+    }
+    let mut temporary = unsafe { File::from_raw_fd(temporary) };
+    std::io::Write::write_all(&mut temporary, WORKTREE_GUARD_MARKER.as_bytes())
+        .context("failed to write unnamed guard ownership marker")?;
+    temporary
+        .sync_all()
+        .context("failed to sync guard ownership marker")?;
+    let empty = CString::new("").context("invalid empty marker publication path")?;
+    if unsafe {
+        libc::linkat(
+            temporary.as_raw_fd(),
+            empty.as_ptr(),
+            root.as_raw_fd(),
+            marker.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed atomic no-replace guard marker publication");
+    }
+    root.sync_all()
+        .context("failed to sync guard root after marker publication")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn create_guard_marker(_root: &File) -> Result<()> {
+    bail!("atomic guard ownership marker publication requires Linux O_TMPFILE/linkat")
+}
+
+#[cfg(unix)]
+fn ensure_guard_line_at(directory: &File, name: &str, value: &str) -> Result<()> {
+    if value.contains(['\n', '\r']) {
+        bail!("guard state value contains an unsupported line break");
+    }
+    let mut bytes = value.as_bytes().to_vec();
+    bytes.push(b'\n');
+    ensure_guard_file_bytes_at(directory, name, &bytes).map(|_| ())
+}
+
+#[cfg(unix)]
+fn ensure_guard_path_line_at(directory: &File, name: &str, value: &Path) -> Result<()> {
+    let value = value.as_os_str().as_bytes();
+    if value.contains(&b'\n') || value.contains(&b'\r') {
+        bail!("guard state path contains an unsupported line break");
+    }
+    let mut bytes = value.to_vec();
+    bytes.push(b'\n');
+    ensure_guard_file_bytes_at(directory, name, &bytes).map(|_| ())
+}
+
+#[cfg(unix)]
+fn ensure_guard_file_bytes_at(directory: &File, name: &str, expected: &[u8]) -> Result<File> {
+    let name_c = guard_component(name)?;
+    let created = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name_c.as_ptr(),
+            libc::O_RDWR
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+            0o600,
+        )
+    };
+    if created >= 0 {
+        let mut file = unsafe { File::from_raw_fd(created) };
+        std::io::Write::write_all(&mut file, expected)
+            .with_context(|| format!("failed to write guard state {name}"))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync guard state {name}"))?;
+        return Ok(file);
+    }
+    let create_error = std::io::Error::last_os_error();
+    if create_error.kind() != ErrorKind::AlreadyExists {
+        return Err(create_error).with_context(|| format!("failed to create guard state {name}"));
+    }
+    let opened = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name_c.as_ptr(),
+            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if opened < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to open existing guard state {name}"));
+    }
+    let mut file = unsafe { File::from_raw_fd(opened) };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect existing guard state {name}"))?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        bail!("guard state is not a private single-link regular file: {name}");
+    }
+    let mut observed = Vec::new();
+    (&file)
+        .take(
+            u64::try_from(expected.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut observed)
+        .with_context(|| format!("failed to read guard state {name}"))?;
+    if observed == expected {
+        return Ok(file);
+    }
+    if !expected.starts_with(&observed) {
+        bail!("refusing to overwrite changed guard state {name}");
+    }
+    // A strict prefix is repairable only inside an exact marker-owned root.
+    // The marker itself is never sent through this repair path.
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("failed to seek interrupted guard state {name}"))?;
+    file.set_len(0)
+        .with_context(|| format!("failed to reset interrupted guard state {name}"))?;
+    std::io::Write::write_all(&mut file, expected)
+        .with_context(|| format!("failed to repair interrupted guard state {name}"))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync repaired guard state {name}"))?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn existing_or_effective_prior_hook_paths(
+    repo: &Repository,
+    layout: &WorktreeGuardLayout,
+    include_values: &[String],
+    root: &File,
+) -> Result<EffectivePriorHookPaths> {
+    let worktree_exists = guard_file_exists_at(root, "previous-hooks-path")?;
+    let git_dir_exists = guard_file_exists_at(root, "previous-git-dir-hooks-path")?;
+    match (worktree_exists, git_dir_exists) {
+        (true, true) => {
+            let worktree_hooks = read_guard_path_line_at(root, "previous-hooks-path")?;
+            let commit_state = guard_file_exists_at(root, "human-v3-chained-commit-msg")?;
+            let push_state = guard_file_exists_at(root, "human-v3-chained-pre-push")?;
+            let (human_v3_commit_msg, human_v3_pre_push) = match (commit_state, push_state) {
+                (true, true) => (
+                    read_guard_bool_at(root, "human-v3-chained-commit-msg")?,
+                    read_guard_bool_at(root, "human-v3-chained-pre-push")?,
+                ),
+                (false, false) if include_values.is_empty() => (
+                    prior_hook_contains_human_authorship_v3_marker(
+                        &worktree_hooks.join("commit-msg"),
+                    )?,
+                    prior_hook_contains_human_authorship_v3_marker(
+                        &worktree_hooks.join("pre-push"),
+                    )?,
+                ),
+                _ => bail!("guard human-authorship composition state is incomplete"),
+            };
+            Ok(EffectivePriorHookPaths {
+                worktree_hooks,
+                git_dir_hooks: read_guard_path_line_at(root, "previous-git-dir-hooks-path")?,
+                human_v3_commit_msg,
+                human_v3_pre_push,
+            })
+        }
+        (false, false) if include_values.is_empty() => {
+            effective_hook_paths_before_guard(repo, layout)
+        }
+        (false, false) => {
+            bail!("active guard include has no persisted prior hook-path state")
+        }
+        _ => bail!("guard prior hook-path state is incomplete"),
+    }
+}
+
+#[cfg(unix)]
+fn read_guard_bool_at(directory: &File, name: &str) -> Result<bool> {
+    match read_guard_line_at(directory, name)?.as_slice() {
+        b"true" => Ok(true),
+        b"false" => Ok(false),
+        _ => bail!("guard boolean state is invalid: {name}"),
+    }
+}
+
+#[cfg(unix)]
+fn guard_component(name: &str) -> Result<CString> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        bail!("invalid guard-tree component: {name}");
+    }
+    CString::new(name.as_bytes()).context("guard-tree component contains NUL")
+}
+
+#[cfg(unix)]
+fn open_guard_directory(path: &Path, label: &str) -> Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    options
+        .open(path)
+        .with_context(|| format!("failed to open {label} without following links"))
+}
+
+#[cfg(unix)]
+fn open_guard_directory_at(directory: &File, name: &str, label: &str) -> Result<File> {
+    let name = guard_component(name)?;
+    let opened = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY
+                | libc::O_DIRECTORY
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+        )
+    };
+    if opened < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to open {label} descriptor-relative"));
+    }
+    Ok(unsafe { File::from_raw_fd(opened) })
+}
+
+#[cfg(unix)]
+fn verify_guard_directory_binding(path: &Path, held: &File, label: &str) -> Result<()> {
+    let held = held
+        .metadata()
+        .with_context(|| format!("failed to inspect held {label}"))?;
+    let named =
+        fs::symlink_metadata(path).with_context(|| format!("failed to rebind named {label}"))?;
+    if !held.is_dir()
+        || !named.is_dir()
+        || named.file_type().is_symlink()
+        || held.dev() != named.dev()
+        || held.ino() != named.ino()
+    {
+        bail!("{label} pathname identity changed during mutation");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn guard_file_exists_at(directory: &File, name: &str) -> Result<bool> {
+    let name = guard_component(name)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0
+    {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == ErrorKind::NotFound {
+        Ok(false)
+    } else {
+        Err(error).with_context(|| format!("failed to inspect guard state {name:?}"))
+    }
+}
+
+#[cfg(unix)]
+fn read_guard_path_line_at(directory: &File, name: &str) -> Result<PathBuf> {
+    Ok(PathBuf::from(OsString::from_vec(read_guard_line_at(
+        directory, name,
+    )?)))
+}
+
+#[cfg(unix)]
+fn read_guard_line_at(directory: &File, name: &str) -> Result<Vec<u8>> {
+    let mut bytes = read_guard_regular_file_at(directory, name, MAX_WORKTREE_GIT_TEXT_FILE_BYTES)?;
+    if bytes.last() != Some(&b'\n') {
+        bail!("guard state is not a single newline-terminated value: {name}");
+    }
+    bytes.pop();
+    if bytes.contains(&b'\n') || bytes.contains(&b'\r') {
+        bail!("guard state contains multiple lines: {name}");
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn read_guard_regular_file_at(directory: &File, name: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    let name_c = guard_component(name)?;
+    let opened = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name_c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if opened < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to open guard state {name}"));
+    }
+    let mut file = unsafe { File::from_raw_fd(opened) };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect guard state {name}"))?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() > max_bytes {
+        bail!("guard state is not a single-link regular file: {name}");
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read guard state {name}"))?;
+    if u64::try_from(bytes.len()).map_or(true, |len| len > max_bytes) {
+        bail!("guard state exceeds its bounded read limit: {name}");
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn guard_regular_mode_at(directory: &File, name: &str) -> Result<u32> {
+    let name = guard_component(name)?;
+    let opened = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if opened < 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to open guard regular file");
+    }
+    let file = unsafe { File::from_raw_fd(opened) };
+    let metadata = file
+        .metadata()
+        .context("failed to inspect guard regular file")?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        bail!("guard entry is not a single-link regular file");
+    }
+    Ok(metadata.permissions().mode())
+}
+
+#[cfg(unix)]
+fn read_guard_regular_snapshot_at(
+    directory: &File,
+    name: &str,
+    max_bytes: u64,
+) -> Result<(Vec<u8>, u32, (u64, u64))> {
+    let name = guard_component(name)?;
+    let opened = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if opened < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to open guard regular-file snapshot");
+    }
+    let mut file = unsafe { File::from_raw_fd(opened) };
+    let metadata = file
+        .metadata()
+        .context("failed to inspect guard regular-file snapshot")?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() > max_bytes {
+        bail!("guard regular-file snapshot has unsafe type, links, or size");
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .context("failed to read guard regular-file snapshot")?;
+    if u64::try_from(bytes.len()).map_or(true, |len| len > max_bytes) {
+        bail!("guard regular-file snapshot exceeded its limit");
+    }
+    let after = file
+        .metadata()
+        .context("failed to re-inspect guard regular-file snapshot")?;
+    if !same_prior_hook_metadata(&metadata, &after) {
+        bail!("guard regular-file snapshot changed while being read");
+    }
+    Ok((
+        bytes,
+        metadata.permissions().mode(),
+        (metadata.dev(), metadata.ino()),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn publish_exact_guard_file_at(
+    directory: &File,
+    name: &str,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<()> {
+    let temporary = create_unnamed_guard_file_at(directory, bytes, mode)?;
+    link_unnamed_guard_file_at(&temporary, directory, name)
+}
+
+#[cfg(target_os = "linux")]
+fn create_unnamed_guard_file_at(directory: &File, bytes: &[u8], mode: u32) -> Result<File> {
+    let dot = CString::new(".").context("invalid guard publication directory")?;
+    let temporary = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            dot.as_ptr(),
+            libc::O_WRONLY | libc::O_TMPFILE | libc::O_CLOEXEC,
+            mode,
+        )
+    };
+    if temporary < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to create unnamed guard publication file");
+    }
+    let mut temporary = unsafe { File::from_raw_fd(temporary) };
+    std::io::Write::write_all(&mut temporary, bytes)
+        .context("failed to write unnamed guard publication file")?;
+    if unsafe { libc::fchmod(temporary.as_raw_fd(), mode as libc::mode_t) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to set guard publication mode");
+    }
+    temporary
+        .sync_all()
+        .context("failed to sync unnamed guard publication file")?;
+    Ok(temporary)
+}
+
+#[cfg(target_os = "linux")]
+fn link_unnamed_guard_file_at(temporary: &File, directory: &File, name: &str) -> Result<()> {
+    let name = guard_component(name)?;
+    let empty = CString::new("").context("invalid empty guard publication path")?;
+    if unsafe {
+        libc::linkat(
+            temporary.as_raw_fd(),
+            empty.as_ptr(),
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed atomic no-replace guard file publication");
+    }
+    directory
+        .sync_all()
+        .context("failed to sync guard publication directory")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn publish_exact_guard_file_at(
+    _directory: &File,
+    _name: &str,
+    _bytes: &[u8],
+    _mode: u32,
+) -> Result<()> {
+    bail!("atomic guard file publication requires Linux O_TMPFILE/linkat")
+}
+
+#[cfg(target_os = "linux")]
+fn rename_guard_entry_noreplace_at(directory: &File, source: &str, target: &str) -> Result<()> {
+    let source = guard_component(source)?;
+    let target = guard_component(target)?;
+    if unsafe {
+        libc::renameat2(
+            directory.as_raw_fd(),
+            source.as_ptr(),
+            directory.as_raw_fd(),
+            target.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("atomic no-replace guard entry rename failed");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn rename_guard_entry_exchange_at(directory: &File, source: &str, target: &str) -> Result<()> {
+    let source = guard_component(source)?;
+    let target = guard_component(target)?;
+    if unsafe {
+        libc::renameat2(
+            directory.as_raw_fd(),
+            source.as_ptr(),
+            directory.as_raw_fd(),
+            target.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).context("atomic guard entry exchange failed");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_guard_dispatchers(
+    layout: &WorktreeGuardLayout,
+    root: &File,
+    previous_hooks: &EffectivePriorHookPaths,
+) -> Result<File> {
+    if !guard_file_exists_at(root, "hooks")? {
+        let hooks = guard_component("hooks")?;
+        if unsafe { libc::mkdirat(root.as_raw_fd(), hooks.as_ptr(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to create descriptor-relative guard hooks directory");
+        }
+    }
+    let hooks = open_guard_directory_at(root, "hooks", "guard hooks directory")?;
+
+    // Preflight every existing dispatcher before creating anything so one
+    // changed hook cannot leave a partial reinstall behind.
+    for hook_name in WORKTREE_GUARD_HOOK_NAMES {
+        let expected = expected_guard_dispatcher_bytes(previous_hooks, hook_name)?;
+        guard_dispatcher_matches_expected_at(&hooks, hook_name, &expected)?;
+    }
+
+    for hook_name in WORKTREE_GUARD_HOOK_NAMES {
+        let expected = expected_guard_dispatcher_bytes(previous_hooks, hook_name)?;
+        if guard_dispatcher_matches_expected_at(&hooks, hook_name, &expected)? {
+            continue;
+        }
+        let hook = ensure_guard_file_bytes_at(&hooks, hook_name, &expected)?;
+        if unsafe { libc::fchmod(hook.as_raw_fd(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to make guard hook executable: {hook_name}"));
+        }
+    }
+    hooks
+        .sync_all()
+        .context("failed to sync guard hooks directory")?;
+    verify_guard_directory_binding(&layout.hooks, &hooks, "guard hooks")?;
+    Ok(hooks)
+}
+
+#[cfg(unix)]
+fn guard_dispatcher_matches_expected_at(
+    hooks: &File,
+    hook_name: &str,
+    expected: &[u8],
+) -> Result<bool> {
+    if !guard_file_exists_at(hooks, hook_name)? {
+        return Ok(false);
+    }
+    let bytes = read_guard_regular_file_at(hooks, hook_name, PRIOR_HOOK_MARKER_SCAN_LIMIT)?;
+    let backup = human_authorship_backup_name(hook_name);
+    if bytes == expected || expected.starts_with(&bytes) {
+        if let Some(backup) = backup {
+            if guard_file_exists_at(hooks, &backup)? {
+                bail!("ambiguous human-authorship backup exists beside MACO dispatcher");
+            }
+        }
+        return Ok(bytes == expected);
+    }
+    if human_authorship_v3_wrapper(hook_name) == Some(bytes.as_slice()) {
+        let backup = backup.context("human-authorship wrapper has no MACO backup name")?;
+        if read_guard_regular_file_at(hooks, &backup, PRIOR_HOOK_MARKER_SCAN_LIMIT)? != expected {
+            bail!("human-authorship wrapper does not preserve the exact MACO dispatcher");
+        }
+        return Ok(true);
+    }
+    bail!("refusing to overwrite changed or non-MACO guard hook {hook_name}")
+}
+
+#[cfg(unix)]
+fn expected_guard_dispatcher_bytes(
+    previous_hooks: &EffectivePriorHookPaths,
+    hook_name: &str,
+) -> Result<Vec<u8>> {
+    let mut expected = WORKTREE_GUARD_ASSET.to_vec();
+    let chained_human_v3 = match hook_name {
+        "commit-msg" => previous_hooks.human_v3_commit_msg,
+        "pre-push" => previous_hooks.human_v3_pre_push,
+        _ => false,
+    };
+    if chained_human_v3 {
+        expected.extend_from_slice(HUMAN_AUTHORSHIP_GUARD_V3_TRAILER);
+    }
+    Ok(expected)
+}
+
+#[cfg(unix)]
+fn prior_hook_contains_human_authorship_v3_marker(hook: &Path) -> Result<bool> {
+    let initial = match fs::symlink_metadata(hook) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Ok(false)
+        }
+        Ok(metadata) => metadata,
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            return Ok(false)
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect prior hook {}", hook.display()))
+        }
+    };
+    if initial.len() > PRIOR_HOOK_MARKER_SCAN_LIMIT {
+        bail!(
+            "prior hook exceeds the {}-byte compatibility scan limit: {}",
+            PRIOR_HOOK_MARKER_SCAN_LIMIT,
+            hook.display()
+        );
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let file = options.open(hook).with_context(|| {
+        format!(
+            "failed to open prior hook without following links: {}",
+            hook.display()
+        )
+    })?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened prior hook {}", hook.display()))?;
+    if !opened.is_file()
+        || opened.len() > PRIOR_HOOK_MARKER_SCAN_LIMIT
+        || !same_prior_hook_metadata(&initial, &opened)
+    {
+        bail!(
+            "prior hook changed during compatibility scan: {}",
+            hook.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    (&file)
+        .take(PRIOR_HOOK_MARKER_SCAN_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read prior hook {}", hook.display()))?;
+    if u64::try_from(bytes.len()).map_or(true, |len| len > PRIOR_HOOK_MARKER_SCAN_LIMIT) {
+        bail!(
+            "prior hook exceeds the {}-byte compatibility scan limit: {}",
+            PRIOR_HOOK_MARKER_SCAN_LIMIT,
+            hook.display()
+        );
+    }
+    let after_read = fs::symlink_metadata(hook)
+        .with_context(|| format!("failed to re-inspect prior hook {}", hook.display()))?;
+    let opened_after_read = file
+        .metadata()
+        .with_context(|| format!("failed to re-inspect opened prior hook {}", hook.display()))?;
+    if !same_prior_hook_metadata(&opened, &opened_after_read)
+        || !same_prior_hook_metadata(&opened, &after_read)
+    {
+        bail!(
+            "prior hook changed during compatibility scan: {}",
+            hook.display()
+        );
+    }
+    Ok(bytes
+        .windows(HUMAN_AUTHORSHIP_GUARD_V3_MARKER.len())
+        .any(|window| window == HUMAN_AUTHORSHIP_GUARD_V3_MARKER))
+}
+
+#[cfg(unix)]
+fn same_prior_hook_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
+}
+
+#[cfg(unix)]
+fn write_guard_config(layout: &WorktreeGuardLayout, root: &File) -> Result<()> {
+    let expected = expected_guard_config_bytes(&layout.hooks)?;
+    ensure_guard_file_bytes_at(root, "config", &expected).map(|_| ())
+}
+
+#[cfg(unix)]
+fn expected_guard_config_bytes(hooks: &Path) -> Result<Vec<u8>> {
+    let path = hooks.as_os_str().as_bytes();
+    if path.contains(&b'\n') || path.contains(&b'\r') {
+        bail!("guard hooks path contains an unsupported line break");
+    }
+    let mut bytes = b"[core]\n\thooksPath = \"".to_vec();
+    for byte in path {
+        match byte {
+            b'\\' => bytes.extend_from_slice(b"\\\\"),
+            b'\"' => bytes.extend_from_slice(b"\\\""),
+            b'\t' => bytes.extend_from_slice(b"\\t"),
+            0x08 => bytes.extend_from_slice(b"\\b"),
+            _ => bytes.push(*byte),
+        }
+    }
+    bytes.extend_from_slice(b"\"\n");
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn guard_include_values(layout: &WorktreeGuardLayout) -> Result<Vec<String>> {
+    let config = match git2::Config::open(&layout.include_config) {
+        Ok(config) => config,
+        Err(error) if error.code() == ErrorCode::NotFound && layout.include_config_created => {
+            return Ok(Vec::new())
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to open guard include configuration {}",
+                    layout.include_config.display()
+                )
+            })
+        }
+    };
+    let mut entries = match config.multivar(&layout.include_key, None) {
+        Ok(entries) => entries,
+        Err(error) if error.code() == ErrorCode::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("failed to inspect guard conditional include"),
+    };
+    let mut values = Vec::new();
+    while let Some(entry) = entries.next() {
+        let entry = entry.context("failed to read guard conditional include")?;
+        values.push(
+            entry
+                .value()
+                .context("guard conditional include is not valid UTF-8")?
+                .to_string(),
+        );
+    }
+    Ok(values)
+}
+
+#[cfg(unix)]
+fn ensure_guard_include(layout: &WorktreeGuardLayout) -> Result<()> {
+    recover_pending_guard_config_transaction(layout)?;
+    match guard_include_values(layout)?.as_slice() {
+        [] => {
+            mutate_guard_include_fragment(layout, true)?;
+        }
+        [value] if value == &layout.config_text => return Ok(()),
+        _ => bail!("guard conditional include is duplicated or owned by another value"),
+    }
+    if guard_include_values(layout)? != [layout.config_text.clone()] {
+        bail!("guard conditional include did not persist exactly once");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_guard_include(layout: &WorktreeGuardLayout) -> Result<()> {
+    recover_pending_guard_config_transaction(layout)?;
+    if guard_include_values(layout)? != [layout.config_text.clone()] {
+        bail!("refusing to remove changed or duplicated guard conditional include");
+    }
+    mutate_guard_include_fragment(layout, false)?;
+    if !guard_include_values(layout)?.is_empty() {
+        bail!("guard conditional include remains after removal");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn recover_pending_guard_config_transaction(layout: &WorktreeGuardLayout) -> Result<()> {
+    let parent_path = layout
+        .include_config
+        .parent()
+        .context("guard include configuration has no parent")?;
+    let file_name = layout
+        .include_config
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("guard include configuration name is not UTF-8")?;
+    let parent = open_guard_directory(parent_path, "guard include configuration parent")?;
+    let root = open_guard_directory(&layout.root, "guard root")?;
+    recover_guard_config_transaction(layout, &root, &parent, file_name).map(|_| ())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn recover_pending_guard_config_transaction(_layout: &WorktreeGuardLayout) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn mutate_guard_include_fragment(layout: &WorktreeGuardLayout, add: bool) -> Result<()> {
+    let parent_path = layout
+        .include_config
+        .parent()
+        .context("guard include configuration has no parent")?;
+    let file_name = layout
+        .include_config
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("guard include configuration name is not UTF-8")?;
+    let parent = open_guard_directory(parent_path, "guard include configuration parent")?;
+    verify_guard_directory_binding(parent_path, &parent, "guard include configuration parent")?;
+    let root = open_guard_directory(&layout.root, "guard root")?;
+    verify_guard_directory_binding(&layout.root, &root, "guard root")?;
+    let fragment = expected_guard_include_fragment(layout)?;
+    if let Some(recovered_add) =
+        recover_guard_config_transaction(layout, &root, &parent, file_name)?
+    {
+        if recovered_add == add {
+            return Ok(());
+        }
+    }
+    let exists = guard_file_exists_at(&parent, file_name)?;
+    if !exists && (!add || !layout.include_config_created) {
+        bail!("guard include configuration disappeared before mutation");
+    }
+    let (before, before_mode, before_identity) = if exists {
+        let (bytes, mode, identity) =
+            read_guard_regular_snapshot_at(&parent, file_name, MAX_MANAGED_REGISTRY_BYTES)?;
+        (bytes, mode, Some(identity))
+    } else {
+        (Vec::new(), 0o600, None)
+    };
+    let mut after = before.clone();
+    if add {
+        if before
+            .windows(fragment.len())
+            .any(|window| window == fragment)
+        {
+            bail!("exact guard include fragment already exists without matching config state");
+        }
+        after.extend_from_slice(&fragment);
+    } else {
+        let positions = before
+            .windows(fragment.len())
+            .enumerate()
+            .filter_map(|(index, window)| (window == fragment).then_some(index))
+            .collect::<Vec<_>>();
+        if positions.len() != 1 {
+            bail!("guard include fragment is missing, duplicated, or reformatted");
+        }
+        let start = positions[0];
+        after.drain(start..start + fragment.len());
+    }
+    let lock_name = format!("{file_name}.lock");
+    let rollback_name = format!("{file_name}.maco-worktree-guard-rollback");
+    if guard_file_exists_at(&parent, &lock_name)? {
+        bail!("Git configuration lock already exists; refusing guard config mutation");
+    }
+    if guard_file_exists_at(&parent, &rollback_name)? {
+        bail!(
+            "guard configuration rollback entry already exists without a recoverable transaction"
+        );
+    }
+    cleanup_incomplete_guard_config_journal(&root)?;
+    let staged = create_unnamed_guard_file_at(&parent, &after, before_mode & 0o7777)?;
+    let staged_metadata = staged
+        .metadata()
+        .context("failed to inspect staged guard configuration")?;
+    let rollback = create_unnamed_guard_file_at(&parent, &before, before_mode & 0o7777)?;
+    let rollback_metadata = rollback
+        .metadata()
+        .context("failed to inspect rollback guard configuration")?;
+    publish_exact_guard_file_at(&root, "include-config-before", &before, 0o600)?;
+    publish_exact_guard_file_at(&root, "include-config-after", &after, 0o600)?;
+    let manifest = GuardConfigTransaction {
+        add,
+        before_present: before_identity.is_some(),
+        delete_after: !add && layout.include_config_created && after.is_empty(),
+        before_identity: before_identity.unwrap_or((0, 0)),
+        before_mode,
+        staged_identity: (staged_metadata.dev(), staged_metadata.ino()),
+        staged_mode: staged_metadata.permissions().mode(),
+        rollback_identity: (rollback_metadata.dev(), rollback_metadata.ino()),
+        rollback_mode: rollback_metadata.permissions().mode(),
+    };
+    publish_exact_guard_file_at(
+        &root,
+        "include-config-transaction",
+        &manifest.encode(),
+        0o600,
+    )?;
+    root.sync_all()
+        .context("failed to sync prepared guard config transaction")?;
+    if let Err(error) = link_unnamed_guard_file_at(&rollback, &parent, &rollback_name) {
+        unlink_guard_entry_if_matching_identity_at(
+            &parent,
+            &rollback_name,
+            manifest.rollback_identity,
+        )?;
+        parent
+            .sync_all()
+            .context("failed to sync failed rollback publication cleanup")?;
+        cleanup_guard_config_journal(&root)?;
+        return Err(error).context("failed to publish exact guard config rollback");
+    }
+    if let Err(error) = link_unnamed_guard_file_at(&staged, &parent, &lock_name) {
+        unlink_guard_entry_if_matching_identity_at(&parent, &lock_name, manifest.staged_identity)?;
+        unlink_guard_entry_if_identity_at(
+            &parent,
+            &rollback_name,
+            manifest.rollback_identity,
+            false,
+        )?;
+        parent
+            .sync_all()
+            .context("failed to sync failed config-lock acquisition cleanup")?;
+        cleanup_guard_config_journal(&root)?;
+        return Err(error).context("failed to acquire exact Git configuration lock");
+    }
+    parent
+        .sync_all()
+        .context("failed to sync published Git configuration lock")?;
+    complete_guard_config_transaction(layout, &root, &parent, file_name, &manifest)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuardConfigTransaction {
+    add: bool,
+    before_present: bool,
+    delete_after: bool,
+    before_identity: (u64, u64),
+    before_mode: u32,
+    staged_identity: (u64, u64),
+    staged_mode: u32,
+    rollback_identity: (u64, u64),
+    rollback_mode: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl GuardConfigTransaction {
+    fn encode(&self) -> Vec<u8> {
+        format!(
+            "v2|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\n",
+            u8::from(self.add),
+            u8::from(self.before_present),
+            u8::from(self.delete_after),
+            self.before_identity.0,
+            self.before_identity.1,
+            self.before_mode,
+            self.staged_identity.0,
+            self.staged_identity.1,
+            self.staged_mode,
+            self.rollback_identity.0,
+            self.rollback_identity.1,
+            self.rollback_mode,
+        )
+        .into_bytes()
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let text =
+            std::str::from_utf8(bytes).context("guard config transaction manifest is not UTF-8")?;
+        let text = text
+            .strip_suffix('\n')
+            .context("guard config transaction manifest is not newline terminated")?;
+        let fields = text.split('|').collect::<Vec<_>>();
+        if fields.len() != 13 || fields[0] != "v2" {
+            bail!("guard config transaction manifest has an unknown shape");
+        }
+        let parse_bool = |value: &str| -> Result<bool> {
+            match value {
+                "0" => Ok(false),
+                "1" => Ok(true),
+                _ => bail!("guard config transaction boolean is invalid"),
+            }
+        };
+        Ok(Self {
+            add: parse_bool(fields[1])?,
+            before_present: parse_bool(fields[2])?,
+            delete_after: parse_bool(fields[3])?,
+            before_identity: (
+                fields[4]
+                    .parse()
+                    .context("invalid config preimage device")?,
+                fields[5].parse().context("invalid config preimage inode")?,
+            ),
+            before_mode: fields[6].parse().context("invalid config preimage mode")?,
+            staged_identity: (
+                fields[7].parse().context("invalid staged config device")?,
+                fields[8].parse().context("invalid staged config inode")?,
+            ),
+            staged_mode: fields[9].parse().context("invalid staged config mode")?,
+            rollback_identity: (
+                fields[10]
+                    .parse()
+                    .context("invalid rollback config device")?,
+                fields[11]
+                    .parse()
+                    .context("invalid rollback config inode")?,
+            ),
+            rollback_mode: fields[12].parse().context("invalid rollback config mode")?,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn recover_guard_config_transaction(
+    layout: &WorktreeGuardLayout,
+    root: &File,
+    parent: &File,
+    file_name: &str,
+) -> Result<Option<bool>> {
+    let lock_name = format!("{file_name}.lock");
+    let rollback_name = format!("{file_name}.maco-worktree-guard-rollback");
+    if !guard_file_exists_at(root, "include-config-transaction")? {
+        if guard_file_exists_at(parent, &lock_name)?
+            || guard_file_exists_at(parent, &rollback_name)?
+        {
+            bail!("guard config lock or rollback exists without a recoverable transaction");
+        }
+        cleanup_incomplete_guard_config_journal(root)?;
+        return Ok(None);
+    }
+    let manifest = GuardConfigTransaction::decode(&read_guard_regular_file_at(
+        root,
+        "include-config-transaction",
+        1024,
+    )?)?;
+    if !guard_file_exists_at(parent, &lock_name)?
+        && !guard_file_exists_at(root, "include-config-exchanged")?
+    {
+        let target = optional_guard_snapshot_at(parent, file_name, MAX_MANAGED_REGISTRY_BYTES)?;
+        let after =
+            read_guard_regular_file_at(root, "include-config-after", MAX_MANAGED_REGISTRY_BYTES)?;
+        let target_is_staged = snapshot_matches(
+            target.as_ref(),
+            &after,
+            manifest.staged_mode,
+            manifest.staged_identity,
+        );
+        // Exchange of an existing target always retains the deterministic
+        // lock. With no lock/phase, that publication never occurred. For an
+        // absent target, no-replace rename consumes the lock, so only the
+        // exact staged inode proves a committed publication.
+        let publication_never_started = manifest.before_present || !target_is_staged;
+        if publication_never_started {
+            if guard_file_exists_at(parent, &rollback_name)? {
+                unlink_guard_entry_if_identity_at(
+                    parent,
+                    &rollback_name,
+                    manifest.rollback_identity,
+                    false,
+                )?;
+                parent
+                    .sync_all()
+                    .context("failed to sync abandoned guard config rollback")?;
+            }
+            cleanup_guard_config_journal(root)?;
+            return Ok(None);
+        }
+    }
+    complete_guard_config_transaction(layout, root, parent, file_name, &manifest)?;
+    Ok(Some(manifest.add))
+}
+
+#[cfg(target_os = "linux")]
+fn complete_guard_config_transaction(
+    layout: &WorktreeGuardLayout,
+    root: &File,
+    parent: &File,
+    file_name: &str,
+    manifest: &GuardConfigTransaction,
+) -> Result<()> {
+    let before =
+        read_guard_regular_file_at(root, "include-config-before", MAX_MANAGED_REGISTRY_BYTES)?;
+    let after =
+        read_guard_regular_file_at(root, "include-config-after", MAX_MANAGED_REGISTRY_BYTES)?;
+    let lock_name = format!("{file_name}.lock");
+    let rollback_name = format!("{file_name}.maco-worktree-guard-rollback");
+    let target = optional_guard_snapshot_at(parent, file_name, MAX_MANAGED_REGISTRY_BYTES)?;
+    let target_identity = guard_entry_identity_at(parent, file_name)?;
+    let lock = optional_guard_snapshot_at(parent, &lock_name, MAX_MANAGED_REGISTRY_BYTES)?;
+    let lock_identity = guard_entry_identity_at(parent, &lock_name)?;
+    let rollback = optional_guard_snapshot_at(parent, &rollback_name, MAX_MANAGED_REGISTRY_BYTES)?;
+    let rollback_identity = guard_entry_identity_at(parent, &rollback_name)?;
+    let target_is_before = manifest.before_present
+        && snapshot_matches(
+            target.as_ref(),
+            &before,
+            manifest.before_mode,
+            manifest.before_identity,
+        );
+    let target_is_staged = snapshot_matches(
+        target.as_ref(),
+        &after,
+        manifest.staged_mode,
+        manifest.staged_identity,
+    );
+    let target_is_rollback = snapshot_matches(
+        target.as_ref(),
+        &before,
+        manifest.rollback_mode,
+        manifest.rollback_identity,
+    );
+    let lock_is_staged = snapshot_matches(
+        lock.as_ref(),
+        &after,
+        manifest.staged_mode,
+        manifest.staged_identity,
+    );
+    let lock_is_before = manifest.before_present
+        && snapshot_matches(
+            lock.as_ref(),
+            &before,
+            manifest.before_mode,
+            manifest.before_identity,
+        );
+    let rollback_is_before = snapshot_matches(
+        rollback.as_ref(),
+        &before,
+        manifest.rollback_mode,
+        manifest.rollback_identity,
+    );
+    let rollback_is_staged = snapshot_matches(
+        rollback.as_ref(),
+        &after,
+        manifest.staged_mode,
+        manifest.staged_identity,
+    );
+
+    if (manifest.before_present && target_is_before && lock_is_staged)
+        || (!manifest.before_present && target.is_none() && lock_is_staged)
+    {
+        if !rollback_is_before {
+            bail!("guard config rollback changed before exchange; preserving transaction");
+        }
+        if manifest.before_present {
+            rename_guard_entry_exchange_at(parent, &lock_name, file_name)?;
+        } else {
+            rename_guard_entry_noreplace_at(parent, &lock_name, file_name)?;
+        }
+        parent
+            .sync_all()
+            .context("failed to sync guard config exchange")?;
+        return complete_guard_config_transaction(layout, root, parent, file_name, manifest);
+    }
+
+    if target_is_staged && manifest.before_present && lock_identity.is_some() && !lock_is_before {
+        // Never exchange an unproven lock into the live configuration. Swap
+        // only MACO's journaled rollback inode with the exact staged target.
+        if !rollback_is_before {
+            bail!("guard config mismatch has no exact owned rollback; preserving transaction");
+        }
+        if guard_entry_identity_at(parent, file_name)? != Some(manifest.staged_identity) {
+            bail!("staged guard config target changed before rollback exchange; preserving transaction");
+        }
+        rename_guard_entry_exchange_at(parent, &rollback_name, file_name)?;
+        let restored_target =
+            optional_guard_snapshot_at(parent, file_name, MAX_MANAGED_REGISTRY_BYTES)?;
+        let retired_staged =
+            optional_guard_snapshot_at(parent, &rollback_name, MAX_MANAGED_REGISTRY_BYTES)?;
+        let retired_identity = guard_entry_identity_at(parent, &rollback_name)?;
+        if guard_entry_identity_at(parent, file_name)? == Some(manifest.rollback_identity)
+            && retired_identity.is_some()
+            && retired_identity != Some(manifest.staged_identity)
+        {
+            // The target name raced after its last exact check. Put that
+            // unproven entry back at the live name and retain our rollback.
+            rename_guard_entry_exchange_at(parent, &rollback_name, file_name)?;
+            if guard_entry_identity_at(parent, file_name)? != retired_identity
+                || guard_entry_identity_at(parent, &rollback_name)?
+                    != Some(manifest.rollback_identity)
+            {
+                bail!("raced guard config rollback could not restore the displaced target; preserving journal");
+            }
+            parent
+                .sync_all()
+                .context("failed to sync restoration of raced config target")?;
+            bail!("guard include configuration raced the rollback exchange; concurrent target restored");
+        }
+        if !snapshot_matches(
+            restored_target.as_ref(),
+            &before,
+            manifest.rollback_mode,
+            manifest.rollback_identity,
+        ) || !snapshot_matches(
+            retired_staged.as_ref(),
+            &after,
+            manifest.staged_mode,
+            manifest.staged_identity,
+        ) {
+            bail!("guard config mismatch rollback could not be proven; preserving journal");
+        }
+        unlink_guard_entry_if_identity_at(parent, &rollback_name, manifest.staged_identity, false)?;
+        parent
+            .sync_all()
+            .context("failed to sync config rollback")?;
+        cleanup_guard_config_journal(root)?;
+        bail!("guard include configuration changed before exchange; exact preimage restored without touching the foreign lock");
+    }
+
+    if manifest.before_present && target_is_rollback && rollback_is_staged {
+        // Recovery after the owned rollback exchange completed but before its
+        // staged inode and journal were removed. Any lock is unproven and is
+        // deliberately left untouched.
+        unlink_guard_entry_if_identity_at(parent, &rollback_name, manifest.staged_identity, false)?;
+        parent
+            .sync_all()
+            .context("failed to sync recovered config rollback")?;
+        cleanup_guard_config_journal(root)?;
+        bail!("recovered exact guard config preimage without touching the current lock");
+    }
+
+    if manifest.before_present && target_is_rollback && rollback_identity.is_none() {
+        // The exact, uniquely journaled rollback inode is already live and its
+        // retired staged name is gone. This cannot be a pre-exchange target:
+        // the rollback inode originated as an unnamed O_TMPFILE. Preserve any
+        // current lock, durably recognize the completed rollback, and report
+        // the original mutation as failed rather than promoting it to success.
+        parent
+            .sync_all()
+            .context("failed to sync completed guard config rollback recovery")?;
+        cleanup_guard_config_journal(root)?;
+        bail!("recovered completed guard config rollback without touching the current lock");
+    }
+
+    if manifest.before_present && lock_is_before && !target_is_staged {
+        let current = match (target.as_ref(), target_identity) {
+            (Some(snapshot), Some(_)) => Some(snapshot.0.as_slice()),
+            (None, None) => None,
+            _ => {
+                bail!("concurrent guard config target has an unsafe type; preserving transaction")
+            }
+        };
+        let fragment = expected_guard_include_fragment(layout)?;
+        let fragment_count = current.map_or(0, |bytes| {
+            bytes
+                .windows(fragment.len())
+                .filter(|window| *window == fragment.as_slice())
+                .count()
+        });
+        if fragment_count > 1 {
+            bail!("concurrent guard config target has duplicate owned fragments; preserving transaction");
+        }
+        if !rollback_is_before {
+            bail!("concurrent guard config recovery has no exact owned rollback; preserving transaction");
+        }
+        unlink_guard_entry_if_identity_at(parent, &lock_name, manifest.before_identity, false)?;
+        unlink_guard_entry_if_identity_at(
+            parent,
+            &rollback_name,
+            manifest.rollback_identity,
+            false,
+        )?;
+        parent
+            .sync_all()
+            .context("failed to sync concurrent guard config recovery")?;
+        cleanup_guard_config_journal(root)?;
+        let desired_count = if manifest.add { 1 } else { 0 };
+        if fragment_count == desired_count {
+            return Ok(());
+        }
+        return mutate_guard_include_fragment(layout, manifest.add);
+    }
+
+    let exchanged_marker = guard_file_exists_at(root, "include-config-exchanged")?;
+    if manifest.delete_after && target.is_none() && lock_is_staged && exchanged_marker {
+        unlink_guard_entry_if_identity_at(parent, &lock_name, manifest.staged_identity, false)?;
+        if rollback_identity.is_some() {
+            unlink_guard_entry_if_identity_at(
+                parent,
+                &rollback_name,
+                manifest.rollback_identity,
+                false,
+            )?;
+        }
+        parent
+            .sync_all()
+            .context("failed to sync recovered guard-created config removal")?;
+        cleanup_guard_config_journal(root)?;
+        return Ok(());
+    }
+    let committed = target_is_staged
+        && ((!manifest.before_present && lock.is_none())
+            || (manifest.before_present
+                && (lock_is_before || (lock.is_none() && exchanged_marker))));
+    let removed_after_commit =
+        manifest.delete_after && target.is_none() && lock.is_none() && exchanged_marker;
+    if !committed && !removed_after_commit {
+        if lock_is_staged && !target_is_before && !target_is_staged {
+            // Exchange never happened; return only our staged lock to MACO.
+            unlink_guard_entry_if_identity_at(parent, &lock_name, manifest.staged_identity, false)?;
+            if rollback_identity.is_some() {
+                unlink_guard_entry_if_identity_at(
+                    parent,
+                    &rollback_name,
+                    manifest.rollback_identity,
+                    false,
+                )?;
+            }
+            parent
+                .sync_all()
+                .context("failed to sync abandoned guard config publication")?;
+            cleanup_guard_config_journal(root)?;
+        }
+        bail!("ambiguous guard config transaction state; preserving journaled entries");
+    }
+
+    if !exchanged_marker {
+        publish_exact_guard_file_at(root, "include-config-exchanged", b"exchanged\n", 0o600)?;
+        root.sync_all()
+            .context("failed to sync exchanged config phase")?;
+    }
+    if lock_is_before {
+        unlink_guard_entry_if_identity_at(parent, &lock_name, manifest.before_identity, false)?;
+    }
+    if manifest.delete_after && !removed_after_commit {
+        rename_guard_entry_noreplace_at(parent, file_name, &lock_name)?;
+        if guard_entry_identity_at(parent, &lock_name)? != Some(manifest.staged_identity) {
+            if guard_entry_identity_at(parent, file_name)?.is_none() {
+                rename_guard_entry_noreplace_at(parent, &lock_name, file_name)
+                    .context("failed to restore raced config removal")?;
+            }
+            bail!("guard-created config changed during final removal");
+        }
+        unlink_guard_entry_if_identity_at(parent, &lock_name, manifest.staged_identity, false)?;
+    }
+    if rollback_identity.is_some() {
+        unlink_guard_entry_if_identity_at(
+            parent,
+            &rollback_name,
+            manifest.rollback_identity,
+            false,
+        )?;
+    }
+    parent
+        .sync_all()
+        .context("failed to sync completed guard config transaction")?;
+    cleanup_guard_config_journal(root)?;
+    verify_guard_directory_binding(&layout.root, root, "guard root")?;
+    verify_guard_directory_binding(
+        layout
+            .include_config
+            .parent()
+            .context("guard include configuration has no parent")?,
+        parent,
+        "guard include configuration parent",
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_matches(
+    snapshot: Option<&(Vec<u8>, u32, (u64, u64))>,
+    bytes: &[u8],
+    mode: u32,
+    identity: (u64, u64),
+) -> bool {
+    snapshot
+        .is_some_and(|snapshot| snapshot.0 == bytes && snapshot.1 == mode && snapshot.2 == identity)
+}
+
+#[cfg(target_os = "linux")]
+fn optional_guard_snapshot_at(
+    directory: &File,
+    name: &str,
+    max_bytes: u64,
+) -> Result<Option<(Vec<u8>, u32, (u64, u64))>> {
+    if guard_entry_identity_at(directory, name)?.is_none() {
+        return Ok(None);
+    }
+    match read_guard_regular_snapshot_at(directory, name, max_bytes) {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        // Preserve an unexpected entry for the transaction state machine to
+        // classify by no-follow identity; never follow or delete it here.
+        Err(_) => Ok(None),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn guard_entry_identity_at(directory: &File, name: &str) -> Result<Option<(u64, u64)>> {
+    let name = guard_component(name)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0
+    {
+        let stat = unsafe { stat.assume_init() };
+        return Ok(Some((stat.st_dev, stat.st_ino)));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == ErrorKind::NotFound {
+        Ok(None)
+    } else {
+        Err(error).context("failed to inspect guard transaction entry identity")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unlink_guard_entry_if_identity_at(
+    directory: &File,
+    name: &str,
+    expected_identity: (u64, u64),
+    allow_missing: bool,
+) -> Result<()> {
+    match guard_entry_identity_at(directory, name)? {
+        Some(identity) if identity == expected_identity => {
+            unlink_guard_entry_at(directory, name, 0, false)
+        }
+        None if allow_missing => Ok(()),
+        None => bail!("owned guard transaction entry disappeared before removal"),
+        Some(_) => bail!("guard transaction entry identity changed; preserving it"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unlink_guard_entry_if_matching_identity_at(
+    directory: &File,
+    name: &str,
+    expected_identity: (u64, u64),
+) -> Result<bool> {
+    if guard_entry_identity_at(directory, name)? != Some(expected_identity) {
+        return Ok(false);
+    }
+    unlink_guard_entry_at(directory, name, 0, false)?;
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_incomplete_guard_config_journal(root: &File) -> Result<()> {
+    for name in [
+        "include-config-before",
+        "include-config-after",
+        "include-config-exchanged",
+    ] {
+        unlink_guard_entry_at(root, name, 0, true)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_guard_config_journal(root: &File) -> Result<()> {
+    unlink_guard_entry_at(root, "include-config-transaction", 0, true)?;
+    cleanup_incomplete_guard_config_journal(root)?;
+    root.sync_all()
+        .context("failed to sync guard config journal cleanup")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn mutate_guard_include_fragment(_layout: &WorktreeGuardLayout, _add: bool) -> Result<()> {
+    bail!("descriptor-safe guard include mutation requires Linux renameat2")
+}
+
+#[cfg(unix)]
+fn expected_guard_include_fragment(layout: &WorktreeGuardLayout) -> Result<Vec<u8>> {
+    let condition = guard_include_condition(&layout.git_dir, &layout.common_dir)?;
+    let mut fragment = b"\n[includeIf \"gitdir:".to_vec();
+    append_git_config_quoted(&mut fragment, condition.as_bytes())?;
+    fragment.extend_from_slice(b"\"]\n\tpath = \"");
+    append_git_config_quoted(&mut fragment, layout.config_text.as_bytes())?;
+    fragment.extend_from_slice(b"\"\n");
+    Ok(fragment)
+}
+
+#[cfg(unix)]
+fn append_git_config_quoted(output: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+    for byte in value {
+        match byte {
+            b'\\' => output.extend_from_slice(b"\\\\"),
+            b'\"' => output.extend_from_slice(b"\\\""),
+            b'\n' | b'\r' | 0 => bail!("guard Git config value contains an unsupported byte"),
+            b'\t' => output.extend_from_slice(b"\\t"),
+            b'\x08' => output.extend_from_slice(b"\\b"),
+            _ => output.push(*byte),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn require_guard_marker(layout: &WorktreeGuardLayout) -> Result<()> {
+    let marker = layout.root.join("marker");
+    require_regular_guard_file(&marker)?;
+    if fs::read(&marker).context("failed to read guard ownership marker")?
+        != WORKTREE_GUARD_MARKER.as_bytes()
+    {
+        bail!("MACO worktree guard ownership marker is missing or changed");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn require_guard_state(layout: &WorktreeGuardLayout, mode: &WorktreeGuardMode) -> Result<()> {
+    let observed_mode = read_guard_text_line(&layout.root.join("mode"))?;
+    if observed_mode != mode.label() {
+        bail!("worktree guard mode does not match the requested installation");
+    }
+    let observed_branch = read_guard_text_line(&layout.root.join("expected-branch"))?;
+    if observed_branch != mode.expected_branch().unwrap_or_default() {
+        bail!("worktree guard expected branch does not match managed identity");
+    }
+    let observed_git_dir = read_guard_path_line(&layout.root.join("git-dir"))?;
+    if observed_git_dir != layout.git_dir {
+        bail!("worktree guard Git-directory binding changed");
+    }
+    let observed_common = read_guard_path_line(&layout.root.join("common-dir"))?;
+    if observed_common != layout.common_dir {
+        bail!("worktree guard common-directory binding changed");
+    }
+    let previous_hooks = read_guard_path_line(&layout.root.join("previous-hooks-path"))?;
+    if previous_hooks == layout.hooks {
+        bail!("worktree guard previous hook path loops back to itself");
+    }
+    let previous_git_dir_hooks =
+        read_guard_path_line(&layout.root.join("previous-git-dir-hooks-path"))?;
+    if previous_git_dir_hooks == layout.hooks {
+        bail!("worktree guard previous Git-directory hook path loops back to itself");
+    }
+    for state in ["human-v3-chained-commit-msg", "human-v3-chained-pre-push"] {
+        if !matches!(
+            read_guard_text_line(&layout.root.join(state))?.as_str(),
+            "true" | "false"
+        ) {
+            bail!("worktree guard human-authorship composition state is invalid");
+        }
+    }
+    let observed_include_level = read_guard_text_line(&layout.root.join("include-level"))?;
+    if observed_include_level != layout.include_level.label() {
+        bail!("worktree guard include level changed");
+    }
+    let observed_include_config_created =
+        read_guard_text_line(&layout.root.join("include-config-created"))?;
+    let expected_include_config_created = if layout.include_config_created {
+        "true"
+    } else {
+        "false"
+    };
+    if observed_include_config_created != expected_include_config_created {
+        bail!("worktree guard include configuration ownership changed");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_guard_text_line(path: &Path) -> Result<String> {
+    let bytes = read_guard_line_bytes(path)?;
+    String::from_utf8(bytes).context("guard state is not valid UTF-8")
+}
+
+#[cfg(unix)]
+fn read_guard_path_line(path: &Path) -> Result<PathBuf> {
+    Ok(PathBuf::from(OsString::from_vec(read_guard_line_bytes(
+        path,
+    )?)))
+}
+
+#[cfg(unix)]
+fn read_guard_line_bytes(path: &Path) -> Result<Vec<u8>> {
+    require_regular_guard_file(path)?;
+    let mut bytes =
+        fs::read(path).with_context(|| format!("failed to read guard state {}", path.display()))?;
+    if bytes.last() != Some(&b'\n') {
+        bail!("guard state is not a single newline-terminated value");
+    }
+    bytes.pop();
+    if bytes.contains(&b'\n') || bytes.contains(&b'\r') {
+        bail!("guard state contains multiple lines");
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn require_regular_guard_file(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect guard file {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "guard file is not a non-symlink regular file: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_guard_tree_entries(layout: &WorktreeGuardLayout, allow_missing: bool) -> Result<()> {
+    let required_root = BTreeSet::from([
+        OsString::from("marker"),
+        OsString::from("mode"),
+        OsString::from("expected-branch"),
+        OsString::from("git-dir"),
+        OsString::from("previous-hooks-path"),
+        OsString::from("previous-git-dir-hooks-path"),
+        OsString::from("human-v3-chained-commit-msg"),
+        OsString::from("human-v3-chained-pre-push"),
+        OsString::from("common-dir"),
+        OsString::from("include-level"),
+        OsString::from("include-config-created"),
+        OsString::from("config"),
+        OsString::from("hooks"),
+    ]);
+    let mut permitted_root = required_root.clone();
+    permitted_root.insert(OsString::from("human-v3-migration-commit-msg"));
+    permitted_root.insert(OsString::from("human-v3-original-commit-msg"));
+    permitted_root.insert(OsString::from("human-v3-migration-pre-push"));
+    permitted_root.insert(OsString::from("human-v3-original-pre-push"));
+    permitted_root.insert(OsString::from("include-config-transaction"));
+    permitted_root.insert(OsString::from("include-config-before"));
+    permitted_root.insert(OsString::from("include-config-after"));
+    permitted_root.insert(OsString::from("include-config-exchanged"));
+    let observed_root = fs::read_dir(&layout.root)
+        .context("failed to enumerate guard root")?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<BTreeSet<_>>>()?;
+    if (!allow_missing && !required_root.is_subset(&observed_root))
+        || !observed_root.is_subset(&permitted_root)
+    {
+        bail!("guard root contains unexpected entries; refusing recursive removal");
+    }
+    let expected_hooks = WORKTREE_GUARD_HOOK_NAMES
+        .iter()
+        .map(OsString::from)
+        .collect::<BTreeSet<_>>();
+    let mut permitted_hooks = expected_hooks.clone();
+    permitted_hooks.insert(OsString::from("commit-msg.human-authorship-previous"));
+    permitted_hooks.insert(OsString::from("pre-push.human-authorship-previous"));
+    match fs::read_dir(&layout.hooks) {
+        Ok(entries) => {
+            let observed_hooks = entries
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<std::io::Result<BTreeSet<_>>>()?;
+            if (!allow_missing && !expected_hooks.is_subset(&observed_hooks))
+                || !observed_hooks.is_subset(&permitted_hooks)
+            {
+                bail!("guard hooks directory contains unexpected entries; refusing removal");
+            }
+        }
+        Err(error) if allow_missing && error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("failed to enumerate guard hooks"),
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_guard_owned_tree(
+    layout: &WorktreeGuardLayout,
+    root: &File,
+    hooks: Option<&File>,
+) -> Result<()> {
+    if let Some(hooks) = hooks {
+        for hook_name in WORKTREE_GUARD_HOOK_NAMES {
+            unlink_guard_entry_at(hooks, hook_name, 0, true)
+                .with_context(|| format!("failed to remove MACO guard hook {hook_name}"))?;
+        }
+        for backup in [
+            "commit-msg.human-authorship-previous",
+            "pre-push.human-authorship-previous",
+        ] {
+            unlink_guard_entry_at(hooks, backup, 0, true)
+                .with_context(|| format!("failed to remove migrated MACO guard hook {backup}"))?;
+        }
+        verify_guard_directory_binding(&layout.hooks, hooks, "guard hooks")?;
+        unlink_guard_entry_at(root, "hooks", libc::AT_REMOVEDIR, true)
+            .context("failed to remove guard hooks directory")?;
+    }
+    for state_name in [
+        "mode",
+        "expected-branch",
+        "git-dir",
+        "previous-hooks-path",
+        "previous-git-dir-hooks-path",
+        "human-v3-chained-commit-msg",
+        "human-v3-chained-pre-push",
+        "common-dir",
+        "include-level",
+        "include-config-created",
+        "human-v3-migration-commit-msg",
+        "human-v3-original-commit-msg",
+        "human-v3-migration-pre-push",
+        "human-v3-original-pre-push",
+        "include-config-transaction",
+        "include-config-before",
+        "include-config-after",
+        "include-config-exchanged",
+        "config",
+    ] {
+        unlink_guard_entry_at(root, state_name, 0, true)
+            .with_context(|| format!("failed to remove MACO guard state {state_name}"))?;
+    }
+    unlink_guard_entry_at(root, "marker", 0, true)
+        .context("failed to remove MACO guard ownership marker")?;
+    root.sync_all()
+        .context("failed to sync emptied guard root")?;
+    verify_guard_directory_binding(&layout.root, root, "guard root")?;
+    let git_dir = open_guard_directory(&layout.git_dir, "worktree Git directory")?;
+    unlink_guard_entry_at(
+        &git_dir,
+        WORKTREE_GUARD_DIRECTORY,
+        libc::AT_REMOVEDIR,
+        false,
+    )
+    .context("failed to remove MACO guard root")?;
+    git_dir
+        .sync_all()
+        .context("failed to sync worktree Git directory after guard removal")
+}
+
+#[cfg(unix)]
+fn unlink_guard_entry_at(
+    directory: &File,
+    name: &str,
+    flags: libc::c_int,
+    allow_missing: bool,
+) -> Result<()> {
+    let name = guard_component(name)?;
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), flags) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if allow_missing && error.kind() == ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(error).context("descriptor-relative guard entry removal failed")
+    }
+}
+
+#[cfg(unix)]
+fn worktree_guard_report(
+    layout: &WorktreeGuardLayout,
+    mode: &WorktreeGuardMode,
+    status: WorktreeGuardStatus,
+) -> WorktreeGuardReport {
+    WorktreeGuardReport {
+        status,
+        worktree_path: layout.worktree_path.clone(),
+        hooks_path: layout.hooks.clone(),
+        mode: mode.label().to_string(),
+        expected_branch: mode.expected_branch().map(ToOwned::to_owned),
     }
 }
 
@@ -8795,6 +11846,10 @@ fn recover_create_operation(
         registry
             .operations
             .insert(operation.name.clone(), operation.clone());
+        // Persist the authenticated observed binding before the final
+        // registration/guard phase. There is intentionally no guard mutation
+        // before this durable phase, and relative pre-existing hooksPath values
+        // now resolve from the final worktree rather than temporary staging.
         store.save(lock, registry)?;
     }
 
@@ -8863,7 +11918,43 @@ fn recover_create_operation(
                 );
             }
         } else {
-            registry.records.insert(operation.name.clone(), binding);
+            registry
+                .records
+                .insert(operation.name.clone(), binding.clone());
+        }
+        // Keep CreateObserved durable alongside the authenticated record until
+        // the guard has been installed and the lane identity has been checked
+        // again. A crash cannot expose guard state for an unregistered lane,
+        // and a failed install remains recoverable under the creation lock.
+        store.save(lock, registry)?;
+        install_managed_worktree_guard(&operation.path, &operation.branch).with_context(|| {
+            format!(
+                "failed to verify worktree guard for registered managed lane '{}'",
+                operation.name
+            )
+        })?;
+        verify_worktree_clean_at(
+            &operation.path,
+            &operation.branch,
+            expected_branch_oid,
+            cleanliness,
+        )?;
+        let mut guarded_binding = capture_managed_worktree_binding(
+            repo,
+            &store.repository,
+            &root,
+            &operation.name,
+            &operation.branch,
+            operation.branch_ownership == ManagedBranchOwnership::CreatedByMaco,
+            base_oid,
+            expected_branch_oid,
+        )?;
+        guarded_binding.created_at_unix_nanos = binding.created_at_unix_nanos;
+        if guarded_binding != binding {
+            bail!(
+                "create operation '{}' binding changed during guard installation",
+                operation.name
+            );
         }
         registry.operations.remove(&operation.name);
         store.save(lock, registry)?;
@@ -9351,6 +12442,13 @@ fn recover_remove_operation(
             &worktree_quarantine,
             worktree_quarantine_identity,
         )?;
+        #[cfg(unix)]
+        uninstall_bound_managed_worktree_guard(repo, &binding).with_context(|| {
+            format!(
+                "failed to restore prior hooks after quarantining managed lane '{}'",
+                operation.name
+            )
+        })?;
         let metadata_quarantine = operation_metadata_quarantine_path(&operation)?;
         let metadata_exists = path_entry_exists(&binding.metadata_dir)?;
         let metadata_quarantine_exists = path_entry_exists(&metadata_quarantine)?;
@@ -11875,7 +14973,625 @@ fn require_verified_worktree_status_process(output: &ProcessOutput) -> Result<()
 mod tests {
     use super::*;
     use git2::{Oid, Signature};
+    #[cfg(unix)]
+    use std::process::{Command, Output};
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_worktree_guard_blocks_branch_mismatch_and_allows_own_branch() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let remote_path = temp.path().join("remote.git");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        assert_test_git_success(
+            temp.path(),
+            &[
+                "init",
+                "--bare",
+                remote_path.to_str().expect("UTF-8 remote path"),
+            ],
+        );
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        configure_test_git_identity(&repo);
+        commit_readme(&repo).expect("initial commit");
+        let lane = WorktreeManager::new(&repo_path)
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "guarded-lane".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root),
+            })
+            .expect("create guarded worktree");
+        let lane_repo = crate::git_repository::open(&lane.path).expect("open lane");
+        let verified = verify_worktree_guard(
+            &lane_repo,
+            &WorktreeGuardMode::Managed {
+                expected_branch: lane.branch.clone(),
+            },
+        )
+        .expect("verify creation-time guard");
+        assert_eq!(verified.status, WorktreeGuardStatus::Verified);
+        let bootstrapped = ensure_registered_managed_worktree_guard(&lane.path)
+            .expect("supervisor bootstrap must resolve the primary registry");
+        assert_eq!(bootstrapped.status, WorktreeGuardStatus::AlreadyInstalled);
+
+        let unregistered_path = temp.path().join("unregistered-linked");
+        assert_test_git_success(
+            &repo_path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "unregistered-guard-lane",
+                unregistered_path.to_str().expect("UTF-8 unregistered path"),
+            ],
+        );
+        let unregistered_error = ensure_registered_managed_worktree_guard(&unregistered_path)
+            .expect_err("unregistered linked worktree must fail closed");
+        assert!(unregistered_error
+            .to_string()
+            .contains("has no verified registry identity"));
+        let unregistered_repo =
+            crate::git_repository::open(&unregistered_path).expect("open unregistered worktree");
+        assert!(!unregistered_repo
+            .path()
+            .join(WORKTREE_GUARD_DIRECTORY)
+            .exists());
+        assert_test_git_success(
+            &lane.path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote_path.to_str().expect("UTF-8 remote path"),
+            ],
+        );
+
+        fs::write(lane.path.join("README.md"), "# own branch\n").expect("edit own branch");
+        assert_test_git_success(&lane.path, &["add", "README.md"]);
+        let own_commit = run_test_git(&lane.path, &["commit", "-m", "own branch"], &[]);
+        assert!(
+            own_commit.status.success(),
+            "own-branch commit must pass: {}",
+            String::from_utf8_lossy(&own_commit.stderr)
+        );
+        let own_push = run_test_git(&lane.path, &["push", "-u", "origin", "HEAD"], &[]);
+        assert!(
+            own_push.status.success(),
+            "own-branch push must pass: {}",
+            String::from_utf8_lossy(&own_push.stderr)
+        );
+
+        assert_test_git_success(&lane.path, &["switch", "-c", "foreign-branch"]);
+        fs::write(lane.path.join("README.md"), "# foreign branch\n").expect("edit foreign branch");
+        assert_test_git_success(&lane.path, &["add", "README.md"]);
+        let blocked = run_test_git(&lane.path, &["commit", "-m", "foreign blocked"], &[]);
+        assert!(!blocked.status.success(), "foreign branch must be blocked");
+        let blocked_stderr = String::from_utf8_lossy(&blocked.stderr);
+        assert!(blocked_stderr.contains("managed lane branch 'foreign-branch'"));
+        let environment_bypass = run_test_git(
+            &lane.path,
+            &["commit", "-m", "environment bypass"],
+            &[("MACO_GUARD_ALLOW", "1")],
+        );
+        assert!(!environment_bypass.status.success());
+        let prepared = run_test_git(
+            &lane.path,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-m",
+                "prepare foreign push",
+            ],
+            &[],
+        );
+        assert!(prepared.status.success());
+        let blocked_push = run_test_git(
+            &lane.path,
+            &["push", "origin", "HEAD:refs/heads/foreign-branch"],
+            &[],
+        );
+        assert!(!blocked_push.status.success());
+        assert!(String::from_utf8_lossy(&blocked_push.stderr)
+            .contains("push from managed lane branch 'foreign-branch'"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_worktree_guard_resolves_relative_prior_hooks_from_the_final_lane_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        configure_test_git_identity(&repo);
+        commit_readme(&repo).expect("initial commit");
+
+        let relative_hooks = repo_path.join(".githooks");
+        fs::create_dir(&relative_hooks).expect("create relative hooks directory");
+        let relative_pre_commit = relative_hooks.join("pre-commit");
+        fs::write(
+            &relative_pre_commit,
+            "#!/bin/sh\nprintf 'relative-pre-commit\\n' >> \"$(git rev-parse --git-common-dir)/relative-hook-ran\"\n",
+        )
+        .expect("write relative pre-commit hook");
+        fs::set_permissions(&relative_pre_commit, fs::Permissions::from_mode(0o700))
+            .expect("make relative pre-commit hook executable");
+        assert_test_git_success(&repo_path, &["add", ".githooks/pre-commit"]);
+        assert_test_git_success(&repo_path, &["commit", "-m", "add relative hook"]);
+        assert_test_git_success(&repo_path, &["config", "core.hooksPath", ".githooks"]);
+
+        let lane = WorktreeManager::new(&repo_path)
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "relative-hook-lane".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root),
+            })
+            .expect("create guarded worktree");
+        let lane_repo = crate::git_repository::open(&lane.path).expect("open lane");
+        let layout = worktree_guard_layout(&lane_repo).expect("resolve guard layout");
+        assert_eq!(
+            read_guard_path_line(&layout.root.join("previous-hooks-path"))
+                .expect("read chained hooks path"),
+            lane.path.join(".githooks")
+        );
+        assert_eq!(
+            read_guard_path_line(&layout.root.join("previous-git-dir-hooks-path"))
+                .expect("read chained Git-directory hooks path"),
+            layout.git_dir.join(".githooks")
+        );
+
+        fs::write(lane.path.join("README.md"), "# relative hook lane\n").expect("edit lane");
+        assert_test_git_success(&lane.path, &["add", "README.md"]);
+        assert_test_git_success(&lane.path, &["commit", "-m", "exercise relative hook"]);
+        assert_eq!(
+            read_test_hook_log(&repo, "relative-hook-ran"),
+            "relative-pre-commit\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn primary_worktree_guard_blocks_agent_and_custom_managed_branches_and_chains_hooks() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        configure_test_git_identity(&repo);
+        commit_readme(&repo).expect("initial commit");
+        install_test_repository_hooks(&repo);
+        let lane = WorktreeManager::new(&repo_path)
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "custom-lane".to_string(),
+                branch: Some("workers/custom-lane".to_string()),
+                base: None,
+                worktree_root: Some(worktree_root),
+            })
+            .expect("create custom-branch lane");
+        let primary_guard =
+            install_primary_worktree_guard(&repo_path).expect("install primary guard");
+
+        fs::write(repo_path.join("README.md"), "# primary main\n").expect("edit primary main");
+        assert_test_git_success(&repo_path, &["add", "README.md"]);
+        let allowed = run_test_git(&repo_path, &["commit", "-m", "primary main"], &[]);
+        assert!(
+            allowed.status.success(),
+            "primary main commit must pass: {}",
+            String::from_utf8_lossy(&allowed.stderr)
+        );
+        assert_eq!(read_test_hook_log(&repo, "pre-commit-ran"), "pre-commit\n");
+        assert_eq!(read_test_hook_log(&repo, "commit-msg-ran"), "commit-msg\n");
+        let allowed_push =
+            run_test_hook(&repo_path, &primary_guard.hooks_path.join("pre-push"), &[]);
+        assert!(
+            allowed_push.status.success(),
+            "primary human-branch push hook must pass: {}",
+            String::from_utf8_lossy(&allowed_push.stderr)
+        );
+        assert_eq!(read_test_hook_log(&repo, "pre-push-ran"), "pre-push\n");
+
+        assert_test_git_success(&repo_path, &["switch", "-c", "task/human-owned"]);
+        fs::write(repo_path.join("README.md"), "# primary human branch\n")
+            .expect("edit primary human branch");
+        assert_test_git_success(&repo_path, &["add", "README.md"]);
+        assert_test_git_success(&repo_path, &["commit", "-m", "human branch"]);
+        let human_push = run_test_hook(&repo_path, &primary_guard.hooks_path.join("pre-push"), &[]);
+        assert!(human_push.status.success());
+
+        assert_test_git_success(&repo_path, &["switch", "-c", "maco/rogue"]);
+        fs::write(repo_path.join("README.md"), "# rogue\n").expect("edit rogue branch");
+        assert_test_git_success(&repo_path, &["add", "README.md"]);
+        let maco_blocked = run_test_git(&repo_path, &["commit", "-m", "rogue"], &[]);
+        assert!(!maco_blocked.status.success());
+        let maco_stderr = String::from_utf8_lossy(&maco_blocked.stderr);
+        assert!(maco_stderr.contains("primary worktree on agent branch 'maco/rogue'"));
+        assert_eq!(
+            read_test_hook_log(&repo, "pre-commit-ran"),
+            "pre-commit\npre-commit\n"
+        );
+        let blocked_push =
+            run_test_hook(&repo_path, &primary_guard.hooks_path.join("pre-push"), &[]);
+        assert!(!blocked_push.status.success());
+        assert!(String::from_utf8_lossy(&blocked_push.stderr)
+            .contains("push from the primary worktree on agent branch 'maco/rogue'"));
+        assert_eq!(
+            read_test_hook_log(&repo, "pre-push-ran"),
+            "pre-push\npre-push\n"
+        );
+
+        assert_test_git_success(&repo_path, &["reset", "--hard", "HEAD"]);
+        assert_test_git_success(&repo_path, &["switch", "main"]);
+        assert_test_git_success(&lane.path, &["switch", "-c", "lane-parking"]);
+        assert_test_git_success(&repo_path, &["switch", "workers/custom-lane"]);
+        fs::write(repo_path.join("README.md"), "# custom managed\n")
+            .expect("edit custom managed branch");
+        assert_test_git_success(&repo_path, &["add", "README.md"]);
+        let custom_blocked = run_test_git(&repo_path, &["commit", "-m", "custom"], &[]);
+        assert!(!custom_blocked.status.success());
+        assert!(String::from_utf8_lossy(&custom_blocked.stderr)
+            .contains("primary worktree on managed branch 'workers/custom-lane'"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_guard_reinstall_is_idempotent_and_uninstall_restores_existing_hooks() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        configure_test_git_identity(&repo);
+        commit_readme(&repo).expect("initial commit");
+        install_test_repository_hooks(&repo);
+
+        let first = install_primary_worktree_guard(&repo_path).expect("first install");
+        let second = install_primary_worktree_guard(&repo_path).expect("idempotent reinstall");
+        assert_eq!(first.status, WorktreeGuardStatus::Installed);
+        assert_eq!(second.status, WorktreeGuardStatus::AlreadyInstalled);
+        assert_eq!(first.hooks_path, second.hooks_path);
+        let layout = worktree_guard_layout(&repo).expect("resolve default-hook guard layout");
+        for state_name in ["previous-hooks-path", "previous-git-dir-hooks-path"] {
+            assert_eq!(
+                read_guard_path_line(&layout.root.join(state_name))
+                    .expect("read default chained hooks path"),
+                repo.commondir().join("hooks")
+            );
+        }
+        let removed = uninstall_primary_worktree_guard(&repo_path).expect("uninstall guard");
+        assert_eq!(removed.status, WorktreeGuardStatus::Removed);
+        let absent = uninstall_primary_worktree_guard(&repo_path).expect("idempotent uninstall");
+        assert_eq!(absent.status, WorktreeGuardStatus::AlreadyAbsent);
+
+        assert_test_git_success(&repo_path, &["switch", "-c", "maco/unguarded"]);
+        fs::write(repo_path.join("README.md"), "# restored hooks\n").expect("edit after uninstall");
+        assert_test_git_success(&repo_path, &["add", "README.md"]);
+        let commit = run_test_git(&repo_path, &["commit", "-m", "restored"], &[]);
+        assert!(
+            commit.status.success(),
+            "uninstall must restore existing hooks: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        assert_eq!(read_test_hook_log(&repo, "pre-commit-ran"), "pre-commit\n");
+        assert_eq!(read_test_hook_log(&repo, "commit-msg-ran"), "commit-msg\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_guard_dispatchers_satisfy_current_human_authorship_v3_check() {
+        let marker = HUMAN_AUTHORSHIP_GUARD_V3_MARKER;
+        assert!(!WORKTREE_GUARD_ASSET
+            .windows(marker.len())
+            .any(|window| window == marker));
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        configure_test_git_identity(&repo);
+        commit_readme(&repo).expect("initial commit");
+        install_test_repository_hooks(&repo);
+        let report = install_primary_worktree_guard(&repo_path).expect("install guard");
+
+        // This is the current install-human-authorship-guard --check contract:
+        // the effective commit-msg and pre-push hooks are executable and each
+        // contains the exact v3 compatibility marker.
+        for hook_name in ["commit-msg", "pre-push"] {
+            let hook = report.hooks_path.join(hook_name);
+            assert_ne!(
+                fs::metadata(&hook)
+                    .expect("inspect composing dispatcher")
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+            assert!(fs::read(&hook)
+                .expect("read composing dispatcher")
+                .windows(marker.len())
+                .any(|window| window == marker));
+        }
+
+        let prior_commit_msg = repo.commondir().join("hooks/commit-msg");
+        fs::write(&prior_commit_msg, b"#!/bin/sh\nexit 0\n")
+            .expect("remove prior v3 compatibility marker");
+        verify_primary_worktree_guard(&repo_path).expect(
+            "persisted install-time composition must not be rederived from mutable prior hooks",
+        );
+
+        let plain_path = temp.path().join("plain");
+        WorktreeManager::init_repository(&plain_path, "main").expect("init marker-absent repo");
+        let plain = crate::git_repository::open(&plain_path).expect("open marker-absent repo");
+        configure_test_git_identity(&plain);
+        commit_readme(&plain).expect("initial marker-absent commit");
+        let plain_report =
+            install_primary_worktree_guard(&plain_path).expect("install marker-absent guard");
+        for hook_name in ["commit-msg", "pre-push"] {
+            let hook = plain_report.hooks_path.join(hook_name);
+            assert!(!fs::read(&hook)
+                .expect("read marker-absent dispatcher")
+                .windows(marker.len())
+                .any(|window| window == marker));
+        }
+
+        assert_test_git_success(&plain_path, &["switch", "-c", "maco/backup-slot"]);
+        let pre_push = plain_report.hooks_path.join("pre-push");
+        let backup = plain_report
+            .hooks_path
+            .join("pre-push.human-authorship-previous");
+        fs::rename(&pre_push, &backup).expect("simulate human installer backup move");
+        let blocked = run_test_hook(&plain_path, &backup, &[]);
+        assert!(!blocked.status.success());
+        assert!(String::from_utf8_lossy(&blocked.stderr)
+            .contains("push from the primary worktree on agent branch 'maco/backup-slot'"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worktree_guard_verify_and_uninstall_preserve_later_human_v3_and_custom_hooks() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        configure_test_git_identity(&repo);
+        commit_readme(&repo).expect("initial commit");
+        let prior = repo_path.join("custom-hooks");
+        fs::create_dir(&prior).expect("create prior hooks");
+        let custom_commit = b"#!/bin/sh\nprintf 'custom commit-msg\\n' >/dev/null\n";
+        let custom_push = b"#!/bin/sh\ncat >/dev/null\n";
+        for (name, bytes) in [
+            ("commit-msg", custom_commit.as_slice()),
+            ("pre-push", custom_push.as_slice()),
+        ] {
+            let hook = prior.join(name);
+            fs::write(&hook, bytes).expect("write custom prior hook");
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o711))
+                .expect("make custom prior hook executable");
+        }
+        repo.config()
+            .expect("open config")
+            .set_str("core.hooksPath", "custom-hooks")
+            .expect("configure custom hooks");
+        let report = install_primary_worktree_guard(&repo_path).expect("install MACO guard");
+
+        for (name, wrapper) in [
+            ("commit-msg", HUMAN_AUTHORSHIP_COMMIT_MSG_V3),
+            ("pre-push", HUMAN_AUTHORSHIP_PRE_PUSH_V3),
+        ] {
+            let hook = report.hooks_path.join(name);
+            let backup = report
+                .hooks_path
+                .join(format!("{name}.human-authorship-previous"));
+            fs::rename(&hook, &backup).expect("primary v3 installer preserves MACO hook");
+            fs::write(&hook, wrapper).expect("write exact primary v3 dispatcher shape");
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))
+                .expect("make v3 dispatcher executable");
+        }
+
+        verify_primary_worktree_guard(&repo_path)
+            .expect("verify must accept exact later-installed v3 wrapper and MACO backup");
+        uninstall_primary_worktree_guard(&repo_path)
+            .expect("uninstall must migrate v3 while preserving custom hooks");
+        assert_eq!(
+            repo.config()
+                .expect("reopen config")
+                .get_path("core.hooksPath")
+                .expect("restored hooks path"),
+            PathBuf::from("custom-hooks")
+        );
+        for (name, wrapper, custom) in [
+            (
+                "commit-msg",
+                HUMAN_AUTHORSHIP_COMMIT_MSG_V3,
+                custom_commit.as_slice(),
+            ),
+            (
+                "pre-push",
+                HUMAN_AUTHORSHIP_PRE_PUSH_V3,
+                custom_push.as_slice(),
+            ),
+        ] {
+            assert_eq!(
+                fs::read(prior.join(name)).expect("read migrated v3"),
+                wrapper
+            );
+            let backup = prior.join(format!("{name}.human-authorship-previous"));
+            assert_eq!(
+                fs::read(&backup).expect("read preserved custom hook"),
+                custom
+            );
+            assert_eq!(
+                fs::metadata(&backup)
+                    .expect("inspect preserved custom hook")
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o711
+            );
+        }
+        assert!(!repo.path().join(WORKTREE_GUARD_DIRECTORY).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_guard_hook_refuses_cross_repository_invocation() {
+        let temp = TempDir::new().expect("tempdir");
+        let guarded_path = temp.path().join("guarded");
+        let other_path = temp.path().join("other");
+        WorktreeManager::init_repository(&guarded_path, "main").expect("init guarded repo");
+        WorktreeManager::init_repository(&other_path, "main").expect("init other repo");
+        let guarded = crate::git_repository::open(&guarded_path).expect("open guarded repo");
+        let other = crate::git_repository::open(&other_path).expect("open other repo");
+        configure_test_git_identity(&guarded);
+        configure_test_git_identity(&other);
+        commit_readme(&guarded).expect("commit guarded repo");
+        commit_readme(&other).expect("commit other repo");
+        let report = install_primary_worktree_guard(&guarded_path).expect("install guard");
+
+        let output = run_test_hook(&other_path, &report.hooks_path.join("pre-commit"), &[]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("commit because the Git directory identity changed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_guard_install_refuses_markerless_expected_name_without_mutation() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        configure_test_git_identity(&repo);
+        commit_readme(&repo).expect("initial commit");
+
+        let guard_root = repo.path().join(WORKTREE_GUARD_DIRECTORY);
+        fs::create_dir(&guard_root).expect("create foreign guard root");
+        fs::set_permissions(&guard_root, fs::Permissions::from_mode(0o751))
+            .expect("set foreign root mode");
+        let foreign_state = guard_root.join("mode");
+        let foreign_bytes = b"foreign markerless expected-name content\n";
+        fs::write(&foreign_state, foreign_bytes).expect("write foreign expected-name state");
+        fs::set_permissions(&foreign_state, fs::Permissions::from_mode(0o640))
+            .expect("set foreign state mode");
+
+        let config_path = repo.path().join("config");
+        let root_before = fs::symlink_metadata(&guard_root).expect("inspect foreign root");
+        let state_before = fs::symlink_metadata(&foreign_state).expect("inspect foreign state");
+        let config_before = fs::read(&config_path).expect("read Git config before refusal");
+        let config_mode_before = fs::metadata(&config_path)
+            .expect("inspect Git config before refusal")
+            .permissions()
+            .mode();
+
+        let error = install_primary_worktree_guard(&repo_path)
+            .expect_err("markerless foreign guard state must be rejected");
+        assert!(error
+            .to_string()
+            .contains("directory exists without an ownership marker; refusing collision"));
+
+        let root_after = fs::symlink_metadata(&guard_root).expect("reinspect foreign root");
+        let state_after = fs::symlink_metadata(&foreign_state).expect("reinspect foreign state");
+        assert_eq!(root_after.dev(), root_before.dev());
+        assert_eq!(root_after.ino(), root_before.ino());
+        assert_eq!(
+            root_after.permissions().mode(),
+            root_before.permissions().mode()
+        );
+        assert_eq!(state_after.dev(), state_before.dev());
+        assert_eq!(state_after.ino(), state_before.ino());
+        assert_eq!(
+            state_after.permissions().mode(),
+            state_before.permissions().mode()
+        );
+        assert_eq!(
+            fs::read(&foreign_state).expect("read foreign state after refusal"),
+            foreign_bytes
+        );
+        assert!(!guard_root.join("marker").exists());
+        assert_eq!(
+            fs::read_dir(&guard_root)
+                .expect("enumerate foreign root after refusal")
+                .map(|entry| entry.expect("read foreign entry").file_name())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([OsString::from("mode")])
+        );
+        assert_eq!(
+            fs::read(&config_path).expect("read Git config after refusal"),
+            config_before
+        );
+        assert_eq!(
+            fs::metadata(&config_path)
+                .expect("inspect Git config after refusal")
+                .permissions()
+                .mode(),
+            config_mode_before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_guard_reinstall_refuses_changed_regular_hook_without_overwrite() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        configure_test_git_identity(&repo);
+        commit_readme(&repo).expect("initial commit");
+        let report = install_primary_worktree_guard(&repo_path).expect("install guard");
+        let hook = report.hooks_path.join("commit-msg");
+        let changed = b"#!/bin/sh\n# locally changed regular hook\nexit 0\n";
+        fs::write(&hook, changed).expect("replace fixture dispatcher bytes");
+
+        let error = install_primary_worktree_guard(&repo_path)
+            .expect_err("reinstall must not overwrite changed regular hook");
+        assert!(error
+            .to_string()
+            .contains("refusing to overwrite changed or non-MACO guard hook"));
+        assert_eq!(
+            fs::read(&hook).expect("read refused hook"),
+            changed,
+            "reinstall refusal must preserve changed hook bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orchestrated_git_hooks_path_null_remains_unaffected_by_advisory_guard() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        configure_test_git_identity(&repo);
+        commit_readme(&repo).expect("initial commit");
+        install_test_repository_hooks(&repo);
+        install_primary_worktree_guard(&repo_path).expect("install guard");
+        assert_test_git_success(&repo_path, &["switch", "-c", "maco/orchestrated"]);
+        fs::write(repo_path.join("README.md"), "# command scoped bypass\n")
+            .expect("edit agent branch");
+        assert_test_git_success(&repo_path, &["add", "README.md"]);
+
+        let commit = run_test_git(
+            &repo_path,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-m",
+                "trusted orchestration",
+            ],
+            &[],
+        );
+        assert!(
+            commit.status.success(),
+            "command-scoped hooksPath isolation must bypass all repository hooks: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        assert_eq!(read_test_hook_log(&repo, "pre-commit-ran"), "");
+        assert_eq!(read_test_hook_log(&repo, "commit-msg-ran"), "");
+    }
 
     #[cfg(unix)]
     #[test]
@@ -18985,6 +22701,80 @@ mod tests {
         assert_eq!(report.protected_registration_count, 1);
         assert!(repo.find_worktree(&selected.name).is_err());
         assert!(repo.find_worktree(&unrelated.name).is_ok());
+    }
+
+    #[cfg(unix)]
+    fn configure_test_git_identity(repo: &Repository) {
+        let mut config = repo.config().expect("open test Git config");
+        config
+            .set_str("user.name", "MACO guard test")
+            .expect("set test Git name");
+        config
+            .set_str("user.email", "maco-guard-test@example.invalid")
+            .expect("set test Git email");
+    }
+
+    #[cfg(unix)]
+    fn install_test_repository_hooks(repo: &Repository) {
+        let hooks = repo.commondir().join("hooks");
+        fs::create_dir_all(&hooks).expect("create fixture hooks directory");
+        for (name, marker) in [
+            ("pre-commit", "pre-commit-ran"),
+            ("commit-msg", "commit-msg-ran"),
+            ("pre-push", "pre-push-ran"),
+        ] {
+            let compatibility = if matches!(name, "commit-msg" | "pre-push") {
+                "# human-authorship-guard dispatcher v3\n"
+            } else {
+                ""
+            };
+            let script = format!(
+                "#!/bin/sh\n{compatibility}printf '%s\\n' '{name}' >> \"$(git rev-parse --git-common-dir)/{marker}\"\n"
+            );
+            let path = hooks.join(name);
+            fs::write(&path, script).expect("write fixture hook");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .expect("make fixture hook executable");
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_test_hook_log(repo: &Repository, name: &str) -> String {
+        match fs::read_to_string(repo.commondir().join(name)) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+            Err(error) => panic!("failed to read fixture hook log: {error}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn run_test_git(worktree: &Path, args: &[&str], environment: &[(&str, &str)]) -> Output {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(worktree).args(args);
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        command.output().expect("run fixture Git command")
+    }
+
+    #[cfg(unix)]
+    fn run_test_hook(worktree: &Path, hook: &Path, environment: &[(&str, &str)]) -> Output {
+        let mut command = Command::new(hook);
+        command.current_dir(worktree).args(["origin", "unused"]);
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        command.output().expect("run fixture Git hook")
+    }
+
+    #[cfg(unix)]
+    fn assert_test_git_success(worktree: &Path, args: &[&str]) {
+        let output = run_test_git(worktree, args, &[]);
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn commit_readme(repo: &Repository) -> Result<Oid> {

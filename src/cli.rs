@@ -56,10 +56,11 @@ use crate::{
         ClaimStatusReport, ClaimTelemetryOutcome, MegafileClaimWarning, OwnerReport, SyncStore,
     },
     worktree::{
-        sweep_workspace_worktrees, worktree_report_path_text, RepositoryInfo,
-        WorktreeCreateOptions, WorktreeGcOptions, WorktreeGcReason, WorktreeGcReport,
-        WorktreeGcStatus, WorktreeLifecycleOptions, WorktreeLifecycleReport, WorktreeManager,
-        WorktreeRecord, WorktreeRetentionPolicy, WorktreeSweepDiscoveryStatus,
+        install_primary_worktree_guard, sweep_workspace_worktrees,
+        uninstall_primary_worktree_guard, verify_primary_worktree_guard, worktree_report_path_text,
+        RepositoryInfo, WorktreeCreateOptions, WorktreeGcOptions, WorktreeGcReason,
+        WorktreeGcReport, WorktreeGcStatus, WorktreeLifecycleOptions, WorktreeLifecycleReport,
+        WorktreeManager, WorktreeRecord, WorktreeRetentionPolicy, WorktreeSweepDiscoveryStatus,
         WorktreeSweepFailureKind, WorktreeSweepOptions, WorktreeSweepReport,
         WorktreeSweepRepositoryStatus, WorktreeSweepRootKind, WorktreeTargetLivenessCause,
         WorktreeTargetLivenessEvidence, WorktreeTargetLivenessSource,
@@ -67,7 +68,10 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{
+    de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor},
+    Deserializer, Serialize,
+};
 use serde_json::Value;
 use std::{
     collections::BTreeSet,
@@ -84,6 +88,7 @@ const MAX_ORCHESTRATION_SUMMARY_PATHS: usize = 16 * 1024;
 const MAX_VALIDATION_INPUT_FILES: usize = 1024;
 const MAX_VALIDATION_INPUT_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_VALIDATION_INPUT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_REVIEWED_MERGE_PREVIEW_BYTES: u64 = 96 * 1024 * 1024;
 const MAX_VALIDATION_REPORTS: usize = 1024;
 const MAX_VALIDATION_REPORT_NAME_BYTES: usize = 1024;
 const MAX_VALIDATION_REPORT_MESSAGE_BYTES: usize = 64 * 1024;
@@ -2558,6 +2563,7 @@ impl WorktreeCommand {
                 })?;
                 print_merge_candidate(&candidate, args.json)
             }
+            WorktreeSubcommand::Guard(command) => command.run(),
         }
     }
 }
@@ -3445,6 +3451,53 @@ enum WorktreeSubcommand {
     List(ListWorktreesArgs),
     /// Inspect authenticated pending worktree operations without recovering them.
     Pending(ListWorktreesArgs),
+    /// Manage the advisory primary-worktree Git guard explicitly.
+    Guard(WorktreeGuardCommand),
+}
+
+#[derive(Debug, Args)]
+struct WorktreeGuardCommand {
+    #[command(subcommand)]
+    command: WorktreeGuardSubcommand,
+}
+
+impl WorktreeGuardCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            WorktreeGuardSubcommand::Install(args) => {
+                let report = install_primary_worktree_guard(args.repo)?;
+                print_query_report(&report, args.json)
+            }
+            WorktreeGuardSubcommand::Verify(args) => {
+                let report = verify_primary_worktree_guard(args.repo)?;
+                print_query_report(&report, args.json)
+            }
+            WorktreeGuardSubcommand::Uninstall(args) => {
+                let report = uninstall_primary_worktree_guard(args.repo)?;
+                print_query_report(&report, args.json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum WorktreeGuardSubcommand {
+    /// Install or idempotently refresh the guard in the primary worktree.
+    Install(WorktreeGuardArgs),
+    /// Verify the primary-worktree guard without changing repository state.
+    Verify(WorktreeGuardArgs),
+    /// Remove MACO-owned guard state and restore the prior hook configuration.
+    Uninstall(WorktreeGuardArgs),
+}
+
+#[derive(Debug, Args)]
+struct WorktreeGuardArgs {
+    /// Primary repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -3726,10 +3779,10 @@ fn preview_merge_from_args(
     forces: MergeForceOptions,
     require_validation: bool,
     megafile_policy: MegafileMergePolicy,
-) -> Result<MergeApplyPreview> {
+) -> Result<(MergeApplyPreview, merge::MergePreviewFreshnessWatermark)> {
     let claims = resolve_claims(&repo, &agent_id, explicit_claims)?;
     let validation_evidence = load_validation_evidence(&validation_report_paths, &agent_id)?;
-    merge::preview_merge_apply_with_megafile_policy(
+    merge::preview_merge_apply_with_freshness_and_megafile_policy(
         MergePreviewOptions {
             collect: collect_options_from_claims(&repo, &agent_id, claims, true, Vec::new()),
             forces,
@@ -3751,7 +3804,7 @@ impl MergeCommand {
         match self.command {
             MergeSubcommand::Preview(args) => {
                 let megafile_policy = args.megafile_policy()?;
-                let preview = preview_merge_from_args(
+                let (preview, freshness_watermark) = preview_merge_from_args(
                     args.repo,
                     args.agent_id,
                     args.claim,
@@ -3760,11 +3813,13 @@ impl MergeCommand {
                     args.require_validation,
                     megafile_policy,
                 )?;
-                print_merge_preview(&preview, args.json)
+                print_merge_preview(&preview, &freshness_watermark, args.json)
             }
-            MergeSubcommand::Apply(args) => run_merge_apply_controller(args, |report, json| {
-                print_merge_apply_report(report, json)
-            }),
+            MergeSubcommand::Apply(args) => {
+                run_merge_apply_controller(args, |report, json, review_bound| {
+                    print_merge_apply_report(report, json, review_bound)
+                })
+            }
             MergeSubcommand::Arbitrate(args) => {
                 let first_side =
                     arbitration_side_from_cli(args.first_side, args.first_claim, "first")?;
@@ -3795,7 +3850,7 @@ impl MergeCommand {
 
 fn run_merge_apply_controller(
     args: MergeApplyArgs,
-    mut deliver_report: impl FnMut(&MergeApplyReport, bool) -> Result<()>,
+    mut deliver_report: impl FnMut(&MergeApplyReport, bool, bool) -> Result<()>,
 ) -> Result<()> {
     let lifecycle_repo = args.repo.clone();
     let lifecycle_agent_id = args.agent_id.clone();
@@ -3803,6 +3858,17 @@ fn run_merge_apply_controller(
     let apply_auto_reap = args.apply_auto_reap;
     let lifecycle_trunk_ref = args.trunk_ref.clone();
     let json = args.json;
+    let reviewed_watermark = match load_reviewed_merge_preview(args.reviewed_preview.as_deref()) {
+        Ok(watermark) => watermark,
+        Err(error) => {
+            if let Some(freshness) = error.downcast_ref::<merge::MergePreviewFreshnessError>() {
+                if json {
+                    print_merge_preview_freshness_refusal(freshness, true)?;
+                }
+            }
+            return Err(error);
+        }
+    };
     let megafile_policy = args.megafile_policy()?;
     let claims = resolve_claims(&args.repo, &args.agent_id, args.claim)?;
     let validation_evidence = load_validation_evidence(&args.validation_report, &args.agent_id)?;
@@ -3816,17 +3882,30 @@ fn run_merge_apply_controller(
         forces: args.forces.into_force_options(),
         require_validation: args.require_validation,
     };
-    let mut report = merge::merge_apply_report_with_megafile_policy(
+    let review_requested = reviewed_watermark.is_some();
+    let report = merge::merge_apply_report_with_reviewed_preview_and_megafile_policy(
         MergeApplyOptions {
             preview: preview_options,
             candidate_validation_commands,
         },
         validation_evidence,
         megafile_policy,
-    )?;
+        reviewed_watermark.as_ref(),
+    );
+    let mut report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            if let Some(freshness) = error.downcast_ref::<merge::MergePreviewFreshnessError>() {
+                if json {
+                    print_merge_preview_freshness_refusal(freshness, review_requested)?;
+                }
+            }
+            return Err(error);
+        }
+    };
     if report.status == merge::MergeApplyReportStatus::Blocked {
         if json {
-            deliver_report(&report, true)?;
+            deliver_report(&report, true, review_requested)?;
         }
         let message = report
             .error
@@ -3860,12 +3939,61 @@ fn run_merge_apply_controller(
                     )
                 };
                 report.error = Some(context.clone());
-                deliver_report(&report, json)?;
+                deliver_report(&report, json, review_requested)?;
                 bail!("{context}");
             }
         }
     }
-    deliver_report(&report, json)
+    deliver_report(&report, json, review_requested)
+}
+
+#[derive(Debug, Serialize)]
+struct MergePreviewFreshnessRefusalReport<'a> {
+    status: &'static str,
+    applied: bool,
+    review_requested: bool,
+    review_bound: bool,
+    review_binding_status: &'static str,
+    error_kind: &'static str,
+    reason: &'static str,
+    drift_axes: &'a [merge::MergePreviewDriftAxis],
+    message: String,
+    next_action: &'static str,
+}
+
+fn print_merge_preview_freshness_refusal(
+    error: &merge::MergePreviewFreshnessError,
+    review_requested: bool,
+) -> Result<()> {
+    let report = merge_preview_freshness_refusal_report(error, review_requested);
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn merge_preview_freshness_refusal_report(
+    error: &merge::MergePreviewFreshnessError,
+    review_requested: bool,
+) -> MergePreviewFreshnessRefusalReport<'_> {
+    MergePreviewFreshnessRefusalReport {
+        status: "refused",
+        applied: false,
+        review_requested,
+        review_bound: false,
+        review_binding_status: if review_requested {
+            "not_bound"
+        } else {
+            "not_supplied"
+        },
+        error_kind: "merge_preview_freshness",
+        reason: error.reason(),
+        drift_axes: error.drift_axes(),
+        message: error.to_string(),
+        next_action: if review_requested {
+            "run merge preview again and review the new freshness_watermark"
+        } else {
+            "retry merge apply after concurrent repository activity stops"
+        },
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -3931,6 +4059,9 @@ struct MergeApplyArgs {
     /// Validate a temporary merged candidate; recursive candidate or submodule changes block apply.
     #[arg(long = "validation-command")]
     validation_command: Vec<String>,
+    /// Reviewed `merge preview --json` file, or its exact nested freshness_watermark object. The bounded file is read without following symlinks; drift refuses apply.
+    #[arg(long, value_name = "FILE")]
+    reviewed_preview: Option<PathBuf>,
     /// Block threshold-crossing megafiles unless this is their exact typed decomposition.
     #[arg(long)]
     block_megafiles: bool,
@@ -4544,6 +4675,131 @@ fn load_validation_evidence(paths: &[PathBuf], agent_id: &str) -> Result<Validat
     Ok(evidence)
 }
 
+fn load_reviewed_merge_preview(
+    path: Option<&Path>,
+) -> Result<Option<merge::MergePreviewFreshnessWatermark>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let contents =
+        BoundedRegularReader::read_tree_no_follow(path, MAX_REVIEWED_MERGE_PREVIEW_BYTES)
+            .with_context(|| format!("failed to read reviewed merge preview {}", path.display()))?;
+    let value = parse_duplicate_rejecting_json_value(&contents).map_err(|error| {
+        merge::MergePreviewFreshnessError::MalformedWatermark {
+            message: format!("reviewed preview is not valid JSON: {error}"),
+        }
+    })?;
+    merge::reviewed_merge_preview_watermark_from_json(&value)
+        .map(Some)
+        .with_context(|| format!("invalid reviewed merge preview {}", path.display()))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DuplicateRejectingJsonValueSeed;
+
+impl<'de> DeserializeSeed<'de> for DuplicateRejectingJsonValueSeed {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateRejectingJsonValueVisitor)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DuplicateRejectingJsonValueVisitor;
+
+impl<'de> Visitor<'de> for DuplicateRejectingJsonValueVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .ok_or_else(|| E::custom("JSON number is not finite"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
+        Ok(Value::String(value.to_string()))
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
+        Ok(Value::String(value))
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        DuplicateRejectingJsonValueSeed.deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element_seed(DuplicateRejectingJsonValueSeed)? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(<A::Error as de::Error>::custom(format!(
+                    "duplicate object key {key:?}"
+                )));
+            }
+            let value = object.next_value_seed(DuplicateRejectingJsonValueSeed)?;
+            values.insert(key, value);
+        }
+        Ok(Value::Object(values))
+    }
+}
+
+fn parse_duplicate_rejecting_json_value(
+    contents: &[u8],
+) -> std::result::Result<Value, serde_json::Error> {
+    let mut deserializer = serde_json::Deserializer::from_slice(contents);
+    let value = DuplicateRejectingJsonValueSeed.deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(value)
+}
+
 fn validate_cli_validation_reports(reports: &[ValidationReport]) -> Result<()> {
     if reports.len() > MAX_VALIDATION_REPORTS {
         bail!("validation evidence exceeds its report count limit");
@@ -5129,11 +5385,25 @@ fn print_merge_candidate(candidate: &MergeCandidate, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_merge_preview(preview: &MergeApplyPreview, json: bool) -> Result<()> {
+fn print_merge_preview(
+    preview: &MergeApplyPreview,
+    freshness_watermark: &merge::MergePreviewFreshnessWatermark,
+    json: bool,
+) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(preview)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&merge::MergeApplyPreviewOutput {
+                preview,
+                freshness_watermark,
+            })?
+        );
     } else {
         print_merge_candidate(&preview.candidate, false)?;
+        println!(
+            "Freshness watermark: {}",
+            serde_json::to_string(freshness_watermark)?
+        );
         println!("Readiness: {:?}", preview.safety.readiness.status);
         if !preview.safety.readiness.blockers.is_empty() {
             println!("Blockers: {:?}", preview.safety.readiness.blockers);
@@ -5152,9 +5422,39 @@ fn print_merge_preview(preview: &MergeApplyPreview, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_merge_apply_report(report: &MergeApplyReport, json: bool) -> Result<()> {
+#[derive(Debug, Serialize)]
+struct MergeApplyReportOutput<'a> {
+    #[serde(flatten)]
+    report: &'a MergeApplyReport,
+    review_bound: bool,
+    review_binding_status: &'static str,
+}
+
+fn merge_apply_report_output(
+    report: &MergeApplyReport,
+    review_bound: bool,
+) -> MergeApplyReportOutput<'_> {
+    MergeApplyReportOutput {
+        report,
+        review_bound,
+        review_binding_status: if review_bound {
+            "matched"
+        } else {
+            "not_supplied"
+        },
+    }
+}
+
+fn print_merge_apply_report(
+    report: &MergeApplyReport,
+    json: bool,
+    review_bound: bool,
+) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&merge_apply_report_output(report, review_bound))?
+        );
     } else {
         println!(
             "Merge apply: {}",
@@ -5165,6 +5465,15 @@ fn print_merge_apply_report(report: &MergeApplyReport, json: bool) -> Result<()>
             }
         );
         println!("Readiness: {:?}", report.preview.safety.readiness.status);
+        println!(
+            "Review-bound: {} ({})",
+            review_bound,
+            if review_bound {
+                "matched"
+            } else {
+                "not_supplied"
+            }
+        );
         if !report.recorded_collision_paths.is_empty() {
             println!("Recorded merge collision paths:");
             for path in &report.recorded_collision_paths {
@@ -6715,15 +7024,90 @@ mod tests {
             "src/lib.rs",
             "--validation-command",
             "cargo test",
+            "--reviewed-preview",
+            "reviewed-preview.json",
             "--json",
         ])
         .expect("existing apply command should still parse");
-        assert!(matches!(
-            apply.command,
-            Command::Merge(MergeCommand {
-                command: MergeSubcommand::Apply(_)
-            })
-        ));
+        let Command::Merge(MergeCommand {
+            command: MergeSubcommand::Apply(args),
+        }) = apply.command
+        else {
+            panic!("expected merge apply command");
+        };
+        assert_eq!(
+            args.reviewed_preview,
+            Some(PathBuf::from("reviewed-preview.json"))
+        );
+    }
+
+    #[test]
+    fn no_watermark_freshness_refusal_serialization_is_truthfully_unbound() {
+        let error = merge::MergePreviewFreshnessError::Drift {
+            axes: vec![merge::MergePreviewDriftAxis::PrimaryHead],
+            moved: "primary HEAD".to_string(),
+        };
+        let report = merge_preview_freshness_refusal_report(&error, false);
+        let value = serde_json::to_value(report).expect("serialize unbound freshness refusal");
+
+        assert_eq!(value["review_requested"], false);
+        assert_eq!(value["review_bound"], false);
+        assert_eq!(value["review_binding_status"], "not_supplied");
+        assert_eq!(value["reason"], "preview_freshness_drift");
+        assert!(!value["message"]
+            .as_str()
+            .expect("freshness message")
+            .contains("reviewed"));
+        assert!(!value["next_action"]
+            .as_str()
+            .expect("freshness next action")
+            .contains("review"));
+        assert!(value["next_action"]
+            .as_str()
+            .expect("freshness next action")
+            .contains("concurrent repository activity"));
+
+        let requested = serde_json::to_value(merge_preview_freshness_refusal_report(&error, true))
+            .expect("serialize requested freshness refusal");
+        assert_eq!(requested["review_requested"], true);
+        assert_eq!(requested["review_bound"], false);
+        assert_eq!(requested["review_binding_status"], "not_bound");
+    }
+
+    #[test]
+    fn reviewed_merge_preview_rejects_duplicate_json_keys_at_every_depth_as_malformed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for (name, contents, duplicate_key) in [
+            (
+                "top-level.json",
+                br#"{"freshness_watermark":{},"freshness_watermark":{}}"#.as_slice(),
+                "freshness_watermark",
+            ),
+            (
+                "nested.json",
+                br#"{"freshness_watermark":{"candidate":{"head":"a","head":"b"}}}"#.as_slice(),
+                "head",
+            ),
+            (
+                "array-nested.json",
+                br#"{"freshness_watermark":{"items":[{"path":"a","path":"b"}]}}"#.as_slice(),
+                "path",
+            ),
+        ] {
+            let path = temp.path().join(name);
+            fs::write(&path, contents).expect("write duplicate-key preview fixture");
+            let error = load_reviewed_merge_preview(Some(&path))
+                .expect_err("duplicate JSON key must refuse reviewed preview");
+            let freshness = error
+                .downcast_ref::<merge::MergePreviewFreshnessError>()
+                .expect("duplicate JSON key must remain a typed freshness refusal");
+            let merge::MergePreviewFreshnessError::MalformedWatermark { message } = freshness
+            else {
+                panic!("duplicate JSON key must be classified as a malformed watermark");
+            };
+            assert!(message.contains("duplicate object key"));
+            assert!(message.contains(duplicate_key));
+        }
     }
 
     #[test]
@@ -6820,6 +7204,7 @@ mod tests {
             validation_report: Vec::new(),
             require_validation: false,
             validation_command: Vec::new(),
+            reviewed_preview: None,
             block_megafiles: false,
             decomposition_target: None,
             decomposition_run_id: None,
@@ -6837,8 +7222,13 @@ mod tests {
             json: true,
         };
         let mut delivered = None;
-        let error = run_merge_apply_controller(args, |report, json| {
+        let error = run_merge_apply_controller(args, |report, json, review_bound| {
             assert!(json);
+            assert!(!review_bound);
+            let output = serde_json::to_value(merge_apply_report_output(report, review_bound))
+                .expect("serialize ordinary apply report");
+            assert_eq!(output["review_bound"], false);
+            assert_eq!(output["review_binding_status"], "not_supplied");
             delivered = Some(report.clone());
             Ok(())
         })
@@ -6951,6 +7341,7 @@ mod tests {
             validation_report: Vec::new(),
             require_validation: false,
             validation_command: Vec::new(),
+            reviewed_preview: None,
             block_megafiles: false,
             decomposition_target: None,
             decomposition_run_id: None,
@@ -6968,8 +7359,9 @@ mod tests {
             json: true,
         };
         let mut delivered = None;
-        run_merge_apply_controller(args, |report, json| {
+        run_merge_apply_controller(args, |report, json, review_bound| {
             assert!(json);
+            assert!(!review_bound);
             delivered = Some(report.clone());
             Ok(())
         })
@@ -7014,6 +7406,7 @@ mod tests {
             validation_report: Vec::new(),
             require_validation: false,
             validation_command: Vec::new(),
+            reviewed_preview: None,
             block_megafiles: false,
             decomposition_target: None,
             decomposition_run_id: None,
@@ -7031,8 +7424,9 @@ mod tests {
             json: true,
         };
         let mut finalized = None;
-        run_merge_apply_controller(args, |report, json| {
+        run_merge_apply_controller(args, |report, json, review_bound| {
             assert!(json);
+            assert!(!review_bound);
             finalized = Some(report.clone());
             Ok(())
         })

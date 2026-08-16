@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "contracts": [
+    {
+      "schema": "repository-map-v1.schema.json",
+      "valid": [
+        "repository-map-v1.valid.json"
+      ],
+      "invalid": [
+        {
+          "path": "repository-map-v1.invalid.json",
+          "expected_error": "$.entries[0].size_bytes: const"
+        }
+      ]
+    },
+    {
+      "schema": "semantic-risk-report-v1.schema.json",
+      "valid": [
+        "semantic-risk-report-v1.valid.json"
+      ],
+      "invalid": [
+        {
+          "path": "semantic-risk-report-v1.invalid.json",
+          "expected_error": "$.dependency_impacts[0].direction: enum"
+        }
+      ]
+    },
+    {
+      "schema": "merge-preview-report-v1.schema.json",
+      "valid": [
+        "merge-preview-report-v1.valid.json"
+      ],
+      "invalid": [
+        {
+          "path": "merge-preview-report-v1.invalid.json",
+          "expected_error": "$.freshness_watermark.version: const"
+        }
+      ]
+    },
+    {
+      "schema": "merge-apply-report-v1.schema.json",
+      "valid": [
+        "merge-apply-report-v1.valid.json",
+        "merge-apply-refusal-report-v1.valid.json"
+      ],
+      "invalid": [
+        {
+          "path": "merge-apply-report-v1.invalid.json",
+          "expected_error": "$.review_binding_status: enum"
+        },
+        {
+          "path": "merge-apply-hybrid-report-v1.invalid.json",
+          "expected_error": "$: not"
+        }
+      ]
+    },
+    {
+      "schema": "supervisor-final-report-v1.schema.json",
+      "valid": [
+        "supervisor-final-report-v1.valid.json"
+      ],
+      "invalid": [
+        {
+          "path": "supervisor-final-report-v1.invalid.json",
+          "expected_error": "$.plan_file: pattern"
+        },
+        {
+          "path": "supervisor-final-fallback-v1.invalid.json",
+          "expected_error": "$.role_economics_profile.role_models.supervisor.unavailable_model_fallback: oneOf"
+        },
+        {
+          "path": "supervisor-final-economics-binding-v1.invalid.json",
+          "expected_error": "$.role_economics_profile.execution.assignment_effort_bindings[0].impossible: additionalProperties"
+        },
+        {
+          "path": "supervisor-final-budget-degradation-v1.invalid.json",
+          "expected_error": "$.role_economics_profile.execution.budget_degradations[0].impossible: additionalProperties"
+        },
+        {
+          "path": "supervisor-final-autonomy-v1.invalid.json",
+          "expected_error": "$.autonomy_kpis.denial_rate: required"
+        },
+        {
+          "path": "supervisor-final-admission-config-null-v1.invalid.json",
+          "expected_error": "$.role_economics_profile.execution.concurrency.policy_input_details: anyOf"
+        }
+      ]
+    }
+  ]
+}

@@ -78,6 +78,238 @@ fn merge_preview_and_apply_help_do_not_inherit_arbitration_options() -> Result<(
 }
 
 #[test]
+fn merge_apply_help_exposes_reviewed_preview_freshness_contract() -> Result<()> {
+    let output = Command::new(BIN)
+        .args(["merge", "apply", "--help"])
+        .output()
+        .context("run merge apply help")?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let help = String::from_utf8(output.stdout).context("merge apply help utf8")?;
+    assert!(help.contains("--reviewed-preview <FILE>"), "{help}");
+    assert!(help.contains("merge preview --json"), "{help}");
+    assert!(help.contains("freshness_watermark"), "{help}");
+    assert!(help.contains("without following symlinks"), "{help}");
+    Ok(())
+}
+
+#[test]
+fn merge_apply_json_refuses_malformed_reviewed_preview_before_repository_access() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let reviewed = temp.path().join("malformed-preview.json");
+    fs::write(&reviewed, b"{not-json").context("write malformed preview")?;
+    let output = Command::new(BIN)
+        .args([
+            "merge",
+            "apply",
+            "agent-a",
+            "--repo",
+            "/definitely/not/a/repository",
+            "--reviewed-preview",
+            reviewed.to_str().context("reviewed preview path utf8")?,
+            "--json",
+        ])
+        .output()
+        .context("run malformed reviewed apply")?;
+    assert!(!output.status.success());
+    let refusal: Value =
+        serde_json::from_slice(&output.stdout).context("parse freshness refusal json")?;
+    assert_eq!(refusal["status"], "refused");
+    assert_eq!(refusal["applied"], false);
+    assert_eq!(refusal["review_requested"], true);
+    assert_eq!(refusal["review_bound"], false);
+    assert_eq!(refusal["review_binding_status"], "not_bound");
+    assert_eq!(refusal["error_kind"], "merge_preview_freshness");
+    assert_eq!(refusal["reason"], "watermark_malformed");
+    assert!(refusal["drift_axes"]
+        .as_array()
+        .context("drift axes array")?
+        .is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("failed to discover repository"));
+    Ok(())
+}
+
+#[test]
+fn merge_apply_json_refuses_duplicate_reviewed_preview_key_before_repository_access() -> Result<()>
+{
+    let temp = TempDir::new().context("tempdir")?;
+    let reviewed = temp.path().join("duplicate-preview.json");
+    fs::write(
+        &reviewed,
+        br#"{
+  "version": 1,
+  "primary": {
+    "head": null,
+    "index_digest": null,
+    "worktree_digest": "1111111111111111111111111111111111111111"
+  },
+  "source": {
+    "agent_id": "agent-a",
+    "head": null
+  },
+  "candidate": {
+    "diff_oid": "2222222222222222222222222222222222222222",
+    "diff_oid": "3333333333333333333333333333333333333333",
+    "snapshot_tree_oid": "4444444444444444444444444444444444444444"
+  }
+}"#,
+    )
+    .context("write duplicate-key preview")?;
+    let output = Command::new(BIN)
+        .args([
+            "merge",
+            "apply",
+            "agent-a",
+            "--repo",
+            "/definitely/not/a/repository",
+            "--reviewed-preview",
+            reviewed.to_str().context("reviewed preview path utf8")?,
+            "--json",
+        ])
+        .output()
+        .context("run duplicate-key reviewed apply")?;
+
+    assert!(!output.status.success());
+    let refusal: Value =
+        serde_json::from_slice(&output.stdout).context("parse duplicate-key refusal json")?;
+    assert_eq!(refusal["status"], "refused");
+    assert_eq!(refusal["applied"], false);
+    assert_eq!(refusal["review_requested"], true);
+    assert_eq!(refusal["review_bound"], false);
+    assert_eq!(refusal["review_binding_status"], "not_bound");
+    assert_eq!(refusal["error_kind"], "merge_preview_freshness");
+    assert_eq!(refusal["reason"], "watermark_malformed");
+    assert!(refusal["message"]
+        .as_str()
+        .context("duplicate-key refusal message")?
+        .contains("duplicate object key"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("failed to discover repository"));
+    Ok(())
+}
+
+#[test]
+fn merge_apply_json_refuses_incomplete_or_unknown_full_preview_before_repository_access(
+) -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let watermark = serde_json::json!({
+        "version": 1,
+        "primary": {
+            "head": null,
+            "index_digest": null,
+            "worktree_digest": "1111111111111111111111111111111111111111"
+        },
+        "source": {"agent_id": "agent-a", "head": null},
+        "candidate": {
+            "diff_oid": "2222222222222222222222222222222222222222",
+            "snapshot_tree_oid": "3333333333333333333333333333333333333333"
+        }
+    });
+    let incomplete = serde_json::json!({
+        "candidate": {},
+        "safety": {},
+        "freshness_watermark": watermark
+    });
+    let mut unknown = incomplete.clone();
+    unknown["unknown"] = serde_json::json!(true);
+
+    for (case, reviewed_preview) in [("incomplete", incomplete), ("unknown", unknown)] {
+        let reviewed = temp.path().join(format!("{case}-full-preview.json"));
+        fs::write(
+            &reviewed,
+            serde_json::to_vec(&reviewed_preview).context("serialize malformed full preview")?,
+        )
+        .with_context(|| format!("write {case} full preview"))?;
+        let output = Command::new(BIN)
+            .args([
+                "merge",
+                "apply",
+                "agent-a",
+                "--repo",
+                "/definitely/not/a/repository",
+                "--reviewed-preview",
+                reviewed.to_str().context("reviewed preview path utf8")?,
+                "--json",
+            ])
+            .output()
+            .with_context(|| format!("run {case} full reviewed apply"))?;
+
+        assert!(
+            !output.status.success(),
+            "{case} carrier unexpectedly passed"
+        );
+        let refusal: Value = serde_json::from_slice(&output.stdout)
+            .with_context(|| format!("parse {case} full-carrier refusal json"))?;
+        assert_eq!(refusal["status"], "refused");
+        assert_eq!(refusal["applied"], false);
+        assert_eq!(refusal["review_requested"], true);
+        assert_eq!(refusal["review_bound"], false);
+        assert_eq!(refusal["review_binding_status"], "not_bound");
+        assert_eq!(refusal["error_kind"], "merge_preview_freshness");
+        assert_eq!(refusal["reason"], "watermark_malformed");
+        assert!(refusal["message"]
+            .as_str()
+            .context("full-carrier refusal message")?
+            .contains("full merge preview"));
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("failed to discover repository"),
+            "{case} carrier reached repository discovery"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn merge_apply_json_refuses_unsupported_reviewed_preview_before_repository_access() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let reviewed = temp.path().join("unsupported-preview.json");
+    let watermark = serde_json::json!({
+        "version": 2,
+        "primary": {
+            "head": null,
+            "index_digest": null,
+            "worktree_digest": "1111111111111111111111111111111111111111"
+        },
+        "source": {"agent_id": "agent-a", "head": null},
+        "candidate": {
+            "diff_oid": "2222222222222222222222222222222222222222",
+            "snapshot_tree_oid": "3333333333333333333333333333333333333333"
+        }
+    });
+    fs::write(
+        &reviewed,
+        serde_json::to_vec(&watermark).context("serialize unsupported watermark")?,
+    )
+    .context("write unsupported preview")?;
+    let output = Command::new(BIN)
+        .args([
+            "merge",
+            "apply",
+            "agent-a",
+            "--repo",
+            "/definitely/not/a/repository",
+            "--reviewed-preview",
+            reviewed.to_str().context("reviewed preview path utf8")?,
+            "--json",
+        ])
+        .output()
+        .context("run unsupported reviewed apply")?;
+    assert!(!output.status.success());
+    let refusal: Value =
+        serde_json::from_slice(&output.stdout).context("parse unsupported refusal json")?;
+    assert_eq!(refusal["review_binding_status"], "not_bound");
+    assert_eq!(refusal["reason"], "watermark_version_unsupported");
+    assert!(refusal["message"]
+        .as_str()
+        .context("unsupported refusal message")?
+        .contains("expected version"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("failed to discover repository"));
+    Ok(())
+}
+
+#[test]
 fn merge_arbitrate_refuses_primary_claim_before_repository_or_runner_access() -> Result<()> {
     let output = Command::new(BIN)
         .args([

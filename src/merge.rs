@@ -54,6 +54,7 @@ use std::{
 
 pub const DEFAULT_DIFF_SUMMARY_CHAR_LIMIT: usize = 32 * 1024;
 pub const VALIDATION_BINDING_VERSION: u32 = 1;
+pub const MERGE_PREVIEW_FRESHNESS_WATERMARK_VERSION: u32 = 1;
 pub const ARBITRATION_INPUT_VERSION: u32 = 1;
 pub const ARBITRATION_PROPOSAL_VERSION: u32 = 1;
 pub const ARBITRATION_REPORT_VERSION: u32 = 1;
@@ -1773,6 +1774,125 @@ pub struct MergeApplyPreview {
     pub safety: MergeApplySafety,
 }
 
+/// Exact candidate and repository state reviewed by `merge preview`.
+///
+/// This is intentionally separate from [`MergeApplyPreview`]. Existing library
+/// callers can continue to construct and consume previews without claiming that
+/// they are review-bound, while CLI consumers can persist this strict artifact
+/// and supply it back to `merge apply`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MergeApplyPreviewOutput<'a> {
+    #[serde(flatten)]
+    pub preview: &'a MergeApplyPreview,
+    pub freshness_watermark: &'a MergePreviewFreshnessWatermark,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MergePreviewFreshnessWatermark {
+    pub version: u32,
+    pub primary: MergePreviewPrimaryWatermark,
+    pub source: MergePreviewSourceWatermark,
+    pub candidate: MergePreviewCandidateWatermark,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MergePreviewPrimaryWatermark {
+    pub head: Option<String>,
+    pub index_digest: Option<String>,
+    pub worktree_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MergePreviewSourceWatermark {
+    pub agent_id: String,
+    pub head: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MergePreviewCandidateWatermark {
+    pub diff_oid: String,
+    pub snapshot_tree_oid: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergePreviewDriftAxis {
+    PrimaryHead,
+    PrimaryIndex,
+    PrimaryWorktree,
+    SourceIdentity,
+    SourceHead,
+    CandidateDiff,
+    CandidateSnapshot,
+}
+
+impl MergePreviewDriftAxis {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PrimaryHead => "primary HEAD",
+            Self::PrimaryIndex => "primary index",
+            Self::PrimaryWorktree => "primary worktree",
+            Self::SourceIdentity => "source identity",
+            Self::SourceHead => "source HEAD",
+            Self::CandidateDiff => "candidate diff",
+            Self::CandidateSnapshot => "candidate snapshot",
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MergePreviewFreshnessError {
+    #[error("merge apply refused: reviewed preview watermark is malformed: {message}")]
+    MalformedWatermark { message: String },
+    #[error(
+        "merge apply refused: reviewed preview watermark version {version} is unsupported; expected version {expected}"
+    )]
+    UnsupportedWatermarkVersion { version: u32, expected: u32 },
+    #[error(
+        "merge apply refused: preview freshness state no longer matches current repository state ({moved}); retry after concurrent repository activity stops or run merge preview again"
+    )]
+    Drift {
+        axes: Vec<MergePreviewDriftAxis>,
+        moved: String,
+    },
+}
+
+impl MergePreviewFreshnessError {
+    pub fn drift_axes(&self) -> &[MergePreviewDriftAxis] {
+        match self {
+            Self::MalformedWatermark { .. } | Self::UnsupportedWatermarkVersion { .. } => &[],
+            Self::Drift { axes, .. } => axes,
+        }
+    }
+
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::MalformedWatermark { .. } => "watermark_malformed",
+            Self::UnsupportedWatermarkVersion { .. } => "watermark_version_unsupported",
+            Self::Drift { .. } => "preview_freshness_drift",
+        }
+    }
+
+    fn malformed(message: impl Into<String>) -> Self {
+        Self::MalformedWatermark {
+            message: message.into(),
+        }
+    }
+
+    fn drift(axes: Vec<MergePreviewDriftAxis>) -> Self {
+        let moved = axes
+            .iter()
+            .map(|axis| axis.label())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Self::Drift { axes, moved }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MergeApplySafety {
     pub primary_state_unchanged: SafetyCheck,
@@ -2049,6 +2169,13 @@ struct PrimaryRepositoryState {
     worktree_digest: Oid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CandidateFreshnessState {
+    head: Option<Oid>,
+    diff_oid: Oid,
+    snapshot_tree: Oid,
+}
+
 /// A verified managed-worktree record whose shared execution lease remains
 /// held for the complete lifetime of the value.
 ///
@@ -2224,13 +2351,31 @@ pub fn preview_merge_apply_with_megafile_policy(
     validation_evidence: ValidationEvidenceBundle,
     megafile_policy: MegafileMergePolicy,
 ) -> Result<MergeApplyPreview> {
+    let (preview, _) = preview_merge_apply_with_freshness_and_megafile_policy(
+        options,
+        validation_evidence,
+        megafile_policy,
+    )?;
+    Ok(preview)
+}
+
+/// Captures one merge preview together with the exact versioned state that was
+/// used to compute it. The state is checked again after all preview gates so a
+/// caller never receives a watermark assembled across repository movement.
+pub fn preview_merge_apply_with_freshness_and_megafile_policy(
+    options: MergePreviewOptions,
+    validation_evidence: ValidationEvidenceBundle,
+    megafile_policy: MegafileMergePolicy,
+) -> Result<(MergeApplyPreview, MergePreviewFreshnessWatermark)> {
     let mut collect = options.collect;
     collect.include_full_diff = true;
     let candidate = collect_agent_result_with_evidence(collect, validation_evidence)?;
+    let freshness_watermark = merge_preview_freshness_watermark(&candidate)?;
     let mut preview =
         build_merge_apply_preview(candidate, options.forces, options.require_validation)?;
     assess_megafile_policy(&mut preview, &megafile_policy)?;
-    Ok(preview)
+    verify_reviewed_merge_preview_watermark(&freshness_watermark, &preview)?;
+    Ok((preview, freshness_watermark))
 }
 
 /// Builds a merge preview without attempting to acquire a nested shared
@@ -2719,6 +2864,20 @@ pub fn merge_apply_report_with_megafile_policy(
     validation_evidence: ValidationEvidenceBundle,
     megafile_policy: MegafileMergePolicy,
 ) -> Result<MergeApplyReport> {
+    merge_apply_report_with_reviewed_preview_and_megafile_policy(
+        options,
+        validation_evidence,
+        megafile_policy,
+        None,
+    )
+}
+
+pub fn merge_apply_report_with_reviewed_preview_and_megafile_policy(
+    options: MergeApplyOptions,
+    validation_evidence: ValidationEvidenceBundle,
+    megafile_policy: MegafileMergePolicy,
+    reviewed_watermark: Option<&MergePreviewFreshnessWatermark>,
+) -> Result<MergeApplyReport> {
     let repo_root = discover_primary_repo_root(&options.preview.collect.repo)?;
     let _lock = RepoCommonLock::acquire(&repo_root, "merge-apply")?;
     let mut preview_options = options.preview;
@@ -2726,11 +2885,19 @@ pub fn merge_apply_report_with_megafile_policy(
     if !options.candidate_validation_commands.is_empty() {
         preview_options.require_validation = false;
     }
-    let preview = preview_merge_apply_with_megafile_policy(
+    let (preview, current_watermark) = preview_merge_apply_with_freshness_and_megafile_policy(
         preview_options,
         validation_evidence,
         megafile_policy.clone(),
     )?;
+    if let Some(reviewed_watermark) = reviewed_watermark {
+        let reviewed_watermark = reviewed_watermark.clone().canonicalized()?;
+        let axes = reviewed_watermark.drift_axes(&current_watermark);
+        if !axes.is_empty() {
+            return Err(MergePreviewFreshnessError::drift(axes).into());
+        }
+        verify_reviewed_merge_preview_watermark(&reviewed_watermark, &preview)?;
+    }
     let recorded_collision_paths =
         record_merge_collision_decision(&preview, &megafile_policy.thresholds)?;
     if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
@@ -2745,6 +2912,7 @@ pub fn merge_apply_report_with_megafile_policy(
         options.candidate_validation_commands,
         require_validation_after_candidate,
         &expected_primary_state,
+        reviewed_watermark,
     )?;
     report.recorded_collision_paths = recorded_collision_paths;
     if report.recorded_collision_paths.is_empty() {
@@ -2891,6 +3059,7 @@ pub fn apply_prechecked_merge_with_candidate_validation(
         candidate_validation_commands,
         require_validation_after_candidate,
         &expected_primary_state,
+        None,
     )
 }
 
@@ -2899,7 +3068,11 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
     candidate_validation_commands: Vec<CandidateValidationCommand>,
     require_validation_after_candidate: bool,
     expected_primary_state: &PrimaryRepositoryState,
+    reviewed_watermark: Option<&MergePreviewFreshnessWatermark>,
 ) -> Result<MergeApplyReport> {
+    if let Some(reviewed_watermark) = reviewed_watermark {
+        verify_reviewed_merge_preview_watermark(reviewed_watermark, &preview)?;
+    }
     if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
         bail!(
             "merge apply refused: {}",
@@ -2933,6 +3106,10 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
             .map(|command| command.command.clone())
             .collect::<Vec<_>>();
         let reports = run_candidate_validation_commands(&preview, &candidate_validation_commands)?;
+        run_after_candidate_validation_freshness_test_hook();
+        if let Some(reviewed_watermark) = reviewed_watermark {
+            verify_reviewed_merge_preview_watermark(reviewed_watermark, &preview)?;
+        }
         preview.candidate.validation_evidence.push_bound_reports(
             preview.candidate.validation_binding.clone(),
             reports.clone(),
@@ -2997,6 +3174,10 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
     refresh_apply_safety(&mut preview, expected_primary_state)?;
     if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
         return blocked_merge_apply_report(preview);
+    }
+
+    if let Some(reviewed_watermark) = reviewed_watermark {
+        verify_reviewed_merge_preview_watermark(reviewed_watermark, &preview)?;
     }
 
     let args = match preview.safety.apply_mode {
@@ -3319,6 +3500,1689 @@ pub(crate) fn candidate_validation_binding(
         diff_oid: diff_oid.to_string(),
     }
     .canonicalized()
+}
+
+/// Parses either the exact nested freshness watermark or the complete JSON
+/// emitted by `merge preview --json`.
+pub fn reviewed_merge_preview_watermark_from_json(
+    value: &Value,
+) -> Result<MergePreviewFreshnessWatermark> {
+    let object = value.as_object().ok_or_else(|| {
+        MergePreviewFreshnessError::malformed(
+            "expected a watermark object or full merge preview JSON object",
+        )
+    })?;
+    if !object.contains_key("freshness_watermark") {
+        return parse_merge_preview_freshness_watermark(value);
+    }
+    let exact_envelope = object.len() == 3
+        && object.contains_key("candidate")
+        && object.contains_key("safety")
+        && object.contains_key("freshness_watermark");
+    if !exact_envelope {
+        return Err(MergePreviewFreshnessError::malformed(
+            "full merge preview JSON must contain exactly candidate, safety, and freshness_watermark",
+        )
+        .into());
+    }
+    if !object.get("safety").is_some_and(Value::is_object) {
+        return Err(MergePreviewFreshnessError::malformed(
+            "full merge preview safety must be an object",
+        )
+        .into());
+    }
+    let watermark_value = object.get("freshness_watermark").ok_or_else(|| {
+        MergePreviewFreshnessError::malformed("full merge preview omitted freshness_watermark")
+    })?;
+    let watermark = parse_merge_preview_freshness_watermark(watermark_value)?;
+    verify_full_preview_watermark_carrier(value, &watermark)?;
+    Ok(watermark)
+}
+
+fn parse_merge_preview_freshness_watermark(
+    value: &Value,
+) -> Result<MergePreviewFreshnessWatermark> {
+    let watermark: MergePreviewFreshnessWatermark =
+        serde_json::from_value(value.clone()).map_err(|error| {
+            MergePreviewFreshnessError::malformed(format!(
+                "invalid merge preview freshness watermark: {error}"
+            ))
+        })?;
+    watermark.canonicalized().map_err(anyhow::Error::from)
+}
+
+fn verify_full_preview_watermark_carrier(
+    value: &Value,
+    watermark: &MergePreviewFreshnessWatermark,
+) -> Result<()> {
+    let candidate = value
+        .get("candidate")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            MergePreviewFreshnessError::malformed("full merge preview candidate must be an object")
+        })?;
+    validate_full_preview_candidate_shape(candidate)?;
+    let safety = value
+        .get("safety")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            MergePreviewFreshnessError::malformed("full merge preview safety must be an object")
+        })?;
+    validate_full_preview_safety_shape(safety)?;
+    let metadata = candidate
+        .get("metadata")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            MergePreviewFreshnessError::malformed(
+                "full merge preview candidate.metadata must be an object",
+            )
+        })?;
+    let metadata_agent_id = metadata
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            MergePreviewFreshnessError::malformed(
+                "full merge preview candidate.metadata.agent_id must be a string",
+            )
+        })?;
+    let metadata_primary_head = full_preview_optional_oid(metadata, "primary_head")?;
+    let metadata_agent_head = full_preview_optional_oid(metadata, "agent_head")?;
+    let metadata_merge_base = full_preview_optional_oid(metadata, "merge_base")?;
+    let metadata_base_matches_primary = match metadata.get("base_matches_primary") {
+        Some(Value::Bool(value)) => Some(*value),
+        Some(Value::Null) => None,
+        _ => return Err(MergePreviewFreshnessError::malformed(
+            "full merge preview candidate.metadata.base_matches_primary must be a boolean or null",
+        )
+        .into()),
+    };
+    let binding_value = candidate.get("validation_binding").ok_or_else(|| {
+        MergePreviewFreshnessError::malformed(
+            "full merge preview candidate omitted validation_binding",
+        )
+    })?;
+    let binding: CandidateValidationBinding = serde_json::from_value(binding_value.clone())
+        .map_err(|error| {
+            MergePreviewFreshnessError::malformed(format!(
+                "full merge preview candidate.validation_binding is invalid: {error}"
+            ))
+        })?;
+    let binding = binding.canonicalized().map_err(|error| {
+        MergePreviewFreshnessError::malformed(format!(
+            "full merge preview candidate.validation_binding is invalid: {error}"
+        ))
+    })?;
+    let diff = candidate
+        .get("diff")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            MergePreviewFreshnessError::malformed(
+                "full merge preview candidate.diff must be an object",
+            )
+        })?;
+    let diff_full = diff.get("full").and_then(Value::as_str).ok_or_else(|| {
+        MergePreviewFreshnessError::malformed(
+            "full merge preview candidate.diff.full must be a string",
+        )
+    })?;
+    let diff_summary = diff
+        .get("summary")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            MergePreviewFreshnessError::malformed(
+                "full merge preview candidate.diff.summary must be an object",
+            )
+        })?;
+    let summary_text = diff_summary
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            MergePreviewFreshnessError::malformed(
+                "full merge preview candidate.diff.summary.text must be a string",
+            )
+        })?;
+    let summary_truncated = diff_summary
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            MergePreviewFreshnessError::malformed(
+                "full merge preview candidate.diff.summary.truncated must be a boolean",
+            )
+        })?;
+    let summary_matches_full_diff = if summary_truncated {
+        diff_full.starts_with(summary_text)
+            && summary_text.chars().count() < diff_full.chars().count()
+    } else {
+        summary_text == diff_full
+    };
+    let presented_diff_matches_binding =
+        full_preview_diff_matches_binding(diff_full, &binding.diff_oid)?;
+    let changed_paths = full_preview_string_array(candidate, "changed_paths")?;
+    let changes = candidate
+        .get("changes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            MergePreviewFreshnessError::malformed(
+                "full merge preview candidate.changes must be an array",
+            )
+        })?;
+    let change_paths = changes
+        .iter()
+        .map(|change| {
+            change
+                .as_object()
+                .and_then(|change| change.get("path"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    MergePreviewFreshnessError::malformed(
+                        "full merge preview candidate.changes paths must be strings",
+                    )
+                })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let expected_base_matches_primary = match (&metadata_primary_head, &metadata_merge_base) {
+        (Some(primary_head), Some(merge_base)) => Some(primary_head == merge_base),
+        _ => None,
+    };
+
+    let matches_outer_candidate = metadata_agent_id == watermark.source.agent_id
+        && binding.agent_id == watermark.source.agent_id
+        && metadata_primary_head == watermark.primary.head
+        && binding.primary_head == watermark.primary.head
+        && metadata_agent_head == watermark.source.head
+        && binding.agent_head == watermark.source.head
+        && binding.merge_base == metadata_merge_base
+        && metadata_base_matches_primary == expected_base_matches_primary
+        && presented_diff_matches_binding
+        && summary_matches_full_diff
+        && changed_paths == change_paths
+        && binding.diff_oid == watermark.candidate.diff_oid;
+    if !matches_outer_candidate {
+        return Err(MergePreviewFreshnessError::malformed(
+            "full merge preview candidate does not match its validation_binding and freshness_watermark",
+        )
+        .into());
+    }
+    // `snapshot_tree_oid` is intentionally carried only by the watermark: the
+    // existing public preview candidate does not serialize its private tree.
+    Ok(())
+}
+
+fn validate_full_preview_candidate_shape(candidate: &serde_json::Map<String, Value>) -> Result<()> {
+    full_preview_exact_keys(
+        candidate,
+        "candidate",
+        &[
+            "metadata",
+            "claimed_paths",
+            "changed_paths",
+            "changes",
+            "unclaimed_changed_paths",
+            "diff",
+            "validations",
+            "validation_binding",
+        ],
+    )?;
+
+    let metadata = full_preview_object(candidate, "metadata", "candidate.metadata")?;
+    full_preview_exact_keys(
+        metadata,
+        "candidate.metadata",
+        &[
+            "agent_id",
+            "worktree_path",
+            "branch",
+            "primary_repo_root",
+            "primary_head",
+            "agent_head",
+            "merge_base",
+            "base_matches_primary",
+        ],
+    )?;
+    for field in ["agent_id", "worktree_path", "branch", "primary_repo_root"] {
+        full_preview_string(metadata, field, &format!("candidate.metadata.{field}"))?;
+    }
+    for field in ["primary_head", "agent_head", "merge_base"] {
+        full_preview_string_or_null(metadata, field, &format!("candidate.metadata.{field}"))?;
+    }
+    full_preview_bool_or_null(
+        metadata,
+        "base_matches_primary",
+        "candidate.metadata.base_matches_primary",
+    )?;
+
+    for field in ["claimed_paths", "changed_paths", "unclaimed_changed_paths"] {
+        full_preview_string_array(candidate, field)?;
+    }
+
+    let changes = full_preview_array(candidate, "changes", "candidate.changes")?;
+    for (index, change) in changes.iter().enumerate() {
+        let context = format!("candidate.changes[{index}]");
+        let change = change.as_object().ok_or_else(|| {
+            MergePreviewFreshnessError::malformed(format!(
+                "full merge preview {context} must be an object"
+            ))
+        })?;
+        full_preview_exact_keys(change, &context, &["path", "kind"])?;
+        full_preview_string(change, "path", &format!("{context}.path"))?;
+        let kind = full_preview_string(change, "kind", &format!("{context}.kind"))?;
+        if !matches!(
+            kind,
+            "added"
+                | "modified"
+                | "deleted"
+                | "renamed"
+                | "typechange"
+                | "untracked"
+                | "conflicted"
+                | "unknown"
+        ) {
+            return Err(MergePreviewFreshnessError::malformed(format!(
+                "full merge preview {context}.kind is invalid"
+            ))
+            .into());
+        }
+    }
+
+    let diff = full_preview_object(candidate, "diff", "candidate.diff")?;
+    full_preview_exact_keys(diff, "candidate.diff", &["summary", "full"])?;
+    full_preview_string(diff, "full", "candidate.diff.full")?;
+    let summary = full_preview_object(diff, "summary", "candidate.diff.summary")?;
+    full_preview_exact_keys(summary, "candidate.diff.summary", &["text", "truncated"])?;
+    full_preview_string(summary, "text", "candidate.diff.summary.text")?;
+    full_preview_bool(summary, "truncated", "candidate.diff.summary.truncated")?;
+
+    let validations = full_preview_array(candidate, "validations", "candidate.validations")?;
+    for (index, validation) in validations.iter().enumerate() {
+        let context = format!("candidate.validations[{index}]");
+        let validation = validation.as_object().ok_or_else(|| {
+            MergePreviewFreshnessError::malformed(format!(
+                "full merge preview {context} must be an object"
+            ))
+        })?;
+        full_preview_exact_keys(
+            validation,
+            &context,
+            &["name", "status", "message", "paths"],
+        )?;
+        full_preview_string(validation, "name", &format!("{context}.name"))?;
+        let status = full_preview_string(validation, "status", &format!("{context}.status"))?;
+        if !matches!(status, "not_run" | "passed" | "failed" | "skipped") {
+            return Err(MergePreviewFreshnessError::malformed(format!(
+                "full merge preview {context}.status is invalid"
+            ))
+            .into());
+        }
+        full_preview_string_or_null(validation, "message", &format!("{context}.message"))?;
+        let paths = full_preview_array(validation, "paths", &format!("{context}.paths"))?;
+        if paths.iter().any(|path| !path.is_string()) {
+            return Err(MergePreviewFreshnessError::malformed(format!(
+                "full merge preview {context}.paths entries must be strings"
+            ))
+            .into());
+        }
+    }
+
+    let binding = full_preview_object(
+        candidate,
+        "validation_binding",
+        "candidate.validation_binding",
+    )?;
+    full_preview_exact_keys(
+        binding,
+        "candidate.validation_binding",
+        &[
+            "version",
+            "agent_id",
+            "primary_head",
+            "agent_head",
+            "merge_base",
+            "diff_oid",
+        ],
+    )
+}
+
+fn validate_full_preview_safety_shape(safety: &serde_json::Map<String, Value>) -> Result<()> {
+    full_preview_exact_keys(
+        safety,
+        "safety",
+        &[
+            "primary_state_unchanged",
+            "dirty_primary",
+            "stale_base",
+            "apply_check",
+            "unclaimed_edits",
+            "validation",
+            "validation_evidence",
+            "megafile",
+            "megafile_warnings",
+            "megafile_decomposition_target",
+            "megafile_decomposition_evidence",
+            "megafile_blocking",
+            "validation_required",
+            "candidate_validation_commands",
+            "force_options",
+            "apply_mode",
+            "semantic_conflicts",
+            "readiness",
+        ],
+    )?;
+    for field in [
+        "primary_state_unchanged",
+        "dirty_primary",
+        "stale_base",
+        "apply_check",
+        "unclaimed_edits",
+        "validation",
+        "megafile",
+    ] {
+        validate_full_preview_safety_check(
+            full_preview_object(safety, field, &format!("safety.{field}"))?,
+            &format!("safety.{field}"),
+        )?;
+    }
+    validate_full_preview_validation_evidence_check(full_preview_object(
+        safety,
+        "validation_evidence",
+        "safety.validation_evidence",
+    )?)?;
+    let warnings = full_preview_array(safety, "megafile_warnings", "safety.megafile_warnings")?;
+    for (index, warning) in warnings.iter().enumerate() {
+        validate_full_preview_megafile_assessment(warning, index)?;
+    }
+    full_preview_string_or_null(
+        safety,
+        "megafile_decomposition_target",
+        "safety.megafile_decomposition_target",
+    )?;
+    if let Some(evidence) = safety
+        .get("megafile_decomposition_evidence")
+        .and_then(Value::as_object)
+    {
+        validate_full_preview_decomposition_evidence(evidence)?;
+    } else if safety.get("megafile_decomposition_evidence") != Some(&Value::Null) {
+        return Err(MergePreviewFreshnessError::malformed(
+            "full merge preview safety.megafile_decomposition_evidence must be an object or null",
+        )
+        .into());
+    }
+    full_preview_bool(safety, "megafile_blocking", "safety.megafile_blocking")?;
+    full_preview_bool(safety, "validation_required", "safety.validation_required")?;
+    full_preview_string_array_at(
+        full_preview_array(
+            safety,
+            "candidate_validation_commands",
+            "safety.candidate_validation_commands",
+        )?,
+        "safety.candidate_validation_commands",
+    )?;
+    validate_full_preview_force_options(full_preview_object(
+        safety,
+        "force_options",
+        "safety.force_options",
+    )?)?;
+    let apply_mode = full_preview_string(safety, "apply_mode", "safety.apply_mode")?;
+    if !matches!(apply_mode, "none" | "direct" | "three_way") {
+        return Err(MergePreviewFreshnessError::malformed(
+            "full merge preview safety.apply_mode is invalid",
+        )
+        .into());
+    }
+    validate_full_preview_semantic_conflicts(full_preview_object(
+        safety,
+        "semantic_conflicts",
+        "safety.semantic_conflicts",
+    )?)?;
+    validate_full_preview_readiness(full_preview_object(
+        safety,
+        "readiness",
+        "safety.readiness",
+    )?)?;
+    Ok(())
+}
+
+fn validate_full_preview_safety_check(
+    check: &serde_json::Map<String, Value>,
+    context: &str,
+) -> Result<()> {
+    full_preview_exact_keys(check, context, &["status", "message", "paths"])?;
+    full_preview_safety_status(check, "status", &format!("{context}.status"))?;
+    full_preview_string_or_null(check, "message", &format!("{context}.message"))?;
+    full_preview_string_array_at(
+        full_preview_array(check, "paths", &format!("{context}.paths"))?,
+        &format!("{context}.paths"),
+    )
+}
+
+fn validate_full_preview_validation_evidence_check(
+    check: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    let context = "safety.validation_evidence";
+    full_preview_exact_keys(
+        check,
+        context,
+        &["status", "binding_status", "message", "paths"],
+    )?;
+    full_preview_safety_status(check, "status", &format!("{context}.status"))?;
+    let binding_status = full_preview_string(
+        check,
+        "binding_status",
+        &format!("{context}.binding_status"),
+    )?;
+    if !matches!(
+        binding_status,
+        "not_required" | "no_passed_report" | "bound" | "unbound" | "mismatched"
+    ) {
+        return Err(MergePreviewFreshnessError::malformed(format!(
+            "full merge preview {context}.binding_status is invalid"
+        ))
+        .into());
+    }
+    full_preview_string_or_null(check, "message", &format!("{context}.message"))?;
+    full_preview_string_array_at(
+        full_preview_array(check, "paths", &format!("{context}.paths"))?,
+        &format!("{context}.paths"),
+    )
+}
+
+fn validate_full_preview_megafile_assessment(value: &Value, index: usize) -> Result<()> {
+    let context = format!("safety.megafile_warnings[{index}]");
+    let assessment = full_preview_object_value(value, &context)?;
+    full_preview_exact_keys(
+        assessment,
+        &context,
+        &[
+            "version",
+            "path",
+            "is_megafile",
+            "signals",
+            "latest_sample",
+            "previous_sample",
+            "growth_bytes",
+            "growth_lines",
+            "claims_in_window",
+            "collisions_in_window",
+            "accepted_decompositions",
+        ],
+    )?;
+    for field in ["latest_sample", "previous_sample"] {
+        match assessment.get(field) {
+            Some(Value::Null) => {}
+            Some(Value::Object(sample)) => {
+                full_preview_exact_keys(
+                    sample,
+                    &format!("{context}.{field}"),
+                    &["path", "bytes", "lines"],
+                )?;
+            }
+            _ => {
+                return Err(MergePreviewFreshnessError::malformed(format!(
+                    "full merge preview {context}.{field} must be an object or null"
+                ))
+                .into())
+            }
+        }
+    }
+    serde_json::from_value::<MegafileAssessment>(value.clone()).map_err(|error| {
+        MergePreviewFreshnessError::malformed(format!(
+            "full merge preview {context} is invalid: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn validate_full_preview_decomposition_evidence(
+    evidence: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    let context = "safety.megafile_decomposition_evidence";
+    full_preview_exact_keys(
+        evidence,
+        context,
+        &[
+            "run_id",
+            "orchestrator_id",
+            "worker_id",
+            "target_path",
+            "replacement_paths",
+            "supervisor_candidate_binding",
+        ],
+    )?;
+    let run_id = full_preview_string(evidence, "run_id", &format!("{context}.run_id"))?;
+    RunId::new(run_id).map_err(|error| {
+        MergePreviewFreshnessError::malformed(format!(
+            "full merge preview {context}.run_id is invalid: {error}"
+        ))
+    })?;
+    for field in ["orchestrator_id", "worker_id", "target_path"] {
+        full_preview_string(evidence, field, &format!("{context}.{field}"))?;
+    }
+    full_preview_string_array_at(
+        full_preview_array(
+            evidence,
+            "replacement_paths",
+            &format!("{context}.replacement_paths"),
+        )?,
+        &format!("{context}.replacement_paths"),
+    )?;
+    validate_full_preview_validation_binding(
+        evidence
+            .get("supervisor_candidate_binding")
+            .ok_or_else(|| {
+                MergePreviewFreshnessError::malformed(format!(
+                    "full merge preview {context}.supervisor_candidate_binding is missing"
+                ))
+            })?,
+        &format!("{context}.supervisor_candidate_binding"),
+    )
+}
+
+fn validate_full_preview_force_options(forces: &serde_json::Map<String, Value>) -> Result<()> {
+    let context = "safety.force_options";
+    let fields = [
+        "allow_dirty_primary",
+        "allow_stale_base",
+        "allow_unclaimed_edits",
+        "allow_validation_failures",
+        "allow_apply_conflicts",
+    ];
+    full_preview_exact_keys(forces, context, &fields)?;
+    for field in fields {
+        full_preview_bool(forces, field, &format!("{context}.{field}"))?;
+    }
+    Ok(())
+}
+
+fn validate_full_preview_readiness(readiness: &serde_json::Map<String, Value>) -> Result<()> {
+    let context = "safety.readiness";
+    full_preview_exact_keys(
+        readiness,
+        context,
+        &["status", "blockers", "forced", "details"],
+    )?;
+    let status = full_preview_string(readiness, "status", &format!("{context}.status"))?;
+    if !matches!(status, "safe" | "forced" | "blocked") {
+        return Err(MergePreviewFreshnessError::malformed(format!(
+            "full merge preview {context}.status is invalid"
+        ))
+        .into());
+    }
+    for field in ["blockers", "forced"] {
+        let entries = full_preview_array(readiness, field, &format!("{context}.{field}"))?;
+        for (index, entry) in entries.iter().enumerate() {
+            let entry = entry.as_str().ok_or_else(|| {
+                MergePreviewFreshnessError::malformed(format!(
+                    "full merge preview {context}.{field}[{index}] must be a string"
+                ))
+            })?;
+            full_preview_apply_blocker(entry, &format!("{context}.{field}[{index}]"))?;
+        }
+    }
+    let details = full_preview_array(readiness, "details", &format!("{context}.details"))?;
+    for (index, detail) in details.iter().enumerate() {
+        let detail_context = format!("{context}.details[{index}]");
+        let detail = detail.as_object().ok_or_else(|| {
+            MergePreviewFreshnessError::malformed(format!(
+                "full merge preview {detail_context} must be an object"
+            ))
+        })?;
+        validate_full_preview_blocker_detail(detail, &detail_context)?;
+    }
+    Ok(())
+}
+
+fn validate_full_preview_blocker_detail(
+    detail: &serde_json::Map<String, Value>,
+    context: &str,
+) -> Result<()> {
+    full_preview_exact_keys(
+        detail,
+        context,
+        &[
+            "kind",
+            "disposition",
+            "check_status",
+            "paths",
+            "message",
+            "validation_reports",
+            "validation_commands",
+            "next_safe_operation",
+        ],
+    )?;
+    let kind = full_preview_string(detail, "kind", &format!("{context}.kind"))?;
+    full_preview_apply_blocker(kind, &format!("{context}.kind"))?;
+    let disposition =
+        full_preview_string(detail, "disposition", &format!("{context}.disposition"))?;
+    if !matches!(disposition, "blocked" | "forced") {
+        return Err(MergePreviewFreshnessError::malformed(format!(
+            "full merge preview {context}.disposition is invalid"
+        ))
+        .into());
+    }
+    full_preview_safety_status(detail, "check_status", &format!("{context}.check_status"))?;
+    full_preview_string_array_at(
+        full_preview_array(detail, "paths", &format!("{context}.paths"))?,
+        &format!("{context}.paths"),
+    )?;
+    full_preview_string_or_null(detail, "message", &format!("{context}.message"))?;
+    let reports = full_preview_array(
+        detail,
+        "validation_reports",
+        &format!("{context}.validation_reports"),
+    )?;
+    for (index, report) in reports.iter().enumerate() {
+        let report_context = format!("{context}.validation_reports[{index}]");
+        validate_full_preview_validation_report(report, &report_context)?;
+    }
+    full_preview_string_array_at(
+        full_preview_array(
+            detail,
+            "validation_commands",
+            &format!("{context}.validation_commands"),
+        )?,
+        &format!("{context}.validation_commands"),
+    )?;
+    full_preview_string_or_null(
+        detail,
+        "next_safe_operation",
+        &format!("{context}.next_safe_operation"),
+    )
+}
+
+fn validate_full_preview_validation_report(report: &Value, context: &str) -> Result<()> {
+    let report = full_preview_object_value(report, context)?;
+    full_preview_exact_keys(report, context, &["name", "status", "message", "paths"])?;
+    full_preview_string(report, "name", &format!("{context}.name"))?;
+    let status = full_preview_string(report, "status", &format!("{context}.status"))?;
+    if !matches!(status, "not_run" | "passed" | "failed" | "skipped") {
+        return Err(MergePreviewFreshnessError::malformed(format!(
+            "full merge preview {context}.status is invalid"
+        ))
+        .into());
+    }
+    full_preview_string_or_null(report, "message", &format!("{context}.message"))?;
+    full_preview_string_array_at(
+        full_preview_array(report, "paths", &format!("{context}.paths"))?,
+        &format!("{context}.paths"),
+    )
+}
+
+fn validate_full_preview_validation_binding(value: &Value, context: &str) -> Result<()> {
+    let binding = full_preview_object_value(value, context)?;
+    full_preview_exact_keys(
+        binding,
+        context,
+        &[
+            "version",
+            "agent_id",
+            "primary_head",
+            "agent_head",
+            "merge_base",
+            "diff_oid",
+        ],
+    )?;
+    let parsed: CandidateValidationBinding =
+        serde_json::from_value(value.clone()).map_err(|error| {
+            MergePreviewFreshnessError::malformed(format!(
+                "full merge preview {context} is invalid: {error}"
+            ))
+        })?;
+    parsed.canonicalized().map_err(|error| {
+        MergePreviewFreshnessError::malformed(format!(
+            "full merge preview {context} is invalid: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn validate_full_preview_semantic_conflicts(
+    semantic: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    let context = "safety.semantic_conflicts";
+    full_preview_exact_keys_with_optional(
+        semantic,
+        context,
+        &[
+            "advisory",
+            "status",
+            "risk",
+            "confidence",
+            "degraded",
+            "conflict_paths",
+            "overlaps",
+        ],
+        &["notes"],
+    )?;
+    full_preview_bool(semantic, "advisory", &format!("{context}.advisory"))?;
+    full_preview_enum_field(
+        semantic,
+        "status",
+        &format!("{context}.status"),
+        &["no_conflict", "classified", "degraded"],
+    )?;
+    full_preview_semantic_risk(semantic, "risk", &format!("{context}.risk"))?;
+    full_preview_semantic_confidence(semantic, "confidence", &format!("{context}.confidence"))?;
+    full_preview_bool(semantic, "degraded", &format!("{context}.degraded"))?;
+    full_preview_optional_string_array(semantic, "notes", &format!("{context}.notes"))?;
+    full_preview_string_array_at(
+        full_preview_array(
+            semantic,
+            "conflict_paths",
+            &format!("{context}.conflict_paths"),
+        )?,
+        &format!("{context}.conflict_paths"),
+    )?;
+    let overlaps = full_preview_array(semantic, "overlaps", &format!("{context}.overlaps"))?;
+    for (index, overlap) in overlaps.iter().enumerate() {
+        let overlap_context = format!("{context}.overlaps[{index}]");
+        validate_full_preview_semantic_overlap(
+            full_preview_object_value(overlap, &overlap_context)?,
+            &overlap_context,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_full_preview_semantic_overlap(
+    overlap: &serde_json::Map<String, Value>,
+    context: &str,
+) -> Result<()> {
+    full_preview_exact_keys_with_optional(
+        overlap,
+        context,
+        &[
+            "path",
+            "kind",
+            "risk",
+            "confidence",
+            "primary",
+            "candidate",
+            "common_symbols",
+            "common_impls",
+            "common_modules",
+            "impacted_files",
+            "dependency_impacts",
+        ],
+        &["notes"],
+    )?;
+    full_preview_string(overlap, "path", &format!("{context}.path"))?;
+    full_preview_enum_field(
+        overlap,
+        "kind",
+        &format!("{context}.kind"),
+        &[
+            "import_only",
+            "formatting_only",
+            "signature_level",
+            "symbol_level",
+            "impl_level",
+            "module_level",
+            "file_level",
+            "unresolved",
+        ],
+    )?;
+    full_preview_semantic_risk(overlap, "risk", &format!("{context}.risk"))?;
+    full_preview_semantic_confidence(overlap, "confidence", &format!("{context}.confidence"))?;
+    for field in ["primary", "candidate"] {
+        let side_context = format!("{context}.{field}");
+        validate_full_preview_semantic_side(
+            full_preview_object(overlap, field, &side_context)?,
+            &side_context,
+        )?;
+    }
+    for field in ["common_symbols", "common_impls"] {
+        let entries = full_preview_array(overlap, field, &format!("{context}.{field}"))?;
+        for (index, symbol) in entries.iter().enumerate() {
+            let symbol_context = format!("{context}.{field}[{index}]");
+            validate_full_preview_semantic_symbol(
+                full_preview_object_value(symbol, &symbol_context)?,
+                &symbol_context,
+            )?;
+        }
+    }
+    for field in ["common_modules", "impacted_files"] {
+        full_preview_string_array_at(
+            full_preview_array(overlap, field, &format!("{context}.{field}"))?,
+            &format!("{context}.{field}"),
+        )?;
+    }
+    let impacts = full_preview_array(
+        overlap,
+        "dependency_impacts",
+        &format!("{context}.dependency_impacts"),
+    )?;
+    for (index, impact) in impacts.iter().enumerate() {
+        let impact_context = format!("{context}.dependency_impacts[{index}]");
+        validate_full_preview_semantic_conflict_dependency_impact(
+            full_preview_object_value(impact, &impact_context)?,
+            &impact_context,
+        )?;
+    }
+    full_preview_optional_string_array(overlap, "notes", &format!("{context}.notes"))
+}
+
+fn validate_full_preview_semantic_side(
+    side: &serde_json::Map<String, Value>,
+    context: &str,
+) -> Result<()> {
+    full_preview_exact_keys(
+        side,
+        context,
+        &[
+            "touched_symbols",
+            "touched_impls",
+            "touched_modules",
+            "touched_imports",
+            "formatting_only",
+            "import_only",
+            "signature_level",
+            "current_line_ranges",
+            "base_line_ranges",
+        ],
+    )?;
+    for field in ["touched_symbols", "touched_impls"] {
+        let entries = full_preview_array(side, field, &format!("{context}.{field}"))?;
+        for (index, symbol) in entries.iter().enumerate() {
+            let symbol_context = format!("{context}.{field}[{index}]");
+            validate_full_preview_semantic_symbol(
+                full_preview_object_value(symbol, &symbol_context)?,
+                &symbol_context,
+            )?;
+        }
+    }
+    full_preview_string_array_at(
+        full_preview_array(
+            side,
+            "touched_modules",
+            &format!("{context}.touched_modules"),
+        )?,
+        &format!("{context}.touched_modules"),
+    )?;
+    let imports = full_preview_array(
+        side,
+        "touched_imports",
+        &format!("{context}.touched_imports"),
+    )?;
+    for (index, import) in imports.iter().enumerate() {
+        let import_context = format!("{context}.touched_imports[{index}]");
+        validate_full_preview_semantic_import(
+            full_preview_object_value(import, &import_context)?,
+            &import_context,
+        )?;
+    }
+    for field in ["formatting_only", "import_only", "signature_level"] {
+        full_preview_bool(side, field, &format!("{context}.{field}"))?;
+    }
+    for field in ["current_line_ranges", "base_line_ranges"] {
+        let ranges = full_preview_array(side, field, &format!("{context}.{field}"))?;
+        for (index, range) in ranges.iter().enumerate() {
+            let range_context = format!("{context}.{field}[{index}]");
+            validate_full_preview_semantic_line_range(
+                full_preview_object_value(range, &range_context)?,
+                &range_context,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_full_preview_semantic_symbol(
+    symbol: &serde_json::Map<String, Value>,
+    context: &str,
+) -> Result<()> {
+    full_preview_exact_keys(
+        symbol,
+        context,
+        &[
+            "name",
+            "qualified_path",
+            "kind",
+            "visibility",
+            "impl_target",
+            "impl_trait",
+            "file",
+        ],
+    )?;
+    for field in ["name", "visibility", "file"] {
+        full_preview_string(symbol, field, &format!("{context}.{field}"))?;
+    }
+    full_preview_string_array_at(
+        full_preview_array(
+            symbol,
+            "qualified_path",
+            &format!("{context}.qualified_path"),
+        )?,
+        &format!("{context}.qualified_path"),
+    )?;
+    full_preview_enum_field(
+        symbol,
+        "kind",
+        &format!("{context}.kind"),
+        &[
+            "module",
+            "function",
+            "struct",
+            "enum",
+            "trait",
+            "impl",
+            "method",
+            "const",
+            "type_alias",
+        ],
+    )?;
+    for field in ["impl_target", "impl_trait"] {
+        full_preview_string_or_null(symbol, field, &format!("{context}.{field}"))?;
+    }
+    Ok(())
+}
+
+fn validate_full_preview_semantic_import(
+    import: &serde_json::Map<String, Value>,
+    context: &str,
+) -> Result<()> {
+    full_preview_exact_keys(import, context, &["path", "alias", "glob", "visibility"])?;
+    for field in ["path", "visibility"] {
+        full_preview_string(import, field, &format!("{context}.{field}"))?;
+    }
+    full_preview_string_or_null(import, "alias", &format!("{context}.alias"))?;
+    full_preview_bool(import, "glob", &format!("{context}.glob"))?;
+    Ok(())
+}
+
+fn validate_full_preview_semantic_line_range(
+    range: &serde_json::Map<String, Value>,
+    context: &str,
+) -> Result<()> {
+    full_preview_exact_keys(range, context, &["start_line", "end_line"])?;
+    full_preview_u64(range, "start_line", &format!("{context}.start_line"))?;
+    full_preview_u64(range, "end_line", &format!("{context}.end_line"))?;
+    Ok(())
+}
+
+fn validate_full_preview_semantic_conflict_dependency_impact(
+    impact: &serde_json::Map<String, Value>,
+    context: &str,
+) -> Result<()> {
+    full_preview_exact_keys(impact, context, &["side", "impact"])?;
+    full_preview_enum_field(
+        impact,
+        "side",
+        &format!("{context}.side"),
+        &["primary", "candidate"],
+    )?;
+    validate_full_preview_semantic_dependency_impact(
+        full_preview_object(impact, "impact", &format!("{context}.impact"))?,
+        &format!("{context}.impact"),
+    )
+}
+
+fn validate_full_preview_semantic_dependency_impact(
+    impact: &serde_json::Map<String, Value>,
+    context: &str,
+) -> Result<()> {
+    full_preview_exact_keys(
+        impact,
+        context,
+        &["direction", "changed_path", "related_file", "dependency"],
+    )?;
+    full_preview_enum_field(
+        impact,
+        "direction",
+        &format!("{context}.direction"),
+        &["incoming", "outgoing"],
+    )?;
+    full_preview_string(impact, "changed_path", &format!("{context}.changed_path"))?;
+    full_preview_string_or_null(impact, "related_file", &format!("{context}.related_file"))?;
+    validate_full_preview_semantic_dependency(
+        full_preview_object(impact, "dependency", &format!("{context}.dependency"))?,
+        &format!("{context}.dependency"),
+    )
+}
+
+fn validate_full_preview_semantic_dependency(
+    dependency: &serde_json::Map<String, Value>,
+    context: &str,
+) -> Result<()> {
+    full_preview_exact_keys(
+        dependency,
+        context,
+        &["from_file", "from_module", "to", "to_file", "kind", "span"],
+    )?;
+    for field in ["from_file", "to"] {
+        full_preview_string(dependency, field, &format!("{context}.{field}"))?;
+    }
+    full_preview_string_array_at(
+        full_preview_array(dependency, "from_module", &format!("{context}.from_module"))?,
+        &format!("{context}.from_module"),
+    )?;
+    full_preview_string_or_null(dependency, "to_file", &format!("{context}.to_file"))?;
+    full_preview_enum_field(
+        dependency,
+        "kind",
+        &format!("{context}.kind"),
+        &["import", "module_declaration", "inline_module"],
+    )?;
+    validate_full_preview_source_span(
+        full_preview_object(dependency, "span", &format!("{context}.span"))?,
+        &format!("{context}.span"),
+    )
+}
+
+fn validate_full_preview_source_span(
+    span: &serde_json::Map<String, Value>,
+    context: &str,
+) -> Result<()> {
+    let fields = ["start_byte", "end_byte", "start_line", "end_line"];
+    full_preview_exact_keys(span, context, &fields)?;
+    for field in fields {
+        full_preview_u64(span, field, &format!("{context}.{field}"))?;
+    }
+    Ok(())
+}
+
+fn full_preview_safety_status(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<()> {
+    full_preview_enum_field(object, field, context, &["passed", "failed", "skipped"])
+}
+
+fn full_preview_apply_blocker(value: &str, context: &str) -> Result<()> {
+    if matches!(
+        value,
+        "dirty_primary"
+            | "stale_base"
+            | "apply_check_failed"
+            | "excluded_reference"
+            | "unclaimed_edits"
+            | "validation_missing"
+            | "validation_not_run"
+            | "validation_skipped"
+            | "validation_failed"
+    ) {
+        return Ok(());
+    }
+    Err(
+        MergePreviewFreshnessError::malformed(format!("full merge preview {context} is invalid"))
+            .into(),
+    )
+}
+
+fn full_preview_semantic_risk(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<()> {
+    full_preview_enum_field(
+        object,
+        field,
+        context,
+        &["none", "low", "medium", "high", "unknown"],
+    )
+}
+
+fn full_preview_semantic_confidence(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<()> {
+    full_preview_enum_field(object, field, context, &["none", "low", "medium", "high"])
+}
+
+fn full_preview_enum_field(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+    accepted: &[&str],
+) -> Result<()> {
+    let value = full_preview_string(object, field, context)?;
+    if accepted.contains(&value) {
+        return Ok(());
+    }
+    Err(
+        MergePreviewFreshnessError::malformed(format!("full merge preview {context} is invalid"))
+            .into(),
+    )
+}
+
+fn full_preview_optional_string_array(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<()> {
+    let Some(value) = object.get(field) else {
+        return Ok(());
+    };
+    let values = value.as_array().ok_or_else(|| {
+        MergePreviewFreshnessError::malformed(format!(
+            "full merge preview {context} must be an array"
+        ))
+    })?;
+    if values.is_empty() {
+        return Err(MergePreviewFreshnessError::malformed(format!(
+            "full merge preview {context} must be omitted when empty"
+        ))
+        .into());
+    }
+    full_preview_string_array_at(values, context)
+}
+
+fn full_preview_string_array_at(values: &[Value], context: &str) -> Result<()> {
+    if values.iter().all(Value::is_string) {
+        return Ok(());
+    }
+    Err(MergePreviewFreshnessError::malformed(format!(
+        "full merge preview {context} entries must be strings"
+    ))
+    .into())
+}
+
+fn full_preview_object_value<'a>(
+    value: &'a Value,
+    context: &str,
+) -> Result<&'a serde_json::Map<String, Value>> {
+    value.as_object().ok_or_else(|| {
+        MergePreviewFreshnessError::malformed(format!(
+            "full merge preview {context} must be an object"
+        ))
+        .into()
+    })
+}
+
+fn full_preview_u64(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<u64> {
+    object.get(field).and_then(Value::as_u64).ok_or_else(|| {
+        MergePreviewFreshnessError::malformed(format!(
+            "full merge preview {context} must be a non-negative integer"
+        ))
+        .into()
+    })
+}
+
+fn full_preview_exact_keys_with_optional(
+    object: &serde_json::Map<String, Value>,
+    context: &str,
+    required: &[&str],
+    optional: &[&str],
+) -> Result<()> {
+    let mut missing = required
+        .iter()
+        .filter_map(|field| (!object.contains_key(*field)).then_some(*field))
+        .collect::<Vec<_>>();
+    let mut unknown = object
+        .keys()
+        .filter(|field| !required.contains(&field.as_str()) && !optional.contains(&field.as_str()))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    missing.sort_unstable();
+    unknown.sort_unstable();
+    if missing.is_empty() && unknown.is_empty() {
+        return Ok(());
+    }
+    Err(MergePreviewFreshnessError::malformed(format!(
+        "full merge preview {context} has missing keys [{}] and unknown keys [{}]",
+        missing.join(", "),
+        unknown.join(", ")
+    ))
+    .into())
+}
+
+fn full_preview_exact_keys(
+    object: &serde_json::Map<String, Value>,
+    context: &str,
+    expected: &[&str],
+) -> Result<()> {
+    let mut missing = expected
+        .iter()
+        .filter_map(|field| (!object.contains_key(*field)).then_some(*field))
+        .collect::<Vec<_>>();
+    let mut unknown = object
+        .keys()
+        .filter(|field| !expected.contains(&field.as_str()))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    missing.sort_unstable();
+    unknown.sort_unstable();
+    if missing.is_empty() && unknown.is_empty() {
+        return Ok(());
+    }
+    Err(MergePreviewFreshnessError::malformed(format!(
+        "full merge preview {context} has missing keys [{}] and unknown keys [{}]",
+        missing.join(", "),
+        unknown.join(", ")
+    ))
+    .into())
+}
+
+fn full_preview_object<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<&'a serde_json::Map<String, Value>> {
+    object.get(field).and_then(Value::as_object).ok_or_else(|| {
+        MergePreviewFreshnessError::malformed(format!(
+            "full merge preview {context} must be an object"
+        ))
+        .into()
+    })
+}
+
+fn full_preview_array<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<&'a Vec<Value>> {
+    object.get(field).and_then(Value::as_array).ok_or_else(|| {
+        MergePreviewFreshnessError::malformed(format!(
+            "full merge preview {context} must be an array"
+        ))
+        .into()
+    })
+}
+
+fn full_preview_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<&'a str> {
+    object.get(field).and_then(Value::as_str).ok_or_else(|| {
+        MergePreviewFreshnessError::malformed(format!(
+            "full merge preview {context} must be a string"
+        ))
+        .into()
+    })
+}
+
+fn full_preview_bool(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<bool> {
+    object.get(field).and_then(Value::as_bool).ok_or_else(|| {
+        MergePreviewFreshnessError::malformed(format!(
+            "full merge preview {context} must be a boolean"
+        ))
+        .into()
+    })
+}
+
+fn full_preview_string_or_null(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<()> {
+    match object.get(field) {
+        Some(Value::String(_) | Value::Null) => Ok(()),
+        _ => Err(MergePreviewFreshnessError::malformed(format!(
+            "full merge preview {context} must be a string or null"
+        ))
+        .into()),
+    }
+}
+
+fn full_preview_bool_or_null(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<()> {
+    match object.get(field) {
+        Some(Value::Bool(_) | Value::Null) => Ok(()),
+        _ => Err(MergePreviewFreshnessError::malformed(format!(
+            "full merge preview {context} must be a boolean or null"
+        ))
+        .into()),
+    }
+}
+
+fn full_preview_diff_matches_binding(presented: &str, expected_oid: &str) -> Result<bool> {
+    let presented_oid = Oid::hash_object(ObjectType::Blob, presented.as_bytes())
+        .context("failed to hash full merge preview candidate.diff.full")?
+        .to_string();
+    if presented_oid == expected_oid {
+        return Ok(true);
+    }
+    let Some(decoded) = decode_escaped_patch_text(presented) else {
+        return Ok(false);
+    };
+    if patch_text_for_json(&decoded) != presented {
+        return Ok(false);
+    }
+    let decoded_oid = Oid::hash_object(ObjectType::Blob, &decoded)
+        .context("failed to hash decoded full merge preview candidate.diff.full")?
+        .to_string();
+    Ok(decoded_oid == expected_oid)
+}
+
+fn decode_escaped_patch_text(value: &str) -> Option<Vec<u8>> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte > 0x7f {
+            return None;
+        }
+        if byte != b'\\' {
+            decoded.push(byte);
+            index += 1;
+            continue;
+        }
+        match bytes.get(index + 1).copied() {
+            Some(b'\\') => {
+                decoded.push(b'\\');
+                index += 2;
+            }
+            Some(b'x') => {
+                let high = bytes
+                    .get(index + 2)
+                    .copied()
+                    .and_then(uppercase_hex_value)?;
+                let low = bytes
+                    .get(index + 3)
+                    .copied()
+                    .and_then(uppercase_hex_value)?;
+                decoded.push((high << 4) | low);
+                index += 4;
+            }
+            _ => return None,
+        }
+    }
+    Some(decoded)
+}
+
+fn uppercase_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn full_preview_string_array<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Vec<&'a str>> {
+    object
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            MergePreviewFreshnessError::malformed(format!(
+                "full merge preview candidate.{field} must be an array"
+            ))
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                MergePreviewFreshnessError::malformed(format!(
+                    "full merge preview candidate.{field} entries must be strings"
+                ))
+                .into()
+            })
+        })
+        .collect()
+}
+
+fn full_preview_optional_oid(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<String>> {
+    let value = object.get(field).ok_or_else(|| {
+        MergePreviewFreshnessError::malformed(format!(
+            "full merge preview candidate.metadata.{field} is missing"
+        ))
+    })?;
+    let value = match value {
+        Value::Null => None,
+        Value::String(value) => Some(value.clone()),
+        _ => {
+            return Err(MergePreviewFreshnessError::malformed(format!(
+                "full merge preview candidate.metadata.{field} must be a string or null"
+            ))
+            .into())
+        }
+    };
+    canonical_optional_watermark_oid(value, &format!("candidate.metadata.{field}"))
+        .map_err(anyhow::Error::from)
+}
+
+pub fn verify_reviewed_merge_preview_watermark(
+    reviewed: &MergePreviewFreshnessWatermark,
+    current_preview: &MergeApplyPreview,
+) -> Result<()> {
+    let reviewed = reviewed.clone().canonicalized()?;
+    let current = current_merge_preview_freshness_watermark(&current_preview.candidate)?;
+    let axes = reviewed.drift_axes(&current);
+    if axes.is_empty() {
+        Ok(())
+    } else {
+        Err(MergePreviewFreshnessError::drift(axes).into())
+    }
+}
+
+fn merge_preview_freshness_watermark(
+    candidate: &MergeCandidate,
+) -> Result<MergePreviewFreshnessWatermark> {
+    let primary = PrimaryRepositoryState::capture(&candidate.metadata.primary_repo_root)?;
+    let watermark = MergePreviewFreshnessWatermark::from_candidate(candidate, primary)?;
+    let current = current_merge_preview_freshness_watermark(candidate)?;
+    let axes = watermark.drift_axes(&current);
+    if axes.is_empty() {
+        Ok(watermark)
+    } else {
+        Err(MergePreviewFreshnessError::drift(axes).into())
+    }
+}
+
+fn current_merge_preview_freshness_watermark(
+    candidate: &MergeCandidate,
+) -> Result<MergePreviewFreshnessWatermark> {
+    let primary_before = PrimaryRepositoryState::capture(&candidate.metadata.primary_repo_root)?;
+    let source = capture_candidate_freshness_state(candidate)?;
+    let primary_after = PrimaryRepositoryState::capture(&candidate.metadata.primary_repo_root)?;
+    if primary_before != primary_after {
+        return Err(MergePreviewFreshnessError::drift(vec![
+            MergePreviewDriftAxis::PrimaryHead,
+            MergePreviewDriftAxis::PrimaryIndex,
+            MergePreviewDriftAxis::PrimaryWorktree,
+        ])
+        .into());
+    }
+    MergePreviewFreshnessWatermark::from_live_candidate(candidate, primary_after, source)
+}
+
+fn capture_candidate_freshness_state(
+    candidate: &MergeCandidate,
+) -> Result<CandidateFreshnessState> {
+    let repo =
+        crate::git_repository::open(&candidate.metadata.worktree_path).with_context(|| {
+            format!(
+                "failed to open source worktree {} for merge preview freshness",
+                candidate.metadata.worktree_path.display()
+            )
+        })?;
+    let base = collection_base_oid(&candidate.metadata)?;
+    capture_two_matching(|| {
+        let before_head = head_oid(&repo).context("failed to read source HEAD for freshness")?;
+        let before_index = hash_optional_file(&repo.path().join("index"))?;
+        let before_status = capture_repository_status(&repo)?;
+        let captured = snapshot_worktree_candidate_from_base(
+            &repo,
+            &candidate.metadata.worktree_path,
+            before_head,
+            base,
+        )?;
+        let after_head = head_oid(&repo).context("failed to re-read source HEAD for freshness")?;
+        let after_index = hash_optional_file(&repo.path().join("index"))?;
+        let after_status = capture_repository_status(&repo)?;
+        if before_head != after_head || before_index != after_index || before_status != after_status
+        {
+            return Ok(None);
+        }
+        let diff_oid = Oid::hash_object(ObjectType::Blob, &captured.raw_diff)
+            .context("failed to hash current merge candidate diff")?;
+        Ok(Some(CandidateFreshnessState {
+            head: after_head,
+            diff_oid,
+            snapshot_tree: captured.oid,
+        }))
+    })
+}
+
+impl MergePreviewFreshnessWatermark {
+    fn from_candidate(candidate: &MergeCandidate, primary: PrimaryRepositoryState) -> Result<Self> {
+        let source_head = candidate
+            .metadata
+            .agent_head
+            .as_deref()
+            .map(Oid::from_str)
+            .transpose()
+            .context("captured source HEAD is not a Git object id")?;
+        let diff_oid = Oid::hash_object(ObjectType::Blob, &candidate.raw_diff)
+            .context("failed to hash captured merge candidate diff")?;
+        Self::from_parts(
+            candidate,
+            primary,
+            source_head,
+            diff_oid,
+            candidate.snapshot_tree,
+        )
+    }
+
+    fn from_live_candidate(
+        candidate: &MergeCandidate,
+        primary: PrimaryRepositoryState,
+        source: CandidateFreshnessState,
+    ) -> Result<Self> {
+        Self::from_parts(
+            candidate,
+            primary,
+            source.head,
+            source.diff_oid,
+            source.snapshot_tree,
+        )
+    }
+
+    fn from_parts(
+        candidate: &MergeCandidate,
+        primary: PrimaryRepositoryState,
+        source_head: Option<Oid>,
+        diff_oid: Oid,
+        snapshot_tree: Oid,
+    ) -> Result<Self> {
+        let captured_primary_head = candidate
+            .metadata
+            .primary_head
+            .as_deref()
+            .map(Oid::from_str)
+            .transpose()
+            .context("captured primary HEAD is not a Git object id")?;
+        if captured_primary_head != primary.head {
+            return Err(MergePreviewFreshnessError::drift(vec![
+                MergePreviewDriftAxis::PrimaryHead,
+            ])
+            .into());
+        }
+        Ok(Self {
+            version: MERGE_PREVIEW_FRESHNESS_WATERMARK_VERSION,
+            primary: MergePreviewPrimaryWatermark {
+                head: primary.head.map(|oid| oid.to_string()),
+                index_digest: primary.index_digest.map(|oid| oid.to_string()),
+                worktree_digest: primary.worktree_digest.to_string(),
+            },
+            source: MergePreviewSourceWatermark {
+                agent_id: candidate.metadata.agent_id.clone(),
+                head: source_head.map(|oid| oid.to_string()),
+            },
+            candidate: MergePreviewCandidateWatermark {
+                diff_oid: diff_oid.to_string(),
+                snapshot_tree_oid: snapshot_tree.to_string(),
+            },
+        })
+    }
+
+    fn canonicalized(mut self) -> std::result::Result<Self, MergePreviewFreshnessError> {
+        if self.version != MERGE_PREVIEW_FRESHNESS_WATERMARK_VERSION {
+            return Err(MergePreviewFreshnessError::UnsupportedWatermarkVersion {
+                version: self.version,
+                expected: MERGE_PREVIEW_FRESHNESS_WATERMARK_VERSION,
+            });
+        }
+        let normalized_agent = normalize_agent_id(&self.source.agent_id).map_err(|error| {
+            MergePreviewFreshnessError::malformed(format!("source.agent_id is invalid: {error}"))
+        })?;
+        if normalized_agent != self.source.agent_id {
+            return Err(MergePreviewFreshnessError::malformed(
+                "source.agent_id must be canonical",
+            ));
+        }
+        self.primary.head = canonical_optional_watermark_oid(self.primary.head, "primary.head")?;
+        self.primary.index_digest =
+            canonical_optional_watermark_oid(self.primary.index_digest, "primary.index_digest")?;
+        self.primary.worktree_digest =
+            canonical_watermark_oid(&self.primary.worktree_digest, "primary.worktree_digest")?;
+        self.source.head = canonical_optional_watermark_oid(self.source.head, "source.head")?;
+        self.candidate.diff_oid =
+            canonical_watermark_oid(&self.candidate.diff_oid, "candidate.diff_oid")?;
+        self.candidate.snapshot_tree_oid = canonical_watermark_oid(
+            &self.candidate.snapshot_tree_oid,
+            "candidate.snapshot_tree_oid",
+        )?;
+        Ok(self)
+    }
+
+    fn drift_axes(&self, current: &Self) -> Vec<MergePreviewDriftAxis> {
+        let mut axes = Vec::new();
+        if self.primary.head != current.primary.head {
+            axes.push(MergePreviewDriftAxis::PrimaryHead);
+        }
+        if self.primary.index_digest != current.primary.index_digest {
+            axes.push(MergePreviewDriftAxis::PrimaryIndex);
+        }
+        if self.primary.worktree_digest != current.primary.worktree_digest {
+            axes.push(MergePreviewDriftAxis::PrimaryWorktree);
+        }
+        if self.source.agent_id != current.source.agent_id {
+            axes.push(MergePreviewDriftAxis::SourceIdentity);
+        }
+        if self.source.head != current.source.head {
+            axes.push(MergePreviewDriftAxis::SourceHead);
+        }
+        if self.candidate.diff_oid != current.candidate.diff_oid {
+            axes.push(MergePreviewDriftAxis::CandidateDiff);
+        }
+        if self.candidate.snapshot_tree_oid != current.candidate.snapshot_tree_oid {
+            axes.push(MergePreviewDriftAxis::CandidateSnapshot);
+        }
+        axes
+    }
+}
+
+fn canonical_optional_watermark_oid(
+    value: Option<String>,
+    field: &str,
+) -> std::result::Result<Option<String>, MergePreviewFreshnessError> {
+    value
+        .map(|value| canonical_watermark_oid(&value, field))
+        .transpose()
+}
+
+fn canonical_watermark_oid(
+    value: &str,
+    field: &str,
+) -> std::result::Result<String, MergePreviewFreshnessError> {
+    let oid = Oid::from_str(value).map_err(|_| {
+        MergePreviewFreshnessError::malformed(format!("{field} must be a Git object id"))
+    })?;
+    let canonical = oid.to_string();
+    if canonical != value {
+        return Err(MergePreviewFreshnessError::malformed(format!(
+            "{field} must use its canonical 40-character lowercase form"
+        )));
+    }
+    Ok(canonical)
 }
 
 fn canonical_optional_oid(value: Option<String>, field: &str) -> Result<Option<String>> {
@@ -5648,6 +7512,50 @@ fn run_candidate_validation_commands(
     }
     Ok(reports)
 }
+
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_CANDIDATE_VALIDATION_FRESHNESS_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct AfterCandidateValidationFreshnessHookGuard;
+
+#[cfg(test)]
+impl Drop for AfterCandidateValidationFreshnessHookGuard {
+    fn drop(&mut self) {
+        AFTER_CANDIDATE_VALIDATION_FRESHNESS_HOOK.with(|slot| {
+            slot.replace(None);
+        });
+    }
+}
+
+#[cfg(test)]
+fn install_after_candidate_validation_freshness_hook(
+    hook: impl FnOnce() + 'static,
+) -> AfterCandidateValidationFreshnessHookGuard {
+    AFTER_CANDIDATE_VALIDATION_FRESHNESS_HOOK.with(|slot| {
+        let previous = slot.replace(Some(Box::new(hook)));
+        assert!(
+            previous.is_none(),
+            "candidate validation freshness hook already installed"
+        );
+    });
+    AfterCandidateValidationFreshnessHookGuard
+}
+
+#[cfg(test)]
+fn run_after_candidate_validation_freshness_test_hook() {
+    AFTER_CANDIDATE_VALIDATION_FRESHNESS_HOOK.with(|slot| {
+        if let Some(hook) = slot.take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_after_candidate_validation_freshness_test_hook() {}
 
 struct CandidateValidationSandbox {
     runtime_directory: PrivateRuntimeDirectory,
@@ -8425,7 +10333,13 @@ fn sort_validation_reports(reports: &mut [ValidationReport]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::megafile::{FileSizeSample, MegafileRecordKind, MegafileThresholdCalibration};
+    use crate::megafile::{
+        FileSizeSample, MegafileRecordKind, MegafileSignal, MegafileThresholdCalibration,
+    };
+    use crate::repo_semantic::{
+        SemanticDependency, SemanticDependencyDirection, SemanticDependencyImpact,
+        SemanticDependencyKind, SemanticSymbolKind, SourceSpan,
+    };
     use crate::worktree::WorktreeCreateOptions;
     use git2::Signature;
     use std::process::{Command, Stdio};
@@ -9133,6 +11047,806 @@ mod tests {
             forces: MergeForceOptions::default(),
             require_validation: false,
         }
+    }
+
+    fn merge_watermark_fixture(root: &Path) -> (PathBuf, WorktreeRecord) {
+        let (repo_path, agent) = create_semantic_merge_fixture(
+            root,
+            &[
+                ("README.md", "# Smoke\n"),
+                ("src/lib.rs", "pub fn ok() -> bool { true }\n"),
+            ],
+        );
+        fs::write(agent.path.join("README.md"), "# Smoke\n\nreviewed\n")
+            .expect("edit reviewed merge candidate");
+        (repo_path, agent)
+    }
+
+    fn capture_reviewed_watermark(
+        repo_path: &Path,
+    ) -> (MergeApplyPreview, MergePreviewFreshnessWatermark) {
+        preview_merge_apply_with_freshness_and_megafile_policy(
+            semantic_preview_options(repo_path, "README.md"),
+            ValidationEvidenceBundle::default(),
+            MegafileMergePolicy::default(),
+        )
+        .expect("capture reviewed merge preview")
+    }
+
+    fn apply_reviewed_watermark(
+        repo_path: &Path,
+        watermark: Option<&MergePreviewFreshnessWatermark>,
+    ) -> Result<MergeApplyReport> {
+        merge_apply_report_with_reviewed_preview_and_megafile_policy(
+            MergeApplyOptions {
+                preview: semantic_preview_options(repo_path, "README.md"),
+                candidate_validation_commands: Vec::new(),
+            },
+            ValidationEvidenceBundle::default(),
+            MegafileMergePolicy::default(),
+            watermark,
+        )
+    }
+
+    fn assert_reviewed_watermark_drift(
+        error: &anyhow::Error,
+        expected_axes: &[MergePreviewDriftAxis],
+    ) {
+        let freshness = error
+            .downcast_ref::<MergePreviewFreshnessError>()
+            .expect("typed reviewed preview freshness refusal");
+        assert_eq!(freshness.reason(), "preview_freshness_drift");
+        assert_eq!(freshness.drift_axes(), expected_axes);
+        assert!(error.to_string().contains("run merge preview again"));
+    }
+
+    fn assert_malformed_reviewed_preview(value: &Value) {
+        let error = reviewed_merge_preview_watermark_from_json(value)
+            .expect_err("malformed full reviewed preview must fail");
+        assert_eq!(
+            error
+                .downcast_ref::<MergePreviewFreshnessError>()
+                .expect("typed malformed full reviewed preview")
+                .reason(),
+            "watermark_malformed"
+        );
+    }
+
+    fn commit_empty_for_merge_watermark(repo_path: &Path, message: &str) {
+        let repo = crate::git_repository::open(repo_path).expect("open watermark repository");
+        let parent = repo
+            .head()
+            .expect("watermark repository HEAD")
+            .peel_to_commit()
+            .expect("watermark parent commit");
+        let tree = parent.tree().expect("watermark parent tree");
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &[&parent],
+        )
+        .expect("create empty watermark commit");
+    }
+
+    #[test]
+    fn merge_preview_output_exposes_exact_versioned_freshness_watermark() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, _) = merge_watermark_fixture(temp.path());
+        let (preview, watermark) = capture_reviewed_watermark(&repo_path);
+        let output = serde_json::to_value(MergeApplyPreviewOutput {
+            preview: &preview,
+            freshness_watermark: &watermark,
+        })
+        .expect("serialize merge preview output");
+
+        assert_eq!(
+            output["freshness_watermark"]["version"],
+            MERGE_PREVIEW_FRESHNESS_WATERMARK_VERSION
+        );
+        assert_eq!(
+            output["freshness_watermark"]["source"]["agent_id"],
+            "agent-a"
+        );
+        assert_eq!(
+            output["freshness_watermark"]["candidate"]["diff_oid"],
+            output["candidate"]["validation_binding"]["diff_oid"]
+        );
+        assert!(output["freshness_watermark"]["primary"]["head"].is_string());
+        assert!(output["freshness_watermark"]["primary"]["index_digest"].is_string());
+        assert!(output["freshness_watermark"]["primary"]["worktree_digest"].is_string());
+        assert!(output["freshness_watermark"]["source"]["head"].is_string());
+        assert!(output["freshness_watermark"]["candidate"]["snapshot_tree_oid"].is_string());
+
+        let parsed = reviewed_merge_preview_watermark_from_json(&output)
+            .expect("parse full merge preview output");
+        assert_eq!(parsed, watermark);
+        let nested = reviewed_merge_preview_watermark_from_json(&output["freshness_watermark"])
+            .expect("parse nested merge preview watermark");
+        assert_eq!(nested, watermark);
+    }
+
+    #[test]
+    fn reviewed_merge_watermark_parser_refuses_malformed_and_unsupported_inputs() {
+        let malformed = serde_json::json!({"version": 1, "primary": {}});
+        let malformed_error = reviewed_merge_preview_watermark_from_json(&malformed)
+            .expect_err("malformed reviewed watermark must fail");
+        let malformed_freshness = malformed_error
+            .downcast_ref::<MergePreviewFreshnessError>()
+            .expect("typed malformed watermark refusal");
+        assert_eq!(malformed_freshness.reason(), "watermark_malformed");
+
+        let unsupported = serde_json::json!({
+            "version": MERGE_PREVIEW_FRESHNESS_WATERMARK_VERSION + 1,
+            "primary": {
+                "head": null,
+                "index_digest": null,
+                "worktree_digest": "1111111111111111111111111111111111111111"
+            },
+            "source": {"agent_id": "agent-a", "head": null},
+            "candidate": {
+                "diff_oid": "2222222222222222222222222222222222222222",
+                "snapshot_tree_oid": "3333333333333333333333333333333333333333"
+            }
+        });
+        let unsupported_error = reviewed_merge_preview_watermark_from_json(&unsupported)
+            .expect_err("unsupported reviewed watermark must fail");
+        let unsupported_freshness = unsupported_error
+            .downcast_ref::<MergePreviewFreshnessError>()
+            .expect("typed unsupported watermark refusal");
+        assert_eq!(
+            unsupported_freshness.reason(),
+            "watermark_version_unsupported"
+        );
+    }
+
+    #[test]
+    fn full_preview_diff_binding_accepts_the_non_utf8_presentation() {
+        let raw = b"literal \\x41 and invalid \xff\n";
+        let presented = patch_text_for_json(raw);
+        let oid = Oid::hash_object(ObjectType::Blob, raw)
+            .expect("hash non-UTF-8 reviewed diff")
+            .to_string();
+
+        assert!(full_preview_diff_matches_binding(&presented, &oid)
+            .expect("verify non-UTF-8 reviewed diff"));
+        assert!(!full_preview_diff_matches_binding("tampered", &oid)
+            .expect("reject tampered reviewed diff"));
+
+        let printable_raw = b"A\xff\n";
+        let printable_oid = Oid::hash_object(ObjectType::Blob, printable_raw)
+            .expect("hash printable non-UTF-8 reviewed diff")
+            .to_string();
+        assert!(
+            !full_preview_diff_matches_binding("\\x41\\xFF\n", &printable_oid)
+                .expect("reject non-canonical reviewed diff presentation")
+        );
+    }
+
+    #[test]
+    fn reviewed_merge_watermark_parser_rejects_ambiguous_or_incomplete_preview_carriers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, _) = merge_watermark_fixture(temp.path());
+        let (preview, watermark) = capture_reviewed_watermark(&repo_path);
+        let full = serde_json::to_value(MergeApplyPreviewOutput {
+            preview: &preview,
+            freshness_watermark: &watermark,
+        })
+        .expect("serialize full preview");
+
+        let incomplete = serde_json::json!({"freshness_watermark": watermark});
+        let incomplete_error = reviewed_merge_preview_watermark_from_json(&incomplete)
+            .expect_err("watermark carrier without candidate and safety must fail");
+        assert_eq!(
+            incomplete_error
+                .downcast_ref::<MergePreviewFreshnessError>()
+                .expect("typed incomplete carrier refusal")
+                .reason(),
+            "watermark_malformed"
+        );
+
+        let mut ambiguous = full["freshness_watermark"].clone();
+        ambiguous["freshness_watermark"] = full["freshness_watermark"].clone();
+        let ambiguous_error = reviewed_merge_preview_watermark_from_json(&ambiguous)
+            .expect_err("ambiguous nested watermark carrier must fail");
+        assert_eq!(
+            ambiguous_error
+                .downcast_ref::<MergePreviewFreshnessError>()
+                .expect("typed ambiguous carrier refusal")
+                .reason(),
+            "watermark_malformed"
+        );
+
+        let mut mismatched = full.clone();
+        mismatched["candidate"]["metadata"]["agent_id"] = serde_json::json!("agent-b");
+        let mismatch_error = reviewed_merge_preview_watermark_from_json(&mismatched)
+            .expect_err("outer candidate mismatch must fail");
+        let mismatch = mismatch_error
+            .downcast_ref::<MergePreviewFreshnessError>()
+            .expect("typed outer candidate mismatch refusal");
+        assert_eq!(mismatch.reason(), "watermark_malformed");
+        assert!(mismatch_error.to_string().contains("does not match"));
+
+        let mut mismatched_base = full.clone();
+        mismatched_base["candidate"]["validation_binding"]["merge_base"] =
+            serde_json::json!("1111111111111111111111111111111111111111");
+        let base_error = reviewed_merge_preview_watermark_from_json(&mismatched_base)
+            .expect_err("validation binding merge base mismatch must fail");
+        assert_eq!(
+            base_error
+                .downcast_ref::<MergePreviewFreshnessError>()
+                .expect("typed merge base mismatch refusal")
+                .reason(),
+            "watermark_malformed"
+        );
+
+        let mut mismatched_diff = full.clone();
+        mismatched_diff["candidate"]["diff"]["full"] =
+            serde_json::json!("tampered reviewed patch\n");
+        let diff_error = reviewed_merge_preview_watermark_from_json(&mismatched_diff)
+            .expect_err("presented diff mismatch must fail");
+        assert_eq!(
+            diff_error
+                .downcast_ref::<MergePreviewFreshnessError>()
+                .expect("typed presented diff mismatch refusal")
+                .reason(),
+            "watermark_malformed"
+        );
+
+        let mut mismatched_summary = mismatched_diff.clone();
+        mismatched_summary["candidate"]["diff"]["full"] = full["candidate"]["diff"]["full"].clone();
+        mismatched_summary["candidate"]["diff"]["summary"]["text"] =
+            serde_json::json!("not the reviewed patch");
+        let summary_error = reviewed_merge_preview_watermark_from_json(&mismatched_summary)
+            .expect_err("presented diff summary mismatch must fail");
+        assert_eq!(
+            summary_error
+                .downcast_ref::<MergePreviewFreshnessError>()
+                .expect("typed presented diff summary mismatch refusal")
+                .reason(),
+            "watermark_malformed"
+        );
+
+        let mut mismatched_changes = full;
+        mismatched_changes["candidate"]["changed_paths"] = serde_json::json!(["different.rs"]);
+        let changes_error = reviewed_merge_preview_watermark_from_json(&mismatched_changes)
+            .expect_err("changed path projection mismatch must fail");
+        assert_eq!(
+            changes_error
+                .downcast_ref::<MergePreviewFreshnessError>()
+                .expect("typed changed path projection mismatch refusal")
+                .reason(),
+            "watermark_malformed"
+        );
+    }
+
+    #[test]
+    fn reviewed_merge_watermark_parser_requires_a_closed_complete_candidate_shape() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, _) = merge_watermark_fixture(temp.path());
+        let (preview, watermark) = capture_reviewed_watermark(&repo_path);
+        let full = serde_json::to_value(MergeApplyPreviewOutput {
+            preview: &preview,
+            freshness_watermark: &watermark,
+        })
+        .expect("serialize full preview");
+
+        let mut missing_candidate_field = full.clone();
+        missing_candidate_field["candidate"]
+            .as_object_mut()
+            .expect("candidate object")
+            .remove("claimed_paths");
+
+        let mut unknown_candidate_field = full.clone();
+        unknown_candidate_field["candidate"]["unknown"] = serde_json::json!(true);
+
+        let mut unknown_metadata_field = full.clone();
+        unknown_metadata_field["candidate"]["metadata"]["unknown"] = serde_json::json!(true);
+
+        let mut unknown_summary_field = full.clone();
+        unknown_summary_field["candidate"]["diff"]["summary"]["unknown"] = serde_json::json!(true);
+
+        let mut unknown_change_field = full.clone();
+        unknown_change_field["candidate"]["changes"][0]["unknown"] = serde_json::json!(true);
+
+        let mut unknown_validation_field = full;
+        unknown_validation_field["candidate"]["validations"] = serde_json::json!([{
+            "name": "check",
+            "status": "passed",
+            "message": null,
+            "paths": [],
+            "unknown": true
+        }]);
+
+        for malformed in [
+            missing_candidate_field,
+            unknown_candidate_field,
+            unknown_metadata_field,
+            unknown_summary_field,
+            unknown_change_field,
+            unknown_validation_field,
+        ] {
+            assert_malformed_reviewed_preview(&malformed);
+        }
+    }
+
+    #[test]
+    fn reviewed_merge_watermark_parser_requires_a_closed_complete_safety_shape() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, _) = merge_watermark_fixture(temp.path());
+        let (preview, watermark) = capture_reviewed_watermark(&repo_path);
+        let full = serde_json::to_value(MergeApplyPreviewOutput {
+            preview: &preview,
+            freshness_watermark: &watermark,
+        })
+        .expect("serialize full preview");
+
+        let mut empty_safety = full.clone();
+        empty_safety["safety"] = serde_json::json!({});
+
+        let mut unknown_safety_field = full.clone();
+        unknown_safety_field["safety"]["unknown"] = serde_json::json!(true);
+
+        let mut invalid_safety_category = full.clone();
+        invalid_safety_category["safety"]["validation_required"] = serde_json::json!("false");
+
+        let mut missing_safety_check_field = full.clone();
+        missing_safety_check_field["safety"]["dirty_primary"]
+            .as_object_mut()
+            .expect("dirty_primary safety check")
+            .remove("paths");
+
+        let mut unknown_safety_check_field = full.clone();
+        unknown_safety_check_field["safety"]["dirty_primary"]["unknown"] = serde_json::json!(true);
+
+        let mut missing_force_option = full.clone();
+        missing_force_option["safety"]["force_options"]
+            .as_object_mut()
+            .expect("force_options object")
+            .remove("allow_dirty_primary");
+
+        let mut unknown_force_option = full.clone();
+        unknown_force_option["safety"]["force_options"]["unknown"] = serde_json::json!(false);
+
+        let mut missing_readiness_field = full.clone();
+        missing_readiness_field["safety"]["readiness"]
+            .as_object_mut()
+            .expect("readiness object")
+            .remove("details");
+
+        let mut unknown_readiness_field = full.clone();
+        unknown_readiness_field["safety"]["readiness"]["unknown"] = serde_json::json!(true);
+
+        let mut invalid_readiness_enum = full.clone();
+        invalid_readiness_enum["safety"]["readiness"]["blockers"] =
+            serde_json::json!(["invented_blocker"]);
+
+        let mut missing_semantic_field = full.clone();
+        missing_semantic_field["safety"]["semantic_conflicts"]
+            .as_object_mut()
+            .expect("semantic_conflicts object")
+            .remove("risk");
+
+        let mut unknown_semantic_field = full;
+        unknown_semantic_field["safety"]["semantic_conflicts"]["unknown"] = serde_json::json!(true);
+
+        for malformed in [
+            empty_safety,
+            unknown_safety_field,
+            invalid_safety_category,
+            missing_safety_check_field,
+            unknown_safety_check_field,
+            missing_force_option,
+            unknown_force_option,
+            missing_readiness_field,
+            unknown_readiness_field,
+            invalid_readiness_enum,
+            missing_semantic_field,
+            unknown_semantic_field,
+        ] {
+            assert_malformed_reviewed_preview(&malformed);
+        }
+    }
+
+    #[test]
+    fn reviewed_merge_watermark_parser_closes_readiness_and_megafile_subtrees() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, _) = merge_watermark_fixture(temp.path());
+        let (preview, watermark) = capture_reviewed_watermark(&repo_path);
+        let mut full = serde_json::to_value(MergeApplyPreviewOutput {
+            preview: &preview,
+            freshness_watermark: &watermark,
+        })
+        .expect("serialize full preview");
+        full["safety"]["readiness"] = serde_json::to_value(ApplyReadiness {
+            status: ApplyReadinessStatus::Blocked,
+            blockers: vec![ApplyBlocker::ValidationFailed],
+            forced: Vec::new(),
+            details: vec![ApplyBlockerDetail {
+                kind: ApplyBlocker::ValidationFailed,
+                disposition: ApplyBlockerDisposition::Blocked,
+                check_status: SafetyCheckStatus::Failed,
+                paths: vec![PathBuf::from("README.md")],
+                message: Some("validation failed".to_string()),
+                validation_reports: vec![ValidationReport {
+                    name: "unit".to_string(),
+                    status: ValidationStatus::Failed,
+                    message: None,
+                    paths: vec![PathBuf::from("README.md")],
+                }],
+                validation_commands: vec!["unit".to_string()],
+                next_safe_operation: Some("fix the failure".to_string()),
+            }],
+        })
+        .expect("serialize readiness subtree");
+        full["safety"]["megafile_warnings"] = serde_json::json!([MegafileAssessment {
+            version: 1,
+            path: PathBuf::from("README.md"),
+            is_megafile: true,
+            signals: vec![MegafileSignal::FileBytes {
+                observed: 10,
+                threshold: 5,
+            }],
+            latest_sample: Some(FileSizeSample {
+                path: PathBuf::from("README.md"),
+                bytes: 10,
+                lines: 1,
+            }),
+            previous_sample: None,
+            growth_bytes: 10,
+            growth_lines: 1,
+            claims_in_window: 0,
+            collisions_in_window: 0,
+            accepted_decompositions: 0,
+        }]);
+        full["safety"]["megafile_decomposition_evidence"] =
+            serde_json::to_value(VerifiedMegafileDecompositionEvidence {
+                run_id: RunId::new("reviewed-decomposition").expect("run id"),
+                orchestrator_id: "orchestrator".to_string(),
+                worker_id: "worker".to_string(),
+                target_path: PathBuf::from("README.md"),
+                replacement_paths: vec![PathBuf::from("docs/replacement.md")],
+                supervisor_candidate_binding: preview.candidate.validation_binding.clone(),
+            })
+            .expect("serialize decomposition evidence");
+
+        reviewed_merge_preview_watermark_from_json(&full)
+            .expect("accept serializer-produced nested safety subtrees");
+
+        let mut unknown_detail = full.clone();
+        unknown_detail["safety"]["readiness"]["details"][0]["unknown"] = serde_json::json!(true);
+
+        let mut missing_validation_report_field = full.clone();
+        missing_validation_report_field["safety"]["readiness"]["details"][0]["validation_reports"]
+            [0]
+        .as_object_mut()
+        .expect("validation report object")
+        .remove("status");
+
+        let mut unknown_warning_signal_field = full.clone();
+        unknown_warning_signal_field["safety"]["megafile_warnings"][0]["signals"][0]["unknown"] =
+            serde_json::json!(true);
+
+        let mut missing_warning_field = full.clone();
+        missing_warning_field["safety"]["megafile_warnings"][0]
+            .as_object_mut()
+            .expect("megafile warning object")
+            .remove("growth_bytes");
+
+        let mut missing_optional_warning_field = full.clone();
+        missing_optional_warning_field["safety"]["megafile_warnings"][0]
+            .as_object_mut()
+            .expect("megafile warning object")
+            .remove("previous_sample");
+
+        let mut unknown_decomposition_field = full.clone();
+        unknown_decomposition_field["safety"]["megafile_decomposition_evidence"]["unknown"] =
+            serde_json::json!(true);
+
+        let mut missing_decomposition_binding_field = full;
+        missing_decomposition_binding_field["safety"]["megafile_decomposition_evidence"]
+            ["supervisor_candidate_binding"]
+            .as_object_mut()
+            .expect("supervisor candidate binding")
+            .remove("diff_oid");
+
+        for malformed in [
+            unknown_detail,
+            missing_validation_report_field,
+            unknown_warning_signal_field,
+            missing_warning_field,
+            missing_optional_warning_field,
+            unknown_decomposition_field,
+            missing_decomposition_binding_field,
+        ] {
+            assert_malformed_reviewed_preview(&malformed);
+        }
+    }
+
+    #[test]
+    fn reviewed_merge_watermark_parser_closes_deep_semantic_conflict_subtrees() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, _) = merge_watermark_fixture(temp.path());
+        let (preview, watermark) = capture_reviewed_watermark(&repo_path);
+        let symbol = SemanticConflictSymbol {
+            name: "reviewed".to_string(),
+            qualified_path: vec!["reviewed".to_string()],
+            kind: SemanticSymbolKind::Function,
+            visibility: "pub".to_string(),
+            impl_target: None,
+            impl_trait: None,
+            file: PathBuf::from("src/lib.rs"),
+        };
+        let side = SemanticConflictSide {
+            touched_symbols: vec![symbol.clone()],
+            touched_impls: Vec::new(),
+            touched_modules: vec!["crate".to_string()],
+            touched_imports: vec![SemanticConflictImport {
+                path: "crate::shared".to_string(),
+                alias: None,
+                glob: false,
+                visibility: "private".to_string(),
+            }],
+            formatting_only: false,
+            import_only: false,
+            signature_level: false,
+            current_line_ranges: vec![SemanticConflictLineRange {
+                start_line: 1,
+                end_line: 2,
+            }],
+            base_line_ranges: Vec::new(),
+        };
+        let semantic = SemanticConflictClassification {
+            advisory: true,
+            status: SemanticConflictClassificationStatus::Classified,
+            risk: SemanticConflictRisk::Medium,
+            confidence: SemanticConflictConfidence::High,
+            degraded: false,
+            notes: vec!["reviewed classification".to_string()],
+            conflict_paths: vec![PathBuf::from("src/lib.rs")],
+            overlaps: vec![SemanticConflictOverlap {
+                path: PathBuf::from("src/lib.rs"),
+                kind: SemanticConflictOverlapKind::SymbolLevel,
+                risk: SemanticConflictRisk::Medium,
+                confidence: SemanticConflictConfidence::High,
+                primary: side.clone(),
+                candidate: side,
+                common_symbols: vec![symbol],
+                common_impls: Vec::new(),
+                common_modules: vec!["crate".to_string()],
+                impacted_files: vec![PathBuf::from("src/dependent.rs")],
+                dependency_impacts: vec![SemanticConflictDependencyImpact {
+                    side: SemanticConflictDependencySide::Primary,
+                    impact: SemanticDependencyImpact {
+                        direction: SemanticDependencyDirection::Outgoing,
+                        changed_path: PathBuf::from("src/lib.rs"),
+                        related_file: Some(PathBuf::from("src/dependent.rs")),
+                        dependency: SemanticDependency {
+                            from_file: PathBuf::from("src/lib.rs"),
+                            from_module: vec!["crate".to_string()],
+                            to: "crate::dependent".to_string(),
+                            to_file: Some(PathBuf::from("src/dependent.rs")),
+                            kind: SemanticDependencyKind::ModuleDeclaration,
+                            span: SourceSpan {
+                                start_byte: 0,
+                                end_byte: 3,
+                                start_line: 1,
+                                end_line: 1,
+                            },
+                        },
+                    },
+                }],
+                notes: vec!["overlap note".to_string()],
+            }],
+        };
+        let mut full = serde_json::to_value(MergeApplyPreviewOutput {
+            preview: &preview,
+            freshness_watermark: &watermark,
+        })
+        .expect("serialize full preview");
+        full["safety"]["semantic_conflicts"] =
+            serde_json::to_value(semantic).expect("serialize semantic conflicts");
+
+        reviewed_merge_preview_watermark_from_json(&full)
+            .expect("accept serializer-produced semantic conflict subtree");
+
+        let mut unknown_side_field = full.clone();
+        unknown_side_field["safety"]["semantic_conflicts"]["overlaps"][0]["primary"]["unknown"] =
+            serde_json::json!(true);
+
+        let mut missing_symbol_field = full.clone();
+        missing_symbol_field["safety"]["semantic_conflicts"]["overlaps"][0]["common_symbols"][0]
+            .as_object_mut()
+            .expect("semantic symbol object")
+            .remove("kind");
+
+        let mut invalid_dependency_enum = full.clone();
+        invalid_dependency_enum["safety"]["semantic_conflicts"]["overlaps"][0]
+            ["dependency_impacts"][0]["impact"]["direction"] = serde_json::json!("sideways");
+
+        let mut unknown_span_field = full;
+        unknown_span_field["safety"]["semantic_conflicts"]["overlaps"][0]["dependency_impacts"]
+            [0]["impact"]["dependency"]["span"]["unknown"] = serde_json::json!(0);
+
+        for malformed in [
+            unknown_side_field,
+            missing_symbol_field,
+            invalid_dependency_enum,
+            unknown_span_field,
+        ] {
+            assert_malformed_reviewed_preview(&malformed);
+        }
+    }
+
+    #[test]
+    fn reviewed_merge_apply_refuses_source_head_drift_before_primary_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, agent) = merge_watermark_fixture(temp.path());
+        let (_, watermark) = capture_reviewed_watermark(&repo_path);
+        let agent_repo = crate::git_repository::open(&agent.path).expect("open source repository");
+        commit_all_for_semantic_test(&agent_repo, "source moved").expect("commit source drift");
+
+        let error = apply_reviewed_watermark(&repo_path, Some(&watermark))
+            .expect_err("source HEAD drift must refuse reviewed apply");
+        assert_reviewed_watermark_drift(&error, &[MergePreviewDriftAxis::SourceHead]);
+        assert_eq!(
+            fs::read_to_string(repo_path.join("README.md")).expect("read unchanged primary"),
+            "# Smoke\n"
+        );
+    }
+
+    #[test]
+    fn reviewed_merge_apply_refuses_primary_head_drift_before_primary_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, _) = merge_watermark_fixture(temp.path());
+        let (_, watermark) = capture_reviewed_watermark(&repo_path);
+        commit_empty_for_merge_watermark(&repo_path, "primary moved");
+
+        let error = apply_reviewed_watermark(&repo_path, Some(&watermark))
+            .expect_err("primary HEAD drift must refuse reviewed apply");
+        assert_reviewed_watermark_drift(&error, &[MergePreviewDriftAxis::PrimaryHead]);
+        assert_eq!(
+            fs::read_to_string(repo_path.join("README.md")).expect("read unchanged primary"),
+            "# Smoke\n"
+        );
+    }
+
+    #[test]
+    fn reviewed_merge_apply_refuses_uncommitted_candidate_drift() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, agent) = merge_watermark_fixture(temp.path());
+        let (_, watermark) = capture_reviewed_watermark(&repo_path);
+        fs::write(agent.path.join("README.md"), "# Smoke\n\ndrifted\n")
+            .expect("drift uncommitted candidate");
+
+        let error = apply_reviewed_watermark(&repo_path, Some(&watermark))
+            .expect_err("candidate drift must refuse reviewed apply");
+        assert_reviewed_watermark_drift(
+            &error,
+            &[
+                MergePreviewDriftAxis::CandidateDiff,
+                MergePreviewDriftAxis::CandidateSnapshot,
+            ],
+        );
+        assert_eq!(
+            fs::read_to_string(repo_path.join("README.md")).expect("read unchanged primary"),
+            "# Smoke\n"
+        );
+    }
+
+    #[test]
+    fn reviewed_merge_apply_refuses_mismatched_source_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, _) = merge_watermark_fixture(temp.path());
+        let (_, mut watermark) = capture_reviewed_watermark(&repo_path);
+        watermark.source.agent_id = "agent-b".to_string();
+
+        let error = apply_reviewed_watermark(&repo_path, Some(&watermark))
+            .expect_err("mismatched source identity must refuse reviewed apply");
+        assert_reviewed_watermark_drift(&error, &[MergePreviewDriftAxis::SourceIdentity]);
+        assert_eq!(
+            fs::read_to_string(repo_path.join("README.md")).expect("read unchanged primary"),
+            "# Smoke\n"
+        );
+    }
+
+    #[test]
+    fn reviewed_merge_apply_succeeds_without_drift_and_marks_review_binding() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, _) = merge_watermark_fixture(temp.path());
+        let (_, watermark) = capture_reviewed_watermark(&repo_path);
+
+        let report = apply_reviewed_watermark(&repo_path, Some(&watermark))
+            .expect("unchanged reviewed apply must succeed");
+        assert_eq!(report.status, MergeApplyReportStatus::Applied);
+        assert!(report.applied);
+        assert_eq!(
+            fs::read_to_string(repo_path.join("README.md")).expect("read applied primary"),
+            "# Smoke\n\nreviewed\n"
+        );
+    }
+
+    #[test]
+    fn reviewed_merge_apply_rechecks_freshness_after_candidate_validation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, _) = merge_watermark_fixture(temp.path());
+        let (_, watermark) = capture_reviewed_watermark(&repo_path);
+        let drift_path = repo_path.join("src/lib.rs");
+        let _hook = install_after_candidate_validation_freshness_hook(move || {
+            fs::write(&drift_path, "pub fn ok() -> bool { false }\n")
+                .expect("mutate primary after candidate validation");
+        });
+
+        let error = merge_apply_report_with_reviewed_preview_and_megafile_policy(
+            MergeApplyOptions {
+                preview: semantic_preview_options(&repo_path, "README.md"),
+                candidate_validation_commands: vec![CandidateValidationCommand {
+                    command: "true".to_string(),
+                }],
+            },
+            ValidationEvidenceBundle::default(),
+            MegafileMergePolicy::default(),
+            Some(&watermark),
+        )
+        .expect_err("post-validation primary drift must refuse reviewed apply");
+
+        assert_reviewed_watermark_drift(&error, &[MergePreviewDriftAxis::PrimaryWorktree]);
+        assert_eq!(
+            fs::read_to_string(repo_path.join("README.md")).expect("read unchanged primary"),
+            "# Smoke\n"
+        );
+    }
+
+    #[test]
+    fn reviewed_merge_apply_recaptures_candidate_after_validation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, agent) = merge_watermark_fixture(temp.path());
+        let (_, watermark) = capture_reviewed_watermark(&repo_path);
+        let candidate_path = agent.path.join("README.md");
+        let _hook = install_after_candidate_validation_freshness_hook(move || {
+            fs::write(&candidate_path, "# Smoke\n\nchanged during validation\n")
+                .expect("mutate candidate after validation");
+        });
+
+        let error = merge_apply_report_with_reviewed_preview_and_megafile_policy(
+            MergeApplyOptions {
+                preview: semantic_preview_options(&repo_path, "README.md"),
+                candidate_validation_commands: vec![CandidateValidationCommand {
+                    command: "true".to_string(),
+                }],
+            },
+            ValidationEvidenceBundle::default(),
+            MegafileMergePolicy::default(),
+            Some(&watermark),
+        )
+        .expect_err("post-validation candidate drift must refuse reviewed apply");
+
+        assert_reviewed_watermark_drift(
+            &error,
+            &[
+                MergePreviewDriftAxis::CandidateDiff,
+                MergePreviewDriftAxis::CandidateSnapshot,
+            ],
+        );
+        assert_eq!(
+            fs::read_to_string(repo_path.join("README.md")).expect("read unchanged primary"),
+            "# Smoke\n"
+        );
+    }
+
+    #[test]
+    fn merge_apply_without_reviewed_watermark_remains_compatible_and_explicitly_unbound() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, _) = merge_watermark_fixture(temp.path());
+
+        let report = apply_reviewed_watermark(&repo_path, None)
+            .expect("ordinary fresh apply remains supported");
+        assert_eq!(report.status, MergeApplyReportStatus::Applied);
+        assert!(report.applied);
     }
 
     fn megafile_test_policy(
