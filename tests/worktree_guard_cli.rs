@@ -264,147 +264,47 @@ fn primary_guard_chains_relative_receive_hooks_from_the_git_directory() -> Resul
 }
 
 #[test]
-fn managed_guard_created_by_maco_allows_only_its_registered_branch_for_commit_and_push(
-) -> Result<()> {
-    let fixture = GuardFixture::new("managed-identity")?;
+fn managed_worktree_create_cli_fails_closed_without_repository_cleanliness_capability() -> Result<()>
+{
+    let fixture = GuardFixture::new("managed-create-capability")?;
     let expected_branch = "workers/registered-lane";
-    let custom = install_relative_custom_hooks(&fixture.primary)?;
-    git_success(&fixture.primary, &["add", "custom-hooks"])?;
-    git_success(
-        &fixture.primary,
-        &["commit", "-q", "-m", "add production managed hook fixtures"],
-    )?;
-    let pre_commit_before = fs::read(&custom.pre_commit)?;
-    let pre_push_before = fs::read(&custom.pre_push)?;
     let worktree_root = fixture.temp.path().join("managed-worktrees");
-    let created = command_output(
-        Command::new(BIN)
-            .args(["worktree", "create", "registered-lane", "--repo"])
-            .arg(&fixture.primary)
-            .args(["--worktree-root"])
-            .arg(&worktree_root)
-            .args(["--branch", expected_branch, "--json"]),
-        "create production managed worktree",
-    )?;
-    let created: Value = serde_json::from_slice(&created.stdout)
-        .context("parse production managed worktree JSON")?;
-    let linked = PathBuf::from(
-        created["path"]
-            .as_str()
-            .context("managed worktree report has no path")?,
+    let worktrees_before = git_stdout(&fixture.primary, &["worktree", "list", "--porcelain"])?;
+    let branches_before = git_stdout(&fixture.primary, &["for-each-ref", "refs/heads"])?;
+    let output = Command::new(BIN)
+        .args(["worktree", "create", "registered-lane", "--repo"])
+        .arg(&fixture.primary)
+        .args(["--worktree-root"])
+        .arg(&worktree_root)
+        .args(["--branch", expected_branch, "--json"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .context("run unsupported managed worktree create")?;
+    assert!(
+        !output.status.success(),
+        "public managed worktree creation must fail without a repository-cleanliness capability"
     );
-    assert_eq!(created["branch"], expected_branch);
-    let root = linked_git_dir(&linked)?.join("maco-worktree-guard");
-    let hooks = root.join("hooks");
-    for state in [
-        "marker",
-        "mode",
-        "expected-branch",
-        "git-dir",
-        "common-dir",
-        "previous-hooks-path",
-        "previous-git-dir-hooks-path",
-        "include-level",
-        "include-config-created",
-        "config",
-    ] {
-        assert!(
-            root.join(state).is_file(),
-            "missing production guard state {state}"
-        );
-    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "managed worktree creation is unsupported without a capability-bound repository cleanliness input"
+        ),
+        "unexpected managed worktree creation refusal: {stderr}"
+    );
+    assert!(!worktree_root.exists());
+    assert!(!fixture.common_dir.join("worktrees").exists());
+    assert!(!fixture.common_dir.join("maco").exists());
     assert_eq!(
-        effective_hooks_path(&linked)?,
-        path_text(&hooks)?,
-        "the production managed guard must be the effective hook path"
+        git_stdout(&fixture.primary, &["worktree", "list", "--porcelain"])?,
+        worktrees_before
     );
-
-    assert_commit_succeeds(
-        &linked,
-        "linked.txt",
-        "registered lane\n",
-        "registered lane commit",
-    )?;
-    git_success(
-        &linked,
-        &["push", "origin", "HEAD:refs/heads/workers/registered-lane"],
-    )?;
-    assert!(bare_ref_exists(
-        &fixture.origin,
-        "refs/heads/workers/registered-lane"
-    )?);
-
-    git_success(&linked, &["switch", "-q", "-c", "workers/foreign-lane"])?;
-    stage_file(&linked, "foreign.txt", "foreign lane\n")?;
-    let blocked_commit = git(&linked, &["commit", "-m", "foreign lane commit"])?;
-    assert_guard_refusal(&blocked_commit, "commit", "workers/foreign-lane")?;
-
-    let environment_bypass = git_with_environment(
-        &linked,
-        &["commit", "-m", "environment bypass must fail"],
-        &[("MACO_GUARD_ALLOW", "1")],
-    )?;
-    assert!(
-        !environment_bypass.status.success(),
-        "managed branch guard must ignore an untrusted environment bypass"
+    assert_eq!(
+        git_stdout(&fixture.primary, &["for-each-ref", "refs/heads"])?,
+        branches_before
     );
-
-    let prepared_foreign = git(
-        &linked,
-        &[
-            "-c",
-            "core.hooksPath=/dev/null",
-            "commit",
-            "-m",
-            "prepare foreign push fixture",
-        ],
-    )?;
-    assert!(prepared_foreign.status.success());
-
-    let blocked_push = git(
-        &linked,
-        &["push", "origin", "HEAD:refs/heads/workers/foreign-lane"],
-    )?;
-    assert_guard_refusal(&blocked_push, "push", "workers/foreign-lane")?;
-    assert!(!bare_ref_exists(
-        &fixture.origin,
-        "refs/heads/workers/foreign-lane"
-    )?);
-
-    let push_environment_bypass = git_with_environment(
-        &linked,
-        &["push", "origin", "HEAD:refs/heads/workers/foreign-lane"],
-        &[("MACO_GUARD_ALLOW", "1")],
-    )?;
-    assert!(
-        !push_environment_bypass.status.success(),
-        "managed push guard must ignore an untrusted environment bypass"
-    );
-
-    git_success(&linked, &["switch", "-q", "--detach"])?;
-    stage_file(&linked, "detached.txt", "detached lane\n")?;
-    let detached_commit = git(&linked, &["commit", "-m", "detached lane commit"])?;
-    assert_guard_refusal(&detached_commit, "commit", "detached HEAD")?;
-
-    fs::write(root.join("git-dir"), b"/not/the/managed/git-dir\n")
-        .context("corrupt managed guard identity")?;
-    let corrupt_identity = git(&linked, &["commit", "-m", "identity check must fail"])?;
-    assert!(!corrupt_identity.status.success());
-    let corrupt_stderr = String::from_utf8_lossy(&corrupt_identity.stderr);
-    assert!(
-        corrupt_stderr.contains("Git directory identity changed"),
-        "identity corruption must fail closed: {corrupt_stderr}"
-    );
-
-    assert_eq!(fs::read(&custom.pre_commit)?, pre_commit_before);
-    assert_eq!(fs::read(&custom.pre_push)?, pre_push_before);
-    let pre_commit_log = fs::read_to_string(fixture.common_dir.join("custom-pre-commit.log"))?;
-    assert!(pre_commit_log.matches("pre-commit\n").count() >= 2);
-    let pre_push_args = fs::read_to_string(fixture.common_dir.join("custom-pre-push.args"))?;
-    assert!(pre_push_args.matches("remote=origin\n").count() >= 1);
-    assert!(pre_push_args.contains(&format!("location={}\n", fixture.origin.display())));
-    let pre_push_stdin = fs::read_to_string(fixture.common_dir.join("custom-pre-push.stdin"))?;
-    assert!(pre_push_stdin.contains("refs/heads/workers/registered-lane"));
 
     Ok(())
 }
@@ -711,13 +611,6 @@ fn restore_guard_tree_permissions(root: &Path) -> Result<()> {
         fs::set_permissions(entry?.path(), fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
-}
-
-fn linked_git_dir(repo: &Path) -> Result<PathBuf> {
-    Ok(PathBuf::from(git_stdout(
-        repo,
-        &["rev-parse", "--path-format=absolute", "--git-dir"],
-    )?))
 }
 
 fn bare_ref_exists(repo: &Path, reference: &str) -> Result<bool> {

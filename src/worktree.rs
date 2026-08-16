@@ -14996,13 +14996,20 @@ mod tests {
         let repo = crate::git_repository::open(&repo_path).expect("open repo");
         configure_test_git_identity(&repo);
         commit_readme(&repo).expect("initial commit");
-        let lane = WorktreeManager::new(&repo_path)
-            .create_for_test(WorktreeCreateOptions {
-                agent_id: "guarded-lane".to_string(),
-                branch: None,
-                base: None,
-                worktree_root: Some(worktree_root),
-            })
+        let manager = WorktreeManager::new(&repo_path);
+        let cleanliness = manager
+            .acquire_repository_cleanliness()
+            .expect("capture clean repository capability");
+        let lane = manager
+            .create_with_repository_cleanliness(
+                WorktreeCreateOptions {
+                    agent_id: "guarded-lane".to_string(),
+                    branch: None,
+                    base: None,
+                    worktree_root: Some(worktree_root),
+                },
+                &cleanliness,
+            )
             .expect("create guarded worktree");
         let lane_repo = crate::git_repository::open(&lane.path).expect("open lane");
         let verified = verify_worktree_guard(
