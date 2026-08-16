@@ -39,7 +39,7 @@ use std::{
 
 #[path = "codex_app_server.rs"]
 pub(crate) mod codex_app_server;
-pub mod executor;
+pub(crate) mod executor;
 
 pub use crate::protected_path::SandboxDenialRetryability;
 
@@ -55,6 +55,7 @@ const MAX_CREDENTIAL_REDACTION_PATTERNS: usize = 32;
 const MAX_CREDENTIAL_REDACTION_PATTERN_BYTES: usize = 128 * 1024;
 const CREDENTIAL_REDACTION: &[u8] = b"[REDACTED]";
 const CODEX_MINIMUM_VERSION: (u64, u64, u64) = (0, 138, 0);
+const CODEX_DUPLEX_AUDITED_VERSION: (u64, u64, u64) = (0, 144, 4);
 const TRUSTED_PATH: &str = "/run/current-system/sw/bin:/usr/bin:/bin";
 const OUTER_SYSTEMD_POLICY_ID: &str = "maco_external_codex_outer_systemd_v1";
 const INNER_CODEX_POLICY_ID: &str = "maco_external_codex_inner_v1";
@@ -1242,6 +1243,37 @@ fn run_external_agent_runtime(
             "external agent was cancelled before executable preflight".to_string(),
         );
     }
+    let duplex_review_required = runtime == ExternalExecutionRuntime::Verified
+        && spec.invocation == ExternalAgentInvocation::CodexSupervisor
+        && spec.workspace_access == WorkspaceAccess::ReadWrite;
+    if duplex_review_required && review_runtime.is_none() {
+        return failed_external_environment_run(
+            spec,
+            started,
+            command_display(&spec.program, &[]),
+            false,
+            EnvironmentFailureCategory::SandboxUnavailable,
+            Some(EnvironmentRequirement::sandbox(
+                EnvironmentSandboxCapability::VerifiedExternalCodex,
+            )),
+            "writable verified Codex requires a duplex MACO pre-action reviewer".to_string(),
+        );
+    }
+    if duplex_review_required {
+        if let Err(error) = validate_universal_pre_action_coverage() {
+            return failed_external_environment_run(
+                spec,
+                started,
+                command_display(&spec.program, &[]),
+                false,
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(EnvironmentRequirement::sandbox(
+                    EnvironmentSandboxCapability::VerifiedExternalCodex,
+                )),
+                error.to_string(),
+            );
+        }
+    }
     let program_trust = external_program_trust(spec);
     let resolved_program = match resolve_external_program(&spec.program, &spec.cwd) {
         Ok(program) => program,
@@ -1365,52 +1397,28 @@ fn run_external_agent_runtime(
     };
     let mut target_controls = protected_controls.clone();
     target_controls.writable_artifact_root = Some(output_staging.root_path().to_path_buf());
-    let duplex_review_required = runtime == ExternalExecutionRuntime::Verified
-        && spec.invocation == ExternalAgentInvocation::CodexSupervisor
-        && spec.workspace_access == WorkspaceAccess::ReadWrite;
-    if duplex_review_required && review_runtime.is_none() {
-        return failed_external_environment_run(
-            spec,
-            started,
-            command_display(&resolved_program, &[]),
-            false,
-            EnvironmentFailureCategory::SandboxUnavailable,
-            Some(EnvironmentRequirement::sandbox(
-                EnvironmentSandboxCapability::VerifiedExternalCodex,
-            )),
-            "writable verified Codex requires a duplex MACO pre-action reviewer".to_string(),
-        );
-    }
-    if duplex_review_required {
-        if let Err(error) = validate_universal_pre_action_coverage() {
-            return failed_external_environment_run(
-                spec,
-                started,
-                command_display(&resolved_program, &[]),
-                false,
-                EnvironmentFailureCategory::SandboxUnavailable,
-                Some(EnvironmentRequirement::sandbox(
-                    EnvironmentSandboxCapability::VerifiedExternalCodex,
-                )),
-                error.to_string(),
-            );
-        }
-    }
-    let argv = if duplex_review_required {
-        codex_app_server_argv(&target_spec, &target_controls)
+    // The duplex argv is deliberately deferred until the contained version probe exactly matches
+    // the audited app-server protocol. This remains a mandatory latent release gate even if
+    // universal pre-action coverage becomes available in a future Codex protocol.
+    let mut argv = if duplex_review_required {
+        Vec::new()
     } else {
         command_argv_with_controls(&target_spec, &target_controls)
     };
-    let argv_digest = match argv_digest(&argv) {
-        Ok(digest) => digest,
-        Err(error) => {
-            return failed_external_run(
-                spec,
-                started,
-                command_display(&resolved_program, &argv),
-                false,
-                format!("failed to bind external-agent permission evidence to argv: {error}"),
-            );
+    let mut bound_argv_digest = if duplex_review_required {
+        None
+    } else {
+        match argv_digest(&argv) {
+            Ok(digest) => Some(digest),
+            Err(error) => {
+                return failed_external_run(
+                    spec,
+                    started,
+                    command_display(&resolved_program, &argv),
+                    false,
+                    format!("failed to bind external-agent permission evidence to argv: {error}"),
+                );
+            }
         }
     };
 
@@ -1758,6 +1766,52 @@ fn run_external_agent_runtime(
             return report;
         }
     }
+    if duplex_review_required {
+        let Some(version) =
+            codex_version.map(|(major, minor, patch)| EnvironmentVersion::new(major, minor, patch))
+        else {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::ProbeFailed,
+                Some(codex_environment_requirement()),
+                "writable Codex app-server version was unavailable after mandatory preflight"
+                    .to_string(),
+            );
+            return report;
+        };
+        if let Err(error) = validate_duplex_app_server_version(version) {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::VersionMismatch,
+                Some(codex_environment_requirement()),
+                error.to_string(),
+            );
+            return report;
+        }
+        argv = codex_app_server_argv(&target_spec, &target_controls);
+        report.command = command_display(&resolved_program, &argv);
+        bound_argv_digest = match argv_digest(&argv) {
+            Ok(digest) => Some(digest),
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_external_error(
+                    &mut report,
+                    format!("failed to bind external-agent permission evidence to argv: {error}"),
+                );
+                return report;
+            }
+        };
+    }
+    let Some(argv_digest) = bound_argv_digest else {
+        report.duration_ms = duration_millis(started.elapsed());
+        record_external_error(
+            &mut report,
+            "external-agent argv was not bound before target release".to_string(),
+        );
+        return report;
+    };
     if let Err(error) =
         validate_external_program_identity(&resolved_program, spec.program == Path::new("codex"))
             .and_then(|()| {
@@ -3157,6 +3211,20 @@ fn preflight_codex_version(
         });
     }
     Ok(version)
+}
+
+fn validate_duplex_app_server_version(version: EnvironmentVersion) -> Result<()> {
+    let audited = EnvironmentVersion::new(
+        CODEX_DUPLEX_AUDITED_VERSION.0,
+        CODEX_DUPLEX_AUDITED_VERSION.1,
+        CODEX_DUPLEX_AUDITED_VERSION.2,
+    );
+    if version != audited {
+        bail!(
+            "Codex {version} does not match the audited writable app-server protocol version {audited}"
+        );
+    }
+    Ok(())
 }
 
 fn preflight_custom_codex_version(
@@ -6477,6 +6545,23 @@ mod tests {
     }
 
     #[test]
+    fn writable_app_server_accepts_only_the_exact_audited_codex_version() {
+        validate_duplex_app_server_version(EnvironmentVersion::new(0, 144, 4))
+            .expect("audited Codex app-server version");
+        for version in [
+            EnvironmentVersion::new(0, 144, 3),
+            EnvironmentVersion::new(0, 144, 5),
+            EnvironmentVersion::new(0, 145, 0),
+        ] {
+            let error = validate_duplex_app_server_version(version)
+                .expect_err("unaudited app-server version must fail closed");
+            assert!(error
+                .to_string()
+                .contains("does not match the audited writable app-server protocol version"));
+        }
+    }
+
+    #[test]
     fn local_executor_forwards_the_concrete_reviewed_runner_once_without_changing_its_run() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -6550,9 +6635,10 @@ mod tests {
         assert_eq!(journal.records, vec![journal_record]);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
-    fn production_writable_path_refuses_before_starting_any_child_process() -> Result<()> {
+    fn repeated_retention_bound_writable_refusal_leaves_no_child_or_staging_residue() -> Result<()>
+    {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir()?;
@@ -6566,7 +6652,9 @@ mod tests {
         let incoming = temp.path().join("incoming");
         fs::create_dir(&incoming)?;
         fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
-        let spec = ExternalAgentCommand::codex(
+        let agents = temp.path().join(".agents");
+        fs::set_permissions(&agents, fs::Permissions::from_mode(0o700))?;
+        let mut spec = ExternalAgentCommand::codex(
             &agent,
             temp.path(),
             &prompt,
@@ -6574,27 +6662,65 @@ mod tests {
             incoming.join("last-message.txt"),
             Duration::from_secs(5),
         );
+        let unused_retention_config = temp.path().join("must-not-open-retention.json");
+        spec.machine_global_retention = Some(ExternalMachineGlobalRetentionBinding {
+            config: unused_retention_config.clone(),
+            root_id: "runtime".to_string(),
+            owner: "retention-bound-refusal".to_string(),
+            correction_correlation_id: "coverage-gate-refusal".to_string(),
+        });
+        let would_be_materialized_control = agents.join("must-not-materialize.md");
+        spec.worktree_control_exceptions = vec![PathBuf::from(".agents/must-not-materialize.md")];
         let context = test_review_context();
         let mut journal = RecordingPreActionJournal::default();
+        let runtime_root = crate::process_runner::trusted_linux_runtime_root()?;
+        let staging_prefix = format!(".maco-external-output-{}-", std::process::id());
+        let staging_roots = || -> Result<BTreeSet<OsString>> {
+            let mut roots = BTreeSet::new();
+            for entry in fs::read_dir(&runtime_root)? {
+                let entry = entry?;
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&staging_prefix)
+                {
+                    roots.insert(entry.file_name());
+                }
+            }
+            Ok(roots)
+        };
+        let before = staging_roots()?;
 
-        let report = run_external_agent_cancellable_reviewed(
-            &spec,
-            &ProcessCancellation::new(),
-            Some(ExternalPreActionReviewRuntime {
+        for iteration in 0..32 {
+            let review_runtime = (iteration % 2 == 1).then_some(ExternalPreActionReviewRuntime {
                 context: &context,
                 journal: &mut journal,
-            }),
-        );
+            });
+            let report = run_external_agent_cancellable_reviewed(
+                &spec,
+                &ProcessCancellation::new(),
+                review_runtime,
+            );
 
-        assert!(!marker.exists());
-        assert!(!report.stdout.target_launch_attempted);
-        assert_eq!(report.process_tree, None);
-        assert_eq!(report.side_effects, None);
-        assert!(report.environment_blocked());
-        assert!(report
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("writable Codex failed closed before launch")));
+            assert!(!marker.exists());
+            assert!(!would_be_materialized_control.exists());
+            assert!(!report.stdout.target_launch_attempted);
+            assert_eq!(report.process_tree, None);
+            assert_eq!(report.side_effects, None);
+            assert!(report.environment_blocked());
+            let expected_refusal = if iteration % 2 == 0 {
+                "requires a duplex MACO pre-action reviewer"
+            } else {
+                "writable Codex failed closed before launch"
+            };
+            assert!(report
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains(expected_refusal)));
+        }
+        assert_eq!(staging_roots()?, before);
+        assert!(!unused_retention_config.exists());
+        assert!(!would_be_materialized_control.exists());
         assert!(journal.records.is_empty());
         Ok(())
     }
@@ -6701,7 +6827,7 @@ if mode in ("decline", "protocol_loss"):
     assert first["params"]["expectedTurnId"] == "turn-contained"
     assert "turnId" not in first["params"]
     assert first["params"]["input"][0]["text"].startswith("MACO_GATE_DENIAL_V1\n")
-    send({"id": first["id"], "result": {}})
+    send({"id": first["id"], "result": {"turnId": "turn-contained"}})
     decision = receive()
     assert decision["id"] == 77
     assert decision["result"]["decision"] == "decline"

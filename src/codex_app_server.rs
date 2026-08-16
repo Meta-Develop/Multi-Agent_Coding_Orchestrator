@@ -23,6 +23,41 @@ const OUTPUT_AGENT_MESSAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EXTERNAL_CODEX_PERMISSION_PROFILE: &str = "maco_external_codex";
 const DUPLEX_APPROVAL_POLICY: &str = "untrusted";
+const COMMAND_APPROVAL_FIELDS: &[&str] = &[
+    "threadId",
+    "turnId",
+    "itemId",
+    "startedAtMs",
+    "approvalId",
+    "environmentId",
+    "reason",
+    "networkApprovalContext",
+    "command",
+    "cwd",
+    "commandActions",
+    "additionalPermissions",
+    "proposedExecpolicyAmendment",
+    "proposedNetworkPolicyAmendments",
+    "availableDecisions",
+];
+const FILE_CHANGE_APPROVAL_FIELDS: &[&str] = &[
+    "threadId",
+    "turnId",
+    "itemId",
+    "startedAtMs",
+    "reason",
+    "grantRoot",
+];
+const PERMISSION_APPROVAL_FIELDS: &[&str] = &[
+    "threadId",
+    "turnId",
+    "itemId",
+    "environmentId",
+    "startedAtMs",
+    "cwd",
+    "reason",
+    "permissions",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransportRead {
@@ -1019,13 +1054,17 @@ where
                     message: "response id was already completed".to_string(),
                 });
             }
-            if pending_correction_responses.remove(&id).is_some() {
+            if let std::collections::btree_map::Entry::Occupied(pending) =
+                pending_correction_responses.entry(id)
+            {
                 if object.contains_key("error") {
                     return Err(AppServerError::Remote {
                         phase: "gate denial feedback",
                         message: "app-server rejected typed gate-denial feedback".to_string(),
                     });
                 }
+                validate_turn_steer_acknowledgement(&message, turn_id)?;
+                pending.remove();
                 continue;
             }
             return Err(AppServerError::Unexpected {
@@ -1099,6 +1138,7 @@ where
             }
             "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
                 validate_turn_correlation(params, thread_id, turn_id, "approval")?;
+                validate_approval_request_fields(method, params)?;
                 let request_id = object
                     .get("id")
                     .ok_or_else(|| AppServerError::Malformed {
@@ -1221,6 +1261,7 @@ where
             }
             "item/permissions/requestApproval" => {
                 validate_turn_correlation(params, thread_id, turn_id, "permission approval")?;
+                validate_approval_request_fields(method, params)?;
                 let request_id = object
                     .get("id")
                     .ok_or_else(|| AppServerError::Malformed {
@@ -1253,6 +1294,7 @@ where
                             phase: "permission approval",
                             message: "permission approval item has no active lifecycle".to_string(),
                         })?;
+                validate_optional_approval_metadata(params)?;
                 let request = ApprovalRequest {
                     kind: ApprovalKind::PermissionExpansion,
                     thread_id: required_map_text(params, "threadId", "permission approval")?
@@ -1641,13 +1683,40 @@ fn item_requires_blocking_review(item_type: &str) -> bool {
 fn parse_approval_request(
     method: &str,
     params: &Map<String, Value>,
-    item: Value,
+    mut item: Value,
 ) -> Result<ApprovalRequest, AppServerError> {
     let kind = if method == "item/commandExecution/requestApproval" {
         ApprovalKind::CommandExecution
     } else {
         ApprovalKind::FileChange
     };
+    validate_optional_approval_metadata(params)?;
+    if let Some(command_actions) = params.get("commandActions") {
+        let actions = command_actions
+            .as_array()
+            .ok_or_else(|| AppServerError::Malformed {
+                phase: "approval",
+                message: "commandActions is not an array".to_string(),
+            })?;
+        let item_object = item
+            .as_object_mut()
+            .ok_or_else(|| AppServerError::Malformed {
+                phase: "approval",
+                message: "active approval item is not an object".to_string(),
+            })?;
+        match item_object.get("commandActions") {
+            Some(item_actions) if item_actions != command_actions => {
+                return Err(AppServerError::Unexpected {
+                    phase: "approval",
+                    message: "approval commandActions did not match the active item".to_string(),
+                });
+            }
+            None => {
+                item_object.insert("commandActions".to_string(), Value::Array(actions.clone()));
+            }
+            Some(_) => {}
+        }
+    }
     Ok(ApprovalRequest {
         kind,
         thread_id: required_map_text(params, "threadId", "approval")?.to_string(),
@@ -1673,6 +1742,132 @@ fn approval_requests_ceiling_expansion(params: &Map<String, Value>) -> bool {
         || params
             .get("proposedNetworkPolicyAmendments")
             .is_some_and(non_empty_array_or_value)
+        || params
+            .get("proposedExecpolicyAmendment")
+            .is_some_and(non_null_value)
+        // The available decision set changes response authority. Until MACO consumes that set as
+        // a typed contract, a non-null value is conservatively handled as a ceiling expansion.
+        || params
+            .get("availableDecisions")
+            .is_some_and(non_null_value)
+        || params.get("approvalId").is_some_and(non_null_value)
+        || params.get("environmentId").is_some_and(non_null_value)
+        || params
+            .get("commandActions")
+            .is_some_and(non_empty_array_or_value)
+}
+
+fn validate_approval_request_fields(
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<(), AppServerError> {
+    let allowed = match method {
+        "item/commandExecution/requestApproval" => COMMAND_APPROVAL_FIELDS,
+        "item/fileChange/requestApproval" => FILE_CHANGE_APPROVAL_FIELDS,
+        "item/permissions/requestApproval" => PERMISSION_APPROVAL_FIELDS,
+        _ => {
+            return Err(AppServerError::Unexpected {
+                phase: "approval",
+                message: format!("unsupported approval request method {method}"),
+            });
+        }
+    };
+    if let Some(field) = params
+        .keys()
+        .find(|field| !allowed.iter().any(|known| *known == field.as_str()))
+    {
+        return Err(AppServerError::Unexpected {
+            phase: "approval",
+            message: format!("unsupported {method} parameter {field}"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_optional_approval_metadata(params: &Map<String, Value>) -> Result<(), AppServerError> {
+    for field in ["approvalId", "environmentId"] {
+        optional_bounded_text(params.get(field), field, 256)?;
+    }
+    if let Some(started_at) = params.get("startedAtMs") {
+        if !started_at.is_null() && started_at.as_u64().is_none() {
+            return Err(AppServerError::Malformed {
+                phase: "approval",
+                message: "startedAtMs is not an unsigned integer".to_string(),
+            });
+        }
+    }
+    if let Some(available_decisions) = params.get("availableDecisions") {
+        if !available_decisions.is_null() {
+            let decisions =
+                available_decisions
+                    .as_array()
+                    .ok_or_else(|| AppServerError::Malformed {
+                        phase: "approval",
+                        message: "availableDecisions is not an array".to_string(),
+                    })?;
+            if decisions.len() > 16 || decisions.iter().any(|decision| decision.as_str().is_none())
+            {
+                return Err(AppServerError::Malformed {
+                    phase: "approval",
+                    message: "availableDecisions is not a bounded string array".to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_turn_steer_acknowledgement(
+    message: &Value,
+    expected_turn_id: &str,
+) -> Result<(), AppServerError> {
+    let response = message
+        .as_object()
+        .ok_or_else(|| AppServerError::Malformed {
+            phase: "gate denial feedback",
+            message: "turn/steer acknowledgement is not an object".to_string(),
+        })?;
+    if response.len() != 2 || !response.contains_key("id") || !response.contains_key("result") {
+        return Err(AppServerError::Malformed {
+            phase: "gate denial feedback",
+            message: "turn/steer acknowledgement does not match the audited response envelope"
+                .to_string(),
+        });
+    }
+    let result = message
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or_else(|| AppServerError::Malformed {
+            phase: "gate denial feedback",
+            message: "turn/steer acknowledgement result is missing or is not an object".to_string(),
+        })?;
+    if result.len() != 1 || !result.contains_key("turnId") {
+        return Err(AppServerError::Malformed {
+            phase: "gate denial feedback",
+            message: "turn/steer acknowledgement result does not match the audited schema"
+                .to_string(),
+        });
+    }
+    let acknowledged_turn = result
+        .get("turnId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppServerError::Malformed {
+            phase: "gate denial feedback",
+            message: "turn/steer acknowledgement turnId is not a string".to_string(),
+        })?;
+    validate_identifier(acknowledged_turn, "turn/steer acknowledgement turn id", 256).map_err(
+        |error| AppServerError::Malformed {
+            phase: "gate denial feedback",
+            message: error.to_string(),
+        },
+    )?;
+    if acknowledged_turn != expected_turn_id {
+        return Err(AppServerError::Unexpected {
+            phase: "gate denial feedback",
+            message: "turn/steer acknowledgement did not identify the active turn".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn non_null_value(value: &Value) -> bool {
@@ -1701,9 +1896,10 @@ fn bounded_review(
     if Instant::now() >= approval_deadline {
         return Err(AppServerError::ApprovalTimeout);
     }
-    // The callback is deliberately synchronous: a timed-out classifier or journal append must
-    // not continue as a detached effect after the child has been cancelled. Trusted reviewers
-    // receive the same deadline and are required to bound their own read-only classifier call.
+    // This borrowed synchronous callback receives neither the absolute deadline nor a cancellation
+    // capability. The checks below can therefore detect expiry only after reviewer and journal work
+    // returns; they do not bound a stuck call. Writable release remains blocked until an owned,
+    // cancel-safe boundary can bound reviewer, journal, transport, child termination, and joins.
     let review = reviewer
         .review(request)
         .map_err(|_| AppServerError::ApprovalReviewerLost)?
@@ -2097,6 +2293,63 @@ mod tests {
         })
     }
 
+    fn run_denial_feedback_acknowledgement(
+        acknowledgement: Value,
+        duplicate_acknowledgement: bool,
+    ) -> Result<AppServerOutcome, AppServerError> {
+        let mut messages = base_messages();
+        messages.extend([
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "ack-item", "type": "fileChange", "status": "inProgress"}
+                }
+            }),
+            json!({
+                "id": 70,
+                "method": "item/fileChange/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "ack-item",
+                    "startedAtMs": 1,
+                    "reason": "unsafe write"
+                }
+            }),
+            acknowledgement.clone(),
+        ]);
+        if duplicate_acknowledgement {
+            messages.push(acknowledgement);
+        }
+        messages.extend([
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "ack-item", "type": "fileChange", "status": "declined"}
+                }
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed", "items": []}
+                }
+            }),
+        ]);
+        let mut transport = FakeTransport::from_values(messages);
+        run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("ack-schema")),
+            || false,
+        )
+    }
+
     fn auto_review_messages(
         started_target: Option<&str>,
         completed_target: Option<&str>,
@@ -2410,7 +2663,7 @@ mod tests {
                     "reason": "update source"
                 }
             }),
-            json!({"id": 4, "result": {}}),
+            json!({"id": 4, "result": {"turnId": "turn-1"}}),
             json!({
                 "method": "item/completed",
                 "params": {
@@ -2469,6 +2722,77 @@ mod tests {
                 .is_none(),
             "TurnSteerParams must use expectedTurnId, not turnId"
         );
+    }
+
+    #[test]
+    fn denial_feedback_acknowledgement_requires_exact_active_turn_result() {
+        let outcome = run_denial_feedback_acknowledgement(
+            json!({"id": 4, "result": {"turnId": "turn-1"}}),
+            false,
+        )
+        .expect("documented turn/steer acknowledgement");
+        assert_eq!(outcome.gate_denials.len(), 1);
+
+        for malformed in [
+            json!({"id": 4, "result": null}),
+            json!({"id": 4, "result": true}),
+            json!({"id": 4, "result": {}}),
+            json!({"id": 4, "result": {"turnId": 7}}),
+            json!({"id": 4, "result": {"turnId": {"id": "turn-1"}}}),
+            json!({"id": 4, "result": {"turnId": "turn-1", "future": true}}),
+            json!({
+                "id": 4,
+                "result": {"turnId": "turn-1"},
+                "method": "turn/steer",
+                "params": {}
+            }),
+        ] {
+            let error = run_denial_feedback_acknowledgement(malformed, false)
+                .expect_err("malformed acknowledgement must fail closed");
+            assert!(matches!(
+                error,
+                AppServerError::Malformed {
+                    phase: "gate denial feedback",
+                    ..
+                }
+            ));
+        }
+
+        let wrong_turn = run_denial_feedback_acknowledgement(
+            json!({"id": 4, "result": {"turnId": "turn-other"}}),
+            false,
+        )
+        .expect_err("wrong-turn acknowledgement must fail closed");
+        assert!(matches!(
+            wrong_turn,
+            AppServerError::Unexpected {
+                phase: "gate denial feedback",
+                ..
+            }
+        ));
+
+        let remote_error = run_denial_feedback_acknowledgement(
+            json!({"id": 4, "error": {"code": -1, "message": "rejected"}}),
+            false,
+        )
+        .expect_err("error acknowledgement must fail closed");
+        assert!(matches!(
+            remote_error,
+            AppServerError::Remote {
+                phase: "gate denial feedback",
+                ..
+            }
+        ));
+
+        let duplicate = run_denial_feedback_acknowledgement(
+            json!({"id": 4, "result": {"turnId": "turn-1"}}),
+            true,
+        )
+        .expect_err("duplicate acknowledgement must fail closed");
+        assert!(matches!(
+            duplicate,
+            AppServerError::Duplicate { phase: "turn", .. }
+        ));
     }
 
     #[test]
@@ -2584,7 +2908,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_callback_has_a_real_wall_clock_timeout() {
+    fn approval_timeout_is_detected_only_after_synchronous_callback_returns() {
         let mut messages = base_messages();
         messages.extend([
             json!({
@@ -2638,7 +2962,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_is_polled_while_approval_callback_is_running() {
+    fn approval_cancellation_is_detected_only_after_synchronous_callback_returns() {
         let mut messages = base_messages();
         messages.extend([
             json!({
@@ -2759,7 +3083,7 @@ mod tests {
                     }
                 }
             }),
-            json!({"id": 4, "result": {}}),
+            json!({"id": 4, "result": {"turnId": "turn-1"}}),
             json!({
                 "method": "item/completed",
                 "params": {
@@ -2822,7 +3146,7 @@ mod tests {
                     "reason": "request broader access"
                 }
             }),
-            json!({"id": 4, "result": {}}),
+            json!({"id": 4, "result": {"turnId": "turn-1"}}),
             json!({
                 "method": "item/completed",
                 "params": {
@@ -2883,7 +3207,7 @@ mod tests {
                     "reason": "request broader access"
                 }
             }),
-            json!({"id": 4, "result": {}}),
+            json!({"id": 4, "result": {"turnId": "turn-1"}}),
             json!({
                 "id": 82,
                 "method": "item/fileChange/requestApproval",
@@ -2955,7 +3279,7 @@ mod tests {
                     "command": "unsafe command"
                 }
             }),
-            json!({"id": 4, "result": {}}),
+            json!({"id": 4, "result": {"turnId": "turn-1"}}),
             json!({
                 "method": "item/completed",
                 "params": {
@@ -3051,9 +3375,177 @@ mod tests {
                 "proposedNetworkPolicyAmendments".to_string(),
                 json!([{"host": "example.invalid", "action": "allow"}]),
             )]),
+            Map::from_iter([(
+                "proposedExecpolicyAmendment".to_string(),
+                json!({"command": "future executable"}),
+            )]),
+            Map::from_iter([(
+                "availableDecisions".to_string(),
+                json!(["accept", "decline"]),
+            )]),
+            Map::from_iter([("approvalId".to_string(), json!("subcommand-1"))]),
+            Map::from_iter([("environmentId".to_string(), json!("environment-1"))]),
+            Map::from_iter([(
+                "commandActions".to_string(),
+                json!([{"type": "write", "path": "/outside"}]),
+            )]),
         ] {
             assert!(approval_requests_ceiling_expansion(&params));
         }
+    }
+
+    #[test]
+    fn audited_approval_field_sets_are_method_specific_and_future_fields_fail_closed() {
+        for (method, allowed) in [
+            (
+                "item/commandExecution/requestApproval",
+                COMMAND_APPROVAL_FIELDS,
+            ),
+            (
+                "item/fileChange/requestApproval",
+                FILE_CHANGE_APPROVAL_FIELDS,
+            ),
+            (
+                "item/permissions/requestApproval",
+                PERMISSION_APPROVAL_FIELDS,
+            ),
+        ] {
+            let params = Map::from_iter(
+                allowed
+                    .iter()
+                    .map(|field| ((*field).to_string(), Value::Null)),
+            );
+            validate_approval_request_fields(method, &params)
+                .expect("all audited method fields are classified");
+
+            let mut future = params;
+            future.insert("futureSafetyAuthority".to_string(), json!(true));
+            assert!(matches!(
+                validate_approval_request_fields(method, &future),
+                Err(AppServerError::Unexpected {
+                    phase: "approval",
+                    ..
+                })
+            ));
+        }
+
+        for (method, foreign_field) in [
+            ("item/commandExecution/requestApproval", "grantRoot"),
+            ("item/fileChange/requestApproval", "command"),
+            ("item/permissions/requestApproval", "additionalPermissions"),
+        ] {
+            assert!(validate_approval_request_fields(
+                method,
+                &Map::from_iter([(foreign_field.to_string(), Value::Null)])
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn unknown_approval_field_aborts_before_reviewer_or_response() {
+        let mut messages = base_messages();
+        messages.extend([
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "future-field", "type": "commandExecution", "status": "inProgress"}
+                }
+            }),
+            json!({
+                "id": 86,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "future-field",
+                    "command": "echo bounded",
+                    "futureSafetyAuthority": {"allow": true}
+                }
+            }),
+        ]);
+        let reviewer_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&reviewer_calls);
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut move |_: ApprovalRequest| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ApprovalReview::accept())
+            },
+            || false,
+        )
+        .expect_err("unknown approval authority must fail closed");
+
+        assert!(matches!(
+            error,
+            AppServerError::Unexpected {
+                phase: "approval",
+                ..
+            }
+        ));
+        assert_eq!(reviewer_calls.load(Ordering::SeqCst), 0);
+        assert!(!transport
+            .sent
+            .iter()
+            .any(|message| message.get("id") == Some(&json!(86))));
+    }
+
+    #[test]
+    fn unknown_permission_field_aborts_before_reviewer_or_response() {
+        let mut messages = base_messages();
+        messages.extend([
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "future-permission", "type": "commandExecution", "status": "inProgress"}
+                }
+            }),
+            json!({
+                "id": 87,
+                "method": "item/permissions/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "future-permission",
+                    "permissions": {},
+                    "futurePermissionAuthority": {"hostFilesystem": true}
+                }
+            }),
+        ]);
+        let reviewer_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&reviewer_calls);
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut move |_: ApprovalRequest| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ApprovalReview::accept())
+            },
+            || false,
+        )
+        .expect_err("unknown permission authority must fail closed");
+
+        assert!(matches!(
+            error,
+            AppServerError::Unexpected {
+                phase: "approval",
+                ..
+            }
+        ));
+        assert_eq!(reviewer_calls.load(Ordering::SeqCst), 0);
+        assert!(!transport
+            .sent
+            .iter()
+            .any(|message| message.get("id") == Some(&json!(87))));
     }
 
     #[test]
