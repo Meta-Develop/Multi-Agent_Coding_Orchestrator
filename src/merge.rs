@@ -9,6 +9,7 @@ use crate::{
     artifacts::{
         state_auth::sha256_hex, ArtifactFileDisposition, ArtifactRunWriter, RunArtifactFamily,
     },
+    collect_revalidation::RevalidationGuard,
     external_agent::{
         run_external_agent, ExternalAgentCommand, ExternalMachineGlobalRetentionBinding,
     },
@@ -2157,6 +2158,27 @@ pub(crate) fn collect_agent_result_with_evidence_and_write_lease(
     )
 }
 
+/// Collects directly under the composite authenticated claim/worktree guard.
+/// The caller must retain the guard through every artifact derived from the
+/// returned candidate.
+pub(crate) fn collect_agent_result_with_existing_guard(
+    options: MergeCollectOptions,
+    guard: &RevalidationGuard<'_>,
+) -> Result<MergeCandidate> {
+    guard.verify()?;
+    let validation_evidence = ValidationEvidenceBundle::legacy(options.validations.clone());
+    let repo_root = discover_primary_repo_root(&options.repo)?;
+    let write_lease = guard
+        .write_lease(&options.agent_id)
+        .with_context(|| format!("guard has no write lease for agent '{}'", options.agent_id))?;
+    collect_agent_result_from_verified_record(
+        options,
+        validation_evidence,
+        repo_root,
+        write_lease.record(),
+    )
+}
+
 fn collect_agent_result_from_verified_record(
     options: MergeCollectOptions,
     validation_evidence: ValidationEvidenceBundle,
@@ -2247,6 +2269,19 @@ pub(crate) fn preview_merge_apply_with_evidence_and_write_lease(
         validation_evidence,
         write_lease,
     )?;
+    let mut preview =
+        build_merge_apply_preview(candidate, options.forces, options.require_validation)?;
+    assess_megafile_policy(&mut preview, &MegafileMergePolicy::default())?;
+    Ok(preview)
+}
+
+pub(crate) fn preview_merge_apply_with_existing_guard(
+    options: MergePreviewOptions,
+    guard: &RevalidationGuard<'_>,
+) -> Result<MergeApplyPreview> {
+    let mut collect = options.collect;
+    collect.include_full_diff = true;
+    let candidate = collect_agent_result_with_existing_guard(collect, guard)?;
     let mut preview =
         build_merge_apply_preview(candidate, options.forces, options.require_validation)?;
     assess_megafile_policy(&mut preview, &MegafileMergePolicy::default())?;

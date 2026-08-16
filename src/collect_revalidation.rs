@@ -44,12 +44,33 @@ pub(crate) enum RevalidationError {
     RequestLimit { limit: usize },
     #[error("worker revalidation request set contains duplicate agent '{agent_id}'")]
     DuplicateAgent { agent_id: String },
+    #[error("claim-only pre-guard does not match the requested worker authority batch")]
+    ClaimBatchMismatch,
 }
 
 #[derive(Debug)]
 struct GuardBinding<'a> {
     agent_id: String,
     lease: &'a ManagedWorktreeWriteLease,
+}
+
+/// Retains exact authenticated claims while a caller performs a repository
+/// mutation that must precede acquisition of the managed-worktree registry
+/// guard. Existing exclusive per-worktree leases must already be held by the
+/// caller; this pre-guard prevents release, heartbeat, sweep, reclaim, or
+/// takeover until the complete composite guard is assembled.
+#[must_use = "the claim pre-guard must be retained until composite revalidation"]
+#[derive(Debug)]
+pub(crate) struct ExistingClaimBatchGuard {
+    claims: ExistingClaimsGuard,
+    bindings: Vec<ExistingClaimBindingRequest>,
+}
+
+impl ExistingClaimBatchGuard {
+    pub(crate) fn verify(&self) -> Result<(), RevalidationError> {
+        self.claims.verify()?;
+        Ok(())
+    }
 }
 
 /// One linearized claim/worktree authority for a bounded worker batch.
@@ -99,6 +120,16 @@ impl RevalidationGuard<'_> {
         Ok(())
     }
 
+    pub(crate) fn verify_agent(&self, agent_id: &str) -> Result<(), RevalidationError> {
+        let _serial = self
+            .verification
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.claims.verify()?;
+        self.worktrees.verify_agent(agent_id)?;
+        Ok(())
+    }
+
     pub(crate) fn write_lease(&self, agent_id: &str) -> Option<&ManagedWorktreeWriteLease> {
         self.bindings
             .iter()
@@ -112,20 +143,31 @@ pub(crate) fn revalidate_existing_worker_batch<'a>(
     manager: &WorktreeManager,
     requests: Vec<RevalidationRequest<'a>>,
 ) -> Result<RevalidationGuard<'a>, RevalidationError> {
-    revalidate_existing_worker_batch_with_additional_worktrees(
-        repo_path,
-        manager,
-        requests,
-        Vec::new(),
-    )
+    let claims = lock_existing_worker_claim_batch(repo_path, &requests)?;
+    revalidate_existing_worker_batch_from_claim_guard(claims, manager, requests, Vec::new())
 }
 
-pub(crate) fn revalidate_existing_worker_batch_with_additional_worktrees<'a>(
+pub(crate) fn lock_existing_worker_claim_batch(
     repo_path: &Path,
+    requests: &[RevalidationRequest<'_>],
+) -> Result<ExistingClaimBatchGuard, RevalidationError> {
+    validate_request_agents(requests)?;
+    let bindings = claim_bindings(requests);
+    let claims = lock_existing_authenticated_claims(repo_path, bindings.clone())?;
+    Ok(ExistingClaimBatchGuard { claims, bindings })
+}
+
+pub(crate) fn revalidate_existing_worker_batch_from_claim_guard<'a>(
+    claims: ExistingClaimBatchGuard,
     manager: &WorktreeManager,
     requests: Vec<RevalidationRequest<'a>>,
     additional_worktrees: Vec<ExistingWorktreeBindingRequest<'a>>,
 ) -> Result<RevalidationGuard<'a>, RevalidationError> {
+    validate_request_agents(&requests)?;
+    if claims.bindings != claim_bindings(&requests) {
+        return Err(RevalidationError::ClaimBatchMismatch);
+    }
+    claims.verify()?;
     if requests.is_empty() || requests.len() > MAX_REVALIDATION_REQUESTS {
         return Err(RevalidationError::RequestLimit {
             limit: MAX_REVALIDATION_REQUESTS,
@@ -140,15 +182,6 @@ pub(crate) fn revalidate_existing_worker_batch_with_additional_worktrees<'a>(
         }
     }
 
-    let claim_requests = requests
-        .iter()
-        .map(|request| ExistingClaimBindingRequest {
-            agent_id: request.agent_id.clone(),
-            token: request.claim_token,
-            paths: request.claimed_paths.clone(),
-        })
-        .collect::<Vec<_>>();
-    let claims = lock_existing_authenticated_claims(repo_path, claim_requests)?;
     if requests
         .len()
         .checked_add(additional_worktrees.len())
@@ -185,21 +218,50 @@ pub(crate) fn revalidate_existing_worker_batch_with_additional_worktrees<'a>(
         })
         .collect();
     Ok(RevalidationGuard {
-        claims,
+        claims: claims.claims,
         worktrees,
         bindings,
         verification: std::sync::Mutex::new(()),
     })
 }
 
+fn validate_request_agents(requests: &[RevalidationRequest<'_>]) -> Result<(), RevalidationError> {
+    if requests.is_empty() || requests.len() > MAX_REVALIDATION_REQUESTS {
+        return Err(RevalidationError::RequestLimit {
+            limit: MAX_REVALIDATION_REQUESTS,
+        });
+    }
+    let mut agents = std::collections::BTreeSet::new();
+    for request in requests {
+        if !agents.insert(request.agent_id.clone()) {
+            return Err(RevalidationError::DuplicateAgent {
+                agent_id: request.agent_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn claim_bindings(requests: &[RevalidationRequest<'_>]) -> Vec<ExistingClaimBindingRequest> {
+    requests
+        .iter()
+        .map(|request| ExistingClaimBindingRequest {
+            agent_id: request.agent_id.clone(),
+            token: request.claim_token,
+            paths: request.claimed_paths.clone(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        sync_store::SyncStore,
-        worktree::{WorktreeCreateOptions, WorktreeManager},
+        state_migration::neuter_legacy_retirement_mutations,
+        sync_store::{neuter_claim_state_mutations, SyncStore},
+        worktree::{neuter_managed_registry_mutations, WorktreeCreateOptions, WorktreeManager},
     };
-    use anyhow::{Context, Result};
+    use anyhow::{bail, Context, Result};
     use git2::{Oid, Signature};
     use std::{collections::BTreeMap, fs, path::Path, sync::mpsc, time::Duration};
     use tempfile::TempDir;
@@ -312,6 +374,47 @@ mod tests {
     }
 
     #[test]
+    fn issue_84_existing_only_guard_works_with_all_mutation_entrypoints_neutered() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let state_root = crate::git_repository::open(&fixture.repo_path)?
+            .commondir()
+            .join("maco/state");
+        let before = recursive_regular_bytes(&state_root)?;
+        let _retirement_neuter = neuter_legacy_retirement_mutations();
+        let _claim_neuter = neuter_claim_state_mutations();
+        let _registry_neuter = neuter_managed_registry_mutations();
+
+        let guard = fixture.guard()?;
+        guard.verify()?;
+        drop(guard);
+
+        assert_eq!(recursive_regular_bytes(&state_root)?, before);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn issue_84_existing_only_guard_emits_no_state_tree_mutation_events() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let state_root = crate::git_repository::open(&fixture.repo_path)?
+            .commondir()
+            .join("maco/state");
+        let before = recursive_regular_bytes(&state_root)?;
+        let tripwire = StateMutationTripwire::arm(&state_root)?;
+        let _retirement_neuter = neuter_legacy_retirement_mutations();
+        let _claim_neuter = neuter_claim_state_mutations();
+        let _registry_neuter = neuter_managed_registry_mutations();
+
+        let guard = fixture.guard()?;
+        guard.verify()?;
+        drop(guard);
+
+        tripwire.assert_quiet()?;
+        assert_eq!(recursive_regular_bytes(&state_root)?, before);
+        Ok(())
+    }
+
+    #[test]
     fn issue_84_guard_lifetime_blocks_release_through_artifact_publication() -> Result<()> {
         let fixture = Fixture::new()?;
         let guard = fixture.guard()?;
@@ -396,7 +499,13 @@ mod tests {
             vec![fixture.request()],
         )
         .expect_err("wrong symbolic branch must fail before collection");
-        assert!(error.to_string().contains("wrong branch"));
+        assert!(
+            matches!(
+                error,
+                RevalidationError::Worktree(ExistingWorktreeRevalidationError::WrongBranch { .. })
+            ),
+            "unexpected error: {error:?}"
+        );
         repo.set_head(&expected_ref)?;
         Ok(())
     }
@@ -435,6 +544,50 @@ mod tests {
         .expect_err("missing authenticated state cannot initialize itself");
         assert!(error.to_string().contains("unavailable"));
         assert!(!claim_root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn issue_84_missing_claim_lock_fails_without_mutable_lock_bootstrap() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let lock_path = crate::git_repository::open(&fixture.repo_path)?
+            .commondir()
+            .join("maco/state/claims.lock");
+        fs::remove_file(&lock_path)?;
+
+        revalidate_existing_worker_batch(
+            &fixture.repo_path,
+            &fixture.manager,
+            vec![fixture.request()],
+        )
+        .expect_err("missing stable claims lock must stop existing-only revalidation");
+
+        assert!(
+            !lock_path.exists(),
+            "revalidation recreated the claims lock"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn issue_84_missing_registry_lock_fails_without_mutable_lock_bootstrap() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let lock_path = crate::git_repository::open(&fixture.repo_path)?
+            .commondir()
+            .join("maco/state/managed_worktrees.lock");
+        fs::remove_file(&lock_path)?;
+
+        revalidate_existing_worker_batch(
+            &fixture.repo_path,
+            &fixture.manager,
+            vec![fixture.request()],
+        )
+        .expect_err("missing stable managed registry lock must stop existing-only revalidation");
+
+        assert!(
+            !lock_path.exists(),
+            "revalidation recreated the registry lock"
+        );
         Ok(())
     }
 
@@ -564,5 +717,85 @@ mod tests {
         let mut output = BTreeMap::new();
         visit(root, root, &mut output)?;
         Ok(output)
+    }
+
+    #[cfg(target_os = "linux")]
+    struct StateMutationTripwire {
+        fd: std::os::fd::RawFd,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl StateMutationTripwire {
+        fn arm(root: &Path) -> Result<Self> {
+            use std::os::unix::ffi::OsStrExt as _;
+
+            let mut directories = Vec::new();
+            collect_existing_directories(root, &mut directories)?;
+            // SAFETY: inotify_init1 has no pointer arguments and the returned
+            // descriptor is owned by this guard until Drop.
+            let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error()).context("initialize inotify tripwire");
+            }
+            let tripwire = Self { fd };
+            let mask = libc::IN_CREATE
+                | libc::IN_DELETE
+                | libc::IN_MOVED_FROM
+                | libc::IN_MOVED_TO
+                | libc::IN_MODIFY
+                | libc::IN_ATTRIB;
+            for directory in directories {
+                let encoded = std::ffi::CString::new(directory.as_os_str().as_bytes())
+                    .context("state directory path contains NUL")?;
+                // SAFETY: encoded is a live NUL-terminated path and fd is the
+                // owned inotify descriptor retained by tripwire.
+                let watch = unsafe { libc::inotify_add_watch(fd, encoded.as_ptr(), mask) };
+                if watch < 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .with_context(|| format!("watch state directory {}", directory.display()));
+                }
+            }
+            Ok(tripwire)
+        }
+
+        fn assert_quiet(&self) -> Result<()> {
+            let mut buffer = [0_u8; 16 * 1024];
+            loop {
+                // SAFETY: buffer is writable for its full length and fd stays
+                // open for this method's complete duration.
+                let read = unsafe { libc::read(self.fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+                if read > 0 {
+                    bail!("existing-only revalidation emitted a state-tree mutation event");
+                }
+                if read == 0 {
+                    return Ok(());
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    return Ok(());
+                }
+                return Err(error).context("drain inotify state mutation tripwire");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for StateMutationTripwire {
+        fn drop(&mut self) {
+            // SAFETY: fd is owned by this value and is closed exactly once.
+            let _ = unsafe { libc::close(self.fd) };
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn collect_existing_directories(root: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
+        output.push(root.to_path_buf());
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                collect_existing_directories(&entry.path(), output)?;
+            }
+        }
+        Ok(())
     }
 }

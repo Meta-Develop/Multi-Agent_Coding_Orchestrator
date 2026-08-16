@@ -960,6 +960,45 @@ impl ExistingManagedWorktreeGuard<'_> {
         }
         Ok(())
     }
+
+    /// Revalidates one member of a retained batch at its original HEAD.
+    ///
+    /// Parallel worker commands may advance their own branches after their
+    /// literal pre-spawn check. A later sibling must still authenticate the
+    /// retained registry state, but must not reject merely because that
+    /// already-started sibling advanced its branch. The full batch is rebound
+    /// to all resulting HEADs after every child has joined.
+    pub(crate) fn verify_agent(
+        &self,
+        agent_id: &str,
+    ) -> std::result::Result<(), ExistingWorktreeRevalidationError> {
+        let mut matching = self
+            .requests
+            .iter()
+            .filter(|request| request.agent_id == agent_id);
+        let request = matching
+            .next()
+            .ok_or(ExistingWorktreeRevalidationError::ExpectationMismatch)?;
+        if matching.next().is_some() {
+            return Err(ExistingWorktreeRevalidationError::ExpectationMismatch);
+        }
+        let authenticated = self
+            .store
+            .load_existing_authenticated_state(&self.lock)
+            .map_err(|source| ExistingWorktreeRevalidationError::StateUnavailable { source })?;
+        if authenticated != self.authenticated {
+            return Err(ExistingWorktreeRevalidationError::StateChanged);
+        }
+        reject_pending_managed_operation(&authenticated.registry)?;
+        verify_existing_worktree_request(
+            &self.store,
+            &self.lock,
+            &authenticated,
+            request,
+            request.expected_head_oid,
+            request.expected_ref_oid,
+        )
+    }
 }
 
 /// Removal owns a distinct capability so a write lease cannot be mistaken for
@@ -7873,6 +7912,8 @@ impl ManagedWorktreeRegistryStore {
     }
 
     fn lock(&self) -> Result<ManagedWorktreeRegistryLock> {
+        #[cfg(test)]
+        reject_neutered_managed_registry_mutation()?;
         let lock = KernelStateLock::acquire_direct(&self.state_root, "managed_worktrees.lock")?;
         let bound = ManagedWorktreeRegistryLock {
             root_identity: self.state_root.identity().clone(),
@@ -8412,6 +8453,34 @@ fn finish_with_registry_lock_verification<T>(
 thread_local! {
     static MANAGED_REGISTRY_AFTER_PRECHECK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static MANAGED_REGISTRY_MUTATIONS_NEUTERED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct ManagedRegistryMutationNeuter {
+    previous: bool,
+}
+
+#[cfg(test)]
+impl Drop for ManagedRegistryMutationNeuter {
+    fn drop(&mut self) {
+        MANAGED_REGISTRY_MUTATIONS_NEUTERED.with(|slot| slot.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn neuter_managed_registry_mutations() -> ManagedRegistryMutationNeuter {
+    let previous = MANAGED_REGISTRY_MUTATIONS_NEUTERED.with(|slot| slot.replace(true));
+    ManagedRegistryMutationNeuter { previous }
+}
+
+#[cfg(test)]
+fn reject_neutered_managed_registry_mutation() -> Result<()> {
+    if MANAGED_REGISTRY_MUTATIONS_NEUTERED.with(std::cell::Cell::get) {
+        bail!("managed registry mutation surface was neutered by the test")
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -12379,7 +12448,13 @@ mod tests {
                 expected_ref_oid: base,
             }])
             .expect_err("pending registry operation must stop the harness");
-        assert!(error.to_string().contains("pending operation"));
+        assert!(
+            matches!(
+                error,
+                ExistingWorktreeRevalidationError::PendingOperation { .. }
+            ),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[cfg(unix)]

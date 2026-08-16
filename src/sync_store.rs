@@ -543,6 +543,8 @@ impl RepositoryStateRoot {
     }
 
     pub(crate) fn lock(&self) -> Result<RepositoryStateLock> {
+        #[cfg(test)]
+        reject_neutered_claim_state_mutation()?;
         let lock = KernelStateLock::acquire_direct(&self.root, self.lock_file)?;
         let lock_identity = lock.identity().clone();
         Ok(RepositoryStateLock {
@@ -657,6 +659,34 @@ impl RepositoryStateRoot {
 thread_local! {
     static REPOSITORY_STATE_AFTER_PRECHECK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static CLAIM_STATE_MUTATIONS_NEUTERED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct ClaimStateMutationNeuter {
+    previous: bool,
+}
+
+#[cfg(test)]
+impl Drop for ClaimStateMutationNeuter {
+    fn drop(&mut self) {
+        CLAIM_STATE_MUTATIONS_NEUTERED.with(|slot| slot.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn neuter_claim_state_mutations() -> ClaimStateMutationNeuter {
+    let previous = CLAIM_STATE_MUTATIONS_NEUTERED.with(|slot| slot.replace(true));
+    ClaimStateMutationNeuter { previous }
+}
+
+#[cfg(test)]
+fn reject_neutered_claim_state_mutation() -> Result<()> {
+    if CLAIM_STATE_MUTATIONS_NEUTERED.with(std::cell::Cell::get) {
+        bail!("claim-state mutation surface was neutered by the test")
+    }
+    Ok(())
 }
 
 #[cfg(test)]

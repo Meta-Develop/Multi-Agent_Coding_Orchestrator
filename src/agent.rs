@@ -1,4 +1,8 @@
 use crate::{
+    collect_revalidation::{
+        revalidate_existing_worker_batch, RevalidationGuard, RevalidationHeadExpectation,
+        RevalidationRequest,
+    },
     llm::{
         provider::CommandPurpose, LlmProvider, LlmRequest, LlmResponse, PromptContext,
         ProposedCommand, ProposedPatch, Redactor, RepoExcerpt, RequestBudget, ValidationCommand,
@@ -14,12 +18,15 @@ use crate::{
     },
     sync::{normalize_repo_relative_path, PathClaim},
     sync_store::SyncStore,
-    worktree::{normalize_agent_id, WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
+    worktree::{
+        normalize_agent_id, ManagedWorktreeWriteLease, WorktreeCreateOptions, WorktreeManager,
+        WorktreeRecord,
+    },
 };
 use anyhow::{bail, Context, Result};
 #[cfg(test)]
 use git2::Repository;
-use git2::StatusOptions;
+use git2::{Oid, StatusOptions};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -154,10 +161,20 @@ pub struct OutputSummary {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct SelectedWorktree {
-    record: WorktreeRecord,
+    lease: ManagedWorktreeWriteLease,
     reused: bool,
+}
+
+impl SelectedWorktree {
+    fn record(&self) -> &WorktreeRecord {
+        self.lease.record()
+    }
+
+    fn path(&self) -> &Path {
+        self.lease.path()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -213,11 +230,6 @@ fn run_agent_with_provider_runtime<P>(
 where
     P: LlmProvider,
 {
-    if runtime == AgentExecutionRuntime::Verified {
-        bail!(
-            "agent assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
-        );
-    }
     let repo = discover_repo_root(&options.repo)?;
     let agent_id = normalize_agent_id(&options.agent_id)?;
     let claimed_paths = normalize_claimed_paths(options.claimed_paths)?;
@@ -300,9 +312,10 @@ fn run_claimed_agent<P>(run: ClaimedAgentRun<'_, P>) -> Result<AgentRunReport>
 where
     P: LlmProvider,
 {
+    let manager = WorktreeManager::new(&run.repo);
     let capabilities = run.provider.capabilities();
     let prompt = build_prompt(
-        &run.selected.record.path,
+        run.selected.path(),
         &run.agent_id,
         &run.task,
         &run.claimed_paths,
@@ -322,12 +335,29 @@ where
     let mut execution_error = None;
 
     for patch in &response.proposal.patches {
-        let result = apply_proposed_patch(
-            &run.selected.record.path,
+        let expected_head = selected_head_oid(&run.selected)?;
+        let guard = revalidate_claimed_agent(
+            &run.repo,
+            &manager,
+            &run.agent_id,
+            &run.claimed_paths,
+            &run.claim,
+            &run.selected,
+            expected_head,
+        )?;
+        let mut result = apply_proposed_patch(
+            run.selected.path(),
             patch,
             &run.claimed_paths,
             run.runtime,
+            &guard,
         );
+        if let Err(error) =
+            verify_claimed_agent_after_operation(&guard, &run.agent_id, &run.selected)
+        {
+            result.success = false;
+            result.error = Some(format!("worker patch boundary changed: {error}"));
+        }
         if !result.success && execution_error.is_none() {
             execution_error = result.error.clone();
         }
@@ -360,12 +390,29 @@ where
             .iter()
             .filter(|command| command.purpose != CommandPurpose::Validate)
         {
-            let result = run_proposed_command(
-                &run.selected.record.path,
+            let expected_head = selected_head_oid(&run.selected)?;
+            let guard = revalidate_claimed_agent(
+                &run.repo,
+                &manager,
+                &run.agent_id,
+                &run.claimed_paths,
+                &run.claim,
+                &run.selected,
+                expected_head,
+            )?;
+            let mut result = run_proposed_command(
+                run.selected.path(),
                 command,
                 run.command_timeout,
                 run.runtime,
+                &guard,
             );
+            if let Err(error) =
+                verify_claimed_agent_after_operation(&guard, &run.agent_id, &run.selected)
+            {
+                result.success = false;
+                result.error = Some(format!("worker command boundary changed: {error}"));
+            }
             if !result.success && execution_error.is_none() {
                 execution_error = result.error.clone();
             }
@@ -384,12 +431,29 @@ where
             .iter()
             .filter(|command| command.purpose == CommandPurpose::Validate)
         {
-            let result = run_proposed_command(
-                &run.selected.record.path,
+            let expected_head = selected_head_oid(&run.selected)?;
+            let guard = revalidate_claimed_agent(
+                &run.repo,
+                &manager,
+                &run.agent_id,
+                &run.claimed_paths,
+                &run.claim,
+                &run.selected,
+                expected_head,
+            )?;
+            let mut result = run_proposed_command(
+                run.selected.path(),
                 command,
                 run.command_timeout,
                 run.runtime,
+                &guard,
             );
+            if let Err(error) =
+                verify_claimed_agent_after_operation(&guard, &run.agent_id, &run.selected)
+            {
+                result.success = false;
+                result.error = Some(format!("worker validation boundary changed: {error}"));
+            }
             validations.push(validation_report_for_command(&result));
             if !result.success && execution_error.is_none() {
                 execution_error = result.error.clone();
@@ -403,12 +467,29 @@ where
 
     if execution_error.is_none() {
         for validation in &run.validation_commands {
-            let result = run_validation_command(
-                &run.selected.record.path,
+            let expected_head = selected_head_oid(&run.selected)?;
+            let guard = revalidate_claimed_agent(
+                &run.repo,
+                &manager,
+                &run.agent_id,
+                &run.claimed_paths,
+                &run.claim,
+                &run.selected,
+                expected_head,
+            )?;
+            let mut result = run_validation_command(
+                run.selected.path(),
                 validation,
                 run.command_timeout,
                 run.runtime,
+                &guard,
             );
+            if let Err(error) =
+                verify_claimed_agent_after_operation(&guard, &run.agent_id, &run.selected)
+            {
+                result.success = false;
+                result.error = Some(format!("configured validation boundary changed: {error}"));
+            }
             validations.push(validation_report_for_command(&result));
             if !result.success && execution_error.is_none() {
                 execution_error = result.error.clone();
@@ -420,26 +501,43 @@ where
         }
     }
 
-    let candidate = merge::collect_agent_result(MergeCollectOptions {
-        repo: run.repo.clone(),
-        agent_id: run.agent_id.clone(),
-        claimed_paths: run.claimed_paths.clone(),
-        include_full_diff: false,
-        diff_summary_char_limit: merge::DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
-        validations: validations.clone(),
-    })?;
-    let merge_preview = merge::preview_merge_apply(MergePreviewOptions {
-        collect: MergeCollectOptions {
+    let collection_head = selected_head_oid(&run.selected)?;
+    let collection_guard = revalidate_claimed_agent(
+        &run.repo,
+        &manager,
+        &run.agent_id,
+        &run.claimed_paths,
+        &run.claim,
+        &run.selected,
+        collection_head,
+    )?;
+    let candidate = merge::collect_agent_result_with_existing_guard(
+        MergeCollectOptions {
             repo: run.repo.clone(),
             agent_id: run.agent_id.clone(),
             claimed_paths: run.claimed_paths.clone(),
-            include_full_diff: true,
+            include_full_diff: false,
             diff_summary_char_limit: merge::DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
-            validations,
+            validations: validations.clone(),
         },
-        forces: MergeForceOptions::default(),
-        require_validation: false,
-    })?;
+        &collection_guard,
+    )?;
+    collection_guard.verify()?;
+    let merge_preview = merge::preview_merge_apply_with_existing_guard(
+        MergePreviewOptions {
+            collect: MergeCollectOptions {
+                repo: run.repo.clone(),
+                agent_id: run.agent_id.clone(),
+                claimed_paths: run.claimed_paths.clone(),
+                include_full_diff: true,
+                diff_summary_char_limit: merge::DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
+                validations,
+            },
+            forces: MergeForceOptions::default(),
+            require_validation: false,
+        },
+        &collection_guard,
+    )?;
 
     let boundary_error = if candidate.unclaimed_changed_paths.is_empty() {
         None
@@ -453,14 +551,14 @@ where
     let success = execution_error.is_none() && boundary_error.is_none() && !validation_failed;
     let error = execution_error.or(boundary_error);
 
-    Ok(AgentRunReport {
+    let report = AgentRunReport {
         success,
         repo: run.repo,
         agent_id: run.agent_id,
         request_id: response.request_id.clone(),
         provider_id: response.provider_id.clone(),
         model: response.model.clone(),
-        worktree: run.selected.record,
+        worktree: run.selected.record().clone(),
         worktree_reused: run.selected.reused,
         claim: Some(run.claim),
         released_claims: Vec::new(),
@@ -474,7 +572,73 @@ where
         candidate,
         merge_preview,
         error,
-    })
+    };
+    collection_guard.verify()?;
+    Ok(report)
+}
+
+fn selected_head_oid(selected: &SelectedWorktree) -> Result<Oid> {
+    let repo = crate::git_repository::open(selected.path())?;
+    let expected_ref = format!("refs/heads/{}", selected.record().branch);
+    let head = repo.head().context("managed worker HEAD is unavailable")?;
+    if head.name().context("managed worker HEAD name is invalid")? != expected_ref {
+        bail!("managed worker HEAD is detached or on the wrong branch");
+    }
+    let oid = head
+        .target()
+        .context("managed worker symbolic HEAD does not resolve directly")?;
+    let ref_oid = repo
+        .find_reference(&expected_ref)
+        .context("managed worker branch ref is unavailable")?
+        .target()
+        .context("managed worker branch ref does not resolve directly")?;
+    if oid != ref_oid {
+        bail!("managed worker HEAD and branch ref OIDs differ");
+    }
+    Ok(oid)
+}
+
+fn revalidate_claimed_agent<'a>(
+    repo: &Path,
+    manager: &WorktreeManager,
+    agent_id: &str,
+    claimed_paths: &[PathBuf],
+    claim: &PathClaim,
+    selected: &'a SelectedWorktree,
+    expected_head_oid: Oid,
+) -> Result<RevalidationGuard<'a>> {
+    if claim.agent_id != agent_id || claim.paths != claimed_paths {
+        bail!("worker claim does not match its exact owner and path set");
+    }
+    revalidate_existing_worker_batch(
+        repo,
+        manager,
+        vec![RevalidationRequest {
+            agent_id: agent_id.to_string(),
+            claim_token: claim.token,
+            claimed_paths: claim.paths.clone(),
+            write_lease: &selected.lease,
+            expected_worktree: selected.record().clone(),
+            expected_head_oid,
+            expected_ref_oid: expected_head_oid,
+        }],
+    )
+    .context("authenticated worker boundary revalidation failed")
+}
+
+fn verify_claimed_agent_after_operation(
+    guard: &RevalidationGuard<'_>,
+    agent_id: &str,
+    selected: &SelectedWorktree,
+) -> Result<()> {
+    let oid = selected_head_oid(selected)?;
+    guard
+        .verify_with_heads(&[RevalidationHeadExpectation {
+            agent_id: agent_id.to_string(),
+            head_oid: oid,
+            ref_oid: oid,
+        }])
+        .context("authenticated worker boundary changed during operation")
 }
 
 fn build_prompt(
@@ -538,8 +702,12 @@ fn select_worktree(
             );
         }
         ensure_clean_worktree(&record)?;
+        let lease = manager.acquire_write_execution_lease(agent_id)?;
+        if lease.record() != &record {
+            bail!("managed worktree changed before its exclusive lease was acquired");
+        }
         return Ok(SelectedWorktree {
-            record,
+            lease,
             reused: true,
         });
     }
@@ -556,12 +724,14 @@ fn select_worktree(
         base: None,
         worktree_root: None,
     };
-    #[cfg(test)]
-    let record = manager.create_for_test(create_options)?;
-    #[cfg(not(test))]
-    let record = manager.create(create_options)?;
+    let cleanliness = manager.acquire_repository_cleanliness()?;
+    let record = manager.create_with_repository_cleanliness(create_options, &cleanliness)?;
+    let lease = manager.acquire_write_execution_lease(agent_id)?;
+    if lease.record() != &record {
+        bail!("created worktree changed before its exclusive lease was acquired");
+    }
     Ok(SelectedWorktree {
-        record,
+        lease,
         reused: false,
     })
 }
@@ -617,6 +787,7 @@ fn apply_proposed_patch(
     patch: &ProposedPatch,
     claimed_paths: &[PathBuf],
     runtime: AgentExecutionRuntime,
+    guard: &RevalidationGuard<'_>,
 ) -> PatchApplicationReport {
     let normalized_path = match normalize_repo_relative_path(&patch.path) {
         Ok(path) => path,
@@ -666,7 +837,18 @@ fn apply_proposed_patch(
         };
     }
 
-    match run_git_apply(worktree_path, &patch.unified_diff, runtime) {
+    if let Err(error) = guard.verify() {
+        return PatchApplicationReport {
+            path: normalized_path,
+            success: false,
+            stdout: OutputSummary::default(),
+            stderr: OutputSummary::default(),
+            error: Some(format!(
+                "worker harness was not executed because literal pre-spawn revalidation failed: {error}"
+            )),
+        };
+    }
+    match run_git_apply(worktree_path, &patch.unified_diff, runtime, guard) {
         Ok(result) => PatchApplicationReport {
             path: normalized_path,
             success: result.status.is_some_and(|status| status.success()),
@@ -825,6 +1007,7 @@ fn run_proposed_command(
     command: &ProposedCommand,
     timeout: Duration,
     runtime: AgentExecutionRuntime,
+    guard: &RevalidationGuard<'_>,
 ) -> CommandExecutionReport {
     run_command(
         worktree_path,
@@ -835,6 +1018,7 @@ fn run_proposed_command(
             timeout,
         },
         runtime,
+        guard,
     )
 }
 
@@ -843,6 +1027,7 @@ fn run_validation_command(
     validation: &AgentValidationCommand,
     timeout: Duration,
     runtime: AgentExecutionRuntime,
+    guard: &RevalidationGuard<'_>,
 ) -> CommandExecutionReport {
     run_command(
         worktree_path,
@@ -853,6 +1038,7 @@ fn run_validation_command(
             timeout,
         },
         runtime,
+        guard,
     )
 }
 
@@ -860,6 +1046,7 @@ fn run_command(
     worktree_path: &Path,
     spec: CommandSpec,
     runtime: AgentExecutionRuntime,
+    guard: &RevalidationGuard<'_>,
 ) -> CommandExecutionReport {
     let normalized_cwd = match normalize_optional_working_directory(spec.working_directory.as_ref())
     {
@@ -894,7 +1081,7 @@ fn run_command(
     )
     .with_environment(EnvironmentMode::ClearAndSet(sandbox_environment()))
     .with_timeout(Some(spec.timeout));
-    let result = run_process(match runtime {
+    let process_spec = match runtime {
         AgentExecutionRuntime::Verified => process_spec
             .with_private_runtime_home(true)
             .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
@@ -903,7 +1090,25 @@ fn run_command(
         #[cfg(test)]
         AgentExecutionRuntime::NonpublishableSimulation => process_spec
             .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
-    });
+    };
+    if let Err(error) = guard.verify() {
+        return CommandExecutionReport {
+            command: spec.command,
+            purpose: spec.purpose,
+            working_directory: normalized_cwd,
+            success: false,
+            exit_code: None,
+            duration_ms: duration_millis(started.elapsed()),
+            timed_out: false,
+            timeout_seconds: spec.timeout.as_secs(),
+            stdout: OutputSummary::default(),
+            stderr: OutputSummary::default(),
+            error: Some(format!(
+                "worker harness was not executed because literal pre-spawn revalidation failed: {error}"
+            )),
+        };
+    }
+    let result = run_process(process_spec);
 
     match result {
         Ok(output) => {
@@ -997,6 +1202,7 @@ fn run_git_apply(
     worktree_path: &Path,
     patch: &str,
     runtime: AgentExecutionRuntime,
+    guard: &RevalidationGuard<'_>,
 ) -> Result<ProcessOutput> {
     let process_spec = ProcessSpec::direct(
         "git apply",
@@ -1007,7 +1213,7 @@ fn run_git_apply(
     )
     .with_environment(EnvironmentMode::ClearAndSet(sandbox_environment()))
     .with_stdin(StdinMode::Bytes(patch.as_bytes().to_vec()));
-    let output = run_process(match runtime {
+    let process_spec = match runtime {
         AgentExecutionRuntime::Verified => process_spec
             .with_private_runtime_home(true)
             .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
@@ -1016,8 +1222,12 @@ fn run_git_apply(
         #[cfg(test)]
         AgentExecutionRuntime::NonpublishableSimulation => process_spec
             .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
-    })
-    .with_context(|| format!("failed to run git apply in {}", worktree_path.display()))?;
+    };
+    guard
+        .verify()
+        .context("worker harness was not executed because literal pre-spawn revalidation failed")?;
+    let output = run_process(process_spec)
+        .with_context(|| format!("failed to run git apply in {}", worktree_path.display()))?;
     let succeeded = match runtime {
         AgentExecutionRuntime::Verified => output.safety_sensitive_succeeded(),
         #[cfg(test)]
