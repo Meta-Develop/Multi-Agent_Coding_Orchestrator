@@ -6928,6 +6928,21 @@ mod tests {
         super::resume_plan_file_simulation(options)
     }
 
+    #[cfg(target_os = "linux")]
+    fn missing_delegated_user_manager_before_target(error: &ProcessRunError) -> bool {
+        matches!(
+            error,
+            ProcessRunError::EnvironmentFailure {
+                failure,
+                target_process_started: false,
+                ..
+            } if failure.category
+                == crate::external_agent::EnvironmentFailureCategory::SandboxUnavailable
+                && failure.summary
+                    .contains("is not inside a delegated systemd user manager")
+        )
+    }
+
     fn test_candidate_binding(worktree_path: &Path, base_oid: Oid) -> AgentCandidateBinding {
         let state = capture_consistent_candidate_state(
             worktree_path,
@@ -8149,6 +8164,14 @@ mod tests {
         let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
+        let worktree = WorktreeManager::new(&repo_path)
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("precreate clean worktree for claim-boundary test");
         SyncStore::open(&repo_path)
             .expect("open store")
             .claim_paths("other-agent", ["README.md"])
@@ -8158,23 +8181,30 @@ mod tests {
             &plan_file,
             r#"{
               "agents": [
-                {"id": "agent-a", "paths": ["README.md"], "command": "echo should-not-run"}
+                {"id": "agent-a", "paths": ["README.md"], "command": "touch should-not-run"}
               ]
             }"#,
         )
         .expect("write plan");
 
-        let summary = run_plan_file(OrchestrationRunOptions {
-            repo: repo_path.clone(),
-            plan_file,
-            keep_claims: false,
-            jobs: 1,
-            patch_dir: None,
-        })
+        let summary = run_plan_file_with_controls(
+            OrchestrationRunOptions {
+                repo: repo_path.clone(),
+                plan_file,
+                keep_claims: false,
+                jobs: 1,
+                patch_dir: None,
+            },
+            OrchestrationRunControls {
+                worktree_reuse_policy: Some(WorktreeReusePolicy::Required),
+                ..OrchestrationRunControls::default()
+            },
+        )
         .expect("run plan");
 
         assert!(!summary.success);
         assert_eq!(summary.first_failed_agent(), Some("agent-a"));
+        assert!(summary.agents[0].worktree_reused);
         assert!(summary.agents[0]
             .error
             .as_deref()
@@ -8187,6 +8217,10 @@ mod tests {
                 .expect("owner")
                 .owner,
             Some("other-agent".to_string())
+        );
+        assert!(
+            !worktree.path.join("should-not-run").exists(),
+            "claim-conflicted worker command was executed"
         );
     }
 
@@ -9902,6 +9936,47 @@ mod tests {
         commit_all(&repo, "initial commit").expect("commit");
         let plan_file = temp.path().join("plan.json");
         let key_name = crate::artifacts::state_auth::authentication_key_file_name();
+        SyncStore::open(&repo_path).expect("initialize authenticated repository state");
+        let key_path = repo.commondir().join("maco/state").join(key_name);
+        assert!(
+            key_path.is_file(),
+            "repository authentication key is absent"
+        );
+        let containment_probe_marker = temp.path().join("containment-probe-ran");
+        let probe = run_process(
+            ProcessSpec::shell(
+                "verified orchestration containment probe",
+                Shell::for_current_platform(),
+                format!("touch '{}'", containment_probe_marker.display()),
+                temp.path(),
+                256,
+            )
+            .with_timeout(Some(Duration::from_secs(5))),
+        );
+        match probe {
+            Ok(output) => {
+                assert!(output.status.is_some_and(|status| status.success()));
+                assert!(containment_probe_marker.is_file());
+                fs::remove_file(&containment_probe_marker)
+                    .expect("remove containment probe marker");
+            }
+            Err(error) if missing_delegated_user_manager_before_target(&error) => {
+                assert!(
+                    !containment_probe_marker.exists(),
+                    "pre-spawn containment failure still executed its target marker"
+                );
+                assert!(
+                    WorktreeManager::new(&repo_path)
+                        .list()
+                        .expect("list worktrees after containment refusal")
+                        .is_empty(),
+                    "verified worker setup ran despite pre-spawn containment refusal"
+                );
+                eprintln!("skipping verified orchestration runtime: {error}");
+                return;
+            }
+            Err(error) => panic!("unexpected verified containment probe failure: {error:?}"),
+        }
         fs::write(
             &plan_file,
             serde_json::to_vec(&serde_json::json!({
@@ -9941,7 +10016,7 @@ mod tests {
         assert_eq!(summary.released_claims.len(), 1);
         assert!(summary.release_errors.is_empty());
         assert!(
-            repo.commondir().join("maco/state").join(key_name).is_file(),
+            key_path.is_file(),
             "the key must exist on the host so the child failure proves isolation"
         );
         assert_eq!(
