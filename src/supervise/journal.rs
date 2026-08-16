@@ -193,6 +193,38 @@ pub(super) fn record_gate_correction_event_strict(
     Ok(())
 }
 
+pub(super) fn record_assignment_suitability_event_strict(
+    journal: &mut Option<OrchestrationEventJournal>,
+    writer: &mut ArtifactRunWriter,
+    node: &str,
+    parent: Option<&str>,
+    outcome: &AssignmentSuitabilityOutcome,
+) -> Result<()> {
+    let active_journal = journal.as_mut().context(
+        "strict assignment suitability provenance requires an orchestration event journal",
+    )?;
+    if !active_journal.is_enabled() {
+        bail!("strict assignment suitability provenance journal is disabled");
+    }
+    active_journal
+        .append(
+            writer,
+            node,
+            parent,
+            OrchestrationRole::Supervisor,
+            OrchestrationEventKind::Gate,
+            json!({
+                "gate": "assignment_suitability",
+                "outcome": outcome,
+            }),
+        )
+        .context("failed to append strict assignment suitability event")?;
+    if !active_journal.is_enabled() {
+        bail!("strict assignment suitability provenance journal became disabled");
+    }
+    Ok(())
+}
+
 pub(super) fn record_pre_action_event_strict(
     journal: &mut Option<OrchestrationEventJournal>,
     writer: &mut ArtifactRunWriter,

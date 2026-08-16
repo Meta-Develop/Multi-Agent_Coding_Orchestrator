@@ -1010,6 +1010,7 @@ fn supervisor_traceability_reports_missing_changes_and_diff_binding() {
         admission: SupervisorAdmissionConfig::default(),
         evidence_only_reaudit: None,
         generated_follow_up: None,
+        review_loop_guard: None,
     };
     let mut report_a = injected_child_report(&plan.assignments[0]);
     report_a.files_changed = vec![PathBuf::from("src/a.rs")];
@@ -1061,6 +1062,7 @@ fn supervisor_traceability_binds_ordinary_success_to_observed_paths_and_diff() {
         admission: SupervisorAdmissionConfig::default(),
         evidence_only_reaudit: None,
         generated_follow_up: None,
+        review_loop_guard: None,
     };
     let mut report = injected_child_report(&plan.assignments[0]);
     report.files_changed = vec![PathBuf::from("src/a.rs")];
@@ -1198,6 +1200,7 @@ fn admitted_nested_assignment_retains_ordinary_pipeline_and_acceptance_evidence(
         admission: SupervisorAdmissionConfig::default(),
         evidence_only_reaudit: None,
         generated_follow_up: None,
+        review_loop_guard: None,
     };
     let inspections = BTreeMap::from([(
         execution.id.clone(),

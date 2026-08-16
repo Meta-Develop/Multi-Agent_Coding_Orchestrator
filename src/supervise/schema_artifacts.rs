@@ -33,12 +33,45 @@ pub(super) fn write_supervisor_final_schema(
     write_schema(writer, relative, supervisor_final_report_schema_value())
 }
 
+pub(super) fn write_review_loop_guard_schema(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+) -> Result<()> {
+    write_schema(writer, relative, review_loop_guard_evidence_schema_value())
+}
+
+pub(super) fn write_review_loop_guard_evidence(
+    writer: &mut ArtifactRunWriter,
+    assignment_id: &str,
+    evidence: &ReviewLoopGuardEvidence,
+) -> Result<PathBuf> {
+    let relative = PathBuf::from("reports")
+        .join("review-loop-guard")
+        .join(format!("{assignment_id}.json"));
+    write_artifact_json(
+        writer,
+        &relative,
+        evidence,
+        MAX_REVIEW_LOOP_GUARD_EVIDENCE_BYTES,
+        ArtifactFileDisposition::PrivateEvidence,
+    )
+    .with_context(|| {
+        format!(
+            "failed to write review-loop guard evidence {}",
+            relative.display()
+        )
+    })?;
+    Ok(relative)
+}
+
 pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "SupervisorFinalReport",
         "type": "object",
-        "required": ["version", "role_economics_profile", "role_usage", "usage_complete"],
+        "required": [
+            "version", "role_economics_profile", "role_usage", "usage_complete"
+        ],
         "properties": {
             "version": {"type": "integer", "const": SUPERVISOR_SCHEMA_VERSION},
             "role_economics_profile": role_economics_profile_schema_value(),
@@ -89,7 +122,210 @@ pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
                 "type": "array",
                 "items": environment_failure_schema_value()
             },
+            "assignment_suitability_outcomes": assignment_suitability_outcomes_schema_value(),
+            "orchestrator_reports": {
+                "type": "array",
+                "maxItems": MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES,
+                "items": orchestrator_report_schema_value()
+            },
             "generated_follow_up_tasks": generated_follow_up_tasks_schema_value()
+        }
+    })
+}
+
+pub(super) fn review_loop_guard_config_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["max_low_severity", "consecutive_low_severity_cycles"],
+        "properties": {
+            "max_low_severity": {"type": "string", "enum": ["info", "warning"]},
+            "consecutive_low_severity_cycles": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_REVIEW_LOOP_GUARD_CYCLES
+            }
+        }
+    })
+}
+
+pub(super) fn review_loop_guard_evidence_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "config", "cycles", "stop_disposition", "retry_suppressed",
+            "final_validation_floor", "locked_review_accepted"
+        ],
+        "properties": {
+            "config": review_loop_guard_config_schema_value(),
+            "cycles": {
+                "type": "array",
+                "maxItems": MAX_REVIEW_LOOP_GUARD_CYCLES,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "cycle_ordinal", "low_severity", "consecutive_low_severity_cycles"
+                    ],
+                    "properties": {
+                        "cycle_ordinal": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_REVIEW_LOOP_GUARD_CYCLES
+                        },
+                        "highest_severity": {
+                            "type": ["string", "null"],
+                            "enum": ["info", "warning", "error", null]
+                        },
+                        "low_severity": {"type": "boolean"},
+                        "consecutive_low_severity_cycles": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": MAX_REVIEW_LOOP_GUARD_CYCLES
+                        }
+                    }
+                }
+            },
+            "stop_disposition": {
+                "type": "string",
+                "enum": [
+                    "threshold_not_reached", "threshold_reached_without_retry",
+                    "correction_retry_suppressed"
+                ]
+            },
+            "retry_suppressed": {"type": "boolean"},
+            "final_validation_floor": {
+                "type": "string",
+                "enum": [
+                    "passed", "missing", "failed", "licensed_dependent_failures"
+                ]
+            },
+            "locked_review_accepted": {"type": "boolean"}
+        }
+    })
+}
+
+pub(super) fn assignment_suitability_config_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "classification", "bounded_scope", "max_scope_paths",
+            "verification_path", "autonomous_completion"
+        ],
+        "allOf": [{
+            "if": {
+                "anyOf": [
+                    {"properties": {"classification": {"not": {"const": "viable"}}}},
+                    {"properties": {"bounded_scope": {"const": false}}},
+                    {"properties": {"verification_path": {"const": null}}},
+                    {"properties": {"autonomous_completion": {"const": false}}}
+                ]
+            },
+            "then": {"required": ["rationale"]}
+        }],
+        "properties": {
+            "classification": {
+                "type": "string",
+                "enum": ["viable", "unclear", "needs_decision", "duplicate", "invalid", "out_of_scope"]
+            },
+            "bounded_scope": {"type": "boolean"},
+            "max_scope_paths": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_SUPERVISOR_ASSIGNMENT_SCOPE_PATHS
+            },
+            "verification_path": {
+                "type": ["string", "null"],
+                "enum": ["supervisor_validation_floor", null]
+            },
+            "autonomous_completion": {"type": "boolean"},
+            "rationale": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_ASSIGNMENT_SUITABILITY_RATIONALE_CHARS,
+                "pattern": ASSIGNMENT_SUITABILITY_RATIONALE_PATTERN
+            }
+        }
+    })
+}
+
+fn assignment_suitability_outcomes_schema_value() -> serde_json::Value {
+    json!({
+        "type": "array",
+        "maxItems": MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES,
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "assignment_id", "assessment_source", "classification", "disposition",
+                "verification_path", "axes", "reasons"
+            ],
+            "properties": {
+                "assignment_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_SUPERVISOR_ASSIGNMENT_ID_BYTES
+                },
+                "assessment_source": {
+                    "type": "string",
+                    "enum": [
+                        "historical_compatibility_default", "explicit_assignment_authority",
+                        "generated_planner_authority",
+                        "generated_follow_up_authority"
+                    ]
+                },
+                "classification": assignment_suitability_config_schema_value()["properties"]["classification"].clone(),
+                "disposition": {"type": "string", "enum": ["admitted", "parked", "refused"]},
+                "verification_path": assignment_suitability_config_schema_value()["properties"]["verification_path"].clone(),
+                "axes": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "bounded_scope", "scope_path_count", "max_scope_paths",
+                        "within_scope_path_limit", "verification_path_declared",
+                        "autonomous_completion"
+                    ],
+                    "properties": {
+                        "bounded_scope": {"type": "boolean"},
+                        "scope_path_count": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_SUPERVISOR_ASSIGNMENT_INPUT_PATHS
+                        },
+                        "max_scope_paths": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_SUPERVISOR_ASSIGNMENT_SCOPE_PATHS
+                        },
+                        "within_scope_path_limit": {"type": "boolean"},
+                        "verification_path_declared": {"type": "boolean"},
+                        "autonomous_completion": {"type": "boolean"}
+                    }
+                },
+                "reasons": {
+                    "type": "array",
+                    "maxItems": MAX_ASSIGNMENT_SUITABILITY_REASONS,
+                    "uniqueItems": true,
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "classification_unclear", "classification_needs_decision",
+                            "classification_duplicate", "classification_invalid",
+                            "classification_out_of_scope", "scope_not_bounded",
+                            "verification_path_missing", "autonomous_completion_not_viable",
+                            "ancestor_not_admitted"
+                        ]
+                    }
+                },
+                "rationale": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_ASSIGNMENT_SUITABILITY_RATIONALE_CHARS,
+                    "pattern": ASSIGNMENT_SUITABILITY_RATIONALE_PATTERN
+                }
+            }
         }
     })
 }

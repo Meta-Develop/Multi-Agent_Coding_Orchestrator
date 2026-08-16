@@ -6,7 +6,10 @@ use crate::{
         state_auth::{random_identifier, AuthenticationDomain, RepositoryAuthBinding},
         ArtifactRetentionFamily, ArtifactRetentionPolicy, RunArtifactPruneReport,
     },
-    authenticated_snapshot::{AuthenticatedSnapshot, AuthenticatedSnapshotStore, SnapshotSpec},
+    authenticated_snapshot::{
+        AuthenticatedSnapshot, AuthenticatedSnapshotStore, ExistingAuthenticatedSnapshot,
+        SnapshotSpec,
+    },
     gate_denial::GateDenial,
     machine_global::{
         DestructiveTargetInput, GateOutcome, MachineGlobalRetentionBinding, MachineGlobalStore,
@@ -27,8 +30,8 @@ use crate::{
     },
     state_journal::JournalSpec,
     state_migration::{
-        finalize_legacy_retirement, prepare_legacy_retirement, LegacyAdoption,
-        LEGACY_RETIREMENT_DOMAIN,
+        finalize_legacy_retirement, prepare_legacy_retirement,
+        verify_existing_active_legacy_retirement, LegacyAdoption, LEGACY_RETIREMENT_DOMAIN,
     },
     sync_store::{LockedClaimsSnapshot, SyncStore},
 };
@@ -46,6 +49,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use thiserror::Error;
 
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -823,6 +827,180 @@ impl ManagedWorktreeWriteLease {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ExistingWorktreeBindingRequest<'a> {
+    pub agent_id: String,
+    pub lease: &'a ManagedWorktreeWriteLease,
+    pub expected_record: WorktreeRecord,
+    pub expected_head_oid: Oid,
+    pub expected_ref_oid: Oid,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExistingWorktreeHeadExpectation {
+    pub agent_id: String,
+    pub head_oid: Oid,
+    pub ref_oid: Oid,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ExistingWorktreeRevalidationError {
+    #[error("existing authenticated managed-worktree state is unavailable or invalid")]
+    StateUnavailable {
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error("existing managed-worktree registry lock is busy")]
+    RegistryBusy,
+    #[error("existing managed-worktree registry lock is missing")]
+    RegistryLockMissing,
+    #[error("managed-worktree revalidation request count exceeds the {limit} entry bound")]
+    RequestLimit { limit: usize },
+    #[error("managed-worktree registry has pending {kind} operation '{name}' in phase '{phase}'")]
+    PendingOperation {
+        name: String,
+        kind: String,
+        phase: String,
+    },
+    #[error("write lease for agent '{agent_id}' belongs to a different repository or record")]
+    LeaseAuthorityMismatch { agent_id: String },
+    #[error("write lease for agent '{agent_id}' is not the current exclusive incarnation")]
+    LeaseIncarnationMismatch { agent_id: String },
+    #[error("managed worktree binding for agent '{agent_id}' is unavailable or invalid")]
+    BindingInvalid {
+        agent_id: String,
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error("managed worktree record mismatch for agent '{agent_id}'")]
+    RecordMismatch { agent_id: String },
+    #[error("managed worktree HEAD is detached for agent '{agent_id}'")]
+    DetachedHead { agent_id: String },
+    #[error("managed worktree branch mismatch for agent '{agent_id}': expected '{expected}', found '{actual}'")]
+    WrongBranch {
+        agent_id: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("managed worktree HEAD OID mismatch for agent '{agent_id}': expected {expected}, found {actual}")]
+    HeadOidMismatch {
+        agent_id: String,
+        expected: Oid,
+        actual: Oid,
+    },
+    #[error("managed worktree ref OID mismatch for agent '{agent_id}': expected {expected}, found {actual}")]
+    RefOidMismatch {
+        agent_id: String,
+        expected: Oid,
+        actual: Oid,
+    },
+    #[error("authenticated managed-worktree state changed while its guard was held")]
+    StateChanged,
+    #[error("managed-worktree end expectation set does not match its guarded batch")]
+    ExpectationMismatch,
+}
+
+#[must_use = "the managed-worktree guard must be retained for the protected operation"]
+#[derive(Debug)]
+pub(crate) struct ExistingManagedWorktreeGuard<'a> {
+    store: ManagedWorktreeRegistryStore,
+    lock: ManagedWorktreeRegistryLock,
+    authenticated: AuthenticatedManagedState,
+    requests: Vec<ExistingWorktreeBindingRequest<'a>>,
+}
+
+impl ExistingManagedWorktreeGuard<'_> {
+    pub(crate) fn verify(&self) -> std::result::Result<(), ExistingWorktreeRevalidationError> {
+        let expectations = self
+            .requests
+            .iter()
+            .map(|request| ExistingWorktreeHeadExpectation {
+                agent_id: request.agent_id.clone(),
+                head_oid: request.expected_head_oid,
+                ref_oid: request.expected_ref_oid,
+            })
+            .collect::<Vec<_>>();
+        self.verify_with_heads(&expectations)
+    }
+
+    pub(crate) fn verify_with_heads(
+        &self,
+        expectations: &[ExistingWorktreeHeadExpectation],
+    ) -> std::result::Result<(), ExistingWorktreeRevalidationError> {
+        if expectations.len() != self.requests.len() {
+            return Err(ExistingWorktreeRevalidationError::ExpectationMismatch);
+        }
+        let by_agent = expectations
+            .iter()
+            .map(|expectation| (expectation.agent_id.as_str(), expectation))
+            .collect::<BTreeMap<_, _>>();
+        if by_agent.len() != expectations.len() {
+            return Err(ExistingWorktreeRevalidationError::ExpectationMismatch);
+        }
+        let authenticated = self
+            .store
+            .load_existing_authenticated_state(&self.lock)
+            .map_err(|source| ExistingWorktreeRevalidationError::StateUnavailable { source })?;
+        if authenticated != self.authenticated {
+            return Err(ExistingWorktreeRevalidationError::StateChanged);
+        }
+        reject_pending_managed_operation(&authenticated.registry)?;
+        for request in &self.requests {
+            let expectation = by_agent
+                .get(request.agent_id.as_str())
+                .ok_or(ExistingWorktreeRevalidationError::ExpectationMismatch)?;
+            verify_existing_worktree_request(
+                &self.store,
+                &self.lock,
+                &authenticated,
+                request,
+                expectation.head_oid,
+                expectation.ref_oid,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Revalidates one member of a retained batch at its original HEAD.
+    ///
+    /// Parallel worker commands may advance their own branches after their
+    /// literal pre-spawn check. A later sibling must still authenticate the
+    /// retained registry state, but must not reject merely because that
+    /// already-started sibling advanced its branch. The full batch is rebound
+    /// to all resulting HEADs after every child has joined.
+    pub(crate) fn verify_agent(
+        &self,
+        agent_id: &str,
+    ) -> std::result::Result<(), ExistingWorktreeRevalidationError> {
+        let mut matching = self
+            .requests
+            .iter()
+            .filter(|request| request.agent_id == agent_id);
+        let request = matching
+            .next()
+            .ok_or(ExistingWorktreeRevalidationError::ExpectationMismatch)?;
+        if matching.next().is_some() {
+            return Err(ExistingWorktreeRevalidationError::ExpectationMismatch);
+        }
+        let authenticated = self
+            .store
+            .load_existing_authenticated_state(&self.lock)
+            .map_err(|source| ExistingWorktreeRevalidationError::StateUnavailable { source })?;
+        if authenticated != self.authenticated {
+            return Err(ExistingWorktreeRevalidationError::StateChanged);
+        }
+        reject_pending_managed_operation(&authenticated.registry)?;
+        verify_existing_worktree_request(
+            &self.store,
+            &self.lock,
+            &authenticated,
+            request,
+            request.expected_head_oid,
+            request.expected_ref_oid,
+        )
+    }
+}
+
 /// Removal owns a distinct capability so a write lease cannot be mistaken for
 /// durable removal intent during crash recovery.
 #[derive(Debug)]
@@ -1428,6 +1606,7 @@ mod persisted_optional_path {
     }
 }
 
+#[derive(Debug)]
 struct ManagedWorktreeRegistryStore {
     repo_path: PathBuf,
     state_root: SafeRoot,
@@ -3144,6 +3323,52 @@ impl WorktreeManager {
             repository: registry_store.repository.clone(),
             _lock: lock,
             _process_lease: process_lease,
+        })
+    }
+
+    /// Revalidates a bounded batch of already-held exclusive write leases using
+    /// only existing authenticated state. The returned guard retains the one
+    /// global managed registry lock, so cooperative lifecycle operations cannot
+    /// change an incarnation, record, or pending-operation set until the
+    /// caller's mutation/collection boundary is complete.
+    pub(crate) fn revalidate_existing_write_leases<'a>(
+        &self,
+        requests: Vec<ExistingWorktreeBindingRequest<'a>>,
+    ) -> std::result::Result<ExistingManagedWorktreeGuard<'a>, ExistingWorktreeRevalidationError>
+    {
+        if requests.is_empty() || requests.len() > MAX_MANAGED_RECORDS {
+            return Err(ExistingWorktreeRevalidationError::RequestLimit {
+                limit: MAX_MANAGED_RECORDS,
+            });
+        }
+        let repo = self
+            .open_repository()
+            .map_err(|source| ExistingWorktreeRevalidationError::StateUnavailable { source })?;
+        let store = ManagedWorktreeRegistryStore::open_existing(&repo)
+            .map_err(|source| ExistingWorktreeRevalidationError::StateUnavailable { source })?
+            .ok_or_else(|| ExistingWorktreeRevalidationError::StateUnavailable {
+                source: anyhow::anyhow!("authenticated managed-worktree state is absent"),
+            })?;
+        let lock = store.lock_existing_for_revalidation()?;
+        let authenticated = store
+            .load_existing_authenticated_state(&lock)
+            .map_err(|source| ExistingWorktreeRevalidationError::StateUnavailable { source })?;
+        reject_pending_managed_operation(&authenticated.registry)?;
+        for request in &requests {
+            verify_existing_worktree_request(
+                &store,
+                &lock,
+                &authenticated,
+                request,
+                request.expected_head_oid,
+                request.expected_ref_oid,
+            )?;
+        }
+        Ok(ExistingManagedWorktreeGuard {
+            store,
+            lock,
+            authenticated,
+            requests,
         })
     }
 
@@ -7422,6 +7647,196 @@ struct VerifiedManagedWorktree {
     branch_oid: Oid,
 }
 
+fn reject_pending_managed_operation(
+    registry: &ManagedWorktreeRegistry,
+) -> std::result::Result<(), ExistingWorktreeRevalidationError> {
+    if let Some(operation) = registry.operations.values().next() {
+        return Err(ExistingWorktreeRevalidationError::PendingOperation {
+            name: operation.name.clone(),
+            kind: managed_operation_kind_label(operation.kind).to_string(),
+            phase: managed_operation_phase_label(operation.phase).to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn verify_existing_worktree_request(
+    store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
+    authenticated: &AuthenticatedManagedState,
+    request: &ExistingWorktreeBindingRequest<'_>,
+    expected_head_oid: Oid,
+    expected_ref_oid: Oid,
+) -> std::result::Result<(), ExistingWorktreeRevalidationError> {
+    let name = normalize_agent_id(&request.agent_id).map_err(|source| {
+        ExistingWorktreeRevalidationError::BindingInvalid {
+            agent_id: request.agent_id.clone(),
+            source,
+        }
+    })?;
+    if request.lease.record.name != name
+        || request.lease.record != request.expected_record
+        || request.lease.repository != store.repository
+    {
+        return Err(ExistingWorktreeRevalidationError::LeaseAuthorityMismatch {
+            agent_id: request.agent_id.clone(),
+        });
+    }
+    store
+        .verify_lock(lock)
+        .map_err(|source| ExistingWorktreeRevalidationError::StateUnavailable { source })?;
+    let incarnation = authenticated
+        .incarnations
+        .get(&name)
+        .filter(|incarnation| incarnation.active)
+        .ok_or_else(
+            || ExistingWorktreeRevalidationError::LeaseIncarnationMismatch {
+                agent_id: request.agent_id.clone(),
+            },
+        )?;
+    let lease_name = managed_worktree_lease_name(&name, incarnation)
+        .map_err(|source| ExistingWorktreeRevalidationError::StateUnavailable { source })?;
+    let lease_path = store
+        .state_root
+        .direct_child(&lease_name)
+        .map_err(|source| ExistingWorktreeRevalidationError::StateUnavailable { source })?;
+    if request.lease._process_lease.kind != ManagedProcessLeaseKind::Exclusive
+        || request.lease._process_lease.key != lease_name
+        || request.lease._lock.path() != lease_path
+    {
+        return Err(
+            ExistingWorktreeRevalidationError::LeaseIncarnationMismatch {
+                agent_id: request.agent_id.clone(),
+            },
+        );
+    }
+    request
+        .lease
+        ._lock
+        .verify_direct_binding(&store.state_root)
+        .map_err(
+            |_| ExistingWorktreeRevalidationError::LeaseIncarnationMismatch {
+                agent_id: request.agent_id.clone(),
+            },
+        )?;
+
+    let binding = authenticated.registry.records.get(&name).ok_or_else(|| {
+        ExistingWorktreeRevalidationError::BindingInvalid {
+            agent_id: request.agent_id.clone(),
+            source: anyhow::anyhow!("managed worktree has no authenticated record"),
+        }
+    })?;
+    inspect_expected_worktree_head(
+        &request.expected_record.path,
+        &request.agent_id,
+        &request.expected_record.branch,
+        expected_head_oid,
+        expected_ref_oid,
+    )?;
+    let record = verified_worktree_record(
+        &crate::git_repository::open(&store.repo_path).map_err(|source| {
+            ExistingWorktreeRevalidationError::BindingInvalid {
+                agent_id: request.agent_id.clone(),
+                source: source.into(),
+            }
+        })?,
+        &store.repository,
+        binding,
+    )
+    .map_err(|source| ExistingWorktreeRevalidationError::BindingInvalid {
+        agent_id: request.agent_id.clone(),
+        source,
+    })?;
+    if record != request.expected_record {
+        return Err(ExistingWorktreeRevalidationError::RecordMismatch {
+            agent_id: request.agent_id.clone(),
+        });
+    }
+    inspect_expected_worktree_head(
+        &record.path,
+        &request.agent_id,
+        &record.branch,
+        expected_head_oid,
+        expected_ref_oid,
+    )
+}
+
+fn inspect_expected_worktree_head(
+    path: &Path,
+    agent_id: &str,
+    branch: &str,
+    expected_head_oid: Oid,
+    expected_ref_oid: Oid,
+) -> std::result::Result<(), ExistingWorktreeRevalidationError> {
+    let repository = crate::git_repository::open(path).map_err(|source| {
+        ExistingWorktreeRevalidationError::BindingInvalid {
+            agent_id: agent_id.to_string(),
+            source: source.into(),
+        }
+    })?;
+    let head = repository.find_reference("HEAD").map_err(|source| {
+        ExistingWorktreeRevalidationError::BindingInvalid {
+            agent_id: agent_id.to_string(),
+            source: source.into(),
+        }
+    })?;
+    let actual_ref = head.symbolic_target().map_err(|source| {
+        ExistingWorktreeRevalidationError::BindingInvalid {
+            agent_id: agent_id.to_string(),
+            source: source.into(),
+        }
+    })?;
+    let Some(actual_ref) = actual_ref else {
+        return Err(ExistingWorktreeRevalidationError::DetachedHead {
+            agent_id: agent_id.to_string(),
+        });
+    };
+    let expected_ref = format!("refs/heads/{branch}");
+    if actual_ref != expected_ref {
+        return Err(ExistingWorktreeRevalidationError::WrongBranch {
+            agent_id: agent_id.to_string(),
+            expected: expected_ref,
+            actual: actual_ref.to_string(),
+        });
+    }
+    let actual_head_oid = repository
+        .head()
+        .and_then(|head| {
+            head.target()
+                .ok_or_else(|| git2::Error::from_str("worktree HEAD has no direct target"))
+        })
+        .map_err(|source| ExistingWorktreeRevalidationError::BindingInvalid {
+            agent_id: agent_id.to_string(),
+            source: source.into(),
+        })?;
+    if actual_head_oid != expected_head_oid {
+        return Err(ExistingWorktreeRevalidationError::HeadOidMismatch {
+            agent_id: agent_id.to_string(),
+            expected: expected_head_oid,
+            actual: actual_head_oid,
+        });
+    }
+    let actual_ref_oid = repository
+        .find_reference(&expected_ref)
+        .and_then(|reference| {
+            reference
+                .target()
+                .ok_or_else(|| git2::Error::from_str("managed branch ref has no direct target"))
+        })
+        .map_err(|source| ExistingWorktreeRevalidationError::BindingInvalid {
+            agent_id: agent_id.to_string(),
+            source: source.into(),
+        })?;
+    if actual_ref_oid != expected_ref_oid {
+        return Err(ExistingWorktreeRevalidationError::RefOidMismatch {
+            agent_id: agent_id.to_string(),
+            expected: expected_ref_oid,
+            actual: actual_ref_oid,
+        });
+    }
+    Ok(())
+}
+
 fn verified_worktree_record(
     repo: &Repository,
     repository: &ManagedRepositoryBinding,
@@ -7497,6 +7912,8 @@ impl ManagedWorktreeRegistryStore {
     }
 
     fn lock(&self) -> Result<ManagedWorktreeRegistryLock> {
+        #[cfg(test)]
+        reject_neutered_managed_registry_mutation()?;
         let lock = KernelStateLock::acquire_direct(&self.state_root, "managed_worktrees.lock")?;
         let bound = ManagedWorktreeRegistryLock {
             root_identity: self.state_root.identity().clone(),
@@ -7529,6 +7946,33 @@ impl ManagedWorktreeRegistryStore {
         Ok(bound)
     }
 
+    fn lock_existing_for_revalidation(
+        &self,
+    ) -> std::result::Result<ManagedWorktreeRegistryLock, ExistingWorktreeRevalidationError> {
+        let lock = match KernelStateLock::try_acquire_existing_exclusive_direct(
+            &self.state_root,
+            "managed_worktrees.lock",
+        )
+        .map_err(|source| ExistingWorktreeRevalidationError::StateUnavailable { source })?
+        {
+            ExistingExclusiveLock::Acquired(lock) => lock,
+            ExistingExclusiveLock::Busy => {
+                return Err(ExistingWorktreeRevalidationError::RegistryBusy)
+            }
+            ExistingExclusiveLock::Missing => {
+                return Err(ExistingWorktreeRevalidationError::RegistryLockMissing)
+            }
+        };
+        let bound = ManagedWorktreeRegistryLock {
+            root_identity: self.state_root.identity().clone(),
+            lock_identity: lock.identity().clone(),
+            lock,
+        };
+        self.verify_lock(&bound)
+            .map_err(|source| ExistingWorktreeRevalidationError::StateUnavailable { source })?;
+        Ok(bound)
+    }
+
     fn load_existing_read_only(&self) -> Result<Option<ManagedWorktreeRegistry>> {
         if !self
             .state_root
@@ -7543,15 +7987,45 @@ impl ManagedWorktreeRegistryStore {
             return Ok(None);
         }
         let lock = self.lock_existing()?;
+        Ok(Some(
+            self.load_existing_authenticated_state(&lock)?.registry,
+        ))
+    }
+
+    fn load_existing_authenticated_state(
+        &self,
+        lock: &ManagedWorktreeRegistryLock,
+    ) -> Result<AuthenticatedManagedState> {
+        self.verify_lock(lock)?;
+        if !self
+            .state_root
+            .direct_child_exists(ManagedSnapshotSpec::ROOT_NAME)?
+        {
+            if self
+                .state_root
+                .direct_child_exists("managed_worktrees.json")?
+            {
+                bail!(
+                    "legacy managed worktree state requires explicit migration before read-only inspection"
+                );
+            }
+            bail!("authenticated managed worktree snapshot is absent");
+        }
         let authenticator = repository_authenticator_key_only(&self.repo_path)?;
-        let auth_binding = authenticator.binding().clone();
-        let snapshot = AuthenticatedSnapshotStore::<
-            ManagedSnapshotSpec,
-            AuthenticatedManagedState,
-        >::read_existing_current(authenticator, MANAGED_LOGICAL_ID)?;
-        self.validate_authenticated_snapshot(&snapshot, &auth_binding)?;
-        self.verify_lock(&lock)?;
-        Ok(Some(snapshot.value.registry))
+        let existing: ExistingAuthenticatedSnapshot<AuthenticatedManagedState> =
+            AuthenticatedSnapshotStore::<ManagedSnapshotSpec, AuthenticatedManagedState>::
+                read_existing_current_with_identity(authenticator, MANAGED_LOGICAL_ID)?;
+        self.validate_authenticated_snapshot(&existing.snapshot, &existing.identity.repository)?;
+        verify_existing_active_legacy_retirement::<ManagedSnapshotSpec>(
+            &self.repo_path,
+            "managed_worktrees",
+            "managed_worktrees.json",
+            LEGACY_RETIREMENT_DOMAIN,
+            &existing.identity,
+            existing.snapshot.generation,
+        )?;
+        self.verify_lock(lock)?;
+        Ok(existing.snapshot.value)
     }
 
     fn try_acquire_shared_worktree_read_lock(
@@ -7979,6 +8453,34 @@ fn finish_with_registry_lock_verification<T>(
 thread_local! {
     static MANAGED_REGISTRY_AFTER_PRECHECK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static MANAGED_REGISTRY_MUTATIONS_NEUTERED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct ManagedRegistryMutationNeuter {
+    previous: bool,
+}
+
+#[cfg(test)]
+impl Drop for ManagedRegistryMutationNeuter {
+    fn drop(&mut self) {
+        MANAGED_REGISTRY_MUTATIONS_NEUTERED.with(|slot| slot.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn neuter_managed_registry_mutations() -> ManagedRegistryMutationNeuter {
+    let previous = MANAGED_REGISTRY_MUTATIONS_NEUTERED.with(|slot| slot.replace(true));
+    ManagedRegistryMutationNeuter { previous }
+}
+
+#[cfg(test)]
+fn reject_neutered_managed_registry_mutation() -> Result<()> {
+    if MANAGED_REGISTRY_MUTATIONS_NEUTERED.with(std::cell::Cell::get) {
+        bail!("managed registry mutation surface was neutered by the test")
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -11876,6 +12378,84 @@ mod tests {
     use super::*;
     use git2::{Oid, Signature};
     use tempfile::TempDir;
+
+    #[test]
+    fn issue_84_pending_registry_operation_stops_existing_only_revalidation() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        let base = commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        manager
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root.clone()),
+            })
+            .expect("create managed worker");
+        let lease = manager
+            .acquire_write_execution_lease("agent-a")
+            .expect("exclusive worker lease");
+        let root = SafeRoot::open_or_create_managed(&worktree_root).expect("managed root");
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+        let lock = store.lock().expect("registry lock");
+        let mut registry = store.load(&lock).expect("registry");
+        let pending_name = "pending-other".to_string();
+        registry.operations.insert(
+            pending_name.clone(),
+            ManagedWorktreeOperation {
+                kind: ManagedWorktreeOperationKind::Create,
+                phase: ManagedWorktreeOperationPhase::CreateIntent,
+                name: pending_name.clone(),
+                root: root.path().to_path_buf(),
+                root_identity: root.identity().clone(),
+                path: root.path().join(&pending_name),
+                prepared_path_identity: None,
+                staging_root: None,
+                staging_root_identity: None,
+                staging_path: None,
+                staged_path_identity: None,
+                staged_metadata: None,
+                branch: "maco/pending-other".to_string(),
+                base_oid: base.to_string(),
+                branch_preexisting_oid: None,
+                branch_ownership: ManagedBranchOwnership::Unknown,
+                owned_branch_oid: None,
+                binding: None,
+                delete_branch: false,
+                force: false,
+                expected_branch_oid: None,
+                gc_dirtiness_checksum: None,
+                removal_safety: None,
+                worktree_quarantine_path: None,
+                worktree_quarantine_identity: None,
+                metadata_quarantine_path: None,
+                metadata_quarantine_identity: None,
+            },
+        );
+        store.save(&lock, &mut registry).expect("save pending op");
+        drop(lock);
+        drop(store);
+        let error = manager
+            .revalidate_existing_write_leases(vec![ExistingWorktreeBindingRequest {
+                agent_id: "agent-a".to_string(),
+                lease: &lease,
+                expected_record: lease.record().clone(),
+                expected_head_oid: base,
+                expected_ref_oid: base,
+            }])
+            .expect_err("pending registry operation must stop the harness");
+        assert!(
+            matches!(
+                error,
+                ExistingWorktreeRevalidationError::PendingOperation { .. }
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
 
     #[cfg(unix)]
     #[test]

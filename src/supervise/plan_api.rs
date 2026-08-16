@@ -11,6 +11,13 @@ fn validate_execution_target_pre_dispatch(
     )
 }
 
+/// Returns only the executable plan model.
+///
+/// Assignment suitability provenance, review-loop guard configuration, and
+/// other document sidecar metadata are intentionally not represented by
+/// [`SupervisorPlan`]. Call
+/// [`supervisor_plan_document_from_task_file`] when that metadata must survive
+/// a parse/normalize round trip.
 pub fn supervisor_plan_from_task_file(
     repo: impl AsRef<Path>,
     task_file: impl AsRef<Path>,
@@ -18,6 +25,12 @@ pub fn supervisor_plan_from_task_file(
     Ok(supervisor_plan_and_consultant_from_task_file(repo, task_file)?.plan)
 }
 
+/// Returns only the executable plan model.
+///
+/// Generated suitability provenance, review-loop guard configuration, and
+/// other document sidecar metadata are intentionally omitted. Use
+/// [`supervisor_plan_document_from_goal_spec`] for a normalized document that
+/// preserves them.
 pub fn supervisor_plan_from_goal_spec(
     repo: impl AsRef<Path>,
     goal: &str,
@@ -146,6 +159,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
             depth: MIN_SUPERVISOR_DEPTH,
             flattened_index: planning_index,
         });
+        insert_generated_planner_suitability(&mut assignment_metadata, planning_id.clone());
 
         spec_fragment_ids_by_assignment
             .insert(assignment.id.clone(), assignment.fragment_ids.clone());
@@ -163,6 +177,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
             (assignment.id.clone(), worker.id.clone()),
             WorkerAssignmentMetadata::default(),
         );
+        insert_generated_planner_suitability(&mut assignment_metadata, assignment.id.clone());
         let execution_index = assignments.len();
         assignments.push(OrchestratorAssignment {
             id: assignment.id.clone(),
@@ -217,6 +232,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
         admission: SupervisorAdmissionConfig::default(),
         evidence_only_reaudit: None,
         generated_follow_up: None,
+        review_loop_guard: None,
     };
     let (plan, plan_metadata) = validate_supervisor_plan(plan, metadata)?;
     Ok(LoadedSupervisorPlan {
@@ -227,6 +243,25 @@ fn supervisor_plan_and_consultant_from_goal_spec(
     })
 }
 
+pub(super) fn insert_generated_planner_suitability(
+    assignment_metadata: &mut AssignmentMetadata,
+    assignment_id: String,
+) {
+    assignment_metadata.insert_suitability(
+        assignment_id,
+        AssignmentSuitabilityConfig::default(),
+        AssignmentSuitabilityAssessmentSource::GeneratedPlannerAuthority,
+    );
+}
+
+/// Loads only the executable plan model from a plan document.
+///
+/// This historical API has a deliberately lossy compatibility boundary:
+/// assignment-local suitability declarations, their descriptive provenance,
+/// and review-loop guard configuration live in validated document sidecar
+/// metadata. Execution entrypoints use the complete internal document loader;
+/// callers that need normalized metadata should use
+/// [`supervisor_plan_document_from_task_file`].
 pub fn load_supervisor_plan_file(path: impl AsRef<Path>) -> Result<SupervisorPlan> {
     Ok(load_supervisor_plan_file_with_consultant(path)?.plan)
 }
@@ -284,7 +319,17 @@ pub(crate) fn validate_generated_follow_up_plan_document(
         .context("generated follow-up plan failed the ordinary full-document loader")?;
     if loaded.plan != generated.ordinary_plan()
         || loaded.consultant != generated.consultant
+        || loaded.assignment_metadata.suitability != generated.effective_assignment_suitability()
+        || loaded
+            .assignment_metadata
+            .suitability_sources
+            .values()
+            .any(|source| {
+                *source != AssignmentSuitabilityAssessmentSource::GeneratedFollowUpAuthority
+            })
         || loaded.plan_metadata.assignment_schedule != generated.assignment_schedule
+        || loaded.plan_metadata.review_loop_guard
+            != generated_follow_up_review_loop_guard(&generated.generated_follow_up)?
         || loaded.plan_metadata.run_budget != generated.run_budget
         || loaded.plan_metadata.generated_follow_up != Some(generated.generated_follow_up.clone())
         || !loaded.plan_metadata.spec_fragment_ids.is_empty()
@@ -388,6 +433,25 @@ fn supervisor_plan_metadata_from_value(
                 .context("execution_target is invalid")
         })
         .transpose()?;
+    let explicit_review_loop_guard = value
+        .get("review_loop_guard")
+        .map(|guard| {
+            serde_json::from_value::<ReviewLoopGuardConfig>(guard.clone())
+                .context("review_loop_guard is invalid")
+        })
+        .transpose()?;
+    let generated_review_loop_guard = generated_follow_up
+        .as_ref()
+        .map(generated_follow_up_review_loop_guard)
+        .transpose()?
+        .flatten();
+    if explicit_review_loop_guard.is_some()
+        && generated_review_loop_guard.is_some()
+        && explicit_review_loop_guard != generated_review_loop_guard
+    {
+        bail!("generated follow-up review_loop_guard differs from its reserved operator defaults");
+    }
+    let review_loop_guard = explicit_review_loop_guard.or(generated_review_loop_guard);
     let raw_assignments = value
         .get("assignments")
         .and_then(Value::as_array)
@@ -400,6 +464,7 @@ fn supervisor_plan_metadata_from_value(
         evidence_only_reaudit,
         generated_follow_up,
         execution_target,
+        review_loop_guard,
         ..SupervisorPlanMetadata::default()
     };
     collect_assignment_plan_metadata(
@@ -642,13 +707,43 @@ fn assignment_metadata_from_plan_value(
         None => &[],
     };
     let mut metadata_by_worker = AssignmentMetadata::new();
+    if value.get("assignment_suitability").is_some() {
+        bail!("top-level assignment_suitability is unsupported; configure each assignment.suitability explicitly");
+    }
+    let generated_by_construction = value.get("generated_follow_up").is_some();
     let assignments_by_id = plan
         .assignments
         .iter()
         .map(|assignment| (assignment.id.as_str(), assignment))
         .collect::<BTreeMap<_, _>>();
     for raw_assignment in raw_assignments {
-        collect_assignment_metadata(raw_assignment, &assignments_by_id, &mut metadata_by_worker)?;
+        collect_assignment_metadata(
+            raw_assignment,
+            &assignments_by_id,
+            generated_by_construction,
+            &mut metadata_by_worker,
+        )?;
+    }
+    let expected_ids = plan
+        .assignments
+        .iter()
+        .map(|assignment| assignment.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let suitability_ids = metadata_by_worker
+        .suitability
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if suitability_ids != expected_ids {
+        bail!("assignment suitability must cover every normalized assignment exactly once");
+    }
+    let suitability_source_ids = metadata_by_worker
+        .suitability_sources
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if suitability_source_ids != expected_ids {
+        bail!("assignment suitability sources must cover every normalized assignment exactly once");
     }
     Ok(metadata_by_worker)
 }
@@ -656,6 +751,7 @@ fn assignment_metadata_from_plan_value(
 fn collect_assignment_metadata(
     raw_assignment: &Value,
     assignments_by_id: &BTreeMap<&str, &OrchestratorAssignment>,
+    generated_by_construction: bool,
     metadata_by_worker: &mut AssignmentMetadata,
 ) -> Result<()> {
     let raw_id = raw_assignment
@@ -665,6 +761,69 @@ fn collect_assignment_metadata(
         .trim();
     let assignment = assignments_by_id.get(raw_id).copied();
     if let Some(assignment) = assignment {
+        let declared_source = raw_assignment
+            .get("suitability_assessment_source")
+            .map(|source| {
+                serde_json::from_value::<AssignmentSuitabilityAssessmentSource>(source.clone())
+                    .with_context(|| {
+                        format!(
+                            "assignment '{}' suitability_assessment_source is invalid",
+                            assignment.id
+                        )
+                    })
+            })
+            .transpose()?;
+        let nested_suitability = raw_assignment
+            .get("suitability")
+            .map(|suitability| {
+                serde_json::from_value::<AssignmentSuitabilityConfig>(suitability.clone())
+                    .with_context(|| {
+                        format!("assignment '{}' suitability is invalid", assignment.id)
+                    })
+            })
+            .transpose()?;
+        let (suitability, suitability_source) = if let Some(suitability) = nested_suitability {
+            if declared_source.is_some() {
+                bail!(
+                    "assignment '{}' cannot combine explicit suitability with suitability_assessment_source",
+                    assignment.id
+                );
+            }
+            (
+                suitability,
+                AssignmentSuitabilityAssessmentSource::ExplicitAssignmentAuthority,
+            )
+        } else if generated_by_construction {
+            if declared_source.is_some() {
+                bail!(
+                    "generated follow-up assignment '{}' cannot override its construction-derived suitability source",
+                    assignment.id
+                );
+            }
+            (
+                AssignmentSuitabilityConfig::default(),
+                AssignmentSuitabilityAssessmentSource::GeneratedFollowUpAuthority,
+            )
+        } else if let Some(source) = declared_source {
+            if source != AssignmentSuitabilityAssessmentSource::GeneratedPlannerAuthority {
+                bail!(
+                    "assignment '{}' may declare only generated_planner_authority without an explicit suitability object",
+                    assignment.id
+                );
+            }
+            (AssignmentSuitabilityConfig::default(), source)
+        } else {
+            (
+                AssignmentSuitabilityConfig::default(),
+                AssignmentSuitabilityAssessmentSource::HistoricalCompatibilityDefault,
+            )
+        };
+        suitability.validate(&assignment.id)?;
+        metadata_by_worker.insert_suitability(
+            assignment.id.clone(),
+            suitability,
+            suitability_source,
+        );
         if let Some(effort) = raw_assignment.get("reasoning_effort") {
             let effort =
                 serde_json::from_value::<ReasoningEffort>(effort.clone()).with_context(|| {
@@ -749,7 +908,12 @@ fn collect_assignment_metadata(
         .map(Vec::as_slice)
         .unwrap_or_default()
     {
-        collect_assignment_metadata(child, assignments_by_id, metadata_by_worker)?;
+        collect_assignment_metadata(
+            child,
+            assignments_by_id,
+            generated_by_construction,
+            metadata_by_worker,
+        )?;
     }
     Ok(())
 }
@@ -767,6 +931,32 @@ pub(super) fn supervisor_plan_value(
         .and_then(Value::as_array_mut)
         .context("normalized supervisor plan assignments did not serialize to an array")?;
     for (assignment_value, assignment) in assignments.iter_mut().zip(&plan.assignments) {
+        match assignment_metadata.suitability_source(&assignment.id) {
+            AssignmentSuitabilityAssessmentSource::HistoricalCompatibilityDefault => {}
+            AssignmentSuitabilityAssessmentSource::ExplicitAssignmentAuthority => {
+                assignment_value
+                    .as_object_mut()
+                    .context("normalized assignment did not serialize to an object")?
+                    .insert(
+                        "suitability".to_string(),
+                        serde_json::to_value(assignment_metadata.suitability(&assignment.id))
+                            .context("failed to serialize assignment suitability")?,
+                    );
+            }
+            AssignmentSuitabilityAssessmentSource::GeneratedPlannerAuthority => {
+                assignment_value
+                    .as_object_mut()
+                    .context("normalized assignment did not serialize to an object")?
+                    .insert(
+                        "suitability_assessment_source".to_string(),
+                        serde_json::to_value(
+                            AssignmentSuitabilityAssessmentSource::GeneratedPlannerAuthority,
+                        )
+                        .context("failed to serialize generated planner suitability source")?,
+                    );
+            }
+            AssignmentSuitabilityAssessmentSource::GeneratedFollowUpAuthority => {}
+        }
         if let Some(effort) = assignment_metadata.reasoning_effort(&assignment.id) {
             assignment_value
                 .as_object_mut()
@@ -857,6 +1047,13 @@ pub(super) fn supervisor_plan_value(
             "execution_target".to_string(),
             serde_json::to_value(execution_target)
                 .context("failed to serialize execution_target plan field")?,
+        );
+    }
+    if let Some(review_loop_guard) = plan_metadata.review_loop_guard {
+        object.insert(
+            "review_loop_guard".to_string(),
+            serde_json::to_value(review_loop_guard)
+                .context("failed to serialize review_loop_guard plan field")?,
         );
     }
     if let Some(operation) = &plan_metadata.evidence_only_reaudit {
@@ -1006,21 +1203,29 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_work
     let repo = discover_repo_root(&options.repo)?;
     let loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
     validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
-    let manager = WorktreeManager::new(&repo);
-    let cleanliness = manager.acquire_repository_cleanliness()?;
     let source_loaded = loaded.clone();
     let template = options.clone();
-    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
-    let source_report = run_supervisor_plan_with_runner_and_creation(
-        loaded,
-        options,
-        max_concurrent_children,
-        SupervisorExecutionRuntime::Verified,
-        SupervisorWorktreeCreation::Bound(&cleanliness),
-        runtime_model_catalog,
-        &run_external_agent_cancellable_reviewed,
-    )?;
-    drop(cleanliness);
+    let source_report = if supervisor_plan_is_wholly_non_admitted(&loaded)? {
+        finalize_wholly_non_admitted_supervisor_plan(
+            loaded,
+            options,
+            max_concurrent_children,
+            &run_external_agent_cancellable_reviewed,
+        )?
+    } else {
+        let manager = WorktreeManager::new(&repo);
+        let cleanliness = manager.acquire_repository_cleanliness()?;
+        let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
+        run_supervisor_plan_with_runner_and_creation(
+            loaded,
+            options,
+            max_concurrent_children,
+            SupervisorExecutionRuntime::Verified,
+            SupervisorWorktreeCreation::Bound(&cleanliness),
+            runtime_model_catalog,
+            &run_external_agent_cancellable_reviewed,
+        )?
+    };
     let mut permit = |_plan: &SupervisorPlan| Ok(None);
     let cancellation_observed = AtomicBool::new(false);
     run_generated_follow_up_cascade(
@@ -1205,14 +1410,22 @@ fn run_supervisor_plan_file_cascade_with_gate(
     }
     let source_loaded = loaded.clone();
     let template = options.clone();
-    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
-    if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
-        bail!("autopilot caller cancelled after runtime catalog resolution before exact loaded-plan dispatch");
-    }
-    if let Some(source_dispatch_started) = source_dispatch_started {
-        source_dispatch_started.store(true, Ordering::SeqCst);
-    }
-    let source_report = if source_loaded.plan_metadata.execution_target.is_some() {
+    let wholly_non_admitted = supervisor_plan_is_wholly_non_admitted(&loaded)?;
+    let source_report = if wholly_non_admitted {
+        finalize_wholly_non_admitted_supervisor_plan(
+            loaded,
+            options,
+            max_concurrent_children,
+            external_runner,
+        )?
+    } else if source_loaded.plan_metadata.execution_target.is_some() {
+        let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
+        if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
+            bail!("autopilot caller cancelled after runtime catalog resolution before exact loaded-plan dispatch");
+        }
+        if let Some(source_dispatch_started) = source_dispatch_started {
+            source_dispatch_started.store(true, Ordering::SeqCst);
+        }
         run_supervisor_plan_with_runner_and_creation(
             loaded,
             options,
@@ -1225,6 +1438,13 @@ fn run_supervisor_plan_file_cascade_with_gate(
     } else {
         let manager = WorktreeManager::new(&repo);
         let cleanliness = manager.acquire_repository_cleanliness()?;
+        let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
+        if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
+            bail!("autopilot caller cancelled after runtime catalog resolution before exact loaded-plan dispatch");
+        }
+        if let Some(source_dispatch_started) = source_dispatch_started {
+            source_dispatch_started.store(true, Ordering::SeqCst);
+        }
         run_supervisor_plan_with_runner_and_creation(
             loaded,
             options,
@@ -1263,6 +1483,14 @@ fn run_supervisor_goal_spec_with_max_concurrent_children(
     let repo = discover_repo_root(&options.repo)?;
     let loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
+    if supervisor_plan_is_wholly_non_admitted(&loaded)? {
+        return finalize_wholly_non_admitted_supervisor_plan(
+            loaded,
+            options,
+            max_concurrent_children,
+            &run_external_agent_cancellable_reviewed,
+        );
+    }
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
     let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
@@ -1478,6 +1706,7 @@ pub(super) fn evidence_only_reaudit_plan_from_source(
         evidence_only_reaudit: Some(operation),
         generated_follow_up: None,
         execution_target: None,
+        review_loop_guard: source_loaded.plan_metadata.review_loop_guard,
     };
     let (plan, plan_metadata) = validate_supervisor_plan(plan, plan_metadata)?;
     Ok(LoadedSupervisorPlan {
@@ -1588,10 +1817,18 @@ fn run_supervisor_plan_file_with_runner_and_max_concurrent_children(
 ) -> Result<SupervisorFinalReport> {
     validate_max_concurrent_children(max_concurrent_children)?;
     let repo = discover_repo_root(&options.repo)?;
-    let manager = WorktreeManager::new(&repo);
-    let cleanliness = manager.acquire_repository_cleanliness()?;
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
+    if supervisor_plan_is_wholly_non_admitted(&loaded)? {
+        return finalize_wholly_non_admitted_supervisor_plan(
+            loaded,
+            options,
+            max_concurrent_children,
+            external_runner,
+        );
+    }
+    let manager = WorktreeManager::new(&repo);
+    let cleanliness = manager.acquire_repository_cleanliness()?;
     let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
     run_supervisor_plan_with_runner_and_creation(
         loaded,
@@ -2005,6 +2242,7 @@ pub fn collect_supervisor_run(
         decomposition_candidates: Vec::new(),
         generated_follow_up_tasks: Vec::new(),
         assignment_traceability: Vec::new(),
+        assignment_suitability_outcomes: Vec::new(),
         coverage_gaps: Vec::new(),
         breaker_trip: None,
         orchestrator_reports: Vec::new(),

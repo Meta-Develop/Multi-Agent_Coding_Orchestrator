@@ -271,10 +271,72 @@ fn run_licensed_scenario(
 }
 
 #[test]
+fn authenticated_licensed_top_level_failure_satisfies_effective_validation_floor() {
+    let assignment = licensed_assignment();
+    let mut child = dependent_failure_child(&assignment, "src/client.rs");
+
+    prepare_licensed_breakage_review(&assignment, &mut child);
+
+    let review = child
+        .licensed_breakage_review
+        .as_ref()
+        .expect("supervisor authenticates the licensed breakage review");
+    assert!(!review.failures.is_empty());
+    assert_eq!(
+        review.declaration_sha256,
+        licensed_breakage_declaration_sha256(
+            assignment
+                .licensed_breakage
+                .as_ref()
+                .expect("licensed assignment declaration"),
+        )
+        .expect("hash licensed assignment declaration")
+    );
+    assert_eq!(child.validation_results[0].status, ReviewStatus::Failed);
+    assert_eq!(child.status, ReviewStatus::Succeeded);
+    assert!(child.accepted);
+    assert!(!child.rejected);
+    assert_eq!(
+        effective_review_loop_validation_floor(&assignment, &child),
+        ReviewLoopValidationFloor::LicensedDependentFailures
+    );
+    assert_eq!(
+        effective_validation_floor_blocker(&assignment, &child),
+        None
+    );
+
+    let evidence = ReviewLoopGuardTracker::new(ReviewLoopGuardConfig {
+        max_low_severity: ReviewLoopLowSeverity::Info,
+        consecutive_low_severity_cycles: 1,
+    })
+    .evidence(&assignment, &child);
+    assert_eq!(
+        evidence.final_validation_floor,
+        ReviewLoopValidationFloor::LicensedDependentFailures
+    );
+
+    let mut mismatched = child;
+    mismatched
+        .licensed_breakage_review
+        .as_mut()
+        .expect("authenticated licensed review")
+        .failures[0]
+        .failure_signature = "mismatched failure signature".to_string();
+    assert_eq!(
+        effective_review_loop_validation_floor(&assignment, &mismatched),
+        ReviewLoopValidationFloor::Failed
+    );
+    assert_eq!(
+        effective_validation_floor_blocker(&assignment, &mismatched),
+        Some(GateApplyBlocker::ValidationFailed)
+    );
+}
+
+#[test]
 fn declared_scoped_breakage_passes_and_journals_dispatchable_follow_up_plan() {
     let assignment = licensed_assignment();
     let child = dependent_failure_child(&assignment, "src/client.rs");
-    let scenario = run_licensed_scenario(assignment, child, true, "licensed-breakage-e2e");
+    let scenario = run_licensed_scenario(assignment.clone(), child, true, "licensed-breakage-e2e");
 
     assert!(scenario.report.success, "{:#?}", scenario.report.findings);
     assert_eq!(scenario.report.generated_follow_up_tasks.len(), 1);
@@ -324,6 +386,15 @@ fn declared_scoped_breakage_passes_and_journals_dispatchable_follow_up_plan() {
     assert_eq!(
         scenario.report.orchestrator_reports[0].status,
         ReviewStatus::Succeeded
+    );
+    let review_loop_evidence = ReviewLoopGuardTracker::new(ReviewLoopGuardConfig {
+        max_low_severity: ReviewLoopLowSeverity::Info,
+        consecutive_low_severity_cycles: 1,
+    })
+    .evidence(&assignment, &scenario.report.orchestrator_reports[0]);
+    assert_eq!(
+        review_loop_evidence.final_validation_floor,
+        ReviewLoopValidationFloor::LicensedDependentFailures
     );
     let review = scenario.report.orchestrator_reports[0]
         .licensed_breakage_review
@@ -461,10 +532,15 @@ fn generated_follow_up_plan_inherits_gate_context_and_closes_budget() {
     source_budget
         .role_token_reservations
         .insert(AgentRole::GateClassifier, 17);
+    let review_loop_guard = ReviewLoopGuardConfig {
+        max_low_severity: ReviewLoopLowSeverity::Warning,
+        consecutive_low_severity_cycles: 2,
+    };
 
     let tasks = generated_licensed_follow_up_tasks(
         &source_plan,
         &source_consultant,
+        Some(review_loop_guard),
         &source_budget,
         &assignment,
         &report,
@@ -497,6 +573,11 @@ fn generated_follow_up_plan_inherits_gate_context_and_closes_budget() {
     assert_eq!(generated.role_models, source_plan.role_models);
     assert_eq!(generated.model_pricing, source_plan.model_pricing);
     assert_eq!(generated.review_lenses, source_plan.review_lenses);
+    assert_eq!(
+        generated_follow_up_review_loop_guard(&generated.generated_follow_up)
+            .expect("decode generated review-loop guard"),
+        Some(review_loop_guard)
+    );
     assert_eq!(
         generated.review_aggregation_policy,
         source_plan.review_aggregation_policy
@@ -538,6 +619,10 @@ fn generated_follow_up_plan_inherits_gate_context_and_closes_budget() {
     );
     assert_eq!(loaded.plan.role_models, source_plan.role_models);
     assert_eq!(loaded.plan.model_pricing, source_plan.model_pricing);
+    assert_eq!(
+        loaded.plan_metadata.review_loop_guard,
+        Some(review_loop_guard)
+    );
     assert_eq!(
         loaded.plan_metadata.run_budget.limits.soft_cost_usd,
         Some(25.0)
@@ -774,6 +859,7 @@ fn strict_journal_failure_cannot_silently_swallow_generated_tasks() {
     let tasks = generated_licensed_follow_up_tasks(
         &injected_plan(assignment.clone(), 0),
         &SupervisorConsultantPlan::default(),
+        None,
         &SupervisorBudgetConfig::default(),
         &assignment,
         &report,

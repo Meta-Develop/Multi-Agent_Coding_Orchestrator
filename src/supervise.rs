@@ -234,6 +234,16 @@ const MAX_NESTED_REPOSITORY_DEPTH: usize = 32;
 const MAX_DIRECTORY_FINGERPRINT_DEPTH: usize = 256;
 const MAX_PRIMARY_WORKTREE_CLAIM_PATHS: usize = 16;
 const MAX_PRIMARY_WORKTREE_SCOPE_BYTES: usize = 1024 * 1024;
+const MAX_ASSIGNMENT_SUITABILITY_RATIONALE_CHARS: usize = 2 * 1024;
+const MAX_ASSIGNMENT_SUITABILITY_REASONS: usize = 4;
+const MAX_SUPERVISOR_ASSIGNMENT_SCOPE_PATHS: usize = 256;
+const MAX_SUPERVISOR_ASSIGNMENT_INPUT_PATHS: usize = 4096;
+const MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES: usize = 4096;
+const MAX_SUPERVISOR_ASSIGNMENT_ID_BYTES: usize = 64;
+const MAX_REVIEW_LOOP_GUARD_CYCLES: usize = MAX_GATE_CORRECTIONS_LIMIT as usize + 1;
+const MAX_REVIEW_LOOP_GUARD_EVIDENCE_BYTES: usize = 64 * 1024;
+const REVIEW_LOOP_GUARD_EVENT_VERSION: u32 = 1;
+const ASSIGNMENT_SUITABILITY_RATIONALE_PATTERN: &str = r"^[^\u0000-\u001F\u007F-\u009F\s](?:[^\u0000-\u001F\u007F-\u009F]*[^\u0000-\u001F\u007F-\u009F\s])?$";
 const BREAKER_RECOVERY_GUIDANCE: &str = "inspect the breaker window and child evidence, correct the repeated coordination failure, then start a new supervise run; pending assignments were not launched";
 const LOCAL_RUNTIME_ROOTS: &[&[u8]] = &[
     b".maco",
@@ -463,6 +473,20 @@ pub struct SupervisorPlan {
     pub review_aggregation_policy: ReviewAggregationPolicy,
     #[serde(default)]
     pub assignments: Vec<OrchestratorAssignment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewLoopLowSeverity {
+    Info,
+    Warning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewLoopGuardConfig {
+    pub max_low_severity: ReviewLoopLowSeverity,
+    pub consecutive_low_severity_cycles: u8,
 }
 
 pub(crate) fn default_supervisor_review_lenses() -> Vec<ReviewLensConfig> {
@@ -1277,10 +1301,235 @@ struct LoadedSupervisorPlan {
     plan_metadata: SupervisorPlanMetadata,
 }
 
+/// Operator-authored pre-claim classification for one supervisor assignment.
+///
+/// `duplicate` and `invalid` are triage categories only. They do not relax the
+/// ordinary structural plan validation that runs before this gate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentSuitabilityClassification {
+    #[default]
+    Viable,
+    Unclear,
+    NeedsDecision,
+    Duplicate,
+    Invalid,
+    OutOfScope,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentVerificationPath {
+    #[default]
+    SupervisorValidationFloor,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+/// Descriptive origin metadata for a suitability assessment.
+///
+/// This label preserves parse/normalize provenance; it is not an authenticated
+/// credential and does not by itself authorize assignment admission.
+pub enum AssignmentSuitabilityAssessmentSource {
+    #[default]
+    HistoricalCompatibilityDefault,
+    ExplicitAssignmentAuthority,
+    GeneratedPlannerAuthority,
+    GeneratedFollowUpAuthority,
+}
+
+/// Strict assignment-local declaration consumed by the pre-claim gate.
+///
+/// Historical plans omit this object and receive the deliberate legacy-safe
+/// default: viable, bounded, autonomously completable, and verified through
+/// the supervisor validation floor.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentSuitabilityConfig {
+    pub classification: AssignmentSuitabilityClassification,
+    pub bounded_scope: bool,
+    pub max_scope_paths: usize,
+    pub verification_path: Option<AssignmentVerificationPath>,
+    pub autonomous_completion: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+}
+
+impl Default for AssignmentSuitabilityConfig {
+    fn default() -> Self {
+        Self {
+            classification: AssignmentSuitabilityClassification::Viable,
+            bounded_scope: true,
+            max_scope_paths: MAX_SUPERVISOR_ASSIGNMENT_SCOPE_PATHS,
+            verification_path: Some(AssignmentVerificationPath::SupervisorValidationFloor),
+            autonomous_completion: true,
+            rationale: None,
+        }
+    }
+}
+
+impl AssignmentSuitabilityConfig {
+    fn validate(&self, assignment_id: &str) -> Result<()> {
+        if self.max_scope_paths == 0 || self.max_scope_paths > MAX_SUPERVISOR_ASSIGNMENT_SCOPE_PATHS
+        {
+            bail!(
+                "assignment '{assignment_id}' suitability max_scope_paths must be between 1 and {MAX_SUPERVISOR_ASSIGNMENT_SCOPE_PATHS}"
+            );
+        }
+        if let Some(rationale) = self.rationale.as_deref() {
+            if rationale.is_empty()
+                || rationale.trim() != rationale
+                || rationale.chars().count() > MAX_ASSIGNMENT_SUITABILITY_RATIONALE_CHARS
+                || rationale.chars().any(char::is_control)
+            {
+                bail!(
+                    "assignment '{assignment_id}' suitability rationale must be non-empty bounded printable text without surrounding whitespace"
+                );
+            }
+        }
+        if !self.declared_viable() && self.rationale.is_none() {
+            bail!(
+                "assignment '{assignment_id}' non-viable suitability requires a bounded rationale"
+            );
+        }
+        Ok(())
+    }
+
+    fn declared_viable(&self) -> bool {
+        self.classification == AssignmentSuitabilityClassification::Viable
+            && self.bounded_scope
+            && self.verification_path.is_some()
+            && self.autonomous_completion
+    }
+
+    fn outcome(
+        &self,
+        assignment_id: &str,
+        scope_path_count: usize,
+        assessment_source: AssignmentSuitabilityAssessmentSource,
+    ) -> AssignmentSuitabilityOutcome {
+        let within_scope_path_limit =
+            scope_path_count > 0 && scope_path_count <= self.max_scope_paths;
+        let axes = AssignmentSuitabilityAxisResults {
+            bounded_scope: self.bounded_scope,
+            scope_path_count,
+            max_scope_paths: self.max_scope_paths,
+            within_scope_path_limit,
+            verification_path_declared: self.verification_path.is_some(),
+            autonomous_completion: self.autonomous_completion,
+        };
+        let viable = self.declared_viable() && within_scope_path_limit;
+        let disposition = if viable {
+            AssignmentSuitabilityDisposition::Admitted
+        } else {
+            match self.classification {
+                AssignmentSuitabilityClassification::Duplicate
+                | AssignmentSuitabilityClassification::Invalid
+                | AssignmentSuitabilityClassification::OutOfScope => {
+                    AssignmentSuitabilityDisposition::Refused
+                }
+                AssignmentSuitabilityClassification::Viable
+                | AssignmentSuitabilityClassification::Unclear
+                | AssignmentSuitabilityClassification::NeedsDecision => {
+                    AssignmentSuitabilityDisposition::Parked
+                }
+            }
+        };
+        let mut reasons = Vec::with_capacity(MAX_ASSIGNMENT_SUITABILITY_REASONS);
+        match self.classification {
+            AssignmentSuitabilityClassification::Viable => {}
+            AssignmentSuitabilityClassification::Unclear => {
+                reasons.push(AssignmentSuitabilityReason::ClassificationUnclear)
+            }
+            AssignmentSuitabilityClassification::NeedsDecision => {
+                reasons.push(AssignmentSuitabilityReason::ClassificationNeedsDecision)
+            }
+            AssignmentSuitabilityClassification::Duplicate => {
+                reasons.push(AssignmentSuitabilityReason::ClassificationDuplicate)
+            }
+            AssignmentSuitabilityClassification::Invalid => {
+                reasons.push(AssignmentSuitabilityReason::ClassificationInvalid)
+            }
+            AssignmentSuitabilityClassification::OutOfScope => {
+                reasons.push(AssignmentSuitabilityReason::ClassificationOutOfScope)
+            }
+        }
+        if !axes.bounded_scope || !axes.within_scope_path_limit {
+            reasons.push(AssignmentSuitabilityReason::ScopeNotBounded);
+        }
+        if !axes.verification_path_declared {
+            reasons.push(AssignmentSuitabilityReason::VerificationPathMissing);
+        }
+        if !axes.autonomous_completion {
+            reasons.push(AssignmentSuitabilityReason::AutonomousCompletionNotViable);
+        }
+        AssignmentSuitabilityOutcome {
+            assignment_id: assignment_id.to_string(),
+            assessment_source,
+            classification: self.classification,
+            disposition,
+            verification_path: self.verification_path,
+            axes,
+            reasons,
+            rationale: self.rationale.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentSuitabilityDisposition {
+    Admitted,
+    Parked,
+    Refused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentSuitabilityReason {
+    ClassificationUnclear,
+    ClassificationNeedsDecision,
+    ClassificationDuplicate,
+    ClassificationInvalid,
+    ClassificationOutOfScope,
+    ScopeNotBounded,
+    VerificationPathMissing,
+    AutonomousCompletionNotViable,
+    AncestorNotAdmitted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentSuitabilityAxisResults {
+    pub bounded_scope: bool,
+    pub scope_path_count: usize,
+    pub max_scope_paths: usize,
+    pub within_scope_path_limit: bool,
+    pub verification_path_declared: bool,
+    pub autonomous_completion: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentSuitabilityOutcome {
+    pub assignment_id: String,
+    #[serde(default)]
+    pub assessment_source: AssignmentSuitabilityAssessmentSource,
+    pub classification: AssignmentSuitabilityClassification,
+    pub disposition: AssignmentSuitabilityDisposition,
+    pub verification_path: Option<AssignmentVerificationPath>,
+    pub axes: AssignmentSuitabilityAxisResults,
+    pub reasons: Vec<AssignmentSuitabilityReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AssignmentMetadata {
     workers: BTreeMap<(String, String), WorkerAssignmentMetadata>,
     reasoning_efforts: BTreeMap<String, ReasoningEffort>,
+    suitability: BTreeMap<String, AssignmentSuitabilityConfig>,
+    suitability_sources: BTreeMap<String, AssignmentSuitabilityAssessmentSource>,
 }
 
 impl AssignmentMetadata {
@@ -1312,9 +1561,37 @@ impl AssignmentMetadata {
         self.reasoning_efforts.get(assignment_id).copied()
     }
 
+    fn insert_suitability(
+        &mut self,
+        assignment_id: String,
+        suitability: AssignmentSuitabilityConfig,
+        source: AssignmentSuitabilityAssessmentSource,
+    ) -> Option<AssignmentSuitabilityConfig> {
+        self.suitability_sources
+            .insert(assignment_id.clone(), source);
+        self.suitability.insert(assignment_id, suitability)
+    }
+
+    fn suitability(&self, assignment_id: &str) -> AssignmentSuitabilityConfig {
+        self.suitability
+            .get(assignment_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn suitability_source(&self, assignment_id: &str) -> AssignmentSuitabilityAssessmentSource {
+        self.suitability_sources
+            .get(assignment_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
     fn retain_assignment(&mut self, assignment_id: &str) {
         self.workers.retain(|(owner, _), _| owner == assignment_id);
         self.reasoning_efforts
+            .retain(|owner, _| owner == assignment_id);
+        self.suitability.retain(|owner, _| owner == assignment_id);
+        self.suitability_sources
             .retain(|owner, _| owner == assignment_id);
     }
 }
@@ -1324,6 +1601,8 @@ impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMe
         Self {
             workers,
             reasoning_efforts: BTreeMap::new(),
+            suitability: BTreeMap::new(),
+            suitability_sources: BTreeMap::new(),
         }
     }
 }
@@ -1340,6 +1619,7 @@ struct SupervisorPlanMetadata {
     evidence_only_reaudit: Option<EvidenceOnlyReauditPlan>,
     generated_follow_up: Option<GeneratedFollowUpPlanContext>,
     execution_target: Option<SupervisorExecutionTarget>,
+    review_loop_guard: Option<ReviewLoopGuardConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -1509,6 +1789,18 @@ impl GeneratedFollowUpSupervisorPlan {
         self.assignments
             .first()
             .context("generated follow-up supervisor plan has no assignment")
+    }
+
+    fn effective_assignment_suitability(&self) -> BTreeMap<String, AssignmentSuitabilityConfig> {
+        self.assignments
+            .iter()
+            .map(|assignment| {
+                (
+                    assignment.id.clone(),
+                    AssignmentSuitabilityConfig::default(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -1930,6 +2222,59 @@ pub struct OrchestratorReviewReport {
     pub next_safe_action: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewLoopStopDisposition {
+    ThresholdNotReached,
+    ThresholdReachedWithoutRetry,
+    CorrectionRetrySuppressed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewLoopValidationFloor {
+    Passed,
+    Missing,
+    Failed,
+    LicensedDependentFailures,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewLoopCycleRecord {
+    pub cycle_ordinal: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highest_severity: Option<FindingSeverity>,
+    pub low_severity: bool,
+    pub consecutive_low_severity_cycles: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewLoopGuardEvidence {
+    pub config: ReviewLoopGuardConfig,
+    pub cycles: Vec<ReviewLoopCycleRecord>,
+    pub stop_disposition: ReviewLoopStopDisposition,
+    pub retry_suppressed: bool,
+    pub final_validation_floor: ReviewLoopValidationFloor,
+    pub locked_review_accepted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+enum ReviewLoopGuardJournalEvent {
+    CycleObserved {
+        version: u32,
+        config: ReviewLoopGuardConfig,
+        cycle: ReviewLoopCycleRecord,
+    },
+    CorrectionRetrySuppressed {
+        version: u32,
+        cycle_ordinal: u8,
+        consecutive_low_severity_cycles: u8,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct SupervisorFinalReport {
     pub version: u32,
@@ -2010,6 +2355,8 @@ pub struct SupervisorFinalReport {
     pub generated_follow_up_tasks: Vec<GeneratedFollowUpTaskRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assignment_traceability: Vec<AssignmentTraceability>,
+    #[serde(default)]
+    pub assignment_suitability_outcomes: Vec<AssignmentSuitabilityOutcome>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub coverage_gaps: Vec<SupervisorCoverageGap>,
     #[serde(default)]
@@ -2527,11 +2874,22 @@ fn run_supervisor_plan_file_with_runner(
         );
     }
     let repo = discover_repo_root(&options.repo)?;
+    let serialized_runner = Mutex::new(external_runner);
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    if supervisor_plan_is_wholly_non_admitted(&loaded)? {
+        return finalize_wholly_non_admitted_supervisor_plan(
+            loaded,
+            options,
+            1,
+            &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+                Ok(mut runner) => runner(command),
+                Err(poisoned) => poisoned.into_inner()(command),
+            },
+        );
+    }
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
-    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
     let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
-    let serialized_runner = Mutex::new(external_runner);
     run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
@@ -2953,6 +3311,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         decomposition_candidates: vec![completion],
         generated_follow_up_tasks: Vec::new(),
         assignment_traceability: Vec::new(),
+        assignment_suitability_outcomes: Vec::new(),
         coverage_gaps: Vec::new(),
         breaker_trip: None,
         orchestrator_reports: vec![child],
@@ -3335,6 +3694,11 @@ enum SupervisorWorktreeCreation<'a> {
     Bound(&'a RepositoryCleanlinessCapability),
     ExistingOnly,
     PrimaryWorktree,
+    /// A wholly non-admitted plan may materialize its typed refusal report
+    /// without acquiring any worktree-creation capability. The scheduler
+    /// rejects this mode unless every assignment was already classified as
+    /// parked or refused.
+    SuitabilityRefusalOnly,
     #[cfg(test)]
     TestOnly,
 }
@@ -3431,6 +3795,17 @@ impl GateCorrectionTracker {
             .as_ref()
             .map(|active| active.denial.correction_correlation_id.as_str().to_string())
             .unwrap_or_else(|| gate_correlation_id(entity_id, self.denials.len().saturating_add(1)))
+    }
+
+    fn could_authorize_retry(&self, denial: &GateDenial) -> bool {
+        let denial_can_begin = self
+            .active
+            .as_ref()
+            .map(|active| active.denial.denial_id == denial.denial_id)
+            .unwrap_or(true);
+        denial_can_begin
+            && denial.retryability == GateRetryability::RetryAfterCorrection
+            && self.used < self.budget
     }
 
     fn authorize(
@@ -3642,6 +4017,7 @@ struct AssignmentExecutionContext<'a, 'writer> {
     index: usize,
     concurrent_mode: bool,
     plan: &'a SupervisorPlan,
+    review_loop_guard: Option<ReviewLoopGuardConfig>,
     budget_config: &'a SupervisorBudgetConfig,
     consultant: &'a SupervisorConsultantPlan,
     assignment_metadata: &'a AssignmentMetadata,

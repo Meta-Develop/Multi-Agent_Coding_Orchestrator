@@ -172,6 +172,9 @@ pub(super) fn validate_supervisor_plan(
     if plan.max_child_assignments == 0 {
         bail!("max_child_assignments must be at least 1 (legacy max_child_processes is accepted as an alias)");
     }
+    if plan.max_child_assignments > MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES {
+        bail!("max_child_assignments must be at most {MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES}");
+    }
     if plan.max_child_retries > MAX_CHILD_RETRIES_LIMIT {
         bail!(
             "max_child_retries must be at most {}",
@@ -183,6 +186,22 @@ pub(super) fn validate_supervisor_plan(
             "max_gate_corrections must be at most {}",
             MAX_GATE_CORRECTIONS_LIMIT
         );
+    }
+    if let Some(guard) = metadata.review_loop_guard {
+        let maximum_cycles = MAX_GATE_CORRECTIONS_LIMIT.saturating_add(1);
+        if guard.consecutive_low_severity_cycles == 0
+            || guard.consecutive_low_severity_cycles > maximum_cycles
+        {
+            bail!(
+                "review_loop_guard.consecutive_low_severity_cycles must be between 1 and {maximum_cycles}"
+            );
+        }
+        let configured_cycle_limit = plan.max_gate_corrections.saturating_add(1);
+        if guard.consecutive_low_severity_cycles > configured_cycle_limit {
+            bail!(
+                "review_loop_guard.consecutive_low_severity_cycles must be at most max_gate_corrections + 1 ({configured_cycle_limit})"
+            );
+        }
     }
     if plan.child_timeout_seconds == 0 {
         bail!("child_timeout_seconds must be greater than zero");
@@ -277,11 +296,19 @@ pub(super) fn validate_supervisor_plan(
             plan.max_child_assignments
         );
     }
+    if plan.assignments.len() > MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES {
+        bail!("supervisor plan exceeds its {MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES}-assignment limit");
+    }
     if metadata.assignment_schedule.len() != plan.assignments.len() {
         bail!("assignment schedule does not cover every flattened assignment");
     }
     let mut seen = BTreeSet::new();
     for (index, assignment) in plan.assignments.iter_mut().enumerate() {
+        if assignment.id.len() > MAX_SUPERVISOR_ASSIGNMENT_ID_BYTES {
+            bail!(
+                "supervisor assignment id exceeds {MAX_SUPERVISOR_ASSIGNMENT_ID_BYTES} ASCII bytes"
+            );
+        }
         assignment.id = normalize_agent_id(&assignment.id)?;
         if !seen.insert(assignment.id.clone()) {
             bail!("duplicate orchestrator assignment id '{}'", assignment.id);
@@ -289,6 +316,12 @@ pub(super) fn validate_supervisor_plan(
         if assignment.role != AgentRole::ChildOrchestrator {
             bail!(
                 "assignment '{}' role must be child_orchestrator",
+                assignment.id
+            );
+        }
+        if assignment.assigned_paths.len() > MAX_SUPERVISOR_ASSIGNMENT_INPUT_PATHS {
+            bail!(
+                "assignment '{}' exceeds its {MAX_SUPERVISOR_ASSIGNMENT_INPUT_PATHS}-path input limit",
                 assignment.id
             );
         }
@@ -548,6 +581,71 @@ pub(super) fn generated_follow_up_operator_defaults() -> Vec<GeneratedFollowUpOp
     ]
 }
 
+const GENERATED_REVIEW_LOOP_MAX_LOW_SEVERITY_FIELD: &str = "review_loop_guard.max_low_severity";
+const GENERATED_REVIEW_LOOP_CONSECUTIVE_CYCLES_FIELD: &str =
+    "review_loop_guard.consecutive_low_severity_cycles";
+const GENERATED_REVIEW_LOOP_MAX_LOW_SEVERITY_RATIONALE: &str =
+    "inherits the source plan's bounded low-severity review-loop classification";
+const GENERATED_REVIEW_LOOP_CONSECUTIVE_CYCLES_RATIONALE: &str =
+    "inherits the source plan's bounded consecutive low-severity cycle threshold";
+
+pub(super) fn generated_follow_up_operator_defaults_with_review_loop_guard(
+    review_loop_guard: Option<ReviewLoopGuardConfig>,
+) -> Vec<GeneratedFollowUpOperatorDefault> {
+    let mut defaults = generated_follow_up_operator_defaults();
+    if let Some(guard) = review_loop_guard {
+        defaults.push(GeneratedFollowUpOperatorDefault {
+            field: GENERATED_REVIEW_LOOP_MAX_LOW_SEVERITY_FIELD.to_string(),
+            value: match guard.max_low_severity {
+                ReviewLoopLowSeverity::Info => "info",
+                ReviewLoopLowSeverity::Warning => "warning",
+            }
+            .to_string(),
+            rationale: GENERATED_REVIEW_LOOP_MAX_LOW_SEVERITY_RATIONALE.to_string(),
+        });
+        defaults.push(GeneratedFollowUpOperatorDefault {
+            field: GENERATED_REVIEW_LOOP_CONSECUTIVE_CYCLES_FIELD.to_string(),
+            value: guard.consecutive_low_severity_cycles.to_string(),
+            rationale: GENERATED_REVIEW_LOOP_CONSECUTIVE_CYCLES_RATIONALE.to_string(),
+        });
+    }
+    defaults
+}
+
+pub(super) fn generated_follow_up_review_loop_guard(
+    context: &GeneratedFollowUpPlanContext,
+) -> Result<Option<ReviewLoopGuardConfig>> {
+    let severity = context
+        .operator_defaults
+        .iter()
+        .filter(|default| default.field == GENERATED_REVIEW_LOOP_MAX_LOW_SEVERITY_FIELD)
+        .collect::<Vec<_>>();
+    let cycles = context
+        .operator_defaults
+        .iter()
+        .filter(|default| default.field == GENERATED_REVIEW_LOOP_CONSECUTIVE_CYCLES_FIELD)
+        .collect::<Vec<_>>();
+    match (severity.as_slice(), cycles.as_slice()) {
+        ([], []) => Ok(None),
+        ([severity], [cycles]) => {
+            let max_low_severity = match severity.value.as_str() {
+                "info" => ReviewLoopLowSeverity::Info,
+                "warning" => ReviewLoopLowSeverity::Warning,
+                _ => bail!("generated follow-up review-loop severity is invalid"),
+            };
+            let consecutive_low_severity_cycles = cycles
+                .value
+                .parse::<u8>()
+                .context("generated follow-up review-loop threshold is invalid")?;
+            Ok(Some(ReviewLoopGuardConfig {
+                max_low_severity,
+                consecutive_low_severity_cycles,
+            }))
+        }
+        _ => bail!("generated follow-up review-loop operator defaults are partial or duplicated"),
+    }
+}
+
 pub(super) fn derived_generated_follow_up_budget(
     plan: &SupervisorPlan,
     source: &SupervisorBudgetConfig,
@@ -624,7 +722,9 @@ fn validate_generated_follow_up_plan(
     if plan.task_file.is_some() || !metadata.spec_fragment_ids.is_empty() {
         bail!("generated_follow_up operator defaults require null task_file and empty spec_fragment_ids");
     }
-    if context.operator_defaults != generated_follow_up_operator_defaults() {
+    if context.operator_defaults
+        != generated_follow_up_operator_defaults_with_review_loop_guard(metadata.review_loop_guard)
+    {
         bail!("generated_follow_up operator defaults are incomplete or undocumented");
     }
     context.breaking_assignment_id = normalize_agent_id(&context.breaking_assignment_id)

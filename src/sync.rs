@@ -21,6 +21,7 @@ impl ClaimToken {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PathClaim {
     pub token: ClaimToken,
     pub agent_id: String,
@@ -548,5 +549,17 @@ mod tests {
             coordinator.snapshot().expect("snapshot"),
             vec![first, second]
         );
+    }
+
+    #[test]
+    fn persisted_path_claim_rejects_unknown_fields() {
+        let value = serde_json::json!({
+            "token": 1,
+            "agent_id": "agent-a",
+            "paths": ["src"],
+            "unexpected": true,
+        });
+
+        assert!(serde_json::from_value::<PathClaim>(value).is_err());
     }
 }

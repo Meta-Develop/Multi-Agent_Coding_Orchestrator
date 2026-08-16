@@ -4,20 +4,24 @@ use crate::sync::{
 use crate::{
     artifacts::{
         repository_authenticator_key_only,
-        state_auth::{AuthenticationDomain, RepositoryAuthBinding},
+        state_auth::{sha256_hex, AuthenticationDomain, RepositoryAuthBinding},
     },
-    authenticated_snapshot::{AuthenticatedSnapshotStore, SnapshotSpec},
+    authenticated_snapshot::{
+        AuthenticatedSnapshot, AuthenticatedSnapshotStore, ExistingAuthenticatedSnapshot,
+        SnapshotSpec,
+    },
     live_claim::{
         claim_process_liveness, current_claim_process_identity, ClaimProcessIdentity,
         ClaimProcessLiveness,
     },
     megafile::{MegafileAssessment, MegafileStore, MegafileThresholds},
     orchestrator::RunId,
-    safe_state::{stable_checksum, FileIdentity, KernelStateLock, SafeRoot},
+    safe_state::{stable_checksum, ExistingExclusiveLock, FileIdentity, KernelStateLock, SafeRoot},
     state_journal::JournalSpec,
     state_migration::{
         decode_checksumless_legacy_claims_state, finalize_legacy_retirement,
-        prepare_legacy_retirement, LegacyAdoption, LEGACY_RETIREMENT_DOMAIN,
+        prepare_legacy_retirement, verify_existing_active_legacy_retirement, LegacyAdoption,
+        LEGACY_RETIREMENT_DOMAIN,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -27,7 +31,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
+use thiserror::Error;
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -47,6 +53,13 @@ const MAX_RUN_ID_BYTES: usize = 128;
 const MAX_PROCESS_START_TIME_BYTES: usize = 512;
 const MAX_STATE_PATH_BYTES: usize = 4_096;
 const MAX_STATE_PATH_COMPONENTS: usize = 256;
+const MAX_CLAIM_ID_BYTES: usize = 128;
+const MAX_CLAIM_TIMING_SECONDS: u64 = 365 * 24 * 60 * 60;
+const MAX_SUPERSESSION_LINEAGE_DEPTH: usize = 64;
+const MAX_SUPERSESSION_RECORDS: usize = 1_024;
+
+pub const DEFAULT_CLAIM_HEARTBEAT_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
+pub const DEFAULT_CLAIM_STALE_AFTER_SECONDS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone)]
 pub struct SyncStore {
@@ -77,6 +90,99 @@ impl LockedClaimsSnapshot {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExistingClaimBindingRequest {
+    pub agent_id: String,
+    pub token: ClaimToken,
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ExistingClaimRevalidationError {
+    #[error("existing authenticated claims state is unavailable or invalid")]
+    StateUnavailable {
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error("existing authenticated claims lock is busy")]
+    LockBusy,
+    #[error("existing authenticated claims lock is missing")]
+    LockMissing,
+    #[error("claim revalidation request count exceeds the {limit} entry bound")]
+    RequestLimit { limit: usize },
+    #[error("claim revalidation request for agent '{agent_id}' has noncanonical paths")]
+    NoncanonicalPaths { agent_id: String },
+    #[error(
+        "claim token {token} for agent '{agent_id}' was superseded by token {successor_token}"
+    )]
+    Superseded {
+        agent_id: String,
+        token: u64,
+        successor_token: u64,
+    },
+    #[error("claim token {token} for agent '{agent_id}' is no longer active")]
+    Released { agent_id: String, token: u64 },
+    #[error(
+        "claim token {token} for agent '{agent_id}' was replaced by token {actual_token} owned by '{actual_owner}'"
+    )]
+    Replaced {
+        agent_id: String,
+        token: u64,
+        actual_token: u64,
+        actual_owner: String,
+    },
+    #[error("claim token {token} owner mismatch: expected '{agent_id}', found '{actual_owner}'")]
+    OwnerMismatch {
+        agent_id: String,
+        token: u64,
+        actual_owner: String,
+    },
+    #[error("claim token {token} path binding mismatch for agent '{agent_id}'")]
+    PathsMismatch { agent_id: String, token: u64 },
+    #[error("claim token {token} for agent '{agent_id}' is not live: {state:?}")]
+    NotLive {
+        agent_id: String,
+        token: u64,
+        state: ClaimLivenessState,
+    },
+    #[error("authenticated claims state changed while its existing-only guard was held")]
+    StateChanged,
+}
+
+/// Retains the already-existing claims writer lock for one bounded batch of
+/// mutation/collection authorities. The lock serializes heartbeat, sweep,
+/// takeover, release, and reclaim while the protected operation is active.
+#[must_use = "the claims guard must be retained for the protected operation"]
+#[derive(Debug)]
+pub(crate) struct ExistingClaimsGuard {
+    repo_path: PathBuf,
+    state: RepositoryStateRoot,
+    lock: RepositoryStateLock,
+    authenticated: AuthenticatedClaimsState,
+    requests: Vec<ExistingClaimBindingRequest>,
+    // The outer claims lock prevents heartbeat, release, sweep, reclaim, and
+    // takeover for the guard lifetime. Rechecks therefore use the acquisition
+    // instant that passed full #83 liveness; applying wall-clock aging again
+    // while this same guard blocks heartbeats would manufacture staleness.
+    validated_at_unix_seconds: u64,
+}
+
+impl ExistingClaimsGuard {
+    pub(crate) fn verify(&self) -> std::result::Result<(), ExistingClaimRevalidationError> {
+        let authenticated =
+            read_existing_authenticated_claims(&self.repo_path, &self.state, &self.lock)
+                .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?;
+        if authenticated != self.authenticated {
+            return Err(ExistingClaimRevalidationError::StateChanged);
+        }
+        verify_existing_claim_requests(
+            &authenticated,
+            &self.requests,
+            self.validated_at_unix_seconds,
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MegafileClaimWarning {
@@ -89,6 +195,115 @@ pub struct MegafileClaimWarning {
 #[serde(deny_unknown_fields)]
 pub struct ClaimTelemetryOutcome {
     pub claim: PathClaim,
+    pub warnings: Vec<MegafileClaimWarning>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimTiming {
+    pub heartbeat_interval_seconds: u64,
+    pub stale_after_seconds: u64,
+}
+
+impl Default for ClaimTiming {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval_seconds: DEFAULT_CLAIM_HEARTBEAT_INTERVAL_SECONDS,
+            stale_after_seconds: DEFAULT_CLAIM_STALE_AFTER_SECONDS,
+        }
+    }
+}
+
+impl ClaimTiming {
+    pub fn new(heartbeat_interval_seconds: u64, stale_after_seconds: u64) -> Result<Self> {
+        let timing = Self {
+            heartbeat_interval_seconds,
+            stale_after_seconds,
+        };
+        timing.validate()?;
+        Ok(timing)
+    }
+
+    fn validate(self) -> Result<()> {
+        if self.heartbeat_interval_seconds == 0
+            || self.heartbeat_interval_seconds > MAX_CLAIM_TIMING_SECONDS
+        {
+            bail!(
+                "claim heartbeat interval must be between 1 and {MAX_CLAIM_TIMING_SECONDS} seconds"
+            );
+        }
+        if self.stale_after_seconds == 0 || self.stale_after_seconds > MAX_CLAIM_TIMING_SECONDS {
+            bail!("claim stale threshold must be between 1 and {MAX_CLAIM_TIMING_SECONDS} seconds");
+        }
+        if self.heartbeat_interval_seconds >= self.stale_after_seconds {
+            bail!("claim heartbeat interval must be shorter than its stale threshold");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimLivenessState {
+    Fresh,
+    HeartbeatDue,
+    Stale,
+    TakeoverEligible,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimLivenessReport {
+    #[serde(flatten)]
+    pub claim: PathClaim,
+    pub claim_id: String,
+    pub state: ClaimLivenessState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ambiguity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_unix_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_unix_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_interval_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_after_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub takeover_eligible_since_unix_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimSupersession {
+    pub prior_token: ClaimToken,
+    pub prior_claim_id: String,
+    pub prior_agent_id: String,
+    pub successor_token: ClaimToken,
+    pub successor_claim_id: String,
+    pub successor_agent_id: String,
+    pub path_count: usize,
+    pub paths_checksum: String,
+    pub superseded_at_unix_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimSweepReport {
+    pub now_unix_seconds: u64,
+    pub newly_takeover_eligible: Vec<String>,
+    pub claims: Vec<ClaimLivenessReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimTakeoverOutcome {
+    pub superseded_claim: PathClaim,
+    pub claim: PathClaim,
+    pub liveness: ClaimLivenessReport,
+    pub lineage: ClaimSupersession,
     pub warnings: Vec<MegafileClaimWarning>,
 }
 
@@ -131,6 +346,10 @@ struct AuthenticatedClaimsState {
     claims: Vec<PathClaim>,
     #[serde(default)]
     run_owners: Vec<AuthenticatedClaimRunOwner>,
+    #[serde(default)]
+    liveness: Vec<AuthenticatedClaimLiveness>,
+    #[serde(default)]
+    supersessions: Vec<AuthenticatedClaimSupersession>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -139,6 +358,33 @@ struct AuthenticatedClaimRunOwner {
     token: ClaimToken,
     run_id: String,
     process: ClaimProcessIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatedClaimLiveness {
+    token: ClaimToken,
+    claim_id: String,
+    created_unix_seconds: u64,
+    heartbeat_unix_seconds: u64,
+    heartbeat_interval_seconds: u64,
+    stale_after_seconds: u64,
+    takeover_eligible_since_unix_seconds: Option<u64>,
+    supersedes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatedClaimSupersession {
+    prior_token: ClaimToken,
+    prior_claim_id: String,
+    prior_agent_id: String,
+    successor_token: ClaimToken,
+    successor_claim_id: String,
+    successor_agent_id: String,
+    path_count: usize,
+    paths_checksum: String,
+    superseded_at_unix_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -254,6 +500,32 @@ impl RepositoryStateRoot {
         })
     }
 
+    fn open_existing(
+        repo: &Repository,
+        state_file: &'static str,
+        lock_file: &'static str,
+    ) -> Result<Self> {
+        let common_root = SafeRoot::open_existing(repo.commondir()).with_context(|| {
+            format!(
+                "Git common directory is not a safe current-user-owned directory: {}",
+                repo.commondir().display()
+            )
+        })?;
+        let binding = RepositoryStateBinding {
+            common_dir_path_checksum: stable_checksum(&filesystem_path_bytes(common_root.path())),
+            common_dir_identity: common_root.identity().clone(),
+        };
+        let root = SafeRoot::open_existing(common_root.path().join("maco").join("state"))
+            .context("existing MACO state root is absent or unsafe")?;
+        Ok(Self {
+            state_path: root.direct_child(state_file)?,
+            root,
+            state_file,
+            lock_file,
+            binding,
+        })
+    }
+
     pub(crate) fn state_path(&self) -> &Path {
         &self.state_path
     }
@@ -271,6 +543,8 @@ impl RepositoryStateRoot {
     }
 
     pub(crate) fn lock(&self) -> Result<RepositoryStateLock> {
+        #[cfg(test)]
+        reject_neutered_claim_state_mutation()?;
         let lock = KernelStateLock::acquire_direct(&self.root, self.lock_file)?;
         let lock_identity = lock.identity().clone();
         Ok(RepositoryStateLock {
@@ -279,6 +553,32 @@ impl RepositoryStateRoot {
             state_file: self.state_file,
             lock_identity,
         })
+    }
+
+    fn lock_existing(
+        &self,
+    ) -> std::result::Result<RepositoryStateLock, ExistingClaimRevalidationError> {
+        let lock = match KernelStateLock::try_acquire_existing_exclusive_direct(
+            &self.root,
+            self.lock_file,
+        )
+        .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?
+        {
+            ExistingExclusiveLock::Acquired(lock) => lock,
+            ExistingExclusiveLock::Busy => return Err(ExistingClaimRevalidationError::LockBusy),
+            ExistingExclusiveLock::Missing => {
+                return Err(ExistingClaimRevalidationError::LockMissing)
+            }
+        };
+        let bound = RepositoryStateLock {
+            root_identity: self.root.identity().clone(),
+            state_file: self.state_file,
+            lock_identity: lock.identity().clone(),
+            _lock: lock,
+        };
+        self.verify_lock(&bound)
+            .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?;
+        Ok(bound)
     }
 
     #[cfg(test)]
@@ -359,6 +659,34 @@ impl RepositoryStateRoot {
 thread_local! {
     static REPOSITORY_STATE_AFTER_PRECHECK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static CLAIM_STATE_MUTATIONS_NEUTERED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct ClaimStateMutationNeuter {
+    previous: bool,
+}
+
+#[cfg(test)]
+impl Drop for ClaimStateMutationNeuter {
+    fn drop(&mut self) {
+        CLAIM_STATE_MUTATIONS_NEUTERED.with(|slot| slot.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn neuter_claim_state_mutations() -> ClaimStateMutationNeuter {
+    let previous = CLAIM_STATE_MUTATIONS_NEUTERED.with(|slot| slot.replace(true));
+    ClaimStateMutationNeuter { previous }
+}
+
+#[cfg(test)]
+fn reject_neutered_claim_state_mutation() -> Result<()> {
+    if CLAIM_STATE_MUTATIONS_NEUTERED.with(std::cell::Cell::get) {
+        bail!("claim-state mutation surface was neutered by the test")
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -386,6 +714,213 @@ fn finish_with_lock_verification<T>(result: Result<T>, verification: Result<()>)
             "operation also lost its stable lock-path binding: {lock_error:#}"
         ))),
     }
+}
+
+pub(crate) fn lock_existing_authenticated_claims(
+    repo_path: &Path,
+    requests: Vec<ExistingClaimBindingRequest>,
+) -> std::result::Result<ExistingClaimsGuard, ExistingClaimRevalidationError> {
+    if requests.is_empty() || requests.len() > MAX_SYNC_CLAIMS {
+        return Err(ExistingClaimRevalidationError::RequestLimit {
+            limit: MAX_SYNC_CLAIMS,
+        });
+    }
+    let repo = crate::git_repository::discover(repo_path).map_err(|source| {
+        ExistingClaimRevalidationError::StateUnavailable {
+            source: source.into(),
+        }
+    })?;
+    let state = RepositoryStateRoot::open_existing(&repo, "claims.json", "claims.lock")
+        .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?;
+    let lock = state.lock_existing()?;
+    let repo_path = repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf();
+    let authenticated = read_existing_authenticated_claims(&repo_path, &state, &lock)
+        .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?;
+    let validated_at_unix_seconds = current_unix_seconds()
+        .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?;
+    verify_existing_claim_requests(&authenticated, &requests, validated_at_unix_seconds)?;
+    Ok(ExistingClaimsGuard {
+        repo_path,
+        state,
+        lock,
+        authenticated,
+        requests,
+        validated_at_unix_seconds,
+    })
+}
+
+fn read_existing_authenticated_claims(
+    repo_path: &Path,
+    state: &RepositoryStateRoot,
+    lock: &RepositoryStateLock,
+) -> Result<AuthenticatedClaimsState> {
+    state.verify(lock)?;
+    if !state
+        .root
+        .direct_child_exists(ClaimsSnapshotSpec::ROOT_NAME)?
+    {
+        bail!("authenticated claims snapshot is absent; initialization or migration is required");
+    }
+    let authenticator = repository_authenticator_key_only(repo_path)?;
+    let existing: ExistingAuthenticatedSnapshot<AuthenticatedClaimsState> =
+        AuthenticatedSnapshotStore::<ClaimsSnapshotSpec, AuthenticatedClaimsState>::
+            read_existing_current_with_identity(authenticator, CLAIMS_LOGICAL_ID)?;
+    validate_existing_authenticated_claims_snapshot(
+        &existing.snapshot,
+        &existing.identity.repository,
+    )?;
+    verify_existing_active_legacy_retirement::<ClaimsSnapshotSpec>(
+        repo_path,
+        "claims",
+        "claims.json",
+        LEGACY_RETIREMENT_DOMAIN,
+        &existing.identity,
+        existing.snapshot.generation,
+    )?;
+    state.verify(lock)?;
+    Ok(existing.snapshot.value)
+}
+
+fn validate_existing_authenticated_claims_snapshot(
+    snapshot: &AuthenticatedSnapshot<AuthenticatedClaimsState>,
+    repository: &RepositoryAuthBinding,
+) -> Result<()> {
+    if snapshot.value.version != 1
+        || snapshot.value.snapshot_revision != snapshot.generation
+        || snapshot.value.snapshot_revision != snapshot.token
+        || snapshot.value.repository != *repository
+    {
+        bail!("authenticated claims snapshot binding or revision is inconsistent");
+    }
+    validate_sync_snapshot(&SyncSnapshot {
+        next_token: snapshot.value.next_token,
+        claims: snapshot.value.claims.clone(),
+    })?;
+    validate_claim_run_owners(&snapshot.value.claims, &snapshot.value.run_owners)?;
+    validate_claim_liveness(
+        snapshot.value.next_token,
+        &snapshot.value.claims,
+        &snapshot.value.liveness,
+        &snapshot.value.supersessions,
+    )
+}
+
+fn verify_existing_claim_requests(
+    state: &AuthenticatedClaimsState,
+    requests: &[ExistingClaimBindingRequest],
+    now: u64,
+) -> std::result::Result<(), ExistingClaimRevalidationError> {
+    ensure_supersession_time_not_future(&state.supersessions, now)
+        .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?;
+    let liveness = state
+        .liveness
+        .iter()
+        .map(|entry| (entry.token, entry))
+        .collect::<BTreeMap<_, _>>();
+
+    for request in requests {
+        let canonical = canonical_request_paths(&request.agent_id, &request.paths)?;
+        let Some(claim) = state
+            .claims
+            .iter()
+            .find(|claim| claim.token == request.token)
+        else {
+            if let Some(lineage) = state
+                .supersessions
+                .iter()
+                .find(|entry| entry.prior_token == request.token)
+            {
+                return Err(ExistingClaimRevalidationError::Superseded {
+                    agent_id: request.agent_id.clone(),
+                    token: request.token.get(),
+                    successor_token: lineage.successor_token.get(),
+                });
+            }
+            if let Some(replacement) = state.claims.iter().find(|active| {
+                active.paths.iter().any(|actual| {
+                    canonical
+                        .iter()
+                        .any(|expected| claim_paths_overlap(expected, actual))
+                })
+            }) {
+                return Err(ExistingClaimRevalidationError::Replaced {
+                    agent_id: request.agent_id.clone(),
+                    token: request.token.get(),
+                    actual_token: replacement.token.get(),
+                    actual_owner: replacement.agent_id.clone(),
+                });
+            }
+            return Err(ExistingClaimRevalidationError::Released {
+                agent_id: request.agent_id.clone(),
+                token: request.token.get(),
+            });
+        };
+        if claim.agent_id != request.agent_id {
+            return Err(ExistingClaimRevalidationError::OwnerMismatch {
+                agent_id: request.agent_id.clone(),
+                token: request.token.get(),
+                actual_owner: claim.agent_id.clone(),
+            });
+        }
+        let mut actual = claim.paths.clone();
+        actual.sort();
+        if actual != canonical {
+            return Err(ExistingClaimRevalidationError::PathsMismatch {
+                agent_id: request.agent_id.clone(),
+                token: request.token.get(),
+            });
+        }
+        let report = claim_liveness_report(claim.clone(), liveness.get(&claim.token).copied(), now)
+            .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?;
+        if !matches!(
+            report.state,
+            ClaimLivenessState::Fresh | ClaimLivenessState::HeartbeatDue
+        ) {
+            return Err(ExistingClaimRevalidationError::NotLive {
+                agent_id: request.agent_id.clone(),
+                token: request.token.get(),
+                state: report.state,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn canonical_request_paths(
+    agent_id: &str,
+    paths: &[PathBuf],
+) -> std::result::Result<Vec<PathBuf>, ExistingClaimRevalidationError> {
+    if paths.is_empty() || paths.len() > MAX_SYNC_PATHS {
+        return Err(ExistingClaimRevalidationError::NoncanonicalPaths {
+            agent_id: agent_id.to_string(),
+        });
+    }
+    let mut canonical = Vec::with_capacity(paths.len());
+    for path in paths {
+        let normalized = normalize_repo_relative_path(path).map_err(|_| {
+            ExistingClaimRevalidationError::NoncanonicalPaths {
+                agent_id: agent_id.to_string(),
+            }
+        })?;
+        if &normalized != path {
+            return Err(ExistingClaimRevalidationError::NoncanonicalPaths {
+                agent_id: agent_id.to_string(),
+            });
+        }
+        canonical.push(normalized);
+    }
+    canonical.sort();
+    canonical.dedup();
+    if canonical.len() != paths.len() {
+        return Err(ExistingClaimRevalidationError::NoncanonicalPaths {
+            agent_id: agent_id.to_string(),
+        });
+    }
+    Ok(canonical)
+}
+
+fn claim_paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
 }
 
 impl SyncStore {
@@ -435,6 +970,8 @@ impl SyncStore {
                 agent_id,
                 paths,
                 MegafileThresholds::provisional_bootstrap(),
+                ClaimTiming::default(),
+                current_unix_seconds()?,
                 Some((
                     run_id.as_str().to_string(),
                     current_claim_process_identity(),
@@ -476,7 +1013,69 @@ impl SyncStore {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
-        self.claim_paths_with_telemetry_thresholds_internal(agent_id, paths, thresholds, None)
+        self.claim_paths_with_telemetry_thresholds_and_timing(
+            agent_id,
+            paths,
+            thresholds,
+            ClaimTiming::default(),
+        )
+    }
+
+    pub fn claim_paths_with_telemetry_thresholds_and_timing<I, P>(
+        &self,
+        agent_id: impl AsRef<str>,
+        paths: I,
+        thresholds: MegafileThresholds,
+        timing: ClaimTiming,
+    ) -> Result<ClaimTelemetryOutcome>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        self.claim_paths_with_telemetry_thresholds_internal(
+            agent_id,
+            paths,
+            thresholds,
+            timing,
+            current_unix_seconds()?,
+            None,
+        )
+    }
+
+    pub fn claim_paths_with_timing<I, P>(
+        &self,
+        agent_id: impl AsRef<str>,
+        paths: I,
+        timing: ClaimTiming,
+    ) -> Result<ClaimTelemetryOutcome>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        self.claim_paths_with_timing_at(agent_id, paths, timing, current_unix_seconds()?)
+    }
+
+    /// Caller-supplied time is an internal deterministic test seam. Production
+    /// callers use the trusted system-clock wrapper above.
+    fn claim_paths_with_timing_at<I, P>(
+        &self,
+        agent_id: impl AsRef<str>,
+        paths: I,
+        timing: ClaimTiming,
+        now_unix_seconds: u64,
+    ) -> Result<ClaimTelemetryOutcome>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        self.claim_paths_with_telemetry_thresholds_internal(
+            agent_id,
+            paths,
+            MegafileThresholds::provisional_bootstrap(),
+            timing,
+            now_unix_seconds,
+            None,
+        )
     }
 
     fn claim_paths_with_telemetry_thresholds_internal<I, P>(
@@ -484,6 +1083,8 @@ impl SyncStore {
         agent_id: impl AsRef<str>,
         paths: I,
         thresholds: MegafileThresholds,
+        timing: ClaimTiming,
+        now_unix_seconds: u64,
         run_owner: Option<(String, ClaimProcessIdentity)>,
     ) -> Result<ClaimTelemetryOutcome>
     where
@@ -493,13 +1094,18 @@ impl SyncStore {
         thresholds
             .validate()
             .context("configured megafile claim thresholds are invalid")?;
-        let claim = self.with_locked_update_and_run_owners(
-            |coordinator| {
-                coordinator
-                    .claim_paths(agent_id.as_ref(), paths)
-                    .map_err(Into::into)
-            },
-            |claim, run_owners| {
+        timing.validate()?;
+        let claim =
+            self.with_locked_update(|coordinator, run_owners, liveness, supersessions| {
+                let active_claims = coordinator.snapshot()?;
+                ensure_unambiguous_liveness(
+                    &active_claims,
+                    liveness,
+                    supersessions,
+                    now_unix_seconds,
+                )?;
+                let claim = coordinator.claim_paths(agent_id.as_ref(), paths)?;
+                liveness.push(new_claim_liveness(&claim, timing, now_unix_seconds, None)?);
                 if let Some((run_id, process)) = run_owner {
                     run_owners.push(AuthenticatedClaimRunOwner {
                         token: claim.token,
@@ -507,9 +1113,8 @@ impl SyncStore {
                         process,
                     });
                 }
-                Ok(())
-            },
-        )?;
+                Ok(claim)
+            })?;
         let assessments = (|| {
             MegafileStore::open_with_thresholds(&self.repo_path, thresholds)
                 .context("megafile telemetry could not be opened")?
@@ -539,15 +1144,307 @@ impl SyncStore {
     }
 
     pub fn release(&self, token: ClaimToken) -> Result<PathClaim> {
-        self.with_locked_update(|coordinator| coordinator.release(token).map_err(Into::into))
+        self.with_locked_update(|coordinator, _, _, _| {
+            coordinator.release(token).map_err(Into::into)
+        })
     }
 
     pub fn release_by_agent(&self, agent_id: impl AsRef<str>) -> Result<Vec<PathClaim>> {
-        self.with_locked_update(|coordinator| {
+        self.with_locked_update(|coordinator, _, _, _| {
             coordinator
                 .release_by_agent(agent_id.as_ref())
                 .map_err(Into::into)
         })
+    }
+
+    pub fn heartbeat(
+        &self,
+        token: ClaimToken,
+        agent_id: impl AsRef<str>,
+        timing: Option<ClaimTiming>,
+    ) -> Result<ClaimLivenessReport> {
+        self.heartbeat_at(token, agent_id, timing, current_unix_seconds()?)
+    }
+
+    fn heartbeat_at(
+        &self,
+        token: ClaimToken,
+        agent_id: impl AsRef<str>,
+        timing: Option<ClaimTiming>,
+        now_unix_seconds: u64,
+    ) -> Result<ClaimLivenessReport> {
+        if let Some(timing) = timing {
+            timing.validate()?;
+        }
+        let agent_id = agent_id.as_ref();
+        self.with_locked_update(|coordinator, _, liveness, supersessions| {
+            ensure_supersession_time_not_future(supersessions, now_unix_seconds)?;
+            let claims = coordinator.snapshot()?;
+            let claim = claims
+                .iter()
+                .find(|claim| claim.token == token)
+                .cloned()
+                .with_context(|| format!("claim token is not active: {}", token.get()))?;
+            if claim.agent_id != agent_id {
+                bail!(
+                    "claim heartbeat agent '{}' does not exactly match owner '{}'",
+                    agent_id,
+                    claim.agent_id
+                );
+            }
+            match liveness.iter_mut().find(|entry| entry.token == token) {
+                Some(entry) => {
+                    if entry.takeover_eligible_since_unix_seconds.is_some() {
+                        bail!(
+                            "claim '{}' is takeover-eligible and cannot be revived by heartbeat; release or take it over explicitly",
+                            entry.claim_id
+                        );
+                    }
+                    if now_unix_seconds < entry.heartbeat_unix_seconds {
+                        bail!(
+                            "claim '{}' heartbeat would move backward from {} to {}; refusing ambiguous clock state",
+                            entry.claim_id,
+                            entry.heartbeat_unix_seconds,
+                            now_unix_seconds
+                        );
+                    }
+                    if let Some(timing) = timing {
+                        entry.heartbeat_interval_seconds = timing.heartbeat_interval_seconds;
+                        entry.stale_after_seconds = timing.stale_after_seconds;
+                    }
+                    entry.heartbeat_unix_seconds = now_unix_seconds;
+                }
+                None => liveness.push(new_claim_liveness(
+                    &claim,
+                    timing.unwrap_or_default(),
+                    now_unix_seconds,
+                    None,
+                )?),
+            }
+            let entry = liveness
+                .iter()
+                .find(|entry| entry.token == token)
+                .context("claim heartbeat metadata disappeared during update")?;
+            claim_liveness_report(claim, Some(entry), now_unix_seconds)
+        })
+    }
+
+    pub fn liveness_snapshot(&self) -> Result<Vec<ClaimLivenessReport>> {
+        self.liveness_snapshot_at(current_unix_seconds()?)
+    }
+
+    pub fn liveness_snapshot_at(&self, now_unix_seconds: u64) -> Result<Vec<ClaimLivenessReport>> {
+        let lock = self.state.lock()?;
+        let store = self.open_authenticated_store(&lock)?;
+        let coordinator = SyncCoordinator::from_snapshot(SyncSnapshot {
+            next_token: store.current().value.next_token,
+            claims: store.current().value.claims.clone(),
+        })?;
+        let claims = coordinator.snapshot()?;
+        let liveness = store
+            .current()
+            .value
+            .liveness
+            .iter()
+            .map(|entry| (entry.token, entry))
+            .collect::<BTreeMap<_, _>>();
+        let reports = claims
+            .into_iter()
+            .map(|claim| {
+                let token = claim.token;
+                claim_liveness_report(claim, liveness.get(&token).copied(), now_unix_seconds)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.state.verify(&lock)?;
+        Ok(reports)
+    }
+
+    pub fn sweep_stale(&self) -> Result<ClaimSweepReport> {
+        self.sweep_stale_at(current_unix_seconds()?)
+    }
+
+    fn sweep_stale_at(&self, now_unix_seconds: u64) -> Result<ClaimSweepReport> {
+        self.with_locked_update(|coordinator, _, liveness, supersessions| {
+            let claims = coordinator.snapshot()?;
+            ensure_unambiguous_liveness(&claims, liveness, supersessions, now_unix_seconds)?;
+            let mut newly_takeover_eligible = Vec::new();
+            for entry in liveness.iter_mut() {
+                if now_unix_seconds - entry.heartbeat_unix_seconds >= entry.stale_after_seconds
+                    && entry.takeover_eligible_since_unix_seconds.is_none()
+                {
+                    entry.takeover_eligible_since_unix_seconds = Some(now_unix_seconds);
+                    newly_takeover_eligible.push(entry.claim_id.clone());
+                }
+            }
+            newly_takeover_eligible.sort();
+            let liveness_by_token = liveness
+                .iter()
+                .map(|entry| (entry.token, entry))
+                .collect::<BTreeMap<_, _>>();
+            let reports = claims
+                .into_iter()
+                .map(|claim| {
+                    let token = claim.token;
+                    claim_liveness_report(
+                        claim,
+                        liveness_by_token.get(&token).copied(),
+                        now_unix_seconds,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ClaimSweepReport {
+                now_unix_seconds,
+                newly_takeover_eligible,
+                claims: reports,
+            })
+        })
+    }
+
+    pub fn takeover(
+        &self,
+        prior_token: ClaimToken,
+        agent_id: impl AsRef<str>,
+        timing: Option<ClaimTiming>,
+    ) -> Result<ClaimTakeoverOutcome> {
+        self.takeover_at(prior_token, agent_id, timing, current_unix_seconds()?)
+    }
+
+    fn takeover_at(
+        &self,
+        prior_token: ClaimToken,
+        agent_id: impl AsRef<str>,
+        timing: Option<ClaimTiming>,
+        now_unix_seconds: u64,
+    ) -> Result<ClaimTakeoverOutcome> {
+        if let Some(timing) = timing {
+            timing.validate()?;
+        }
+        let agent_id = agent_id.as_ref();
+        let mut outcome = self.with_locked_update(|coordinator, _, liveness, supersessions| {
+            let claims = coordinator.snapshot()?;
+            ensure_unambiguous_liveness(&claims, liveness, supersessions, now_unix_seconds)?;
+            let prior_claim = claims
+                .iter()
+                .find(|claim| claim.token == prior_token)
+                .cloned()
+                .with_context(|| format!("claim token is not active: {}", prior_token.get()))?;
+            let prior_liveness = liveness
+                .iter()
+                .find(|entry| entry.token == prior_token)
+                .cloned()
+                .context("active predecessor claim has ambiguous liveness metadata")?;
+            let prior_report = claim_liveness_report(
+                prior_claim.clone(),
+                Some(&prior_liveness),
+                now_unix_seconds,
+            )?;
+            if prior_report.state != ClaimLivenessState::TakeoverEligible {
+                bail!(
+                    "claim '{}' is not takeover-eligible (state: {:?})",
+                    prior_liveness.claim_id,
+                    prior_report.state
+                );
+            }
+            if supersessions.len() >= MAX_SUPERSESSION_RECORDS {
+                bail!(
+                    "claim supersession history reached its {} record bound",
+                    MAX_SUPERSESSION_RECORDS
+                );
+            }
+            let lineage_depth =
+                supersession_lineage_depth(&prior_liveness.claim_id, supersessions)?;
+            if lineage_depth >= MAX_SUPERSESSION_LINEAGE_DEPTH {
+                bail!(
+                    "claim supersession lineage reached its {}-claim depth bound",
+                    MAX_SUPERSESSION_LINEAGE_DEPTH
+                );
+            }
+            let inherited_timing = ClaimTiming {
+                heartbeat_interval_seconds: prior_liveness.heartbeat_interval_seconds,
+                stale_after_seconds: prior_liveness.stale_after_seconds,
+            };
+            let successor_timing = timing.unwrap_or(inherited_timing);
+            successor_timing.validate()?;
+            let path_count = prior_claim.paths.len();
+            let paths_checksum = claim_paths_checksum(&prior_claim.paths)?;
+
+            let superseded_claim = coordinator.release(prior_token)?;
+            let claim = coordinator.claim_paths(agent_id, superseded_claim.paths.clone())?;
+            let successor_liveness = new_claim_liveness(
+                &claim,
+                successor_timing,
+                now_unix_seconds,
+                Some(prior_liveness.claim_id.clone()),
+            )?;
+            liveness.push(successor_liveness.clone());
+            let authenticated_lineage = AuthenticatedClaimSupersession {
+                prior_token,
+                prior_claim_id: prior_liveness.claim_id,
+                prior_agent_id: superseded_claim.agent_id.clone(),
+                successor_token: claim.token,
+                successor_claim_id: successor_liveness.claim_id.clone(),
+                successor_agent_id: claim.agent_id.clone(),
+                path_count,
+                paths_checksum,
+                superseded_at_unix_seconds: now_unix_seconds,
+            };
+            supersessions.push(authenticated_lineage.clone());
+            let liveness_report =
+                claim_liveness_report(claim.clone(), Some(&successor_liveness), now_unix_seconds)?;
+            Ok(ClaimTakeoverOutcome {
+                superseded_claim,
+                claim,
+                liveness: liveness_report,
+                lineage: claim_supersession_report(authenticated_lineage),
+                warnings: Vec::new(),
+            })
+        })?;
+        let assessments = (|| {
+            MegafileStore::open_with_thresholds(
+                &self.repo_path,
+                MegafileThresholds::provisional_bootstrap(),
+            )
+            .context("takeover megafile telemetry could not be opened")?
+            .record_claim(&outcome.claim)
+            .context("takeover megafile telemetry could not be recorded")
+        })()
+        .with_context(|| {
+            format!(
+                "takeover successor claim token {} remains durable for agent '{}' and paths {:?}, but its required megafile telemetry failed; inspect the authenticated claim list and explicitly release token {} before retrying if rollback is intended",
+                outcome.claim.token.get(),
+                outcome.claim.agent_id,
+                outcome.claim.paths,
+                outcome.claim.token.get()
+            )
+        })?;
+        outcome.warnings = assessments
+            .into_iter()
+            .filter(|assessment| assessment.is_megafile)
+            .map(|assessment| MegafileClaimWarning {
+                version: 1,
+                path: assessment.path.clone(),
+                assessment,
+            })
+            .collect();
+        outcome
+            .warnings
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(outcome)
+    }
+
+    pub fn supersession_history(&self) -> Result<Vec<ClaimSupersession>> {
+        let lock = self.state.lock()?;
+        let store = self.open_authenticated_store(&lock)?;
+        let history = store
+            .current()
+            .value
+            .supersessions
+            .iter()
+            .cloned()
+            .map(claim_supersession_report)
+            .collect();
+        self.state.verify(&lock)?;
+        Ok(history)
     }
 
     pub fn owner_of(&self, path: impl AsRef<Path>) -> Result<OwnerReport> {
@@ -617,15 +1514,12 @@ impl SyncStore {
 
     fn with_locked_update<T>(
         &self,
-        operation: impl FnOnce(&SyncCoordinator) -> Result<T>,
-    ) -> Result<T> {
-        self.with_locked_update_and_run_owners(operation, |_, _| Ok(()))
-    }
-
-    fn with_locked_update_and_run_owners<T>(
-        &self,
-        operation: impl FnOnce(&SyncCoordinator) -> Result<T>,
-        update_run_owners: impl FnOnce(&T, &mut Vec<AuthenticatedClaimRunOwner>) -> Result<()>,
+        operation: impl FnOnce(
+            &SyncCoordinator,
+            &mut Vec<AuthenticatedClaimRunOwner>,
+            &mut Vec<AuthenticatedClaimLiveness>,
+            &mut Vec<AuthenticatedClaimSupersession>,
+        ) -> Result<T>,
     ) -> Result<T> {
         let lock = self.state.lock()?;
         let mut store = self.open_authenticated_store(&lock)?;
@@ -634,7 +1528,14 @@ impl SyncStore {
             claims: store.current().value.claims.clone(),
         })?;
         let mut run_owners = store.current().value.run_owners.clone();
-        let output = operation(&coordinator)?;
+        let mut liveness = store.current().value.liveness.clone();
+        let mut supersessions = store.current().value.supersessions.clone();
+        let output = operation(
+            &coordinator,
+            &mut run_owners,
+            &mut liveness,
+            &mut supersessions,
+        )?;
         let snapshot = coordinator.to_snapshot()?;
         validate_sync_snapshot(&snapshot)?;
         let active_tokens = snapshot
@@ -643,9 +1544,26 @@ impl SyncStore {
             .map(|claim| claim.token)
             .collect::<BTreeSet<_>>();
         run_owners.retain(|owner| active_tokens.contains(&owner.token));
-        update_run_owners(&output, &mut run_owners)?;
+        liveness.retain(|entry| active_tokens.contains(&entry.token));
         run_owners.sort_by_key(|owner| owner.token);
+        liveness.sort_by_key(|entry| entry.token);
+        supersessions.sort_by_key(|entry| entry.successor_token);
         validate_claim_run_owners(&snapshot.claims, &run_owners)?;
+        validate_claim_liveness(
+            snapshot.next_token,
+            &snapshot.claims,
+            &liveness,
+            &supersessions,
+        )?;
+        if snapshot.next_token == store.current().value.next_token
+            && snapshot.claims == store.current().value.claims
+            && run_owners == store.current().value.run_owners
+            && liveness == store.current().value.liveness
+            && supersessions == store.current().value.supersessions
+        {
+            self.state.verify_lock(&lock)?;
+            return Ok(output);
+        }
         let revision = store
             .current()
             .value
@@ -659,6 +1577,8 @@ impl SyncStore {
             next_token: snapshot.next_token,
             claims: snapshot.claims,
             run_owners,
+            liveness,
+            supersessions,
         };
         if revision % 4_096 == 0 {
             let authenticator = repository_authenticator_key_only(&self.repo_path)?;
@@ -724,6 +1644,8 @@ impl SyncStore {
                 next_token: 1,
                 claims: Vec::new(),
                 run_owners: Vec::new(),
+                liveness: Vec::new(),
+                supersessions: Vec::new(),
             },
             LegacyAdoption::Present(bytes) => {
                 let snapshot = match serde_json::from_slice::<PersistedSyncState>(&bytes) {
@@ -758,6 +1680,8 @@ impl SyncStore {
                     next_token: snapshot.next_token,
                     claims: snapshot.claims,
                     run_owners: Vec::new(),
+                    liveness: Vec::new(),
+                    supersessions: Vec::new(),
                 }
             }
         };
@@ -802,7 +1726,16 @@ impl SyncStore {
             next_token: snapshot.value.next_token,
             claims: snapshot.value.claims.clone(),
         })?;
-        validate_claim_run_owners(&snapshot.value.claims, &snapshot.value.run_owners)
+        validate_claim_run_owners(&snapshot.value.claims, &snapshot.value.run_owners).and_then(
+            |()| {
+                validate_claim_liveness(
+                    snapshot.value.next_token,
+                    &snapshot.value.claims,
+                    &snapshot.value.liveness,
+                    &snapshot.value.supersessions,
+                )
+            },
+        )
     }
 
     fn ensure_legacy_retirement(
@@ -848,6 +1781,8 @@ impl SyncStore {
             next_token: snapshot.next_token,
             claims: snapshot.claims,
             run_owners: Vec::new(),
+            liveness: Vec::new(),
+            supersessions: Vec::new(),
         };
         store.commit(revision, value)?;
         self.state.verify_lock(lock)
@@ -881,6 +1816,227 @@ fn claim_status_report(
         owner_process_id: run_owner.map(|owner| owner.process.pid),
         owner_run_state,
     }
+}
+
+fn current_unix_seconds() -> Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")
+        .map(|duration| duration.as_secs())
+}
+
+fn canonical_claim_id(token: ClaimToken) -> String {
+    format!("claim-{:020}", token.get())
+}
+
+fn new_claim_liveness(
+    claim: &PathClaim,
+    timing: ClaimTiming,
+    now_unix_seconds: u64,
+    supersedes: Option<String>,
+) -> Result<AuthenticatedClaimLiveness> {
+    timing.validate()?;
+    if supersedes
+        .as_ref()
+        .is_some_and(|claim_id| validate_claim_id(claim_id).is_err())
+    {
+        bail!("superseded claim id is invalid");
+    }
+    Ok(AuthenticatedClaimLiveness {
+        token: claim.token,
+        claim_id: canonical_claim_id(claim.token),
+        created_unix_seconds: now_unix_seconds,
+        heartbeat_unix_seconds: now_unix_seconds,
+        heartbeat_interval_seconds: timing.heartbeat_interval_seconds,
+        stale_after_seconds: timing.stale_after_seconds,
+        takeover_eligible_since_unix_seconds: None,
+        supersedes,
+    })
+}
+
+fn claim_liveness_report(
+    claim: PathClaim,
+    liveness: Option<&AuthenticatedClaimLiveness>,
+    now_unix_seconds: u64,
+) -> Result<ClaimLivenessReport> {
+    let Some(liveness) = liveness else {
+        return Ok(ClaimLivenessReport {
+            claim_id: canonical_claim_id(claim.token),
+            claim,
+            state: ClaimLivenessState::Unknown,
+            ambiguity: Some(
+                "authenticated claim predates liveness metadata; exact-owner heartbeat or explicit release is required"
+                    .to_string(),
+            ),
+            created_unix_seconds: None,
+            heartbeat_unix_seconds: None,
+            heartbeat_interval_seconds: None,
+            stale_after_seconds: None,
+            takeover_eligible_since_unix_seconds: None,
+            supersedes: None,
+        });
+    };
+    if liveness.token != claim.token {
+        bail!("claim liveness metadata token does not match its claim");
+    }
+    let mut report = ClaimLivenessReport {
+        claim_id: liveness.claim_id.clone(),
+        claim,
+        state: ClaimLivenessState::Unknown,
+        ambiguity: None,
+        created_unix_seconds: Some(liveness.created_unix_seconds),
+        heartbeat_unix_seconds: Some(liveness.heartbeat_unix_seconds),
+        heartbeat_interval_seconds: Some(liveness.heartbeat_interval_seconds),
+        stale_after_seconds: Some(liveness.stale_after_seconds),
+        takeover_eligible_since_unix_seconds: liveness.takeover_eligible_since_unix_seconds,
+        supersedes: liveness.supersedes.clone(),
+    };
+    if now_unix_seconds < liveness.heartbeat_unix_seconds {
+        report.ambiguity = Some(format!(
+            "observed time {now_unix_seconds} precedes heartbeat {}",
+            liveness.heartbeat_unix_seconds
+        ));
+        return Ok(report);
+    }
+    if let Some(eligible_since) = liveness.takeover_eligible_since_unix_seconds {
+        if now_unix_seconds < eligible_since {
+            report.ambiguity = Some(format!(
+                "observed time {now_unix_seconds} precedes takeover eligibility {eligible_since}"
+            ));
+            return Ok(report);
+        }
+        report.state = ClaimLivenessState::TakeoverEligible;
+        return Ok(report);
+    }
+    let age = now_unix_seconds - liveness.heartbeat_unix_seconds;
+    report.state = if age >= liveness.stale_after_seconds {
+        ClaimLivenessState::Stale
+    } else if age >= liveness.heartbeat_interval_seconds {
+        ClaimLivenessState::HeartbeatDue
+    } else {
+        ClaimLivenessState::Fresh
+    };
+    Ok(report)
+}
+
+fn ensure_unambiguous_liveness(
+    claims: &[PathClaim],
+    liveness: &[AuthenticatedClaimLiveness],
+    supersessions: &[AuthenticatedClaimSupersession],
+    now_unix_seconds: u64,
+) -> Result<()> {
+    ensure_supersession_time_not_future(supersessions, now_unix_seconds)?;
+    let liveness = liveness
+        .iter()
+        .map(|entry| (entry.token, entry))
+        .collect::<BTreeMap<_, _>>();
+    for claim in claims {
+        let report = claim_liveness_report(
+            claim.clone(),
+            liveness.get(&claim.token).copied(),
+            now_unix_seconds,
+        )?;
+        if report.state == ClaimLivenessState::Unknown {
+            bail!(
+                "claim '{}' has ambiguous liveness: {}",
+                report.claim_id,
+                report.ambiguity.as_deref().unwrap_or("unknown reason")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_supersession_time_not_future(
+    supersessions: &[AuthenticatedClaimSupersession],
+    now_unix_seconds: u64,
+) -> Result<()> {
+    if let Some(future) = supersessions
+        .iter()
+        .find(|entry| entry.superseded_at_unix_seconds > now_unix_seconds)
+    {
+        bail!(
+            "claim supersession '{}' has future timestamp {}; observed time is {}; refusing ambiguous clock state",
+            future.successor_claim_id,
+            future.superseded_at_unix_seconds,
+            now_unix_seconds
+        );
+    }
+    Ok(())
+}
+
+fn claim_paths_checksum(paths: &[PathBuf]) -> Result<String> {
+    let payload = serde_json::to_vec(paths).context("failed to encode canonical claim paths")?;
+    Ok(sha256_hex(&payload))
+}
+
+fn claim_supersession_report(value: AuthenticatedClaimSupersession) -> ClaimSupersession {
+    ClaimSupersession {
+        prior_token: value.prior_token,
+        prior_claim_id: value.prior_claim_id,
+        prior_agent_id: value.prior_agent_id,
+        successor_token: value.successor_token,
+        successor_claim_id: value.successor_claim_id,
+        successor_agent_id: value.successor_agent_id,
+        path_count: value.path_count,
+        paths_checksum: value.paths_checksum,
+        superseded_at_unix_seconds: value.superseded_at_unix_seconds,
+    }
+}
+
+fn validate_claim_id(claim_id: &str) -> Result<()> {
+    if claim_id.is_empty() || claim_id.len() > MAX_CLAIM_ID_BYTES {
+        bail!("claim id must be between 1 and {MAX_CLAIM_ID_BYTES} bytes");
+    }
+    if !claim_id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    {
+        bail!("claim id contains unsupported characters");
+    }
+    Ok(())
+}
+
+fn validate_lineage_agent_id(agent_id: &str) -> Result<()> {
+    if agent_id.is_empty() || agent_id.len() > MAX_AGENT_ID_BYTES {
+        bail!("claim lineage agent id has an invalid length");
+    }
+    if !agent_id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    {
+        bail!("claim lineage agent id contains unsupported characters");
+    }
+    Ok(())
+}
+
+fn supersession_lineage_depth(
+    claim_id: &str,
+    supersessions: &[AuthenticatedClaimSupersession],
+) -> Result<usize> {
+    let by_successor = supersessions
+        .iter()
+        .map(|entry| (entry.successor_claim_id.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut seen = BTreeSet::new();
+    let mut current = claim_id;
+    let mut depth = 0usize;
+    while let Some(entry) = by_successor.get(current) {
+        if !seen.insert(current.to_string()) {
+            bail!("claim supersession lineage contains a cycle");
+        }
+        depth = depth
+            .checked_add(1)
+            .context("claim supersession lineage depth overflow")?;
+        if depth > MAX_SUPERSESSION_LINEAGE_DEPTH {
+            bail!(
+                "claim supersession lineage exceeds its {}-claim depth bound",
+                MAX_SUPERSESSION_LINEAGE_DEPTH
+            );
+        }
+        current = &entry.prior_claim_id;
+    }
+    Ok(depth)
 }
 
 fn validate_claim_run_owners(
@@ -931,6 +2087,149 @@ fn validate_claim_run_owners(
     Ok(())
 }
 
+fn validate_claim_liveness(
+    next_token: u64,
+    claims: &[PathClaim],
+    liveness: &[AuthenticatedClaimLiveness],
+    supersessions: &[AuthenticatedClaimSupersession],
+) -> Result<()> {
+    if liveness.len() > claims.len() {
+        bail!("authenticated claim liveness count exceeds active claim count");
+    }
+    if supersessions.len() > MAX_SUPERSESSION_RECORDS {
+        bail!(
+            "authenticated claim supersession history exceeds its {} record bound",
+            MAX_SUPERSESSION_RECORDS
+        );
+    }
+    let active_claims = claims
+        .iter()
+        .map(|claim| (claim.token, claim))
+        .collect::<BTreeMap<_, _>>();
+    let mut active_liveness = BTreeMap::new();
+    for entry in liveness {
+        if !active_claims.contains_key(&entry.token) {
+            bail!(
+                "authenticated liveness references inactive claim token {}",
+                entry.token.get()
+            );
+        }
+        if active_liveness.insert(entry.token, entry).is_some() {
+            bail!(
+                "authenticated claim token {} has duplicate liveness metadata",
+                entry.token.get()
+            );
+        }
+        validate_claim_id(&entry.claim_id)?;
+        if entry.claim_id != canonical_claim_id(entry.token) {
+            bail!("authenticated claim id is not canonical for its token");
+        }
+        ClaimTiming::new(entry.heartbeat_interval_seconds, entry.stale_after_seconds)?;
+        if entry.created_unix_seconds > entry.heartbeat_unix_seconds {
+            bail!("authenticated claim heartbeat predates claim creation");
+        }
+        if let Some(eligible) = entry.takeover_eligible_since_unix_seconds {
+            let eligible_age = eligible
+                .checked_sub(entry.heartbeat_unix_seconds)
+                .context("authenticated claim eligibility predates its last heartbeat")?;
+            if eligible_age < entry.stale_after_seconds {
+                bail!("authenticated claim eligibility was recorded before the stale threshold");
+            }
+        }
+        if let Some(supersedes) = &entry.supersedes {
+            validate_claim_id(supersedes)?;
+            if supersedes == &entry.claim_id {
+                bail!("authenticated claim cannot supersede itself");
+            }
+        }
+    }
+
+    let mut by_prior = BTreeMap::new();
+    let mut by_successor = BTreeMap::new();
+    for entry in supersessions {
+        if entry.prior_token.get() == 0 || entry.successor_token.get() == 0 {
+            bail!("authenticated claim supersession contains token zero");
+        }
+        if entry.successor_token <= entry.prior_token {
+            bail!("authenticated claim supersession tokens are not monotonic");
+        }
+        if entry.prior_token.get() >= next_token || entry.successor_token.get() >= next_token {
+            bail!("authenticated claim supersession token reaches or exceeds next_token");
+        }
+        if active_claims.contains_key(&entry.prior_token) {
+            bail!("authenticated supersession predecessor remains active");
+        }
+        validate_claim_id(&entry.prior_claim_id)?;
+        validate_claim_id(&entry.successor_claim_id)?;
+        if entry.prior_claim_id != canonical_claim_id(entry.prior_token)
+            || entry.successor_claim_id != canonical_claim_id(entry.successor_token)
+        {
+            bail!("authenticated claim supersession contains a noncanonical claim id");
+        }
+        validate_lineage_agent_id(&entry.prior_agent_id)?;
+        validate_lineage_agent_id(&entry.successor_agent_id)?;
+        if entry.path_count == 0 || entry.path_count > MAX_SYNC_PATHS {
+            bail!("authenticated claim supersession path count is out of bounds");
+        }
+        if entry.paths_checksum.len() != 64
+            || !entry
+                .paths_checksum
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!("authenticated claim supersession path checksum is invalid");
+        }
+        if by_prior.insert(entry.prior_token, entry).is_some() {
+            bail!("authenticated claim was superseded more than once");
+        }
+        if by_successor.insert(entry.successor_token, entry).is_some() {
+            bail!("authenticated claim successor has more than one predecessor");
+        }
+    }
+
+    for entry in supersessions {
+        if let Some(previous) = by_successor.get(&entry.prior_token) {
+            if previous.superseded_at_unix_seconds > entry.superseded_at_unix_seconds {
+                bail!("authenticated claim supersession time moved backward");
+            }
+            if previous.successor_claim_id != entry.prior_claim_id
+                || previous.successor_agent_id != entry.prior_agent_id
+                || previous.path_count != entry.path_count
+                || previous.paths_checksum != entry.paths_checksum
+            {
+                bail!("authenticated claim supersession lineage changed owner or scope");
+            }
+        }
+        supersession_lineage_depth(&entry.successor_claim_id, supersessions)?;
+        if active_claims.contains_key(&entry.successor_token)
+            && !active_liveness.contains_key(&entry.successor_token)
+        {
+            bail!("active successor claim is missing its audited liveness metadata");
+        }
+    }
+
+    for (token, entry) in &active_liveness {
+        let lineage = by_successor.get(token).copied();
+        match (&entry.supersedes, lineage) {
+            (None, None) => {}
+            (Some(prior), Some(lineage)) if prior == &lineage.prior_claim_id => {
+                let claim = active_claims
+                    .get(token)
+                    .context("active liveness lost its claim during validation")?;
+                if claim.agent_id != lineage.successor_agent_id
+                    || claim.paths.len() != lineage.path_count
+                    || claim_paths_checksum(&claim.paths)? != lineage.paths_checksum
+                    || entry.created_unix_seconds != lineage.superseded_at_unix_seconds
+                {
+                    bail!("active successor claim no longer matches its audited lineage");
+                }
+            }
+            _ => bail!("active successor claim lineage metadata is inconsistent"),
+        }
+    }
+    Ok(())
+}
+
 fn validate_sync_snapshot(snapshot: &SyncSnapshot) -> Result<()> {
     if snapshot.next_token == 0 {
         bail!("sync state next_token must be nonzero");
@@ -942,7 +2241,9 @@ fn validate_sync_snapshot(snapshot: &SyncSnapshot) -> Result<()> {
         );
     }
     let mut path_count = 0usize;
+    let mut max_token = 0u64;
     for claim in &snapshot.claims {
+        max_token = max_token.max(claim.token.get());
         if claim.agent_id.len() > MAX_AGENT_ID_BYTES {
             bail!("sync state agent id exceeds {MAX_AGENT_ID_BYTES} bytes");
         }
@@ -958,6 +2259,9 @@ fn validate_sync_snapshot(snapshot: &SyncSnapshot) -> Result<()> {
         for path in &claim.paths {
             validate_state_path(path)?;
         }
+    }
+    if snapshot.next_token <= max_token {
+        bail!("sync state next_token must be greater than every active claim token");
     }
     Ok(())
 }
@@ -1053,7 +2357,7 @@ fn ensure_private_state_file(path: &Path) -> Result<FileIdentity> {
 mod tests {
     use super::*;
     use crate::{
-        artifacts::state_auth::{authentication_key_file_name, sha256_hex},
+        artifacts::state_auth::authentication_key_file_name,
         megafile::{
             set_record_claim_fault, FileSizeSample, MegafileStore, MegafileThresholdCalibration,
             MAX_CLAIM_TELEMETRY_TARGETS,
@@ -1112,6 +2416,543 @@ mod tests {
         }
     }
 
+    fn test_timing() -> ClaimTiming {
+        ClaimTiming::new(10, 20).expect("valid test timing")
+    }
+
+    #[test]
+    fn issue_84_stale_claim_is_rejected_by_existing_only_gate() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        let claim = store
+            .claim_paths_with_timing_at("owner", ["src"], test_timing(), 100)
+            .expect("timed claim")
+            .claim;
+        let error = lock_existing_authenticated_claims(
+            &repo_path,
+            vec![ExistingClaimBindingRequest {
+                agent_id: claim.agent_id.clone(),
+                token: claim.token,
+                paths: claim.paths.clone(),
+            }],
+        )
+        .expect_err("stale claim must stop the harness");
+        assert!(error.to_string().contains("not live"));
+    }
+
+    #[test]
+    fn issue_84_takeover_lineage_rejects_superseded_token() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        let prior = store
+            .claim_paths_with_timing_at("owner", ["src"], test_timing(), 100)
+            .expect("timed claim")
+            .claim;
+        store
+            .sweep_stale_at(120)
+            .expect("persist takeover eligibility");
+        store
+            .takeover_at(prior.token, "successor", None, 121)
+            .expect("takeover");
+        let error = lock_existing_authenticated_claims(
+            &repo_path,
+            vec![ExistingClaimBindingRequest {
+                agent_id: prior.agent_id.clone(),
+                token: prior.token,
+                paths: prior.paths.clone(),
+            }],
+        )
+        .expect_err("superseded predecessor must stop the harness");
+        assert!(error.to_string().contains("superseded"));
+    }
+
+    fn authenticated_claims_state(store: &SyncStore) -> AuthenticatedClaimsState {
+        let lock = store.state.lock().expect("claims lock");
+        store
+            .open_authenticated_store(&lock)
+            .expect("authenticated claims")
+            .current()
+            .value
+            .clone()
+    }
+
+    fn commit_unvalidated_authenticated_state(
+        store: &SyncStore,
+        mutate: impl FnOnce(&mut AuthenticatedClaimsState),
+    ) {
+        let lock = store.state.lock().expect("claims lock");
+        let mut authenticated = store
+            .open_authenticated_store(&lock)
+            .expect("authenticated claims");
+        let revision = authenticated
+            .current()
+            .value
+            .snapshot_revision
+            .checked_add(1)
+            .expect("test revision");
+        let mut value = authenticated.current().value.clone();
+        value.snapshot_revision = revision;
+        mutate(&mut value);
+        authenticated
+            .commit(revision, value)
+            .expect("commit signed malformed test state");
+    }
+
+    #[test]
+    fn claim_timing_rejects_zero_equal_reversed_and_over_bound_values() {
+        assert!(ClaimTiming::new(0, 2).is_err());
+        assert!(ClaimTiming::new(1, 0).is_err());
+        assert!(ClaimTiming::new(2, 2).is_err());
+        assert!(ClaimTiming::new(3, 2).is_err());
+        assert!(
+            ClaimTiming::new(MAX_CLAIM_TIMING_SECONDS + 1, MAX_CLAIM_TIMING_SECONDS + 1).is_err()
+        );
+        assert!(ClaimTiming::new(1, MAX_CLAIM_TIMING_SECONDS + 1).is_err());
+    }
+
+    #[test]
+    fn liveness_defaults_and_exact_stale_boundary_are_deterministic() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        let claim = store
+            .claim_paths_with_timing_at("owner", ["src"], test_timing(), 100)
+            .expect("timed claim")
+            .claim;
+
+        assert_eq!(
+            store.liveness_snapshot_at(109).expect("fresh")[0].state,
+            ClaimLivenessState::Fresh
+        );
+        assert_eq!(
+            store.liveness_snapshot_at(110).expect("due")[0].state,
+            ClaimLivenessState::HeartbeatDue
+        );
+        assert_eq!(
+            store.liveness_snapshot_at(119).expect("still due")[0].state,
+            ClaimLivenessState::HeartbeatDue
+        );
+        assert_eq!(
+            store
+                .liveness_snapshot_at(120)
+                .expect("exact stale boundary")[0]
+                .state,
+            ClaimLivenessState::Stale
+        );
+        assert_eq!(
+            store.owner_of("src/lib.rs").expect("owner").owner,
+            Some("owner".to_string())
+        );
+        assert_eq!(claim.token.get(), 1);
+    }
+
+    #[test]
+    fn heartbeat_before_sweep_refreshes_but_eligibility_is_sticky_after_sweep() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        let claim = store
+            .claim_paths_with_timing_at("owner", ["src"], test_timing(), 100)
+            .expect("timed claim")
+            .claim;
+
+        let refreshed = store
+            .heartbeat_at(claim.token, "owner", None, 119)
+            .expect("heartbeat before sweep");
+        assert_eq!(refreshed.state, ClaimLivenessState::Fresh);
+        assert!(store
+            .sweep_stale_at(138)
+            .expect("not yet stale")
+            .newly_takeover_eligible
+            .is_empty());
+        let swept = store.sweep_stale_at(139).expect("exact stale sweep");
+        assert_eq!(
+            swept.newly_takeover_eligible,
+            vec![canonical_claim_id(claim.token)]
+        );
+        assert_eq!(swept.claims[0].state, ClaimLivenessState::TakeoverEligible);
+        assert_eq!(
+            store.owner_of("src/lib.rs").expect("owner remains").owner,
+            Some("owner".to_string())
+        );
+
+        let late = store
+            .heartbeat_at(claim.token, "owner", None, 140)
+            .expect_err("sticky eligibility rejects late heartbeat");
+        assert!(late.to_string().contains("cannot be revived"));
+        assert_eq!(
+            store.liveness_snapshot_at(140).expect("still eligible")[0].state,
+            ClaimLivenessState::TakeoverEligible
+        );
+    }
+
+    #[test]
+    fn no_op_sweep_does_not_advance_authenticated_revision() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        store
+            .claim_paths_with_timing_at("owner", ["src"], test_timing(), 100)
+            .expect("timed claim");
+        let before_fresh_sweep = authenticated_claims_state(&store).snapshot_revision;
+        assert!(store
+            .sweep_stale_at(119)
+            .expect("fresh no-op sweep")
+            .newly_takeover_eligible
+            .is_empty());
+        assert_eq!(
+            authenticated_claims_state(&store).snapshot_revision,
+            before_fresh_sweep
+        );
+
+        store.sweep_stale_at(120).expect("eligibility commit");
+        let before_repeat = authenticated_claims_state(&store).snapshot_revision;
+        assert!(store
+            .sweep_stale_at(121)
+            .expect("eligible no-op sweep")
+            .newly_takeover_eligible
+            .is_empty());
+        assert_eq!(
+            authenticated_claims_state(&store).snapshot_revision,
+            before_repeat
+        );
+    }
+
+    #[test]
+    fn takeover_is_atomic_and_preserves_auditable_lineage() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        let prior = store
+            .claim_paths_with_timing_at("owner", ["src", "README.md"], test_timing(), 100)
+            .expect("timed claim")
+            .claim;
+        store.sweep_stale_at(120).expect("mark eligible");
+
+        let outcome = store
+            .takeover_at(prior.token, "successor", None, 121)
+            .expect("take over stale claim");
+
+        assert_eq!(outcome.superseded_claim, prior);
+        assert_eq!(outcome.claim.token.get(), 2);
+        assert_eq!(outcome.claim.agent_id, "successor");
+        assert_eq!(outcome.claim.paths, prior.paths);
+        assert_eq!(outcome.liveness.state, ClaimLivenessState::Fresh);
+        assert_eq!(
+            outcome.liveness.supersedes.as_deref(),
+            Some(canonical_claim_id(prior.token).as_str())
+        );
+        assert_eq!(outcome.lineage.prior_agent_id, "owner");
+        assert_eq!(outcome.lineage.successor_agent_id, "successor");
+        assert_eq!(outcome.lineage.path_count, prior.paths.len());
+        assert_eq!(
+            store.owner_of("src/lib.rs").expect("successor owner").owner,
+            Some("successor".to_string())
+        );
+        let state = authenticated_claims_state(&store);
+        assert_eq!(state.claims, vec![outcome.claim]);
+        assert_eq!(state.supersessions.len(), 1);
+    }
+
+    #[test]
+    fn takeover_telemetry_failure_reports_durable_successor_and_lineage() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        let prior = store
+            .claim_paths_with_timing_at("owner", ["src"], test_timing(), 100)
+            .expect("timed claim")
+            .claim;
+        store.sweep_stale_at(120).expect("mark eligible");
+        set_record_claim_fault();
+
+        let error = store
+            .takeover_at(prior.token, "successor", None, 121)
+            .expect_err("takeover telemetry fault");
+        let message = format!("{error:#}");
+        assert!(message.contains("successor claim token 2 remains durable"));
+        assert!(message.contains("explicitly release token 2"));
+        let state = authenticated_claims_state(&store);
+        assert_eq!(state.claims.len(), 1);
+        assert_eq!(state.claims[0].token.get(), 2);
+        assert_eq!(state.claims[0].agent_id, "successor");
+        assert_eq!(state.supersessions.len(), 1);
+    }
+
+    #[test]
+    fn legacy_claim_is_readable_but_blocks_mutation_until_exact_owner_heartbeat() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        let legacy_claim = PathClaim {
+            token: ClaimToken::from_u64(1),
+            agent_id: "legacy-owner".to_string(),
+            paths: vec![PathBuf::from("src")],
+        };
+        let lock = store.state.lock().expect("claims lock");
+        store
+            .save_snapshot(
+                &lock,
+                SyncSnapshot {
+                    next_token: 2,
+                    claims: vec![legacy_claim.clone()],
+                },
+            )
+            .expect("save legacy-shaped authenticated snapshot");
+        drop(lock);
+
+        let report = store.liveness_snapshot_at(100).expect("legacy liveness");
+        assert_eq!(report[0].claim, legacy_claim);
+        assert_eq!(report[0].state, ClaimLivenessState::Unknown);
+        assert!(store
+            .claim_paths_with_timing_at("other", ["README.md"], test_timing(), 100)
+            .expect_err("ambiguous legacy state blocks ordinary claim")
+            .to_string()
+            .contains("ambiguous liveness"));
+        assert!(store
+            .sweep_stale_at(100)
+            .expect_err("ambiguous legacy state blocks sweep")
+            .to_string()
+            .contains("ambiguous liveness"));
+        assert!(store
+            .takeover_at(legacy_claim.token, "other", None, 100)
+            .expect_err("ambiguous legacy state blocks takeover")
+            .to_string()
+            .contains("ambiguous liveness"));
+        assert!(store
+            .heartbeat_at(legacy_claim.token, "not-owner", None, 100)
+            .expect_err("wrong owner cannot initialize")
+            .to_string()
+            .contains("does not exactly match"));
+
+        let initialized = store
+            .heartbeat_at(legacy_claim.token, "legacy-owner", Some(test_timing()), 100)
+            .expect("exact owner initializes legacy metadata");
+        assert_eq!(initialized.state, ClaimLivenessState::Fresh);
+        store
+            .claim_paths_with_timing_at("other", ["README.md"], test_timing(), 101)
+            .expect("unambiguous state permits disjoint claim");
+    }
+
+    #[test]
+    fn future_heartbeat_and_clock_rollback_fail_closed_without_mutation() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        let claim = store
+            .claim_paths_with_timing_at("owner", ["src"], test_timing(), 200)
+            .expect("future claim")
+            .claim;
+        let before = authenticated_claims_state(&store);
+
+        let report = store.liveness_snapshot_at(199).expect("future report");
+        assert_eq!(report[0].state, ClaimLivenessState::Unknown);
+        assert!(report[0]
+            .ambiguity
+            .as_deref()
+            .is_some_and(|message| message.contains("precedes heartbeat")));
+        assert!(store
+            .heartbeat_at(claim.token, "owner", None, 199)
+            .expect_err("rollback heartbeat")
+            .to_string()
+            .contains("move backward"));
+        assert!(store
+            .sweep_stale_at(199)
+            .expect_err("future state blocks sweep")
+            .to_string()
+            .contains("ambiguous liveness"));
+        assert_eq!(authenticated_claims_state(&store), before);
+    }
+
+    #[test]
+    fn concurrent_takeovers_commit_exactly_one_successor() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        let prior = store
+            .claim_paths_with_timing_at("owner", ["src"], test_timing(), 100)
+            .expect("timed claim")
+            .claim;
+        store.sweep_stale_at(120).expect("mark eligible");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for agent in ["contender-b", "contender-a"] {
+            let worker_store = store.clone();
+            let worker_barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                worker_barrier.wait();
+                worker_store.takeover_at(prior.token, agent, None, 121)
+            }));
+        }
+        barrier.wait();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("takeover worker"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_err()).count(),
+            1
+        );
+        let state = authenticated_claims_state(&store);
+        assert_eq!(state.claims.len(), 1);
+        assert_eq!(state.claims[0].token.get(), 2);
+        assert_eq!(state.supersessions.len(), 1);
+        assert_eq!(state.supersessions[0].prior_token, prior.token);
+        assert_eq!(
+            state.supersessions[0].successor_token,
+            state.claims[0].token
+        );
+    }
+
+    #[test]
+    fn authenticated_schema_accepts_missing_legacy_sidecars_and_rejects_unknown_fields() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        store
+            .claim_paths_with_timing_at("owner", ["src"], test_timing(), 100)
+            .expect("timed claim");
+        let value = authenticated_claims_state(&store);
+        let encoded = serde_json::to_value(&value).expect("authenticated value");
+        let mut unknown_liveness = encoded.clone();
+        unknown_liveness["liveness"][0]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<AuthenticatedClaimsState>(unknown_liveness).is_err());
+
+        let mut legacy = encoded;
+        let object = legacy.as_object_mut().expect("object");
+        object.remove("liveness");
+        object.remove("supersessions");
+        let decoded: AuthenticatedClaimsState =
+            serde_json::from_value(legacy.clone()).expect("legacy defaults");
+        assert!(decoded.liveness.is_empty());
+        assert!(decoded.supersessions.is_empty());
+
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .insert("unexpected".to_string(), serde_json::json!(true));
+        assert!(serde_json::from_value::<AuthenticatedClaimsState>(legacy).is_err());
+    }
+
+    #[test]
+    fn signed_duplicate_liveness_and_malformed_lineage_fail_on_open() {
+        let duplicate_temp = TempDir::new().expect("duplicate tempdir");
+        let duplicate_repo = duplicate_temp.path().join("repo");
+        WorktreeManager::init_repository(&duplicate_repo, "main").expect("init duplicate repo");
+        let duplicate_store = SyncStore::open(&duplicate_repo).expect("open duplicate claims");
+        duplicate_store
+            .claim_paths_with_timing_at("owner", ["src"], test_timing(), 100)
+            .expect("timed duplicate claim");
+        duplicate_store
+            .claim_paths_with_timing_at("other", ["tests"], test_timing(), 100)
+            .expect("second timed duplicate claim");
+        commit_unvalidated_authenticated_state(&duplicate_store, |state| {
+            state.liveness[1] = state.liveness[0].clone();
+        });
+        let duplicate_error = SyncStore::open(&duplicate_repo)
+            .expect_err("signed duplicate liveness must fail closed");
+        assert!(format!("{duplicate_error:#}").contains("duplicate liveness metadata"));
+
+        let lineage_temp = TempDir::new().expect("lineage tempdir");
+        let lineage_repo = lineage_temp.path().join("repo");
+        WorktreeManager::init_repository(&lineage_repo, "main").expect("init lineage repo");
+        let lineage_store = SyncStore::open(&lineage_repo).expect("open lineage claims");
+        let active = lineage_store
+            .claim_paths_with_timing_at("owner", ["src"], test_timing(), 100)
+            .expect("timed lineage claim")
+            .claim;
+        commit_unvalidated_authenticated_state(&lineage_store, |state| {
+            state.next_token = 3;
+            state.supersessions.push(AuthenticatedClaimSupersession {
+                prior_token: active.token,
+                prior_claim_id: canonical_claim_id(active.token),
+                prior_agent_id: active.agent_id.clone(),
+                successor_token: ClaimToken::from_u64(2),
+                successor_claim_id: canonical_claim_id(ClaimToken::from_u64(2)),
+                successor_agent_id: "successor".to_string(),
+                path_count: active.paths.len(),
+                paths_checksum: claim_paths_checksum(&active.paths).expect("path checksum"),
+                superseded_at_unix_seconds: 120,
+            });
+        });
+        let lineage_error =
+            SyncStore::open(&lineage_repo).expect_err("active predecessor must fail closed");
+        assert!(format!("{lineage_error:#}").contains("predecessor remains active"));
+    }
+
+    #[test]
+    fn validator_rejects_early_eligibility_and_successor_time_mismatch() {
+        let claim = PathClaim {
+            token: ClaimToken::from_u64(1),
+            agent_id: "owner".to_string(),
+            paths: vec![PathBuf::from("src")],
+        };
+        let mut early =
+            new_claim_liveness(&claim, test_timing(), 100, None).expect("claim liveness");
+        early.takeover_eligible_since_unix_seconds = Some(119);
+        assert!(
+            validate_claim_liveness(2, std::slice::from_ref(&claim), &[early], &[])
+                .expect_err("early eligibility")
+                .to_string()
+                .contains("before the stale threshold")
+        );
+
+        let successor = PathClaim {
+            token: ClaimToken::from_u64(2),
+            agent_id: "successor".to_string(),
+            paths: claim.paths.clone(),
+        };
+        let prior_id = canonical_claim_id(claim.token);
+        let successor_liveness =
+            new_claim_liveness(&successor, test_timing(), 121, Some(prior_id.clone()))
+                .expect("successor liveness");
+        let history = AuthenticatedClaimSupersession {
+            prior_token: claim.token,
+            prior_claim_id: prior_id,
+            prior_agent_id: claim.agent_id,
+            successor_token: successor.token,
+            successor_claim_id: canonical_claim_id(successor.token),
+            successor_agent_id: successor.agent_id.clone(),
+            path_count: successor.paths.len(),
+            paths_checksum: claim_paths_checksum(&successor.paths).expect("path checksum"),
+            superseded_at_unix_seconds: 120,
+        };
+        assert!(validate_claim_liveness(
+            3,
+            std::slice::from_ref(&successor),
+            &[successor_liveness],
+            std::slice::from_ref(&history),
+        )
+        .expect_err("successor time mismatch")
+        .to_string()
+        .contains("audited lineage"));
+        assert!(
+            ensure_supersession_time_not_future(std::slice::from_ref(&history), 119)
+                .expect_err("future lineage time")
+                .to_string()
+                .contains("ambiguous clock state")
+        );
+        assert!(validate_claim_liveness(2, &[], &[], &[history])
+            .expect_err("historical token reuse guard")
+            .to_string()
+            .contains("reaches or exceeds next_token"));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn run_owned_status_distinguishes_live_holder_from_leftover_after_process_exit() {
@@ -1126,6 +2967,8 @@ mod tests {
                 "interrupted-assignment",
                 ["README.md"],
                 MegafileThresholds::provisional_bootstrap(),
+                ClaimTiming::default(),
+                current_unix_seconds().expect("current time"),
                 Some(("interrupted-run".to_string(), process)),
             )
             .expect("record run-owned claim")
@@ -1178,7 +3021,7 @@ mod tests {
         let writer_thread = std::thread::spawn(move || {
             ready_tx.send(()).expect("signal ready");
             start_rx.recv().expect("receive start");
-            writer.with_locked_update(|coordinator| {
+            writer.with_locked_update(|coordinator, _, _, _| {
                 coordinator
                     .claim_paths("neutral-arbiter", ["src"])
                     .map_err(Into::into)

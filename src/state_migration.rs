@@ -204,6 +204,38 @@ pub(crate) fn set_legacy_retirement_fault(point: LegacyRetirementFaultPoint) {
 }
 
 #[cfg(test)]
+thread_local! {
+    static LEGACY_RETIREMENT_MUTATIONS_NEUTERED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct LegacyRetirementMutationNeuter {
+    previous: bool,
+}
+
+#[cfg(test)]
+impl Drop for LegacyRetirementMutationNeuter {
+    fn drop(&mut self) {
+        LEGACY_RETIREMENT_MUTATIONS_NEUTERED.with(|slot| slot.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn neuter_legacy_retirement_mutations() -> LegacyRetirementMutationNeuter {
+    let previous = LEGACY_RETIREMENT_MUTATIONS_NEUTERED.with(|slot| slot.replace(true));
+    LegacyRetirementMutationNeuter { previous }
+}
+
+#[cfg(test)]
+fn reject_neutered_legacy_retirement_mutation() -> Result<()> {
+    if LEGACY_RETIREMENT_MUTATIONS_NEUTERED.with(std::cell::Cell::get) {
+        bail!("legacy retirement mutation surface was neutered by the test")
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn run_legacy_retirement_fault(point: LegacyRetirementFaultPoint) -> Result<()> {
     let triggered = LEGACY_RETIREMENT_FAULT.with(|slot| {
         if slot.get() == Some(point) {
@@ -280,6 +312,8 @@ pub(crate) fn prepare_legacy_retirement<S: SnapshotSpec>(
     domain: AuthenticationDomain,
     legacy_fence: &impl Fn() -> Result<()>,
 ) -> Result<LegacyRetirementPreparation> {
+    #[cfg(test)]
+    reject_neutered_legacy_retirement_mutation()?;
     legacy_fence()?;
     let repository = crate::git_repository::discover(repo_path)?;
     let common_root = SafeRoot::open_existing(repository.commondir())?;
@@ -469,6 +503,8 @@ pub(crate) fn finalize_legacy_retirement<S: SnapshotSpec>(
     snapshot_generation: u64,
     legacy_fence: &impl Fn() -> Result<()>,
 ) -> Result<()> {
+    #[cfg(test)]
+    reject_neutered_legacy_retirement_mutation()?;
     legacy_fence()?;
     let repository = crate::git_repository::discover(repo_path)?;
     let common_root = SafeRoot::open_existing(repository.commondir())?;
@@ -538,6 +574,47 @@ pub(crate) fn finalize_legacy_retirement<S: SnapshotSpec>(
         &tombstone.descriptor,
         legacy_fence,
     )
+}
+
+/// Verifies that an already-published authenticated snapshot is paired with
+/// the exact active legacy-retirement tombstone, without completing or
+/// cleaning any transitional state.
+///
+/// This is intentionally stricter than the recovery-capable consumer open:
+/// pending tombstones and leftover intent/sidecar files are reported as state
+/// requiring recovery. No root, lock, file, or snapshot is created here.
+pub(crate) fn verify_existing_active_legacy_retirement<S: SnapshotSpec>(
+    repo_path: &Path,
+    consumer: &str,
+    file_name: &str,
+    domain: AuthenticationDomain,
+    snapshot_identity: &JournalIdentity,
+    snapshot_generation: u64,
+) -> Result<()> {
+    let repository = crate::git_repository::discover(repo_path)?;
+    let common_root = SafeRoot::open_existing(repository.commondir())?;
+    let state_root = SafeRoot::open_existing(common_root.path().join("maco/state"))?;
+    let bytes = BoundedRegularReader::read_direct(&state_root, file_name, MAX_LEGACY_STATE_BYTES)?;
+    let authenticator = repository_authenticator_key_only(repo_path)?;
+    authenticator.verify_repository_binding(&snapshot_identity.repository)?;
+    let tombstone =
+        verify_retirement_tombstone(&authenticator, consumer, file_name, domain, &bytes)?;
+    if tombstone.phase != LegacyRetirementPhase::Active
+        || tombstone.snapshot_identity.as_ref() != Some(snapshot_identity)
+        || tombstone.snapshot_generation != Some(snapshot_generation)
+    {
+        bail!(
+            "legacy retirement is not active for the exact authenticated snapshot; recovery is required"
+        );
+    }
+
+    let consumer_root = AuthenticatedStateJournal::<S>::existing_root(&authenticator)?;
+    if consumer_root.direct_child_exists(RETIREMENT_INTENT_FILE)?
+        || consumer_root.direct_child_exists(RETIREMENT_SIDECAR_FILE)?
+    {
+        bail!("active legacy retirement still has transitional residue; recovery is required");
+    }
+    authenticator.verify_epoch()
 }
 
 fn pending_retirement_tombstone(

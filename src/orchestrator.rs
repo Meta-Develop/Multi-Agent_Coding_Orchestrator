@@ -10,6 +10,11 @@ use crate::{
         decode_agent_checkpoint, decode_run_checkpoint, encode_agent_checkpoint,
         encode_run_checkpoint, LosslessPath,
     },
+    collect_revalidation::{
+        lock_existing_worker_claim_batch, revalidate_existing_worker_batch,
+        revalidate_existing_worker_batch_from_claim_guard, RevalidationGuard,
+        RevalidationHeadExpectation, RevalidationRequest,
+    },
     merge::capture_worktree_diff_from_commit,
     process_runner::{
         run_process, trusted_system_executable, CapturedBytes, EnvironmentMode, ProcessRunError,
@@ -26,8 +31,8 @@ use crate::{
     sync::{normalize_repo_relative_path, ClaimToken, PathClaim},
     sync_store::SyncStore,
     worktree::{
-        normalize_agent_id, ManagedWorktreeWriteLease, WorktreeCreateOptions, WorktreeManager,
-        WorktreeRecord,
+        normalize_agent_id, ExistingWorktreeBindingRequest, ManagedWorktreeWriteLease,
+        WorktreeCreateOptions, WorktreeManager, WorktreeRecord,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -943,11 +948,6 @@ fn run_plan_with_controls_runtime(
     controls: OrchestrationRunControls,
     runtime: OrchestrationExecutionRuntime,
 ) -> Result<OrchestrationSummary> {
-    if runtime == OrchestrationExecutionRuntime::Verified {
-        bail!(
-            "orchestration assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
-        );
-    }
     if options.jobs == 0 {
         bail!("orchestration jobs must be at least 1");
     }
@@ -1053,6 +1053,24 @@ fn run_plan_with_controls_runtime(
                 semantic_cleanup.tokens_mut(),
             );
         }
+        let claims_checkpoint_expected = summaries
+            .iter()
+            .enumerate()
+            .filter(|(_, summary)| summary.claim.is_some())
+            .map(|(index, _)| (index, repo_head))
+            .collect::<Vec<_>>();
+        let claims_checkpoint_guard = if claims_checkpoint_expected.is_empty() {
+            None
+        } else {
+            Some(revalidate_selected_batch(
+                &repo,
+                &manager,
+                &plan,
+                &summaries,
+                &worktrees,
+                &claims_checkpoint_expected,
+            )?)
+        };
         write_checkpoint_if_configured(
             &controls,
             RunCheckpointStage::ClaimsAcquired,
@@ -1075,9 +1093,14 @@ fn run_plan_with_controls_runtime(
                 semantic_release_errors: &[],
             },
         )?;
+        if let Some(guard) = claims_checkpoint_guard.as_ref() {
+            guard.verify()?;
+        }
+        drop(claims_checkpoint_guard);
 
         let captured_candidates = run_agent_schedule_with_patch_dir(
             &AgentScheduleContext {
+                repo: &repo,
                 manager: &manager,
                 plan: &plan,
                 worktrees: &worktrees,
@@ -1089,6 +1112,7 @@ fn run_plan_with_controls_runtime(
             options.patch_dir.as_deref(),
             checkpoint_writer.as_mut(),
         )?;
+        let mut agents_completed_published = false;
         if summaries
             .iter()
             .all(|summary| summary.status == AgentRunStatus::Succeeded)
@@ -1100,50 +1124,96 @@ fn run_plan_with_controls_runtime(
                     &serde_json::json!({ "agent_count": summaries.len() }),
                 )?;
             }
-            let outcome = run_repo_validation_commands(
-                &plan,
-                &repo,
-                &manager,
-                &worktrees,
-                &repo_head,
-                &captured_candidates,
+            let validation_context = RepoValidationContext {
+                plan: &plan,
+                repo: &repo,
+                manager: &manager,
+                worktrees: &worktrees,
+                agent_summaries: &summaries,
+                base_oid: &repo_head,
+                candidates: &captured_candidates,
                 runtime,
-            );
+            };
+            let outcome = run_repo_validation_commands(&validation_context, |outcome| {
+                if let Some(writer) = checkpoint_writer.as_mut() {
+                    writer.event(
+                        PHASE_REPO_VALIDATED,
+                        None,
+                        &serde_json::json!({
+                            "validation_count": outcome.summaries.len(),
+                            "has_target": outcome.target.is_some(),
+                        }),
+                    )?;
+                }
+                write_checkpoint_if_configured(
+                    &controls,
+                    RunCheckpointStage::AgentsCompleted,
+                    &run_id,
+                    checkpoint_writer.as_mut(),
+                    CheckpointView {
+                        repo: &repo,
+                        repo_head: &repo_head,
+                        plan_file: &options.plan_file,
+                        plan: &plan,
+                        keep_claims: options.keep_claims,
+                        worktree_reuse_policy,
+                        success: false,
+                        agents: &summaries,
+                        repo_validation: &outcome.summaries,
+                        repo_validation_target: outcome.target.as_ref(),
+                        released_claims: &[],
+                        release_errors: &[],
+                        released_semantic_intents: &[],
+                        semantic_release_errors: &[],
+                    },
+                )?;
+                agents_completed_published = true;
+                Ok(())
+            })?;
             repo_validation = outcome.summaries;
             repo_validation_target = outcome.target;
-            if let Some(writer) = checkpoint_writer.as_mut() {
-                writer.event(
-                    PHASE_REPO_VALIDATED,
-                    None,
-                    &serde_json::json!({
-                        "validation_count": repo_validation.len(),
-                        "has_target": repo_validation_target.is_some(),
-                    }),
-                )?;
-            }
         }
-        write_checkpoint_if_configured(
-            &controls,
-            RunCheckpointStage::AgentsCompleted,
-            &run_id,
-            checkpoint_writer.as_mut(),
-            CheckpointView {
-                repo: &repo,
-                repo_head: &repo_head,
-                plan_file: &options.plan_file,
-                plan: &plan,
-                keep_claims: options.keep_claims,
-                worktree_reuse_policy,
-                success: false,
-                agents: &summaries,
-                repo_validation: &repo_validation,
-                repo_validation_target: repo_validation_target.as_ref(),
-                released_claims: &[],
-                release_errors: &[],
-                released_semantic_intents: &[],
-                semantic_release_errors: &[],
-            },
-        )?;
+        if !agents_completed_published {
+            let checkpoint_expected = checkpoint_revalidation_expectations(&summaries, repo_head)?;
+            let checkpoint_guard = if checkpoint_expected.is_empty() {
+                None
+            } else {
+                Some(revalidate_selected_batch(
+                    &repo,
+                    &manager,
+                    &plan,
+                    &summaries,
+                    &worktrees,
+                    &checkpoint_expected,
+                )?)
+            };
+            write_checkpoint_if_configured(
+                &controls,
+                RunCheckpointStage::AgentsCompleted,
+                &run_id,
+                checkpoint_writer.as_mut(),
+                CheckpointView {
+                    repo: &repo,
+                    repo_head: &repo_head,
+                    plan_file: &options.plan_file,
+                    plan: &plan,
+                    keep_claims: options.keep_claims,
+                    worktree_reuse_policy,
+                    success: false,
+                    agents: &summaries,
+                    repo_validation: &repo_validation,
+                    repo_validation_target: repo_validation_target.as_ref(),
+                    released_claims: &[],
+                    release_errors: &[],
+                    released_semantic_intents: &[],
+                    semantic_release_errors: &[],
+                },
+            )?;
+            if let Some(guard) = checkpoint_guard.as_ref() {
+                guard.verify()?;
+            }
+            drop(checkpoint_guard);
+        }
 
         let (released_claims, release_errors) = if options.keep_claims {
             claim_cleanup.disarm_keep();
@@ -1270,17 +1340,6 @@ fn resume_plan_file_runtime(
         let store = SyncStore::open(&repo)?;
         let semantic_store = SemanticIntentStore::open(&repo)?;
         let mut summaries = summaries_from_checkpoint(&plan, &checkpoint)?;
-        let worktrees = validate_resume_worktrees(
-            &manager,
-            &plan,
-            &checkpoint,
-            &mut summaries,
-            &repo_head,
-            runtime,
-        )?;
-        if let Some(writer) = checkpoint_writer.as_ref() {
-            writer.reject_inside_worktrees(&worktrees)?;
-        }
 
         if checkpoint.stage == RunCheckpointStage::Final {
             return Ok(summary_from_parts(SummaryParts {
@@ -1322,6 +1381,18 @@ fn resume_plan_file_runtime(
                 }
             }
         }
+        let worktrees = validate_resume_worktrees(
+            &repo,
+            &manager,
+            &plan,
+            &checkpoint,
+            &mut summaries,
+            &repo_head,
+            runtime,
+        )?;
+        if let Some(writer) = checkpoint_writer.as_ref() {
+            writer.reject_inside_worktrees(&worktrees)?;
+        }
         let (active_semantic_tokens, semantic_coordination_needed) =
             active_checkpoint_semantic_tokens(&semantic_store, &mut summaries)?;
         semantic_cleanup.set_tokens(active_semantic_tokens);
@@ -1341,6 +1412,20 @@ fn resume_plan_file_runtime(
             );
         }
 
+        let resume_claims_checkpoint_expected =
+            checkpoint_revalidation_expectations(&summaries, repo_head)?;
+        let resume_claims_checkpoint_guard = if resume_claims_checkpoint_expected.is_empty() {
+            None
+        } else {
+            Some(revalidate_selected_batch(
+                &repo,
+                &manager,
+                &plan,
+                &summaries,
+                &worktrees,
+                &resume_claims_checkpoint_expected,
+            )?)
+        };
         write_checkpoint_if_configured(
             &controls,
             RunCheckpointStage::ClaimsAcquired,
@@ -1363,9 +1448,14 @@ fn resume_plan_file_runtime(
                 semantic_release_errors: &[],
             },
         )?;
+        if let Some(guard) = resume_claims_checkpoint_guard.as_ref() {
+            guard.verify()?;
+        }
+        drop(resume_claims_checkpoint_guard);
 
         let captured_candidates = run_agent_schedule_with_patch_dir(
             &AgentScheduleContext {
+                repo: &repo,
                 manager: &manager,
                 plan: &plan,
                 worktrees: &worktrees,
@@ -1377,6 +1467,7 @@ fn resume_plan_file_runtime(
             options.patch_dir.as_deref(),
             checkpoint_writer.as_mut(),
         )?;
+        let mut agents_completed_published = false;
         let (repo_validation, repo_validation_target) = if summaries
             .iter()
             .all(|summary| summary.status == AgentRunStatus::Succeeded)
@@ -1388,25 +1479,52 @@ fn resume_plan_file_runtime(
                     &serde_json::json!({ "agent_count": summaries.len() }),
                 )?;
             }
-            let outcome = run_repo_validation_commands(
-                &plan,
-                &repo,
-                &manager,
-                &worktrees,
-                &repo_head,
-                &captured_candidates,
+            let validation_context = RepoValidationContext {
+                plan: &plan,
+                repo: &repo,
+                manager: &manager,
+                worktrees: &worktrees,
+                agent_summaries: &summaries,
+                base_oid: &repo_head,
+                candidates: &captured_candidates,
                 runtime,
-            );
-            if let Some(writer) = checkpoint_writer.as_mut() {
-                writer.event(
-                    PHASE_REPO_VALIDATED,
-                    None,
-                    &serde_json::json!({
-                        "validation_count": outcome.summaries.len(),
-                        "has_target": outcome.target.is_some(),
-                    }),
+            };
+            let outcome = run_repo_validation_commands(&validation_context, |outcome| {
+                if let Some(writer) = checkpoint_writer.as_mut() {
+                    writer.event(
+                        PHASE_REPO_VALIDATED,
+                        None,
+                        &serde_json::json!({
+                            "validation_count": outcome.summaries.len(),
+                            "has_target": outcome.target.is_some(),
+                        }),
+                    )?;
+                }
+                write_checkpoint_if_configured(
+                    &controls,
+                    RunCheckpointStage::AgentsCompleted,
+                    &Some(checkpoint.run_id.clone()),
+                    checkpoint_writer.as_mut(),
+                    CheckpointView {
+                        repo: &repo,
+                        repo_head: &repo_head,
+                        plan_file: &plan_file,
+                        plan: &plan,
+                        keep_claims: checkpoint.keep_claims,
+                        worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+                        success: false,
+                        agents: &summaries,
+                        repo_validation: &outcome.summaries,
+                        repo_validation_target: outcome.target.as_ref(),
+                        released_claims: &[],
+                        release_errors: &[],
+                        released_semantic_intents: &[],
+                        semantic_release_errors: &[],
+                    },
                 )?;
-            }
+                agents_completed_published = true;
+                Ok(())
+            })?;
             (outcome.summaries, outcome.target)
         } else {
             (
@@ -1415,28 +1533,47 @@ fn resume_plan_file_runtime(
             )
         };
 
-        write_checkpoint_if_configured(
-            &controls,
-            RunCheckpointStage::AgentsCompleted,
-            &Some(checkpoint.run_id.clone()),
-            checkpoint_writer.as_mut(),
-            CheckpointView {
-                repo: &repo,
-                repo_head: &repo_head,
-                plan_file: &plan_file,
-                plan: &plan,
-                keep_claims: checkpoint.keep_claims,
-                worktree_reuse_policy: checkpoint.worktree_reuse_policy,
-                success: false,
-                agents: &summaries,
-                repo_validation: &repo_validation,
-                repo_validation_target: repo_validation_target.as_ref(),
-                released_claims: &[],
-                release_errors: &[],
-                released_semantic_intents: &[],
-                semantic_release_errors: &[],
-            },
-        )?;
+        if !agents_completed_published {
+            let checkpoint_expected = checkpoint_revalidation_expectations(&summaries, repo_head)?;
+            let checkpoint_guard = if checkpoint_expected.is_empty() {
+                None
+            } else {
+                Some(revalidate_selected_batch(
+                    &repo,
+                    &manager,
+                    &plan,
+                    &summaries,
+                    &worktrees,
+                    &checkpoint_expected,
+                )?)
+            };
+            write_checkpoint_if_configured(
+                &controls,
+                RunCheckpointStage::AgentsCompleted,
+                &Some(checkpoint.run_id.clone()),
+                checkpoint_writer.as_mut(),
+                CheckpointView {
+                    repo: &repo,
+                    repo_head: &repo_head,
+                    plan_file: &plan_file,
+                    plan: &plan,
+                    keep_claims: checkpoint.keep_claims,
+                    worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+                    success: false,
+                    agents: &summaries,
+                    repo_validation: &repo_validation,
+                    repo_validation_target: repo_validation_target.as_ref(),
+                    released_claims: &[],
+                    release_errors: &[],
+                    released_semantic_intents: &[],
+                    semantic_release_errors: &[],
+                },
+            )?;
+            if let Some(guard) = checkpoint_guard.as_ref() {
+                guard.verify()?;
+            }
+            drop(checkpoint_guard);
+        }
 
         let (released_claims, release_errors) = if checkpoint.keep_claims {
             claim_cleanup.disarm_keep();
@@ -1818,6 +1955,7 @@ fn summaries_from_checkpoint(
 }
 
 fn validate_resume_worktrees(
+    repo_path: &Path,
     manager: &WorktreeManager,
     plan: &OrchestrationPlan,
     checkpoint: &RunCheckpoint,
@@ -1875,28 +2013,56 @@ fn validate_resume_worktrees(
             );
         }
 
-        let primary_verified = manager
-            .get_managed_verified(&recorded.name)
-            .with_context(|| {
-                format!(
-                    "checkpoint '{}' managed worktree binding for agent '{}' is invalid",
-                    checkpoint.run_id.as_str(),
-                    agent.id
-                )
-            })?;
-        if &primary_verified != current {
-            bail!(
-                "checkpoint '{}' managed worktree record or Git backlink for agent '{}' changed while its write lease was held",
-                checkpoint.run_id.as_str(),
-                agent.id
-            );
-        }
-
         let worktree_repo = crate::git_repository::open(&current.path).with_context(|| {
             format!(
                 "failed to inspect checkpoint worktree '{}' at {}",
                 current.name,
                 current.path.display()
+            )
+        })?;
+        let expected_head_oid = match checkpoint_agent.status {
+            AgentRunStatus::Pending => *repo_head,
+            AgentRunStatus::Succeeded => {
+                let encoded = checkpoint_agent
+                    .candidate_binding
+                    .as_ref()
+                    .map(|binding| binding.head_oid.as_str())
+                    .or_else(|| {
+                        checkpoint_agent
+                            .command_completed_binding
+                            .as_ref()
+                            .map(|binding| binding.head_oid.as_str())
+                    })
+                    .context("completed resume candidate has no exact HEAD binding")?;
+                Oid::from_str(encoded).context("completed resume candidate HEAD is invalid")?
+            }
+            AgentRunStatus::Failed | AgentRunStatus::Skipped => head_oid(&worktree_repo)?,
+        };
+        let claim = summary
+            .claim
+            .as_ref()
+            .with_context(|| format!("resume agent '{}' has no live claim", agent.id))?;
+        if claim.agent_id != agent.id || !paths_match(&claim.paths, &agent.paths) {
+            bail!("resume agent '{}' claim owner or paths changed", agent.id);
+        }
+        let revalidation_guard = revalidate_existing_worker_batch(
+            repo_path,
+            manager,
+            vec![RevalidationRequest {
+                agent_id: agent.id.clone(),
+                claim_token: claim.token,
+                claimed_paths: claim.paths.clone(),
+                write_lease: &lease,
+                expected_worktree: current.clone(),
+                expected_head_oid,
+                expected_ref_oid: expected_head_oid,
+            }],
+        )
+        .with_context(|| {
+            format!(
+                "checkpoint '{}' resume authority for agent '{}' is invalid",
+                checkpoint.run_id.as_str(),
+                agent.id
             )
         })?;
         match checkpoint_agent.status {
@@ -2003,22 +2169,6 @@ fn validate_resume_worktrees(
                             )
                         })?;
                 }
-                let before_patch_capture = manager
-                    .get_managed_verified(&recorded.name)
-                    .with_context(|| {
-                        format!(
-                            "checkpoint '{}' managed worktree binding for agent '{}' changed before exact candidate recapture",
-                            checkpoint.run_id.as_str(),
-                            agent.id
-                        )
-                    })?;
-                if &before_patch_capture != current {
-                    bail!(
-                        "checkpoint '{}' managed worktree record for agent '{}' drifted before exact candidate recapture",
-                        checkpoint.run_id.as_str(),
-                        agent.id
-                    );
-                }
                 if let Some(binding) = checkpoint_agent.candidate_binding.as_ref() {
                     let captured = capture_bound_candidate(
                         &current.path,
@@ -2044,22 +2194,8 @@ fn validate_resume_worktrees(
             }
             AgentRunStatus::Failed | AgentRunStatus::Skipped => {}
         }
-        let after_validation = manager
-            .get_managed_verified(&recorded.name)
-            .with_context(|| {
-                format!(
-                    "checkpoint '{}' managed worktree binding for agent '{}' changed during resume validation",
-                    checkpoint.run_id.as_str(),
-                    agent.id
-                )
-            })?;
-        if &after_validation != current {
-            bail!(
-                "checkpoint '{}' managed worktree record for agent '{}' drifted during resume validation",
-                checkpoint.run_id.as_str(),
-                agent.id
-            );
-        }
+        revalidation_guard.verify()?;
+        drop(revalidation_guard);
         summary.worktree = Some(current.clone());
         summary.worktree_reused = true;
         selected.push(SelectedWorktree {
@@ -2107,19 +2243,34 @@ fn acquire_resume_claims(
                 summary.claim = Some(active_claim.clone());
                 tokens.push(active_claim.token);
             }
-            Ok(None) => match store.claim_paths(&agent.id, agent.paths.iter()) {
-                Ok(claim) => {
-                    tokens.push(claim.token);
-                    summary.claim = Some(claim);
+            Ok(None) => {
+                if let Some(checkpoint_token) =
+                    summary.claim.as_ref().map(|claim| claim.token.get())
+                {
+                    fail_summary(
+                        summary,
+                        format!(
+                            "cannot resume agent '{}' because checkpoint claim token {} is no longer the exact active claim; release/reclaim and supersession require a new run",
+                            agent.id,
+                            checkpoint_token
+                        ),
+                    );
+                } else {
+                    match store.claim_paths(&agent.id, agent.paths.iter()) {
+                        Ok(claim) => {
+                            tokens.push(claim.token);
+                            summary.claim = Some(claim);
+                        }
+                        Err(error) => fail_summary(
+                            summary,
+                            format!(
+                                "failed to acquire resume claim for agent '{}' on checkpoint paths: {error}",
+                                agent.id
+                            ),
+                        ),
+                    }
                 }
-                Err(error) => fail_summary(
-                    summary,
-                    format!(
-                        "failed to acquire resume claim for agent '{}' on checkpoint paths: {error}",
-                        agent.id
-                    ),
-                ),
-            },
+            }
             Err(error) => fail_summary(
                 summary,
                 format!(
@@ -2692,6 +2843,10 @@ impl SelectedWorktree {
     fn path(&self) -> &Path {
         self.lease.path()
     }
+
+    fn lease(&self) -> &ManagedWorktreeWriteLease {
+        &self.lease
+    }
 }
 
 fn select_worktrees(
@@ -2753,10 +2908,8 @@ fn select_worktrees(
             base: None,
             worktree_root: None,
         };
-        #[cfg(test)]
-        manager.create_for_test(create_options)?;
-        #[cfg(not(test))]
-        manager.create(create_options)?;
+        let cleanliness = manager.acquire_repository_cleanliness()?;
+        manager.create_with_repository_cleanliness(create_options, &cleanliness)?;
         let lease = manager
             .acquire_write_execution_lease(&agent.id)
             .with_context(|| {
@@ -2895,6 +3048,12 @@ fn prepare_patch_outputs(
     let Some(patch_dir) = patch_dir else {
         return Ok(outputs);
     };
+    if !summaries
+        .iter()
+        .any(|summary| summary.status == AgentRunStatus::Pending)
+    {
+        return Ok(outputs);
+    }
     let root = SecureOutputRoot::open_or_create(patch_dir)?;
     for worktree in worktrees {
         root.reject_inside(worktree.path())?;
@@ -2963,6 +3122,7 @@ impl Drop for PatchOutputGuard {
 }
 
 struct AgentScheduleContext<'a> {
+    repo: &'a Path,
     manager: &'a WorktreeManager,
     plan: &'a OrchestrationPlan,
     worktrees: &'a [SelectedWorktree],
@@ -2971,14 +3131,148 @@ struct AgentScheduleContext<'a> {
     runtime: OrchestrationExecutionRuntime,
 }
 
+struct SelectedCandidateContext<'a> {
+    repo: &'a Path,
+    manager: &'a WorktreeManager,
+    agent: &'a AgentPlan,
+    worktree: &'a SelectedWorktree,
+    base_oid: &'a Oid,
+    runtime: OrchestrationExecutionRuntime,
+}
+
+impl AgentScheduleContext<'_> {
+    fn selected_candidate(&self, index: usize) -> SelectedCandidateContext<'_> {
+        SelectedCandidateContext {
+            repo: self.repo,
+            manager: self.manager,
+            agent: &self.plan.agents[index],
+            worktree: &self.worktrees[index],
+            base_oid: self.base_oid,
+            runtime: self.runtime,
+        }
+    }
+}
+
+fn selected_revalidation_request<'a>(
+    agent: &AgentPlan,
+    summary: &AgentRunSummary,
+    worktree: &'a SelectedWorktree,
+    expected_head_oid: Oid,
+) -> Result<RevalidationRequest<'a>> {
+    let claim = summary
+        .claim
+        .as_ref()
+        .with_context(|| format!("agent '{}' has no authenticated live claim", agent.id))?;
+    let recorded = summary
+        .worktree
+        .as_ref()
+        .with_context(|| format!("agent '{}' has no selected worktree binding", agent.id))?;
+    if claim.agent_id != agent.id || !paths_match(&claim.paths, &agent.paths) {
+        bail!(
+            "agent '{}' claim owner or exact path set does not match its plan",
+            agent.id
+        );
+    }
+    if recorded != worktree.record() || worktree.record().name != agent.id {
+        bail!(
+            "agent '{}' selected worktree does not match its held write lease",
+            agent.id
+        );
+    }
+    Ok(RevalidationRequest {
+        agent_id: agent.id.clone(),
+        claim_token: claim.token,
+        claimed_paths: claim.paths.clone(),
+        write_lease: worktree.lease(),
+        expected_worktree: recorded.clone(),
+        expected_head_oid,
+        expected_ref_oid: expected_head_oid,
+    })
+}
+
+fn revalidate_selected_batch<'a>(
+    repo: &Path,
+    manager: &WorktreeManager,
+    plan: &OrchestrationPlan,
+    summaries: &[AgentRunSummary],
+    worktrees: &'a [SelectedWorktree],
+    expected: &[(usize, Oid)],
+) -> Result<RevalidationGuard<'a>> {
+    let requests = expected
+        .iter()
+        .map(|(index, oid)| {
+            selected_revalidation_request(
+                &plan.agents[*index],
+                &summaries[*index],
+                &worktrees[*index],
+                *oid,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    revalidate_existing_worker_batch(repo, manager, requests)
+        .context("authenticated worker boundary revalidation failed")
+}
+
+fn checkpoint_revalidation_expectations(
+    summaries: &[AgentRunSummary],
+    base_oid: Oid,
+) -> Result<Vec<(usize, Oid)>> {
+    summaries
+        .iter()
+        .enumerate()
+        .filter(|(_, summary)| summary.claim.is_some())
+        .map(|(index, summary)| {
+            let encoded = summary
+                .candidate_binding
+                .as_ref()
+                .map(|binding| binding.head_oid.as_str())
+                .or_else(|| {
+                    summary
+                        .command_completed_binding
+                        .as_ref()
+                        .map(|binding| binding.head_oid.as_str())
+                });
+            let oid = match encoded {
+                Some(encoded) => Oid::from_str(encoded).with_context(|| {
+                    format!("agent '{}' checkpoint HEAD is invalid", summary.id)
+                })?,
+                None => base_oid,
+            };
+            Ok((index, oid))
+        })
+        .collect()
+}
+
 fn run_agent_schedule_with_patch_dir(
     context: &AgentScheduleContext<'_>,
     summaries: &mut [AgentRunSummary],
     patch_dir: Option<&Path>,
     checkpoint_writer: Option<&mut RunCheckpointWriter>,
 ) -> Result<Vec<Option<CapturedCandidate>>> {
+    let pending = summaries
+        .iter()
+        .enumerate()
+        .filter(|(_, summary)| summary.status == AgentRunStatus::Pending)
+        .map(|(index, _)| (index, *context.base_oid))
+        .collect::<Vec<_>>();
+    let reservation_guard = if patch_dir.is_some() && !pending.is_empty() {
+        Some(revalidate_selected_batch(
+            context.repo,
+            context.manager,
+            context.plan,
+            summaries,
+            context.worktrees,
+            &pending,
+        )?)
+    } else {
+        None
+    };
     let mut patch_outputs =
         prepare_patch_outputs(patch_dir, context.plan, summaries, context.worktrees)?;
+    if let Some(guard) = reservation_guard.as_ref() {
+        guard.verify()?;
+    }
+    drop(reservation_guard);
     let mut captured_candidates = vec![None; summaries.len()];
     let schedule_result = run_agent_schedule(
         context,
@@ -3033,13 +3327,24 @@ fn run_agent_schedule(
         if summaries[index].status != AgentRunStatus::Succeeded {
             continue;
         }
+        let candidate_binding = summaries[index].candidate_binding.clone();
+        let completed_binding = summaries[index].command_completed_binding.clone();
+        let checkpoint_head = candidate_binding
+            .as_ref()
+            .map(|binding| binding.head_oid.as_str())
+            .or_else(|| {
+                completed_binding
+                    .as_ref()
+                    .map(|binding| binding.head_oid.as_str())
+            })
+            .context("completed agent is missing a checkpoint HEAD binding")?;
+        let checkpoint_head = Oid::from_str(checkpoint_head)
+            .context("completed agent checkpoint HEAD binding is invalid")?;
+        let selected_candidate = context.selected_candidate(index);
         let expected = capture_selected_candidate_state(
-            context.manager,
-            &context.plan.agents[index],
+            &selected_candidate,
             &summaries[index],
-            &context.worktrees[index],
-            context.base_oid,
-            context.runtime,
+            checkpoint_head,
         )
         .with_context(|| {
             format!(
@@ -3047,8 +3352,6 @@ fn run_agent_schedule(
                 summaries[index].id
             )
         })?;
-        let candidate_binding = summaries[index].candidate_binding.clone();
-        let completed_binding = summaries[index].command_completed_binding.clone();
         match (&candidate_binding, &completed_binding) {
             (Some(binding), _) => ensure_candidate_binding_matches_state(binding, &expected)?,
             (None, Some(binding)) => binding.verify_state(&expected)?,
@@ -3057,6 +3360,17 @@ fn run_agent_schedule(
                 summaries[index].id
             ),
         }
+        let validation_start_request = selected_revalidation_request(
+            &context.plan.agents[index],
+            &summaries[index],
+            &context.worktrees[index],
+            expected.head_oid,
+        )?;
+        let validation_start_guard = revalidate_existing_worker_batch(
+            context.repo,
+            context.manager,
+            vec![validation_start_request],
+        )?;
         if let Some(writer) = checkpoint_writer.as_deref_mut() {
             writer.agent_event(
                 PHASE_VALIDATION_STARTED,
@@ -3064,15 +3378,17 @@ fn run_agent_schedule(
                 &AgentCheckpoint::from(&summaries[index]),
             )?;
         }
+        validation_start_guard.verify()?;
         let state_intact = run_agent_validation_commands(
             &context.plan.agents[index],
             &mut summaries[index],
             &context.worktrees[index],
-            context.manager,
             &expected,
             context.base_oid,
             context.runtime,
+            &validation_start_guard,
         );
+        validation_start_guard.verify()?;
         if let Some(writer) = checkpoint_writer.as_deref_mut() {
             writer.agent_event(
                 PHASE_VALIDATED,
@@ -3080,20 +3396,31 @@ fn run_agent_schedule(
                 &AgentCheckpoint::from(&summaries[index]),
             )?;
         }
+        validation_start_guard.verify()?;
+        drop(validation_start_guard);
         if !state_intact || summaries[index].status != AgentRunStatus::Succeeded {
             bail!(
                 "completed agent '{}' failed mandatory resume validation; start a new run after resolving the validation failure",
                 summaries[index].id
             );
         }
-        let captured = capture_selected_bound_candidate(
-            context.manager,
+        let publication_request = selected_revalidation_request(
             &context.plan.agents[index],
             &summaries[index],
+            &context.worktrees[index],
+            expected.head_oid,
+        )?;
+        let publication_guard = revalidate_existing_worker_batch(
+            context.repo,
+            context.manager,
+            vec![publication_request],
+        )?;
+        let captured = capture_selected_bound_candidate(
             &context.worktrees[index],
             context.base_oid,
             &expected,
             context.runtime,
+            &publication_guard,
         )?;
         if let Some(binding) = candidate_binding.as_ref() {
             if &captured.binding != binding {
@@ -3129,6 +3456,8 @@ fn run_agent_schedule(
                 &AgentCheckpoint::from(&summaries[index]),
             )?;
         }
+        publication_guard.verify()?;
+        drop(publication_guard);
         captured_candidates[index] = Some(captured);
     }
 
@@ -3158,13 +3487,19 @@ fn run_agent_schedule(
             break;
         }
 
+        let command_expectations = ready
+            .iter()
+            .map(|index| (*index, *context.base_oid))
+            .collect::<Vec<_>>();
+        let command_guard = revalidate_selected_batch(
+            context.repo,
+            context.manager,
+            context.plan,
+            summaries,
+            context.worktrees,
+            &command_expectations,
+        )?;
         for index in &ready {
-            verify_selected_worktree_binding(
-                context.manager,
-                &context.plan.agents[*index],
-                &summaries[*index],
-                &context.worktrees[*index],
-            )?;
             if let Some(writer) = checkpoint_writer.as_deref_mut() {
                 writer.agent_event(
                     PHASE_COMMAND_STARTED,
@@ -3174,119 +3509,181 @@ fn run_agent_schedule(
             }
         }
         let outcomes = run_ready_agents(
-            context.manager,
             context.plan,
             summaries,
             context.worktrees,
             &ready,
             context.runtime,
+            &command_guard,
         )?;
 
-        for (index, run_result) in outcomes {
-            apply_command_result(&mut summaries[index], run_result);
-            let expected_state = capture_selected_candidate_state(
-                context.manager,
-                &context.plan.agents[index],
-                &summaries[index],
-                &context.worktrees[index],
-                context.base_oid,
-                context.runtime,
-            );
-            let expected_state = match expected_state {
-                Ok(state) => {
-                    summaries[index].changed_paths = state.changed_paths.clone();
-                    summaries[index].unclaimed_changed_paths = state
-                        .changed_paths
-                        .iter()
-                        .filter(|path| {
-                            !context.plan.agents[index]
-                                .paths
-                                .iter()
-                                .any(|claim| path_is_covered_by_claim(path, claim))
-                        })
-                        .cloned()
-                        .collect();
-                    summaries[index].command_completed_binding =
-                        Some(CompletedCommandStateBinding::from_state(&state)?);
-                    if let Some(writer) = checkpoint_writer.as_deref_mut() {
-                        writer.agent_event(
-                            PHASE_COMMAND_COMPLETED,
-                            &summaries[index].id,
-                            &AgentCheckpoint::from(&summaries[index]),
-                        )?;
-                    }
-                    Some(state)
-                }
-                Err(error) => {
-                    #[cfg(test)]
-                    notify_candidate_boundary_failure(&context.plan.agents[index].id);
-                    fail_summary(
-                        &mut summaries[index],
-                        format!("failed to bind candidate before validation: {error}"),
-                    );
-                    None
-                }
-            };
-            let mut state_intact = expected_state.is_some();
-            if summaries[index].status == AgentRunStatus::Succeeded {
-                if let Some(expected_state) = expected_state.as_ref() {
-                    if let Some(writer) = checkpoint_writer.as_deref_mut() {
-                        writer.agent_event(
-                            PHASE_VALIDATION_STARTED,
-                            &summaries[index].id,
-                            &AgentCheckpoint::from(&summaries[index]),
-                        )?;
-                    }
-                    state_intact = run_agent_validation_commands(
-                        &context.plan.agents[index],
-                        &mut summaries[index],
-                        &context.worktrees[index],
-                        context.manager,
-                        expected_state,
-                        context.base_oid,
-                        context.runtime,
-                    );
-                    if let Some(writer) = checkpoint_writer.as_deref_mut() {
-                        writer.agent_event(
-                            PHASE_VALIDATED,
-                            &summaries[index].id,
-                            &AgentCheckpoint::from(&summaries[index]),
-                        )?;
-                    }
-                }
+        for (_, outcome) in &outcomes {
+            if outcome
+                .as_ref()
+                .ok()
+                .is_some_and(|result| !result.harness_executed)
+            {
+                bail!("worker command batch stopped at literal pre-spawn revalidation");
             }
-            let patch_output = patch_outputs[index].take();
-            let captured = if state_intact {
-                expected_state.as_ref().and_then(|expected_state| {
-                    match capture_selected_bound_candidate(
-                        context.manager,
-                        &context.plan.agents[index],
-                        &summaries[index],
-                        &context.worktrees[index],
-                        context.base_oid,
-                        expected_state,
-                        context.runtime,
-                    ) {
-                        Ok(captured) => Some(captured),
-                        Err(error) => {
-                            fail_summary(
-                                &mut summaries[index],
-                                format!("failed to finalize bound candidate: {error}"),
-                            );
-                            None
-                        }
+        }
+        let launched_heads = ready
+            .iter()
+            .map(|index| {
+                selected_symbolic_head_oid(&context.worktrees[*index]).map(|oid| {
+                    RevalidationHeadExpectation {
+                        agent_id: context.plan.agents[*index].id.clone(),
+                        head_oid: oid,
+                        ref_oid: oid,
                     }
                 })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        command_guard
+            .verify_with_heads(&launched_heads)
+            .context("worker authority changed before post-command collection")?;
+
+        let mut completed = Vec::with_capacity(outcomes.len());
+        for (index, run_result) in outcomes {
+            apply_command_result(&mut summaries[index], run_result);
+            let state = capture_consistent_candidate_state(
+                context.worktrees[index].path(),
+                context.base_oid,
+                context.runtime,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to capture guarded command result for agent '{}'",
+                    summaries[index].id
+                )
+            })?;
+            completed.push((index, state));
+        }
+        let completed_heads = completed
+            .iter()
+            .map(|(index, state)| RevalidationHeadExpectation {
+                agent_id: context.plan.agents[*index].id.clone(),
+                head_oid: state.head_oid,
+                ref_oid: state.head_oid,
+            })
+            .collect::<Vec<_>>();
+        command_guard
+            .verify_with_heads(&completed_heads)
+            .context("worker command boundary changed before result publication")?;
+        for (index, state) in &completed {
+            summaries[*index].changed_paths = state.changed_paths.clone();
+            summaries[*index].unclaimed_changed_paths = state
+                .changed_paths
+                .iter()
+                .filter(|path| {
+                    !context.plan.agents[*index]
+                        .paths
+                        .iter()
+                        .any(|claim| path_is_covered_by_claim(path, claim))
+                })
+                .cloned()
+                .collect();
+            summaries[*index].command_completed_binding =
+                Some(CompletedCommandStateBinding::from_state(state)?);
+            if let Some(writer) = checkpoint_writer.as_deref_mut() {
+                writer.agent_event(
+                    PHASE_COMMAND_COMPLETED,
+                    &summaries[*index].id,
+                    &AgentCheckpoint::from(&summaries[*index]),
+                )?;
+            }
+        }
+        command_guard
+            .verify_with_heads(&completed_heads)
+            .context("worker command result drifted during checkpoint publication")?;
+        drop(command_guard);
+
+        for (index, expected_state) in completed {
+            let mut state_intact = true;
+            if summaries[index].status == AgentRunStatus::Succeeded {
+                let validation_start_request = selected_revalidation_request(
+                    &context.plan.agents[index],
+                    &summaries[index],
+                    &context.worktrees[index],
+                    expected_state.head_oid,
+                )?;
+                let validation_start_guard = revalidate_existing_worker_batch(
+                    context.repo,
+                    context.manager,
+                    vec![validation_start_request],
+                )?;
+                if let Some(writer) = checkpoint_writer.as_deref_mut() {
+                    writer.agent_event(
+                        PHASE_VALIDATION_STARTED,
+                        &summaries[index].id,
+                        &AgentCheckpoint::from(&summaries[index]),
+                    )?;
+                }
+                validation_start_guard.verify()?;
+                state_intact = run_agent_validation_commands(
+                    &context.plan.agents[index],
+                    &mut summaries[index],
+                    &context.worktrees[index],
+                    &expected_state,
+                    context.base_oid,
+                    context.runtime,
+                    &validation_start_guard,
+                );
+                validation_start_guard.verify()?;
+                if let Some(writer) = checkpoint_writer.as_deref_mut() {
+                    writer.agent_event(
+                        PHASE_VALIDATED,
+                        &summaries[index].id,
+                        &AgentCheckpoint::from(&summaries[index]),
+                    )?;
+                }
+                validation_start_guard.verify()?;
+                drop(validation_start_guard);
+            }
+            let mut patch_output = patch_outputs[index].take().map(PatchOutputGuard::new);
+            let publication_guard = if state_intact {
+                let request = selected_revalidation_request(
+                    &context.plan.agents[index],
+                    &summaries[index],
+                    &context.worktrees[index],
+                    expected_state.head_oid,
+                )?;
+                Some(revalidate_existing_worker_batch(
+                    context.repo,
+                    context.manager,
+                    vec![request],
+                )?)
             } else {
                 None
             };
+            let captured = match publication_guard.as_ref() {
+                Some(guard) => match capture_selected_bound_candidate(
+                    &context.worktrees[index],
+                    context.base_oid,
+                    &expected_state,
+                    context.runtime,
+                    guard,
+                ) {
+                    Ok(captured) => Some(captured),
+                    Err(error) => {
+                        fail_summary(
+                            &mut summaries[index],
+                            format!("failed to finalize bound candidate: {error}"),
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
             if let Some(captured) = captured {
+                let publication_guard = publication_guard
+                    .as_ref()
+                    .context("candidate publication guard disappeared")?;
                 summaries[index].candidate_binding = Some(captured.binding.clone());
                 inspect_captured_agent_changes(
                     &context.plan.agents[index],
                     &mut summaries[index],
                     &captured,
-                    patch_output,
+                    patch_output.as_mut().and_then(PatchOutputGuard::take),
                 );
                 if let Some(writer) = checkpoint_writer.as_deref_mut() {
                     writer.agent_event(
@@ -3295,51 +3692,24 @@ fn run_agent_schedule(
                         &AgentCheckpoint::from(&summaries[index]),
                     )?;
                 }
+                publication_guard.verify()?;
                 if summaries[index].status == AgentRunStatus::Succeeded {
                     captured_candidates[index] = Some(captured);
                 }
             } else {
+                drop(publication_guard);
+                let selected_candidate = context.selected_candidate(index);
                 inspect_agent_paths_without_patch(
-                    &context.plan.agents[index],
+                    &selected_candidate,
                     &mut summaries[index],
-                    context.manager,
-                    &context.worktrees[index],
-                    context.base_oid,
-                    patch_output,
+                    expected_state.head_oid,
+                    patch_output.as_mut().and_then(PatchOutputGuard::take),
                 );
             }
             remaining.remove(&index);
         }
     }
 
-    Ok(())
-}
-
-fn verify_selected_worktree_binding(
-    manager: &WorktreeManager,
-    agent: &AgentPlan,
-    summary: &AgentRunSummary,
-    worktree: &SelectedWorktree,
-) -> Result<()> {
-    let recorded = summary
-        .worktree
-        .as_ref()
-        .with_context(|| format!("agent '{}' has no selected worktree binding", agent.id))?;
-    if recorded != worktree.record() || worktree.record().name != agent.id {
-        bail!(
-            "agent '{}' selected worktree does not match its held write lease",
-            agent.id
-        );
-    }
-    let verified = manager
-        .get_managed_verified(&agent.id)
-        .with_context(|| format!("agent '{}' managed worktree binding is invalid", agent.id))?;
-    if &verified != worktree.record() {
-        bail!(
-            "agent '{}' managed worktree record or Git backlink changed while its write lease was held",
-            agent.id
-        );
-    }
     Ok(())
 }
 
@@ -3387,31 +3757,36 @@ fn notify_candidate_boundary_failure(agent_id: &str) {
 }
 
 fn capture_selected_candidate_state(
-    manager: &WorktreeManager,
-    agent: &AgentPlan,
+    context: &SelectedCandidateContext<'_>,
     summary: &AgentRunSummary,
-    worktree: &SelectedWorktree,
-    base_oid: &Oid,
-    runtime: OrchestrationExecutionRuntime,
+    expected_head_oid: Oid,
 ) -> Result<CandidateStateSnapshot> {
-    verify_selected_worktree_binding(manager, agent, summary, worktree)?;
-    let state = capture_consistent_candidate_state(worktree.path(), base_oid, runtime)?;
-    verify_selected_worktree_binding(manager, agent, summary, worktree)?;
+    let request =
+        selected_revalidation_request(context.agent, summary, context.worktree, expected_head_oid)?;
+    let guard = revalidate_existing_worker_batch(context.repo, context.manager, vec![request])?;
+    let state = capture_consistent_candidate_state(
+        context.worktree.path(),
+        context.base_oid,
+        context.runtime,
+    )?;
+    guard.verify_with_heads(&[RevalidationHeadExpectation {
+        agent_id: context.agent.id.clone(),
+        head_oid: state.head_oid,
+        ref_oid: state.head_oid,
+    }])?;
     Ok(state)
 }
 
 fn capture_selected_bound_candidate(
-    manager: &WorktreeManager,
-    agent: &AgentPlan,
-    summary: &AgentRunSummary,
     worktree: &SelectedWorktree,
     base_oid: &Oid,
     expected_state: &CandidateStateSnapshot,
     runtime: OrchestrationExecutionRuntime,
+    guard: &RevalidationGuard<'_>,
 ) -> Result<CapturedCandidate> {
-    verify_selected_worktree_binding(manager, agent, summary, worktree)?;
+    guard.verify()?;
     let captured = capture_bound_candidate(worktree.path(), base_oid, expected_state, runtime)?;
-    verify_selected_worktree_binding(manager, agent, summary, worktree)?;
+    guard.verify()?;
     Ok(captured)
 }
 
@@ -3507,71 +3882,109 @@ fn agent_status_label(status: AgentRunStatus) -> &'static str {
 }
 
 fn run_ready_agents(
-    manager: &WorktreeManager,
     plan: &OrchestrationPlan,
     summaries: &[AgentRunSummary],
     worktrees: &[SelectedWorktree],
     ready: &[usize],
     runtime: OrchestrationExecutionRuntime,
+    guard: &RevalidationGuard<'_>,
 ) -> Result<Vec<(usize, Result<CommandRunResult, ProcessRunError>)>> {
     if ready.len() == 1 {
         let index = ready[0];
-        verify_selected_worktree_binding(
-            manager,
-            &plan.agents[index],
-            &summaries[index],
-            &worktrees[index],
-        )?;
         let spec = command_spec(
             &plan.agents[index],
             &summaries[index],
             &worktrees[index],
             runtime,
         )?;
-        return Ok(vec![(index, run_agent_command(spec))]);
-    }
-
-    let mut handles = Vec::with_capacity(ready.len());
-    for index in ready {
-        verify_selected_worktree_binding(
-            manager,
-            &plan.agents[*index],
-            &summaries[*index],
-            &worktrees[*index],
-        )?;
-        let spec = command_spec(
-            &plan.agents[*index],
-            &summaries[*index],
-            &worktrees[*index],
-            runtime,
-        )?;
-        let index = *index;
-        handles.push((
+        return Ok(vec![(
             index,
-            thread::spawn(move || (index, run_agent_command(spec))),
-        ));
+            run_agent_command_after_revalidation(spec, guard, &plan.agents[index].id),
+        )]);
     }
 
-    let mut outcomes = Vec::with_capacity(handles.len());
-    for (index, handle) in handles {
-        let outcome = handle.join().unwrap_or_else(|_| {
-            (
-                index,
-                Ok(CommandRunResult {
-                    status: None,
-                    duration_ms: 0,
-                    timed_out: false,
-                    stdout: OutputSummary::default(),
-                    stderr: OutputSummary::default(),
-                    process_error: Some("agent command runner panicked".to_string()),
-                }),
+    let specs = ready
+        .iter()
+        .map(|index| {
+            command_spec(
+                &plan.agents[*index],
+                &summaries[*index],
+                &worktrees[*index],
+                runtime,
             )
-        });
-        outcomes.push(outcome);
-    }
+            .map(|spec| (*index, spec))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut outcomes = thread::scope(|scope| {
+        let handles = specs
+            .into_iter()
+            .map(|(index, spec)| {
+                let agent_id = plan.agents[index].id.clone();
+                (
+                    index,
+                    scope.spawn(move || {
+                        (
+                            index,
+                            run_agent_command_after_revalidation(spec, guard, &agent_id),
+                        )
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|(index, handle)| {
+                handle.join().unwrap_or_else(|_| {
+                    (
+                        index,
+                        Ok(CommandRunResult {
+                            harness_executed: false,
+                            status: None,
+                            duration_ms: 0,
+                            timed_out: false,
+                            stdout: OutputSummary::default(),
+                            stderr: OutputSummary::default(),
+                            process_error: Some("agent command runner panicked".to_string()),
+                        }),
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+    });
 
     outcomes.sort_by_key(|(index, _)| *index);
     Ok(outcomes)
+}
+
+fn selected_symbolic_head_oid(worktree: &SelectedWorktree) -> Result<Oid> {
+    let repo = crate::git_repository::open(worktree.path())?;
+    let expected_ref = format!("refs/heads/{}", worktree.record().branch);
+    let head = repo.head().context("managed worker HEAD is unavailable")?;
+    if head.name().context("managed worker HEAD name is invalid")? != expected_ref {
+        bail!("managed worker HEAD is detached or on the wrong branch");
+    }
+    let head_oid = head
+        .target()
+        .context("managed worker symbolic HEAD does not resolve directly")?;
+    let ref_oid = repo
+        .find_reference(&expected_ref)
+        .context("managed worker branch ref is unavailable")?
+        .target()
+        .context("managed worker branch ref does not resolve directly")?;
+    if head_oid != ref_oid {
+        bail!("managed worker HEAD and branch ref OIDs differ");
+    }
+    Ok(head_oid)
+}
+
+fn run_agent_command_after_revalidation(
+    spec: CommandRunSpec,
+    guard: &RevalidationGuard<'_>,
+    agent_id: &str,
+) -> Result<CommandRunResult, ProcessRunError> {
+    run_agent_command(spec, || {
+        guard.verify_agent(agent_id).map_err(anyhow::Error::from)
+    })
 }
 
 fn inspect_captured_agent_changes(
@@ -3621,22 +4034,46 @@ fn inspect_captured_agent_changes(
 }
 
 fn inspect_agent_paths_without_patch(
-    agent: &AgentPlan,
+    context: &SelectedCandidateContext<'_>,
     summary: &mut AgentRunSummary,
-    manager: &WorktreeManager,
-    worktree: &SelectedWorktree,
-    base_oid: &Oid,
+    expected_head_oid: Oid,
     patch_output: Option<ReservedOutputFile>,
 ) {
+    let request = match selected_revalidation_request(
+        context.agent,
+        summary,
+        context.worktree,
+        expected_head_oid,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            fail_summary(
+                summary,
+                format!("refusing rejected-candidate inspection: {error}"),
+            );
+            return;
+        }
+    };
+    let guard = match revalidate_existing_worker_batch(context.repo, context.manager, vec![request])
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            fail_summary(
+                summary,
+                format!("refusing rejected-candidate inspection: {error}"),
+            );
+            return;
+        }
+    };
     let _patch_output = patch_output.map(PatchOutputGuard::new);
-    if let Err(error) = verify_selected_worktree_binding(manager, agent, summary, worktree) {
+    if let Err(error) = guard.verify() {
         fail_summary(
             summary,
             format!("refusing rejected-candidate inspection: {error}"),
         );
         return;
     }
-    let repo = match crate::git_repository::open(worktree.path()) {
+    let repo = match crate::git_repository::open(context.worktree.path()) {
         Ok(repo) => repo,
         Err(error) => {
             fail_summary(
@@ -3646,7 +4083,7 @@ fn inspect_agent_paths_without_patch(
             return;
         }
     };
-    let changed_paths = match collect_paths_changed_since_base(&repo, base_oid) {
+    let changed_paths = match collect_paths_changed_since_base(&repo, context.base_oid) {
         Ok(paths) => paths,
         Err(error) => {
             fail_summary(
@@ -3656,7 +4093,7 @@ fn inspect_agent_paths_without_patch(
             return;
         }
     };
-    if let Err(error) = verify_selected_worktree_binding(manager, agent, summary, worktree) {
+    if let Err(error) = guard.verify() {
         fail_summary(
             summary,
             format!("rejected candidate binding changed during inspection: {error}"),
@@ -3668,7 +4105,8 @@ fn inspect_agent_paths_without_patch(
         .changed_paths
         .iter()
         .filter(|path| {
-            !agent
+            !context
+                .agent
                 .paths
                 .iter()
                 .any(|claim| path_is_covered_by_claim(path, claim))
@@ -4364,6 +4802,17 @@ fn run_fixed_git_with_stdin(
     stdin: StdinMode,
     runtime: OrchestrationExecutionRuntime,
 ) -> Result<std::process::Output> {
+    run_fixed_git_with_stdin_guarded(worktree_path, args, access, stdin, runtime, || Ok(()))
+}
+
+fn run_fixed_git_with_stdin_guarded(
+    worktree_path: &Path,
+    args: impl IntoIterator<Item = impl Into<std::ffi::OsString>>,
+    access: WorkspaceAccess,
+    stdin: StdinMode,
+    runtime: OrchestrationExecutionRuntime,
+    mut verify_pre_spawn: impl FnMut() -> Result<()>,
+) -> Result<std::process::Output> {
     if let StdinMode::Bytes(bytes) = &stdin {
         if bytes.len() >= COMBINED_CANDIDATE_MAX_BYTES {
             bail!(
@@ -4417,7 +4866,7 @@ fn run_fixed_git_with_stdin(
     .with_stdin(stdin)
     .with_stdin_limit(COMBINED_CANDIDATE_MAX_BYTES)
     .with_timeout(Some(GIT_COMMAND_TIMEOUT));
-    let run_result = run_process(match runtime {
+    let process_spec = match runtime {
         OrchestrationExecutionRuntime::Verified => {
             let profile = match access {
                 WorkspaceAccess::ReadOnly => {
@@ -4441,7 +4890,11 @@ fn run_fixed_git_with_stdin(
         #[cfg(test)]
         OrchestrationExecutionRuntime::NonpublishableSimulation => process_spec
             .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
-    });
+    };
+    verify_pre_spawn().context(
+        "combined candidate harness was not executed because literal pre-spawn revalidation failed",
+    )?;
+    let run_result = run_process(process_spec);
     let output = run_result?;
     if output.timed_out
         || output.process_error.is_some()
@@ -4530,10 +4983,10 @@ fn run_agent_validation_commands(
     agent: &AgentPlan,
     summary: &mut AgentRunSummary,
     worktree: &SelectedWorktree,
-    manager: &WorktreeManager,
     expected_state: &CandidateStateSnapshot,
     base_oid: &Oid,
     runtime: OrchestrationExecutionRuntime,
+    guard: &RevalidationGuard<'_>,
 ) -> bool {
     let Some(recorded) = summary.worktree.as_ref() else {
         fail_summary(summary, "agent has no selected worktree for validation");
@@ -4559,7 +5012,7 @@ fn run_agent_validation_commands(
             base_oid,
             expected_state,
             runtime,
-            || verify_selected_worktree_binding(manager, agent, summary, worktree),
+            || guard.verify().map_err(anyhow::Error::from),
         );
         #[cfg(test)]
         if !binding_intact {
@@ -4597,7 +5050,11 @@ fn run_candidate_bound_validation_command(
             false,
         );
     }
-    let mut run_summary = run_validation_command(validation, root, runtime);
+    let (mut run_summary, harness_executed) =
+        run_validation_command(validation, root, runtime, &mut verify_binding);
+    if !harness_executed {
+        return (run_summary, false);
+    }
     if let Err(error) = verify_binding() {
         append_validation_error(
             &mut run_summary,
@@ -4662,6 +5119,17 @@ struct RepoValidationOutcome {
     target: Option<RepoValidationTargetBinding>,
 }
 
+struct RepoValidationContext<'a> {
+    plan: &'a OrchestrationPlan,
+    repo: &'a Path,
+    manager: &'a WorktreeManager,
+    worktrees: &'a [SelectedWorktree],
+    agent_summaries: &'a [AgentRunSummary],
+    base_oid: &'a Oid,
+    candidates: &'a [Option<CapturedCandidate>],
+    runtime: OrchestrationExecutionRuntime,
+}
+
 #[derive(Debug)]
 struct CombinedCandidateStats {
     candidate_count: usize,
@@ -4674,6 +5142,7 @@ struct DisposableValidationWorktree<'a> {
     manager: &'a WorktreeManager,
     name: String,
     lease: Option<ManagedWorktreeWriteLease>,
+    expected_head_oid: Oid,
     removed: bool,
 }
 
@@ -4687,13 +5156,11 @@ impl<'a> DisposableValidationWorktree<'a> {
             base: Some(base_oid.to_string()),
             worktree_root: None,
         };
-        #[cfg(test)]
+        let cleanliness = manager
+            .acquire_repository_cleanliness()
+            .context("combined candidate repository cleanliness capture failed")?;
         manager
-            .create_for_test(create_options)
-            .context("combined candidate managed worktree creation failed")?;
-        #[cfg(not(test))]
-        manager
-            .create(create_options)
+            .create_with_repository_cleanliness(create_options, &cleanliness)
             .context("combined candidate managed worktree creation failed")?;
         let lease = match manager.acquire_write_execution_lease(&name) {
             Ok(lease) => lease,
@@ -4712,6 +5179,7 @@ impl<'a> DisposableValidationWorktree<'a> {
             manager,
             name,
             lease: Some(lease),
+            expected_head_oid: *base_oid,
             removed: false,
         };
         let verification = (|| -> Result<()> {
@@ -4747,19 +5215,45 @@ impl<'a> DisposableValidationWorktree<'a> {
             .context("combined candidate write lease was released too early")
     }
 
+    fn lease(&self) -> Result<&ManagedWorktreeWriteLease> {
+        self.lease
+            .as_ref()
+            .context("combined candidate write lease was released too early")
+    }
+
     fn verify_binding(&self) -> Result<()> {
         let lease = self
             .lease
             .as_ref()
             .context("combined candidate write lease was released too early")?;
-        let verified = self
-            .manager
-            .get_managed_verified(&self.name)
-            .context("combined candidate managed worktree binding is invalid")?;
-        if &verified != lease.record() {
+        if lease.record().name != self.name {
             bail!(
-                "combined candidate managed worktree record or Git backlink changed while its write lease was held"
+                "combined candidate managed worktree record changed while its write lease was held"
             );
+        }
+        let repo = crate::git_repository::open(lease.path())
+            .context("combined candidate managed worktree path identity is invalid")?;
+        let head = repo
+            .head()
+            .context("combined candidate HEAD is unavailable")?;
+        let expected_ref = format!("refs/heads/{}", lease.record().branch);
+        if head
+            .name()
+            .context("combined candidate HEAD name is invalid")?
+            != expected_ref
+        {
+            bail!("combined candidate HEAD is detached or on the wrong branch");
+        }
+        let oid = head
+            .target()
+            .context("combined candidate symbolic HEAD does not resolve directly")?;
+        let ref_oid = repo
+            .find_reference(&expected_ref)
+            .context("combined candidate branch ref is unavailable")?
+            .target()
+            .context("combined candidate branch ref does not resolve directly")?;
+        if oid != self.expected_head_oid || ref_oid != self.expected_head_oid {
+            bail!("combined candidate HEAD or branch ref drifted");
         }
         Ok(())
     }
@@ -4784,59 +5278,141 @@ impl Drop for DisposableValidationWorktree<'_> {
 }
 
 fn run_repo_validation_commands(
-    plan: &OrchestrationPlan,
-    repo: &Path,
-    manager: &WorktreeManager,
-    worktrees: &[SelectedWorktree],
-    base_oid: &Oid,
-    candidates: &[Option<CapturedCandidate>],
-    runtime: OrchestrationExecutionRuntime,
-) -> RepoValidationOutcome {
-    let primary_before = match capture_consistent_candidate_state(repo, base_oid, runtime) {
-        Ok(state) => state,
-        Err(_) => {
-            return RepoValidationOutcome {
-                summaries: vec![internal_repo_validation_failure(
-                    "primary boundary capture",
-                    "could not bind the primary worktree before combined-candidate validation",
-                )],
-                target: None,
+    context: &RepoValidationContext<'_>,
+    mut publish: impl FnMut(&RepoValidationOutcome) -> Result<()>,
+) -> Result<RepoValidationOutcome> {
+    let primary_before =
+        match capture_consistent_candidate_state(context.repo, context.base_oid, context.runtime) {
+            Ok(state) => state,
+            Err(_) => {
+                return Ok(RepoValidationOutcome {
+                    summaries: vec![internal_repo_validation_failure(
+                        "primary boundary capture",
+                        "could not bind the primary worktree before combined-candidate validation",
+                    )],
+                    target: None,
+                })
             }
-        }
-    };
-    let stats = match validate_combined_candidate_set(plan, candidates, base_oid) {
-        Ok(stats) => stats,
+        };
+    let stats =
+        match validate_combined_candidate_set(context.plan, context.candidates, context.base_oid) {
+            Ok(stats) => stats,
+            Err(error) => {
+                return Ok(RepoValidationOutcome {
+                    summaries: vec![internal_repo_validation_failure(
+                        "combined candidate bounds",
+                        &error.to_string(),
+                    )],
+                    target: None,
+                })
+            }
+        };
+    if context.agent_summaries.len() != context.plan.agents.len()
+        || context.worktrees.len() != context.plan.agents.len()
+    {
+        return Ok(RepoValidationOutcome {
+            summaries: vec![internal_repo_validation_failure(
+                "combined candidate authority",
+                "agent claim/worktree bindings do not match the combined candidate set",
+            )],
+            target: None,
+        });
+    }
+    let requests = match context
+        .plan
+        .agents
+        .iter()
+        .zip(context.agent_summaries)
+        .zip(context.worktrees)
+        .zip(context.candidates)
+        .map(|(((agent, summary), worktree), candidate)| {
+            let candidate = candidate
+                .as_ref()
+                .with_context(|| format!("candidate for agent '{}' disappeared", agent.id))?;
+            let head = Oid::from_str(&candidate.binding.head_oid)
+                .with_context(|| format!("candidate HEAD for agent '{}' is invalid", agent.id))?;
+            selected_revalidation_request(agent, summary, worktree, head)
+        })
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(requests) => requests,
         Err(error) => {
-            return RepoValidationOutcome {
+            return Ok(RepoValidationOutcome {
                 summaries: vec![internal_repo_validation_failure(
-                    "combined candidate bounds",
+                    "combined candidate authority",
                     &error.to_string(),
                 )],
                 target: None,
-            }
+            })
         }
     };
-    let mut validation_worktree = match DisposableValidationWorktree::create(manager, base_oid) {
-        Ok(worktree) => worktree,
+    let claim_guard = match lock_existing_worker_claim_batch(context.repo, &requests) {
+        Ok(guard) => guard,
         Err(error) => {
-            return RepoValidationOutcome {
+            return Ok(RepoValidationOutcome {
                 summaries: vec![internal_repo_validation_failure(
-                    "combined candidate construction",
+                    "combined candidate authority",
                     &error.to_string(),
                 )],
                 target: None,
+            })
+        }
+    };
+    if let Err(error) = claim_guard.verify() {
+        return Ok(RepoValidationOutcome {
+            summaries: vec![internal_repo_validation_failure(
+                "combined candidate authority",
+                &error.to_string(),
+            )],
+            target: None,
+        });
+    }
+    let mut validation_worktree =
+        match DisposableValidationWorktree::create(context.manager, context.base_oid) {
+            Ok(worktree) => worktree,
+            Err(error) => {
+                return Ok(RepoValidationOutcome {
+                    summaries: vec![internal_repo_validation_failure(
+                        "combined candidate construction",
+                        &error.to_string(),
+                    )],
+                    target: None,
+                })
             }
+        };
+    let target_request = validation_worktree
+        .lease()
+        .map(|lease| ExistingWorktreeBindingRequest {
+            agent_id: validation_worktree.name.clone(),
+            lease,
+            expected_record: lease.record().clone(),
+            expected_head_oid: *context.base_oid,
+            expected_ref_oid: *context.base_oid,
+        });
+    let source_guard = match target_request.and_then(|target_request| {
+        revalidate_existing_worker_batch_from_claim_guard(
+            claim_guard,
+            context.manager,
+            requests,
+            vec![target_request],
+        )
+        .map_err(anyhow::Error::from)
+    }) {
+        Ok(guard) => guard,
+        Err(error) => {
+            let _ = validation_worktree.cleanup();
+            return Ok(RepoValidationOutcome {
+                summaries: vec![internal_repo_validation_failure(
+                    "combined candidate authority",
+                    &error.to_string(),
+                )],
+                target: None,
+            });
         }
     };
 
-    let execution = execute_combined_candidate_validation(
-        plan,
-        &validation_worktree,
-        base_oid,
-        candidates,
-        &stats,
-        runtime,
-    );
+    let execution =
+        execute_combined_candidate_validation(context, &validation_worktree, &stats, &source_guard);
     let mut outcome = match execution {
         Ok(outcome) => outcome,
         Err(error) => RepoValidationOutcome {
@@ -4848,14 +5424,15 @@ fn run_repo_validation_commands(
         },
     };
 
-    if validation_worktree.cleanup().is_err() {
+    if source_guard.verify().is_err() {
         outcome.summaries.push(internal_repo_validation_failure(
-            "combined candidate cleanup",
-            "exclusive removal of the disposable validation target failed",
+            "combined candidate authority",
+            "an authenticated source claim or worktree changed during combined validation",
         ));
+        outcome.target = None;
     }
 
-    match capture_consistent_candidate_state(repo, base_oid, runtime) {
+    match capture_consistent_candidate_state(context.repo, context.base_oid, context.runtime) {
         Ok(after) => {
             if let Some(drift) = after.drift_from(&primary_before) {
                 outcome.summaries.push(internal_repo_validation_failure(
@@ -4869,16 +5446,20 @@ fn run_repo_validation_commands(
             "could not verify the primary worktree after repo validation",
         )),
     }
-    verify_agent_worktrees_after_repo_validation(
-        manager,
-        plan,
-        worktrees,
-        candidates,
-        base_oid,
-        runtime,
-        &mut outcome.summaries,
-    );
-    outcome
+    source_guard.verify()?;
+    publish(&outcome)?;
+    source_guard
+        .verify()
+        .context("combined candidate authority changed during checkpoint publication")?;
+    drop(source_guard);
+
+    if validation_worktree.cleanup().is_err() {
+        outcome.summaries.push(internal_repo_validation_failure(
+            "combined candidate cleanup",
+            "exclusive removal of the disposable validation target failed",
+        ));
+    }
+    Ok(outcome)
 }
 
 fn validate_combined_candidate_set(
@@ -4958,41 +5539,105 @@ fn validate_combined_candidate_set(
 }
 
 fn execute_combined_candidate_validation(
-    plan: &OrchestrationPlan,
+    context: &RepoValidationContext<'_>,
     validation_worktree: &DisposableValidationWorktree<'_>,
-    base_oid: &Oid,
-    candidates: &[Option<CapturedCandidate>],
     stats: &CombinedCandidateStats,
-    runtime: OrchestrationExecutionRuntime,
+    source_guard: &RevalidationGuard<'_>,
 ) -> Result<RepoValidationOutcome> {
+    verify_combined_source_candidates(
+        context.plan,
+        context.worktrees,
+        context.base_oid,
+        context.candidates,
+        context.runtime,
+        source_guard,
+    )?;
     validation_worktree.verify_binding()?;
     let validation_path = validation_worktree.path()?;
-    apply_captured_candidate_patches(plan, validation_path, candidates, runtime, || {
-        validation_worktree.verify_binding()
-    })?;
+    apply_captured_candidate_patches(
+        context.plan,
+        validation_path,
+        context.candidates,
+        context.runtime,
+        || {
+            source_guard.verify()?;
+            validation_worktree.verify_binding()
+        },
+    )?;
 
+    source_guard.verify()?;
     validation_worktree.verify_binding()?;
-    let combined_state = capture_consistent_candidate_state(validation_path, base_oid, runtime)
-        .context("combined candidate binding capture failed")?;
+    let combined_state =
+        capture_consistent_candidate_state(validation_path, context.base_oid, context.runtime)
+            .context("combined candidate binding capture failed")?;
+    source_guard.verify()?;
     validation_worktree.verify_binding()?;
     if combined_state.changed_paths != stats.changed_paths {
         bail!("materialized combined candidate paths did not match the captured union");
     }
-    let combined = capture_bound_candidate(validation_path, base_oid, &combined_state, runtime)
-        .context("materialized combined candidate diff capture failed")?;
-    validation_worktree.verify_binding()?;
-    let target = repo_validation_target_binding(stats, base_oid, &combined);
-    let summaries = run_bound_repo_validation_commands(
-        plan,
-        validation_worktree,
-        base_oid,
+    source_guard.verify()?;
+    let combined = capture_bound_candidate(
+        validation_path,
+        context.base_oid,
         &combined_state,
-        runtime,
+        context.runtime,
+    )
+    .context("materialized combined candidate diff capture failed")?;
+    source_guard.verify()?;
+    validation_worktree.verify_binding()?;
+    let target = repo_validation_target_binding(stats, context.base_oid, &combined);
+    let summaries = run_bound_repo_validation_commands(
+        context.plan,
+        validation_worktree,
+        context.base_oid,
+        &combined_state,
+        context.runtime,
+        source_guard,
     );
+    verify_combined_source_candidates(
+        context.plan,
+        context.worktrees,
+        context.base_oid,
+        context.candidates,
+        context.runtime,
+        source_guard,
+    )?;
     Ok(RepoValidationOutcome {
         summaries,
         target: Some(target),
     })
+}
+
+fn verify_combined_source_candidates(
+    plan: &OrchestrationPlan,
+    worktrees: &[SelectedWorktree],
+    base_oid: &Oid,
+    candidates: &[Option<CapturedCandidate>],
+    runtime: OrchestrationExecutionRuntime,
+    guard: &RevalidationGuard<'_>,
+) -> Result<()> {
+    if worktrees.len() != plan.agents.len() || candidates.len() != plan.agents.len() {
+        bail!("combined source candidate authority set is incomplete");
+    }
+    guard.verify()?;
+    for ((agent, worktree), expected) in plan.agents.iter().zip(worktrees).zip(candidates) {
+        let expected = expected
+            .as_ref()
+            .with_context(|| format!("candidate for agent '{}' disappeared", agent.id))?;
+        let state = capture_consistent_candidate_state(worktree.path(), base_oid, runtime)
+            .with_context(|| format!("source candidate '{}' state recapture failed", agent.id))?;
+        ensure_candidate_binding_matches_state(&expected.binding, &state)?;
+        let recaptured = capture_bound_candidate(worktree.path(), base_oid, &state, runtime)
+            .with_context(|| format!("source candidate '{}' diff recapture failed", agent.id))?;
+        if recaptured.binding != expected.binding || recaptured.patch != expected.patch {
+            bail!(
+                "source candidate '{}' changed before combined application",
+                agent.id
+            );
+        }
+        guard.verify()?;
+    }
+    Ok(())
 }
 
 fn apply_captured_candidate_patches(
@@ -5010,12 +5655,13 @@ fn apply_captured_candidate_patches(
             continue;
         }
         verify_binding()?;
-        let output = run_fixed_git_with_stdin(
+        let output = run_fixed_git_with_stdin_guarded(
             validation_path,
             ["apply", "--binary", "--whitespace=nowarn", "-"],
             WorkspaceAccess::ReadWrite,
             StdinMode::Bytes(candidate.patch.clone()),
             runtime,
+            &mut verify_binding,
         )
         .with_context(|| {
             format!(
@@ -5061,6 +5707,7 @@ fn run_bound_repo_validation_commands(
     base_oid: &Oid,
     expected_state: &CandidateStateSnapshot,
     runtime: OrchestrationExecutionRuntime,
+    source_guard: &RevalidationGuard<'_>,
 ) -> Vec<ValidationRunSummary> {
     let mut summaries = Vec::new();
     let validation_path = match validation_worktree.path() {
@@ -5079,7 +5726,10 @@ fn run_bound_repo_validation_commands(
             base_oid,
             expected_state,
             runtime,
-            || validation_worktree.verify_binding(),
+            || {
+                source_guard.verify()?;
+                validation_worktree.verify_binding()
+            },
         );
         if !binding_intact
             && run_summary
@@ -5099,53 +5749,6 @@ fn run_bound_repo_validation_commands(
         }
     }
     summaries
-}
-
-fn verify_agent_worktrees_after_repo_validation(
-    manager: &WorktreeManager,
-    plan: &OrchestrationPlan,
-    worktrees: &[SelectedWorktree],
-    candidates: &[Option<CapturedCandidate>],
-    base_oid: &Oid,
-    runtime: OrchestrationExecutionRuntime,
-    summaries: &mut Vec<ValidationRunSummary>,
-) {
-    if worktrees.len() != candidates.len() || worktrees.len() != plan.agents.len() {
-        summaries.push(internal_repo_validation_failure(
-            "agent candidate verification",
-            "agent worktree lease set no longer matches the candidate set",
-        ));
-        return;
-    }
-    for ((agent, worktree), candidate) in plan.agents.iter().zip(worktrees).zip(candidates) {
-        let Some(candidate) = candidate else {
-            continue;
-        };
-        let verified = manager
-            .get_managed_verified(&agent.id)
-            .and_then(|record| {
-                if &record != worktree.record() {
-                    bail!("managed worktree record drifted");
-                }
-                Ok(())
-            })
-            .and_then(|()| capture_consistent_candidate_state(worktree.path(), base_oid, runtime))
-            .and_then(|state| ensure_candidate_binding_matches_state(&candidate.binding, &state))
-            .and_then(|()| {
-                let record = manager.get_managed_verified(&agent.id)?;
-                if &record != worktree.record() {
-                    bail!("managed worktree record drifted after capture");
-                }
-                Ok(())
-            });
-        if verified.is_err() {
-            summaries.push(internal_repo_validation_failure(
-                "agent candidate verification",
-                "an agent worktree changed while the combined candidate was validated",
-            ));
-            break;
-        }
-    }
 }
 
 fn internal_repo_validation_failure(name: &str, message: &str) -> ValidationRunSummary {
@@ -5168,7 +5771,8 @@ fn run_validation_command(
     validation: &ValidationCommandPlan,
     root: &Path,
     runtime: OrchestrationExecutionRuntime,
-) -> ValidationRunSummary {
+    verify_pre_spawn: &mut impl FnMut() -> Result<()>,
+) -> (ValidationRunSummary, bool) {
     let working_directory = validation
         .working_directory
         .as_ref()
@@ -5189,10 +5793,10 @@ fn run_validation_command(
             summary.error = Some(format!(
                 "failed to bind repository sensitive state before validation: {error:#}"
             ));
-            return summary;
+            return (summary, false);
         }
     };
-    let result = run_agent_command(CommandRunSpec {
+    let spec = CommandRunSpec {
         command: validation.command.clone(),
         workspace_root: root.to_path_buf(),
         working_directory,
@@ -5201,8 +5805,16 @@ fn run_validation_command(
         visible_read_only_roots,
         hidden_roots,
         runtime,
-    });
-    validation_summary_from_result(validation, result)
+    };
+    let result = run_agent_command(spec, verify_pre_spawn);
+    let harness_executed = result
+        .as_ref()
+        .ok()
+        .is_some_and(|result| result.harness_executed);
+    (
+        validation_summary_from_result(validation, result),
+        harness_executed,
+    )
 }
 
 fn validation_summary_from_result(
@@ -5291,7 +5903,10 @@ fn strict_command_profile(spec: &CommandRunSpec) -> StrictOfflineWorkspaceProfil
         .fold(profile, |profile, hidden| profile.with_hidden_root(hidden))
 }
 
-fn run_agent_command(spec: CommandRunSpec) -> Result<CommandRunResult, ProcessRunError> {
+fn run_agent_command(
+    spec: CommandRunSpec,
+    mut verify_pre_spawn: impl FnMut() -> Result<()>,
+) -> Result<CommandRunResult, ProcessRunError> {
     let strict_profile = strict_command_profile(&spec);
     let mut environment = sandbox_environment();
     environment.extend(spec.env);
@@ -5304,7 +5919,7 @@ fn run_agent_command(spec: CommandRunSpec) -> Result<CommandRunResult, ProcessRu
     )
     .with_environment(EnvironmentMode::ClearAndSet(environment))
     .with_timeout(spec.timeout);
-    let mut output = run_process(match spec.runtime {
+    let process_spec = match spec.runtime {
         OrchestrationExecutionRuntime::Verified => process_spec
             .with_private_runtime_home(true)
             .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
@@ -5313,7 +5928,21 @@ fn run_agent_command(spec: CommandRunSpec) -> Result<CommandRunResult, ProcessRu
         #[cfg(test)]
         OrchestrationExecutionRuntime::NonpublishableSimulation => process_spec
             .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
-    })?;
+    };
+    if let Err(error) = verify_pre_spawn() {
+        return Ok(CommandRunResult {
+            harness_executed: false,
+            status: None,
+            duration_ms: 0,
+            timed_out: false,
+            stdout: OutputSummary::default(),
+            stderr: OutputSummary::default(),
+            process_error: Some(format!(
+                "worker harness was not executed because literal pre-spawn revalidation failed: {error}"
+            )),
+        });
+    }
+    let mut output = run_process(process_spec)?;
 
     let safety_verified = output.safety_evidence_verified();
     let safety_evidence = (output.process_tree, output.side_effects);
@@ -5336,6 +5965,7 @@ fn run_agent_command(spec: CommandRunSpec) -> Result<CommandRunResult, ProcessRu
     }
 
     Ok(CommandRunResult {
+        harness_executed: true,
         status: output.status,
         duration_ms: output.duration_ms(),
         timed_out: output.timed_out,
@@ -5347,6 +5977,7 @@ fn run_agent_command(spec: CommandRunSpec) -> Result<CommandRunResult, ProcessRu
 
 #[derive(Debug, Clone)]
 struct CommandRunResult {
+    harness_executed: bool,
     status: Option<ExitStatus>,
     duration_ms: u64,
     timed_out: bool,
@@ -5871,6 +6502,7 @@ enum CommandJournalState {
 
 fn validate_command_phase_history(journal: &StateJournal) -> Result<()> {
     let mut states = BTreeMap::<String, CommandJournalState>::new();
+    let mut validations_in_progress = BTreeSet::<String>::new();
     for record in journal.records() {
         let Some(subject) = record.subject.as_ref() else {
             continue;
@@ -5917,6 +6549,38 @@ fn validate_command_phase_history(journal: &StateJournal) -> Result<()> {
                     );
                 }
             },
+            PHASE_VALIDATION_STARTED => {
+                if !validations_in_progress.insert(subject.clone()) {
+                    bail!(
+                        "checkpoint records a second validation start for agent '{}'; refusing possible double execution",
+                        subject
+                    );
+                }
+                let started = decode_agent_checkpoint(record.payload.clone())
+                    .context("authenticated validation-start payload is malformed")?;
+                if started.id != *subject {
+                    bail!(
+                        "checkpoint validation start subject does not match agent '{}'",
+                        subject
+                    );
+                }
+            }
+            PHASE_VALIDATED => {
+                if !validations_in_progress.remove(subject) {
+                    bail!(
+                        "checkpoint validation completion for agent '{}' has no unique preceding start",
+                        subject
+                    );
+                }
+                let completed = decode_agent_checkpoint(record.payload.clone())
+                    .context("authenticated validation-completion payload is malformed")?;
+                if completed.id != *subject {
+                    bail!(
+                        "checkpoint validation completion subject does not match agent '{}'",
+                        subject
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -5929,6 +6593,12 @@ fn validate_command_phase_history(journal: &StateJournal) -> Result<()> {
             CommandJournalState::Completed => {}
             CommandJournalState::CandidateCaptured => {}
         }
+    }
+    if let Some(agent) = validations_in_progress.into_iter().next() {
+        bail!(
+            "checkpoint shows validation_started for agent '{}' without durable completion; validation outcome is uncertain and will not be rerun automatically, start a new run",
+            agent
+        );
     }
     Ok(())
 }
@@ -6284,6 +6954,21 @@ mod tests {
 
     fn resume_plan_file(options: OrchestrationResumeOptions) -> Result<OrchestrationSummary> {
         super::resume_plan_file_simulation(options)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn missing_delegated_user_manager_before_target(error: &ProcessRunError) -> bool {
+        matches!(
+            error,
+            ProcessRunError::EnvironmentFailure {
+                failure,
+                target_process_started: false,
+                ..
+            } if failure.category
+                == crate::external_agent::EnvironmentFailureCategory::SandboxUnavailable
+                && failure.summary
+                    .contains("is not inside a delegated systemd user manager")
+        )
     }
 
     fn test_candidate_binding(worktree_path: &Path, base_oid: Oid) -> AgentCandidateBinding {
@@ -7507,6 +8192,14 @@ mod tests {
         let repo = crate::git_repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
+        let worktree = WorktreeManager::new(&repo_path)
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("precreate clean worktree for claim-boundary test");
         SyncStore::open(&repo_path)
             .expect("open store")
             .claim_paths("other-agent", ["README.md"])
@@ -7516,23 +8209,30 @@ mod tests {
             &plan_file,
             r#"{
               "agents": [
-                {"id": "agent-a", "paths": ["README.md"], "command": "echo should-not-run"}
+                {"id": "agent-a", "paths": ["README.md"], "command": "touch should-not-run"}
               ]
             }"#,
         )
         .expect("write plan");
 
-        let summary = run_plan_file(OrchestrationRunOptions {
-            repo: repo_path.clone(),
-            plan_file,
-            keep_claims: false,
-            jobs: 1,
-            patch_dir: None,
-        })
+        let summary = run_plan_file_with_controls(
+            OrchestrationRunOptions {
+                repo: repo_path.clone(),
+                plan_file,
+                keep_claims: false,
+                jobs: 1,
+                patch_dir: None,
+            },
+            OrchestrationRunControls {
+                worktree_reuse_policy: Some(WorktreeReusePolicy::Required),
+                ..OrchestrationRunControls::default()
+            },
+        )
         .expect("run plan");
 
         assert!(!summary.success);
         assert_eq!(summary.first_failed_agent(), Some("agent-a"));
+        assert!(summary.agents[0].worktree_reused);
         assert!(summary.agents[0]
             .error
             .as_deref()
@@ -7545,6 +8245,10 @@ mod tests {
                 .expect("owner")
                 .owner,
             Some("other-agent".to_string())
+        );
+        assert!(
+            !worktree.path.join("should-not-run").exists(),
+            "claim-conflicted worker command was executed"
         );
     }
 
@@ -9250,7 +9954,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn verified_run_fails_closed_before_child_can_read_repository_authentication_key() {
+    fn verified_run_executes_child_without_exposing_repository_authentication_key() {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let checkpoint_dir = temp.path().join("checkpoints");
@@ -9260,6 +9964,47 @@ mod tests {
         commit_all(&repo, "initial commit").expect("commit");
         let plan_file = temp.path().join("plan.json");
         let key_name = crate::artifacts::state_auth::authentication_key_file_name();
+        SyncStore::open(&repo_path).expect("initialize authenticated repository state");
+        let key_path = repo.commondir().join("maco/state").join(key_name);
+        assert!(
+            key_path.is_file(),
+            "repository authentication key is absent"
+        );
+        let containment_probe_marker = temp.path().join("containment-probe-ran");
+        let probe = run_process(
+            ProcessSpec::shell(
+                "verified orchestration containment probe",
+                Shell::for_current_platform(),
+                format!("touch '{}'", containment_probe_marker.display()),
+                temp.path(),
+                256,
+            )
+            .with_timeout(Some(Duration::from_secs(5))),
+        );
+        match probe {
+            Ok(output) => {
+                assert!(output.status.is_some_and(|status| status.success()));
+                assert!(containment_probe_marker.is_file());
+                fs::remove_file(&containment_probe_marker)
+                    .expect("remove containment probe marker");
+            }
+            Err(error) if missing_delegated_user_manager_before_target(&error) => {
+                assert!(
+                    !containment_probe_marker.exists(),
+                    "pre-spawn containment failure still executed its target marker"
+                );
+                assert!(
+                    WorktreeManager::new(&repo_path)
+                        .list()
+                        .expect("list worktrees after containment refusal")
+                        .is_empty(),
+                    "verified worker setup ran despite pre-spawn containment refusal"
+                );
+                eprintln!("skipping verified orchestration runtime: {error}");
+                return;
+            }
+            Err(error) => panic!("unexpected verified containment probe failure: {error:?}"),
+        }
         fs::write(
             &plan_file,
             serde_json::to_vec(&serde_json::json!({
@@ -9274,9 +10019,9 @@ mod tests {
             .expect("encode plan"),
         )
         .expect("write plan");
-        let error = super::run_plan_file_with_controls(
+        let summary = super::run_plan_file_with_controls(
             OrchestrationRunOptions {
-                repo: repo_path,
+                repo: repo_path.clone(),
                 plan_file,
                 keep_claims: false,
                 jobs: 1,
@@ -9289,10 +10034,30 @@ mod tests {
                 semantic_coordination: SemanticCoordinationMode::Off,
             },
         )
-        .expect_err("verified assignment creation must fail closed");
-        assert!(error
-            .to_string()
-            .contains("orchestration assignment creation is temporarily unsupported"));
+        .expect("verified assignment must run with repository state hidden");
+
+        assert!(summary.success, "unexpected summary: {summary:#?}");
+        assert_eq!(summary.agents[0].status, AgentRunStatus::Succeeded);
+        assert_eq!(summary.agents[0].exit_code, Some(0));
+        assert_eq!(summary.agents[0].stdout.text.trim(), "state-hidden");
+        assert_eq!(summary.agents[0].error, None);
+        assert_eq!(summary.released_claims.len(), 1);
+        assert!(summary.release_errors.is_empty());
+        assert!(
+            key_path.is_file(),
+            "the key must exist on the host so the child failure proves isolation"
+        );
+        assert_eq!(
+            SyncStore::open(&repo_path)
+                .expect("open store")
+                .snapshot()
+                .expect("snapshot"),
+            Vec::<PathClaim>::new()
+        );
+        let released = WorktreeManager::new(&repo_path)
+            .acquire_write_execution_lease("key-isolation")
+            .expect("verified run releases its write lease");
+        drop(released);
     }
 
     #[cfg(unix)]
@@ -9796,6 +10561,33 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn issue_84_literal_pre_spawn_failure_neuters_worker_harness() {
+        let temp = TempDir::new().expect("tempdir");
+        let sentinel = temp.path().join("must-not-exist");
+        let result = run_agent_command(
+            CommandRunSpec {
+                command: "touch must-not-exist".to_string(),
+                workspace_root: temp.path().to_path_buf(),
+                working_directory: temp.path().to_path_buf(),
+                env: BTreeMap::new(),
+                timeout: Some(Duration::from_secs(3)),
+                visible_read_only_roots: Vec::new(),
+                hidden_roots: Vec::new(),
+                runtime: OrchestrationExecutionRuntime::NonpublishableSimulation,
+            },
+            || bail!("injected authenticated boundary failure"),
+        )
+        .expect("boundary failure is reported without spawning");
+        assert!(result.status.is_none());
+        assert!(result
+            .process_error
+            .as_deref()
+            .is_some_and(|error| error.contains("literal pre-spawn revalidation failed")));
+        assert!(!sentinel.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn agent_command_drains_large_output_before_timeout() {
         let temp = TempDir::new().expect("tempdir");
         let result = run_agent_command(CommandRunSpec {
@@ -9807,7 +10599,7 @@ mod tests {
             visible_read_only_roots: Vec::new(),
             hidden_roots: Vec::new(),
             runtime: OrchestrationExecutionRuntime::NonpublishableSimulation,
-        })
+        }, || Ok(()))
         .expect("run large-output agent command");
 
         assert!(result.status.is_some_and(|status| status.success()));
