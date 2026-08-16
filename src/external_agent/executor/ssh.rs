@@ -303,10 +303,12 @@ impl<T: SshTransport> AgentExecutor for SshExecutor<T> {
             TransportCall::LostResponse { detail } => {
                 return Ok(Effect::Uncertain(Box::new(UncertainEffect {
                     operation: Operation::Collect,
-                    key,
-                    reconciliation: ReconciliationTarget::Execution(ExecutionQuery::Known(
-                        request.identity,
-                    )),
+                    key: key.clone(),
+                    reconciliation: ReconciliationTarget::Collection(CollectionLookup {
+                        identity: request.identity,
+                        policy_digest,
+                        collection_key: key,
+                    }),
                     detail,
                 })));
             }

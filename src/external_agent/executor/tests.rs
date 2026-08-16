@@ -414,6 +414,41 @@ fn config_is_strict_credential_free_and_remote_paths_are_unambiguous() {
 }
 
 #[test]
+fn executor_selection_defaults_local_and_requires_an_explicit_strict_ssh_target() {
+    assert_eq!(ExecutorSelection::default(), ExecutorSelection::Local);
+    assert_eq!(ExecutorSelection::local(), ExecutorSelection::Local);
+    assert_eq!(
+        serde_json::from_str::<ExecutorSelection>(r#"{"kind":"local"}"#).expect("local selection"),
+        ExecutorSelection::Local
+    );
+    assert_eq!(
+        serde_json::to_string(&ExecutorSelection::Local).expect("serialize local selection"),
+        r#"{"kind":"local"}"#
+    );
+
+    let selected_target = target();
+    let remote = ExecutorSelection::ssh(selected_target.clone());
+    assert_eq!(remote.ssh_target(), Some(&selected_target));
+    let encoded = serde_json::to_string(&remote).expect("serialize SSH selection");
+    let decoded =
+        serde_json::from_str::<ExecutorSelection>(&encoded).expect("deserialize SSH selection");
+    assert_eq!(decoded, remote);
+
+    for invalid in [
+        r#"{"kind":"ssh"}"#,
+        r#"{"kind":"unknown"}"#,
+        r#"{"kind":"local","target":{}}"#,
+        r#"{"kind":"local","password":"secret"}"#,
+        r#"{"kind":"ssh","target":{"host_id":"home-lxc-a","endpoint":"lxc-a.internal","user":"runner","port":22,"helper":"/opt/maco/helper","root":"/srv/maco/runs","private_key":"/secret/key"}}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<ExecutorSelection>(invalid).is_err(),
+            "accepted invalid executor selection: {invalid}"
+        );
+    }
+}
+
+#[test]
 fn logical_paths_literals_and_argv_fail_closed_on_path_spellings() {
     for raw in [
         "/etc/passwd",
@@ -759,6 +794,53 @@ fn nonzero_exit_and_timeout_are_process_outcomes() {
 }
 
 #[test]
+fn terminal_process_signal_preserves_sigsegv_separately_from_control_requests() {
+    assert!(ProcessSignal::new(0).is_err());
+    assert!(ProcessSignal::new(65).is_err());
+
+    let (_, _, identity) = launch_fixture(1_000);
+    let query = ExecutionQuery::Known(identity.clone());
+    let status_key = derive_query_key("status", &query);
+    let max_wait = BoundedMillis::new(500).expect("wait");
+    let wait_key = derive_wait_key("wait", &identity, max_wait);
+    let sigsegv = ProcessSignal::new(11).expect("SIGSEGV");
+    let executor = SshExecutor::new(
+        target(),
+        ScriptedTransport::new(vec![
+            Script::Status(TransportCall::Response(StatusReceipt::from_wire(
+                EXECUTOR_PROTOCOL_VERSION,
+                status_key,
+                query.clone(),
+                ExecutionStatus::Signaled {
+                    identity: identity.clone(),
+                    signal: sigsegv,
+                },
+            ))),
+            Script::Wait(TransportCall::Response(WaitReceipt::from_wire(
+                EXECUTOR_PROTOCOL_VERSION,
+                wait_key,
+                identity.clone(),
+                WaitOutcome::Signaled { signal: sigsegv },
+            ))),
+        ]),
+    );
+
+    assert!(matches!(
+        executor
+            .status(StatusRequest { query })
+            .expect("signaled status"),
+        ExecutionStatus::Signaled { signal, .. } if signal.get() == 11
+    ));
+    assert_eq!(
+        executor
+            .wait(WaitRequest::new(identity, WaitSpec::new(max_wait)))
+            .expect("signaled wait"),
+        WaitOutcome::Signaled { signal: sigsegv }
+    );
+    executor.transport().assert_consumed();
+}
+
+#[test]
 fn timeout_uses_payload_bound_term_wait_kill_wait_sequence() {
     let (_, _, identity) = launch_fixture(1_000);
     let initial = BoundedMillis::new(10).expect("wait");
@@ -800,7 +882,7 @@ fn timeout_uses_payload_bound_term_wait_kill_wait_sequence() {
             kill_wait_key,
             identity.clone(),
             WaitOutcome::Signaled {
-                signal: ControlSignal::Kill,
+                signal: ProcessSignal::new(9).expect("SIGKILL"),
             },
         ))),
     ]);
@@ -994,6 +1076,43 @@ fn collection_rejects_safe_manifest_with_escaping_patch_and_still_cleans_up() {
 }
 
 #[test]
+fn lost_collection_preserves_the_immutable_policy_and_collection_key_binding() {
+    let (_, _, identity) = launch_fixture(1_000);
+    let policy = output_policy(2048, 64);
+    let policy_digest = policy.digest().clone();
+    let collection_key = derive_collection_key(&identity, &policy_digest);
+    let executor = SshExecutor::new(
+        target(),
+        ScriptedTransport::new(vec![Script::Collect(TransportCall::LostResponse {
+            detail: "collection response lost".to_string(),
+        })]),
+    );
+
+    let uncertain = match executor
+        .collect(CollectRequest::new(identity.clone(), policy))
+        .expect("uncertain collection")
+    {
+        Effect::Uncertain(value) => value,
+        Effect::Confirmed(value) => panic!("unexpected collection confirmation: {value:?}"),
+    };
+    assert_eq!(uncertain.operation, Operation::Collect);
+    assert_eq!(uncertain.key, collection_key);
+    assert_eq!(
+        uncertain.reconciliation,
+        ReconciliationTarget::Collection(CollectionLookup {
+            identity,
+            policy_digest,
+            collection_key,
+        })
+    );
+    assert!(matches!(
+        executor.transport().requests().as_slice(),
+        [RequestRecord::Collect(_)]
+    ));
+    executor.transport().assert_consumed();
+}
+
+#[test]
 fn patch_parser_rejects_quoted_backslash_mismatch_and_unsafe_null_headers() {
     let bad_patches = [
         b"diff --git \"a/src/lib.rs\" \"b/src/lib.rs\"\n--- a/src/lib.rs\n+++ b/src/lib.rs\n"
@@ -1177,7 +1296,7 @@ fn collection_rejects_unsorted_duplicate_outside_and_undeclared_paths() {
 #[test]
 fn bounded_wire_types_reject_patch_output_and_aggregate_overruns() {
     assert!(matches!(
-        CollectedBlob::from_wire_bounded(vec![0; 11], 11, Digest::for_bytes(&vec![0; 11]), 10,),
+        CollectedBlob::from_wire_bounded(vec![0; 11], 11, Digest::for_bytes(&[0; 11]), 10,),
         Err(ExecutorError::LimitExceeded { .. })
     ));
 

@@ -22,6 +22,7 @@ const MAX_OUTPUT_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_OUTPUT_MEDIA_TYPE_BYTES: usize = 128;
 const MAX_CHANGED_PATHS: usize = 4096;
 const MAX_WAIT_MILLIS: u64 = 24 * 60 * 60 * 1000;
+const MAX_LINUX_PROCESS_SIGNAL: u16 = 64;
 // Conservative wire-accounting overheads. The fixed allowance covers the complete
 // maximum-width execution identity, receipt keys/digests, scalar fields, container
 // counts, and their length prefixes. Per-item allowances cover their own framing
@@ -1286,6 +1287,36 @@ pub struct StatusTransportRequest {
     pub query: ExecutionQuery,
 }
 
+/// Signal reported by a completed process on the remote Linux execution target.
+///
+/// This is deliberately distinct from [`ControlSignal`]: process status may report
+/// any standard or real-time Linux signal, while control requests are restricted to
+/// the protocol's TERM-then-KILL policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessSignal(NonZeroU16);
+
+impl ProcessSignal {
+    pub fn new(value: u16) -> ExecutorResult<Self> {
+        let value = NonZeroU16::new(value).ok_or_else(|| {
+            invalid(
+                "process terminal signal",
+                "must be a nonzero Linux signal number",
+            )
+        })?;
+        if value.get() > MAX_LINUX_PROCESS_SIGNAL {
+            return Err(invalid(
+                "process terminal signal",
+                "exceeds the Linux signal range",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn get(self) -> u16 {
+        self.0.get()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionStatus {
     NotFound,
@@ -1296,7 +1327,7 @@ pub enum ExecutionStatus {
     },
     Signaled {
         identity: ExecutionIdentity,
-        signal: ControlSignal,
+        signal: ProcessSignal,
     },
 }
 
@@ -1397,7 +1428,7 @@ pub struct WaitTransportRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitOutcome {
     Exited { code: i32 },
-    Signaled { signal: ControlSignal },
+    Signaled { signal: ProcessSignal },
     TimedOut,
     RunningAtDeadline,
 }
@@ -2543,9 +2574,17 @@ pub struct CleanupLookup {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionLookup {
+    pub identity: ExecutionIdentity,
+    pub policy_digest: Digest,
+    pub collection_key: IdempotencyKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconciliationTarget {
     StageOperator(StageLookup),
     Execution(ExecutionQuery),
+    Collection(CollectionLookup),
     Cleanup(CleanupLookup),
 }
 

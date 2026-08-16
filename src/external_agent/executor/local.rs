@@ -9,9 +9,9 @@
 /// remote lifecycle. The current local contract is one synchronous higher-ranked
 /// callback carrying a borrowed review runtime and returning the concrete local run
 /// report. Claiming lifecycle parity here would require type erasure or fabricated
-/// local stage/launch state. The integration wave must register an outer synchronous
-/// seam with those real parent types; local selection then forwards here unchanged,
-/// while remote selection may internally drive the six typed operations.
+/// local stage/launch state. The real crate's existing synchronous reviewed entrypoint
+/// now forwards through this adapter with those concrete parent types. Production
+/// selection and remote transport wiring remain separate integration work.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LocalExecutor;
 

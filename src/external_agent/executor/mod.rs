@@ -7,16 +7,19 @@
 //! coordinator-side containment, review, recapture, and merge gates are outside
 //! this protocol boundary.
 //!
-//! `LocalExecutor` is compatibility forwarding, not six-phase trait parity. A common
-//! selectable outer seam requires the concrete higher-ranked borrowed review/runtime
-//! types in the sequenced registration wave and is intentionally not fabricated here.
+//! `LocalExecutor` is compatibility forwarding, not six-phase trait parity. The real
+//! crate's existing concrete higher-ranked reviewed runner forwards through it without
+//! changing the callback surface. Production selection and SSH transport wiring remain
+//! outside this executor-owned foundation.
 
 mod checksum;
 mod local;
+mod selection;
 mod ssh;
 mod types;
 
 pub use local::LocalExecutor;
+pub use selection::ExecutorSelection;
 pub use ssh::{AgentExecutor, SshExecutor, SshTransport};
 pub use types::*;
 
