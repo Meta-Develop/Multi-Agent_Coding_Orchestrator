@@ -775,14 +775,16 @@ impl ForgeCoordinationEngine {
     }
 
     fn require_trusted_actor(&self, actor: &ForgeActor) -> Result<()> {
-        if self
-            .trusted_actors
-            .get(actor.provider_actor_id())
-            .is_none_or(|trusted| trusted != actor)
-        {
+        if !self.is_trusted_actor(actor) {
             bail!("coordination record actor is not in the exact trusted actor allowlist");
         }
         Ok(())
+    }
+
+    fn is_trusted_actor(&self, actor: &ForgeActor) -> bool {
+        self.trusted_actors
+            .get(actor.provider_actor_id())
+            .is_some_and(|trusted| trusted == actor)
     }
 
     fn parse_records(
@@ -793,6 +795,12 @@ impl ForgeCoordinationEngine {
         let mut dispositions = Vec::new();
         let mut marker_count = 0_usize;
         for comment in observation.comments() {
+            // Untrusted comments are discussion, not coordination input. Filtering
+            // before parsing prevents an outsider from turning malformed marker-like
+            // text into a denial of service against otherwise valid trusted state.
+            if !self.is_trusted_actor(comment.author()) {
+                continue;
+            }
             let Some(record) = CoordinationRecord::parse(comment.body())? else {
                 continue;
             };
@@ -801,7 +809,6 @@ impl ForgeCoordinationEngine {
             if marker_count > MAX_COORDINATION_RECORDS {
                 bail!("coordination thread exceeds its record count limit");
             }
-            self.require_trusted_actor(comment.author())?;
             let observed = ObservedRecord {
                 record,
                 provenance: RecordProvenance::from_comment(comment),
@@ -852,6 +859,7 @@ struct ClaimDefinition {
     scopes: Vec<String>,
     stale_after_seconds: u64,
     supersedes: Option<String>,
+    winning_timestamp: ForgeTimestamp,
     winning_nonce: String,
 }
 
@@ -884,6 +892,7 @@ impl ClaimModel {
                 scopes: scopes.clone(),
                 stale_after_seconds: *stale_after_seconds,
                 supersedes: supersedes.clone(),
+                winning_timestamp: observed.provenance.created_at.clone(),
                 winning_nonce: activation_nonce.clone(),
             };
             match definitions.entry(claim_id.clone()) {
@@ -899,7 +908,14 @@ impl ClaimModel {
                     {
                         bail!("one claim id has ambiguous activation definitions");
                     }
-                    if candidate.winning_nonce < current.winning_nonce {
+                    if (
+                        candidate.winning_timestamp.clone(),
+                        candidate.winning_nonce.clone(),
+                    ) < (
+                        current.winning_timestamp.clone(),
+                        current.winning_nonce.clone(),
+                    ) {
+                        current.winning_timestamp = candidate.winning_timestamp;
                         current.winning_nonce = candidate.winning_nonce;
                     }
                 }
@@ -999,6 +1015,7 @@ fn reduce_claims(
     }
     for timestamp in timestamps {
         let at = timestamp_seconds(&timestamp)?;
+        let mut explicitly_released = BTreeSet::new();
         let (mut references, replay_dispositions) =
             canonical_claim_references(records, &timestamp)?;
         dispositions.extend(replay_dispositions);
@@ -1052,6 +1069,7 @@ fn reduce_claims(
                 if claim.status == ClaimStatus::Active {
                     claim.status = ClaimStatus::Released;
                     claim.terminal = Some(observed.provenance.clone());
+                    explicitly_released.insert(claim_id.clone());
                 } else {
                     dispositions.push(RecordDisposition {
                         kind: RecordDispositionKind::ObsoleteLineageMutation,
@@ -1088,6 +1106,13 @@ fn reduce_claims(
                 .definitions
                 .get(&claim_id)
                 .context("claim activation lost its definition")?;
+            if explicitly_released.iter().any(|released_claim_id| {
+                claims
+                    .get(released_claim_id)
+                    .is_some_and(|released| scopes_overlap(&released.scopes, &definition.scopes))
+            }) {
+                bail!("same-second overlapping claim release and activation are ambiguous");
+            }
             let conflicting = active_conflict(&claims, &definition.scopes, Some(&claim_id));
             let mut status = ClaimStatus::Active;
             let mut conflict = None;
@@ -1100,6 +1125,7 @@ fn reduce_claims(
                     conflict = Some(predecessor_id.clone());
                 } else {
                     let predecessor = predecessor.context("validated predecessor disappeared")?;
+                    let predecessor_already_superseded = predecessor.superseded_by.is_some();
                     let predecessor_stale = predecessor.status == ClaimStatus::Active
                         && elapsed_at_least(
                             timestamp_seconds(&predecessor.last_heartbeat.created_at)?,
@@ -1107,7 +1133,10 @@ fn reduce_claims(
                             predecessor.stale_after_seconds,
                         )?;
                     let predecessor_released = predecessor.status == ClaimStatus::Released;
-                    if !(predecessor_stale || predecessor_released) {
+                    if predecessor_already_superseded {
+                        status = ClaimStatus::InvalidTakeover;
+                        conflict = predecessor.superseded_by.clone();
+                    } else if !(predecessor_stale || predecessor_released) {
                         status = ClaimStatus::InvalidTakeover;
                         conflict = Some(predecessor_id.clone());
                     } else if conflicting
@@ -1116,13 +1145,15 @@ fn reduce_claims(
                     {
                         status = ClaimStatus::Conflict;
                         conflict = conflicting;
-                    } else if predecessor_stale {
+                    } else {
                         let predecessor = claims
                             .get_mut(predecessor_id)
-                            .context("stale predecessor disappeared")?;
-                        predecessor.status = ClaimStatus::Superseded;
+                            .context("accepted predecessor disappeared")?;
+                        if predecessor_stale {
+                            predecessor.status = ClaimStatus::Superseded;
+                            predecessor.terminal = Some(observed.provenance.clone());
+                        }
                         predecessor.superseded_by = Some(claim_id.clone());
-                        predecessor.terminal = Some(observed.provenance.clone());
                     }
                 }
             } else if let Some(active) = conflicting {
@@ -1213,14 +1244,16 @@ fn canonical_claim_references<'a>(
     Ok((by_reference.into_values().collect(), dispositions))
 }
 
+type ReducedAgentStates = (
+    BTreeMap<(String, String), ForgeAgentState>,
+    Vec<RecordDisposition>,
+);
+
 fn reduce_agent_states(
     records: &[ObservedRecord],
     model: &ClaimModel,
     claims: &BTreeMap<String, ForgeClaimState>,
-) -> Result<(
-    BTreeMap<(String, String), ForgeAgentState>,
-    Vec<RecordDisposition>,
-)> {
+) -> Result<ReducedAgentStates> {
     let mut sequences = BTreeMap::<(String, String), BTreeMap<u64, ObservedRecord>>::new();
     let mut dispositions = Vec::new();
     let mut lineages = BTreeMap::<(String, String), &ForgeClaimState>::new();
@@ -1240,6 +1273,7 @@ fn reduce_agent_states(
             bail!("accepted claims ambiguously reuse one agent activation lineage");
         }
     }
+    let mut canonical_states = BTreeMap::<(String, String, u64), ObservedRecord>::new();
     for observed in records {
         let CoordinationAction::AgentState {
             agent_id,
@@ -1250,34 +1284,15 @@ fn reduce_agent_states(
         else {
             continue;
         };
-        let lineage = lineages
-            .get(&(agent_id.clone(), activation_nonce.clone()))
-            .context("agent state does not bind an accepted winning claim lineage")?;
-        if observed.provenance.actor != lineage.activation.actor
-            || observed.provenance.created_at < lineage.activation.created_at
+        let (claim_id, activation, _) =
+            resolve_state_activation(model, agent_id, activation_nonce)?;
+        if observed.provenance.actor != activation.provenance.actor
+            || observed.provenance.created_at < activation.provenance.created_at
         {
             bail!("agent state is not bound to its activation actor and provider time");
         }
-        if let Some(terminal) = &lineage.terminal {
-            match observed.provenance.created_at.cmp(&terminal.created_at) {
-                std::cmp::Ordering::Greater => {
-                    dispositions.push(RecordDisposition {
-                        kind: RecordDispositionKind::ObsoleteLineageMutation,
-                        event_id: observed.record.event_id.clone(),
-                        provenance: observed.provenance.clone(),
-                    });
-                    continue;
-                }
-                std::cmp::Ordering::Equal => {
-                    bail!("same-second agent state and lineage termination are ambiguous");
-                }
-                std::cmp::Ordering::Less => {}
-            }
-        }
-        let states = sequences
-            .entry((agent_id.clone(), activation_nonce.clone()))
-            .or_default();
-        match states.entry(*sequence) {
+        let key = (claim_id.to_string(), activation_nonce.clone(), *sequence);
+        match canonical_states.entry(key) {
             Entry::Vacant(entry) => {
                 entry.insert(observed.clone());
             }
@@ -1303,6 +1318,56 @@ fn reduce_agent_states(
             Entry::Occupied(_) => {
                 bail!("agent state sequence has ambiguous payloads");
             }
+        }
+    }
+    for ((claim_id, activation_nonce, sequence), observed) in canonical_states {
+        let definition = model
+            .definitions
+            .get(&claim_id)
+            .context("agent state lineage lost its claim definition")?;
+        if definition.winning_nonce != activation_nonce {
+            dispositions.push(RecordDisposition {
+                kind: RecordDispositionKind::LosingActivationNonce,
+                event_id: observed.record.event_id,
+                provenance: observed.provenance,
+            });
+            continue;
+        }
+        let lineage = claims
+            .get(&claim_id)
+            .context("winning agent state lineage lost its reduced claim")?;
+        if matches!(
+            lineage.status,
+            ClaimStatus::Conflict | ClaimStatus::InvalidTakeover
+        ) {
+            dispositions.push(RecordDisposition {
+                kind: RecordDispositionKind::ObsoleteLineageMutation,
+                event_id: observed.record.event_id,
+                provenance: observed.provenance,
+            });
+            continue;
+        }
+        if let Some(terminal) = &lineage.terminal {
+            match observed.provenance.created_at.cmp(&terminal.created_at) {
+                std::cmp::Ordering::Greater => {
+                    dispositions.push(RecordDisposition {
+                        kind: RecordDispositionKind::ObsoleteLineageMutation,
+                        event_id: observed.record.event_id.clone(),
+                        provenance: observed.provenance.clone(),
+                    });
+                    continue;
+                }
+                std::cmp::Ordering::Equal => {
+                    bail!("same-second agent state and lineage termination are ambiguous");
+                }
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        let states = sequences
+            .entry((lineage.agent_id.clone(), activation_nonce))
+            .or_default();
+        if states.insert(sequence, observed).is_some() {
+            bail!("canonical agent state sequence was inserted more than once");
         }
     }
     let mut result = BTreeMap::new();
@@ -1363,6 +1428,41 @@ fn reduce_agent_states(
     Ok((result, dispositions))
 }
 
+fn resolve_state_activation<'a>(
+    model: &'a ClaimModel,
+    agent_id: &str,
+    activation_nonce: &str,
+) -> Result<(&'a str, &'a ObservedRecord, &'a ClaimDefinition)> {
+    let mut resolved = None;
+    let mut nonce_exists = false;
+    for ((claim_id, nonce), activation) in &model.activations {
+        if nonce != activation_nonce {
+            continue;
+        }
+        nonce_exists = true;
+        let definition = model
+            .definitions
+            .get(claim_id)
+            .context("claim activation lost its definition")?;
+        if definition.agent_id != agent_id {
+            continue;
+        }
+        if resolved
+            .replace((claim_id.as_str(), activation, definition))
+            .is_some()
+        {
+            bail!("agent state ambiguously matches multiple claim activations");
+        }
+    }
+    resolved.with_context(|| {
+        if nonce_exists {
+            "agent state activation nonce belongs to a different agent"
+        } else {
+            "agent state uses an unknown activation nonce"
+        }
+    })
+}
+
 fn active_conflict(
     claims: &BTreeMap<String, ForgeClaimState>,
     scopes: &[String],
@@ -1377,16 +1477,21 @@ fn active_conflict(
 }
 
 fn scopes_overlap(left: &[String], right: &[String]) -> bool {
-    let mut left_index = 0_usize;
-    let mut right_index = 0_usize;
-    while left_index < left.len() && right_index < right.len() {
-        match left[left_index].cmp(&right[right_index]) {
-            std::cmp::Ordering::Less => left_index = left_index.saturating_add(1),
-            std::cmp::Ordering::Greater => right_index = right_index.saturating_add(1),
-            std::cmp::Ordering::Equal => return true,
-        }
-    }
-    false
+    left.iter().any(|left_scope| {
+        right
+            .iter()
+            .any(|right_scope| scope_keys_overlap(left_scope, right_scope))
+    })
+}
+
+fn scope_keys_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn record_order_key(record: &&ObservedRecord) -> (String, String, String) {
@@ -1445,11 +1550,12 @@ fn validate_scopes(scopes: &[String]) -> Result<()> {
         bail!("claim scopes must be a bounded non-empty collection");
     }
     let mut prior = None::<&str>;
-    for scope in scopes {
+    for (index, scope) in scopes.iter().enumerate() {
         validate_text(scope, "claim scope", MAX_SCOPE_BYTES, false)?;
         if scope.starts_with('/')
             || scope.ends_with('/')
             || scope.contains("//")
+            || scope.contains('\\')
             || scope
                 .split('/')
                 .any(|component| matches!(component, "." | ".."))
@@ -1459,6 +1565,12 @@ fn validate_scopes(scopes: &[String]) -> Result<()> {
         }
         if prior.is_some_and(|previous| previous >= scope.as_str()) {
             bail!("claim scopes must be strictly sorted and unique");
+        }
+        if scopes[..index]
+            .iter()
+            .any(|previous| scope_keys_overlap(previous, scope))
+        {
+            bail!("claim scopes cannot contain redundant ancestor and descendant keys");
         }
         prior = Some(scope);
     }
@@ -1642,13 +1754,31 @@ mod tests {
         nonce: &str,
         supersedes: Option<&str>,
     ) -> CoordinationRecord {
+        claim_with_scopes(
+            event,
+            claim_id,
+            agent_id,
+            nonce,
+            vec!["path:src/publication.rs".to_string()],
+            supersedes,
+        )
+    }
+
+    fn claim_with_scopes(
+        event: &str,
+        claim_id: &str,
+        agent_id: &str,
+        nonce: &str,
+        scopes: Vec<String>,
+        supersedes: Option<&str>,
+    ) -> CoordinationRecord {
         CoordinationRecord::claim(
             &item(),
             event,
             claim_id,
             agent_id,
             nonce,
-            vec!["path:src/publication.rs".to_string()],
+            scopes,
             60,
             supersedes.map(str::to_string),
         )
@@ -1783,6 +1913,133 @@ mod tests {
     }
 
     #[test]
+    fn hierarchical_scope_overlap_is_boundary_aware_and_order_independent() {
+        let writer = actor("B_writer", "writer-bot");
+        let parent = claim_with_scopes(
+            "event-parent",
+            "claim-z",
+            "agent-parent",
+            "nonce-parent",
+            vec!["path:src".to_string()],
+            None,
+        );
+        let child = claim_with_scopes(
+            "event-child",
+            "claim-a",
+            "agent-child",
+            "nonce-child",
+            vec!["path:src/file.rs".to_string()],
+            None,
+        );
+        let forward = engine(&writer)
+            .reconstruct(&observation(
+                T30,
+                vec![
+                    comment("C_parent", &writer, T0, &parent),
+                    comment("C_child", &writer, T0, &child),
+                ],
+            ))
+            .expect("hierarchical race");
+        let reverse = engine(&writer)
+            .reconstruct(&observation(
+                T30,
+                vec![
+                    comment("C_child", &writer, T0, &child),
+                    comment("C_parent", &writer, T0, &parent),
+                ],
+            ))
+            .expect("reverse hierarchical race");
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.claims()[0].status(), ClaimStatus::Active);
+        assert_eq!(forward.claims()[1].status(), ClaimStatus::Conflict);
+        assert!(scope_keys_overlap("path:src", "path:src/file.rs"));
+        assert!(scope_keys_overlap("path:src/file.rs", "path:src"));
+
+        let sibling_a = claim_with_scopes(
+            "event-sibling-a",
+            "claim-a",
+            "agent-a",
+            "nonce-a",
+            vec!["path:src/a.rs".to_string()],
+            None,
+        );
+        let sibling_b = claim_with_scopes(
+            "event-sibling-b",
+            "claim-b",
+            "agent-b",
+            "nonce-b",
+            vec!["path:src/b.rs".to_string()],
+            None,
+        );
+        let siblings = engine(&writer)
+            .reconstruct(&observation(
+                T30,
+                vec![
+                    comment("C_sibling_a", &writer, T0, &sibling_a),
+                    comment("C_sibling_b", &writer, T0, &sibling_b),
+                ],
+            ))
+            .expect("siblings do not overlap");
+        assert!(siblings
+            .claims()
+            .iter()
+            .all(|claim| claim.status() == ClaimStatus::Active));
+
+        let prefix = claim_with_scopes(
+            "event-prefix",
+            "claim-a",
+            "agent-a",
+            "nonce-a",
+            vec!["path:src".to_string()],
+            None,
+        );
+        let mere_prefix = claim_with_scopes(
+            "event-mere-prefix",
+            "claim-b",
+            "agent-b",
+            "nonce-b",
+            vec!["path:src2".to_string()],
+            None,
+        );
+        let prefixes = engine(&writer)
+            .reconstruct(&observation(
+                T30,
+                vec![
+                    comment("C_prefix", &writer, T0, &prefix),
+                    comment("C_mere_prefix", &writer, T0, &mere_prefix),
+                ],
+            ))
+            .expect("mere prefixes do not overlap");
+        assert!(prefixes
+            .claims()
+            .iter()
+            .all(|claim| claim.status() == ClaimStatus::Active));
+
+        assert!(CoordinationRecord::claim(
+            &item(),
+            "event-backslash",
+            "claim-backslash",
+            "agent-a",
+            "nonce-a",
+            vec![r"path:src\file.rs".to_string()],
+            60,
+            None,
+        )
+        .is_err());
+        assert!(CoordinationRecord::claim(
+            &item(),
+            "event-redundant",
+            "claim-redundant",
+            "agent-a",
+            "nonce-a",
+            vec!["path:src".to_string(), "path:src/file.rs".to_string()],
+            60,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn lexicographically_first_activation_nonce_wins_and_loser_mutations_are_inert() {
         let writer = actor("B_writer", "writer-bot");
         let losing = claim("event-nonce-z", "claim-a", "agent-a", "nonce-z", None);
@@ -1796,6 +2053,16 @@ mod tests {
             "loser exits",
         )
         .expect("release");
+        let losing_state = CoordinationRecord::agent_state(
+            &item(),
+            "event-state-z",
+            "agent-a",
+            "nonce-z",
+            1,
+            AgentPhase::Failed,
+            Some("losing activation".to_string()),
+        )
+        .expect("state");
         let snapshot = engine(&writer)
             .reconstruct(&observation(
                 T30,
@@ -1803,13 +2070,35 @@ mod tests {
                     comment("C_z", &writer, T0, &losing),
                     comment("C_a", &writer, T0, &winning),
                     comment("C_release_z", &writer, T30, &losing_release),
+                    comment("C_state_z", &writer, T30, &losing_state),
                 ],
             ))
             .expect("reconstruct");
         assert_eq!(snapshot.claims().len(), 1);
         assert_eq!(snapshot.claims()[0].activation_nonce(), "nonce-a");
         assert_eq!(snapshot.claims()[0].status(), ClaimStatus::Active);
-        assert_eq!(snapshot.ignored_losing_nonce_count(), 2);
+        assert!(snapshot.agents().is_empty());
+        assert_eq!(snapshot.ignored_losing_nonce_count(), 3);
+    }
+
+    #[test]
+    fn earliest_activation_timestamp_precedes_nonce_tie_break() {
+        let writer = actor("B_writer", "writer-bot");
+        let established = claim("event-established", "claim-a", "agent-a", "nonce-z", None);
+        let delayed_lower = claim("event-delayed", "claim-a", "agent-a", "nonce-a", None);
+        let snapshot = engine(&writer)
+            .reconstruct(&observation(
+                T60,
+                vec![
+                    comment("C_established", &writer, T0, &established),
+                    comment("C_delayed", &writer, T30, &delayed_lower),
+                ],
+            ))
+            .expect("later nonce is inert");
+        assert_eq!(snapshot.claims().len(), 1);
+        assert_eq!(snapshot.claims()[0].activation_nonce(), "nonce-z");
+        assert_eq!(snapshot.claims()[0].status(), ClaimStatus::Active);
+        assert_eq!(snapshot.ignored_losing_nonce_count(), 1);
     }
 
     #[test]
@@ -1891,13 +2180,35 @@ mod tests {
             "nonce-b",
             Some("claim-a"),
         );
-        let snapshot = engine(&writer)
+        let direct_race = claim("event-direct-race", "claim-c", "agent-c", "nonce-c", None);
+        assert!(engine(&writer)
             .reconstruct(&observation(
                 T60,
                 vec![
                     comment("C_first", &writer, T0, &first),
                     comment("C_release", &writer, T30, &release),
                     comment("C_successor", &writer, T30, &successor),
+                ],
+            ))
+            .is_err());
+        assert!(engine(&writer)
+            .reconstruct(&observation(
+                T60,
+                vec![
+                    comment("C_first", &writer, T0, &first),
+                    comment("C_release", &writer, T30, &release),
+                    comment("C_direct_race", &writer, T30, &direct_race),
+                ],
+            ))
+            .is_err());
+
+        let snapshot = engine(&writer)
+            .reconstruct(&observation(
+                T90,
+                vec![
+                    comment("C_first", &writer, T0, &first),
+                    comment("C_release", &writer, T30, &release),
+                    comment("C_successor", &writer, T60, &successor),
                 ],
             ))
             .expect("reconstruct");
@@ -1910,7 +2221,63 @@ mod tests {
                 .stable_id(),
             "C_release"
         );
+        assert_eq!(snapshot.claims()[0].superseded_by(), Some("claim-b"));
         assert_eq!(snapshot.claims()[1].status(), ClaimStatus::Active);
+    }
+
+    #[test]
+    fn released_predecessor_accepts_only_one_successor() {
+        let writer = actor("B_writer", "writer-bot");
+        let first = claim("event-first", "claim-a", "agent-a", "nonce-a", None);
+        let release_first = CoordinationRecord::release(
+            &item(),
+            "event-release-first",
+            "claim-a",
+            "agent-a",
+            "nonce-a",
+            "handoff",
+        )
+        .expect("release");
+        let successor = claim(
+            "event-successor",
+            "claim-b",
+            "agent-b",
+            "nonce-b",
+            Some("claim-a"),
+        );
+        let release_successor = CoordinationRecord::release(
+            &item(),
+            "event-release-successor",
+            "claim-b",
+            "agent-b",
+            "nonce-b",
+            "finished",
+        )
+        .expect("release");
+        let aba = claim(
+            "event-aba",
+            "claim-c",
+            "agent-c",
+            "nonce-c",
+            Some("claim-a"),
+        );
+        let snapshot = engine(&writer)
+            .reconstruct(&observation(
+                T120,
+                vec![
+                    comment("C_first", &writer, T0, &first),
+                    comment("C_release_first", &writer, T30, &release_first),
+                    comment("C_successor", &writer, T60, &successor),
+                    comment("C_release_successor", &writer, T90, &release_successor),
+                    comment("C_aba", &writer, T120, &aba),
+                ],
+            ))
+            .expect("fork is reduced deterministically");
+        assert_eq!(snapshot.claims()[0].status(), ClaimStatus::Released);
+        assert_eq!(snapshot.claims()[0].superseded_by(), Some("claim-b"));
+        assert_eq!(snapshot.claims()[1].status(), ClaimStatus::Released);
+        assert_eq!(snapshot.claims()[2].status(), ClaimStatus::InvalidTakeover);
+        assert_eq!(snapshot.claims()[2].conflicts_with(), Some("claim-b"));
     }
 
     #[test]
@@ -1982,18 +2349,37 @@ mod tests {
     }
 
     #[test]
-    fn malformed_untrusted_replayed_and_ambiguous_records_fail_closed_as_specified() {
+    fn only_trusted_markers_count_and_trusted_invalid_records_fail_closed() {
         let writer = actor("B_writer", "writer-bot");
         let outsider = actor("B_outsider", "outsider-bot");
         let same_handle_impostor = actor("B_impostor", "writer-bot");
+        assert!(!engine(&writer).is_trusted_actor(&same_handle_impostor));
         let record = claim("event-a", "claim-a", "agent-a", "nonce-a", None);
-        let untrusted = observation(T30, vec![comment("C_untrusted", &outsider, T0, &record)]);
-        assert!(engine(&writer).reconstruct(&untrusted).is_err());
-        let same_handle_untrusted = observation(
+        let baseline = engine(&writer)
+            .reconstruct(&observation(
+                T30,
+                vec![comment("C_trusted", &writer, T0, &record)],
+            ))
+            .expect("trusted baseline");
+        let polluted = observation(
             T30,
-            vec![comment("C_same_handle", &same_handle_impostor, T0, &record)],
+            vec![
+                comment("C_trusted", &writer, T0, &record),
+                comment("C_untrusted", &outsider, T0, &record),
+                raw_comment(
+                    "C_untrusted_malformed",
+                    &outsider,
+                    T0,
+                    "<!-- maco:forge-coordination:v1 malformed",
+                ),
+            ],
         );
-        assert!(engine(&writer).reconstruct(&same_handle_untrusted).is_err());
+        assert_eq!(
+            engine(&writer)
+                .reconstruct(&polluted)
+                .expect("outsiders cannot affect trusted state"),
+            baseline
+        );
 
         let malformed = observation(
             T30,
@@ -2005,6 +2391,12 @@ mod tests {
             )],
         );
         assert!(engine(&writer).reconstruct(&malformed).is_err());
+    }
+
+    #[test]
+    fn trusted_replayed_and_ambiguous_records_are_inert_or_fail_closed() {
+        let writer = actor("B_writer", "writer-bot");
+        let record = claim("event-a", "claim-a", "agent-a", "nonce-a", None);
 
         let replay = observation(
             T30,
@@ -2026,6 +2418,62 @@ mod tests {
             ],
         );
         assert!(engine(&writer).reconstruct(&ambiguous).is_err());
+    }
+
+    #[test]
+    fn losing_scope_race_and_invalid_takeover_states_are_inert() {
+        let writer = actor("B_writer", "writer-bot");
+        let winner = claim("event-winner", "claim-a", "agent-a", "nonce-a", None);
+        let conflict = claim("event-conflict", "claim-z", "agent-z", "nonce-z", None);
+        let invalid = claim(
+            "event-invalid",
+            "claim-y",
+            "agent-y",
+            "nonce-y",
+            Some("claim-missing"),
+        );
+        let conflict_state = CoordinationRecord::agent_state(
+            &item(),
+            "event-conflict-state",
+            "agent-z",
+            "nonce-z",
+            1,
+            AgentPhase::Working,
+            None,
+        )
+        .expect("state");
+        let invalid_state = CoordinationRecord::agent_state(
+            &item(),
+            "event-invalid-state",
+            "agent-y",
+            "nonce-y",
+            1,
+            AgentPhase::Working,
+            None,
+        )
+        .expect("state");
+        let snapshot = engine(&writer)
+            .reconstruct(&observation(
+                T60,
+                vec![
+                    comment("C_winner", &writer, T0, &winner),
+                    comment("C_conflict", &writer, T0, &conflict),
+                    comment("C_invalid", &writer, T0, &invalid),
+                    comment("C_conflict_state", &writer, T30, &conflict_state),
+                    comment("C_invalid_state", &writer, T30, &invalid_state),
+                ],
+            ))
+            .expect("losing lineages are inert");
+        assert!(snapshot.agents().is_empty());
+        assert_eq!(snapshot.claims()[0].status(), ClaimStatus::Active);
+        assert_eq!(snapshot.claims()[1].status(), ClaimStatus::InvalidTakeover);
+        assert_eq!(snapshot.claims()[2].status(), ClaimStatus::Conflict);
+        for event_id in ["event-conflict-state", "event-invalid-state"] {
+            assert!(snapshot.dispositions().iter().any(|disposition| {
+                disposition.kind() == RecordDispositionKind::ObsoleteLineageMutation
+                    && disposition.event_id() == event_id
+            }));
+        }
     }
 
     #[test]
