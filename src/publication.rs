@@ -1,3 +1,4 @@
+pub mod forge_coordination;
 pub mod forge_transport;
 
 use crate::{
