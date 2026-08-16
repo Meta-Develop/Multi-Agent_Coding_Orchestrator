@@ -2353,6 +2353,10 @@ fn initialize_scheduler_evidence(
         initialization.artifact_writer,
         Path::new("schemas/supervisor-final-report.schema.json"),
     )?;
+    write_review_loop_guard_schema(
+        initialization.artifact_writer,
+        Path::new("schemas/review-loop-guard-evidence.schema.json"),
+    )?;
     let field_guide_store = FieldGuideStore::open(initialization.repo, FieldGuideLimits::default())
         .context("failed to open authenticated field guide for supervise run")?;
     let field_guide_prompt = SupervisorFieldGuidePrompt::from_store(&field_guide_store)?;

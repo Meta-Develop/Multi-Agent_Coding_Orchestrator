@@ -241,6 +241,8 @@ const MAX_SUPERVISOR_ASSIGNMENT_INPUT_PATHS: usize = 4096;
 const MAX_SUPERVISOR_ASSIGNMENT_OUTCOMES: usize = 4096;
 const MAX_SUPERVISOR_ASSIGNMENT_ID_BYTES: usize = 64;
 const MAX_REVIEW_LOOP_GUARD_CYCLES: usize = MAX_GATE_CORRECTIONS_LIMIT as usize + 1;
+const MAX_REVIEW_LOOP_GUARD_EVIDENCE_BYTES: usize = 64 * 1024;
+const REVIEW_LOOP_GUARD_EVENT_VERSION: u32 = 1;
 const ASSIGNMENT_SUITABILITY_RATIONALE_PATTERN: &str = r"^[^\u0000-\u001F\u007F-\u009F\s](?:[^\u0000-\u001F\u007F-\u009F]*[^\u0000-\u001F\u007F-\u009F\s])?$";
 const BREAKER_RECOVERY_GUIDANCE: &str = "inspect the breaker window and child evidence, correct the repeated coordination failure, then start a new supervise run; pending assignments were not launched";
 const LOCAL_RUNTIME_ROOTS: &[&[u8]] = &[
@@ -2224,6 +2226,7 @@ pub struct OrchestratorReviewReport {
 #[serde(rename_all = "snake_case")]
 pub enum ReviewLoopStopDisposition {
     ThresholdNotReached,
+    ThresholdReachedWithoutRetry,
     CorrectionRetrySuppressed,
 }
 
@@ -2254,6 +2257,21 @@ pub struct ReviewLoopGuardEvidence {
     pub retry_suppressed: bool,
     pub final_validation_floor: ReviewLoopValidationFloor,
     pub locked_review_accepted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+enum ReviewLoopGuardJournalEvent {
+    CycleObserved {
+        version: u32,
+        config: ReviewLoopGuardConfig,
+        cycle: ReviewLoopCycleRecord,
+    },
+    CorrectionRetrySuppressed {
+        version: u32,
+        cycle_ordinal: u8,
+        consecutive_low_severity_cycles: u8,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

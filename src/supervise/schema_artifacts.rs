@@ -33,6 +33,37 @@ pub(super) fn write_supervisor_final_schema(
     write_schema(writer, relative, supervisor_final_report_schema_value())
 }
 
+pub(super) fn write_review_loop_guard_schema(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+) -> Result<()> {
+    write_schema(writer, relative, review_loop_guard_evidence_schema_value())
+}
+
+pub(super) fn write_review_loop_guard_evidence(
+    writer: &mut ArtifactRunWriter,
+    assignment_id: &str,
+    evidence: &ReviewLoopGuardEvidence,
+) -> Result<PathBuf> {
+    let relative = PathBuf::from("reports")
+        .join("review-loop-guard")
+        .join(format!("{assignment_id}.json"));
+    write_artifact_json(
+        writer,
+        &relative,
+        evidence,
+        MAX_REVIEW_LOOP_GUARD_EVIDENCE_BYTES,
+        ArtifactFileDisposition::PrivateEvidence,
+    )
+    .with_context(|| {
+        format!(
+            "failed to write review-loop guard evidence {}",
+            relative.display()
+        )
+    })?;
+    Ok(relative)
+}
+
 pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -158,7 +189,10 @@ pub(super) fn review_loop_guard_evidence_schema_value() -> serde_json::Value {
             },
             "stop_disposition": {
                 "type": "string",
-                "enum": ["threshold_not_reached", "correction_retry_suppressed"]
+                "enum": [
+                    "threshold_not_reached", "threshold_reached_without_retry",
+                    "correction_retry_suppressed"
+                ]
             },
             "retry_suppressed": {"type": "boolean"},
             "final_validation_floor": {

@@ -1,5 +1,255 @@
 use super::*;
 
+#[derive(Debug)]
+pub(super) struct ReviewLoopGuardTracker {
+    config: ReviewLoopGuardConfig,
+    pub(super) cycles: Vec<ReviewLoopCycleRecord>,
+    threshold_reached: bool,
+    retry_suppressed: bool,
+}
+
+impl ReviewLoopGuardTracker {
+    pub(super) fn new(config: ReviewLoopGuardConfig) -> Self {
+        Self {
+            config,
+            cycles: Vec::new(),
+            threshold_reached: false,
+            retry_suppressed: false,
+        }
+    }
+
+    pub(super) fn observe_real_parent_review(
+        &mut self,
+        artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+        assignment: &OrchestratorAssignment,
+        journal_parent_id: &str,
+        audit_reports: &[AuditorReport],
+    ) -> Result<bool> {
+        let highest_severity = highest_real_parent_review_severity(assignment, audit_reports);
+        let has_real_parent_review = audit_reports
+            .iter()
+            .any(|report| is_parent_auditor_id(assignment, &report.id));
+        if !has_real_parent_review {
+            return Ok(false);
+        }
+        let cycle_index = self
+            .cycles
+            .len()
+            .checked_add(1)
+            .context("review-loop guard cycle count overflowed")?;
+        if cycle_index > MAX_REVIEW_LOOP_GUARD_CYCLES {
+            bail!(
+                "review-loop guard exceeded its bounded {} cycle history",
+                MAX_REVIEW_LOOP_GUARD_CYCLES
+            );
+        }
+        let cycle_ordinal = u8::try_from(cycle_index)
+            .context("review-loop guard cycle ordinal exceeded its u8 bound")?;
+        let low_severity = review_loop_severity_is_low(self.config, highest_severity);
+        let previous_streak = self
+            .cycles
+            .last()
+            .map(|cycle| cycle.consecutive_low_severity_cycles)
+            .unwrap_or(0);
+        let consecutive_low_severity_cycles = if low_severity {
+            previous_streak
+                .checked_add(1)
+                .context("review-loop guard low-severity streak overflowed")?
+        } else {
+            0
+        };
+        let cycle = ReviewLoopCycleRecord {
+            cycle_ordinal,
+            highest_severity,
+            low_severity,
+            consecutive_low_severity_cycles,
+        };
+        record_review_loop_guard_event(
+            artifacts,
+            assignment,
+            journal_parent_id,
+            &ReviewLoopGuardJournalEvent::CycleObserved {
+                version: REVIEW_LOOP_GUARD_EVENT_VERSION,
+                config: self.config,
+                cycle: cycle.clone(),
+            },
+        )?;
+        self.cycles.push(cycle);
+        self.threshold_reached =
+            consecutive_low_severity_cycles >= self.config.consecutive_low_severity_cycles;
+        Ok(self.threshold_reached)
+    }
+
+    pub(super) fn suppress_correction_retry(
+        &mut self,
+        artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+        assignment: &OrchestratorAssignment,
+        journal_parent_id: &str,
+    ) -> Result<()> {
+        if !self.threshold_reached {
+            bail!("review-loop guard cannot suppress a retry before its threshold is reached");
+        }
+        let cycle = self
+            .cycles
+            .last()
+            .context("review-loop guard threshold has no observed review cycle")?;
+        record_review_loop_guard_event(
+            artifacts,
+            assignment,
+            journal_parent_id,
+            &ReviewLoopGuardJournalEvent::CorrectionRetrySuppressed {
+                version: REVIEW_LOOP_GUARD_EVENT_VERSION,
+                cycle_ordinal: cycle.cycle_ordinal,
+                consecutive_low_severity_cycles: cycle.consecutive_low_severity_cycles,
+            },
+        )?;
+        self.retry_suppressed = true;
+        Ok(())
+    }
+
+    pub(super) fn evidence(
+        &self,
+        child_report: &OrchestratorReviewReport,
+    ) -> ReviewLoopGuardEvidence {
+        ReviewLoopGuardEvidence {
+            config: self.config,
+            cycles: self.cycles.clone(),
+            stop_disposition: if self.retry_suppressed {
+                ReviewLoopStopDisposition::CorrectionRetrySuppressed
+            } else if self.threshold_reached {
+                ReviewLoopStopDisposition::ThresholdReachedWithoutRetry
+            } else {
+                ReviewLoopStopDisposition::ThresholdNotReached
+            },
+            retry_suppressed: self.retry_suppressed,
+            final_validation_floor: review_loop_validation_floor(child_report),
+            locked_review_accepted: locked_parent_review_accepted(child_report),
+        }
+    }
+}
+
+fn highest_real_parent_review_severity(
+    assignment: &OrchestratorAssignment,
+    audit_reports: &[AuditorReport],
+) -> Option<FindingSeverity> {
+    audit_reports
+        .iter()
+        .filter(|report| is_parent_auditor_id(assignment, &report.id))
+        .flat_map(|report| report.findings.iter().map(|finding| finding.severity))
+        .fold(None, |highest, severity| {
+            Some(match (highest, severity) {
+                (Some(FindingSeverity::Error), _) | (_, FindingSeverity::Error) => {
+                    FindingSeverity::Error
+                }
+                (Some(FindingSeverity::Warning), _) | (_, FindingSeverity::Warning) => {
+                    FindingSeverity::Warning
+                }
+                _ => FindingSeverity::Info,
+            })
+        })
+}
+
+fn review_loop_severity_is_low(
+    config: ReviewLoopGuardConfig,
+    highest_severity: Option<FindingSeverity>,
+) -> bool {
+    match (config.max_low_severity, highest_severity) {
+        (_, None | Some(FindingSeverity::Info)) => true,
+        (ReviewLoopLowSeverity::Warning, Some(FindingSeverity::Warning)) => true,
+        (_, Some(FindingSeverity::Warning | FindingSeverity::Error)) => false,
+    }
+}
+
+fn review_loop_validation_floor(
+    child_report: &OrchestratorReviewReport,
+) -> ReviewLoopValidationFloor {
+    if child_report.validation_results.is_empty() {
+        ReviewLoopValidationFloor::Missing
+    } else if child_report
+        .validation_results
+        .iter()
+        .any(validation_failed)
+    {
+        ReviewLoopValidationFloor::Failed
+    } else {
+        ReviewLoopValidationFloor::Passed
+    }
+}
+
+fn locked_parent_review_accepted(child_report: &OrchestratorReviewReport) -> bool {
+    child_report
+        .review_lens_aggregate
+        .as_ref()
+        .is_some_and(|aggregate| aggregate.decision == ReviewAggregationDecision::Accept)
+}
+
+fn record_review_loop_guard_event(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    assignment: &OrchestratorAssignment,
+    journal_parent_id: &str,
+    event: &ReviewLoopGuardJournalEvent,
+) -> Result<()> {
+    let payload = serde_json::to_value(event)
+        .context("failed to serialize strict review-loop guard journal event")?;
+    with_supervisor_artifacts(artifacts, |writer, journal| {
+        record_gate_correction_event_strict(
+            journal,
+            writer,
+            &assignment.id,
+            Some(journal_parent_id),
+            OrchestrationRole::Auditor,
+            payload,
+        )
+    })
+}
+
+pub(super) fn finalize_review_loop_guard_evidence(
+    tracker: &ReviewLoopGuardTracker,
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    assignment: &OrchestratorAssignment,
+    child_report: &mut OrchestratorReviewReport,
+) -> Result<()> {
+    let evidence = tracker.evidence(child_report);
+    if evidence.cycles.len() > MAX_REVIEW_LOOP_GUARD_CYCLES {
+        bail!("review-loop guard evidence exceeds its bounded cycle history");
+    }
+    let relative = with_supervisor_artifacts(artifacts, |writer, _| {
+        write_review_loop_guard_evidence(writer, &assignment.id, &evidence)
+    })?;
+    child_report.findings.push(Finding {
+        severity: FindingSeverity::Info,
+        message: format!(
+            "review-loop guard evidence is recorded at {}",
+            relative.display()
+        ),
+        paths: vec![relative],
+    });
+    Ok(())
+}
+
+pub(super) fn suppress_review_loop_retry_if_threshold(
+    threshold_reached: bool,
+    review_loop_tracker: Option<&mut ReviewLoopGuardTracker>,
+    outcome: &mut AssignmentExecutionOutcome,
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    assignment: &OrchestratorAssignment,
+    journal_parent_id: &str,
+    denial: &GateDenial,
+) -> Result<bool> {
+    if !threshold_reached {
+        return Ok(false);
+    }
+    review_loop_tracker
+        .context("review-loop threshold lost its configured tracker")?
+        .suppress_correction_retry(artifacts, assignment, journal_parent_id)?;
+    outcome
+        .gate_tracker
+        .as_mut()
+        .context("gate correction tracker was not initialized")?
+        .escalate(denial.clone(), artifacts, &assignment.id, journal_parent_id)?;
+    Ok(true)
+}
+
 pub(super) fn execute_supervisor_assignment(
     context: AssignmentExecutionContext<'_, '_>,
 ) -> AssignmentExecutionOutcome {
@@ -2333,6 +2583,7 @@ fn decide_parent_auditor_gate(
     auditor_environment_blocked: bool,
     pre_auditor_candidate: Option<SupervisorCandidateInspection>,
     mut child_report: OrchestratorReviewReport,
+    mut review_loop_tracker: Option<&mut ReviewLoopGuardTracker>,
     retry_feedback: &mut Option<ChildAttemptCorrection>,
 ) -> Result<ParentAuditorGateDisposition> {
     let AssignmentExecutionContext { artifacts, .. } = context;
@@ -2357,6 +2608,15 @@ fn decide_parent_auditor_gate(
     let auditor_rejection_kind = parent_auditor_rejection_kind(assignment, &child_report);
     let evidence_only_rejection = parent_auditor_failed
         && auditor_rejection_kind == Some(AuditorRejectionKind::EvidenceQuality);
+    let review_loop_threshold_reached = match review_loop_tracker.as_deref_mut() {
+        Some(tracker) => tracker.observe_real_parent_review(
+            artifacts,
+            assignment,
+            journal_parent_id,
+            &child_report.audit_reports,
+        )?,
+        None => false,
+    };
     if parent_auditor_repair_eligible(
         parent_auditor_failed,
         assignment_containment_verified,
@@ -2390,20 +2650,30 @@ fn decide_parent_auditor_gate(
                 .context("gate correction tracker was not initialized")?
                 .escalate(denial, artifacts, &assignment.id, journal_parent_id)?;
         } else {
-            let authorized_denial = outcome
-                .gate_tracker
-                .as_mut()
-                .context("gate correction tracker was not initialized")?
-                .authorize(
-                    denial,
-                    artifacts,
-                    &assignment.id,
-                    journal_parent_id,
-                    &mut outcome.health_signals,
-                )?;
-            if let Some(authorized_denial) = authorized_denial {
-                *retry_feedback = Some(ChildAttemptCorrection::Gate(authorized_denial));
-                return Ok(ParentAuditorGateDisposition::Retry);
+            if !suppress_review_loop_retry_if_threshold(
+                review_loop_threshold_reached,
+                review_loop_tracker.as_deref_mut(),
+                outcome,
+                artifacts,
+                assignment,
+                journal_parent_id,
+                &denial,
+            )? {
+                let authorized_denial = outcome
+                    .gate_tracker
+                    .as_mut()
+                    .context("gate correction tracker was not initialized")?
+                    .authorize(
+                        denial,
+                        artifacts,
+                        &assignment.id,
+                        journal_parent_id,
+                        &mut outcome.health_signals,
+                    )?;
+                if let Some(authorized_denial) = authorized_denial {
+                    *retry_feedback = Some(ChildAttemptCorrection::Gate(authorized_denial));
+                    return Ok(ParentAuditorGateDisposition::Retry);
+                }
             }
         }
     } else if matches!(
@@ -2491,6 +2761,9 @@ fn decide_parent_auditor_gate(
     tracker.escalate_active(artifacts, &assignment.id, journal_parent_id)?;
     child_report.gate_denials = tracker.denials.clone();
     child_report.gate_correction_outcomes = tracker.outcomes.clone();
+    if let Some(tracker) = review_loop_tracker {
+        finalize_review_loop_guard_evidence(tracker, artifacts, assignment, &mut child_report)?;
+    }
     Ok(ParentAuditorGateDisposition::Complete {
         report: child_report,
         candidate: traceability_candidate,
@@ -2614,6 +2887,7 @@ fn execute_supervisor_assignment_inner(
         .saturating_add(1);
     let mut next_attempt = 1usize;
     let mut auditor_attempt = 0usize;
+    let mut review_loop_tracker = context.review_loop_guard.map(ReviewLoopGuardTracker::new);
     let (child_report, completed_candidate_inspection, completed_assignment_containment) = 'gate_controller: loop {
         let mut child_report = None;
         let mut child_containment_verified = false;
@@ -2960,6 +3234,7 @@ fn execute_supervisor_assignment_inner(
             auditor_environment_blocked,
             pre_auditor_candidate,
             child_report,
+            review_loop_tracker.as_mut(),
             &mut retry_feedback,
         )? {
             ParentAuditorGateDisposition::Retry => continue 'gate_controller,
@@ -3426,6 +3701,7 @@ mod decomposition_tests {
             auditor_collection.environment_blocked,
             None,
             child_report,
+            None,
             &mut retry_feedback,
         )
         .expect("direct auditor gate invocation")

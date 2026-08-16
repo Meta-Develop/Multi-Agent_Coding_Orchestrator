@@ -662,7 +662,7 @@ fn resume_refuses_pre_finalization_lifecycle_with_typed_reason() {
 }
 
 #[test]
-fn resume_refuses_dispatch_started_without_durable_completion_as_uncertain() {
+fn resume_refuses_threshold_stop_without_assignment_completion_as_uncertain() {
     let (_temp, repo) = injected_repository();
     let run_id = RunId::new("authenticated-resume-uncertain").expect("valid uncertain run id");
     let assignment = injected_assignment(false);
@@ -685,7 +685,7 @@ fn resume_refuses_dispatch_started_without_durable_completion_as_uncertain() {
         ..SupervisorPlanMetadata::default()
     };
     let ledger = RunBudgetLedger::new(RunBudgetLimits::default()).expect("uncertain budget ledger");
-    let writer = ArtifactRunWriter::reserve(
+    let mut writer = ArtifactRunWriter::reserve(
         &repo,
         RunArtifactFamily::Supervise,
         run_id.clone(),
@@ -726,6 +726,28 @@ fn resume_refuses_dispatch_started_without_durable_completion_as_uncertain() {
     checkpoint
         .dispatch_started(false, &assignment.id, 1)
         .expect("checkpoint child dispatch start");
+    let mut orchestration_journal = Some(OrchestrationEventJournal::new(
+        "authenticated-resume-repository",
+        run_id.as_str(),
+    ));
+    record_gate_correction_event_strict(
+        &mut orchestration_journal,
+        &mut writer,
+        &assignment.id,
+        Some(run_id.as_str()),
+        OrchestrationRole::Auditor,
+        serde_json::to_value(ReviewLoopGuardJournalEvent::CorrectionRetrySuppressed {
+            version: REVIEW_LOOP_GUARD_EVENT_VERSION,
+            cycle_ordinal: 1,
+            consecutive_low_severity_cycles: 1,
+        })
+        .expect("serialize threshold stop event"),
+    )
+    .expect("durably record threshold stop before interruption");
+    let threshold_events = fs::read_to_string(writer.run_dir().join(ORCHESTRATION_EVENT_PATH))
+        .expect("read interrupted threshold journal");
+    assert!(threshold_events.contains("correction_retry_suppressed"));
+    drop(orchestration_journal);
     drop(checkpoint);
     drop(writer);
 
