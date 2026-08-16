@@ -50,7 +50,7 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(unix)]

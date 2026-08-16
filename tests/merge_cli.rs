@@ -310,6 +310,74 @@ fn merge_apply_json_refuses_unsupported_reviewed_preview_before_repository_acces
 }
 
 #[test]
+fn merge_apply_json_refuses_reviewed_preview_drift_before_primary_mutation() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\nreviewed\n")
+        .context("edit reviewed candidate")?;
+    let preview = run_success_json(&[
+        "merge",
+        "preview",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--json",
+    ])?;
+    let reviewed_preview_path = temp.path().join("reviewed-preview.json");
+    fs::write(
+        &reviewed_preview_path,
+        serde_json::to_vec_pretty(&preview).context("serialize complete reviewed preview")?,
+    )
+    .context("persist complete reviewed preview")?;
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\ndrifted\n")
+        .context("change candidate after preview")?;
+
+    let refusal = run_failure_json(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--reviewed-preview",
+        reviewed_preview_path
+            .to_str()
+            .context("reviewed preview path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(refusal["status"], "refused");
+    assert_eq!(refusal["applied"], false);
+    assert_eq!(refusal["review_requested"], true);
+    assert_eq!(refusal["review_bound"], false);
+    assert_eq!(refusal["review_binding_status"], "not_bound");
+    assert_eq!(refusal["reason"], "preview_freshness_drift");
+    let drift_axes = refusal["drift_axes"]
+        .as_array()
+        .context("drift axes array")?;
+    assert!(
+        drift_axes
+            .iter()
+            .any(|axis| axis == "candidate_diff" || axis == "candidate_snapshot"),
+        "candidate drift missing from refusal: {refusal}"
+    );
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
+        "# Smoke\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn merge_arbitrate_refuses_primary_claim_before_repository_or_runner_access() -> Result<()> {
     let output = Command::new(BIN)
         .args([
