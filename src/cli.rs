@@ -7075,6 +7075,150 @@ mod tests {
     }
 
     #[test]
+    fn merge_apply_json_refuses_reviewed_candidate_drift_without_mutating_primary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repository");
+        fs::write(repo_path.join("README.md"), "# Smoke\n").expect("write README");
+        let repo = crate::git_repository::open(&repo_path).expect("open repository");
+        let mut index = repo.index().expect("open index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("stage README");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("commit fixture");
+        drop(tree);
+        drop(repo);
+
+        let manager = WorktreeManager::new(&repo_path);
+        let cleanliness = manager
+            .acquire_repository_cleanliness()
+            .expect("acquire repository cleanliness capability");
+        let worktree = manager
+            .create_with_repository_cleanliness(
+                WorktreeCreateOptions {
+                    agent_id: "agent-a".to_string(),
+                    branch: None,
+                    base: None,
+                    worktree_root: None,
+                },
+                &cleanliness,
+            )
+            .expect("create capability-bound managed worktree");
+        fs::write(worktree.path.join("README.md"), "# Smoke\n\nreviewed\n")
+            .expect("edit reviewed candidate");
+
+        let repo_arg = repo_path.to_str().expect("repository path UTF-8");
+        let parsed_preview = Cli::try_parse_from([
+            "maco",
+            "merge",
+            "preview",
+            "agent-a",
+            "--repo",
+            repo_arg,
+            "--claim",
+            "README.md",
+            "--json",
+        ])
+        .expect("reviewed preview CLI should parse");
+        let Command::Merge(MergeCommand {
+            command: MergeSubcommand::Preview(preview_args),
+        }) = parsed_preview.command
+        else {
+            panic!("expected merge preview command");
+        };
+        assert!(preview_args.json);
+        let megafile_policy = preview_args
+            .megafile_policy()
+            .expect("resolve preview megafile policy");
+        let (preview, freshness_watermark) = preview_merge_from_args(
+            preview_args.repo,
+            preview_args.agent_id,
+            preview_args.claim,
+            preview_args.validation_report,
+            preview_args.forces.into_force_options(),
+            preview_args.require_validation,
+            megafile_policy,
+        )
+        .expect("capture reviewed merge preview");
+        let reviewed_preview_path = temp.path().join("reviewed-preview.json");
+        let reviewed_preview = merge::MergeApplyPreviewOutput {
+            preview: &preview,
+            freshness_watermark: &freshness_watermark,
+        };
+        fs::write(
+            &reviewed_preview_path,
+            serde_json::to_vec_pretty(&reviewed_preview)
+                .expect("serialize complete reviewed preview"),
+        )
+        .expect("persist complete reviewed preview");
+        fs::write(worktree.path.join("README.md"), "# Smoke\n\ndrifted\n")
+            .expect("change candidate after preview");
+
+        let reviewed_preview_arg = reviewed_preview_path
+            .to_str()
+            .expect("reviewed preview path UTF-8");
+        let parsed_apply = Cli::try_parse_from([
+            "maco",
+            "merge",
+            "apply",
+            "agent-a",
+            "--repo",
+            repo_arg,
+            "--claim",
+            "README.md",
+            "--reviewed-preview",
+            reviewed_preview_arg,
+            "--json",
+        ])
+        .expect("review-bound apply CLI should parse");
+        let Command::Merge(MergeCommand {
+            command: MergeSubcommand::Apply(apply_args),
+        }) = parsed_apply.command
+        else {
+            panic!("expected merge apply command");
+        };
+        let error = run_merge_apply_controller(apply_args, |_, _, _| {
+            panic!("freshness refusal must precede merge report delivery")
+        })
+        .expect_err("drifted reviewed candidate must be refused");
+        let freshness = error
+            .downcast_ref::<merge::MergePreviewFreshnessError>()
+            .expect("controller must preserve typed freshness refusal");
+        assert_eq!(freshness.reason(), "preview_freshness_drift");
+        assert_eq!(
+            freshness.drift_axes(),
+            &[
+                merge::MergePreviewDriftAxis::CandidateDiff,
+                merge::MergePreviewDriftAxis::CandidateSnapshot,
+            ]
+        );
+
+        let refusal = serde_json::to_value(merge_preview_freshness_refusal_report(freshness, true))
+            .expect("serialize controller freshness refusal");
+        assert_eq!(refusal["status"], "refused");
+        assert_eq!(refusal["applied"], false);
+        assert_eq!(refusal["review_requested"], true);
+        assert_eq!(refusal["review_bound"], false);
+        assert_eq!(refusal["review_binding_status"], "not_bound");
+        assert_eq!(refusal["error_kind"], "merge_preview_freshness");
+        assert_eq!(refusal["reason"], "preview_freshness_drift");
+        assert_eq!(
+            refusal["drift_axes"],
+            serde_json::json!(["candidate_diff", "candidate_snapshot"])
+        );
+        assert_eq!(
+            fs::read_to_string(repo_path.join("README.md")).expect("read primary README"),
+            "# Smoke\n"
+        );
+    }
+
+    #[test]
     fn reviewed_merge_preview_rejects_duplicate_json_keys_at_every_depth_as_malformed() {
         let temp = tempfile::tempdir().expect("tempdir");
         for (name, contents, duplicate_key) in [
