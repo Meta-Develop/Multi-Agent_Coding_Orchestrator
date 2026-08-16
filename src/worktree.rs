@@ -3931,10 +3931,10 @@ fn open_or_create_prior_hooks_directory(path: &Path) -> Result<File> {
     match open_guard_directory(path, "prior hooks directory") {
         Ok(directory) => return Ok(directory),
         Err(error)
-            if !error
+            if error
                 .root_cause()
                 .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == ErrorKind::NotFound) =>
+                .is_none_or(|error| error.kind() != ErrorKind::NotFound) =>
         {
             return Err(error)
         }
@@ -4860,11 +4860,14 @@ fn guard_regular_mode_at(directory: &File, name: &str) -> Result<u32> {
 }
 
 #[cfg(unix)]
+type GuardRegularSnapshot = (Vec<u8>, u32, (u64, u64));
+
+#[cfg(unix)]
 fn read_guard_regular_snapshot_at(
     directory: &File,
     name: &str,
     max_bytes: u64,
-) -> Result<(Vec<u8>, u32, (u64, u64))> {
+) -> Result<GuardRegularSnapshot> {
     let name = guard_component(name)?;
     let opened = unsafe {
         libc::openat(
@@ -5630,8 +5633,9 @@ fn complete_guard_config_transaction(
         manifest.staged_identity,
     );
 
-    if (manifest.before_present && target_is_before && lock_is_staged)
-        || (!manifest.before_present && target.is_none() && lock_is_staged)
+    if lock_is_staged
+        && ((manifest.before_present && target_is_before)
+            || (!manifest.before_present && target.is_none()))
     {
         if !rollback_is_before {
             bail!("guard config rollback changed before exchange; preserving transaction");
@@ -5852,7 +5856,7 @@ fn complete_guard_config_transaction(
 
 #[cfg(target_os = "linux")]
 fn snapshot_matches(
-    snapshot: Option<&(Vec<u8>, u32, (u64, u64))>,
+    snapshot: Option<&GuardRegularSnapshot>,
     bytes: &[u8],
     mode: u32,
     identity: (u64, u64),
@@ -5866,7 +5870,7 @@ fn optional_guard_snapshot_at(
     directory: &File,
     name: &str,
     max_bytes: u64,
-) -> Result<Option<(Vec<u8>, u32, (u64, u64))>> {
+) -> Result<Option<GuardRegularSnapshot>> {
     if guard_entry_identity_at(directory, name)?.is_none() {
         return Ok(None);
     }
