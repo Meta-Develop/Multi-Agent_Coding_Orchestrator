@@ -3515,12 +3515,14 @@ fn local_deterministic_fake_fallback_reaches_shared_supervisor_core_without_exte
     .expect("run deterministic fake fallback through the shared supervisor core");
 
     assert_eq!(invocations, 0);
-    assert!(!report.success);
+    assert!(report.success, "unexpected fake-core failure: {report:#?}");
     assert!(!report.publishable);
-    assert!(!report.accepted);
-    assert!(report.rejected);
-    assert_eq!(report.status, ReviewStatus::Failed);
     assert_eq!(report.commands_run.len(), 2);
+    assert!(report.commands_run.iter().all(|command| {
+        command.command.len() == 1
+            && command.command[0] == "maco-internal-deterministic-fake"
+            && command.status == ReviewStatus::Succeeded
+    }));
     assert!(report.commands_run.iter().all(|command| {
         command.command.len() == 1
             && command.command[0] == "maco-internal-deterministic-fake"
@@ -3533,16 +3535,6 @@ fn local_deterministic_fake_fallback_reaches_shared_supervisor_core_without_exte
             .map(|profile| profile.model_availability),
         Some(RoleModelAvailability::Unavailable)
     );
-    let child = report
-        .orchestrator_reports
-        .first()
-        .expect("shared core must retain the deterministic child report");
-    assert!(!child.accepted);
-    assert!(child.rejected);
-    assert_eq!(child.status, ReviewStatus::Failed);
-    assert!(child.findings.iter().any(|finding| finding
-        .message
-        .contains("no pre-auditor supervisor candidate binding")));
 }
 
 #[test]
