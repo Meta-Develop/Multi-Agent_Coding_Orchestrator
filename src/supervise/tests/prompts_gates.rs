@@ -316,7 +316,7 @@ fn worker_prompt_includes_execution_journal_contract() {
     plan.role_models.insert(
         AgentRole::Worker,
         RoleModelSelection {
-            model: Some("worker-model".to_string()),
+            model: Some("gpt-5.6-sol".to_string()),
             reasoning_effort: Some("low".to_string()),
             unavailable_model_fallback: UnavailableModelFallback::FailClosed,
         },
@@ -335,7 +335,7 @@ fn worker_prompt_includes_execution_journal_contract() {
     assert!(prompt.contains("write a structured execution journal"));
     assert!(prompt.contains("\"start_timestamp\""));
     assert!(prompt.contains("\"changed_paths\""));
-    assert!(prompt.contains("Worker model: worker-model"));
+    assert!(prompt.contains("Worker model: gpt-5.6-sol"));
     assert!(prompt.contains("Worker reasoning effort: low"));
     assert!(prompt.contains("runtime-side role-tagged usage reporting"));
 }

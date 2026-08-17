@@ -161,7 +161,7 @@ fn budget_integration_serial_scheduler_accounts_exact_hard_boundary_by_process_r
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, "gpt-5.6-sol", 1.0);
     let budget = injected_run_budget(None, Some(20), None, None, 10, 10);
     let options = injected_options(&repo_path, temp.path(), "budget-serial-exact-hard");
     let mut invocations = 0usize;
@@ -232,7 +232,7 @@ fn budget_integration_auditor_admission_refusal_reaches_typed_child_and_final_re
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, "gpt-5.6-sol", 1.0);
     let budget = injected_run_budget(None, Some(15), None, None, 10, 10);
     let options = injected_options(&repo_path, temp.path(), "budget-auditor-typed-denial");
     let mut invocations = 0usize;
@@ -327,7 +327,7 @@ fn budget_integration_cost_enforcement_refuses_missing_model_pricing_before_laun
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment, 0);
     let selection = RoleModelSelection {
-        model: Some("unpriced-model".to_string()),
+        model: Some("gpt-5.6-terra".to_string()),
         reasoning_effort: None,
         unavailable_model_fallback: UnavailableModelFallback::FailClosed,
     };
@@ -393,7 +393,7 @@ fn budget_integration_concurrent_scheduler_cannot_oversubscribe_and_drains_admit
         injected_named_assignment("child-b", "b.txt"),
     ];
     let mut plan = injected_multi_plan(assignments.clone(), 0);
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, "gpt-5.6-sol", 1.0);
     let budget = injected_run_budget(None, Some(100), None, None, 60, 40);
     let options = injected_options(
         &repo_path,
@@ -647,7 +647,7 @@ fn budget_lifecycle_child_pre_runner_failure_releases_reservation_and_stops_pend
     let child_b = injected_named_assignment("child-b", "src/lib.rs");
     let mut plan = injected_multi_plan(vec![child_a, child_b], 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, "gpt-5.6-sol", 1.0);
     let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
     let run_id = "budget-child-pre-runner-release";
     let options = injected_options(&repo_path, temp.path(), run_id);
@@ -699,7 +699,7 @@ fn budget_lifecycle_auditor_pre_runner_failure_releases_reservation_and_stops_pe
     let child_b = injected_named_assignment("child-b", "src/lib.rs");
     let mut plan = injected_multi_plan(vec![child_a.clone(), child_b], 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, "gpt-5.6-sol", 1.0);
     let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
     let run_id = "budget-auditor-pre-runner-release";
     let options = injected_options(&repo_path, temp.path(), run_id);
@@ -764,7 +764,7 @@ fn budget_lifecycle_child_runner_panic_reconciles_missing_and_stops_pending() {
     let child_b = injected_named_assignment("child-b", "src/lib.rs");
     let mut plan = injected_multi_plan(vec![child_a, child_b], 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, "gpt-5.6-sol", 1.0);
     let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
     let run_id = "budget-child-runner-panic";
     let options = injected_options(&repo_path, temp.path(), run_id);
@@ -820,7 +820,7 @@ fn budget_lifecycle_auditor_runner_panic_reconciles_missing_and_stops_pending() 
     let child_b = injected_named_assignment("child-b", "src/lib.rs");
     let mut plan = injected_multi_plan(vec![child_a.clone(), child_b], 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, "gpt-5.6-sol", 1.0);
     let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
     let run_id = "budget-auditor-runner-panic";
     let options = injected_options(&repo_path, temp.path(), run_id);
@@ -885,7 +885,7 @@ fn budget_integration_reservation_is_released_when_codex_process_never_starts() 
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment.clone(), 0);
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, "gpt-5.6-sol", 1.0);
     let budget = injected_run_budget(None, Some(100), None, None, 50, 50);
     let options = injected_options(&repo_path, temp.path(), "budget-never-started-release");
     let mut invocations = 0usize;
@@ -924,7 +924,7 @@ fn budget_integration_reservation_is_released_when_codex_process_never_starts() 
 fn budget_integration_uncertain_start_is_conservatively_reconciled_not_released() {
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment, 0);
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, "gpt-5.6-sol", 1.0);
     let budget = injected_run_budget(None, Some(100), None, None, 50, 50);
     let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
     let temp = tempfile::tempdir().expect("uncertain-start command root");
@@ -936,7 +936,7 @@ fn budget_integration_uncertain_start_is_conservatively_reconciled_not_released(
         temp.path().join("report.json"),
         Duration::from_secs(1),
     );
-    command.model = Some("priced-model".to_string());
+    command.model = Some("gpt-5.6-sol".to_string());
     let mut reservation = match reserve_dispatch_budget(
         &plan,
         &budget,
@@ -980,7 +980,7 @@ fn budget_integration_uncertain_start_is_conservatively_reconciled_not_released(
 fn budget_integration_parseable_usage_without_verified_containment_is_estimated() {
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment, 0);
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, "gpt-5.6-sol", 1.0);
     let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
     let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
     let temp = tempfile::tempdir().expect("unverified containment command root");
@@ -992,7 +992,7 @@ fn budget_integration_parseable_usage_without_verified_containment_is_estimated(
         temp.path().join("report.json"),
         Duration::from_secs(1),
     );
-    command.model = Some("priced-model".to_string());
+    command.model = Some("gpt-5.6-sol".to_string());
     let mut reservation = match reserve_dispatch_budget(
         &plan,
         &budget,
@@ -1049,7 +1049,7 @@ fn budget_integration_parseable_usage_without_verified_containment_is_estimated(
 fn budget_integration_parseable_usage_from_truncated_capture_is_estimated() {
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment, 0);
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, "gpt-5.6-sol", 1.0);
     let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
     let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
     let temp = tempfile::tempdir().expect("truncated capture command root");
@@ -1061,7 +1061,7 @@ fn budget_integration_parseable_usage_from_truncated_capture_is_estimated() {
         temp.path().join("report.json"),
         Duration::from_secs(1),
     );
-    command.model = Some("priced-model".to_string());
+    command.model = Some("gpt-5.6-sol".to_string());
     let mut reservation = match reserve_dispatch_budget(
         &plan,
         &budget,
