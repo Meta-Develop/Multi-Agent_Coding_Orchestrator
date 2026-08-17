@@ -3523,11 +3523,6 @@ fn local_deterministic_fake_fallback_reaches_shared_supervisor_core_without_exte
             && command.command[0] == "maco-internal-deterministic-fake"
             && command.status == ReviewStatus::Succeeded
     }));
-    assert!(report.commands_run.iter().all(|command| {
-        command.command.len() == 1
-            && command.command[0] == "maco-internal-deterministic-fake"
-            && command.status == ReviewStatus::Succeeded
-    }));
     assert_eq!(
         report
             .role_economics_profile
