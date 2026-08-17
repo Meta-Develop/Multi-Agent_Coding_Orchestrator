@@ -8,8 +8,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 #[test]
 fn evaluation_cli_runs_committed_fake_manifest_as_json_without_cwd_writes() -> Result<()> {
     let working = TempDir::new().context("create empty evaluation cwd")?;
-    let manifest_path = fixture_path("manifest-v1.json");
-    let plan_path = fixture_path("hand-authored-plan-v1.json");
+    let (_inputs, manifest_path, plan_path) = copied_fixture_inputs()?;
 
     let output = Command::new(BIN)
         .current_dir(working.path())
@@ -101,8 +100,7 @@ fn evaluation_cli_runs_committed_fake_manifest_as_json_without_cwd_writes() -> R
 #[test]
 fn evaluation_cli_refuses_opted_in_real_provider_before_state_artifacts() -> Result<()> {
     let working = TempDir::new().context("create empty evaluation cwd")?;
-    let manifest_path = fixture_path("manifest-v1.json");
-    let plan_path = fixture_path("hand-authored-plan-v1.json");
+    let (_inputs, manifest_path, plan_path) = copied_fixture_inputs()?;
 
     let output = Command::new(BIN)
         .current_dir(working.path())
@@ -150,8 +148,7 @@ fn evaluation_cli_refuses_opted_in_real_provider_before_state_artifacts() -> Res
 #[test]
 fn evaluation_cli_refuses_real_provider_without_opt_in_before_state_artifacts() -> Result<()> {
     let working = TempDir::new().context("create empty evaluation cwd")?;
-    let manifest_path = fixture_path("manifest-v1.json");
-    let plan_path = fixture_path("hand-authored-plan-v1.json");
+    let (_inputs, manifest_path, plan_path) = copied_fixture_inputs()?;
 
     let output = Command::new(BIN)
         .current_dir(working.path())
@@ -304,4 +301,15 @@ fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/model_mix_evaluation")
         .join(name)
+}
+
+fn copied_fixture_inputs() -> Result<(TempDir, PathBuf, PathBuf)> {
+    let inputs = TempDir::new().context("create readable evaluation input directory")?;
+    let manifest_path = inputs.path().join("manifest-v1.json");
+    let plan_path = inputs.path().join("hand-authored-plan-v1.json");
+    fs::copy(fixture_path("manifest-v1.json"), &manifest_path)
+        .context("copy committed evaluation manifest into readable input directory")?;
+    fs::copy(fixture_path("hand-authored-plan-v1.json"), &plan_path)
+        .context("copy committed evaluation plan into readable input directory")?;
+    Ok((inputs, manifest_path, plan_path))
 }
