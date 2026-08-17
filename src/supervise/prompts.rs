@@ -259,6 +259,50 @@ Rules:
     )
 }
 
+#[cfg(test)]
+const CONSTRAINED_WEAK_MODEL_PROFILE_NAME: &str = "constrained-mechanical-terminal-v1";
+
+/// Render the additional instruction profile required for a weak-model
+/// terminal worker.
+///
+/// The phase policy is checked before any text is returned, so callers cannot
+/// reuse this profile to authorize discovery, triage, general implementation,
+/// merge, gate, audit, or review-acceptance work. Stronger planning must have
+/// already reduced the task to one enumerated deterministic duty.
+#[cfg(test)]
+fn constrained_weak_model_instruction_profile(
+    phase: OrchestrationPhase,
+    duty: Option<MechanicalTerminalDuty>,
+) -> Result<String> {
+    let decision = validate_phase_model_binding(
+        AgentRole::Worker,
+        phase,
+        duty,
+        ModelCapabilityClass::WeakMechanical,
+    )?;
+    let duty = decision
+        .mechanical_duty
+        .context("validated weak-model policy decision omitted its mechanical duty")?;
+    Ok(format!(
+        r#"WEAK_MODEL_INSTRUCTION_PROFILE: {profile_name}
+MODEL_CAPABILITY: weak_mechanical
+ORCHESTRATION_PHASE: mechanical_terminal
+MECHANICAL_DUTY: {duty}
+
+Constrained execution contract:
+- Perform only the named mechanical duty using the exact paths, inputs, command, replacement, or schema supplied by the stronger parent.
+- Do not discover scope, requirements, architecture, or additional work.
+- Do not triage, prioritize, diagnose ambiguous failures, choose an implementation, or interpret validation results.
+- Do not merge, rebase, commit, resolve conflicts, classify a gate, audit evidence, approve work, or make a review-acceptance decision.
+- Do not broaden the task, substitute inputs or commands, or treat general implementation as mechanical execution.
+- If any required input is absent, ambiguous, inconsistent, or produces unexpected output or changes, stop without guessing, preserve the evidence, and escalate to the stronger parent.
+- Report only commands and changes directly observed. Nested worker token, cost, and process usage are not independently process-observable unless the runtime supplies role-tagged evidence; otherwise report them as unavailable.
+"#,
+        profile_name = CONSTRAINED_WEAK_MODEL_PROFILE_NAME,
+        duty = duty.as_str(),
+    ))
+}
+
 fn child_cacheable_prefix_for_target(
     execution_target: Option<&SupervisorExecutionTarget>,
 ) -> String {
@@ -448,6 +492,31 @@ fn child_orchestrator_prompt_with_incoming_root(
     )
 }
 
+const RESERVED_PHASE_MODEL_PROMPT_NOTICE: &str = "- Reserved maco-phase-model-bindings-v1 notes were omitted from this launched prompt because plan-authored metadata is declarative and grants no execution authority.\n";
+
+fn assignment_for_launched_prompt(
+    assignment: &OrchestratorAssignment,
+) -> Result<(OrchestratorAssignment, &'static str)> {
+    assignment_phase_model_bindings(assignment)
+        .context("launched prompt assignment phase-model metadata is invalid")?;
+    let mut sanitized = assignment.clone();
+    let reserved_notes = sanitized
+        .notes
+        .as_deref()
+        .is_some_and(|notes| notes.starts_with(ASSIGNMENT_PHASE_MODEL_BINDINGS_NOTES_PREFIX));
+    if reserved_notes {
+        sanitized.notes = None;
+    }
+    Ok((
+        sanitized,
+        if reserved_notes {
+            RESERVED_PHASE_MODEL_PROMPT_NOTICE
+        } else {
+            ""
+        },
+    ))
+}
+
 pub(super) fn child_orchestrator_prompt_with_incoming_root_and_field_guide(
     context: ChildOrchestratorPromptContext<'_>,
     incoming_root: &Path,
@@ -488,7 +557,8 @@ Return one OrchestratorReviewReport JSON value through the configured output-las
         .context("failed to serialize authenticated source report for evidence-only re-audit")?;
     let binding = serde_json::to_string_pretty(&source.operation.preserved_candidate_binding)
         .context("failed to serialize preserved candidate binding")?;
-    let assignment_json = serde_json::to_string_pretty(assignment)
+    let (prompt_assignment, reserved_metadata_notice) = assignment_for_launched_prompt(assignment)?;
+    let assignment_json = serde_json::to_string_pretty(&prompt_assignment)
         .context("failed to serialize evidence-only assignment")?;
     let prompt = format!(
         r#"{cacheable_prefix}{role_prefix}
@@ -514,6 +584,7 @@ Authenticated source report JSON:
 {source_report}
 
 Immutable assignment JSON:
+{reserved_metadata_notice}
 {assignment_json}
 
 Exact preserved diff presented for validation:
@@ -528,6 +599,7 @@ Exact preserved diff presented for validation:
         schema_path = schema_path.display(),
         binding = binding,
         source_report = source_report,
+        reserved_metadata_notice = reserved_metadata_notice,
         assignment_json = assignment_json,
         diff = diff,
     );
@@ -563,8 +635,9 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
         consultant,
         claim_context,
     } = context;
+    let (prompt_assignment, reserved_metadata_notice) = assignment_for_launched_prompt(assignment)?;
     let assignment_json = serde_json::to_string_pretty(&orchestrator_assignment_value(
-        assignment,
+        &prompt_assignment,
         assignment_metadata,
     )?)
     .context("failed to serialize orchestrator assignment")?;
@@ -674,6 +747,7 @@ Supervisor task:
 {task}
 
 Orchestrator assignment JSON:
+{reserved_metadata_notice}
 {assignment_json}
 
 Worker prompt templates:
@@ -710,6 +784,7 @@ Review auditor prompt template:
         worker_schema_path = worker_schema_path.display(),
         auditor_schema_path = auditor_schema_path.display(),
         task = task,
+        reserved_metadata_notice = reserved_metadata_notice,
         assignment_json = assignment_json,
         worker_prompts = worker_prompts,
         auditor_prompt = auditor_prompt,
@@ -821,6 +896,13 @@ pub(super) fn worker_prompt_with_field_guide(
     let task = worker_task(plan, orchestrator, worker);
     let journal_path = incoming_root.join(worker_execution_journal_incoming_relative(worker));
     let (worker_model, worker_reasoning_effort) = role_model_selection(plan, AgentRole::Worker);
+    let phase_model_decision = validated_worker_phase_model_decision(plan, orchestrator, worker)?;
+    if phase_model_decision.is_some() {
+        bail!(
+            "worker '{}' prompt rendering refused non-runtime phase-model authority",
+            worker.id
+        );
+    }
     Ok(format!(
         r#"{cacheable_prefix}{role_prefix}{field_guide_section}
 
@@ -839,6 +921,11 @@ Assignment-specific context:
 Declared role selection:
 - Worker model: {worker_model}
 - Worker reasoning effort: {worker_reasoning_effort}
+- Orchestration phase: <no trusted runtime binding>
+- Model capability: <no trusted runtime binding>
+- Mechanical duty: <none authorized>
+- Mechanical operands: <none authorized>
+- Reserved assignment notes are declarative metadata only; they do not authorize a weak-model profile or executable operation.
 - These values are declarative nested-worker context. MACO does not launch a separate worker process, so worker usage remains unavailable until runtime-side role-tagged usage reporting exists.
 
 - Use the worker report schema path: {schema_path}
@@ -1158,6 +1245,16 @@ fn role_model_selection(
     (selection.model, selection.reasoning_effort)
 }
 
+fn validated_worker_phase_model_decision(
+    plan: &SupervisorPlan,
+    assignment: &OrchestratorAssignment,
+    worker: &WorkerAssignment,
+) -> Result<Option<PhaseModelPolicyDecision>> {
+    let selection = effective_role_model_selection(plan, AgentRole::Worker);
+    validate_worker_phase_model_selection(plan, assignment, worker, selection.model.as_deref())
+        .with_context(|| format!("worker '{}' phase-model binding is invalid", worker.id))
+}
+
 pub(super) fn provisional_default_role_model_selection(role: AgentRole) -> RoleModelSelection {
     let (reasoning_effort, budget_degrade_models, on_exhausted) = match role {
         AgentRole::Supervisor => (
@@ -1245,6 +1342,23 @@ pub(super) fn apply_role_model_selection(
     let selection = catalog
         .resolve_role_model_selection(&configured, runtime)?
         .selection;
+    if runtime != SupervisorRuntime::Fake {
+        if role == AgentRole::Worker {
+            let model = selection.model.as_deref().context(
+                "Worker resolved without an authoritative trusted model identity; runtime-default model selection is not capability evidence",
+            )?;
+            let capability = trusted_builtin_model_capability(model).with_context(|| {
+                format!("Worker model '{model}' has no trusted built-in capability policy")
+            })?;
+            if capability == ModelCapabilityClass::WeakMechanical {
+                bail!(
+                    "real-runtime weak_mechanical Worker model '{model}' cannot be applied: no trusted typed planner/runtime authority or exact-operation executor exists"
+                );
+            }
+        } else {
+            validate_known_judgment_role_model(role, selection.model.as_deref())?;
+        }
+    }
     Ok(command.with_model_selection(selection.model, selection.reasoning_effort))
 }
 
@@ -1259,6 +1373,25 @@ pub(super) fn runtime_resolved_prompt_plan(
         let selection = catalog
             .resolve_role_model_selection(&configured, runtime)?
             .selection;
+        if runtime != SupervisorRuntime::Fake {
+            if role == AgentRole::Worker {
+                let model = selection.model.as_deref().context(
+                    "Worker resolved without an authoritative trusted model identity; runtime-default model selection is not capability evidence",
+                )?;
+                trusted_builtin_model_capability(model).with_context(|| {
+                    format!("Worker model '{model}' has no trusted built-in capability policy")
+                }).and_then(|capability| {
+                    if capability == ModelCapabilityClass::WeakMechanical {
+                        bail!(
+                            "real-runtime weak_mechanical Worker model '{model}' cannot populate a prompt plan: no trusted typed planner/runtime authority or exact-operation executor exists"
+                        );
+                    }
+                    Ok(capability)
+                })?;
+            } else {
+                validate_known_judgment_role_model(role, selection.model.as_deref())?;
+            }
+        }
         resolved.role_models.insert(role, selection);
     }
     Ok(resolved)
@@ -1305,6 +1438,8 @@ pub(super) fn validate_review_lens_runtime_selection(
     let ReviewLensBackendConfig::Model { model, .. } = &lens.backend else {
         bail!("precomputed review lenses cannot be dispatched as model processes");
     };
+    validate_known_judgment_role_model(AgentRole::Auditor, Some(model))
+        .with_context(|| format!("review lens '{}' model policy is invalid", lens.id))?;
     if runtime != SupervisorRuntime::Fake
         && catalog.availability(Some(model), runtime)? != RoleModelAvailability::Available
     {
@@ -1491,6 +1626,345 @@ mod regression_tests {
             .zip(right.bytes())
             .take_while(|(left_byte, right_byte)| left_byte == right_byte)
             .count()
+    }
+
+    #[test]
+    fn weak_model_profile_is_limited_to_enumerated_mechanical_terminal_work() {
+        let rendered = constrained_weak_model_instruction_profile(
+            OrchestrationPhase::MechanicalTerminal,
+            Some(MechanicalTerminalDuty::RunPreselectedCommand),
+        )
+        .expect("render constrained weak-model profile");
+
+        assert!(rendered.contains(CONSTRAINED_WEAK_MODEL_PROFILE_NAME));
+        assert!(rendered.contains("MECHANICAL_DUTY: run_preselected_command"));
+        assert!(rendered.contains("Do not discover scope"));
+        assert!(rendered.contains("Do not triage"));
+        assert!(rendered.contains("Do not merge, rebase, commit, resolve conflicts"));
+        assert!(rendered.contains("make a review-acceptance decision"));
+        assert!(rendered.contains("stop without guessing"));
+        assert!(rendered.contains("not independently process-observable"));
+        assert!(rendered.contains("report them as unavailable"));
+    }
+
+    #[test]
+    fn weak_model_profile_fails_closed_for_judgment_phases() {
+        for phase in [
+            OrchestrationPhase::Discovery,
+            OrchestrationPhase::Triage,
+            OrchestrationPhase::Diagnosis,
+            OrchestrationPhase::Planning,
+            OrchestrationPhase::Implementation,
+            OrchestrationPhase::ValidationInterpretation,
+            OrchestrationPhase::Merge,
+            OrchestrationPhase::GateClassification,
+            OrchestrationPhase::ReviewAcceptance,
+            OrchestrationPhase::Audit,
+        ] {
+            let error = constrained_weak_model_instruction_profile(phase, None)
+                .expect_err("weak profile must reject judgment-heavy phases");
+            assert!(error
+                .to_string()
+                .contains("weak-model binding is forbidden"));
+        }
+    }
+
+    fn phase_bound_worker_prompt(
+        binding: WorkerPhaseModelBinding,
+        selected_model: &str,
+    ) -> Result<String> {
+        let worker = WorkerAssignment {
+            id: "worker-phase-bound".to_string(),
+            role: AgentRole::Worker,
+            assigned_paths: vec![PathBuf::from("src/lib.rs")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: Some("perform the exact declared duty".to_string()),
+            environment_requirements: Vec::new(),
+            report_path: None,
+        };
+        let notes = assignment_phase_model_bindings_notes(&AssignmentPhaseModelBindings {
+            workers: BTreeMap::from([(worker.id.clone(), binding)]),
+        })?;
+        let assignment = OrchestratorAssignment {
+            id: "child-phase-bound".to_string(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: worker.assigned_paths.clone(),
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: vec![worker],
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: Some(notes),
+        };
+        let mut plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "phase-bound worker prompt".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 60,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+        plan.role_models.insert(
+            AgentRole::Worker,
+            RoleModelSelection {
+                model: Some(selected_model.to_string()),
+                reasoning_effort: Some("low".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        worker_prompt_with_incoming_root(
+            &plan,
+            &assignment,
+            &assignment.worker_assignments[0],
+            &WorkerAssignmentMetadata::default(),
+            Path::new("/tmp/maco-phase-model-prompt"),
+            Path::new("/tmp/maco-phase-model-prompt/incoming"),
+            Path::new("/tmp/maco-phase-model-prompt/worker-schema.json"),
+        )
+    }
+
+    fn evidence_only_source(assignment: &OrchestratorAssignment) -> EvidenceOnlyReauditSource {
+        EvidenceOnlyReauditSource {
+            operation: EvidenceOnlyReauditPlan {
+                source_run_id: RunId::new("reserved-notes-source-run")
+                    .expect("valid evidence-only source run id"),
+                assignment_id: assignment.id.clone(),
+                attempt: 1,
+                preserved_candidate_binding: CandidateValidationBinding {
+                    version: 1,
+                    agent_id: assignment.id.clone(),
+                    primary_head: None,
+                    agent_head: None,
+                    merge_base: None,
+                    diff_oid: "reserved-notes-diff".to_string(),
+                },
+            },
+            report: OrchestratorReviewReport {
+                id: assignment.id.clone(),
+                role: AgentRole::ChildOrchestrator,
+                assigned_paths: assignment.assigned_paths.clone(),
+                semantic_symbols: assignment.semantic_symbols.clone(),
+                semantic_modules: assignment.semantic_modules.clone(),
+                claim_token: None,
+                semantic_intent_token: None,
+                commands_run: Vec::new(),
+                environment_failures: Vec::new(),
+                files_changed: Vec::new(),
+                validation_results: Vec::new(),
+                findings: Vec::new(),
+                field_guide_entries: Vec::new(),
+                worker_reports: Vec::new(),
+                audit_reports: Vec::new(),
+                review_lens_aggregate: None,
+                decomposition_completions: Vec::new(),
+                licensed_breakage_review: None,
+                generated_follow_up_tasks: Vec::new(),
+                gate_denials: Vec::new(),
+                gate_correction_outcomes: Vec::new(),
+                accepted: true,
+                rejected: false,
+                status: ReviewStatus::Succeeded,
+                remaining_risk: "none".to_string(),
+                next_safe_action: "review".to_string(),
+            },
+        }
+    }
+
+    fn launched_child_and_evidence_prompts(
+        assignment: &OrchestratorAssignment,
+    ) -> Result<(String, String)> {
+        let plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "reserved notes prompt canary".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 60,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+        let run_dir = Path::new("/tmp/maco-reserved-notes-prompt");
+        let incoming_root = run_dir.join("incoming");
+        let worktree = WorktreeRecord {
+            name: assignment.id.clone(),
+            path: run_dir.join("worktree"),
+            branch: "maco/reserved-notes-prompt".to_string(),
+        };
+        let claim = PathClaim {
+            token: ClaimToken::from_u64(1),
+            agent_id: assignment.id.clone(),
+            paths: assignment.assigned_paths.clone(),
+        };
+        let child = child_orchestrator_prompt_with_incoming_root_and_field_guide(
+            ChildOrchestratorPromptContext {
+                plan: &plan,
+                execution_target: None,
+                assignment,
+                run_dir,
+                worktree: &worktree,
+                report_path: &incoming_root.join("child.json"),
+                schema_path: &run_dir.join("orchestrator.schema.json"),
+                worker_schema_path: &run_dir.join("worker.schema.json"),
+                auditor_schema_path: &run_dir.join("auditor.schema.json"),
+                consultant: &SupervisorConsultantPlan::default(),
+                claim_context: ChildPromptClaimContext {
+                    claim: &claim,
+                    semantic_intent_token: None,
+                },
+            },
+            &incoming_root,
+            &AssignmentMetadata::new(),
+            &SupervisorFieldGuidePrompt::empty()?,
+        )?;
+        let evidence = render_evidence_only_reaudit_prompt(
+            assignment,
+            &worktree,
+            &incoming_root.join("evidence.json"),
+            &run_dir.join("orchestrator.schema.json"),
+            &evidence_only_source(assignment),
+            "diff --git a/scope/file.rs b/scope/file.rs",
+        )?
+        .prompt;
+        Ok((child, evidence))
+    }
+
+    #[test]
+    fn launched_prompts_strip_reserved_phase_model_operands_but_preserve_legacy_notes() {
+        let worker = WorkerAssignment {
+            id: "reserved-notes-worker".to_string(),
+            role: AgentRole::Worker,
+            assigned_paths: vec![PathBuf::from("scope")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            environment_requirements: Vec::new(),
+            report_path: None,
+        };
+        let reserved_notes = assignment_phase_model_bindings_notes(&AssignmentPhaseModelBindings {
+            workers: BTreeMap::from([(
+                worker.id.clone(),
+                WorkerPhaseModelBinding {
+                    model: FRONTIER_PROFILE_MODEL.to_string(),
+                    phase: OrchestrationPhase::MechanicalTerminal,
+                    mechanical_duty: Some(MechanicalTerminalDuty::RunPreselectedCommand),
+                    mechanical_operands: Some(MechanicalTerminalOperands::RunPreselectedCommand {
+                        argv: vec!["ARGV_RESERVED_CANARY".to_string()],
+                        working_directory: PathBuf::from("scope/RESERVED_PATH_CANARY"),
+                    }),
+                },
+            )]),
+        })
+        .expect("serialize reserved notes canary");
+        let assignment = OrchestratorAssignment {
+            id: "reserved-notes-child".to_string(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("scope")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: vec![worker],
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: Some(reserved_notes),
+        };
+
+        let (child, evidence) = launched_child_and_evidence_prompts(&assignment)
+            .expect("render prompts with strong declarative reserved notes");
+        for prompt in [&child, &evidence] {
+            assert!(prompt.contains(RESERVED_PHASE_MODEL_PROMPT_NOTICE.trim()));
+            assert!(!prompt.contains("mechanical_terminal"));
+            assert!(!prompt.contains("run_preselected_command"));
+            assert!(!prompt.contains("ARGV_RESERVED_CANARY"));
+            assert!(!prompt.contains("RESERVED_PATH_CANARY"));
+        }
+
+        let mut legacy_assignment = assignment;
+        legacy_assignment.notes = Some("LEGACY_NOTES_CANARY".to_string());
+        let (legacy_child, legacy_evidence) =
+            launched_child_and_evidence_prompts(&legacy_assignment)
+                .expect("render prompts with ordinary legacy notes");
+        assert!(legacy_child.contains("LEGACY_NOTES_CANARY"));
+        assert!(legacy_evidence.contains("LEGACY_NOTES_CANARY"));
+        assert!(!legacy_child.contains(RESERVED_PHASE_MODEL_PROMPT_NOTICE.trim()));
+        assert!(!legacy_evidence.contains(RESERVED_PHASE_MODEL_PROMPT_NOTICE.trim()));
+    }
+
+    #[test]
+    fn worker_prompt_rejects_weak_notes_authority_and_never_renders_note_operands() {
+        let weak_binding = WorkerPhaseModelBinding {
+            model: ECONOMY_PROFILE_MODEL.to_string(),
+            phase: OrchestrationPhase::MechanicalTerminal,
+            mechanical_duty: Some(MechanicalTerminalDuty::FormatPreselectedFiles),
+            mechanical_operands: Some(MechanicalTerminalOperands::FormatPreselectedFiles {
+                formatter_argv: vec!["rustfmt".to_string()],
+                paths: vec![PathBuf::from("src/lib.rs")],
+            }),
+        };
+        let weak_error = phase_bound_worker_prompt(weak_binding.clone(), ECONOMY_PROFILE_MODEL)
+            .expect_err("declarative notes must not emit a weak Worker prompt");
+        assert!(
+            format!("{weak_error:#}").contains("assignment notes are declarative metadata only")
+        );
+
+        let mut strong_binding = weak_binding;
+        strong_binding.model = FRONTIER_PROFILE_MODEL.to_string();
+        let prompt = phase_bound_worker_prompt(strong_binding.clone(), FRONTIER_PROFILE_MODEL)
+            .expect("render strong Worker prompt with declarative metadata ignored");
+        assert!(!prompt.contains("WEAK_MODEL_INSTRUCTION_PROFILE"));
+        assert!(!prompt.contains("Mechanical duty: format_preselected_files"));
+        assert!(!prompt.contains("{\"kind\":\"format_preselected_files\""));
+        assert!(prompt.contains("Mechanical duty: <none authorized>"));
+        assert!(prompt.contains("Mechanical operands: <none authorized>"));
+        assert!(prompt.contains("Reserved assignment notes are declarative metadata only"));
+
+        let model_error = phase_bound_worker_prompt(strong_binding, BALANCED_PROFILE_MODEL)
+            .expect_err("runtime model mismatch must invalidate declarative metadata");
+        assert!(model_error
+            .to_string()
+            .contains("phase-model binding is invalid"));
+
+        let (legacy_worker, _, _, _) =
+            fixed_prompt_fixture().expect("render unbound legacy Worker prompt");
+        assert!(legacy_worker.contains("Orchestration phase: <no trusted runtime binding>"));
+        assert!(!legacy_worker.contains("WEAK_MODEL_INSTRUCTION_PROFILE"));
+    }
+
+    #[test]
+    fn review_lens_rejects_unknown_model_even_when_catalog_advertises_it() {
+        let lens = ReviewLensConfig {
+            id: "unknown-review-model".to_string(),
+            backend: ReviewLensBackendConfig::Model {
+                backend_id: "openai".to_string(),
+                model: "custom-unknown-model".to_string(),
+                reasoning_effort: Some("xhigh".to_string()),
+            },
+            information_scope: ReviewInformationScope::DiffOnly,
+        };
+        let catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs(["custom-unknown-model"])
+                .expect("unknown review model catalog"),
+        );
+
+        let error =
+            validate_review_lens_runtime_selection(&lens, SupervisorRuntime::Codex, &catalog)
+                .expect_err("catalog availability must not imply trusted review capability");
+        assert!(format!("{error:#}").contains("no trusted built-in capability policy"));
     }
 
     #[test]
@@ -1766,7 +2240,7 @@ mod regression_tests {
             id: "diff-security".to_string(),
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "provider-alpha".to_string(),
-                model: "model-alpha".to_string(),
+                model: FRONTIER_PROFILE_MODEL.to_string(),
                 reasoning_effort: Some("high".to_string()),
             },
             information_scope: ReviewInformationScope::DiffOnly,
@@ -1775,7 +2249,7 @@ mod regression_tests {
             id: "report-consistency".to_string(),
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "provider-beta".to_string(),
-                model: "model-beta".to_string(),
+                model: FRONTIER_PROFILE_MODEL.to_string(),
                 reasoning_effort: Some("xhigh".to_string()),
             },
             information_scope: ReviewInformationScope::OutputReportOnly,
@@ -1821,8 +2295,7 @@ mod regression_tests {
         assert!(!report_prompt.contains("TRANSCRIPT_MUST_NOT_CROSS_NARROW_LENSES"));
 
         let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([
-            "model-alpha",
-            "model-beta",
+            FRONTIER_PROFILE_MODEL,
         ])?);
         let primary = tempfile::tempdir()?;
         let child_worktree = tempfile::tempdir()?;
@@ -1870,13 +2343,16 @@ mod regression_tests {
             diff_command.model_provider.as_deref(),
             Some("provider-alpha")
         );
-        assert_eq!(diff_command.model.as_deref(), Some("model-alpha"));
+        assert_eq!(diff_command.model.as_deref(), Some(FRONTIER_PROFILE_MODEL));
         assert_eq!(diff_command.reasoning_effort.as_deref(), Some("xhigh"));
         assert_eq!(
             report_command.model_provider.as_deref(),
             Some("provider-beta")
         );
-        assert_eq!(report_command.model.as_deref(), Some("model-beta"));
+        assert_eq!(
+            report_command.model.as_deref(),
+            Some(FRONTIER_PROFILE_MODEL)
+        );
         assert_eq!(report_command.reasoning_effort.as_deref(), Some("max"));
         let diff_argv = crate::external_agent::command_argv(&diff_command)
             .into_iter()
@@ -1888,7 +2364,7 @@ mod regression_tests {
             .collect::<Vec<_>>();
         assert!(diff_argv
             .windows(2)
-            .any(|pair| pair == ["-m", "model-alpha"]));
+            .any(|pair| pair == ["-m", FRONTIER_PROFILE_MODEL]));
         assert!(diff_argv
             .iter()
             .any(|argument| argument == "model_provider=\"provider-alpha\""));
@@ -1897,7 +2373,7 @@ mod regression_tests {
             .any(|argument| argument == "model_reasoning_effort=\"xhigh\""));
         assert!(report_argv
             .windows(2)
-            .any(|pair| pair == ["-m", "model-beta"]));
+            .any(|pair| pair == ["-m", FRONTIER_PROFILE_MODEL]));
         assert!(report_argv
             .iter()
             .any(|argument| argument == "model_provider=\"provider-beta\""));

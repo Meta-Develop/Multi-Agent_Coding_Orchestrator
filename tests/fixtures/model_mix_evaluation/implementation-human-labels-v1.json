@@ -1,0 +1,57 @@
+[
+  {
+    "label_schema_version": 1,
+    "outcome": "accepted",
+    "reason": "explicit synthetic human-label fixture reason",
+    "provenance": {
+      "labeler_id": "fixture-human-reviewer",
+      "authority": "issue-26-test-fixture",
+      "recorded_at": "deterministic-fixture-time",
+      "evidence": "deterministic_synthetic_fake_only",
+      "process_observed": false,
+      "eligible_for_production_default": false,
+      "evidence_material": "deterministic synthetic human-review fixture evidence; no reviewer process observed",
+      "evidence_digest": "sha256:85725082c6625d0c5a092a4bc088588b6c55baf4ceb92290f5b5b32b41eed5d6"
+    },
+    "resulting_candidate_validation_binding": null
+  },
+  {
+    "label_schema_version": 1,
+    "outcome": "rejected",
+    "reason": "explicit synthetic human-label fixture reason",
+    "provenance": {
+      "labeler_id": "fixture-human-reviewer",
+      "authority": "issue-26-test-fixture",
+      "recorded_at": "deterministic-fixture-time",
+      "evidence": "deterministic_synthetic_fake_only",
+      "process_observed": false,
+      "eligible_for_production_default": false,
+      "evidence_material": "deterministic synthetic human-review fixture evidence; no reviewer process observed",
+      "evidence_digest": "sha256:85725082c6625d0c5a092a4bc088588b6c55baf4ceb92290f5b5b32b41eed5d6"
+    },
+    "resulting_candidate_validation_binding": null
+  },
+  {
+    "label_schema_version": 1,
+    "outcome": "accepted_with_modifications",
+    "reason": "explicit synthetic human-label fixture reason",
+    "provenance": {
+      "labeler_id": "fixture-human-reviewer",
+      "authority": "issue-26-test-fixture",
+      "recorded_at": "deterministic-fixture-time",
+      "evidence": "deterministic_synthetic_fake_only",
+      "process_observed": false,
+      "eligible_for_production_default": false,
+      "evidence_material": "deterministic synthetic human-review fixture evidence; no reviewer process observed",
+      "evidence_digest": "sha256:85725082c6625d0c5a092a4bc088588b6c55baf4ceb92290f5b5b32b41eed5d6"
+    },
+    "resulting_candidate_validation_binding": {
+      "version": 1,
+      "agent_id": "issue-26-committed-fixture",
+      "primary_head": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
+      "agent_head": "4444444444444444444444444444444444444444",
+      "merge_base": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
+      "diff_oid": "5555555555555555555555555555555555555555"
+    }
+  }
+]

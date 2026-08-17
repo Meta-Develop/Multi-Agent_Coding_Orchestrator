@@ -158,6 +158,7 @@ fn parked_assignment_is_classified_before_claim_worktree_checkpoint_or_dispatch(
                         "autonomous_completion": true,
                         "rationale": "operator decision is required before this assignment may claim resources"
                     },
+                    "notes": "maco-phase-model-bindings-v1:not-json",
                     "child_assignments": [{
                         "id": "suppressed-descendant",
                         "assigned_paths": ["README.md"]

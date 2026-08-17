@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "trial_id": "issue-26-gate-policy-fake-only-v1",
+  "corpus_binding_digest": "sha256:022348063bac9ff5b4809cb21d35483fdf14343f67aad9e2b4d294fec78c9c3b",
+  "profiles": [
+    {
+      "id": "fake-profile-a",
+      "backend_id": "synthetic-backend",
+      "model_id": "synthetic-fake-profile-a",
+      "reasoning_effort": "deterministic-a",
+      "prompt_version": 1,
+      "policy_version": 1
+    },
+    {
+      "id": "fake-profile-b",
+      "backend_id": "synthetic-backend",
+      "model_id": "synthetic-fake-profile-b",
+      "reasoning_effort": "deterministic-b",
+      "prompt_version": 2,
+      "policy_version": 1
+    }
+  ],
+  "repetitions": 2,
+  "limits": {
+    "wall_time_seconds": 30,
+    "max_dispatches": 64
+  },
+  "evidence": "deterministic_synthetic_fake_only"
+}

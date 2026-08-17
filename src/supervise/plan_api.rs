@@ -48,6 +48,37 @@ pub fn supervisor_plan_document_from_goal_spec(
     Ok(supervisor_plan_and_document_from_goal_spec(repo, goal, spec)?.1)
 }
 
+/// Lowers an already validated planning session into the ordinary supervisor
+/// plan type without invoking a provider or reading repository state.
+///
+/// Heuristic sessions retain the established read-only planning-root plus
+/// execution-child shape. Provider sessions retain the provider's validated
+/// recursive assignment forest.
+pub fn supervisor_plan_from_task_planning_session(
+    goal: &str,
+    spec: &str,
+    session: &planning::TaskPlanningSession,
+) -> Result<SupervisorPlan> {
+    Ok(supervisor_plan_and_consultant_from_task_planning_session(goal, spec, None, session)?.plan)
+}
+
+/// Lowers an already validated planning session into the normalized,
+/// round-trippable supervisor plan document used by the file-entry APIs.
+pub fn supervisor_plan_document_from_task_planning_session(
+    goal: &str,
+    spec: &str,
+    session: &planning::TaskPlanningSession,
+) -> Result<Value> {
+    let loaded =
+        supervisor_plan_and_consultant_from_task_planning_session(goal, spec, None, session)?;
+    supervisor_plan_value(
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )
+}
+
 pub(crate) fn supervisor_plan_and_document_from_goal_spec(
     repo: impl AsRef<Path>,
     goal: &str,
@@ -111,6 +142,39 @@ fn supervisor_plan_and_consultant_from_goal_spec(
 ) -> Result<LoadedSupervisorPlan> {
     let proposal = planning::propose_task_decomposition(repo, goal, spec)
         .context("failed to decompose goal/spec into repository workstreams")?;
+    supervisor_plan_and_consultant_from_heuristic_proposal(goal, spec, task_file, proposal)
+}
+
+fn supervisor_plan_and_consultant_from_task_planning_session(
+    goal: &str,
+    spec: &str,
+    task_file: Option<PathBuf>,
+    session: &planning::TaskPlanningSession,
+) -> Result<LoadedSupervisorPlan> {
+    match session.source() {
+        planning::TaskPlanningSource::Heuristic => {
+            if !session.provider_assignment_tree().is_empty() {
+                bail!("heuristic planning session unexpectedly carries a provider assignment tree");
+            }
+            supervisor_plan_and_consultant_from_heuristic_proposal(
+                goal,
+                spec,
+                task_file,
+                session.proposal().clone(),
+            )
+        }
+        planning::TaskPlanningSource::Provider => {
+            supervisor_plan_and_consultant_from_provider_session(goal, spec, task_file, session)
+        }
+    }
+}
+
+fn supervisor_plan_and_consultant_from_heuristic_proposal(
+    goal: &str,
+    spec: &str,
+    task_file: Option<PathBuf>,
+    proposal: planning::TaskDecompositionProposal,
+) -> Result<LoadedSupervisorPlan> {
     if proposal.assignments.is_empty() {
         bail!(
             "goal/spec produced no actionable workstreams; name at least one repository path, Rust module, or Rust symbol to change"
@@ -252,6 +316,942 @@ pub(super) fn insert_generated_planner_suitability(
         AssignmentSuitabilityConfig::default(),
         AssignmentSuitabilityAssessmentSource::GeneratedPlannerAuthority,
     );
+}
+
+fn supervisor_plan_and_consultant_from_provider_session(
+    goal: &str,
+    spec: &str,
+    task_file: Option<PathBuf>,
+    session: &planning::TaskPlanningSession,
+) -> Result<LoadedSupervisorPlan> {
+    let roots = session.provider_assignment_tree();
+    if roots.is_empty() {
+        bail!("provider planning session has no validated provider assignment tree");
+    }
+
+    let mut assignments = Vec::new();
+    let mut assignment_schedule = Vec::new();
+    let mut assignment_metadata = AssignmentMetadata::new();
+    let mut spec_fragment_ids_by_assignment = BTreeMap::new();
+    let mut current_fragment_ids = BTreeSet::new();
+    let mut actual_max_depth = MIN_SUPERVISOR_DEPTH;
+    for root in roots {
+        lower_provider_assignment_tree(
+            root,
+            None,
+            MIN_SUPERVISOR_DEPTH,
+            &mut assignments,
+            &mut assignment_schedule,
+            &mut assignment_metadata,
+            &mut spec_fragment_ids_by_assignment,
+            &mut current_fragment_ids,
+            &mut actual_max_depth,
+        )?;
+    }
+    if assignments.is_empty() || current_fragment_ids.is_empty() {
+        bail!("provider planning session has no executable remaining work");
+    }
+    let actual_assignment_count = assignments.len();
+    let task = combined_goal_spec(goal, spec);
+    let plan = SupervisorPlan {
+        version: SUPERVISOR_SCHEMA_VERSION,
+        task,
+        task_file,
+        max_depth: actual_max_depth,
+        max_child_assignments: actual_assignment_count,
+        max_child_retries: DEFAULT_MAX_CHILD_RETRIES,
+        max_gate_corrections: DEFAULT_MAX_GATE_CORRECTIONS,
+        child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
+        semantic_coordination: SemanticCoordinationMode::Off,
+        role_models: BTreeMap::new(),
+        model_pricing: BTreeMap::new(),
+        review_lenses: default_supervisor_review_lenses(),
+        review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+        assignments,
+    };
+    let metadata = SupervisorPlanMetadata {
+        execution_target: None,
+        spec_fragment_ids: current_fragment_ids.into_iter().collect(),
+        spec_fragment_ids_by_assignment,
+        assignment_schedule,
+        coverage_gaps: Vec::new(),
+        run_budget: SupervisorBudgetConfig::default(),
+        run_budget_max_duration_seconds: None,
+        admission: SupervisorAdmissionConfig::default(),
+        evidence_only_reaudit: None,
+        generated_follow_up: None,
+        review_loop_guard: None,
+    };
+    let (plan, plan_metadata) = validate_supervisor_plan(plan, metadata)
+        .context("validated provider planning session could not be lowered safely")?;
+    Ok(LoadedSupervisorPlan {
+        plan,
+        consultant: SupervisorConsultantPlan::default(),
+        assignment_metadata,
+        plan_metadata,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_provider_assignment_tree(
+    node: &planning::ProviderTaskAssignmentTree,
+    parent_assignment_id: Option<&str>,
+    depth: u8,
+    assignments: &mut Vec<OrchestratorAssignment>,
+    assignment_schedule: &mut Vec<AssignmentScheduleEntry>,
+    assignment_metadata: &mut AssignmentMetadata,
+    spec_fragment_ids_by_assignment: &mut BTreeMap<String, Vec<String>>,
+    current_fragment_ids: &mut BTreeSet<String>,
+    actual_max_depth: &mut u8,
+) -> Result<()> {
+    if depth > MAX_SUPERVISOR_DEPTH {
+        bail!(
+            "provider assignment '{}' translates to supervisor depth {} above maximum {}",
+            node.id,
+            depth,
+            MAX_SUPERVISOR_DEPTH
+        );
+    }
+    *actual_max_depth = (*actual_max_depth).max(depth);
+    let is_leaf = node.child_assignments.is_empty();
+    let worker_assignments = if is_leaf {
+        let worker = WorkerAssignment {
+            id: format!("{}-worker", node.id),
+            role: AgentRole::Worker,
+            assigned_paths: node.assigned_paths.clone(),
+            semantic_symbols: node.semantic_symbols.clone(),
+            semantic_modules: node.semantic_modules.clone(),
+            task: Some(node.task.clone()),
+            environment_requirements: Vec::new(),
+            report_path: None,
+        };
+        assignment_metadata.insert(
+            (node.id.clone(), worker.id.clone()),
+            WorkerAssignmentMetadata::default(),
+        );
+        for fragment_id in &node.fragment_ids {
+            current_fragment_ids.insert(fragment_id.clone());
+        }
+        spec_fragment_ids_by_assignment.insert(node.id.clone(), node.fragment_ids.clone());
+        vec![worker]
+    } else {
+        spec_fragment_ids_by_assignment.insert(node.id.clone(), Vec::new());
+        Vec::new()
+    };
+
+    insert_generated_planner_suitability(assignment_metadata, node.id.clone());
+    let flattened_index = assignments.len();
+    assignments.push(OrchestratorAssignment {
+        id: node.id.clone(),
+        role: AgentRole::ChildOrchestrator,
+        assigned_paths: node.assigned_paths.clone(),
+        semantic_symbols: node.semantic_symbols.clone(),
+        semantic_modules: node.semantic_modules.clone(),
+        task: Some(node.task.clone()),
+        worker_assignments,
+        environment_requirements: Vec::new(),
+        licensed_breakage: None,
+        notes: None,
+    });
+    assignment_schedule.push(AssignmentScheduleEntry {
+        assignment_id: node.id.clone(),
+        parent_assignment_id: parent_assignment_id.map(str::to_string),
+        depth,
+        flattened_index,
+    });
+
+    let child_depth = depth.checked_add(1).with_context(|| {
+        format!(
+            "provider assignment '{}' overflows supervisor depth",
+            node.id
+        )
+    })?;
+    for child in &node.child_assignments {
+        lower_provider_assignment_tree(
+            child,
+            Some(&node.id),
+            child_depth,
+            assignments,
+            assignment_schedule,
+            assignment_metadata,
+            spec_fragment_ids_by_assignment,
+            current_fragment_ids,
+            actual_max_depth,
+        )?;
+    }
+    Ok(())
+}
+
+fn combined_goal_spec(goal: &str, spec: &str) -> String {
+    match (goal.is_empty(), spec.is_empty()) {
+        (false, false) => format!("{goal}\n\n{spec}"),
+        (false, true) => goal.to_string(),
+        (true, _) => spec.to_string(),
+    }
+}
+
+/// Opaque authority tying one validated provider planning session and its
+/// exact normalized supervisor plan to one caller-selected supervisor run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSupervisorExecutionBinding {
+    run_id: RunId,
+    durable: DurableProviderSupervisorExecutionBinding,
+}
+
+impl ProviderSupervisorExecutionBinding {
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+}
+
+/// The typed plan/document pair and opaque execution binding produced from one
+/// validated provider planning session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundProviderSupervisorPlan {
+    pub plan: SupervisorPlan,
+    pub document: Value,
+    pub execution_binding: ProviderSupervisorExecutionBinding,
+}
+
+const PROVIDER_SUPERVISOR_BINDING_VERSION: u32 = 1;
+const PROVIDER_SUPERVISOR_BINDING_NOTES_PREFIX: &str =
+    "maco-provider-supervisor-execution-binding-v1:";
+const PROVIDER_SUPERVISOR_BINDING_MAX_BYTES: usize = 4096;
+const NORMALIZED_SUPERVISOR_PLAN_ARTIFACT_PATH: &str = "assignments/supervisor-plan.json";
+
+/// Trusted planning authority carried by the already-authenticated normalized
+/// supervisor plan. Provider-authored proposal fields never populate this
+/// record: it is added only after deterministic lowering and validation.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DurableProviderSupervisorExecutionBinding {
+    version: u32,
+    run_id: RunId,
+    session_id: String,
+    provider_id: String,
+    model: String,
+    session_authority_sha256: String,
+    normalized_plan_sha256: String,
+    authority_sha256: String,
+}
+
+/// Lowers and binds a validated provider planning session to an exact future
+/// supervisor run without invoking the provider or performing scheduler work.
+pub fn bind_provider_task_planning_session_to_supervisor_run(
+    goal: &str,
+    spec: &str,
+    session: &planning::TaskPlanningSession,
+    run_id: RunId,
+) -> Result<BoundProviderSupervisorPlan> {
+    if session.source() != planning::TaskPlanningSource::Provider
+        || session.provider_assignment_tree().is_empty()
+    {
+        bail!("supervisor execution binding requires a provider planning session and tree");
+    }
+    let mut loaded =
+        supervisor_plan_and_consultant_from_task_planning_session(goal, spec, None, session)?;
+    let unbound_document = supervisor_plan_value(
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )?;
+    let durable =
+        durable_provider_supervisor_execution_binding(session, run_id.clone(), &unbound_document)?;
+    let first_assignment = loaded
+        .plan
+        .assignments
+        .first_mut()
+        .context("provider supervisor execution binding has no assignment authority carrier")?;
+    if first_assignment.notes.is_some() {
+        bail!("provider supervisor execution binding carrier is already occupied");
+    }
+    first_assignment.notes = Some(format!(
+        "{PROVIDER_SUPERVISOR_BINDING_NOTES_PREFIX}{}",
+        serde_json::to_string(&durable)
+            .context("failed to serialize durable provider supervisor execution binding")?
+    ));
+    let document = supervisor_plan_value(
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )?;
+    let reparsed = parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&document)
+            .context("failed to serialize bound provider supervisor plan")?,
+    )
+    .context("bound provider supervisor plan failed strict round-trip validation")?;
+    let round_trip = supervisor_plan_value(
+        &reparsed.plan,
+        &reparsed.consultant,
+        &reparsed.assignment_metadata,
+        &reparsed.plan_metadata,
+    )?;
+    if round_trip != document {
+        bail!("bound provider supervisor plan changed during strict round-trip validation");
+    }
+    Ok(BoundProviderSupervisorPlan {
+        plan: reparsed.plan,
+        document,
+        execution_binding: ProviderSupervisorExecutionBinding { run_id, durable },
+    })
+}
+
+/// Loads the binding's exact finalized supervisor run through authenticated
+/// artifact state, verifies its persisted normalized plan and run identity,
+/// and returns bounded provider re-planning feedback.
+pub(crate) fn task_execution_feedback_from_authenticated_supervisor_run(
+    repo: impl AsRef<Path>,
+    goal: &str,
+    spec: &str,
+    session: &planning::TaskPlanningSession,
+    binding: &ProviderSupervisorExecutionBinding,
+) -> Result<planning::TaskExecutionFeedback> {
+    let current = bind_provider_task_planning_session_to_supervisor_run(
+        goal,
+        spec,
+        session,
+        binding.run_id.clone(),
+    )?;
+    if current.execution_binding.durable != binding.durable {
+        bail!("provider supervisor execution binding does not match the current session and normalized plan");
+    }
+
+    let repo = discover_repo_root(repo.as_ref())?;
+    let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &binding.run_id)
+        .with_context(|| {
+            format!(
+                "provider supervisor run '{}' is not an authenticated finalized artifact",
+                binding.run_id.as_str()
+            )
+        })?;
+    let report_bytes = reader
+        .read(RunArtifactFamily::Supervise.final_report_relative_path())
+        .context("authenticated provider supervisor run has no final report")?;
+    if report_bytes.len() > MAX_SUPERVISOR_REPORT_BYTES {
+        bail!("authenticated provider supervisor final report exceeds its bounded size");
+    }
+    let report: SupervisorFinalReport = serde_json::from_slice(&report_bytes)
+        .context("authenticated provider supervisor final report is invalid")?;
+    if report.run_id != binding.run_id {
+        bail!(
+            "authenticated supervisor report run id '{}' does not match bound run '{}'",
+            report.run_id.as_str(),
+            binding.run_id.as_str()
+        );
+    }
+
+    let plan_bytes = reader
+        .read(NORMALIZED_SUPERVISOR_PLAN_ARTIFACT_PATH)
+        .context("authenticated provider supervisor run has no normalized supervisor plan")?;
+    let plan_text = std::str::from_utf8(&plan_bytes)
+        .context("authenticated provider supervisor plan is not UTF-8")?;
+    let persisted = parse_supervisor_plan_with_consultant(plan_text)
+        .context("authenticated provider supervisor plan is invalid")?;
+    let persisted_document = supervisor_plan_value(
+        &persisted.plan,
+        &persisted.consultant,
+        &persisted.assignment_metadata,
+        &persisted.plan_metadata,
+    )?;
+    let persisted_binding = durable_provider_binding_from_persisted_plan(&persisted.plan)?;
+    if persisted_binding != binding.durable {
+        bail!("authenticated supervisor run carries the wrong provider/session/model/plan execution binding");
+    }
+    if persisted_document != current.document {
+        bail!("authenticated supervisor run normalized plan does not match its provider execution binding");
+    }
+    verify_provider_binding_preceded_authenticated_dispatch(
+        &repo,
+        &binding.run_id,
+        &persisted_document,
+        &plan_bytes,
+        &report_bytes,
+    )?;
+
+    normalize_task_execution_feedback_from_supervisor_final_report(session, &report)
+}
+
+/// Authenticates the exact finalized supervisor artifact bound to the current
+/// provider planning session, normalizes its terminal execution report, and
+/// performs one provider re-plan through the ordinary provider-neutral
+/// boundary. Invalid artifacts and invalid/provider-failed proposals leave the
+/// last valid plan state intact; proposal attempts still consume the bounded
+/// re-plan attempt counter.
+pub fn replan_provider_task_planning_session_from_authenticated_supervisor_run<
+    P: crate::llm::LlmProvider + ?Sized,
+>(
+    repo: impl AsRef<Path>,
+    goal: &str,
+    spec: &str,
+    session: &mut planning::TaskPlanningSession,
+    binding: &ProviderSupervisorExecutionBinding,
+    provider: &mut P,
+    config: &planning::ProviderPlanningConfig,
+) -> Result<()> {
+    let repo = discover_repo_root(repo.as_ref())?;
+    let feedback = task_execution_feedback_from_authenticated_supervisor_run(
+        &repo, goal, spec, session, binding,
+    )?;
+    planning::replan_task_decomposition_with_provider(&repo, session, &feedback, provider, config)
+}
+
+fn durable_provider_supervisor_execution_binding(
+    session: &planning::TaskPlanningSession,
+    run_id: RunId,
+    unbound_normalized_document: &Value,
+) -> Result<DurableProviderSupervisorExecutionBinding> {
+    let provider_id = session
+        .provider_id()
+        .context("provider planning session has no bound provider identity")?;
+    let model = session
+        .model()
+        .context("provider planning session has no bound model identity")?;
+    if provider_id.is_empty() || model.is_empty() {
+        bail!("provider planning session has an empty provider or model identity");
+    }
+    let session_authority = serde_json::to_vec(&json!({
+        "version": 1,
+        "session_id": session.session_id(),
+        "planning_session_authority": session.execution_binding_authority_state(),
+    }))
+    .context("failed to serialize provider planning session authority")?;
+    let normalized_plan = serde_json::to_vec(unbound_normalized_document)
+        .context("failed to serialize unbound normalized provider supervisor plan")?;
+    let session_authority_sha256 = crate::artifacts::state_auth::sha256_hex(&session_authority);
+    let normalized_plan_sha256 = crate::artifacts::state_auth::sha256_hex(&normalized_plan);
+    let authority = serde_json::to_vec(&json!({
+        "version": PROVIDER_SUPERVISOR_BINDING_VERSION,
+        "run_id": run_id,
+        "session_id": session.session_id(),
+        "provider_id": provider_id,
+        "model": model,
+        "session_authority_sha256": session_authority_sha256,
+        "normalized_plan_sha256": normalized_plan_sha256,
+    }))
+    .context("failed to serialize provider supervisor execution authority")?;
+    let binding = DurableProviderSupervisorExecutionBinding {
+        version: PROVIDER_SUPERVISOR_BINDING_VERSION,
+        run_id,
+        session_id: session.session_id().to_string(),
+        provider_id: provider_id.to_string(),
+        model: model.to_string(),
+        session_authority_sha256,
+        normalized_plan_sha256,
+        authority_sha256: crate::artifacts::state_auth::sha256_hex(&authority),
+    };
+    validate_durable_provider_supervisor_execution_binding(&binding)?;
+    Ok(binding)
+}
+
+fn validate_durable_provider_supervisor_execution_binding(
+    binding: &DurableProviderSupervisorExecutionBinding,
+) -> Result<()> {
+    if binding.version != PROVIDER_SUPERVISOR_BINDING_VERSION {
+        bail!(
+            "unsupported durable provider supervisor execution binding version {}",
+            binding.version
+        );
+    }
+    if binding.session_id.len() != 64
+        || binding.provider_id.is_empty()
+        || binding.model.is_empty()
+        || binding.provider_id.len() > 256
+        || binding.model.len() > 256
+        || binding.provider_id.trim() != binding.provider_id
+        || binding.model.trim() != binding.model
+        || !is_canonical_lower_hex_sha256(&binding.session_id)
+        || !is_canonical_lower_hex_sha256(&binding.session_authority_sha256)
+        || !is_canonical_lower_hex_sha256(&binding.normalized_plan_sha256)
+        || !is_canonical_lower_hex_sha256(&binding.authority_sha256)
+    {
+        bail!("durable provider supervisor execution binding is malformed");
+    }
+    let authority = serde_json::to_vec(&json!({
+        "version": binding.version,
+        "run_id": binding.run_id,
+        "session_id": binding.session_id,
+        "provider_id": binding.provider_id,
+        "model": binding.model,
+        "session_authority_sha256": binding.session_authority_sha256,
+        "normalized_plan_sha256": binding.normalized_plan_sha256,
+    }))
+    .context("failed to reserialize provider supervisor execution authority")?;
+    if crate::artifacts::state_auth::sha256_hex(&authority) != binding.authority_sha256 {
+        bail!("durable provider supervisor execution binding authority digest is invalid");
+    }
+    Ok(())
+}
+
+fn durable_provider_binding_from_persisted_plan(
+    plan: &SupervisorPlan,
+) -> Result<DurableProviderSupervisorExecutionBinding> {
+    let carriers = plan
+        .assignments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, assignment)| {
+            assignment.notes.as_deref().and_then(|notes| {
+                notes
+                    .contains(PROVIDER_SUPERVISOR_BINDING_NOTES_PREFIX)
+                    .then_some((index, notes))
+            })
+        })
+        .collect::<Vec<_>>();
+    if carriers.len() != 1 || carriers[0].0 != 0 {
+        bail!("authenticated supervisor plan must carry exactly one provider execution binding on its first assignment");
+    }
+    let encoded = carriers[0]
+        .1
+        .strip_prefix(PROVIDER_SUPERVISOR_BINDING_NOTES_PREFIX)
+        .context("authenticated supervisor plan provider execution binding is not canonical")?;
+    if encoded.is_empty() || encoded.len() > PROVIDER_SUPERVISOR_BINDING_MAX_BYTES {
+        bail!("authenticated supervisor plan provider execution binding exceeds its strict bound");
+    }
+    let binding: DurableProviderSupervisorExecutionBinding = serde_json::from_str(encoded)
+        .context("authenticated supervisor plan provider execution binding is invalid")?;
+    validate_durable_provider_supervisor_execution_binding(&binding)?;
+    Ok(binding)
+}
+
+fn verify_provider_binding_preceded_authenticated_dispatch(
+    repo: &Path,
+    run_id: &RunId,
+    persisted_document: &Value,
+    persisted_plan_bytes: &[u8],
+    persisted_report_bytes: &[u8],
+) -> Result<()> {
+    // Capture the raw, MAC-verified ordering evidence while holding the
+    // journal's exclusive instance lock. Reopen through the semantic analyzer
+    // immediately afterwards; that second lock is retained through every
+    // comparison so an appended valid-MAC tail cannot race these checks.
+    let authenticator = repository_authenticator_key_only(repo)?;
+    crate::artifacts::validate_repository_authenticated_state(repo, &authenticator)?;
+    let journal =
+        crate::state_journal::StateJournal::open_instance(authenticator, run_id.as_str())?;
+    let records = journal.records().to_vec();
+    drop(journal);
+    let (_checkpoint_guard, snapshot) = open_supervisor_checkpoint(repo, run_id)
+        .context("provider execution feedback requires an authenticated supervise checkpoint")?;
+    if !snapshot.finalization_started || !snapshot.finalized {
+        bail!("provider execution feedback checkpoint is not durably finalized");
+    }
+    let checkpoint_report = snapshot
+        .final_report
+        .as_ref()
+        .context("provider execution feedback checkpoint has no planned final report")?;
+    if !checkpoint_report.artifact_committed {
+        bail!("provider execution feedback checkpoint has no committed final report");
+    }
+    if checkpoint_report.report_bytes != persisted_report_bytes {
+        bail!("authenticated provider supervisor final report differs from its checkpoint-committed bytes");
+    }
+    let prepared = records
+        .first()
+        .filter(|record| record.phase == "supervise_prepared" && record.subject.is_none())
+        .context("authenticated supervise checkpoint has no canonical prepared record")?;
+    if prepared.payload.get("run_id").and_then(Value::as_str) != Some(run_id.as_str()) {
+        bail!("authenticated supervise checkpoint prepared run id is inconsistent");
+    }
+    let normalized_plan = serde_json::to_vec(persisted_document)
+        .context("failed to serialize authenticated normalized provider supervisor plan")?;
+    let expected_normalized_sha256 = crate::artifacts::state_auth::sha256_hex(&normalized_plan);
+    if prepared
+        .payload
+        .get("normalized_plan_sha256")
+        .and_then(Value::as_str)
+        != Some(expected_normalized_sha256.as_str())
+    {
+        bail!("authenticated supervise checkpoint was prepared for a different normalized provider plan");
+    }
+
+    let dispatch_index = records
+        .iter()
+        .position(|record| {
+            matches!(
+                record.phase.as_str(),
+                "child_dispatch_started" | "auditor_dispatch_started"
+            )
+        })
+        .context(
+            "authenticated provider supervisor run has no child or auditor dispatch evidence",
+        )?;
+    let dispatch = &records[dispatch_index];
+    let assignment_start = if dispatch.phase == "child_dispatch_started" {
+        let subject = dispatch
+            .subject
+            .as_deref()
+            .context("authenticated child dispatch has no assignment subject")?;
+        records[..dispatch_index]
+            .iter()
+            .rev()
+            .find(|record| {
+                record.phase == "assignment_started" && record.subject.as_deref() == Some(subject)
+            })
+            .context("authenticated child dispatch has no preceding matching assignment artifact boundary")?
+    } else {
+        records[..dispatch_index]
+            .iter()
+            .rev()
+            .find(|record| record.phase == "assignment_started")
+            .context(
+                "authenticated auditor dispatch preceded every assignment plan artifact boundary",
+            )?
+    };
+    let files = assignment_start
+        .payload
+        .get("artifact")
+        .and_then(|artifact| artifact.get("files"))
+        .and_then(Value::as_array)
+        .context("authenticated pre-dispatch assignment boundary has no artifact manifest")?;
+    let plan_records = files
+        .iter()
+        .filter(|record| {
+            record.get("path").and_then(Value::as_str)
+                == Some(NORMALIZED_SUPERVISOR_PLAN_ARTIFACT_PATH)
+        })
+        .collect::<Vec<_>>();
+    if plan_records.len() != 1 {
+        bail!("authenticated pre-dispatch artifact manifest does not contain exactly one normalized supervisor plan");
+    }
+    let expected_artifact_sha256 = crate::artifacts::state_auth::sha256_hex(persisted_plan_bytes);
+    if plan_records[0].get("sha256").and_then(Value::as_str)
+        != Some(expected_artifact_sha256.as_str())
+        || plan_records[0].get("disposition").and_then(Value::as_str) != Some("private_evidence")
+    {
+        bail!("authenticated normalized provider plan was missing or replaced after the pre-dispatch artifact boundary");
+    }
+    Ok(())
+}
+
+fn is_canonical_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn normalize_task_execution_feedback_from_supervisor_final_report(
+    session: &planning::TaskPlanningSession,
+    report: &SupervisorFinalReport,
+) -> Result<planning::TaskExecutionFeedback> {
+    if session.source() != planning::TaskPlanningSource::Provider
+        || session.provider_assignment_tree().is_empty()
+    {
+        bail!("supervisor execution feedback requires a provider planning session and tree");
+    }
+    if report.run_lifecycle != SupervisorRunLifecycle::Finalized {
+        bail!("supervisor execution feedback requires a finalized report");
+    }
+
+    let mut assignments = BTreeMap::new();
+    let mut flattened_index = 0usize;
+    for root in session.provider_assignment_tree() {
+        collect_provider_feedback_assignments(
+            root,
+            None,
+            MIN_SUPERVISOR_DEPTH,
+            &mut flattened_index,
+            &mut assignments,
+        )?;
+    }
+    let expected_assigned_paths = assignments
+        .values()
+        .flat_map(|assignment| assignment.assigned_paths.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let expected_semantic_symbols = assignments
+        .values()
+        .flat_map(|assignment| assignment.semantic_symbols.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let expected_semantic_modules = assignments
+        .values()
+        .flat_map(|assignment| assignment.semantic_modules.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if report.assigned_paths != expected_assigned_paths
+        || report.semantic_symbols != expected_semantic_symbols
+        || report.semantic_modules != expected_semantic_modules
+    {
+        bail!("supervisor execution report aggregate path or semantic scope does not match the current provider tree");
+    }
+    let executable_ids = assignments
+        .iter()
+        .filter_map(|(id, assignment)| assignment.executable.then_some(id.clone()))
+        .collect::<BTreeSet<_>>();
+    let proposal_assignments = session
+        .proposal()
+        .assignments
+        .iter()
+        .map(|assignment| (assignment.id.as_str(), assignment))
+        .collect::<BTreeMap<_, _>>();
+    if proposal_assignments.len() != executable_ids.len()
+        || executable_ids
+            .iter()
+            .any(|id| !proposal_assignments.contains_key(id.as_str()))
+    {
+        bail!("provider planning session leaf tree and executable proposal disagree");
+    }
+    for id in &executable_ids {
+        let proposal = proposal_assignments
+            .get(id.as_str())
+            .copied()
+            .context("provider executable proposal disappeared during feedback validation")?;
+        let proposal_fragments = proposal
+            .fragment_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let tree_fragments = &assignments
+            .get(id)
+            .context("provider executable tree node disappeared during feedback validation")?
+            .fragment_ids;
+        if &proposal_fragments != tree_fragments {
+            bail!(
+                "provider planning session leaf '{}' fragment mapping disagrees with its executable proposal",
+                id
+            );
+        }
+    }
+
+    let current_fragment_ids = executable_ids
+        .iter()
+        .filter_map(|id| assignments.get(id))
+        .flat_map(|assignment| assignment.fragment_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut traceability_by_id = BTreeMap::new();
+    for trace in &report.assignment_traceability {
+        let assignment_id = trace.assignment_id.trim();
+        let Some(provider_assignment) = assignments.get(assignment_id) else {
+            bail!(
+                "supervisor execution report references unknown provider assignment '{}'",
+                trace.assignment_id
+            );
+        };
+        if traceability_by_id
+            .insert(assignment_id.to_string(), trace)
+            .is_some()
+        {
+            bail!(
+                "supervisor execution report repeats provider assignment '{}'",
+                assignment_id
+            );
+        }
+        if trace.parent_assignment_id != provider_assignment.parent_assignment_id
+            || trace.depth != provider_assignment.depth
+            || trace.flattened_index != provider_assignment.flattened_index
+            || trace.assigned_paths != provider_assignment.assigned_paths
+        {
+            bail!(
+                "supervisor execution report traceability for '{}' does not match the current provider schedule and scope",
+                assignment_id
+            );
+        }
+        let trace_fragments = normalized_report_fragment_ids(
+            &trace.spec_fragment_ids,
+            &current_fragment_ids,
+            "assignment traceability",
+        )?;
+        if provider_assignment.executable {
+            if trace_fragments != provider_assignment.fragment_ids {
+                bail!(
+                    "supervisor execution report fragment mapping for leaf '{}' does not match the current provider tree",
+                    assignment_id
+                );
+            }
+        } else if !trace_fragments.is_empty() {
+            bail!(
+                "supervisor execution report attributes spec fragments to internal provider assignment '{}'",
+                assignment_id
+            );
+        }
+    }
+
+    for (assignment_id, provider_assignment) in &assignments {
+        let trace = traceability_by_id.get(assignment_id).with_context(|| {
+            format!(
+                "supervisor execution report has no traceability row for provider tree node '{}'",
+                assignment_id
+            )
+        })?;
+        if !provider_assignment.executable && trace.report_status != Some(ReviewStatus::Succeeded) {
+            bail!(
+                "supervisor execution report internal provider node '{}' is not terminal succeeded",
+                assignment_id
+            );
+        }
+    }
+
+    let mut completed_assignment_ids = BTreeSet::new();
+    let mut failed_assignment_ids = BTreeSet::new();
+    let mut completed_fragment_ids = BTreeSet::new();
+    for assignment_id in &executable_ids {
+        let trace = traceability_by_id.get(assignment_id).with_context(|| {
+            format!(
+                "supervisor execution report has no traceability row for provider leaf '{}'",
+                assignment_id
+            )
+        })?;
+        match trace.report_status {
+            Some(ReviewStatus::Pending) => bail!(
+                "supervisor execution report leaf '{}' is still pending",
+                assignment_id
+            ),
+            Some(ReviewStatus::Succeeded) => {
+                completed_assignment_ids.insert(assignment_id.clone());
+                if let Some(assignment) = assignments.get(assignment_id) {
+                    completed_fragment_ids.extend(assignment.fragment_ids.iter().cloned());
+                }
+            }
+            Some(ReviewStatus::Failed | ReviewStatus::Rejected | ReviewStatus::Missing) | None => {
+                failed_assignment_ids.insert(assignment_id.clone());
+            }
+        }
+    }
+
+    let mut raw_coverage_gap_fragment_ids = Vec::new();
+    let mut normalized_coverage_gap_fragment_ids = BTreeSet::new();
+    for gap in &report.coverage_gaps {
+        let provider_assignment = if let Some(assignment_id) = gap.assignment_id.as_deref() {
+            let assignment_id = assignment_id.trim();
+            Some(assignments.get(assignment_id).with_context(|| {
+                format!(
+                    "supervisor execution coverage gap references unknown provider assignment '{}'",
+                    assignment_id
+                )
+            })?)
+        } else {
+            None
+        };
+        let Some(raw_fragment_id) = gap.spec_fragment_id.as_deref() else {
+            bail!("supervisor execution report contains a fragmentless coverage gap that cannot be normalized safely");
+        };
+        let fragment_id = raw_fragment_id.trim();
+        if fragment_id.is_empty() || !current_fragment_ids.contains(fragment_id) {
+            bail!(
+                "supervisor execution coverage gap references unknown current fragment '{}'",
+                fragment_id
+            );
+        }
+        if let Some(provider_assignment) = provider_assignment {
+            if !provider_assignment.executable
+                || !provider_assignment.fragment_ids.contains(fragment_id)
+            {
+                bail!(
+                    "supervisor execution coverage gap fragment '{}' does not belong to its provider leaf",
+                    fragment_id
+                );
+            }
+        }
+        raw_coverage_gap_fragment_ids.push(raw_fragment_id.to_string());
+        normalized_coverage_gap_fragment_ids.insert(fragment_id.to_string());
+    }
+    if let Some(contradiction) = completed_fragment_ids
+        .intersection(&normalized_coverage_gap_fragment_ids)
+        .next()
+    {
+        bail!(
+            "supervisor execution report marks succeeded fragment '{}' as a coverage gap",
+            contradiction
+        );
+    }
+
+    let raw_feedback = planning::TaskExecutionFeedback {
+        completed_assignment_ids: completed_assignment_ids.into_iter().collect(),
+        failed_assignment_ids: failed_assignment_ids.into_iter().collect(),
+        coverage_gap_fragment_ids: raw_coverage_gap_fragment_ids,
+        notes: Vec::new(),
+    };
+    planning::validate_and_normalize_execution_feedback_for_session(session, &raw_feedback)
+}
+
+#[cfg(test)]
+pub(super) fn normalize_task_execution_feedback_from_supervisor_final_report_for_test(
+    session: &planning::TaskPlanningSession,
+    report: &SupervisorFinalReport,
+) -> Result<planning::TaskExecutionFeedback> {
+    normalize_task_execution_feedback_from_supervisor_final_report(session, report)
+}
+
+struct ProviderFeedbackAssignment {
+    parent_assignment_id: Option<String>,
+    depth: u8,
+    flattened_index: usize,
+    assigned_paths: Vec<PathBuf>,
+    semantic_symbols: Vec<String>,
+    semantic_modules: Vec<String>,
+    fragment_ids: BTreeSet<String>,
+    executable: bool,
+}
+
+fn collect_provider_feedback_assignments(
+    node: &planning::ProviderTaskAssignmentTree,
+    parent_assignment_id: Option<&str>,
+    depth: u8,
+    flattened_index: &mut usize,
+    assignments: &mut BTreeMap<String, ProviderFeedbackAssignment>,
+) -> Result<()> {
+    let assignment = ProviderFeedbackAssignment {
+        parent_assignment_id: parent_assignment_id.map(str::to_string),
+        depth,
+        flattened_index: *flattened_index,
+        assigned_paths: node.assigned_paths.clone(),
+        semantic_symbols: node.semantic_symbols.clone(),
+        semantic_modules: node.semantic_modules.clone(),
+        fragment_ids: node.fragment_ids.iter().cloned().collect(),
+        executable: node.child_assignments.is_empty(),
+    };
+    if assignments.insert(node.id.clone(), assignment).is_some() {
+        bail!(
+            "provider planning session repeats assignment id '{}'",
+            node.id
+        );
+    }
+    *flattened_index = flattened_index
+        .checked_add(1)
+        .context("provider feedback assignment index overflowed")?;
+    let child_depth = depth
+        .checked_add(1)
+        .context("provider feedback assignment depth overflowed")?;
+    for child in &node.child_assignments {
+        collect_provider_feedback_assignments(
+            child,
+            Some(&node.id),
+            child_depth,
+            flattened_index,
+            assignments,
+        )?;
+    }
+    Ok(())
+}
+
+fn normalized_report_fragment_ids(
+    fragment_ids: &[String],
+    current_fragment_ids: &BTreeSet<String>,
+    source: &str,
+) -> Result<BTreeSet<String>> {
+    let mut normalized = BTreeSet::new();
+    for fragment_id in fragment_ids {
+        let fragment_id = fragment_id.trim();
+        if fragment_id.is_empty() || !current_fragment_ids.contains(fragment_id) {
+            bail!(
+                "supervisor execution {source} references unknown current fragment '{}'",
+                fragment_id
+            );
+        }
+        if !normalized.insert(fragment_id.to_string()) {
+            bail!(
+                "supervisor execution {source} repeats fragment '{}'",
+                fragment_id
+            );
+        }
+    }
+    Ok(normalized)
 }
 
 /// Loads only the executable plan model from a plan document.

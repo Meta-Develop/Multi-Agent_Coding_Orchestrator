@@ -1,4 +1,9 @@
 use super::*;
+use crate::{
+    llm::FakeProvider,
+    planning::{ProviderPlanningConfig, ProviderRecursiveTaskPlan, ProviderTaskAssignmentTree},
+    supervise::plan_api::normalize_task_execution_feedback_from_supervisor_final_report_for_test as normalize_task_execution_feedback_from_supervisor_final_report,
+};
 
 #[test]
 fn authored_serial_plan_reports_independent_scope_width_warning() {
@@ -431,6 +436,1503 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
     )
     .expect("renormalize generated plan");
     assert_eq!(renormalized, document);
+}
+
+fn provider_planning_node(
+    id: &str,
+    task: &str,
+    fragment_ids: &[&str],
+    path: &str,
+    child_assignments: Vec<ProviderTaskAssignmentTree>,
+) -> ProviderTaskAssignmentTree {
+    let module = Path::new(path)
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .expect("provider test path has a UTF-8 file stem");
+    let is_leaf = child_assignments.is_empty();
+    let assigned_paths = if is_leaf {
+        vec![PathBuf::from(path)]
+    } else {
+        child_assignments
+            .iter()
+            .flat_map(|child| child.assigned_paths.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+    let semantic_symbols = if is_leaf {
+        vec![format!("crate::{module}::{module}")]
+    } else {
+        child_assignments
+            .iter()
+            .flat_map(|child| child.semantic_symbols.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+    let semantic_modules = if is_leaf {
+        vec![format!("crate::{module}")]
+    } else {
+        child_assignments
+            .iter()
+            .flat_map(|child| child.semantic_modules.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+    ProviderTaskAssignmentTree {
+        id: id.to_string(),
+        task: task.to_string(),
+        fragment_ids: fragment_ids
+            .iter()
+            .map(|fragment_id| (*fragment_id).to_string())
+            .collect(),
+        assigned_paths,
+        semantic_symbols,
+        semantic_modules,
+        child_assignments,
+    }
+}
+
+fn provider_traceability(
+    assignment_id: &str,
+    parent_assignment_id: Option<&str>,
+    depth: u8,
+    flattened_index: usize,
+    fragment_ids: &[&str],
+    path: &str,
+    report_status: Option<ReviewStatus>,
+) -> AssignmentTraceability {
+    AssignmentTraceability {
+        assignment_id: assignment_id.to_string(),
+        parent_assignment_id: parent_assignment_id.map(str::to_string),
+        depth,
+        flattened_index,
+        spec_fragment_ids: fragment_ids
+            .iter()
+            .map(|fragment_id| (*fragment_id).to_string())
+            .collect(),
+        assigned_paths: vec![PathBuf::from(path)],
+        produced_changed_paths: Vec::new(),
+        produced_diff_binding: None,
+        report_status,
+    }
+}
+
+fn persist_provider_supervisor_artifact(
+    repo: &Path,
+    artifact_run_id: &RunId,
+    document: &Value,
+    report: &SupervisorFinalReport,
+    finalize: bool,
+) {
+    persist_provider_supervisor_artifact_with_pre_dispatch_document(
+        repo,
+        artifact_run_id,
+        document,
+        document,
+        report,
+        finalize,
+    );
+}
+
+fn persist_provider_supervisor_artifact_with_pre_dispatch_document(
+    repo: &Path,
+    artifact_run_id: &RunId,
+    document: &Value,
+    pre_dispatch_document: &Value,
+    report: &SupervisorFinalReport,
+    finalize: bool,
+) {
+    persist_provider_supervisor_artifact_with_faults(
+        repo,
+        artifact_run_id,
+        document,
+        pre_dispatch_document,
+        report,
+        finalize,
+        ProviderSupervisorArtifactFaults::default(),
+    );
+}
+
+#[derive(Default)]
+struct ProviderSupervisorArtifactFaults<'a> {
+    finalized_report_replacement: Option<&'a SupervisorFinalReport>,
+    auditor_dispatch_before_plan: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_provider_supervisor_artifact_with_faults(
+    repo: &Path,
+    artifact_run_id: &RunId,
+    document: &Value,
+    pre_dispatch_document: &Value,
+    report: &SupervisorFinalReport,
+    finalize: bool,
+    faults: ProviderSupervisorArtifactFaults<'_>,
+) {
+    let loaded = parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(document).expect("serialize provider supervisor plan"),
+    )
+    .expect("parse provider supervisor plan for authenticated timeline");
+    let normalized_plan_sha256 = normalized_supervisor_plan_sha256(
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )
+    .expect("digest provider supervisor plan");
+    let ledger = RunBudgetLedger::new(RunBudgetLimits::default())
+        .expect("provider supervisor timeline budget ledger");
+    let mut authenticated_report = report.clone();
+    if authenticated_report.run_budget.is_none() {
+        authenticated_report.run_budget = Some(
+            ledger
+                .report()
+                .expect("provider supervisor authenticated report budget"),
+        );
+    }
+    let report = &authenticated_report;
+    let mut writer = ArtifactRunWriter::reserve(
+        repo,
+        RunArtifactFamily::Supervise,
+        artifact_run_id.clone(),
+        "provider-planning-feedback-test",
+    )
+    .expect("reserve provider supervisor artifact");
+    let mut checkpoint = SupervisorCheckpointWriter::create(
+        repo,
+        SupervisorCheckpointPreparation::new(
+            artifact_run_id,
+            &Oid::ZERO_SHA1,
+            normalized_plan_sha256,
+            1,
+            &loaded.plan,
+            writer
+                .resume_binding()
+                .expect("bind empty provider supervisor artifact"),
+            ledger.report().expect("initial provider supervisor budget"),
+        ),
+    )
+    .expect("create authenticated provider supervisor checkpoint");
+    if faults.auditor_dispatch_before_plan {
+        checkpoint
+            .dispatch_started(true, "provider-pre-plan-auditor", 1)
+            .expect("record pre-plan auditor dispatch start");
+        checkpoint
+            .dispatch_completed(true, "provider-pre-plan-auditor", 1)
+            .expect("record pre-plan auditor dispatch completion");
+    }
+    writer
+        .write_json(
+            "assignments/supervisor-plan.json",
+            pre_dispatch_document,
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .expect("write bound provider supervisor plan");
+    for (index, assignment) in loaded.plan.assignments.iter().enumerate() {
+        checkpoint
+            .assignment_started(
+                assignment,
+                index,
+                Some(
+                    writer
+                        .resume_binding()
+                        .expect("bind pre-dispatch provider supervisor evidence"),
+                ),
+                ledger.report().expect("provider supervisor start budget"),
+            )
+            .expect("record provider supervisor assignment start");
+        checkpoint
+            .dispatch_started(false, &assignment.id, 1)
+            .expect("record provider supervisor child dispatch start");
+        checkpoint
+            .dispatch_completed(false, &assignment.id, 1)
+            .expect("record provider supervisor child dispatch completion");
+        checkpoint
+            .assignment_completed(
+                assignment,
+                index,
+                Some(
+                    writer
+                        .resume_binding()
+                        .expect("bind completed provider supervisor evidence"),
+                ),
+                ledger
+                    .report()
+                    .expect("provider supervisor completion budget"),
+                None,
+                Vec::new(),
+            )
+            .expect("record provider supervisor assignment completion");
+    }
+    if pre_dispatch_document != document {
+        writer
+            .write_json(
+                "assignments/supervisor-plan.json",
+                document,
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("replace late provider supervisor plan");
+    }
+    checkpoint
+        .scheduler_closed(
+            writer
+                .resume_binding()
+                .expect("bind closed provider supervisor scheduler"),
+            ledger.report().expect("provider supervisor closed budget"),
+        )
+        .expect("close provider supervisor scheduler checkpoint");
+    let report_bytes = encode_final_report(report).expect("encode provider supervisor report");
+    checkpoint
+        .final_report_planned(
+            report,
+            &report_bytes,
+            writer
+                .resume_binding()
+                .expect("bind planned provider supervisor report"),
+        )
+        .expect("plan provider supervisor final report");
+    writer
+        .write_bytes(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            &report_bytes,
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .expect("write provider supervisor final report");
+    checkpoint
+        .final_report_committed(
+            report,
+            &report_bytes,
+            writer
+                .resume_binding()
+                .expect("bind committed provider supervisor report"),
+        )
+        .expect("commit provider supervisor final report checkpoint");
+    if let Some(replacement) = faults.finalized_report_replacement {
+        let mut replacement = replacement.clone();
+        if replacement.run_budget.is_none() {
+            replacement.run_budget = report.run_budget.clone();
+        }
+        writer
+            .write_bytes(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                &encode_final_report(&replacement)
+                    .expect("encode replaced provider supervisor report"),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("replace provider supervisor report after checkpoint commit");
+    }
+    checkpoint
+        .finalization_started(report, &report_bytes)
+        .expect("start provider supervisor artifact finalization");
+    if finalize {
+        writer
+            .finalize(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                false,
+            )
+            .expect("finalize provider supervisor artifact");
+        checkpoint
+            .finalized(report, &report_bytes)
+            .expect("finalize provider supervisor checkpoint");
+    }
+}
+
+#[test]
+fn provider_feedback_requires_exact_authenticated_pre_dispatch_planning_binding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    Repository::init(repo).expect("initialize repository");
+    let config = ProviderPlanningConfig::new("binding", "fake-model")
+        .with_max_child_assignments(1)
+        .with_max_depth(1);
+    let session = planning::validated_provider_session_for_test(
+        planning::ValidatedProviderSessionTestInput {
+            fragments: vec![planning::TaskSpecFragment {
+                id: "fragment-001".to_string(),
+                text: "Implement alpha.".to_string(),
+            }],
+            provider_plan: ProviderRecursiveTaskPlan {
+                assignments: vec![provider_planning_node(
+                    "provider-alpha",
+                    "Implement alpha.",
+                    &["fragment-001"],
+                    "src/alpha.rs",
+                    Vec::new(),
+                )],
+            },
+            repository_paths: vec![PathBuf::from("src/alpha.rs")],
+            semantic_modules: ["crate::alpha".to_string()].into_iter().collect(),
+            semantic_symbols: ["crate::alpha::alpha".to_string()].into_iter().collect(),
+            provider_id: "fake-planner",
+            model: "fake-model",
+            config: &config,
+        },
+    )
+    .expect("deterministically validated provider session");
+    let run_id = RunId::new("provider-binding-timeline").expect("valid run id");
+    let bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        "Implement alpha in src/alpha.rs.",
+        &session,
+        run_id.clone(),
+    )
+    .expect("bind provider supervisor plan");
+    let mut report = artifact_test_final_report(&run_id);
+    report.assigned_paths = vec![PathBuf::from("src/alpha.rs")];
+    report.semantic_symbols = vec!["crate::alpha::alpha".to_string()];
+    report.semantic_modules = vec!["crate::alpha".to_string()];
+    report.assignment_traceability = vec![provider_traceability(
+        "provider-alpha",
+        None,
+        2,
+        0,
+        &["fragment-001"],
+        "src/alpha.rs",
+        Some(ReviewStatus::Succeeded),
+    )];
+    persist_provider_supervisor_artifact(repo, &run_id, &bound.document, &report, true);
+    let feedback = task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        "Implement alpha in src/alpha.rs.",
+        &session,
+        &bound.execution_binding,
+    )
+    .expect("read exact authenticated pre-dispatch planning binding");
+    assert_eq!(feedback.completed_assignment_ids, vec!["provider-alpha"]);
+
+    let collision_session = session
+        .reissue_provider_authority_for_test("fake-planner", "fake-model")
+        .expect("reissue otherwise identical planning session");
+    let collision = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        "Implement alpha in src/alpha.rs.",
+        &collision_session,
+        run_id.clone(),
+    )
+    .expect("bind colliding session");
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        "Implement alpha in src/alpha.rs.",
+        &collision_session,
+        &collision.execution_binding,
+    )
+    .expect_err("same-run session collision must fail")
+    .to_string()
+    .contains("wrong provider/session/model/plan"));
+
+    let late_run_id = RunId::new("provider-binding-late").expect("valid late run id");
+    let late = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        "Implement alpha in src/alpha.rs.",
+        &session,
+        late_run_id.clone(),
+    )
+    .expect("bind late provider plan");
+    let mut unbound = late.document.clone();
+    unbound["assignments"][0]
+        .as_object_mut()
+        .expect("first assignment object")
+        .remove("notes");
+    let mut late_report = report.clone();
+    late_report.run_id = late_run_id.clone();
+    persist_provider_supervisor_artifact_with_pre_dispatch_document(
+        repo,
+        &late_run_id,
+        &late.document,
+        &unbound,
+        &late_report,
+        true,
+    );
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        "Implement alpha in src/alpha.rs.",
+        &session,
+        &late.execution_binding,
+    )
+    .expect_err("late binding replacement must fail")
+    .to_string()
+    .contains("missing or replaced after the pre-dispatch artifact boundary"));
+
+    let replaced_report_run_id =
+        RunId::new("provider-binding-report-replaced").expect("valid replaced-report run id");
+    let replaced_report_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        "Implement alpha in src/alpha.rs.",
+        &session,
+        replaced_report_run_id.clone(),
+    )
+    .expect("bind replaced-report provider plan");
+    let mut committed_report = report.clone();
+    committed_report.run_id = replaced_report_run_id.clone();
+    let mut replaced_report = committed_report.clone();
+    replaced_report.status = ReviewStatus::Failed;
+    replaced_report.success = false;
+    persist_provider_supervisor_artifact_with_faults(
+        repo,
+        &replaced_report_run_id,
+        &replaced_report_bound.document,
+        &replaced_report_bound.document,
+        &committed_report,
+        true,
+        ProviderSupervisorArtifactFaults {
+            finalized_report_replacement: Some(&replaced_report),
+            auditor_dispatch_before_plan: false,
+        },
+    );
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        "Implement alpha in src/alpha.rs.",
+        &session,
+        &replaced_report_bound.execution_binding,
+    )
+    .expect_err("report replaced after checkpoint commit must fail")
+    .to_string()
+    .contains("differs from its checkpoint-committed bytes"));
+
+    let auditor_first_run_id =
+        RunId::new("provider-binding-auditor-before-plan").expect("valid auditor-first run id");
+    let auditor_first_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        "Implement alpha in src/alpha.rs.",
+        &session,
+        auditor_first_run_id.clone(),
+    )
+    .expect("bind auditor-first provider plan");
+    let mut auditor_first_report = report.clone();
+    auditor_first_report.run_id = auditor_first_run_id.clone();
+    persist_provider_supervisor_artifact_with_faults(
+        repo,
+        &auditor_first_run_id,
+        &auditor_first_bound.document,
+        &auditor_first_bound.document,
+        &auditor_first_report,
+        true,
+        ProviderSupervisorArtifactFaults {
+            finalized_report_replacement: None,
+            auditor_dispatch_before_plan: true,
+        },
+    );
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        "Implement alpha in src/alpha.rs.",
+        &session,
+        &auditor_first_bound.execution_binding,
+    )
+    .expect_err("auditor dispatch before plan boundary must fail")
+    .to_string()
+    .contains("auditor dispatch preceded every assignment plan artifact boundary"));
+
+    for (suffix, source_phase, appended_phase, expected) in [
+        (
+            "duplicate-finalized",
+            "artifact_finalized",
+            "artifact_finalized",
+            "finalization completion is out of order",
+        ),
+        (
+            "late-assignment",
+            "assignment_started",
+            "assignment_started",
+            "duplicate or late assignment start",
+        ),
+        (
+            "conflicting-dispatch",
+            "child_dispatch_started",
+            "child_dispatch_started",
+            "child dispatch started after assignment completion",
+        ),
+    ] {
+        let journal_run_id =
+            RunId::new(format!("provider-binding-{suffix}")).expect("valid journal run id");
+        let journal_bound = bind_provider_task_planning_session_to_supervisor_run(
+            "",
+            "Implement alpha in src/alpha.rs.",
+            &session,
+            journal_run_id.clone(),
+        )
+        .expect("bind journal-fault provider plan");
+        let mut journal_report = report.clone();
+        journal_report.run_id = journal_run_id.clone();
+        persist_provider_supervisor_artifact(
+            repo,
+            &journal_run_id,
+            &journal_bound.document,
+            &journal_report,
+            true,
+        );
+        let authenticator = repository_authenticator_key_only(repo)
+            .expect("open journal-fault repository authenticator");
+        let mut journal = crate::state_journal::StateJournal::open_instance(
+            authenticator,
+            journal_run_id.as_str(),
+        )
+        .expect("open authenticated provider checkpoint journal");
+        let source = journal
+            .records()
+            .iter()
+            .find(|record| record.phase == source_phase)
+            .expect("source checkpoint phase")
+            .clone();
+        journal
+            .append(appended_phase, source.subject.as_deref(), &source.payload)
+            .expect("append valid-MAC invalid-lifecycle checkpoint record");
+        drop(journal);
+        let error = task_execution_feedback_from_authenticated_supervisor_run(
+            repo,
+            "",
+            "Implement alpha in src/alpha.rs.",
+            &session,
+            &journal_bound.execution_binding,
+        )
+        .expect_err("valid-MAC invalid-lifecycle journal tail must fail");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains(expected),
+            "unexpected journal rejection: {error}"
+        );
+    }
+}
+
+#[test]
+fn provider_recursive_plan_lowers_and_finalized_feedback_drives_remaining_tree() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    Repository::init(repo).expect("initialize repository");
+    fs::create_dir_all(repo.join("src")).expect("create src");
+    fs::write(repo.join("src/root.rs"), "pub fn root() {}\n").expect("write root");
+    fs::write(repo.join("src/alpha.rs"), "pub fn alpha() {}\n").expect("write alpha");
+    fs::write(repo.join("src/beta.rs"), "pub fn beta() {}\n").expect("write beta");
+
+    let initial = ProviderRecursiveTaskPlan {
+        assignments: vec![provider_planning_node(
+            "provider-root",
+            "Coordinate the two disjoint implementation leaves.",
+            &["fragment-001", "fragment-002"],
+            "src/root.rs",
+            vec![
+                provider_planning_node(
+                    "provider-alpha",
+                    "Implement alpha.",
+                    &["fragment-001"],
+                    "src/alpha.rs",
+                    Vec::new(),
+                ),
+                provider_planning_node(
+                    "provider-beta",
+                    "Implement beta.",
+                    &["fragment-002"],
+                    "src/beta.rs",
+                    Vec::new(),
+                ),
+            ],
+        )],
+    };
+    let revised = ProviderRecursiveTaskPlan {
+        assignments: vec![provider_planning_node(
+            "remaining-root",
+            "Coordinate the revised remaining beta work.",
+            &["fragment-002"],
+            "src/root.rs",
+            vec![provider_planning_node(
+                "provider-beta-revised",
+                "Revise beta using execution feedback.",
+                &["fragment-002"],
+                "src/beta.rs",
+                Vec::new(),
+            )],
+        )],
+    };
+    let mut provider = FakeProvider::new("fake-planner", "fake-model");
+    provider
+        .push_json_response("plan-runtime-proposal", &initial)
+        .expect("serialize initial provider plan");
+    provider
+        .push_response(
+            "plan-runtime-replan-01",
+            crate::llm::WorkProposal::summary("malformed recursive replan"),
+        )
+        .push_json_response("plan-runtime-replan-02", &revised)
+        .expect("serialize revised provider plan");
+    let config = ProviderPlanningConfig::new("plan-runtime", "fake-model")
+        .with_max_child_assignments(3)
+        .with_max_depth(2);
+    let spec = "- Implement alpha in src/alpha.rs.\n- Implement beta in src/beta.rs.";
+    let mut session =
+        planning::propose_task_decomposition_with_provider(repo, "", spec, &mut provider, &config)
+            .expect("validated recursive provider plan");
+    let heuristic_session =
+        planning::propose_task_decomposition_with_optional_provider(repo, "", spec, None, &config)
+            .expect("heuristic planning session");
+    assert!(bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &heuristic_session,
+        RunId::new("heuristic-binding-refusal").expect("valid refusal run id"),
+    )
+    .expect_err("heuristic session must not receive provider execution binding")
+    .to_string()
+    .contains("requires a provider planning session"));
+
+    let run_id = RunId::new("provider-planning-feedback").expect("valid run id");
+    let bound =
+        bind_provider_task_planning_session_to_supervisor_run("", spec, &session, run_id.clone())
+            .expect("lower and bind initial provider tree");
+    assert_eq!(bound.execution_binding.run_id(), &run_id);
+    assert_eq!(bound.plan.max_depth, 3);
+    assert_eq!(bound.plan.max_child_assignments, 3);
+    assert_eq!(bound.plan.assignments.len(), 3);
+    let initial_document = bound.document.clone();
+    assert_eq!(initial_document["max_depth"], 3);
+    assert_eq!(initial_document["max_child_assignments"], 3);
+    assert_eq!(
+        initial_document["spec_fragment_ids"],
+        json!(["fragment-001", "fragment-002"])
+    );
+    assert_eq!(
+        initial_document["assignments"]
+            .as_array()
+            .expect("initial assignments")
+            .iter()
+            .map(|assignment| assignment["id"].as_str().expect("assignment id"))
+            .collect::<Vec<_>>(),
+        vec!["provider-root", "provider-alpha", "provider-beta"]
+    );
+    assert!(initial_document["assignments"][0]["worker_assignments"]
+        .as_array()
+        .expect("internal workers")
+        .is_empty());
+    assert!(initial_document["assignments"][0]
+        .get("spec_fragment_ids")
+        .is_none());
+    assert_eq!(
+        initial_document["assignments"][0]["semantic_symbols"],
+        json!(["crate::alpha::alpha", "crate::beta::beta"])
+    );
+    assert_eq!(
+        initial_document["assignments"][0]["semantic_modules"],
+        json!(["crate::alpha", "crate::beta"])
+    );
+    for leaf_index in [1usize, 2] {
+        let leaf = &initial_document["assignments"][leaf_index];
+        assert_eq!(
+            leaf["worker_assignments"]
+                .as_array()
+                .expect("leaf workers")
+                .len(),
+            1
+        );
+        assert_eq!(
+            leaf["worker_assignments"][0]["assigned_paths"],
+            leaf["assigned_paths"]
+        );
+        assert_eq!(leaf["worker_assignments"][0]["task"], leaf["task"]);
+    }
+    assert_eq!(
+        initial_document["assignment_schedule"],
+        json!([
+            {
+                "assignment_id": "provider-root",
+                "depth": 2,
+                "flattened_index": 0
+            },
+            {
+                "assignment_id": "provider-alpha",
+                "parent_assignment_id": "provider-root",
+                "depth": 3,
+                "flattened_index": 1
+            },
+            {
+                "assignment_id": "provider-beta",
+                "parent_assignment_id": "provider-root",
+                "depth": 3,
+                "flattened_index": 2
+            }
+        ])
+    );
+    let parsed_initial = parse_supervisor_plan_with_consultant(&initial_document.to_string())
+        .expect("round-trip initial provider plan");
+    let renormalized_initial = supervisor_plan_value(
+        &parsed_initial.plan,
+        &parsed_initial.consultant,
+        &parsed_initial.assignment_metadata,
+        &parsed_initial.plan_metadata,
+    )
+    .expect("renormalize initial provider plan");
+    assert_eq!(renormalized_initial, initial_document);
+
+    let mut report = artifact_test_final_report(&run_id);
+    report.assigned_paths = vec![PathBuf::from("src/alpha.rs"), PathBuf::from("src/beta.rs")];
+    report.semantic_symbols = vec![
+        "crate::alpha::alpha".to_string(),
+        "crate::beta::beta".to_string(),
+    ];
+    report.semantic_modules = vec!["crate::alpha".to_string(), "crate::beta".to_string()];
+    report.assignment_traceability = vec![
+        provider_traceability(
+            "provider-root",
+            None,
+            2,
+            0,
+            &[],
+            "src/root.rs",
+            Some(ReviewStatus::Succeeded),
+        ),
+        provider_traceability(
+            "provider-alpha",
+            Some("provider-root"),
+            3,
+            1,
+            &["fragment-001"],
+            "src/alpha.rs",
+            Some(ReviewStatus::Succeeded),
+        ),
+        provider_traceability(
+            "provider-beta",
+            Some("provider-root"),
+            3,
+            2,
+            &["fragment-002"],
+            "src/beta.rs",
+            Some(ReviewStatus::Failed),
+        ),
+    ];
+    report.assignment_traceability[0].assigned_paths =
+        vec![PathBuf::from("src/alpha.rs"), PathBuf::from("src/beta.rs")];
+    let beta_gap = SupervisorCoverageGap {
+        kind: CoverageGapKind::NoProducedChanges,
+        spec_fragment_id: Some("fragment-002".to_string()),
+        assignment_id: Some("provider-beta".to_string()),
+        message: "beta produced no accepted changes".to_string(),
+    };
+    report.coverage_gaps = vec![beta_gap.clone(), beta_gap.clone()];
+
+    persist_provider_supervisor_artifact(repo, &run_id, &initial_document, &report, true);
+    let feedback = task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &bound.execution_binding,
+    )
+    .expect("adapt authenticated finalized report feedback");
+    assert_eq!(feedback.completed_assignment_ids, vec!["provider-alpha"]);
+    assert_eq!(feedback.failed_assignment_ids, vec!["provider-beta"]);
+    assert_eq!(feedback.coverage_gap_fragment_ids, vec!["fragment-002"]);
+    assert!(feedback.notes.is_empty());
+
+    let reissued_session = session
+        .reissue_provider_authority_for_test("fake-planner", "fake-model")
+        .expect("reissue otherwise identical provider session");
+    let same_run_collision = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &reissued_session,
+        run_id.clone(),
+    )
+    .expect("bind reissued session to colliding run id");
+    assert_ne!(
+        same_run_collision.execution_binding,
+        bound.execution_binding
+    );
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &reissued_session,
+        &same_run_collision.execution_binding,
+    )
+    .expect_err("same-run otherwise identical session collision must fail")
+    .to_string()
+    .contains("wrong provider/session/model/plan"));
+
+    for (provider_id, model) in [
+        ("different-provider", "fake-model"),
+        ("fake-planner", "different-model"),
+    ] {
+        let replaced_authority = session
+            .reissue_provider_authority_for_test(provider_id, model)
+            .expect("reissue provider/model authority");
+        let replaced = bind_provider_task_planning_session_to_supervisor_run(
+            "",
+            spec,
+            &replaced_authority,
+            run_id.clone(),
+        )
+        .expect("bind replaced provider/model authority");
+        assert!(task_execution_feedback_from_authenticated_supervisor_run(
+            repo,
+            "",
+            spec,
+            &replaced_authority,
+            &replaced.execution_binding,
+        )
+        .expect_err("wrong provider or model binding must fail")
+        .to_string()
+        .contains("wrong provider/session/model/plan"));
+    }
+
+    let missing_binding_run_id =
+        RunId::new("provider-feedback-missing-binding").expect("valid missing-binding run id");
+    let missing_binding_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &session,
+        missing_binding_run_id.clone(),
+    )
+    .expect("bind missing-binding run");
+    let mut missing_binding_document = missing_binding_bound.document.clone();
+    missing_binding_document["assignments"][0]
+        .as_object_mut()
+        .expect("first assignment object")
+        .remove("notes");
+    let mut missing_binding_report = report.clone();
+    missing_binding_report.run_id = missing_binding_run_id.clone();
+    persist_provider_supervisor_artifact(
+        repo,
+        &missing_binding_run_id,
+        &missing_binding_document,
+        &missing_binding_report,
+        true,
+    );
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &missing_binding_bound.execution_binding,
+    )
+    .expect_err("missing durable provider binding must fail")
+    .to_string()
+    .contains("exactly one provider execution binding"));
+
+    let duplicate_binding_run_id =
+        RunId::new("provider-feedback-duplicate-binding").expect("valid duplicate-binding run id");
+    let duplicate_binding_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &session,
+        duplicate_binding_run_id.clone(),
+    )
+    .expect("bind duplicate-binding run");
+    let mut duplicate_binding_document = duplicate_binding_bound.document.clone();
+    duplicate_binding_document["assignments"][1]["notes"] =
+        duplicate_binding_document["assignments"][0]["notes"].clone();
+    let mut duplicate_binding_report = report.clone();
+    duplicate_binding_report.run_id = duplicate_binding_run_id.clone();
+    persist_provider_supervisor_artifact(
+        repo,
+        &duplicate_binding_run_id,
+        &duplicate_binding_document,
+        &duplicate_binding_report,
+        true,
+    );
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &duplicate_binding_bound.execution_binding,
+    )
+    .expect_err("duplicate durable provider binding must fail")
+    .to_string()
+    .contains("exactly one provider execution binding"));
+
+    let late_binding_run_id =
+        RunId::new("provider-feedback-late-binding").expect("valid late-binding run id");
+    let late_binding_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &session,
+        late_binding_run_id.clone(),
+    )
+    .expect("bind late-binding run");
+    let mut pre_dispatch_unbound_document = late_binding_bound.document.clone();
+    pre_dispatch_unbound_document["assignments"][0]
+        .as_object_mut()
+        .expect("first assignment object")
+        .remove("notes");
+    let mut late_binding_report = report.clone();
+    late_binding_report.run_id = late_binding_run_id.clone();
+    persist_provider_supervisor_artifact_with_pre_dispatch_document(
+        repo,
+        &late_binding_run_id,
+        &late_binding_bound.document,
+        &pre_dispatch_unbound_document,
+        &late_binding_report,
+        true,
+    );
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &late_binding_bound.execution_binding,
+    )
+    .expect_err("late provider binding replacement must fail")
+    .to_string()
+    .contains("missing or replaced after the pre-dispatch artifact boundary"));
+
+    let provider_calls_before_bounded_feedback = provider.calls().len();
+    let repeated_gap_run_id =
+        RunId::new("provider-feedback-repeated-gaps").expect("valid repeated-gap run id");
+    let repeated_gap_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &session,
+        repeated_gap_run_id.clone(),
+    )
+    .expect("bind repeated-gap provider run");
+    let mut repeated_gap_report = report.clone();
+    repeated_gap_report.run_id = repeated_gap_run_id.clone();
+    repeated_gap_report.coverage_gaps = vec![beta_gap.clone(); 129];
+    persist_provider_supervisor_artifact(
+        repo,
+        &repeated_gap_run_id,
+        &repeated_gap_bound.document,
+        &repeated_gap_report,
+        true,
+    );
+    assert!(
+        replan_provider_task_planning_session_from_authenticated_supervisor_run(
+            repo,
+            "",
+            spec,
+            &mut session,
+            &repeated_gap_bound.execution_binding,
+            &mut provider,
+            &config,
+        )
+        .expect_err("raw repeated coverage gaps must exceed the feedback item bound")
+        .to_string()
+        .contains("items but at most 128")
+    );
+    assert_eq!(session.replans_used(), 0);
+    assert_eq!(
+        provider.calls().len(),
+        provider_calls_before_bounded_feedback
+    );
+
+    let padded_gap_run_id =
+        RunId::new("provider-feedback-padded-gap").expect("valid padded-gap run id");
+    let padded_gap_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &session,
+        padded_gap_run_id.clone(),
+    )
+    .expect("bind padded-gap provider run");
+    let mut padded_gap_report = report.clone();
+    padded_gap_report.run_id = padded_gap_run_id.clone();
+    padded_gap_report.coverage_gaps = vec![SupervisorCoverageGap {
+        spec_fragment_id: Some(format!("{}fragment-002", " ".repeat(16 * 1024 + 1))),
+        ..beta_gap.clone()
+    }];
+    persist_provider_supervisor_artifact(
+        repo,
+        &padded_gap_run_id,
+        &padded_gap_bound.document,
+        &padded_gap_report,
+        true,
+    );
+    assert!(
+        replan_provider_task_planning_session_from_authenticated_supervisor_run(
+            repo,
+            "",
+            spec,
+            &mut session,
+            &padded_gap_bound.execution_binding,
+            &mut provider,
+            &config,
+        )
+        .expect_err("raw whitespace-padded coverage gap must exceed the byte bound")
+        .to_string()
+        .contains("item contains")
+    );
+    assert_eq!(session.replans_used(), 0);
+    assert_eq!(
+        provider.calls().len(),
+        provider_calls_before_bounded_feedback
+    );
+
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "different goal",
+        spec,
+        &session,
+        &bound.execution_binding,
+    )
+    .expect_err("changed goal must invalidate execution binding")
+    .to_string()
+    .contains("does not match the current session and normalized plan"));
+
+    let missing_run_id = RunId::new("provider-feedback-missing").expect("valid missing run id");
+    let missing_bound =
+        bind_provider_task_planning_session_to_supervisor_run("", spec, &session, missing_run_id)
+            .expect("bind missing provider run");
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &missing_bound.execution_binding,
+    )
+    .expect_err("missing artifact must fail")
+    .to_string()
+    .contains("not an authenticated finalized artifact"));
+
+    let unfinalized_run_id =
+        RunId::new("provider-feedback-unfinalized").expect("valid unfinalized run id");
+    let unfinalized_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &session,
+        unfinalized_run_id.clone(),
+    )
+    .expect("bind unfinalized provider run");
+    let mut unfinalized_report = report.clone();
+    unfinalized_report.run_id = unfinalized_run_id.clone();
+    persist_provider_supervisor_artifact(
+        repo,
+        &unfinalized_run_id,
+        &unfinalized_bound.document,
+        &unfinalized_report,
+        false,
+    );
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &unfinalized_bound.execution_binding,
+    )
+    .expect_err("unfinalized artifact must fail")
+    .to_string()
+    .contains("not an authenticated finalized artifact"));
+
+    let nonterminal_report_run_id =
+        RunId::new("provider-feedback-nonterminal-report").expect("valid nonterminal run id");
+    let nonterminal_report_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &session,
+        nonterminal_report_run_id.clone(),
+    )
+    .expect("bind nonterminal-report provider run");
+    let mut nonterminal_report = report.clone();
+    nonterminal_report.run_id = nonterminal_report_run_id.clone();
+    nonterminal_report.run_lifecycle = SupervisorRunLifecycle::Active;
+    persist_provider_supervisor_artifact(
+        repo,
+        &nonterminal_report_run_id,
+        &nonterminal_report_bound.document,
+        &nonterminal_report,
+        true,
+    );
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &nonterminal_report_bound.execution_binding,
+    )
+    .expect_err("authenticated nonterminal report must fail")
+    .to_string()
+    .contains("requires a finalized report"));
+
+    let mismatched_report_run_id =
+        RunId::new("provider-feedback-report-id").expect("valid report-id run id");
+    let mismatched_report_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &session,
+        mismatched_report_run_id.clone(),
+    )
+    .expect("bind report-id provider run");
+    let mut mismatched_report = report.clone();
+    mismatched_report.run_id =
+        RunId::new("different-provider-report-id").expect("valid different report id");
+    persist_provider_supervisor_artifact(
+        repo,
+        &mismatched_report_run_id,
+        &mismatched_report_bound.document,
+        &mismatched_report,
+        true,
+    );
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &mismatched_report_bound.execution_binding,
+    )
+    .expect_err("mismatched authenticated report run id must fail")
+    .to_string()
+    .contains("does not match bound run"));
+
+    let mismatched_plan_run_id =
+        RunId::new("provider-feedback-plan-id").expect("valid plan-id run id");
+    let mismatched_plan_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &session,
+        mismatched_plan_run_id.clone(),
+    )
+    .expect("bind plan-id provider run");
+    let mut mismatched_document = mismatched_plan_bound.document.clone();
+    mismatched_document["task"] = json!("stale normalized provider task");
+    let mut mismatched_plan_report = report.clone();
+    mismatched_plan_report.run_id = mismatched_plan_run_id.clone();
+    persist_provider_supervisor_artifact(
+        repo,
+        &mismatched_plan_run_id,
+        &mismatched_document,
+        &mismatched_plan_report,
+        true,
+    );
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &mismatched_plan_bound.execution_binding,
+    )
+    .expect_err("mismatched authenticated normalized plan must fail")
+    .to_string()
+    .contains("normalized plan does not match"));
+
+    let mut invalid = report.clone();
+    invalid.assigned_paths.pop();
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("stale aggregate paths must fail")
+            .to_string()
+            .contains("aggregate path or semantic scope")
+    );
+
+    let mut invalid = report.clone();
+    invalid.semantic_symbols[0] = "crate::invented::symbol".to_string();
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("stale aggregate symbols must fail")
+            .to_string()
+            .contains("aggregate path or semantic scope")
+    );
+
+    let mut invalid = report.clone();
+    invalid.semantic_modules[0] = "crate::invented".to_string();
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("stale aggregate modules must fail")
+            .to_string()
+            .contains("aggregate path or semantic scope")
+    );
+
+    let mut invalid = report.clone();
+    invalid.run_lifecycle = SupervisorRunLifecycle::Active;
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("nonfinalized report must fail")
+            .to_string()
+            .contains("finalized")
+    );
+
+    let mut invalid = report.clone();
+    invalid.assignment_traceability.remove(0);
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("missing internal node trace must fail")
+            .to_string()
+            .contains("provider tree node 'provider-root'")
+    );
+
+    for internal_status in [
+        Some(ReviewStatus::Pending),
+        Some(ReviewStatus::Failed),
+        Some(ReviewStatus::Rejected),
+        Some(ReviewStatus::Missing),
+        None,
+    ] {
+        let mut invalid = report.clone();
+        invalid.assignment_traceability[0].report_status = internal_status;
+        assert!(
+            normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+                .expect_err("nonsuccess internal node must fail")
+                .to_string()
+                .contains("internal provider node 'provider-root' is not terminal succeeded")
+        );
+    }
+
+    let mut invalid = report.clone();
+    invalid.assignment_traceability[2].report_status = Some(ReviewStatus::Pending);
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("pending leaf must fail")
+            .to_string()
+            .contains("pending")
+    );
+
+    for failed_status in [
+        Some(ReviewStatus::Failed),
+        Some(ReviewStatus::Rejected),
+        Some(ReviewStatus::Missing),
+        None,
+    ] {
+        let mut terminal_failure = report.clone();
+        terminal_failure.assignment_traceability[2].report_status = failed_status;
+        let normalized = normalize_task_execution_feedback_from_supervisor_final_report(
+            &session,
+            &terminal_failure,
+        )
+        .expect("terminal nonsuccess maps to failed feedback");
+        assert_eq!(normalized.failed_assignment_ids, vec!["provider-beta"]);
+    }
+
+    let mut invalid = report.clone();
+    invalid
+        .assignment_traceability
+        .push(invalid.assignment_traceability[2].clone());
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("duplicate report id must fail")
+            .to_string()
+            .contains("repeats provider assignment")
+    );
+
+    let mut invalid = report.clone();
+    invalid.assignment_traceability[2].assignment_id = "invented-provider-id".to_string();
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("unknown report id must fail")
+            .to_string()
+            .contains("unknown provider assignment")
+    );
+
+    let mut invalid = report.clone();
+    invalid.assignment_traceability.pop();
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("missing leaf report must fail")
+            .to_string()
+            .contains("no traceability row")
+    );
+
+    let mut invalid = report.clone();
+    invalid.assignment_traceability[2].depth = 2;
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("mismatched provider schedule must fail")
+            .to_string()
+            .contains("schedule and scope")
+    );
+
+    let mut invalid = report.clone();
+    invalid.assignment_traceability[2].spec_fragment_ids = vec!["invented-fragment".to_string()];
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("unknown trace fragment must fail")
+            .to_string()
+            .contains("unknown current fragment")
+    );
+
+    let mut invalid = report.clone();
+    invalid.coverage_gaps[0].spec_fragment_id = Some("invented-fragment".to_string());
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("unknown gap fragment must fail")
+            .to_string()
+            .contains("unknown current fragment")
+    );
+
+    let mut invalid = report.clone();
+    invalid.coverage_gaps = vec![SupervisorCoverageGap {
+        kind: CoverageGapKind::NoProducedChanges,
+        spec_fragment_id: None,
+        assignment_id: None,
+        message: "fragmentless global gap".to_string(),
+    }];
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("fragmentless global gap must fail")
+            .to_string()
+            .contains("fragmentless coverage gap")
+    );
+
+    let mut invalid = report.clone();
+    invalid.coverage_gaps.push(SupervisorCoverageGap {
+        kind: CoverageGapKind::MissingAssignmentReport,
+        spec_fragment_id: None,
+        assignment_id: Some("provider-root".to_string()),
+        message: "internal report missing".to_string(),
+    });
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("fragmentless internal missing-report gap must fail")
+            .to_string()
+            .contains("fragmentless coverage gap")
+    );
+
+    let mut invalid = report.clone();
+    invalid.assignment_traceability[2].report_status = Some(ReviewStatus::Succeeded);
+    assert!(
+        normalize_task_execution_feedback_from_supervisor_final_report(&session, &invalid)
+            .expect_err("succeeded fragment gap contradiction must fail")
+            .to_string()
+            .contains("succeeded fragment")
+    );
+
+    let proposal_before_invalid_attempt = session.proposal().clone();
+    replan_provider_task_planning_session_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &mut session,
+        &bound.execution_binding,
+        &mut provider,
+        &config,
+    )
+    .expect_err("invalid authenticated re-plan proposal must fail closed");
+    assert_eq!(session.replans_used(), 1);
+    assert_eq!(session.proposal(), &proposal_before_invalid_attempt);
+    task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &bound.execution_binding,
+    )
+    .expect("failed proposal attempt must retain the original validated-plan binding");
+    replan_provider_task_planning_session_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &mut session,
+        &bound.execution_binding,
+        &mut provider,
+        &config,
+    )
+    .expect("authenticated finalized feedback re-plans remaining provider work");
+    assert_eq!(session.replans_used(), planning::MAX_PROVIDER_REPLANS);
+    assert!(task_execution_feedback_from_authenticated_supervisor_run(
+        repo,
+        "",
+        spec,
+        &session,
+        &bound.execution_binding,
+    )
+    .expect_err("successful re-plan must stale the executed-plan binding")
+    .to_string()
+    .contains("does not match the current session and normalized plan"));
+    let revised_document = supervisor_plan_document_from_task_planning_session("", spec, &session)
+        .expect("lower revised remaining tree");
+    assert_eq!(revised_document["max_depth"], 3);
+    assert_eq!(revised_document["max_child_assignments"], 2);
+    assert_eq!(
+        revised_document["spec_fragment_ids"],
+        json!(["fragment-002"])
+    );
+    assert!(revised_document.get("coverage_gaps").is_none());
+    assert_eq!(
+        revised_document["assignments"]
+            .as_array()
+            .expect("revised assignments")
+            .iter()
+            .map(|assignment| assignment["id"].as_str().expect("assignment id"))
+            .collect::<Vec<_>>(),
+        vec!["remaining-root", "provider-beta-revised"]
+    );
+    assert_eq!(
+        revised_document["assignment_schedule"],
+        json!([
+            {
+                "assignment_id": "remaining-root",
+                "depth": 2,
+                "flattened_index": 0
+            },
+            {
+                "assignment_id": "provider-beta-revised",
+                "parent_assignment_id": "remaining-root",
+                "depth": 3,
+                "flattened_index": 1
+            }
+        ])
+    );
+    assert!(revised_document["assignments"]
+        .as_array()
+        .expect("revised assignments")
+        .iter()
+        .all(|assignment| assignment["id"] != "provider-alpha"));
+
+    let exhausted_run_id =
+        RunId::new("provider-feedback-exact-exhaustion").expect("valid exhaustion run id");
+    let exhausted_bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        spec,
+        &session,
+        exhausted_run_id.clone(),
+    )
+    .expect("bind final validated plan at exact re-plan exhaustion");
+    let mut exhausted_report = artifact_test_final_report(&exhausted_run_id);
+    exhausted_report.assigned_paths = vec![PathBuf::from("src/beta.rs")];
+    exhausted_report.semantic_symbols = vec!["crate::beta::beta".to_string()];
+    exhausted_report.semantic_modules = vec!["crate::beta".to_string()];
+    exhausted_report.assignment_traceability = vec![
+        provider_traceability(
+            "remaining-root",
+            None,
+            2,
+            0,
+            &[],
+            "src/beta.rs",
+            Some(ReviewStatus::Succeeded),
+        ),
+        provider_traceability(
+            "provider-beta-revised",
+            Some("remaining-root"),
+            3,
+            1,
+            &["fragment-002"],
+            "src/beta.rs",
+            Some(ReviewStatus::Failed),
+        ),
+    ];
+    exhausted_report.coverage_gaps = vec![SupervisorCoverageGap {
+        kind: CoverageGapKind::NoProducedChanges,
+        spec_fragment_id: Some("fragment-002".to_string()),
+        assignment_id: Some("provider-beta-revised".to_string()),
+        message: "revised beta remains incomplete".to_string(),
+    }];
+    persist_provider_supervisor_artifact(
+        repo,
+        &exhausted_run_id,
+        &exhausted_bound.document,
+        &exhausted_report,
+        true,
+    );
+    let session_at_exhaustion = session.clone();
+    let calls_at_exhaustion = provider.calls().len();
+    assert!(
+        replan_provider_task_planning_session_from_authenticated_supervisor_run(
+            repo,
+            "",
+            spec,
+            &mut session,
+            &exhausted_bound.execution_binding,
+            &mut provider,
+            &config,
+        )
+        .expect_err("third re-plan attempt must fail at the exact bound")
+        .to_string()
+        .contains("limit of 2 attempt(s) has been exhausted")
+    );
+    assert_eq!(session, session_at_exhaustion);
+    assert_eq!(provider.calls().len(), calls_at_exhaustion);
 }
 
 #[test]
@@ -1238,7 +2740,7 @@ fn role_selection_produces_distinct_launched_role_argv() {
         (
             AgentRole::ChildOrchestrator,
             RoleModelSelection {
-                model: Some("planner-model".to_string()),
+                model: Some(BALANCED_PROFILE_MODEL.to_string()),
                 reasoning_effort: Some("high".to_string()),
                 unavailable_model_fallback: UnavailableModelFallback::FailClosed,
             },
@@ -1246,7 +2748,7 @@ fn role_selection_produces_distinct_launched_role_argv() {
         (
             AgentRole::Worker,
             RoleModelSelection {
-                model: Some("worker-model".to_string()),
+                model: Some(FRONTIER_PROFILE_MODEL.to_string()),
                 reasoning_effort: Some("low".to_string()),
                 unavailable_model_fallback: UnavailableModelFallback::FailClosed,
             },
@@ -1254,7 +2756,7 @@ fn role_selection_produces_distinct_launched_role_argv() {
         (
             AgentRole::Auditor,
             RoleModelSelection {
-                model: Some("auditor-model".to_string()),
+                model: Some(FRONTIER_PROFILE_MODEL.to_string()),
                 reasoning_effort: Some("xhigh".to_string()),
                 unavailable_model_fallback: UnavailableModelFallback::FailClosed,
             },
@@ -1270,8 +2772,7 @@ fn role_selection_produces_distinct_launched_role_argv() {
             Duration::from_secs(1),
         )
     };
-    let catalog =
-        injected_codex_runtime_catalog(&["planner-model", "worker-model", "auditor-model"]);
+    let catalog = injected_codex_runtime_catalog(&[BALANCED_PROFILE_MODEL, FRONTIER_PROFILE_MODEL]);
     let child = apply_role_model_selection(
         base_command(),
         &plan,
@@ -1299,20 +2800,34 @@ fn role_selection_produces_distinct_launched_role_argv() {
 
     assert!(child_argv
         .windows(2)
-        .any(|arguments| arguments == ["-m", "planner-model"]));
+        .any(|arguments| arguments == ["-m", BALANCED_PROFILE_MODEL]));
     assert!(child_argv
         .windows(2)
         .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"high\""] }));
     assert!(auditor_argv
         .windows(2)
-        .any(|arguments| arguments == ["-m", "auditor-model"]));
+        .any(|arguments| arguments == ["-m", FRONTIER_PROFILE_MODEL]));
     assert!(auditor_argv
         .windows(2)
         .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"xhigh\""] }));
     assert!(!child_argv
         .iter()
-        .any(|argument| argument.contains("worker-model")));
+        .any(|argument| argument.contains(FRONTIER_PROFILE_MODEL)));
     assert_ne!(child_argv, auditor_argv);
+
+    plan.role_models
+        .get_mut(&AgentRole::ChildOrchestrator)
+        .expect("child selection")
+        .model = Some(ECONOMY_PROFILE_MODEL.to_string());
+    let weak_error = apply_role_model_selection(
+        base_command(),
+        &plan,
+        AgentRole::ChildOrchestrator,
+        SupervisorRuntime::Codex,
+        &injected_codex_runtime_catalog(&[ECONOMY_PROFILE_MODEL]),
+    )
+    .expect_err("weak model must not launch child implementation judgment");
+    assert!(format!("{weak_error:#}").contains("does not satisfy role 'child_orchestrator'"));
 }
 
 #[test]
@@ -1707,7 +3222,7 @@ fn unavailable_model_fallback_is_a_runtime_aware_command_contract() {
     plan.role_models.insert(
         AgentRole::ChildOrchestrator,
         RoleModelSelection {
-            model: Some("preferred-model".to_string()),
+            model: Some(BALANCED_PROFILE_MODEL.to_string()),
             reasoning_effort: Some("high".to_string()),
             unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
         },
@@ -1722,18 +3237,18 @@ fn unavailable_model_fallback_is_a_runtime_aware_command_contract() {
             Duration::from_secs(1),
         )
     };
-    let missing_catalog = injected_codex_runtime_catalog(&["different-model"]);
+    let missing_catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
 
-    let runtime_default = apply_role_model_selection(
+    let runtime_default_error = apply_role_model_selection(
         base_command(),
         &plan,
         AgentRole::ChildOrchestrator,
         SupervisorRuntime::Codex,
         &missing_catalog,
     )
-    .expect("known unavailable model uses the configured runtime default");
-    assert_eq!(runtime_default.model, None);
-    assert_eq!(runtime_default.reasoning_effort.as_deref(), Some("high"));
+    .expect_err("runtime-default identity is not trusted capability evidence");
+    assert!(format!("{runtime_default_error:#}")
+        .contains("runtime-default model selection is not capability evidence"));
 
     plan.role_models
         .get_mut(&AgentRole::ChildOrchestrator)
@@ -1762,6 +3277,7 @@ fn unavailable_model_fallback_is_a_runtime_aware_command_contract() {
     )
     .expect("the fake runtime may use its deterministic local fallback");
     assert_eq!(local_fake.model, None);
+    assert_eq!(local_fake.reasoning_effort, None);
     let invalid_runtime_error = apply_role_model_selection(
         base_command(),
         &plan,
@@ -1774,86 +3290,28 @@ fn unavailable_model_fallback_is_a_runtime_aware_command_contract() {
 }
 
 #[test]
-fn known_unavailable_child_runtime_default_reaches_production_app_server_argv_before_dispatch() {
+fn known_unavailable_child_runtime_default_rejects_before_dispatch_or_artifacts() {
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
-    let mut plan = injected_plan(assignment.clone(), 0);
+    let mut plan = injected_plan(assignment, 0);
     plan.role_models.insert(
         AgentRole::ChildOrchestrator,
         RoleModelSelection {
-            model: Some("unavailable-child-model".to_string()),
+            model: Some(BALANCED_PROFILE_MODEL.to_string()),
             reasoning_effort: Some("high".to_string()),
             unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
         },
     );
-    plan.role_models.insert(
-        AgentRole::Auditor,
-        RoleModelSelection {
-            model: Some("available-auditor-model".to_string()),
-            reasoning_effort: Some("xhigh".to_string()),
-            unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
-        },
-    );
-    let ReviewLensBackendConfig::Model {
-        model,
-        reasoning_effort,
-        ..
-    } = &mut plan.review_lenses[0].backend
-    else {
-        panic!("default supervisor lens must be model-backed");
-    };
-    *model = "available-auditor-model".to_string();
-    *reasoning_effort = Some("xhigh".to_string());
-    let options = injected_options(
-        &repo_path,
-        temp.path(),
-        "known-unavailable-child-runtime-default",
-    );
-    let catalog = injected_codex_runtime_catalog(&["available-auditor-model"]);
-    let mut child_seen = false;
-    let mut auditor_seen = false;
-    let mut runner = |command: &ExternalAgentCommand| {
-        let name = command
-            .output_last_message
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or_default();
-        if name.contains("review-auditor") {
-            auditor_seen = true;
-            assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
-            let argv = crate::external_agent::command_argv(command)
-                .into_iter()
-                .map(|argument| argument.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            assert!(argv
-                .windows(2)
-                .any(|arguments| arguments == ["-m", "available-auditor-model"]));
-            let child = injected_child_report(&assignment);
-            write_injected_json(
-                &command.output_last_message,
-                &injected_auditor_report(&assignment, &child),
-            );
-        } else {
-            child_seen = true;
-            assert_eq!(command.workspace_access, WorkspaceAccess::ReadWrite);
-            assert!(command.model.is_none());
-            let argv = crate::external_agent::app_server_command_argv(command)
-                .into_iter()
-                .map(|argument| argument.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            assert!(
-                !argv.iter().any(|argument| argument.starts_with("model=")),
-                "known-unavailable child model remained pinned in app-server argv: {argv:?}"
-            );
-            assert!(argv
-                .windows(2)
-                .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"high\""] }));
-            write_injected_assignment_report(command, &assignment);
-        }
-        injected_verified_run(command)
+    let run_id = "known-unavailable-child-runtime-default";
+    let options = injected_options(&repo_path, temp.path(), run_id);
+    let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
+    let mut invocations = 0usize;
+    let mut runner = |_command: &ExternalAgentCommand| {
+        invocations = invocations.saturating_add(1);
+        panic!("runtime-default capability rejection must prevent dispatch")
     };
 
-    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+    let error = run_supervisor_plan_with_runtime_model_catalog_and_runner(
         plan,
         SupervisorConsultantPlan::default(),
         options,
@@ -1861,59 +3319,37 @@ fn known_unavailable_child_runtime_default_reaches_production_app_server_argv_be
         Ok(catalog),
         &mut runner,
     )
-    .expect("run production command path with unavailable child model");
+    .expect_err("runtime-default model must fail before artifact reservation");
 
-    assert!(report.success, "unexpected failed report: {report:#?}");
-    assert!(child_seen);
-    assert!(auditor_seen);
-    assert_eq!(
-        report
-            .role_economics_profile
-            .as_ref()
-            .map(|profile| profile.model_availability),
-        Some(RoleModelAvailability::Unavailable)
+    assert_eq!(invocations, 0);
+    assert!(
+        format!("{error:#}").contains("runtime-default model selection is not capability evidence")
     );
-    let binding = &report
-        .role_economics_profile
-        .as_ref()
-        .and_then(|profile| profile.execution.as_ref())
-        .expect("execution metadata")
-        .role_bindings[&AgentRole::ChildOrchestrator];
-    assert_eq!(
-        binding.configured_model.as_deref(),
-        Some("unavailable-child-model")
-    );
-    assert!(binding.resolved_model.is_none());
-    assert_eq!(binding.resolved_reasoning_effort.as_deref(), Some("high"));
-    assert_eq!(
-        binding.observation,
-        RoleBindingObservation::RuntimeDefaultResolved
-    );
-    assert!(binding
-        .unavailable_reason
-        .as_deref()
-        .is_some_and(|reason| reason.contains("not process-observable")));
+    assert!(!repo_path
+        .join(RunArtifactFamily::Supervise.run_root())
+        .exists());
+    assert!(!repo_path.join(".maco").exists());
 }
 
 #[test]
-fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor() {
+fn configured_lens_selection_uses_trusted_builtin_and_clamps_to_auditor_floor() {
     let (temp, repo_path) = injected_repository();
-    let assignment = injected_assignment(true);
+    let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment.clone(), 0);
     plan.role_models.insert(
         AgentRole::ChildOrchestrator,
         RoleModelSelection {
-            model: Some("available-child-model".to_string()),
+            model: Some(BALANCED_PROFILE_MODEL.to_string()),
             reasoning_effort: Some("high".to_string()),
-            unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
         },
     );
     plan.role_models.insert(
         AgentRole::Auditor,
         RoleModelSelection {
-            model: Some("unavailable-auditor-model".to_string()),
+            model: Some(FRONTIER_PROFILE_MODEL.to_string()),
             reasoning_effort: Some("xhigh".to_string()),
-            unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
         },
     );
     let ReviewLensBackendConfig::Model {
@@ -1924,14 +3360,10 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
     else {
         panic!("default supervisor lens must be model-backed");
     };
-    *model = "available-child-model".to_string();
+    *model = FRONTIER_PROFILE_MODEL.to_string();
     *reasoning_effort = Some("low".to_string());
-    let options = injected_options(
-        &repo_path,
-        temp.path(),
-        "known-unavailable-auditor-runtime-default",
-    );
-    let catalog = injected_codex_runtime_catalog(&["available-child-model"]);
+    let options = injected_options(&repo_path, temp.path(), "trusted-auditor-lens-floor");
+    let catalog = injected_codex_runtime_catalog(&[BALANCED_PROFILE_MODEL, FRONTIER_PROFILE_MODEL]);
     let mut child_seen = false;
     let mut auditor_seen = false;
     let mut runner = |command: &ExternalAgentCommand| {
@@ -1943,7 +3375,7 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
         if name.contains("review-auditor") {
             auditor_seen = true;
             assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
-            assert_eq!(command.model.as_deref(), Some("available-child-model"));
+            assert_eq!(command.model.as_deref(), Some(FRONTIER_PROFILE_MODEL));
             assert_eq!(command.model_provider.as_deref(), Some("openai"));
             assert!(fs::read_to_string(&command.prompt)
                 .expect("read resolved auditor prompt")
@@ -1954,11 +3386,12 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
                 .collect::<Vec<_>>();
             assert!(argv
                 .windows(2)
-                .any(|arguments| arguments == ["-m", "available-child-model"]));
+                .any(|arguments| arguments == ["-m", FRONTIER_PROFILE_MODEL]));
             assert!(argv
                 .windows(2)
                 .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"xhigh\""] }));
-            let child = injected_child_report(&assignment);
+            let mut child = injected_child_report(&assignment);
+            child.files_changed = vec![PathBuf::from("README.md")];
             write_injected_json(
                 &command.output_last_message,
                 &injected_auditor_report(&assignment, &child),
@@ -1970,10 +3403,15 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
                 .into_iter()
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
-            assert!(argv
-                .windows(2)
-                .any(|arguments| { arguments == ["-c", "model=\"available-child-model\""] }));
-            write_injected_assignment_report(command, &assignment);
+            assert!(argv.windows(2).any(|arguments| {
+                arguments[0] == "-c"
+                    && arguments[1] == format!("model=\"{BALANCED_PROFILE_MODEL}\"")
+            }));
+            fs::write(command.cwd.join("README.md"), "trusted lens candidate\n")
+                .expect("write trusted lens candidate");
+            let mut child = injected_child_report(&assignment);
+            child.files_changed = vec![PathBuf::from("README.md")];
+            write_injected_json(&command.output_last_message, &child);
         }
         injected_verified_run(command)
     };
@@ -1986,9 +3424,8 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
         Ok(catalog),
         &mut runner,
     )
-    .expect("run production command path with unavailable auditor model");
+    .expect("run production command path with trusted built-in lens model");
 
-    assert!(report.success, "unexpected failed report: {report:#?}");
     assert!(child_seen);
     assert!(auditor_seen);
     assert_eq!(
@@ -1996,7 +3433,7 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
             .role_economics_profile
             .as_ref()
             .map(|profile| profile.model_availability),
-        Some(RoleModelAvailability::Unavailable)
+        Some(RoleModelAvailability::Available)
     );
 }
 
@@ -2008,21 +3445,21 @@ fn known_unavailable_child_fail_closed_reaches_production_core_without_dispatch_
     plan.role_models.insert(
         AgentRole::ChildOrchestrator,
         RoleModelSelection {
-            model: Some("unavailable-child-model".to_string()),
+            model: Some(BALANCED_PROFILE_MODEL.to_string()),
             reasoning_effort: Some("high".to_string()),
             unavailable_model_fallback: UnavailableModelFallback::FailClosed,
         },
     );
     let run_id = "known-unavailable-child-fail-closed";
     let options = injected_options(&repo_path, temp.path(), run_id);
-    let catalog = injected_codex_runtime_catalog(&["different-model"]);
+    let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
     let mut invocations = 0usize;
     let mut runner = |_command: &ExternalAgentCommand| {
         invocations = invocations.saturating_add(1);
         panic!("known-unavailable fail_closed selection must prevent dispatch")
     };
 
-    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+    let error = run_supervisor_plan_with_runtime_model_catalog_and_runner(
         plan,
         SupervisorConsultantPlan::default(),
         options,
@@ -2030,33 +3467,18 @@ fn known_unavailable_child_fail_closed_reaches_production_core_without_dispatch_
         Ok(catalog),
         &mut runner,
     )
-    .expect("fail_closed selection should produce a finalized rejection report");
+    .expect_err("fail_closed selection must reject before artifact reservation");
 
     assert_eq!(invocations, 0);
-    assert!(!report.success);
-    assert!(report
-        .findings
-        .iter()
-        .any(|finding| finding.message.contains("fallback is fail_closed")));
+    assert!(format!("{error:#}").contains("fallback is fail_closed"));
     let run_root = repo_path
         .join(RunArtifactFamily::Supervise.run_root())
         .join(run_id);
-    let scratch_entries = fs::read_dir(&run_root)
-        .expect("read finalized fail_closed artifact root")
-        .map(|entry| {
-            entry
-                .expect("read fail_closed artifact entry")
-                .file_name()
-                .to_string_lossy()
-                .into_owned()
-        })
-        .filter(|name| name.starts_with("incoming") || name.starts_with("capture"))
-        .collect::<Vec<_>>();
-    assert!(
-        scratch_entries.is_empty(),
-        "fail_closed command construction leaked invocation scratch: {scratch_entries:?}"
-    );
-    assert!(run_root.join(ARTIFACT_FINALIZATION_MARKER).exists());
+    assert!(!run_root.exists());
+    assert!(!repo_path
+        .join(RunArtifactFamily::Supervise.run_root())
+        .exists());
+    assert!(!repo_path.join(".maco").exists());
 }
 
 #[test]
@@ -2093,9 +3515,17 @@ fn local_deterministic_fake_fallback_reaches_shared_supervisor_core_without_exte
     .expect("run deterministic fake fallback through the shared supervisor core");
 
     assert_eq!(invocations, 0);
-    assert!(report.success, "unexpected fake-core failure: {report:#?}");
+    assert!(!report.success);
     assert!(!report.publishable);
+    assert!(!report.accepted);
+    assert!(report.rejected);
+    assert_eq!(report.status, ReviewStatus::Failed);
     assert_eq!(report.commands_run.len(), 2);
+    assert!(report.commands_run.iter().all(|command| {
+        command.command.len() == 1
+            && command.command[0] == "maco-internal-deterministic-fake"
+            && command.status == ReviewStatus::Succeeded
+    }));
     assert_eq!(
         report
             .role_economics_profile
@@ -2103,6 +3533,16 @@ fn local_deterministic_fake_fallback_reaches_shared_supervisor_core_without_exte
             .map(|profile| profile.model_availability),
         Some(RoleModelAvailability::Unavailable)
     );
+    let child = report
+        .orchestrator_reports
+        .first()
+        .expect("shared core must retain the deterministic child report");
+    assert!(!child.accepted);
+    assert!(child.rejected);
+    assert_eq!(child.status, ReviewStatus::Failed);
+    assert!(child.findings.iter().any(|finding| finding
+        .message
+        .contains("no pre-auditor supervisor candidate binding")));
 }
 
 #[test]
@@ -2415,14 +3855,14 @@ fn supervisor_derives_review_coverage_from_assignment_and_run_report() {
 #[test]
 fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
     let (temp, repo_path) = injected_repository();
-    let assignment = injected_assignment(true);
+    let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment.clone(), 0);
     plan.review_lenses = vec![
         ReviewLensConfig {
             id: "diff-security".to_string(),
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "provider-alpha".to_string(),
-                model: "model-alpha".to_string(),
+                model: FRONTIER_PROFILE_MODEL.to_string(),
                 reasoning_effort: Some("high".to_string()),
             },
             information_scope: ReviewInformationScope::DiffOnly,
@@ -2431,32 +3871,23 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
             id: "report-consistency".to_string(),
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "provider-beta".to_string(),
-                model: "model-beta".to_string(),
+                model: FRONTIER_PROFILE_MODEL.to_string(),
                 reasoning_effort: Some("xhigh".to_string()),
             },
             information_scope: ReviewInformationScope::OutputReportOnly,
         },
     ];
     plan.review_aggregation_policy = ReviewAggregationPolicy::AllMustAccept;
-    plan.model_pricing = BTreeMap::from([
-        (
-            "model-alpha".to_string(),
-            ModelPricing {
-                input_usd_per_million_tokens: 1.0,
-                output_usd_per_million_tokens: 2.0,
-            },
-        ),
-        (
-            "model-beta".to_string(),
-            ModelPricing {
-                input_usd_per_million_tokens: 3.0,
-                output_usd_per_million_tokens: 4.0,
-            },
-        ),
-    ]);
+    plan.model_pricing = BTreeMap::from([(
+        FRONTIER_PROFILE_MODEL.to_string(),
+        ModelPricing {
+            input_usd_per_million_tokens: 2.0,
+            output_usd_per_million_tokens: 4.0,
+        },
+    )]);
     let options = injected_options(&repo_path, temp.path(), "stacked-review-lenses-execute");
     let run_id = options.run_id.clone();
-    let catalog = injected_codex_runtime_catalog(&["model-alpha", "model-beta"]);
+    let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
     let mut lens_commands = Vec::new();
     let mut lens_prompts = Vec::new();
     let mut runner = |command: &ExternalAgentCommand| {
@@ -2466,8 +3897,9 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
             .and_then(OsStr::to_str)
             .expect("UTF-8 output name");
         if name.contains("review-auditor") {
-            let mut audit =
-                injected_auditor_report(&assignment, &injected_child_report(&assignment));
+            let mut child = injected_child_report(&assignment);
+            child.files_changed = vec![PathBuf::from("README.md")];
+            let mut audit = injected_auditor_report(&assignment, &child);
             audit.id = name
                 .strip_suffix(".json")
                 .expect("auditor JSON suffix")
@@ -2481,7 +3913,11 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
                 write_injected_usage(command, 200, 40);
             }
         } else {
-            write_injected_assignment_report(command, &assignment);
+            fs::write(command.cwd.join("README.md"), "stacked lens candidate\n")
+                .expect("write stacked lens candidate");
+            let mut child = injected_child_report(&assignment);
+            child.files_changed = vec![PathBuf::from("README.md")];
+            write_injected_json(&command.output_last_message, &child);
             write_injected_usage(command, 50, 10);
         }
         injected_verified_run(command)
@@ -2496,23 +3932,25 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
     )
     .expect("run stacked review lenses");
 
-    assert!(
-        report.success,
-        "unexpected stacked-lens failure: {report:#?}"
-    );
     assert_eq!(lens_commands.len(), 2);
     assert_ne!(lens_commands[0].cwd, lens_commands[1].cwd);
     assert_eq!(
         lens_commands[0].model_provider.as_deref(),
         Some("provider-alpha")
     );
-    assert_eq!(lens_commands[0].model.as_deref(), Some("model-alpha"));
+    assert_eq!(
+        lens_commands[0].model.as_deref(),
+        Some(FRONTIER_PROFILE_MODEL)
+    );
     assert_eq!(lens_commands[0].reasoning_effort.as_deref(), Some("xhigh"));
     assert_eq!(
         lens_commands[1].model_provider.as_deref(),
         Some("provider-beta")
     );
-    assert_eq!(lens_commands[1].model.as_deref(), Some("model-beta"));
+    assert_eq!(
+        lens_commands[1].model.as_deref(),
+        Some(FRONTIER_PROFILE_MODEL)
+    );
     assert_eq!(lens_commands[1].reasoning_effort.as_deref(), Some("xhigh"));
     assert!(lens_prompts[0].contains("\"scope\":\"diff_only\""));
     assert!(!lens_prompts[0].contains("\"scope\":\"output_report_only\""));
@@ -2545,7 +3983,7 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
     );
     assert!(report
         .review_lens_total_cost_usd
-        .is_some_and(|cost| (cost - 0.0009).abs() < 1e-12));
+        .is_some_and(|cost| (cost - 0.00084).abs() < 1e-12));
     let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
         .expect("open stacked-lens artifacts");
     let events = read_finalized_orchestration_events(&reader);
@@ -2583,14 +4021,14 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
 }
 
 #[test]
-fn unavailable_lens_runtime_selection_is_reported_and_journaled_procedurally() {
+fn unknown_advertised_lens_model_rejects_before_dispatch_or_artifacts() {
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
-    let mut plan = injected_plan(assignment.clone(), 0);
+    let mut plan = injected_plan(assignment, 0);
     plan.role_models.insert(
         AgentRole::ChildOrchestrator,
         RoleModelSelection {
-            model: Some("child-model".to_string()),
+            model: Some(BALANCED_PROFILE_MODEL.to_string()),
             reasoning_effort: Some("high".to_string()),
             unavailable_model_fallback: UnavailableModelFallback::FailClosed,
         },
@@ -2598,28 +4036,20 @@ fn unavailable_lens_runtime_selection_is_reported_and_journaled_procedurally() {
     let ReviewLensBackendConfig::Model { model, .. } = &mut plan.review_lenses[0].backend else {
         panic!("default supervisor lens must be model-backed");
     };
-    *model = "missing-lens-model".to_string();
-    let options = injected_options(
-        &repo_path,
-        temp.path(),
-        "unavailable-lens-selection-procedural",
-    );
-    let run_id = options.run_id.clone();
-    let catalog = injected_codex_runtime_catalog(&["child-model"]);
-    let mut invocations = Vec::new();
-    let mut runner = |command: &ExternalAgentCommand| {
-        let name = command
-            .output_last_message
-            .file_name()
-            .and_then(OsStr::to_str)
-            .expect("UTF-8 output name");
-        invocations.push(name.to_string());
-        assert!(!name.contains("review-auditor"));
-        write_injected_assignment_report(command, &assignment);
-        write_injected_usage(command, 50, 10);
-        injected_verified_run(command)
+    *model = "unknown-advertised-lens-model".to_string();
+    let run_id = "unknown-advertised-lens-model";
+    let options = injected_options(&repo_path, temp.path(), run_id);
+    let catalog = injected_codex_runtime_catalog(&[
+        FRONTIER_PROFILE_MODEL,
+        BALANCED_PROFILE_MODEL,
+        "unknown-advertised-lens-model",
+    ]);
+    let mut invocations = 0usize;
+    let mut runner = |_command: &ExternalAgentCommand| {
+        invocations = invocations.saturating_add(1);
+        panic!("unknown advertised lens model must prevent dispatch")
     };
-    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+    let error = run_supervisor_plan_with_runtime_model_catalog_and_runner(
         plan,
         SupervisorConsultantPlan::default(),
         options,
@@ -2627,34 +4057,14 @@ fn unavailable_lens_runtime_selection_is_reported_and_journaled_procedurally() {
         Ok(catalog),
         &mut runner,
     )
-    .expect("finalize unavailable-lens procedural report");
-    assert_eq!(invocations.len(), 1);
-    assert!(!report.success);
-    let aggregate = report.orchestrator_reports[0]
-        .review_lens_aggregate
-        .as_ref()
-        .expect("procedural aggregate");
-    assert_eq!(
-        aggregate.decision,
-        ReviewAggregationDecision::ProceduralFailure
-    );
-    assert_eq!(aggregate.procedural_failures, 1);
-    assert_eq!(
-        aggregate.lens_verdicts[0].effective_verdict,
-        ReviewLensVerdictStatus::ProceduralFailure
-    );
-    assert_eq!(
-        report.review_lens_usage[0].observation,
-        RoleUsageObservation::NotProcessObservable
-    );
-    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
-        .expect("open procedural lens artifacts");
-    assert!(read_finalized_orchestration_events(&reader)
-        .iter()
-        .any(|event| {
-            event.kind == OrchestrationEventKind::Gate
-                && event.payload["review_lens_aggregate"]["decision"] == "procedural_failure"
-        }));
+    .expect_err("unknown advertised lens model must fail static policy");
+
+    assert_eq!(invocations, 0);
+    assert!(format!("{error:#}").contains("no trusted built-in capability policy"));
+    assert!(!repo_path
+        .join(RunArtifactFamily::Supervise.run_root())
+        .exists());
+    assert!(!repo_path.join(".maco").exists());
 }
 
 #[cfg(unix)]
