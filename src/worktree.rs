@@ -1472,12 +1472,13 @@ impl WorktreeManager {
 
     pub fn create_with_retention(
         &self,
-        _options: WorktreeCreateOptions,
-        _retention: WorktreeRetentionPolicy,
+        options: WorktreeCreateOptions,
+        retention: WorktreeRetentionPolicy,
     ) -> Result<WorktreeRecord> {
-        bail!(
-            "managed worktree creation is unsupported without a capability-bound repository cleanliness input"
-        );
+        let cleanliness = self.acquire_repository_cleanliness().with_context(|| {
+            "managed worktree creation requires a clean repository; `maco worktree create` derives the cleanliness capability automatically when the target repository is already clean"
+        })?;
+        self.create_with_repository_cleanliness_and_retention(options, retention, &cleanliness)
     }
 
     /// Captures repository-bound cleanliness evidence for effectful managed
@@ -2663,6 +2664,11 @@ impl WorktreeManager {
                 .cmp(&gc_created_at(&left.binding))
                 .then_with(|| left.binding.name.cmp(&right.binding.name))
         });
+        // Retention is committed only on remove / retain / dry-run exits.
+        // Protection continues deliberately drop `decision.committed_state` so
+        // a live, dirty, or identity-changed lane cannot evict an older
+        // finished candidate. `max_count` / `max_total_bytes` therefore
+        // under-count on-disk usage (conservative: never unsafe removal).
         let mut retention_state = WorktreeGcRetentionState::default();
         for mut candidate in candidates {
             let decision = worktree_gc_retention_decision(
@@ -4239,7 +4245,6 @@ fn mark_reconciliation_index_protected(
     detail: &str,
 ) {
     if let Some(entry) = entries.get_mut(entry_index) {
-        entry.state = WorktreeReconciliationState::Ambiguous;
         entry.action = WorktreeReconciliationAction::Protected;
         entry.detail = detail.to_string();
     }
@@ -5376,6 +5381,10 @@ struct WorktreeGcCandidate {
     apparent_target_bytes: Option<u64>,
 }
 
+/// Running retention budget for candidates that take a keep/remove exit.
+/// Protected candidates do not update this state: a safety hold must not evict
+/// an older finished lane, so `max_count` / `max_total_bytes` can under-count
+/// on-disk usage.
 #[derive(Clone, Copy, Default)]
 struct WorktreeGcRetentionState {
     eligible_count: usize,
@@ -7364,12 +7373,18 @@ fn git_registered_worktree_names(
         let worktree = repo
             .find_worktree(name)
             .with_context(|| format!("failed to inspect Git worktree '{name}'"))?;
-        let path = fs::canonicalize(worktree.path()).with_context(|| {
-            format!(
-                "failed to resolve Git worktree path {}",
-                worktree.path().display()
-            )
-        })?;
+        let path = match fs::canonicalize(worktree.path()) {
+            Ok(path) => path,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to resolve Git worktree path {}",
+                        worktree.path().display()
+                    )
+                })
+            }
+        };
         if path.parent() == Some(worktree_root) {
             names.insert(name.to_string());
         }
@@ -12027,7 +12042,12 @@ mod tests {
             .remove("worker", false, true)
             .expect_err("non-force removal must fail closed");
 
-        assert!(create_error.to_string().contains("capability-bound"));
+        let create_message = format!("{create_error:#}");
+        assert!(
+            create_message.contains("failed to open repository")
+                && create_message.contains("cleanliness capability"),
+            "{create_message}"
+        );
         assert!(remove_error.to_string().contains("capability-bound"));
         assert_eq!(fs::read_dir(temp.path()).expect("read temp").count(), 0);
     }
@@ -12309,6 +12329,35 @@ mod tests {
         )
         .expect("inspect created worktree")
         .is_empty());
+        assert_eq!(
+            manager.list_managed_verified().expect("list worktrees"),
+            vec![record]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn public_create_derives_cleanliness_from_a_clean_repository() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+
+        let record = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "public-create-worker".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root),
+            })
+            .expect("public create derives cleanliness from a clean repository");
+
+        assert_eq!(record.name, "public-create-worker");
+        assert_eq!(record.branch, "maco/public-create-worker");
+        assert!(record.path.join("README.md").is_file());
         assert_eq!(
             manager.list_managed_verified().expect("list worktrees"),
             vec![record]
@@ -14081,6 +14130,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn gc_late_protection_does_not_consume_count_or_size_retention() {
+        // Conservative retention bias: a live/dirty hold must not evict an older
+        // finished lane. Protected candidates stay off the max_count / size budget.
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let worktree_root = temp.path().join("worktrees");
@@ -14817,6 +14868,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn gc_boundary_protection_does_not_consume_count_or_size_retention() {
+        // Conservative retention bias: apply-time dirtiness must not spend the
+        // budget that would otherwise keep the older finished lane.
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let worktree_root = temp.path().join("worktrees");
@@ -15594,6 +15647,45 @@ mod tests {
             "public GC report must not expose the bearer purge token"
         );
         assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn gc_full_apply_reports_removal_despite_stale_git_registration() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        let oid = commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let removable = create_gc_worktree(&manager, "removable-lane", &worktree_root);
+        let commit = repo.find_commit(oid).expect("commit");
+        let branch = repo
+            .branch("topic/stale-registration", &commit, false)
+            .expect("stale registration branch");
+        let reference = branch.into_reference();
+        let mut add = WorktreeAddOptions::new();
+        add.reference(Some(&reference));
+        let stale_path = worktree_root.join("stale-registration");
+        repo.worktree("stale-registration", &stale_path, Some(&add))
+            .expect("registered worktree");
+        fs::remove_dir_all(&stale_path).expect("delete registered worktree out of band");
+
+        let report = manager
+            .gc(gc_options(Some(worktree_root), false))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "full GC discarded its report after durable removal (removable_exists={}): {error:#}",
+                    removable.path.exists()
+                )
+            });
+
+        assert_eq!(report.removed_count, 1, "{report:#?}");
+        assert!(report.entries.iter().any(|entry| {
+            entry.name == removable.name && entry.status == WorktreeGcStatus::Removed
+        }));
+        assert!(!removable.path.exists());
+        assert!(repo.find_worktree("stale-registration").is_ok());
     }
 
     #[cfg(target_os = "linux")]
@@ -18863,6 +18955,10 @@ mod tests {
             .iter()
             .find(|entry| entry.name == lane.name)
             .expect("claimed entry");
+        assert_eq!(
+            entry.state,
+            WorktreeReconciliationState::AuthenticatedMissingBoth
+        );
         assert_eq!(entry.action, WorktreeReconciliationAction::Protected);
         assert!(entry.detail.contains("active durable claim"));
         let lock = store.lock().expect("lock");
@@ -18958,6 +19054,46 @@ mod tests {
         );
         assert!(repo.find_worktree(&lane.name).is_err());
         assert!(repo.find_branch(&lane.branch, BranchType::Local).is_ok());
+    }
+
+    #[test]
+    fn startup_reconciliation_active_claim_preserves_registered_missing_path_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let lane = create_gc_worktree(&manager, "claimed-missing-path", &root);
+        SyncStore::open(&repo_path)
+            .expect("claims")
+            .claim_paths(&lane.name, ["src"])
+            .expect("claim lane");
+        fs::remove_dir_all(&lane.path).expect("remove registered path");
+
+        let report = manager
+            .lifecycle(WorktreeLifecycleOptions {
+                apply: true,
+                startup_reconcile: true,
+                destructive_reconciliation: true,
+                worktree_root: Some(root),
+                ..WorktreeLifecycleOptions::default()
+            })
+            .expect("claimed missing-path reconciliation");
+        let entry = report
+            .reconciliation
+            .entries
+            .iter()
+            .find(|entry| entry.name == lane.name)
+            .expect("claimed missing-path entry");
+        assert_eq!(
+            entry.state,
+            WorktreeReconciliationState::RegisteredMissingPath
+        );
+        assert_eq!(entry.action, WorktreeReconciliationAction::Protected);
+        assert!(entry.detail.contains("active durable claim"));
+        assert!(repo.find_worktree(&lane.name).is_ok());
     }
 
     #[test]
