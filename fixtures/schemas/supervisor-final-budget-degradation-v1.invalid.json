@@ -1,0 +1,11 @@
+{
+  "role_economics_profile": {
+    "execution": {
+      "budget_degradations": [
+        {
+          "impossible": true
+        }
+      ]
+    }
+  }
+}

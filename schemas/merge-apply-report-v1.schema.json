@@ -1,0 +1,553 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/merge-apply-report-v1.schema.json",
+  "title": "MACO Merge Apply Report v1",
+  "description": "Contract for `maco merge apply --json`. A blocked report is emitted before the command exits unsuccessfully.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "preview": {
+      "$ref": "merge-preview-report-v1.schema.json#/$defs/basePreview"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "applied",
+        "nothing_to_apply",
+        "blocked",
+        "refused"
+      ]
+    },
+    "applied": {
+      "type": "boolean"
+    },
+    "gate_denials": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/mergeGateDenial"
+      }
+    },
+    "stdout": {
+      "$ref": "merge-preview-report-v1.schema.json#/$defs/outputSummary"
+    },
+    "stderr": {
+      "$ref": "merge-preview-report-v1.schema.json#/$defs/outputSummary"
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "recorded_collision_paths": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "merge-preview-report-v1.schema.json#/$defs/repositoryRelativePath"
+      }
+    },
+    "accepted_decomposition": {
+      "anyOf": [
+        {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/megafileAssessment"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/mergeLifecycle"
+    },
+    "review_bound": {
+      "type": "boolean"
+    },
+    "review_binding_status": {
+      "type": "string",
+      "enum": [
+        "matched",
+        "not_supplied",
+        "not_bound"
+      ]
+    },
+    "review_requested": {
+      "type": "boolean"
+    },
+    "error_kind": {
+      "const": "merge_preview_freshness"
+    },
+    "reason": {
+      "type": "string",
+      "enum": [
+        "watermark_malformed",
+        "watermark_version_unsupported",
+        "preview_freshness_drift"
+      ]
+    },
+    "drift_axes": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "primary_head",
+          "primary_index",
+          "primary_worktree",
+          "source_identity",
+          "source_head",
+          "candidate_diff",
+          "candidate_snapshot"
+        ]
+      }
+    },
+    "message": {
+      "type": "string"
+    },
+    "next_action": {
+      "type": "string",
+      "enum": [
+        "run merge preview again and review the new freshness_watermark",
+        "retry merge apply after concurrent repository activity stops"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "required": [
+        "preview",
+        "status",
+        "applied",
+        "gate_denials",
+        "stdout",
+        "stderr",
+        "error",
+        "recorded_collision_paths",
+        "accepted_decomposition",
+        "review_bound",
+        "review_binding_status"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "applied",
+            "nothing_to_apply",
+            "blocked"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "review_bound": {
+                "const": true
+              }
+            },
+            "required": [
+              "review_bound"
+            ]
+          },
+          "then": {
+            "properties": {
+              "review_binding_status": {
+                "const": "matched"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "review_binding_status": {
+                "const": "not_supplied"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "required": [
+        "status",
+        "applied",
+        "review_requested",
+        "review_bound",
+        "review_binding_status",
+        "error_kind",
+        "reason",
+        "drift_axes",
+        "message",
+        "next_action"
+      ],
+      "properties": {
+        "status": {
+          "const": "refused"
+        },
+        "applied": {
+          "const": false
+        },
+        "review_bound": {
+          "const": false
+        }
+      }
+    }
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "review_bound": {
+            "const": true
+          }
+        },
+        "required": [
+          "review_bound"
+        ]
+      },
+      "then": {
+        "properties": {
+          "review_binding_status": {
+            "const": "matched"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "review_binding_status": {
+            "enum": [
+              "not_supplied",
+              "not_bound"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "applied"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "applied": {
+            "const": true
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "applied": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "refused"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "review_requested": {
+                  "const": true
+                }
+              },
+              "required": [
+                "review_requested"
+              ]
+            },
+            "then": {
+              "properties": {
+                "review_binding_status": {
+                  "const": "not_bound"
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "review_binding_status": {
+                  "const": "not_supplied"
+                }
+              }
+            }
+          }
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": ["preview"]
+            },
+            {
+              "required": ["gate_denials"]
+            },
+            {
+              "required": ["stdout"]
+            },
+            {
+              "required": ["stderr"]
+            },
+            {
+              "required": ["error"]
+            },
+            {
+              "required": ["recorded_collision_paths"]
+            },
+            {
+              "required": ["accepted_decomposition"]
+            },
+            {
+              "required": ["lifecycle"]
+            }
+          ]
+        }
+      },
+      "else": {
+        "not": {
+          "anyOf": [
+            {
+              "required": ["review_requested"]
+            },
+            {
+              "required": ["error_kind"]
+            },
+            {
+              "required": ["reason"]
+            },
+            {
+              "required": ["drift_axes"]
+            },
+            {
+              "required": ["message"]
+            },
+            {
+              "required": ["next_action"]
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "mergeGateDenial": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "denial_id",
+        "correction_correlation_id",
+        "reason",
+        "retryability",
+        "context",
+        "route",
+        "next_safe_operation"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "const": 1
+        },
+        "denial_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "correction_correlation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "reason": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "family",
+                "blocker"
+              ],
+              "properties": {
+                "family": {
+                  "const": "validation_repair"
+                },
+                "blocker": {
+                  "type": "string",
+                  "enum": [
+                    "validation_missing",
+                    "validation_not_run",
+                    "validation_skipped",
+                    "validation_failed"
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "family",
+                "blocker"
+              ],
+              "properties": {
+                "family": {
+                  "const": "merge_remediation"
+                },
+                "blocker": {
+                  "type": "string",
+                  "enum": [
+                    "dirty_primary",
+                    "stale_base",
+                    "apply_check_failed",
+                    "excluded_reference",
+                    "unclaimed_edits"
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "retryability": {
+          "const": "retry_after_correction"
+        },
+        "context": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "owner",
+            "source",
+            "paths"
+          ],
+          "properties": {
+            "owner": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "primary_drift",
+                "git_apply_check",
+                "merge_scope",
+                "validation_binding",
+                "validation_state",
+                "validation"
+              ]
+            },
+            "paths": {
+              "type": "array",
+              "maxItems": 256,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "merge-preview-report-v1.schema.json#/$defs/repositoryRelativePath"
+              }
+            }
+          }
+        },
+        "route": {
+          "type": "string",
+          "enum": [
+            "child_controller",
+            "integration_controller"
+          ]
+        },
+        "next_safe_operation": {
+          "type": "string",
+          "enum": [
+            "repair_validation",
+            "restore_clean_primary",
+            "refresh_candidate_base",
+            "repair_merge_conflict",
+            "remediate_unclaimed_merge_edits",
+            "remediate_excluded_reference"
+          ]
+        }
+      }
+    },
+    "mergeLifecycle": {
+      "type": "object",
+      "description": "Optional auto-reap lifecycle report. Nested GC/prune details remain open because they are a separately evolving public artifact family.",
+      "required": [
+        "enabled",
+        "apply",
+        "dry_run",
+        "auto_reap_merged",
+        "retry",
+        "reconciliation",
+        "artifact_reclaim_unverifiable",
+        "artifact_external_writers_stopped",
+        "apparent_checked_bytes",
+        "projected_reclaimable_bytes",
+        "actual_reclaimed_bytes",
+        "repository_prune"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "apply": {
+          "type": "boolean"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "auto_reap_merged": {
+          "type": "boolean"
+        },
+        "retry": {
+          "type": "object"
+        },
+        "reconciliation": {
+          "type": "object"
+        },
+        "worktree_gc": {
+          "type": "object"
+        },
+        "artifact_prune": {
+          "type": "object"
+        },
+        "artifact_reclaim_unverifiable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "artifact_external_writers_stopped": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "apparent_checked_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "projected_reclaimable_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "actual_reclaimed_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "repository_prune": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}
