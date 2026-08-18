@@ -140,13 +140,13 @@ pub fn capture_current_heads(
     source_worktree: &Path,
     agent_id: &str,
 ) -> Result<MergePreviewFreshnessWatermark, MergePreviewFreshnessError> {
-    Ok(MergePreviewFreshnessWatermark {
+    MergePreviewFreshnessWatermark {
         version: MERGE_PREVIEW_FRESHNESS_WATERMARK_VERSION,
         primary_head: head_oid_string(primary_repo, "primary HEAD")?,
         source_head: head_oid_string(source_worktree, "source HEAD")?,
         source_agent_id: agent_id.to_string(),
     }
-    .canonicalized()?)
+    .canonicalized()
 }
 
 pub fn refuse_if_drifted(

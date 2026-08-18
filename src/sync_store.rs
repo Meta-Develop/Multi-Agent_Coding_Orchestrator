@@ -2887,12 +2887,12 @@ mod tests {
             3,
             std::slice::from_ref(&successor),
             &[successor_liveness],
-            &[history.clone()],
+            std::slice::from_ref(&history),
         )
         .expect_err("successor time mismatch")
         .to_string()
         .contains("audited lineage"));
-        assert!(ensure_supersession_time_not_future(&[history.clone()], 119)
+        assert!(ensure_supersession_time_not_future(std::slice::from_ref(&history), 119)
             .expect_err("future lineage time")
             .to_string()
             .contains("ambiguous clock state"));
