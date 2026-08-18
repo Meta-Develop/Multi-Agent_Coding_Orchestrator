@@ -2815,15 +2815,13 @@ mod tests {
             "default line bound must stay under the hard ceiling"
         );
         assert!(limits.max_total_bytes >= limits.max_line_bytes);
-        assert!(
-            AppServerLimits {
-                max_line_bytes: OUTPUT_AGENT_MESSAGE_MAX_BYTES,
-                max_total_bytes: HARD_MAX_TOTAL_BYTES,
-                ..AppServerLimits::default()
-            }
-            .validate()
-            .is_ok()
-        );
+        assert!(AppServerLimits {
+            max_line_bytes: OUTPUT_AGENT_MESSAGE_MAX_BYTES,
+            max_total_bytes: HARD_MAX_TOTAL_BYTES,
+            ..AppServerLimits::default()
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]

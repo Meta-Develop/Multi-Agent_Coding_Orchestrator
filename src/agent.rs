@@ -1393,7 +1393,10 @@ diff --git a/README.md b/README.md
         )
         .context("bounded git apply should succeed")?;
         assert!(applied.status.is_some_and(|status| status.success()));
-        assert_eq!(fs::read_to_string(repo_path.join("README.md"))?, "# Changed\n");
+        assert_eq!(
+            fs::read_to_string(repo_path.join("README.md"))?,
+            "# Changed\n"
+        );
 
         let started = Instant::now();
         let error = run_git_apply(
