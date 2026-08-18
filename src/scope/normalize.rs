@@ -1131,7 +1131,7 @@ fn read_journal_with_position(path: &Path, repo_id: &str, run_id: &str) -> io::R
                 path.display()
             )));
         }
-        if !line.ends_with(&[b'\n']) {
+        if !line.ends_with(b"\n") {
             break;
         }
         total_bytes = total_bytes.saturating_add(u64::try_from(bytes_read).unwrap_or(u64::MAX));
@@ -1222,7 +1222,7 @@ fn read_journal_suffix(
                 path.display()
             )));
         }
-        if !line.ends_with(&[b'\n']) {
+        if !line.ends_with(b"\n") {
             break;
         }
         consumed = consumed.saturating_add(u64::try_from(bytes_read).unwrap_or(u64::MAX));
