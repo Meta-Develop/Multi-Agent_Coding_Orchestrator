@@ -2744,3 +2744,84 @@ fn supervisor_input_loader_accepts_direct_regular_files_and_refuses_unsafe_input
     assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
     assert!(load_supervisor_plan_file(&fifo).is_err());
 }
+
+#[test]
+fn provider_planning_session_lowers_recursive_tree_and_binds_run_identity() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    git2::Repository::init(repo).expect("init repo");
+    std::fs::create_dir_all(repo.join("src")).expect("src dir");
+    std::fs::write(repo.join("src/alpha.rs"), "pub fn alpha_task() {}\n").expect("alpha");
+    std::fs::write(repo.join("src/beta.rs"), "pub fn beta_task() {}\n").expect("beta");
+    let config = crate::planning::ProviderPlanningConfig::new("lower", "planner-model");
+    let provider_plan = crate::planning::ProviderRecursiveTaskPlan {
+        assignments: vec![crate::planning::ProviderTaskAssignmentTree {
+            id: "parent".to_string(),
+            task: "Coordinate alpha and beta".to_string(),
+            fragment_ids: vec!["fragment-001".to_string(), "fragment-002".to_string()],
+            assigned_paths: vec![
+                PathBuf::from("src/alpha.rs"),
+                PathBuf::from("src/beta.rs"),
+            ],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            child_assignments: vec![
+                crate::planning::ProviderTaskAssignmentTree {
+                    id: "alpha".to_string(),
+                    task: "Update alpha".to_string(),
+                    fragment_ids: vec!["fragment-001".to_string()],
+                    assigned_paths: vec![PathBuf::from("src/alpha.rs")],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: Vec::new(),
+                    child_assignments: Vec::new(),
+                },
+                crate::planning::ProviderTaskAssignmentTree {
+                    id: "beta".to_string(),
+                    task: "Update beta".to_string(),
+                    fragment_ids: vec!["fragment-002".to_string()],
+                    assigned_paths: vec![PathBuf::from("src/beta.rs")],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: Vec::new(),
+                    child_assignments: Vec::new(),
+                },
+            ],
+        }],
+    };
+    let mut provider = crate::llm::fake::FakeProvider::new("fake-planner", "planner-model");
+    provider
+        .push_json_response("lower-proposal", &provider_plan)
+        .expect("script recursive plan");
+    let session = crate::planning::propose_task_decomposition_with_provider(
+        repo,
+        "",
+        "- Update alpha behavior.\n- Update beta behavior.",
+        &mut provider,
+        &config,
+    )
+    .expect("provider session");
+
+    let plan = supervisor_plan_from_task_planning_session(
+        "",
+        "- Update alpha behavior.\n- Update beta behavior.",
+        &session,
+    )
+    .expect("lower provider session");
+    assert_eq!(plan.assignments.len(), 3);
+    assert_eq!(plan.assignments[0].id, "parent");
+    assert!(plan.assignments[0].worker_assignments.is_empty());
+    assert_eq!(plan.assignments[1].id, "alpha");
+    assert_eq!(plan.assignments[1].worker_assignments.len(), 1);
+    assert_eq!(plan.assignments[2].id, "beta");
+
+    let run_id = crate::orchestrator::RunId::new("provider-bind-run").expect("valid run id");
+    let bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        "- Update alpha behavior.\n- Update beta behavior.",
+        &session,
+        run_id.clone(),
+    )
+    .expect("bind provider session");
+    assert_eq!(bound.execution_binding.run_id(), &run_id);
+    assert_eq!(bound.plan.assignments.len(), 3);
+    assert!(bound.document.get("assignments").is_some());
+}
