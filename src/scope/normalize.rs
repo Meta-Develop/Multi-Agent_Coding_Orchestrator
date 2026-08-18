@@ -926,16 +926,19 @@ fn read_journal_with_position(path: &Path, repo_id: &str, run_id: &str) -> io::R
         if bytes_read == 0 {
             break;
         }
+        if line.len() > MAX_JOURNAL_LINE_BYTES {
+            return Err(invalid_data(format!(
+                "Scope orchestration journal line exceeds the {MAX_JOURNAL_LINE_BYTES} byte limit: {}",
+                path.display()
+            )));
+        }
+        if !line.ends_with(&[b'\n']) {
+            break;
+        }
         total_bytes = total_bytes.saturating_add(u64::try_from(bytes_read).unwrap_or(u64::MAX));
         if total_bytes > MAX_JOURNAL_BYTES {
             return Err(invalid_data(format!(
                 "Scope orchestration journal grew beyond the {MAX_JOURNAL_BYTES} byte limit: {}",
-                path.display()
-            )));
-        }
-        if line.len() > MAX_JOURNAL_LINE_BYTES {
-            return Err(invalid_data(format!(
-                "Scope orchestration journal line exceeds the {MAX_JOURNAL_LINE_BYTES} byte limit: {}",
                 path.display()
             )));
         }
@@ -1014,13 +1017,16 @@ fn read_journal_suffix(
         if bytes_read == 0 {
             break;
         }
-        consumed = consumed.saturating_add(u64::try_from(bytes_read).unwrap_or(u64::MAX));
         if line.len() > MAX_JOURNAL_LINE_BYTES {
             return Err(invalid_data(format!(
                 "Scope orchestration journal line exceeds the {MAX_JOURNAL_LINE_BYTES} byte limit: {}",
                 path.display()
             )));
         }
+        if !line.ends_with(&[b'\n']) {
+            break;
+        }
+        consumed = consumed.saturating_add(u64::try_from(bytes_read).unwrap_or(u64::MAX));
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
@@ -2410,6 +2416,108 @@ mod tests {
             )
             .events
             .is_empty());
+    }
+
+    #[test]
+    fn journal_offset_leaves_unterminated_tail_unconsumed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal = temp
+            .path()
+            .join(".maco/o2/runs/partial/events/orchestration.jsonl");
+        let first = journal_event("first");
+        let second_body = journal_event("second");
+        let second_partial = second_body
+            .strip_suffix('\n')
+            .expect("journal event ends with newline");
+        write(&journal, &format!("{first}{second_partial}"));
+
+        let initial = read_journal_with_position(&journal, "repo-one", "partial")
+            .expect("read partial journal");
+        assert_eq!(initial.events.len(), 1);
+        assert_eq!(initial.events[0].node, "first");
+        assert_eq!(initial.position.offset, first.len() as u64);
+        assert_eq!(initial.position.record_count, 1);
+        assert!(
+            initial.position.offset < fs::metadata(&journal).expect("journal metadata").len(),
+            "stored offset must not consume the unterminated tail"
+        );
+
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .expect("append journal");
+        file.write_all(b"\n").expect("complete second event");
+        drop(file);
+
+        let (suffix, position) =
+            read_journal_suffix(&journal, "repo-one", "partial", &initial.position)
+                .expect("read completed suffix");
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(suffix[0].node, "second");
+        assert_eq!(position.offset, fs::metadata(&journal).expect("len").len());
+        assert_eq!(position.record_count, 2);
+    }
+
+    #[test]
+    fn cached_scope_does_not_lose_straddled_journal_append() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal = temp
+            .path()
+            .join(".maco/o2/runs/straddle/events/orchestration.jsonl");
+        let first = journal_event("first");
+        write(&journal, &first);
+        let mut cache = CachedScope::new(vec![target(temp.path())]);
+        assert!(cache.refresh().expect("initial cache refresh"));
+
+        let second = journal_event("second");
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .expect("append journal");
+        file.write_all(second.trim_end_matches('\n').as_bytes())
+            .expect("append partial event");
+        drop(file);
+
+        let _ = cache.refresh().expect("partial append refresh");
+        assert_eq!(
+            cache
+                .snapshot()
+                .expect("partial snapshot")
+                .events_for_run("repo-one", "o2", "straddle")
+                .expect("partial run")
+                .len(),
+            1
+        );
+        let key = RunKey {
+            repo: "repo-one".to_string(),
+            family: "o2".to_string(),
+            run: "straddle".to_string(),
+        };
+        assert_eq!(
+            cache
+                .journals
+                .get(&key)
+                .expect("journal watch")
+                .position
+                .offset,
+            first.len() as u64
+        );
+
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .expect("complete journal");
+        file.write_all(b"\n").expect("finish second event");
+        drop(file);
+
+        assert!(cache.refresh().expect("completed append refresh"));
+        let events = cache
+            .snapshot()
+            .expect("completed snapshot")
+            .events_for_run("repo-one", "o2", "straddle")
+            .expect("completed run");
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|event| event.node == "second"));
     }
 
     #[test]
