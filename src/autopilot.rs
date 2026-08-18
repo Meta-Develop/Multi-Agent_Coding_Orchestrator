@@ -2350,6 +2350,7 @@ fn supervisor_plan_for_attempt(
         review_aggregation_policy: profile.review_aggregation_policy,
         assignments: vec![OrchestratorAssignment {
             id: agent_id.to_string(),
+            runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: plan.assigned_paths.clone(),
             semantic_symbols: plan.semantic_symbols.clone(),
@@ -3854,6 +3855,8 @@ fn sanitize_supervisor_report(
         runtime: match report.runtime {
             SupervisorRuntime::Codex => "codex",
             SupervisorRuntime::Fake => "fake",
+            SupervisorRuntime::Grok => "grok",
+            SupervisorRuntime::Cursor => "cursor",
         }
         .to_string(),
         publishable: report.publishable,
@@ -4657,6 +4660,7 @@ mod tests {
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: vec![OrchestratorAssignment {
                 id: "agent-a".to_string(),
+                runtime: None,
                 role: AgentRole::ChildOrchestrator,
                 assigned_paths: plan.assigned_paths.clone(),
                 semantic_symbols: plan.semantic_symbols.clone(),
@@ -5289,6 +5293,7 @@ mod tests {
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: vec![OrchestratorAssignment {
                 id: "child-a".to_string(),
+                runtime: None,
                 role: AgentRole::ChildOrchestrator,
                 assigned_paths: vec![PathBuf::from("README.md")],
                 semantic_symbols: Vec::new(),

@@ -435,6 +435,7 @@ pub(super) fn generated_licensed_follow_up_tasks(
             }
             let follow_up_assignment = OrchestratorAssignment {
                 id,
+                runtime: None,
                 role: AgentRole::ChildOrchestrator,
                 assigned_paths: failure.paths.clone(),
                 semantic_symbols: failure.interfaces.clone(),

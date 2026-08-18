@@ -1861,6 +1861,7 @@ mod tests {
         };
         let assignments = vec![OrchestratorAssignment {
             id: assignment_id.clone(),
+            runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![std::path::PathBuf::from(format!("src/{suffix}.rs"))],
             semantic_symbols: Vec::new(),
@@ -1956,6 +1957,7 @@ mod tests {
             review_aggregation_policy: template.review_aggregation_policy,
             assignments: vec![OrchestratorAssignment {
                 id: "child-a".to_string(),
+                runtime: None,
                 role: AgentRole::ChildOrchestrator,
                 assigned_paths: vec![std::path::PathBuf::from("src/breaking.rs")],
                 semantic_symbols: Vec::new(),

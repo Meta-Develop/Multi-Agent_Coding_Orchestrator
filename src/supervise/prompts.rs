@@ -1349,6 +1349,7 @@ mod regression_tests {
         };
         let assignment = OrchestratorAssignment {
             id: child_id.to_string(),
+            runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from(assigned_path)],
             semantic_symbols: vec!["worker_prompt_with_field_guide".to_string()],
@@ -1497,6 +1498,7 @@ mod regression_tests {
     fn worker_embedding_multiplier_uses_all_worker_roles_in_the_run() {
         let assignment = |id: &str, worker_count: usize| OrchestratorAssignment {
             id: id.to_string(),
+            runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
             semantic_symbols: Vec::new(),
@@ -1752,6 +1754,7 @@ mod regression_tests {
     fn review_lens_dispatch_preserves_distinct_runtime_selection_and_scope() -> Result<()> {
         let assignment = OrchestratorAssignment {
             id: "child-decorrelated".to_string(),
+            runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("src/review.rs")],
             semantic_symbols: Vec::new(),
@@ -1911,6 +1914,7 @@ mod regression_tests {
     fn review_lens_prompt_rejects_parent_auditor_ceiling_overrun() -> Result<()> {
         let assignment = OrchestratorAssignment {
             id: "child-bounded-lens".to_string(),
+            runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("src/review.rs")],
             semantic_symbols: Vec::new(),

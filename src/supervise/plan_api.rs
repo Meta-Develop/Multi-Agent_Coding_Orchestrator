@@ -124,6 +124,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
         let planning_index = assignments.len();
         assignments.push(OrchestratorAssignment {
             id: planning_id.clone(),
+            runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: assignment.assigned_paths.clone(),
             semantic_symbols: assignment.semantic_symbols.clone(),
@@ -166,6 +167,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
         let execution_index = assignments.len();
         assignments.push(OrchestratorAssignment {
             id: assignment.id.clone(),
+            runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: assignment.assigned_paths,
             semantic_symbols: assignment.semantic_symbols,

@@ -20,6 +20,7 @@ use crate::process_runner::{
     WorkspaceAccess,
 };
 use crate::protected_path::{DeclaredPathCoordinate, ProtectedPathSpec};
+use crate::runtime_adapter::{LaunchContext, RuntimeAdapterConfig, RuntimeId};
 use crate::safe_state::unsigned_to_u32;
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
 use anyhow::{bail, Context, Result};
@@ -207,6 +208,7 @@ pub struct ExternalAgentCommand {
     /// Explicit binding for recoverable cleanup of the private machine-global output staging
     /// directory. Absence keeps the legacy path as an attributed cooperative bypass.
     pub machine_global_retention: Option<ExternalMachineGlobalRetentionBinding>,
+    pub runtime_adapter: Option<RuntimeAdapterConfig>,
 }
 
 pub type ExternalMachineGlobalRetentionBinding = MachineGlobalRetentionBinding;
@@ -224,6 +226,8 @@ pub enum ExternalAgentInvocation {
     CodexSupervisor,
     CodexConsultant,
     ClaudeConsultant,
+    Grok,
+    Cursor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -611,6 +615,7 @@ impl ExternalAgentCommand {
             worktree_control_exceptions: Vec::new(),
             environment_requirements: Vec::new(),
             machine_global_retention: None,
+            runtime_adapter: None,
         }
     }
 
@@ -640,6 +645,7 @@ impl ExternalAgentCommand {
             worktree_control_exceptions: Vec::new(),
             environment_requirements: Vec::new(),
             machine_global_retention: None,
+            runtime_adapter: None,
         }
     }
 
@@ -669,11 +675,29 @@ impl ExternalAgentCommand {
             worktree_control_exceptions: Vec::new(),
             environment_requirements: Vec::new(),
             machine_global_retention: None,
+            runtime_adapter: None,
         }
     }
 
     pub fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.hidden_roots.push(root.into());
+        self
+    }
+
+    pub fn with_runtime_adapter(
+        mut self,
+        runtime: RuntimeId,
+        mut config: RuntimeAdapterConfig,
+    ) -> Self {
+        if matches!(runtime, RuntimeId::Grok | RuntimeId::Cursor) {
+            config.binary = Some(self.program.clone());
+            self.invocation = match runtime {
+                RuntimeId::Grok => ExternalAgentInvocation::Grok,
+                RuntimeId::Cursor => ExternalAgentInvocation::Cursor,
+                _ => unreachable!(),
+            };
+            self.runtime_adapter = Some(config);
+        }
         self
     }
 
@@ -1517,6 +1541,10 @@ fn run_external_agent_runtime(
     // side effect in the first place.
     if runtime == ExternalExecutionRuntime::Verified
         && program_trust == ExternalProgramTrust::ExplicitCustom
+        && !matches!(
+            spec.invocation,
+            ExternalAgentInvocation::Grok | ExternalAgentInvocation::Cursor
+        )
     {
         report.duration_ms = duration_millis(started.elapsed());
         record_environment_failure(
@@ -1622,8 +1650,11 @@ fn run_external_agent_runtime(
     };
 
     let side_effect_profile = if runtime == ExternalExecutionRuntime::Verified
-        && program_trust == ExternalProgramTrust::TrustedSystemCodex
-    {
+        && (program_trust == ExternalProgramTrust::TrustedSystemCodex
+            || matches!(
+                spec.invocation,
+                ExternalAgentInvocation::Grok | ExternalAgentInvocation::Cursor
+            )) {
         match external_side_effect_profile(
             &target_spec,
             &resolved_program,
@@ -1662,6 +1693,13 @@ fn run_external_agent_runtime(
         None
     };
     let mut external_environment = allowed_env(spec.invocation, program_trust);
+    if let Some(config) = &target_spec.runtime_adapter {
+        for key in &config.env_passthrough {
+            if let Ok(value) = env::var(key) {
+                external_environment.insert(key.clone(), value);
+            }
+        }
+    }
     if let Some(metadata) = &agent_lifecycle {
         external_environment.insert(MACO_RUN_ID_ENV.to_string(), metadata.run_id().to_string());
         external_environment.insert(MACO_TASK_ID_ENV.to_string(), metadata.task_id().to_string());
@@ -1889,7 +1927,7 @@ fn run_external_agent_runtime(
                         }
                     }
                 }
-                match output_staging.reservation() {
+                match output_staging.reservation_mut() {
                     Ok(staged_output) => record_completed_target(
                         &mut report,
                         interactive.process,
@@ -1928,7 +1966,7 @@ fn run_external_agent_runtime(
         }
     } else {
         run_process_cancellable(process_spec, cancellation).map(|output| {
-            match output_staging.reservation() {
+            match output_staging.reservation_mut() {
                 Ok(staged_output) => record_completed_target(
                     &mut report,
                     output,
@@ -2521,7 +2559,7 @@ struct CompletedTargetContext<'a> {
 fn record_completed_target(
     report: &mut ExternalAgentRun,
     output: ProcessOutput,
-    staged_output: &ReservedOutputFile,
+    staged_output: &mut ReservedOutputFile,
     output_reservation: &mut ReservedOutputFile,
     json_log_reservation: &mut ReservedOutputFile,
     credential_redactor: &CredentialRedactor,
@@ -2587,6 +2625,32 @@ fn record_completed_target(
         };
         report.error = append_external_error(report.error.take(), Some(status_error));
     }
+    if let Some(config) = &context.spec.runtime_adapter {
+        let captured = match config.output_capture {
+            crate::runtime_adapter::OutputCaptureMode::OutputFile => None,
+            crate::runtime_adapter::OutputCaptureMode::Stdout => {
+                Some(output.stdout.as_bytes().to_vec())
+            }
+            crate::runtime_adapter::OutputCaptureMode::StdoutAndStderr => Some(
+                output
+                    .stdout
+                    .as_bytes()
+                    .iter()
+                    .chain(output.stderr.as_bytes().iter())
+                    .copied()
+                    .collect(),
+            ),
+        };
+        if let Some(captured) = captured {
+            if let Err(error) = staged_output.write_bytes_atomic(&captured, OUTPUT_TEE_LIMIT_BYTES)
+            {
+                report.error = append_external_error(
+                    report.error.take(),
+                    Some(format!("failed to stage runtime adapter output: {error:#}")),
+                );
+            }
+        }
+    }
     match capture_redacted_staged_output(staged_output, output_reservation, credential_redactor) {
         Ok(bytes) => report.output_last_message = Some(bytes),
         Err(error) => {
@@ -2598,10 +2662,15 @@ fn record_completed_target(
             );
         }
     }
+    let adapter_runtime = matches!(
+        context.spec.invocation,
+        ExternalAgentInvocation::Grok | ExternalAgentInvocation::Cursor
+    );
     report.publishable = context.runtime == ExternalExecutionRuntime::Verified
         && safety_verified
-        && report.program_trust == ExternalProgramTrust::TrustedSystemCodex
-        && report.codex_permissions.is_some()
+        && (adapter_runtime
+            || (report.program_trust == ExternalProgramTrust::TrustedSystemCodex
+                && report.codex_permissions.is_some()))
         && report.exit_code == Some(0)
         && !report.timed_out
         && report.error.is_none();
@@ -5234,7 +5303,12 @@ fn external_side_effect_profile(
     program_trust: ExternalProgramTrust,
     protected_controls: &ProtectedWorktreeControls,
 ) -> Result<SideEffectConfinementProfile> {
-    if program_trust != ExternalProgramTrust::TrustedSystemCodex {
+    if program_trust != ExternalProgramTrust::TrustedSystemCodex
+        && !matches!(
+            spec.invocation,
+            ExternalAgentInvocation::Grok | ExternalAgentInvocation::Cursor
+        )
+    {
         bail!("provider-network confinement is reserved for the trusted system Codex executable");
     }
     let program_parent = program
@@ -5248,7 +5322,10 @@ fn external_side_effect_profile(
         .as_ref()
         .context("external-agent output parent was not validated against protected controls")?;
     match spec.invocation {
-        ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant => {
+        ExternalAgentInvocation::CodexSupervisor
+        | ExternalAgentInvocation::CodexConsultant
+        | ExternalAgentInvocation::Grok
+        | ExternalAgentInvocation::Cursor => {
             let mut profile = match spec.workspace_access {
                 WorkspaceAccess::ReadOnly => ExternalCodexProfile::read_only(&spec.cwd),
                 WorkspaceAccess::ReadWrite => ExternalCodexProfile::read_write(&spec.cwd),
@@ -5771,7 +5848,30 @@ fn command_argv_with_controls(
         ExternalAgentInvocation::CodexSupervisor => codex_supervisor_argv(spec, controls),
         ExternalAgentInvocation::CodexConsultant => codex_consultant_argv(spec, controls),
         ExternalAgentInvocation::ClaudeConsultant => claude_consultant_argv(),
+        ExternalAgentInvocation::Grok | ExternalAgentInvocation::Cursor => {
+            runtime_adapter_argv(spec)
+        }
     }
+}
+
+fn runtime_adapter_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
+    let config = spec.runtime_adapter.clone().unwrap_or_else(|| {
+        RuntimeAdapterConfig::defaults(match spec.invocation {
+            ExternalAgentInvocation::Grok => RuntimeId::Grok,
+            ExternalAgentInvocation::Cursor => RuntimeId::Cursor,
+            _ => RuntimeId::Codex,
+        })
+    });
+    config
+        .render(&LaunchContext {
+            prompt: &spec.prompt,
+            model: spec.model.as_deref(),
+            effort: spec.reasoning_effort.as_deref(),
+            cwd: &spec.cwd,
+            output: &spec.output_last_message,
+        })
+        .map(|launch| launch.argv.into_iter().map(OsString::from).collect())
+        .unwrap_or_default()
 }
 
 fn codex_supervisor_argv(
@@ -8270,7 +8370,7 @@ printf '{"type":"done"}\n'
             Duration::from_secs(5),
         );
         let staged_output_path = incoming.join("staged-output.raw");
-        let staged_output = reserve_external_output(&staged_output_path)?;
+        let mut staged_output = reserve_external_output(&staged_output_path)?;
         let mut output_reservation = reserve_external_output(&output_path)?;
         let mut json_log_reservation = reserve_external_output(&command.json_log)?;
         let credential_redactor = CredentialRedactor::default();
@@ -8314,7 +8414,7 @@ printf '{"type":"done"}\n'
         record_completed_target(
             &mut report,
             output,
-            &staged_output,
+            &mut staged_output,
             &mut output_reservation,
             &mut json_log_reservation,
             &credential_redactor,

@@ -55,6 +55,7 @@ use crate::{
         ReviewLensCoverage, ReviewLensEvidenceKind, ReviewLensRequest, ReviewLensRequestSources,
         ReviewLensVerdict, ReviewLensVerdictStatus, REVIEW_LENS_REQUEST_LIMIT_BYTES,
     },
+    runtime_adapter::RuntimeId,
     safe_state::BoundedRegularReader,
     secure_output::SecureOutputRoot,
     semantic_coord::{SemanticIntent, SemanticIntentRequest, SemanticIntentStore},
@@ -366,13 +367,9 @@ pub struct SupervisorEvidenceOnlyReauditReport {
     pub final_report: Option<SupervisorFinalReport>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum SupervisorRuntime {
-    #[default]
-    Codex,
-    Fake,
-}
+/// Backwards-compatible name for the runtime identifier. Runtime behavior is supplied by
+/// `runtime_adapter`; this is no longer a closed supervisor-owned vendor enum.
+pub type SupervisorRuntime = RuntimeId;
 
 /// Explicit, narrowly scoped departure from the default managed-child-
 /// worktree execution policy.
@@ -830,6 +827,7 @@ pub enum RoleModelAvailability {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RuntimeModelCatalog {
     Codex(CodexRuntimeModelCatalog),
+    OperatorDeclared,
     LocalDeterministicFake,
 }
 
@@ -857,6 +855,7 @@ impl RuntimeModelCatalog {
             )
             .map(Self::Codex),
             SupervisorRuntime::Fake => Ok(Self::LocalDeterministicFake),
+            SupervisorRuntime::Grok | SupervisorRuntime::Cursor => Ok(Self::OperatorDeclared),
         }
     }
 
@@ -877,8 +876,16 @@ impl RuntimeModelCatalog {
             (Self::LocalDeterministicFake, SupervisorRuntime::Fake) => {
                 Ok(RoleModelAvailability::Unavailable)
             }
+            (Self::OperatorDeclared, SupervisorRuntime::Grok | SupervisorRuntime::Cursor) => {
+                Ok(RoleModelAvailability::Available)
+            }
             (Self::Codex(_), SupervisorRuntime::Fake)
-            | (Self::LocalDeterministicFake, SupervisorRuntime::Codex) => {
+            | (Self::LocalDeterministicFake, SupervisorRuntime::Codex)
+            | (Self::Codex(_), SupervisorRuntime::Grok | SupervisorRuntime::Cursor)
+            | (Self::OperatorDeclared, SupervisorRuntime::Codex)
+            | (Self::OperatorDeclared, SupervisorRuntime::Fake)
+            | (Self::LocalDeterministicFake, SupervisorRuntime::Grok | SupervisorRuntime::Cursor) =>
+            {
                 bail!("runtime model catalog does not match the selected supervisor runtime")
             }
         }
@@ -900,6 +907,7 @@ impl RuntimeModelCatalog {
                 }
             }
             Self::LocalDeterministicFake => RoleModelAvailability::Unavailable,
+            Self::OperatorDeclared => RoleModelAvailability::Available,
         }
     }
 
@@ -1363,6 +1371,10 @@ struct WorkerAssignmentMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OrchestratorAssignment {
     pub id: String,
+    /// Optional per-assignment runtime. A CLI override remains authoritative; absent both,
+    /// supervisor execution defaults to Codex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeId>,
     #[serde(default = "child_orchestrator_role")]
     pub role: AgentRole,
     #[serde(default, serialize_with = "serialize_paths")]
@@ -3193,6 +3205,7 @@ impl SupervisorPlan {
             RuntimeModelCatalog::LocalDeterministicFake => {
                 RuntimeModelCatalogObservation::NotConsulted
             }
+            RuntimeModelCatalog::OperatorDeclared => RuntimeModelCatalogObservation::NotConsulted,
         };
         profile
     }
@@ -3962,6 +3975,9 @@ fn test_runtime_model_catalog(
         )
         .map(RuntimeModelCatalog::Codex),
         SupervisorRuntime::Fake => Ok(RuntimeModelCatalog::LocalDeterministicFake),
+        SupervisorRuntime::Grok | SupervisorRuntime::Cursor => {
+            Ok(RuntimeModelCatalog::OperatorDeclared)
+        }
     }
 }
 

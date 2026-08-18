@@ -2959,6 +2959,7 @@ mod decomposition_tests {
     fn test_assignment(id: &str, path: &str) -> OrchestratorAssignment {
         OrchestratorAssignment {
             id: id.to_string(),
+            runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from(path)],
             semantic_symbols: Vec::new(),
