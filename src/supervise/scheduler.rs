@@ -2936,7 +2936,9 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     let resume_binding = artifact_writer.resume_binding();
     #[cfg(test)]
     let resume_binding = if take_force_degraded_checkpoint_finalization() {
-        Err(anyhow!("artifact run is not at a resumable manifest boundary"))
+        Err(anyhow!(
+            "artifact run is not at a resumable manifest boundary"
+        ))
     } else {
         resume_binding
     };
@@ -4531,7 +4533,8 @@ mod decomposition_tests {
     #[test]
     fn persist_releases_terminal_claims_without_checkpoint_writer() {
         let (_temp, repo) = test_repository();
-        let run_id = RunId::new("degraded-terminal-release").expect("valid degraded persist run id");
+        let run_id =
+            RunId::new("degraded-terminal-release").expect("valid degraded persist run id");
         let mut writer = ArtifactRunWriter::reserve(
             &repo,
             RunArtifactFamily::Supervise,

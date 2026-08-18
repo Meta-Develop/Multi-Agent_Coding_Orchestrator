@@ -1267,12 +1267,9 @@ fn admission_commit_recv_failure_cancels_and_drains_active_assignments() {
 
     assert!(!report.success);
     assert!(
-        report
-            .findings
-            .iter()
-            .any(|finding| finding
-                .message
-                .contains("ended before committing or declining budget admission")),
+        report.findings.iter().any(|finding| finding
+            .message
+            .contains("ended before committing or declining budget admission")),
         "admission-commit failure must remain visible: {:#?}",
         report.findings
     );

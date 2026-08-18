@@ -399,7 +399,8 @@ fn resume_refuses_scheduler_closed_budget_that_differs_only_in_elapsed_seconds()
     let run_id = RunId::new("clock-skewed-budget-binding").expect("valid clock-skew run id");
     let assignment = injected_assignment(false);
     let plan = injected_plan(assignment.clone(), 0);
-    let ledger = RunBudgetLedger::new(RunBudgetLimits::default()).expect("clock-skew budget ledger");
+    let ledger =
+        RunBudgetLedger::new(RunBudgetLimits::default()).expect("clock-skew budget ledger");
     let writer = ArtifactRunWriter::reserve(
         &repo,
         RunArtifactFamily::Supervise,
