@@ -63,6 +63,8 @@ jobs:
       - name: Run all tests
         shell: bash
         run: |
+          # No name skip list: containment-dependent lib tests execute
+          # inside the delegated user manager, or the helper fails closed.
           python3 scripts/run_in_delegated_user_manager.py -- \
             cargo test --locked --all-targets
 
