@@ -97,6 +97,32 @@ fn take_force_degraded_checkpoint_finalization() -> bool {
     FORCE_DEGRADED_CHECKPOINT_FINALIZATION.with(|flag| flag.replace(false))
 }
 
+#[cfg(test)]
+static ABORT_ADMISSION_COMMIT_ON_SPAWN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_abort_admission_commit_on_spawn(remaining: usize) {
+    ABORT_ADMISSION_COMMIT_ON_SPAWN.store(remaining, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn take_abort_admission_commit_on_spawn() -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    loop {
+        let remaining = ABORT_ADMISSION_COMMIT_ON_SPAWN.load(SeqCst);
+        if remaining == 0 {
+            return false;
+        }
+        if ABORT_ADMISSION_COMMIT_ON_SPAWN
+            .compare_exchange(remaining, remaining - 1, SeqCst, SeqCst)
+            .is_ok()
+        {
+            return remaining == 1;
+        }
+    }
+}
+
 fn assignments_overlap(left: &OrchestratorAssignment, right: &OrchestratorAssignment) -> bool {
     left.assigned_paths.iter().any(|left_path| {
         right
@@ -1143,6 +1169,10 @@ fn run_concurrent_assignment_schedule(
                             sender: completion_sender,
                         };
                         let _concurrency_guard = concurrency.assignment_started();
+                        #[cfg(test)]
+                        if take_abort_admission_commit_on_spawn() {
+                            panic!("injected admission-commit abort before notify");
+                        }
                         execute_supervisor_assignment(AssignmentExecutionContext {
                             index,
                             concurrent_mode: true,
@@ -1190,12 +1220,33 @@ fn run_concurrent_assignment_schedule(
                     match spawn_result {
                         Ok(handle) => {
                             active.insert(index, handle);
-                            admission_receiver.recv().with_context(|| {
-                                format!(
+                            if let Err(error) = admission_receiver.recv() {
+                                cancellation.cancel();
+                                for (active_index, active_handle) in std::mem::take(&mut active) {
+                                    let mut outcome = match active_handle.join() {
+                                        Ok(outcome) => outcome,
+                                        Err(_) => AssignmentExecutionOutcome::fatal(format!(
+                                            "supervisor assignment '{}' thread panicked",
+                                            context.plan.assignments[active_index].id
+                                        )),
+                                    };
+                                    record_completed_assignment_checkpoint(
+                                        context,
+                                        active_index,
+                                        &outcome,
+                                    )?;
+                                    release_concurrent_assignment(
+                                        &mut outcome,
+                                        context.sync_store,
+                                        context.semantic_store,
+                                    );
+                                    progress.indexed_outcomes[active_index] = Some(outcome);
+                                }
+                                return Err(error).context(format!(
                                     "supervisor assignment '{}' ended before committing or declining budget admission",
                                     assignment.id
-                                )
-                            })?;
+                                ));
+                            }
                         }
                         Err(error) => {
                             cancellation.cancel();

@@ -1219,6 +1219,81 @@ fn degraded_manifest_boundary_finalization_still_releases_serial_claims() {
 }
 
 #[test]
+fn admission_commit_recv_failure_cancels_and_drains_active_assignments() {
+    let (temp, repo_path) = injected_repository();
+    let assignments = vec![
+        injected_named_assignment("admit-a", "README.md"),
+        injected_named_assignment("admit-b", "src/lib.rs"),
+    ];
+    let plan = injected_multi_plan(assignments.clone(), 0);
+    let options = injected_options(&repo_path, temp.path(), "admission-recv-drain");
+    let cancelled_active = Arc::new(AtomicUsize::new(0));
+    let runner = {
+        let assignments = assignments.clone();
+        let cancelled_active = Arc::clone(&cancelled_active);
+        move |command: &ExternalAgentCommand,
+              cancellation: &ProcessCancellation,
+              _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+            let id = injected_command_assignment_id(command);
+            if id == "admit-a" {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !cancellation.is_cancelled() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "active assignment was not cancelled after admission-commit recv failure"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                cancelled_active.fetch_add(1, Ordering::SeqCst);
+            }
+            let assignment = assignments
+                .iter()
+                .find(|assignment| assignment.id == id)
+                .expect("admission drain assignment");
+            write_injected_assignment_report(command, assignment);
+            injected_verified_run(command)
+        }
+    };
+    set_abort_admission_commit_on_spawn(2);
+
+    let report = run_supervisor_plan_with_concurrent_cancellable_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        2,
+        &runner,
+    )
+    .expect("admission-commit recv failure remains reportable after drain");
+
+    assert!(!report.success);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding
+                .message
+                .contains("ended before committing or declining budget admission")),
+        "admission-commit failure must remain visible: {:#?}",
+        report.findings
+    );
+    assert_eq!(cancelled_active.load(Ordering::SeqCst), 1);
+    assert!(
+        report
+            .released_claims
+            .iter()
+            .any(|claim| claim.agent_id == "admit-a"),
+        "drained active assignment claim must be released: {:#?}",
+        report.released_claims
+    );
+    assert!(report.release_errors.is_empty());
+    assert!(SyncStore::open(&repo_path)
+        .expect("open claims after admission drain")
+        .snapshot()
+        .expect("snapshot claims after admission drain")
+        .is_empty());
+}
+
+#[test]
 fn serial_scheduler_error_after_completion_collects_outcomes_and_releases_claims() {
     let (temp, repo_path) = injected_repository();
     let assignments = vec![
