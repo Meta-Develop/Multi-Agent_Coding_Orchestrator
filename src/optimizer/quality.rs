@@ -54,18 +54,66 @@ pub struct ValidatorBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValidatorKind {
-    DeterministicCommand { name: String },
-    FormalProof { tool: String },
-    ModelChecking { tool: String },
+    DeterministicCommand {
+        name: String,
+    },
+    FormalProof {
+        tool: String,
+    },
+    ModelChecking {
+        tool: String,
+    },
     ExhaustiveExploration,
-    PropertyBasedTest { suite: String },
-    DifferentialTest { suite: String },
-    MutationTest { suite: String },
-    StaticAnalysis { tool: String },
-    Fuzzing { harness: String },
-    SecurityAnalysis { tool: String },
-    PerformanceBenchmark { name: String },
-    LlmReview { lens: String, reviewer: RuntimeSlug },
+    PropertyBasedTest {
+        suite: String,
+    },
+    DifferentialTest {
+        suite: String,
+    },
+    MutationTest {
+        suite: String,
+    },
+    StaticAnalysis {
+        tool: String,
+    },
+    Fuzzing {
+        harness: String,
+    },
+    SecurityAnalysis {
+        tool: String,
+    },
+    PerformanceBenchmark {
+        name: String,
+    },
+    LlmReview {
+        lens: ReviewLens,
+        reviewer: RuntimeSlug,
+    },
+}
+
+/// Independent review lenses. Reviewers must differ in information scope.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ReviewLens {
+    SpecificationVsResult,
+    DiffOnly,
+    RepositoryOnly,
+    TestsOnly,
+    PerformanceOnly,
+    SecurityOnly,
+    IndependentProvider { provider: String },
+}
+
+impl ValidatorKind {
+    pub fn is_machine_checkable(&self) -> bool {
+        !matches!(self, Self::LlmReview { .. })
+    }
+
+    pub fn is_formal(&self) -> bool {
+        matches!(
+            self,
+            Self::FormalProof { .. } | Self::ModelChecking { .. } | Self::ExhaustiveExploration
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,5 +229,54 @@ impl QualityContract {
 
     pub fn permit_llm_only_review(&mut self, permitted: bool) {
         self.llm_only_review_permitted = permitted;
+    }
+
+    /// Search-facing clone that can only add a validator.
+    pub fn with_additional_validator(&self, validator: ValidatorBinding) -> Self {
+        let mut clone = self.clone();
+        clone.add_mandatory_validator(validator);
+        clone
+    }
+
+    pub fn has_machine_checkable_mandatory_validator(&self) -> bool {
+        self.mandatory_validators
+            .iter()
+            .any(|binding| binding.required_for_production && binding.kind.is_machine_checkable())
+    }
+
+    pub fn requires_llm_review(&self) -> bool {
+        self.mandatory_validators
+            .iter()
+            .any(|binding| matches!(binding.kind, ValidatorKind::LlmReview { .. }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mandatory_validators_are_append_only() {
+        let mut contract = QualityContract::new(ContractId::new("q1").expect("id"));
+        contract.add_mandatory_validator(ValidatorBinding {
+            validator_id: ValidatorId::new("unit").expect("id"),
+            kind: ValidatorKind::DeterministicCommand {
+                name: "cargo-test".to_string(),
+            },
+            required_for_production: true,
+        });
+        let extended = contract.with_additional_validator(ValidatorBinding {
+            validator_id: ValidatorId::new("security").expect("id"),
+            kind: ValidatorKind::SecurityAnalysis {
+                tool: "audit".to_string(),
+            },
+            required_for_production: true,
+        });
+        assert_eq!(contract.mandatory_validators().len(), 1);
+        assert_eq!(extended.mandatory_validators().len(), 2);
+        assert_eq!(
+            extended.mandatory_validators()[0].validator_id.as_str(),
+            "unit"
+        );
     }
 }

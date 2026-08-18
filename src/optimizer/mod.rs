@@ -52,7 +52,8 @@ pub use action::{
 };
 pub use catalog::{ModelCatalogSnapshot, RuntimeModelCatalog};
 pub use certification::{
-    CandidateBinding, CertificationPlan, CertificationResult, QualityCertifier, TaskBinding,
+    select_under_quality_constraint, CandidateBinding, CertificationPlan, CertificationResult,
+    FailClosedCertifier, QualityCertifier, ScoredCandidate, SelectionOutcome, TaskBinding,
 };
 pub use error::OptimizerError;
 pub use global_search::{GlobalPolicyOptimizer, OptimizationHistory, PolicySearchSpace};
