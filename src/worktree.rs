@@ -2663,6 +2663,11 @@ impl WorktreeManager {
                 .cmp(&gc_created_at(&left.binding))
                 .then_with(|| left.binding.name.cmp(&right.binding.name))
         });
+        // Retention is committed only on remove / retain / dry-run exits.
+        // Protection continues deliberately drop `decision.committed_state` so
+        // a live, dirty, or identity-changed lane cannot evict an older
+        // finished candidate. `max_count` / `max_total_bytes` therefore
+        // under-count on-disk usage (conservative: never unsafe removal).
         let mut retention_state = WorktreeGcRetentionState::default();
         for mut candidate in candidates {
             let decision = worktree_gc_retention_decision(
@@ -5376,6 +5381,10 @@ struct WorktreeGcCandidate {
     apparent_target_bytes: Option<u64>,
 }
 
+/// Running retention budget for candidates that take a keep/remove exit.
+/// Protected candidates do not update this state: a safety hold must not evict
+/// an older finished lane, so `max_count` / `max_total_bytes` can under-count
+/// on-disk usage.
 #[derive(Clone, Copy, Default)]
 struct WorktreeGcRetentionState {
     eligible_count: usize,
@@ -14087,6 +14096,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn gc_late_protection_does_not_consume_count_or_size_retention() {
+        // Conservative retention bias: a live/dirty hold must not evict an older
+        // finished lane. Protected candidates stay off the max_count / size budget.
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let worktree_root = temp.path().join("worktrees");
@@ -14823,6 +14834,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn gc_boundary_protection_does_not_consume_count_or_size_retention() {
+        // Conservative retention bias: apply-time dirtiness must not spend the
+        // budget that would otherwise keep the older finished lane.
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let worktree_root = temp.path().join("worktrees");
