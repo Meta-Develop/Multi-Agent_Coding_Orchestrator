@@ -563,16 +563,17 @@ mod tests {
     }
 
     fn record_with_reserve(reserve: i64, at: u64) -> InvocationRecord {
-        InvocationRecord {
-            policy_id: PolicyId::new("p").expect("policy"),
-            candidate_id: CandidateId::new("c").expect("cand"),
-            started_at: TimestampMillis::from_millis(at),
-            finished_at: Some(TimestampMillis::from_millis(at + 1)),
-            quota_snapshot: ResourceSnapshot {
+        let mut record = InvocationRecord::new(
+            PolicyId::new("p").expect("policy"),
+            CandidateId::new("c").expect("cand"),
+            TimestampMillis::from_millis(at),
+            ResourceSnapshot {
                 observed_at: TimestampMillis::from_millis(at),
                 vector: pool(reserve),
             },
-        }
+        );
+        record.finished_at = Some(TimestampMillis::from_millis(at + 1));
+        record
     }
 
     #[test]

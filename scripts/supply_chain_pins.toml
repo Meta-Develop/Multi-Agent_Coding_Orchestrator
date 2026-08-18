@@ -1,0 +1,4 @@
+# Shared supply-chain tool versions for GitHub Actions and the Nix devshell.
+# Update this file, then refresh the crate hashes in flake.nix together.
+cargo_audit = "0.22.2"
+cargo_deny = "0.20.2"
