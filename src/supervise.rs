@@ -106,6 +106,8 @@ use std::{
 };
 mod plan_api;
 pub use plan_api::*;
+mod model_policy;
+pub use model_policy::*;
 
 mod follow_up_cascade;
 use follow_up_cascade::*;
@@ -1757,6 +1759,14 @@ impl AgentRole {
             Self::GateClassifier => Some(ReasoningEffort::High),
             Self::Auditor => Some(ReasoningEffort::Xhigh),
             Self::Supervisor | Self::ChildOrchestrator | Self::Worker => None,
+        }
+    }
+
+    const fn minimum_model_capability(self) -> ModelCapabilityClass {
+        match self {
+            Self::Supervisor | Self::ChildOrchestrator => ModelCapabilityClass::GeneralJudgment,
+            Self::Worker => ModelCapabilityClass::WeakMechanical,
+            Self::GateClassifier | Self::Auditor => ModelCapabilityClass::CriticalJudgment,
         }
     }
 }

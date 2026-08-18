@@ -464,6 +464,10 @@ impl BudgetDegradationController {
                     .enumerate()
                     .find(|(_, model)| {
                         model.as_str() != before
+                            && model_is_eligible_degrade_target(
+                                AgentRole::ChildOrchestrator,
+                                model.as_str(),
+                            )
                             && catalog
                                 .availability(Some(model.as_str()), runtime)
                                 .is_ok_and(|availability| {
@@ -3111,7 +3115,7 @@ mod decomposition_tests {
             model_policy.apply(&plan).role_models[&AgentRole::ChildOrchestrator]
                 .model
                 .as_deref(),
-            Some(BALANCED_PROFILE_MODEL)
+            Some(ECONOMY_PROFILE_MODEL)
         );
         controller
             .assignment_policy(
@@ -3161,7 +3165,7 @@ mod decomposition_tests {
                 after,
                 resolved_candidate_index: 0,
                 ..
-            } if before == FRONTIER_PROFILE_MODEL && after == BALANCED_PROFILE_MODEL
+            } if before == FRONTIER_PROFILE_MODEL && after == ECONOMY_PROFILE_MODEL
         ));
         assert_eq!(
             controller.records[2].change,
@@ -3196,8 +3200,8 @@ mod decomposition_tests {
                     "assignment_id": "model-assignment",
                     "budget_action": "degrade",
                     "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
-                    "change": {"kind": "model_tier", "role": "child_orchestrator", "before": FRONTIER_PROFILE_MODEL, "after": BALANCED_PROFILE_MODEL, "resolved_candidate_index": 0},
-                    "effective_child_model": BALANCED_PROFILE_MODEL,
+                    "change": {"kind": "model_tier", "role": "child_orchestrator", "before": FRONTIER_PROFILE_MODEL, "after": ECONOMY_PROFILE_MODEL, "resolved_candidate_index": 0},
+                    "effective_child_model": ECONOMY_PROFILE_MODEL,
                     "effective_child_reasoning_effort": "high",
                     "effective_fan_out": 8,
                     "observation": "admission_policy_resolved"
@@ -3208,7 +3212,7 @@ mod decomposition_tests {
                     "budget_action": "degrade",
                     "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
                     "change": {"kind": "fan_out", "before": 8, "after": 4},
-                    "effective_child_model": BALANCED_PROFILE_MODEL,
+                    "effective_child_model": ECONOMY_PROFILE_MODEL,
                     "effective_child_reasoning_effort": "high",
                     "effective_fan_out": 4,
                     "observation": "admission_policy_resolved"
@@ -3219,7 +3223,7 @@ mod decomposition_tests {
                     "budget_action": "owner_escalation",
                     "budget_reasons": ["soft_token_ceiling_reached", "hard_token_ceiling_reached", "missing_pricing"],
                     "change": {"kind": "halt", "before_new_dispatch_allowed": true, "after_new_dispatch_allowed": false},
-                    "effective_child_model": BALANCED_PROFILE_MODEL,
+                    "effective_child_model": ECONOMY_PROFILE_MODEL,
                     "effective_child_reasoning_effort": "high",
                     "effective_fan_out": 4,
                     "observation": "admission_policy_resolved"

@@ -1162,12 +1162,12 @@ pub(super) fn provisional_default_role_model_selection(role: AgentRole) -> RoleM
     let (reasoning_effort, budget_degrade_models, on_exhausted) = match role {
         AgentRole::Supervisor => (
             "xhigh",
-            vec![BALANCED_PROFILE_MODEL, ECONOMY_PROFILE_MODEL],
+            vec![ECONOMY_PROFILE_MODEL],
             TerminalUnavailableModelFallback::RuntimeDefault,
         ),
         AgentRole::ChildOrchestrator | AgentRole::Auditor => (
             "xhigh",
-            vec![BALANCED_PROFILE_MODEL, ECONOMY_PROFILE_MODEL],
+            vec![ECONOMY_PROFILE_MODEL],
             TerminalUnavailableModelFallback::RuntimeDefault,
         ),
         AgentRole::Worker => (
@@ -1245,6 +1245,7 @@ pub(super) fn apply_role_model_selection(
     let selection = catalog
         .resolve_role_model_selection(&configured, runtime)?
         .selection;
+    validate_known_judgment_role_model(role, selection.model.as_deref())?;
     Ok(command.with_model_selection(selection.model, selection.reasoning_effort))
 }
 
@@ -1259,6 +1260,9 @@ pub(super) fn runtime_resolved_prompt_plan(
         let selection = catalog
             .resolve_role_model_selection(&configured, runtime)?
             .selection;
+        if role != AgentRole::Worker {
+            validate_known_judgment_role_model(role, selection.model.as_deref())?;
+        }
         resolved.role_models.insert(role, selection);
     }
     Ok(resolved)
@@ -1286,6 +1290,7 @@ pub(super) fn apply_review_lens_model_selection(
             .with_model_provider(None)
             .with_model_selection(None, None));
     }
+    validate_known_judgment_role_model(AgentRole::Auditor, Some(model))?;
     let resolved_effort = resolve_reasoning_effort(
         AgentRole::Auditor,
         assignment_reasoning_effort,
