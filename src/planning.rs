@@ -1036,6 +1036,7 @@ impl ProviderTreeValidationState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validated_provider_proposal(
     fragments: Vec<TaskSpecFragment>,
     provider_plan: ProviderRecursiveTaskPlan,

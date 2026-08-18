@@ -212,21 +212,21 @@ pub fn default_model_capability_policy() -> ModelCapabilityPolicy {
         source: "agent-registry#38 dated 2026-07/08 priors; cost per accepted task".to_string(),
         models: vec![
             ModelCapabilityEvidence {
-                model: "gpt-5.6-sol".to_string(),
+                model: super::FRONTIER_PROFILE_MODEL.to_string(),
                 capability: ModelCapabilityClass::CriticalJudgment,
                 eligible: true,
                 evidence: "repo-task pass 63.7%; SWE-Bench Pro 64.6%; planner/gate tier".to_string(),
                 as_of: "2026-08-17".to_string(),
             },
             ModelCapabilityEvidence {
-                model: "gpt-5.6-luna".to_string(),
+                model: super::ECONOMY_PROFILE_MODEL.to_string(),
                 capability: ModelCapabilityClass::GeneralJudgment,
                 eligible: true,
                 evidence: "Coding Agent Index 75 at ~20% of Sol per-task cost; Terminal-Bench 2.1 84.7%; SWE-Bench Pro 62.7%; tightly specified leaves only".to_string(),
                 as_of: "2026-08-17".to_string(),
             },
             ModelCapabilityEvidence {
-                model: "gpt-5.6-terra".to_string(),
+                model: super::BALANCED_PROFILE_MODEL.to_string(),
                 capability: ModelCapabilityClass::WeakMechanical,
                 eligible: false,
                 evidence: "agentic rank #112/302; repo-task pass 40.7%; ~2.65x tokens/solved task so higher cost per accepted task than Sol; do not use".to_string(),
