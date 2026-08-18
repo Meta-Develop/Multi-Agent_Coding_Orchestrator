@@ -778,6 +778,7 @@ fn canonical_reason(reason: GateDenialReason) -> Result<GateDenialReason> {
                 blocker,
                 ApplyBlocker::DirtyPrimary
                     | ApplyBlocker::StaleBase
+                    | ApplyBlocker::PrimaryStateChanged
                     | ApplyBlocker::ApplyCheckFailed
                     | ApplyBlocker::ExcludedReference
                     | ApplyBlocker::UnclaimedEdits
@@ -932,6 +933,7 @@ fn reason_for_apply_blocker(blocker: ApplyBlocker) -> GateDenialReason {
         | ApplyBlocker::ValidationFailed => GateDenialReason::ValidationRepair { blocker },
         ApplyBlocker::DirtyPrimary
         | ApplyBlocker::StaleBase
+        | ApplyBlocker::PrimaryStateChanged
         | ApplyBlocker::ApplyCheckFailed
         | ApplyBlocker::ExcludedReference
         | ApplyBlocker::UnclaimedEdits => GateDenialReason::MergeRemediation { blocker },
@@ -967,7 +969,9 @@ fn validate_context_source(reason: &GateDenialReason, source: GateCheckSource) -
             _ => false,
         },
         GateDenialReason::MergeRemediation { blocker } => match blocker {
-            ApplyBlocker::DirtyPrimary => source == GateCheckSource::PrimaryDrift,
+            ApplyBlocker::DirtyPrimary | ApplyBlocker::PrimaryStateChanged => {
+                source == GateCheckSource::PrimaryDrift
+            }
             ApplyBlocker::StaleBase => {
                 matches!(
                     source,
@@ -1070,6 +1074,7 @@ fn next_safe_operation_for(reason: &GateDenialReason) -> NextSafeOperation {
         GateDenialReason::ValidationRepair { .. } => NextSafeOperation::RepairValidation,
         GateDenialReason::MergeRemediation { blocker } => match blocker {
             ApplyBlocker::DirtyPrimary => NextSafeOperation::RestoreCleanPrimary,
+            ApplyBlocker::PrimaryStateChanged => NextSafeOperation::RefreshCandidateBase,
             ApplyBlocker::StaleBase => NextSafeOperation::RefreshCandidateBase,
             ApplyBlocker::ApplyCheckFailed => NextSafeOperation::RepairMergeConflict,
             ApplyBlocker::ExcludedReference => NextSafeOperation::RemediateExcludedReference,
@@ -1185,6 +1190,7 @@ fn reason_label(reason: &GateDenialReason) -> &'static str {
         },
         GateDenialReason::MergeRemediation { blocker } => match blocker {
             ApplyBlocker::DirtyPrimary => "dirty primary",
+            ApplyBlocker::PrimaryStateChanged => "primary state changed after preview",
             ApplyBlocker::StaleBase => "stale candidate base",
             ApplyBlocker::ApplyCheckFailed => "merge apply check failed",
             ApplyBlocker::ExcludedReference => "excluded reference",
@@ -1854,6 +1860,12 @@ mod tests {
                 GateCheckSource::PrimaryDrift,
                 GateDenialRoute::IntegrationController,
                 NextSafeOperation::RestoreCleanPrimary,
+            ),
+            (
+                ApplyBlocker::PrimaryStateChanged,
+                GateCheckSource::PrimaryDrift,
+                GateDenialRoute::IntegrationController,
+                NextSafeOperation::RefreshCandidateBase,
             ),
             (
                 ApplyBlocker::StaleBase,

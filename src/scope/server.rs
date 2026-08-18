@@ -40,6 +40,7 @@ struct ServerConfig {
     accept_poll_interval: Duration,
     stream_poll_interval: Duration,
     stream_heartbeat_interval: Duration,
+    simulate_spawn_failure: bool,
 }
 
 impl ServerConfig {
@@ -53,6 +54,7 @@ impl ServerConfig {
             accept_poll_interval: ACCEPT_POLL_INTERVAL,
             stream_poll_interval: STREAM_POLL_INTERVAL,
             stream_heartbeat_interval: STREAM_HEARTBEAT_INTERVAL,
+            simulate_spawn_failure: false,
         }
     }
 }
@@ -146,12 +148,7 @@ fn serve_listener_with_config(
                 };
                 let source = Arc::clone(&source);
                 let connection_shutdown = Arc::clone(&shutdown);
-                thread::Builder::new()
-                    .name("maco-scope-http".to_string())
-                    .spawn(move || {
-                        let _permit = permit;
-                        let _ = handle_connection(stream, source, connection_shutdown, config);
-                    })?;
+                start_connection_thread(stream, source, connection_shutdown, config, permit);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(config.accept_poll_interval);
@@ -183,6 +180,33 @@ impl Drop for ConnectionPermit {
     }
 }
 
+fn start_connection_thread(
+    mut stream: TcpStream,
+    source: Arc<dyn ScopeDataSource>,
+    shutdown: Arc<AtomicBool>,
+    config: ServerConfig,
+    permit: ConnectionPermit,
+) {
+    if config.simulate_spawn_failure {
+        let _permit = permit;
+        let _ = write_spawn_unavailable(&mut stream);
+        return;
+    }
+    let mut reply = stream.try_clone().ok();
+    if thread::Builder::new()
+        .name("maco-scope-http".to_string())
+        .spawn(move || {
+            let _permit = permit;
+            let _ = handle_connection(stream, source, shutdown, config);
+        })
+        .is_err()
+    {
+        if let Some(reply) = reply.as_mut() {
+            let _ = write_spawn_unavailable(reply);
+        }
+    }
+}
+
 fn handle_connection(
     mut stream: TcpStream,
     source: Arc<dyn ScopeDataSource>,
@@ -194,6 +218,16 @@ fn handle_connection(
     let Some(request) = read_request(&mut stream)? else {
         return Ok(());
     };
+
+    if !request_host_is_loopback(request.host.as_deref()) {
+        return write_json_response(
+            &mut stream,
+            "403 Forbidden",
+            &json!({"error": "host not allowed"}),
+            &[],
+            config.max_json_response_bytes,
+        );
+    }
 
     if request.method != "GET" {
         return write_json_response(
@@ -548,6 +582,7 @@ struct Request {
     method: String,
     path: String,
     query: Option<String>,
+    host: Option<String>,
     last_event_id: Option<String>,
 }
 
@@ -605,6 +640,8 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
     }
     let mut last_event_id = None;
     let mut last_event_id_seen = false;
+    let mut host = None;
+    let mut host_seen = false;
     for line in header.lines().skip(1) {
         if line.is_empty() {
             break;
@@ -621,14 +658,55 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
             }
             last_event_id_seen = true;
             last_event_id = Some(value.trim().to_string());
+        } else if name.trim().eq_ignore_ascii_case("Host") {
+            if host_seen {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate Host header",
+                ));
+            }
+            host_seen = true;
+            host = Some(value.trim().to_string());
         }
     }
     Ok(Some(Request {
         method: method.to_string(),
         path: path.to_string(),
         query: query.map(str::to_string),
+        host,
         last_event_id,
     }))
+}
+
+fn request_host_is_loopback(host: Option<&str>) -> bool {
+    let Some(host) = host.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    matches!(
+        hostname_from_host_header(host)
+            .to_ascii_lowercase()
+            .as_str(),
+        "localhost" | "127.0.0.1" | "[::1]" | "::1"
+    )
+}
+
+fn hostname_from_host_header(host: &str) -> &str {
+    if host.eq_ignore_ascii_case("::1") {
+        return host;
+    }
+    if let Some(end) = host.find(']') {
+        return &host[..=end];
+    }
+    match host.rsplit_once(':') {
+        Some((name, port))
+            if !name.is_empty()
+                && !name.contains(':')
+                && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            name
+        }
+        _ => host,
+    }
 }
 
 fn write_request_too_large(stream: &mut TcpStream) -> io::Result<Option<Request>> {
@@ -677,6 +755,19 @@ fn write_json_response<T: Serialize + ?Sized>(
         "application/json; charset=utf-8",
         &body,
         extra_headers,
+    )
+}
+
+fn write_spawn_unavailable(stream: &mut TcpStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(OVER_CAPACITY_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(OVER_CAPACITY_IO_TIMEOUT))?;
+    drain_request_headers(stream);
+    write_json_response(
+        stream,
+        "503 Service Unavailable",
+        &json!({"error": "failed to start Scope connection"}),
+        &["Retry-After: 1"],
+        MAX_JSON_RESPONSE_BYTES,
     )
 }
 
@@ -977,6 +1068,7 @@ mod tests {
             accept_poll_interval: Duration::from_millis(1),
             stream_poll_interval: Duration::from_millis(5),
             stream_heartbeat_interval: Duration::from_millis(20),
+            simulate_spawn_failure: false,
         }
     }
 
@@ -1051,6 +1143,84 @@ mod tests {
         response
     }
 
+    fn http_get_with_host(address: SocketAddr, path: &str, host: Option<&str>) -> String {
+        let mut stream = TcpStream::connect(address).expect("connect to test server");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set test read timeout");
+        match host {
+            Some(host) => write!(
+                stream,
+                "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write hosted request"),
+            None => write!(stream, "GET {path} HTTP/1.1\r\nConnection: close\r\n\r\n")
+                .expect("write hostless request"),
+        }
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read hosted HTTP response");
+        response
+    }
+
+    #[test]
+    fn loopback_host_header_allows_only_local_names() {
+        for host in [
+            "localhost",
+            "LocalHost",
+            "localhost:7878",
+            "127.0.0.1",
+            "127.0.0.1:9",
+            "[::1]",
+            "[::1]:7878",
+            "::1",
+        ] {
+            assert!(
+                request_host_is_loopback(Some(host)),
+                "rejected loopback host {host}"
+            );
+        }
+        for host in [
+            None,
+            Some(""),
+            Some("attacker.example"),
+            Some("attacker.example:7878"),
+            Some("192.0.2.1"),
+            Some("[::]"),
+            Some("localhost.attacker.example"),
+            Some("127.0.0.1.nip.io"),
+        ] {
+            assert!(
+                !request_host_is_loopback(host),
+                "accepted non-loopback host {host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_loopback_or_missing_host_headers() {
+        let source: Arc<dyn ScopeDataSource> =
+            Arc::new(TestDataSource::new(json!({"projects": []}), Vec::new()));
+        let mut server = TestServer::start(source, test_config());
+
+        let allowed = http_get_with_host(server.address, "/api/projects", Some("127.0.0.1:7878"));
+        assert!(
+            allowed.starts_with("HTTP/1.1 200 OK"),
+            "loopback host rejected: {allowed}"
+        );
+
+        for host in [None, Some("attacker.example"), Some("192.0.2.1:7878")] {
+            let response = http_get_with_host(server.address, "/api/projects", host);
+            assert!(
+                response.starts_with("HTTP/1.1 403 Forbidden"),
+                "unexpected response for host {host:?}: {response}"
+            );
+            assert!(response.contains("host not allowed"));
+        }
+        server.stop();
+    }
+
     #[test]
     fn accepts_only_numeric_loopback_bind_addresses() {
         assert_eq!(
@@ -1109,6 +1279,7 @@ mod tests {
             method: "GET".to_string(),
             path: "/api/stream".to_string(),
             query: Some("repo=repo+space&family=o2%2Dautopilot&run=run%2Fone&since=41".to_string()),
+            host: Some("localhost".to_string()),
             last_event_id: None,
         })
         .expect("stream options");
@@ -1121,6 +1292,7 @@ mod tests {
             method: "GET".to_string(),
             path: "/api/stream".to_string(),
             query: Some("since=now".to_string()),
+            host: Some("localhost".to_string()),
             last_event_id: Some("9".to_string()),
         })
         .expect("Last-Event-ID override");
@@ -1137,6 +1309,7 @@ mod tests {
                     method: "GET".to_string(),
                     path: "/api/stream".to_string(),
                     query: Some(query.to_string()),
+                    host: Some("localhost".to_string()),
                     last_event_id: None,
                 })
                 .is_err(),
@@ -1244,6 +1417,35 @@ mod tests {
         assert!(response.contains("var projectionGroups = new Map()"));
         assert!(response.contains("state.view === \"repository\""));
         assert!(response.contains("state.view === \"combined\""));
+        server.stop();
+    }
+
+    #[test]
+    fn spawn_failure_refuses_one_connection_and_keeps_accepting() {
+        let source: Arc<dyn ScopeDataSource> =
+            Arc::new(TestDataSource::new(json!({"projects": []}), Vec::new()));
+        let mut fail_config = test_config();
+        fail_config.simulate_spawn_failure = true;
+        let mut failing = TestServer::start(Arc::clone(&source), fail_config);
+        let refused = http_get(failing.address, "/api/projects");
+        assert!(
+            refused.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "spawn failure should not terminate the listener: {refused}"
+        );
+        assert!(refused.contains("failed to start Scope connection"));
+        let still_listening = http_get(failing.address, "/api/projects");
+        assert!(
+            still_listening.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "accept loop exited after spawn failure: {still_listening}"
+        );
+        failing.stop();
+
+        let mut server = TestServer::start(source, test_config());
+        let recovered = http_get(server.address, "/api/projects");
+        assert!(
+            recovered.starts_with("HTTP/1.1 200 OK"),
+            "healthy listener should still serve: {recovered}"
+        );
         server.stop();
     }
 
