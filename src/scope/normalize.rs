@@ -142,6 +142,7 @@ pub struct CachedScope {
     snapshot: Option<ScopeSnapshot>,
     run_roots: Vec<RunRootWatch>,
     journals: BTreeMap<RunKey, JournalWatch>,
+    pending_runs: BTreeMap<RunKey, PendingRunWatch>,
     current_stream: Vec<SequencedFamilyEvent>,
     stream_history: Vec<SequencedFamilyEvent>,
     next_event_id: u64,
@@ -178,6 +179,15 @@ struct JournalWatch {
     position: JournalPosition,
 }
 
+#[derive(Clone, Debug)]
+struct PendingRunWatch {
+    repository_root: PathBuf,
+    family_directory: &'static str,
+    path: PathBuf,
+    fingerprint: Option<FileFingerprint>,
+    journal_fingerprint: Option<FileFingerprint>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FileFingerprint {
     length: u64,
@@ -195,6 +205,7 @@ impl CachedScope {
             snapshot: None,
             run_roots: Vec::new(),
             journals: BTreeMap::new(),
+            pending_runs: BTreeMap::new(),
             current_stream: Vec::new(),
             stream_history: Vec::new(),
             next_event_id: 1,
@@ -236,6 +247,24 @@ impl CachedScope {
                     }
                 }
                 Ok(_) | Err(_) => {
+                    rebuild_repositories.insert(key.repo.clone());
+                }
+            }
+        }
+
+        for (key, watch) in &self.pending_runs {
+            if rebuild_repositories.contains(&key.repo) {
+                continue;
+            }
+            match watch.current_state() {
+                Ok((fingerprint, journal_fingerprint))
+                    if fingerprint != watch.fingerprint
+                        || journal_fingerprint != watch.journal_fingerprint =>
+                {
+                    rebuild_repositories.insert(key.repo.clone());
+                }
+                Ok(_) => {}
+                Err(_) => {
                     rebuild_repositories.insert(key.repo.clone());
                 }
             }
@@ -425,6 +454,7 @@ impl CachedScope {
             });
         }
         self.journals.retain(|key, _| key.repo != repo_id);
+        self.pending_runs.retain(|key, _| key.repo != repo_id);
         self.extend_journal_watches_for(repo_id);
         Ok(())
     }
@@ -585,6 +615,7 @@ impl CachedScope {
 
     fn rebuild_journal_watches(&mut self) {
         self.journals.clear();
+        self.pending_runs.clear();
         let repo_ids = self
             .snapshot
             .as_ref()
@@ -616,25 +647,43 @@ impl CachedScope {
             return;
         };
         for run in &project.runs {
-            let Some(position) = run.journal.clone() else {
-                continue;
-            };
             let Some((_, family_directory)) = RUN_FAMILIES
                 .iter()
                 .find(|(family, _)| *family == run.family)
             else {
                 continue;
             };
-            self.journals.insert(
-                RunKey {
-                    repo: repo_id.to_string(),
-                    family: run.family.clone(),
-                    run: run.run.clone(),
-                },
-                JournalWatch {
-                    repository_root: target.path.clone(),
-                    family_directory,
-                    position,
+            let key = RunKey {
+                repo: repo_id.to_string(),
+                family: run.family.clone(),
+                run: run.run.clone(),
+            };
+            if let Some(position) = run.journal.clone() {
+                self.journals.insert(
+                    key,
+                    JournalWatch {
+                        repository_root: target.path.clone(),
+                        family_directory,
+                        position,
+                    },
+                );
+                continue;
+            }
+            let pending = PendingRunWatch {
+                repository_root: target.path.clone(),
+                family_directory,
+                path: run.run_dir.clone(),
+                fingerprint: None,
+                journal_fingerprint: None,
+            };
+            let (fingerprint, journal_fingerprint) =
+                pending.current_state().unwrap_or((None, None));
+            self.pending_runs.insert(
+                key,
+                PendingRunWatch {
+                    fingerprint,
+                    journal_fingerprint,
+                    ..pending
                 },
             );
         }
@@ -646,6 +695,41 @@ impl CachedScope {
                 watch.fingerprint = fingerprint;
             }
         }
+    }
+}
+
+impl PendingRunWatch {
+    fn current_state(&self) -> io::Result<(Option<FileFingerprint>, Option<FileFingerprint>)> {
+        Ok((self.directory_fingerprint()?, self.journal_fingerprint()?))
+    }
+
+    fn directory_fingerprint(&self) -> io::Result<Option<FileFingerprint>> {
+        let Some(run_name) = self.path.file_name().and_then(|name| name.to_str()) else {
+            return Err(invalid_data("Scope pending run path is missing a name"));
+        };
+        let components = [".maco", self.family_directory, "runs", run_name];
+        let Some(path) = validate_directory_chain(&self.repository_root, &components)? else {
+            return Ok(None);
+        };
+        if path != self.path {
+            return Err(invalid_data(format!(
+                "Scope pending run path changed at {}",
+                self.path.display()
+            )));
+        }
+        directory_fingerprint(&path)
+    }
+
+    fn journal_fingerprint(&self) -> io::Result<Option<FileFingerprint>> {
+        let Some(run_name) = self.path.file_name().and_then(|name| name.to_str()) else {
+            return Err(invalid_data("Scope pending run path is missing a name"));
+        };
+        let components = [".maco", self.family_directory, "runs", run_name, "events"];
+        let Some(events_directory) = validate_directory_chain(&self.repository_root, &components)?
+        else {
+            return Ok(None);
+        };
+        journal_fingerprint(&events_directory.join("orchestration.jsonl"))
     }
 }
 
@@ -2622,6 +2706,69 @@ mod tests {
             .expect("completed run");
         assert_eq!(events.len(), 2);
         assert!(events.iter().any(|event| event.node == "second"));
+    }
+
+    #[test]
+    fn cached_scope_picks_up_journal_created_after_first_scan() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run_dir = temp.path().join(".maco/o2/runs/late-journal");
+        fs::create_dir_all(&run_dir).expect("create run directory");
+        let mut cache = CachedScope::new(vec![target(temp.path())]);
+        assert!(cache.refresh().expect("initial run-dir scan"));
+        let initial = cache
+            .snapshot()
+            .expect("initial snapshot")
+            .events_for_run("repo-one", "o2", "late-journal")
+            .expect("fallback run");
+        assert!(initial
+            .iter()
+            .any(|event| event.payload["synthetic"] == true));
+        let key = RunKey {
+            repo: "repo-one".to_string(),
+            family: "o2".to_string(),
+            run: "late-journal".to_string(),
+        };
+        assert!(cache.pending_runs.contains_key(&key));
+        assert!(!cache.journals.contains_key(&key));
+
+        write(
+            &run_dir.join("events/orchestration.jsonl"),
+            &journal_event("late-worker"),
+        );
+        assert!(cache.refresh().expect("late journal refresh"));
+        let events = cache
+            .snapshot()
+            .expect("late snapshot")
+            .events_for_run("repo-one", "o2", "late-journal")
+            .expect("journal run");
+        assert!(events.iter().any(|event| event.node == "late-worker"));
+        assert!(!events
+            .iter()
+            .any(|event| event.payload["synthetic"] == true));
+        assert!(cache.journals.contains_key(&key));
+        assert!(!cache.pending_runs.contains_key(&key));
+    }
+
+    #[test]
+    fn cached_scope_picks_up_late_state_on_journal_less_run() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run_dir = temp.path().join(".maco/o2/runs/late-state");
+        fs::create_dir_all(&run_dir).expect("create run directory");
+        let mut cache = CachedScope::new(vec![target(temp.path())]);
+        assert!(cache.refresh().expect("initial fallback scan"));
+        write(
+            &run_dir.join("STATE.tsv"),
+            "key\tvalue\nupdated_at\t2026-07-20T01:00:00Z\ncurrent_phase\trunning\n",
+        );
+        assert!(cache.refresh().expect("late state refresh"));
+        let events = cache
+            .snapshot()
+            .expect("late state snapshot")
+            .events_for_run("repo-one", "o2", "late-state")
+            .expect("fallback run");
+        assert!(events.iter().any(|event| {
+            event.kind == OrchestrationEventKind::Status && event.payload["source"] == "STATE.tsv"
+        }));
     }
 
     #[test]
