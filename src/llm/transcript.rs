@@ -228,36 +228,36 @@ struct LineRedaction {
 }
 
 fn redact_secret_assignment_line(line: &str) -> LineRedaction {
-    let Some((delimiter_index, delimiter)) = find_assignment_delimiter(line) else {
-        return LineRedaction {
-            text: line.to_string(),
-            changed: false,
+    let mut search_from = 0;
+    while search_from < line.len() {
+        let Some((relative_index, delimiter)) = find_assignment_delimiter(&line[search_from..])
+        else {
+            break;
         };
-    };
-
-    let key = line[..delimiter_index].trim();
-    if !is_secret_key(key) {
-        return LineRedaction {
-            text: line.to_string(),
-            changed: false,
-        };
+        let delimiter_index = search_from + relative_index;
+        let value_start = delimiter_index + delimiter.len();
+        let key = trailing_assignment_key(&line[..delimiter_index]);
+        if is_secret_key(key) {
+            let value = &line[value_start..];
+            if !value.trim().is_empty() {
+                let leading_ws_len = value.len().saturating_sub(value.trim_start().len());
+                let prefix = &line[..value_start];
+                let leading_ws = &value[..leading_ws_len];
+                return LineRedaction {
+                    text: format!("{prefix}{leading_ws}<redacted:secret>"),
+                    changed: true,
+                };
+            }
+        }
+        if delimiter.is_empty() {
+            break;
+        }
+        search_from = value_start;
     }
 
-    let value_start = delimiter_index + delimiter.len();
-    let prefix = &line[..value_start];
-    let value = &line[value_start..];
-    if value.trim().is_empty() {
-        return LineRedaction {
-            text: line.to_string(),
-            changed: false,
-        };
-    }
-
-    let leading_ws_len = value.len().saturating_sub(value.trim_start().len());
-    let leading_ws = &value[..leading_ws_len];
     LineRedaction {
-        text: format!("{prefix}{leading_ws}<redacted:secret>"),
-        changed: true,
+        text: line.to_string(),
+        changed: false,
     }
 }
 
@@ -274,6 +274,24 @@ fn find_assignment_delimiter(line: &str) -> Option<(usize, &'static str)> {
     }
 }
 
+fn trailing_assignment_key(prefix: &str) -> &str {
+    let trimmed = prefix.trim_end();
+    let start = trimmed
+        .rfind(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '"' | '\''))
+        })
+        .map(|index| {
+            index
+                + trimmed[index..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or(1)
+        })
+        .unwrap_or(0);
+    &trimmed[start..]
+}
+
 fn is_secret_key(key: &str) -> bool {
     let normalized = key
         .trim_matches(|c: char| c == '"' || c == '\'' || c.is_whitespace())
@@ -285,6 +303,8 @@ fn is_secret_key(key: &str) -> bool {
         || normalized.contains("PASSWORD")
         || normalized.contains("PRIVATE_KEY")
         || normalized.contains("API_KEY")
+        || normalized.contains("AUTHORIZATION")
+        || normalized.contains("BEARER")
 }
 
 #[cfg(test)]
@@ -336,5 +356,30 @@ mod tests {
         assert_eq!(redacted.turns[0].content, "token=<redacted:secret>");
         assert_eq!(redacted.turns[1].role, TurnRole::Assistant);
         assert_eq!(summary.total_replacements, 1);
+    }
+
+    #[test]
+    fn redacts_secret_assignments_after_the_first_delimiter_on_a_line() {
+        let redactor = Redactor::new();
+
+        let json = redactor.redact(r#"{"user":"a","api_key":"sk-test123"}"#);
+        assert_eq!(json.text, r#"{"user":"a","api_key":<redacted:secret>"#);
+        assert_eq!(json.summary.by_label.get("secret"), Some(&1));
+
+        let env = redactor.redact("env: API_TOKEN=abc");
+        assert_eq!(env.text, "env: API_TOKEN=<redacted:secret>");
+
+        let curl = redactor.redact("cmd=curl -H 'X-Api-Key: v'");
+        assert_eq!(curl.text, "cmd=curl -H 'X-Api-Key: <redacted:secret>");
+
+        let header = redactor.redact("Authorization: Bearer tok");
+        assert_eq!(header.text, "Authorization: <redacted:secret>");
+
+        let bearer = redactor.redact("proxy-authorization: Bearer tok");
+        assert_eq!(bearer.text, "proxy-authorization: <redacted:secret>");
+
+        let unchanged = redactor.redact(r#"{"user":"a","name":"visible"}"#);
+        assert_eq!(unchanged.text, r#"{"user":"a","name":"visible"}"#);
+        assert_eq!(unchanged.summary.total_replacements, 0);
     }
 }
