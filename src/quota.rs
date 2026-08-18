@@ -140,7 +140,8 @@ impl QuotaLedger {
     }
 
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
-        let ledger: Self = serde_json::from_slice(bytes).context("quota ledger is not valid JSON")?;
+        let ledger: Self =
+            serde_json::from_slice(bytes).context("quota ledger is not valid JSON")?;
         if ledger.version != QUOTA_LEDGER_VERSION {
             bail!(
                 "unsupported quota ledger version {} (expected {QUOTA_LEDGER_VERSION})",
@@ -229,12 +230,7 @@ pub fn admission_concurrency_cap(entitlement: &QuotaEntitlement) -> Option<u32> 
     entitlement.max_concurrent_sessions
 }
 
-fn metered_usd(
-    input_tokens: u64,
-    output_tokens: u64,
-    input_rate: f64,
-    output_rate: f64,
-) -> f64 {
+fn metered_usd(input_tokens: u64, output_tokens: u64, input_rate: f64, output_rate: f64) -> f64 {
     (input_tokens as f64) * input_rate / 1_000_000.0
         + (output_tokens as f64) * output_rate / 1_000_000.0
 }
@@ -287,9 +283,7 @@ mod tests {
         assert_eq!(cheap.usd, 0.0);
         assert!(exhaustion_action(&cheap).is_none());
 
-        ledger
-            .record(entitlement.key(), 1_000, 1)
-            .expect("record");
+        ledger.record(entitlement.key(), 1_000, 1).expect("record");
         let over = marginal_cost(&entitlement, &ledger, 100, 0).expect("exhausted");
         assert!(over.exhausted);
         assert!(over.usd > 0.0);

@@ -194,9 +194,8 @@ impl ModelCapabilityPolicy {
     /// Eligible capability for `model`, or `None` when the slug is unknown or
     /// explicitly ineligible.
     pub fn capability_for(&self, model: &str) -> Option<ModelCapabilityClass> {
-        self.lookup(model).and_then(|entry| {
-            entry.eligible.then_some(entry.capability)
-        })
+        self.lookup(model)
+            .and_then(|entry| entry.eligible.then_some(entry.capability))
     }
 }
 
@@ -455,19 +454,19 @@ mod tests {
 
     #[test]
     fn unknown_and_ineligible_models_fail_closed_for_judgment_roles() {
-        let error = validate_known_judgment_role_model(
-            AgentRole::ChildOrchestrator,
-            Some("priced-model"),
-        )
-        .expect_err("unknown model");
-        assert!(error.to_string().contains("has no trusted capability policy"));
+        let error =
+            validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("priced-model"))
+                .expect_err("unknown model");
+        assert!(error
+            .to_string()
+            .contains("has no trusted capability policy"));
 
-        let terra = validate_known_judgment_role_model(
-            AgentRole::ChildOrchestrator,
-            Some("gpt-5.6-terra"),
-        )
-        .expect_err("ineligible terra");
-        assert!(terra.to_string().contains("has no trusted capability policy"));
+        let terra =
+            validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("gpt-5.6-terra"))
+                .expect_err("ineligible terra");
+        assert!(terra
+            .to_string()
+            .contains("has no trusted capability policy"));
 
         validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("gpt-5.6-luna"))
             .expect("luna is general judgment");
@@ -488,7 +487,9 @@ mod tests {
             ModelCapabilityClass::WeakMechanical,
         )
         .expect_err("weak child");
-        assert!(error.to_string().contains("weak-model binding is forbidden"));
+        assert!(error
+            .to_string()
+            .contains("weak-model binding is forbidden"));
 
         validate_phase_model_binding(
             AgentRole::Worker,
@@ -509,11 +510,9 @@ mod tests {
 
     #[test]
     fn fixture_overlay_restores_previous_policy() {
-        let _guard = install_test_fixture_models(&[(
-            "priced-model",
-            ModelCapabilityClass::GeneralJudgment,
-        )])
-        .expect("install fixture");
+        let _guard =
+            install_test_fixture_models(&[("priced-model", ModelCapabilityClass::GeneralJudgment)])
+                .expect("install fixture");
         validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("priced-model"))
             .expect("fixture model is authorized");
         drop(_guard);

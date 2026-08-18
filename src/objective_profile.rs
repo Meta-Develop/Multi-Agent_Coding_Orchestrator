@@ -154,8 +154,7 @@ impl ObjectiveProfile {
         breadth_basis_points: u32,
         anti_shortcut_basis_points: u32,
     ) -> u32 {
-        let weighted = u64::from(held_out_basis_points)
-            * u64::from(self.quality.held_out_percent)
+        let weighted = u64::from(held_out_basis_points) * u64::from(self.quality.held_out_percent)
             + u64::from(breadth_basis_points) * u64::from(self.quality.breadth_percent)
             + u64::from(anti_shortcut_basis_points) * u64::from(self.quality.anti_shortcut_percent);
         (weighted / 100) as u32
@@ -237,18 +236,9 @@ mod tests {
     fn default_profile_reproduces_50_25_25_and_hashes_stably() {
         let profile = default_objective_profile();
         profile.validate().expect("default");
-        assert_eq!(
-            profile.overall_quality_basis_points(10_000, 0, 0),
-            5_000
-        );
-        assert_eq!(
-            profile.overall_quality_basis_points(0, 10_000, 0),
-            2_500
-        );
-        assert_eq!(
-            profile.overall_quality_basis_points(0, 0, 10_000),
-            2_500
-        );
+        assert_eq!(profile.overall_quality_basis_points(10_000, 0, 0), 5_000);
+        assert_eq!(profile.overall_quality_basis_points(0, 10_000, 0), 2_500);
+        assert_eq!(profile.overall_quality_basis_points(0, 0, 10_000), 2_500);
         let first = profile.content_hash().expect("hash");
         let second = profile.content_hash().expect("hash");
         assert_eq!(first, second);

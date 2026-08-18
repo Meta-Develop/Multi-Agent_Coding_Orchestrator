@@ -2713,9 +2713,9 @@ fn calculate_quality(
 pub fn bound_objective_profile(
     profile: &ObjectiveProfile,
 ) -> Result<ObjectiveProfileBinding, EvaluationError> {
-    profile.binding().map_err(|error| {
-        invalid_results("objective_profile", error.to_string())
-    })
+    profile
+        .binding()
+        .map_err(|error| invalid_results("objective_profile", error.to_string()))
 }
 
 #[cfg(test)]

@@ -2759,10 +2759,7 @@ fn provider_planning_session_lowers_recursive_tree_and_binds_run_identity() {
             id: "parent".to_string(),
             task: "Coordinate alpha and beta".to_string(),
             fragment_ids: vec!["fragment-001".to_string(), "fragment-002".to_string()],
-            assigned_paths: vec![
-                PathBuf::from("src/alpha.rs"),
-                PathBuf::from("src/beta.rs"),
-            ],
+            assigned_paths: vec![PathBuf::from("src/alpha.rs"), PathBuf::from("src/beta.rs")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
             child_assignments: vec![

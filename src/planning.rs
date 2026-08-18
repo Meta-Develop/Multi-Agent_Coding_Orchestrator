@@ -2806,7 +2806,8 @@ mod tests {
             git2::Repository::init(repo).expect("init repo");
             write_file(repo, "src/alpha.rs", "pub fn alpha_task() {}\n");
             write_file(repo, "src/beta.rs", "pub fn beta_task() {}\n");
-            let config = ProviderPlanningConfig::new("recursive", "planner-model").with_max_depth(3);
+            let config =
+                ProviderPlanningConfig::new("recursive", "planner-model").with_max_depth(3);
             let provider_plan = ProviderRecursiveTaskPlan {
                 assignments: vec![ProviderTaskAssignmentTree {
                     id: "parent".to_string(),
@@ -2997,7 +2998,9 @@ mod tests {
                 &config,
             )
             .expect_err("reclaiming completed scope must fail");
-            assert!(reclaim_error.to_string().contains("reclaims completed scope"));
+            assert!(reclaim_error
+                .to_string()
+                .contains("reclaims completed scope"));
         });
     }
 

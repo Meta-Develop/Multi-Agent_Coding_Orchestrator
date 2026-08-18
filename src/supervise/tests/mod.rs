@@ -1021,11 +1021,9 @@ fn assert_parseable_partial_usage_is_conservative(
     run_id: &str,
     partial_outcome: ParseablePartialRunOutcome,
 ) {
-    let _capability = install_test_fixture_models(&[(
-        "priced-model",
-        ModelCapabilityClass::CriticalJudgment,
-    )])
-    .expect("partial-usage fixture capability policy");
+    let _capability =
+        install_test_fixture_models(&[("priced-model", ModelCapabilityClass::CriticalJudgment)])
+            .expect("partial-usage fixture capability policy");
     let (temp, repo_path) = injected_repository();
     let child_a = injected_named_assignment("child-a", "README.md");
     let child_b = injected_named_assignment("child-b", "src/lib.rs");

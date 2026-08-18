@@ -3,11 +3,7 @@
 //! Materializes a versioned labeled corpus from allowlisted raw rows. Evidence
 //! is synthetic/fake and ineligible for production defaults.
 
-use crate::{
-    artifacts::state_auth::sha256_hex,
-    evaluation::EvaluationError,
-    llm::Redactor,
-};
+use crate::{artifacts::state_auth::sha256_hex, evaluation::EvaluationError, llm::Redactor};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -611,8 +607,8 @@ mod tests {
         let mut raw: RawGatePolicyCorpus =
             serde_json::from_str(RAW_FIXTURE).expect("parse raw fixture");
         raw.cases[1].expected_decision = GatePolicyDecision::Block;
-        let error = materialize_gate_policy_corpus(raw, &Redactor::new())
-            .expect_err("conflicting labels");
+        let error =
+            materialize_gate_policy_corpus(raw, &Redactor::new()).expect_err("conflicting labels");
         assert!(error
             .to_string()
             .contains("conflicting labels for an identical post-redaction semantic case"));
