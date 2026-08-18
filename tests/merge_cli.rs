@@ -393,7 +393,7 @@ fn merge_apply_revalidates_clean_committed_primary_after_candidate_validation() 
     );
     assert_contains(
         &report["preview"]["safety"]["readiness"]["blockers"],
-        "apply_check_failed",
+        "primary_state_changed",
     )?;
     assert_contains(
         &report["preview"]["safety"]["readiness"]["forced"],

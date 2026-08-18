@@ -904,16 +904,21 @@ fn import_line(line: &str) -> bool {
         || line.starts_with("extern crate ")
 }
 
+fn line_in_range(line: usize, start: usize, end: usize) -> bool {
+    start <= line && line <= end
+}
+
 fn signature_changed(symbol: &SemanticSymbol, changes: &FilePatchChanges) -> bool {
+    let start = symbol.span.start_line;
+    let span_end = symbol.span.end_line.max(start);
+    let signature_end = symbol.span.signature_end_line.max(start);
     changes
         .added_text
         .iter()
-        .filter(|(line, _)| *line == symbol.span.start_line)
-        .any(|(_, line)| line_mentions_signature(line, symbol))
-        || changes
-            .removed_text
-            .iter()
-            .any(|(_, line)| line_mentions_signature(line, symbol))
+        .any(|(line, _)| line_in_range(*line, start, signature_end))
+        || changes.removed_text.iter().any(|(line, text)| {
+            line_in_range(*line, start, span_end) && line_mentions_signature(text, symbol)
+        })
 }
 
 fn line_mentions_signature(line: &str, symbol: &SemanticSymbol) -> bool {
@@ -1244,5 +1249,74 @@ mod tests {
             overlap_risk(SemanticConflictOverlapKind::FormattingOnly),
             SemanticConflictRisk::Low
         );
+    }
+
+    fn test_symbol(
+        kind: SemanticSymbolKind,
+        name: &str,
+        start_line: usize,
+        end_line: usize,
+        signature_end_line: usize,
+    ) -> SemanticSymbol {
+        SemanticSymbol {
+            id: name.to_string(),
+            file: PathBuf::from("src/lib.rs"),
+            name: name.to_string(),
+            qualified_path: vec!["crate".to_string(), name.to_string()],
+            kind,
+            visibility: "public".to_string(),
+            parent_symbol: None,
+            impl_target: None,
+            impl_trait: None,
+            span: repo_semantic::SourceSpan {
+                start_byte: 0,
+                end_byte: 1,
+                start_line,
+                end_line,
+                signature_end_line,
+            },
+        }
+    }
+
+    #[test]
+    fn signature_changed_ignores_unrelated_removed_mentions() {
+        let symbol = test_symbol(SemanticSymbolKind::Function, "foo", 10, 20, 12);
+        let changes = FilePatchChanges {
+            removed_text: vec![line(2, "// see fn foo elsewhere\n")],
+            added_text: vec![line(2, "// note\n")],
+            ..FilePatchChanges::default()
+        };
+        assert!(!signature_changed(&symbol, &changes));
+
+        let impl_symbol = test_symbol(SemanticSymbolKind::Impl, "Worker", 30, 40, 30);
+        let impl_changes = FilePatchChanges {
+            removed_text: vec![line(3, "impl Other {}\n")],
+            ..FilePatchChanges::default()
+        };
+        assert!(!signature_changed(&impl_symbol, &impl_changes));
+    }
+
+    #[test]
+    fn signature_changed_detects_multiline_signature_edits() {
+        let symbol = test_symbol(SemanticSymbolKind::Function, "foo", 10, 20, 13);
+        let param_edit = FilePatchChanges {
+            added_text: vec![line(12, "    x: u32,\n")],
+            removed_text: vec![line(12, "    x: i32,\n")],
+            ..FilePatchChanges::default()
+        };
+        assert!(signature_changed(&symbol, &param_edit));
+
+        let body_edit = FilePatchChanges {
+            added_text: vec![line(18, "    value += 1;\n")],
+            removed_text: vec![line(18, "    value += 2;\n")],
+            ..FilePatchChanges::default()
+        };
+        assert!(!signature_changed(&symbol, &body_edit));
+
+        let removed_signature = FilePatchChanges {
+            removed_text: vec![line(10, "fn foo(\n")],
+            ..FilePatchChanges::default()
+        };
+        assert!(signature_changed(&symbol, &removed_signature));
     }
 }
