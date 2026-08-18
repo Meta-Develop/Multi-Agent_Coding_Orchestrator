@@ -118,6 +118,29 @@ impl AgentRuntimeAdapter for GeminiAdapter {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeCodeAdapter {
+    config: RuntimeAdapterConfig,
+}
+
+impl ClaudeCodeAdapter {
+    pub fn from_environment() -> Self {
+        Self {
+            config: RuntimeAdapterConfig::from_adapter_environment(AdapterId::ClaudeCode),
+        }
+    }
+}
+
+impl AgentRuntimeAdapter for ClaudeCodeAdapter {
+    fn adapter_id(&self) -> AdapterId {
+        AdapterId::ClaudeCode
+    }
+
+    fn config(&self) -> &RuntimeAdapterConfig {
+        &self.config
+    }
+}
+
 impl RuntimeId {
     pub const fn default_binary(self) -> &'static str {
         AdapterId::from_runtime(self).default_binary()
@@ -211,6 +234,21 @@ impl RuntimeAdapterConfig {
                 ],
                 // cursor-agent --print writes to stdout; there is no --output file flag
                 // and no standalone --effort flag.
+                OutputCaptureMode::Stdout,
+                true,
+            ),
+            AdapterId::ClaudeCode => (
+                vec![
+                    "-p".into(),
+                    "--output-format".into(),
+                    "json".into(),
+                    "--model".into(),
+                    "{model}".into(),
+                    "--effort".into(),
+                    "{effort}".into(),
+                ],
+                // claude --print writes the JSON envelope to stdout; there is no
+                // --output file flag and no --cwd flag. Prompt text is fed on stdin.
                 OutputCaptureMode::Stdout,
                 true,
             ),
@@ -645,6 +683,55 @@ mod tests {
     }
 
     #[test]
+    fn claude_defaults_match_print_json_and_feed_prompt_on_stdin() -> Result<()> {
+        let adapter = ClaudeCodeAdapter::from_environment();
+        assert_eq!(adapter.adapter_id(), AdapterId::ClaudeCode);
+        assert_eq!(adapter.capabilities(), RuntimeCapabilities::CLAUDE_CODE);
+        assert!(!adapter.capabilities().admits_writable_release());
+        let config = adapter.config();
+        assert_eq!(config.binary_path(), Path::new("claude"));
+        assert_eq!(config.output_capture, OutputCaptureMode::Stdout);
+        assert!(config.feed_prompt_on_stdin);
+        assert_eq!(
+            config.argument_template,
+            [
+                "-p",
+                "--output-format",
+                "json",
+                "--model",
+                "{model}",
+                "--effort",
+                "{effort}",
+            ]
+        );
+
+        let spec = config.render(&launch_context(
+            Path::new("prompt.txt"),
+            Some("sonnet"),
+            Some("high"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert_eq!(
+            spec.argv,
+            [
+                "-p",
+                "--output-format",
+                "json",
+                "--model",
+                "sonnet",
+                "--effort",
+                "high",
+            ]
+        );
+        assert!(!spec
+            .argv
+            .iter()
+            .any(|arg| arg == "--output" || arg == "--cwd"));
+        Ok(())
+    }
+
+    #[test]
     fn gemini_prompt_text_fails_closed_when_the_file_is_missing() {
         let config = RuntimeAdapterConfig::defaults_for(AdapterId::GeminiCli);
         let error = config
@@ -847,6 +934,24 @@ mod tests {
         assert!(
             !help.contains("--effort <"),
             "cursor-agent grew a standalone --effort flag; revisit the adapter template"
+        );
+    }
+
+    #[test]
+    fn claude_template_flags_are_present_on_the_installed_cli() {
+        let Some(help) = installed_cli_help("claude") else {
+            return;
+        };
+        for flag in ["--print", "--output-format", "--model", "--effort"] {
+            assert!(help.contains(flag), "installed claude help missing {flag}");
+        }
+        assert!(
+            help.contains("--resume"),
+            "installed claude help missing session resume"
+        );
+        assert!(
+            help.contains("--permission-mode"),
+            "installed claude help missing permission-mode"
         );
     }
 

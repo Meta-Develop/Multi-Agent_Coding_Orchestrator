@@ -18,16 +18,19 @@ pub enum AdapterId {
     Fake,
     Grok,
     Cursor,
+    #[serde(rename = "claude-code")]
+    ClaudeCode,
     #[serde(rename = "gemini-cli")]
     GeminiCli,
 }
 
 impl AdapterId {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Codex,
         Self::Fake,
         Self::Grok,
         Self::Cursor,
+        Self::ClaudeCode,
         Self::GeminiCli,
     ];
 
@@ -37,6 +40,7 @@ impl AdapterId {
             Self::Fake => "fake",
             Self::Grok => "grok",
             Self::Cursor => "cursor",
+            Self::ClaudeCode => "claude-code",
             Self::GeminiCli => "gemini-cli",
         }
     }
@@ -47,6 +51,7 @@ impl AdapterId {
             "fake" => Some(Self::Fake),
             "grok" => Some(Self::Grok),
             "cursor" => Some(Self::Cursor),
+            "claude-code" | "claude" => Some(Self::ClaudeCode),
             "gemini-cli" | "gemini" => Some(Self::GeminiCli),
             _ => None,
         }
@@ -58,6 +63,7 @@ impl AdapterId {
             Self::Fake => "fake",
             Self::Grok => "grok",
             Self::Cursor => "cursor-agent",
+            Self::ClaudeCode => "claude",
             Self::GeminiCli => "gemini",
         }
     }
@@ -66,6 +72,7 @@ impl AdapterId {
         match self {
             Self::Grok => Some("MACO_GROK"),
             Self::Cursor => Some("MACO_CURSOR"),
+            Self::ClaudeCode => Some("MACO_CLAUDE"),
             Self::GeminiCli => Some("MACO_GEMINI"),
             Self::Codex | Self::Fake => None,
         }
@@ -90,7 +97,7 @@ impl AdapterId {
             Self::Fake => Some(RuntimeId::Fake),
             Self::Grok => Some(RuntimeId::Grok),
             Self::Cursor => Some(RuntimeId::Cursor),
-            Self::GeminiCli => None,
+            Self::ClaudeCode | Self::GeminiCli => None,
         }
     }
 
@@ -100,6 +107,7 @@ impl AdapterId {
             Self::Fake => RuntimeCapabilities::FAKE,
             Self::Grok => RuntimeCapabilities::GROK,
             Self::Cursor => RuntimeCapabilities::CURSOR,
+            Self::ClaudeCode => RuntimeCapabilities::CLAUDE_CODE,
             Self::GeminiCli => RuntimeCapabilities::GEMINI_CLI,
         }
     }
@@ -297,6 +305,17 @@ impl RuntimeCapabilities {
         session_resume: SessionResume::Supported,
     };
 
+    pub const CLAUDE_CODE: Self = Self {
+        // `--permission-mode` and PreToolUse hooks exist on the CLI, but this
+        // adapter does not yet host a blocking MACO callback.
+        blocking_pre_action_callback: BlockingPreActionCallback::None,
+        writable_workspace: WorkspaceWritability::Partial,
+        side_effect_confinement: SideEffectConfinement::Unverified,
+        model_catalog: ModelCatalogSource::OperatorDeclared,
+        usage_reporting: UsageReporting::None,
+        session_resume: SessionResume::Supported,
+    };
+
     pub const GEMINI_CLI: Self = Self {
         // `--approval-mode` is CLI-side, not a MACO-hosted callback.
         blocking_pre_action_callback: BlockingPreActionCallback::None,
@@ -482,6 +501,7 @@ mod tests {
         assert!(!RuntimeCapabilities::GROK.admits_writable_release());
         assert!(!RuntimeCapabilities::CURSOR.admits_writable_release());
         assert!(!RuntimeCapabilities::GEMINI_CLI.admits_writable_release());
+        assert!(!RuntimeCapabilities::CLAUDE_CODE.admits_writable_release());
         assert!(!RuntimeCapabilities::FAKE.admits_writable_release());
         assert_eq!(
             RuntimeCapabilities::GEMINI_CLI.writable_refusal(),
@@ -526,6 +546,18 @@ mod tests {
     }
 
     #[test]
+    fn claude_code_identity_round_trips_through_serde_and_parse() {
+        assert_eq!(AdapterId::parse("claude-code"), Some(AdapterId::ClaudeCode));
+        assert_eq!(AdapterId::parse("claude"), Some(AdapterId::ClaudeCode));
+        let json = serde_json::to_string(&AdapterId::ClaudeCode).unwrap();
+        assert_eq!(json, "\"claude-code\"");
+        assert_eq!(
+            serde_json::from_str::<AdapterId>(&json).unwrap(),
+            AdapterId::ClaudeCode
+        );
+    }
+
+    #[test]
     fn allowlist_ignores_unknown_names_and_does_not_fail_startup() {
         assert_eq!(parse_adapter_allowlist(None), AdapterId::ALL);
         assert_eq!(
@@ -547,6 +579,10 @@ mod tests {
         );
         assert_eq!(
             AdapterId::GeminiCli.capabilities().model_catalog,
+            ModelCatalogSource::OperatorDeclared
+        );
+        assert_eq!(
+            AdapterId::ClaudeCode.capabilities().model_catalog,
             ModelCatalogSource::OperatorDeclared
         );
     }
