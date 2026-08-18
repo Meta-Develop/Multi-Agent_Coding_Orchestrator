@@ -15,11 +15,14 @@ use std::{
 };
 use thiserror::Error;
 
-const HARD_MAX_LINE_BYTES: usize = 1024 * 1024;
+const OUTPUT_AGENT_MESSAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// JSON envelope around a completed `agentMessage` so the advertised 8MB text
+/// bound remains receivable as a single JSONL line.
+const AGENT_MESSAGE_JSON_ENVELOPE_BYTES: usize = 256 * 1024;
+const HARD_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 const HARD_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const HARD_MAX_MESSAGES: usize = 16_384;
 const HARD_MAX_PROMPT_BYTES: usize = 1024 * 1024;
-const OUTPUT_AGENT_MESSAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EXTERNAL_CODEX_PERMISSION_PROFILE: &str = "maco_external_codex";
 
@@ -210,8 +213,9 @@ pub(crate) struct AppServerLimits {
 impl Default for AppServerLimits {
     fn default() -> Self {
         Self {
-            max_line_bytes: 256 * 1024,
-            max_total_bytes: 8 * 1024 * 1024,
+            max_line_bytes: OUTPUT_AGENT_MESSAGE_MAX_BYTES
+                .saturating_add(AGENT_MESSAGE_JSON_ENVELOPE_BYTES),
+            max_total_bytes: HARD_MAX_TOTAL_BYTES,
             max_messages: 8_192,
             turn_timeout: Duration::from_secs(300),
             approval_timeout: Duration::from_secs(30),
@@ -2795,6 +2799,79 @@ mod tests {
         .expect_err("initialize malformed");
         assert!(matches!(error, AppServerError::Malformed { .. }));
         assert!(!sent_interrupt(&transport));
+    }
+
+    #[test]
+    fn default_line_bound_reaches_the_agent_message_ceiling() {
+        let limits = AppServerLimits::default()
+            .validate()
+            .expect("default limits must be valid");
+        assert!(
+            limits.max_line_bytes >= OUTPUT_AGENT_MESSAGE_MAX_BYTES,
+            "duplex default line bound must admit the advertised 8MB agent message"
+        );
+        assert!(
+            limits.max_line_bytes <= HARD_MAX_LINE_BYTES,
+            "default line bound must stay under the hard ceiling"
+        );
+        assert!(limits.max_total_bytes >= limits.max_line_bytes);
+        assert!(
+            AppServerLimits {
+                max_line_bytes: OUTPUT_AGENT_MESSAGE_MAX_BYTES,
+                max_total_bytes: HARD_MAX_TOTAL_BYTES,
+                ..AppServerLimits::default()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn completed_agent_message_past_the_old_line_cap_is_received() {
+        let text = "x".repeat(300 * 1024);
+        let mut messages = base_messages();
+        messages.extend([
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "final-msg", "type": "agentMessage", "status": "inProgress"}
+                }
+            }),
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 2,
+                    "item": {
+                        "id": "final-msg",
+                        "type": "agentMessage",
+                        "status": "completed",
+                        "text": text
+                    }
+                }
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed", "items": []}
+                }
+            }),
+        ]);
+        let mut transport = FakeTransport::from_values(messages);
+        let outcome = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("large-message")),
+            || false,
+        )
+        .expect("300KiB completed agent message must be receivable");
+        assert_eq!(outcome.final_message.as_deref(), Some(text.as_str()));
+        assert_eq!(outcome.completed_items, 1);
     }
 
     #[test]
