@@ -36,6 +36,7 @@ pub mod publication;
 pub mod repo_map;
 pub mod repo_semantic;
 pub mod review;
+pub mod runtime_adapter;
 pub mod safe_state;
 pub mod scope;
 pub(crate) mod secure_output;

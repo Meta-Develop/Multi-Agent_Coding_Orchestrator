@@ -862,13 +862,23 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 host_disk_per_child_mib: args.host_disk_per_child_mib,
                 host_fallback_children: args.host_fallback_children,
             };
+            let runtime = args.runtime.unwrap_or_else(|| {
+                supervise::load_supervisor_plan_file(&plan_file)
+                    .ok()
+                    .and_then(|plan| plan.assignments.first().and_then(|a| a.runtime))
+                    .unwrap_or(supervise::SupervisorRuntime::Codex)
+            });
             let options = SupervisorRunOptions {
                 repo: resolved_repo,
                 plan_file,
                 run_id: resolved_run_id.clone(),
                 parent_node: args.parent_node.map(Into::into),
-                codex_bin: args.codex_bin,
-                runtime: args.runtime,
+                codex_bin: args.runtime_bin.unwrap_or_else(|| match runtime {
+                    supervise::SupervisorRuntime::Grok => PathBuf::from("grok"),
+                    supervise::SupervisorRuntime::Cursor => PathBuf::from("cursor-agent"),
+                    _ => args.codex_bin,
+                }),
+                runtime,
                 allow_dirty_primary: args.allow_dirty_primary,
                 admission_overrides,
                 budget_overrides,
@@ -931,8 +941,14 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     source_run_id: RunId::new(&args.source_run_id)?,
                     assignment_id: args.assignment_id,
                     run_id: resolved.run_id.clone(),
-                    codex_bin: args.codex_bin,
-                    runtime: args.runtime,
+                    codex_bin: args.runtime_bin.unwrap_or_else(|| {
+                        match args.runtime.unwrap_or(supervise::SupervisorRuntime::Codex) {
+                            supervise::SupervisorRuntime::Grok => PathBuf::from("grok"),
+                            supervise::SupervisorRuntime::Cursor => PathBuf::from("cursor-agent"),
+                            _ => args.codex_bin,
+                        }
+                    }),
+                    runtime: args.runtime.unwrap_or(supervise::SupervisorRuntime::Codex),
                     allow_dirty_primary: args.allow_dirty_primary,
                     machine_global_retention: Some(MachineGlobalRetentionBinding {
                         config: args.machine_global_config,
@@ -1080,9 +1096,12 @@ struct RunSuperviseArgs {
     /// Codex-compatible executable to invoke. Ignored by the deterministic Fake runtime.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
+    /// Selected runtime executable. Defaults to `--codex-bin` for Codex and the adapter default otherwise.
+    #[arg(long)]
+    runtime_bin: Option<PathBuf>,
     /// Runtime. Fake is deterministic in-process simulation and never executes Codex or publishes.
-    #[arg(long, value_enum, default_value_t = supervise::SupervisorRuntime::Codex)]
-    runtime: supervise::SupervisorRuntime,
+    #[arg(long, value_enum)]
+    runtime: Option<supervise::SupervisorRuntime>,
     /// Allow supervise to run when the primary worktree is dirty.
     #[arg(long)]
     allow_dirty_primary: bool,
@@ -1144,9 +1163,12 @@ struct ReauditSuperviseArgs {
     /// Codex-compatible executable to invoke. Ignored by the deterministic Fake runtime.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
+    /// Selected runtime executable. Defaults to `--codex-bin` for Codex and the adapter default otherwise.
+    #[arg(long)]
+    runtime_bin: Option<PathBuf>,
     /// Runtime. Fake is deterministic in-process simulation and never publishes.
-    #[arg(long, value_enum, default_value_t = supervise::SupervisorRuntime::Codex)]
-    runtime: supervise::SupervisorRuntime,
+    #[arg(long, value_enum)]
+    runtime: Option<supervise::SupervisorRuntime>,
     /// Allow the primary worktree to be dirty while preserving its exact captured state.
     #[arg(long)]
     allow_dirty_primary: bool,

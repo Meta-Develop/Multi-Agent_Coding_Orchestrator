@@ -747,6 +747,15 @@ fn prepare_child_attempt<'a>(
         &attempt_artifacts.report_path,
         Duration::from_secs(budget_plan.child_timeout_seconds),
     );
+    if matches!(
+        options.runtime,
+        SupervisorRuntime::Grok | SupervisorRuntime::Cursor
+    ) {
+        command = command.with_runtime_adapter(
+            options.runtime,
+            crate::runtime_adapter::RuntimeAdapterConfig::from_environment(options.runtime),
+        );
+    }
     command = apply_role_model_selection(
         command,
         &budget_plan,
@@ -997,6 +1006,18 @@ fn dispatch_and_collect_child_attempt<'a>(
                     std::panic::resume_unwind(payload);
                 }
             }
+        }
+        SupervisorRuntime::Grok | SupervisorRuntime::Cursor => {
+            if let Err(error) = budget_reservation.mark_invoked() {
+                drop(incoming_output_root);
+                drop(capture_output_root);
+                with_supervisor_artifacts(artifacts, |writer, _| {
+                    discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+                })?;
+                return Err(error);
+            }
+            record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
+            Ok(external_runner(&command, cancellation, None))
         }
         SupervisorRuntime::Fake => {
             if let Err(error) = budget_reservation.mark_invoked() {
@@ -1796,6 +1817,15 @@ fn prepare_parent_auditor<'a>(
         &auditor_report_path,
         Duration::from_secs(plan.child_timeout_seconds),
     );
+    if matches!(
+        options.runtime,
+        SupervisorRuntime::Grok | SupervisorRuntime::Cursor
+    ) {
+        auditor_command = auditor_command.with_runtime_adapter(
+            options.runtime,
+            crate::runtime_adapter::RuntimeAdapterConfig::from_environment(options.runtime),
+        );
+    }
     auditor_command = apply_review_lens_model_selection(
         auditor_command,
         lens,
@@ -2052,6 +2082,22 @@ fn dispatch_and_collect_parent_auditor(
                     std::panic::resume_unwind(payload);
                 }
             }
+        }
+        SupervisorRuntime::Grok | SupervisorRuntime::Cursor => {
+            if let Err(error) = auditor_budget_reservation.mark_invoked() {
+                drop(auditor_incoming_root);
+                drop(auditor_capture_root);
+                with_supervisor_artifacts(artifacts, |writer, _| {
+                    discard_invocation_scratches(
+                        writer,
+                        &auditor_incoming_scratch,
+                        &auditor_capture_scratch,
+                    )
+                })?;
+                return Err(error);
+            }
+            record_dispatch_checkpoint(artifacts, true, false, &auditor_id, auditor_attempt)?;
+            Ok(external_runner(&auditor_command, cancellation, None))
         }
         SupervisorRuntime::Fake => {
             if let Err(error) = auditor_budget_reservation.mark_invoked() {
@@ -3137,6 +3183,7 @@ mod decomposition_tests {
 
         let assignment = OrchestratorAssignment {
             id: "phase-child".to_string(),
+            runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),

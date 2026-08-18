@@ -311,6 +311,7 @@ fn run_injected_git(repo: &Path, args: &[&str]) {
 fn injected_assignment(with_worker: bool) -> OrchestratorAssignment {
     OrchestratorAssignment {
         id: "child-a".to_string(),
+        runtime: None,
         role: AgentRole::ChildOrchestrator,
         assigned_paths: vec![PathBuf::from("README.md")],
         semantic_symbols: Vec::new(),
@@ -338,6 +339,7 @@ fn injected_assignment(with_worker: bool) -> OrchestratorAssignment {
 fn injected_named_assignment(id: &str, path: &str) -> OrchestratorAssignment {
     OrchestratorAssignment {
         id: id.to_string(),
+        runtime: None,
         role: AgentRole::ChildOrchestrator,
         assigned_paths: vec![PathBuf::from(path)],
         semantic_symbols: Vec::new(),
