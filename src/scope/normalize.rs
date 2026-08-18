@@ -28,12 +28,12 @@ const MAX_RUNS_PER_REPOSITORY: usize = 4_096;
 const MAX_DIRECTORY_ENTRIES: usize = 4_096;
 const MAX_DISCOVERY_ENTRIES: usize = 16_384;
 const MAX_NAMED_FILES: usize = 4_096;
-const MAX_EVENTS_PER_RUN: usize = 16_384;
+const MAX_JOURNAL_RECORDS: usize = 32_768;
+const MAX_EVENTS_PER_RUN: usize = MAX_JOURNAL_RECORDS;
 const MAX_ASSIGNMENTS_PER_RUN: usize = 4_096;
 const MAX_ASSIGNMENT_DEPTH: usize = 16;
 const MAX_EMBEDDED_REPORTS: usize = 4_096;
 const MAX_REPORT_DEPTH: usize = 16;
-const MAX_JOURNAL_RECORDS: usize = 32_768;
 const MAX_JOURNAL_LINE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,6 +82,8 @@ pub struct ProjectSnapshot {
     pub id: String,
     pub path: PathBuf,
     pub runs: Vec<RunSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scan_errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -207,9 +209,14 @@ impl CachedScope {
 
         let mut rebuild_repositories = BTreeSet::new();
         for watch in &self.run_roots {
-            let fingerprint = watch.current_fingerprint()?;
-            if fingerprint != watch.fingerprint {
-                rebuild_repositories.insert(watch.repo.clone());
+            match watch.current_fingerprint() {
+                Ok(fingerprint) if fingerprint != watch.fingerprint => {
+                    rebuild_repositories.insert(watch.repo.clone());
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    rebuild_repositories.insert(watch.repo.clone());
+                }
             }
         }
 
@@ -217,8 +224,8 @@ impl CachedScope {
             if rebuild_repositories.contains(&key.repo) {
                 continue;
             }
-            match watch.fingerprint(key)? {
-                Some(fingerprint)
+            match watch.fingerprint(key) {
+                Ok(Some(fingerprint))
                     if same_file_identity(&fingerprint, &watch.position.fingerprint)
                         && fingerprint.length >= watch.position.offset =>
                 {
@@ -228,7 +235,7 @@ impl CachedScope {
                         rebuild_repositories.insert(key.repo.clone());
                     }
                 }
-                _ => {
+                Ok(_) | Err(_) => {
                     rebuild_repositories.insert(key.repo.clone());
                 }
             }
@@ -236,7 +243,9 @@ impl CachedScope {
 
         let mut changed = !rebuild_repositories.is_empty();
         for repo_id in &rebuild_repositories {
-            self.rebuild_repository(repo_id)?;
+            if let Err(error) = self.rebuild_repository(repo_id) {
+                self.record_repository_scan_error(repo_id, &error);
+            }
         }
 
         let keys = self.journals.keys().cloned().collect::<Vec<_>>();
@@ -247,31 +256,58 @@ impl CachedScope {
             let Some(watch) = self.journals.get(&key).cloned() else {
                 continue;
             };
-            let Some(fingerprint) = watch.fingerprint(&key)? else {
-                self.rebuild_repository(&key.repo)?;
-                changed = true;
-                continue;
+            let fingerprint = match watch.fingerprint(&key) {
+                Ok(Some(fingerprint)) => fingerprint,
+                Ok(None) | Err(_) => {
+                    if let Err(error) = self.rebuild_repository(&key.repo) {
+                        self.record_repository_scan_error(&key.repo, &error);
+                    }
+                    changed = true;
+                    continue;
+                }
             };
             if fingerprint.length <= watch.position.offset {
                 continue;
             }
-            let path = watch.validated_path(&key)?.ok_or_else(|| {
-                invalid_data(format!(
-                    "Scope journal disappeared for '{}/{}/{}'",
-                    key.repo, key.family, key.run
-                ))
-            })?;
+            let path = match watch.validated_path(&key) {
+                Ok(Some(path)) => path,
+                Ok(None) | Err(_) => {
+                    if let Err(error) = self.rebuild_repository(&key.repo) {
+                        self.record_repository_scan_error(&key.repo, &error);
+                    }
+                    changed = true;
+                    continue;
+                }
+            };
             let (events, position) =
-                read_journal_suffix(&path, &key.repo, &key.run, &watch.position)?;
-            let inserted = self.append_run_events(&key, events)?;
-            self.record_events(&key.family, inserted)?;
+                match read_journal_suffix(&path, &key.repo, &key.run, &watch.position) {
+                    Ok(read) => read,
+                    Err(_) => {
+                        if let Err(error) = self.rebuild_repository(&key.repo) {
+                            self.record_repository_scan_error(&key.repo, &error);
+                        }
+                        changed = true;
+                        continue;
+                    }
+                };
+            match self.append_run_events(&key, events) {
+                Ok(inserted) => {
+                    if let Err(error) = self.record_events(&key.family, inserted) {
+                        self.record_repository_scan_error(&key.repo, &error);
+                    }
+                }
+                Err(error) => {
+                    self.record_repository_scan_error(&key.repo, &error);
+                    continue;
+                }
+            }
             if let Some(current) = self.journals.get_mut(&key) {
                 current.position = position;
             }
             changed = true;
         }
 
-        self.refresh_run_root_fingerprints()?;
+        self.refresh_run_root_fingerprints();
         Ok(changed)
     }
 
@@ -393,6 +429,27 @@ impl CachedScope {
         Ok(())
     }
 
+    fn record_repository_scan_error(&mut self, repo_id: &str, error: &io::Error) {
+        let Some(snapshot) = self.snapshot.as_mut() else {
+            return;
+        };
+        let Some(project) = snapshot
+            .projects
+            .iter_mut()
+            .find(|project| project.id == repo_id)
+        else {
+            return;
+        };
+        let message = format!("skipped repository refresh: {error}");
+        if !project
+            .scan_errors
+            .iter()
+            .any(|existing| existing == &message)
+        {
+            project.scan_errors.push(message);
+        }
+    }
+
     fn append_run_events(
         &mut self,
         key: &RunKey,
@@ -432,7 +489,7 @@ impl CachedScope {
                 }
             }
         }
-        ensure_event_limit(&run.events)?;
+        ensure_event_limit(&mut run.events);
         run.event_count = run.events.len();
         run.final_report_exists = final_report_exists(&run.family, &run.run_dir)?;
         Ok(inserted)
@@ -583,11 +640,12 @@ impl CachedScope {
         }
     }
 
-    fn refresh_run_root_fingerprints(&mut self) -> io::Result<()> {
+    fn refresh_run_root_fingerprints(&mut self) {
         for watch in &mut self.run_roots {
-            watch.fingerprint = watch.current_fingerprint()?;
+            if let Ok(fingerprint) = watch.current_fingerprint() {
+                watch.fingerprint = fingerprint;
+            }
         }
-        Ok(())
     }
 }
 
@@ -648,17 +706,12 @@ fn run_root_watches(repositories: &[RepositoryTarget]) -> io::Result<Vec<RunRoot
                 .join(family_directory)
                 .join("runs");
             let components = [".maco", family_directory, "runs"];
-            let fingerprint = match validate_directory_chain(&target.path, &components)? {
-                Some(validated) => {
-                    if validated != path {
-                        return Err(invalid_data(format!(
-                            "Scope run root path changed for repository '{}'",
-                            target.id
-                        )));
-                    }
-                    directory_fingerprint(&validated)?
+            let fingerprint = match validate_directory_chain(&target.path, &components) {
+                Ok(Some(validated)) if validated == path => {
+                    directory_fingerprint(&validated).ok().flatten()
                 }
-                None => None,
+                Ok(Some(_)) | Err(_) => None,
+                Ok(None) => None,
             };
             watches.push(RunRootWatch {
                 repo: target.id.clone(),
@@ -738,7 +791,15 @@ pub fn scan_repositories(repositories: &[RepositoryTarget]) -> io::Result<ScopeS
 
     let mut projects = Vec::with_capacity(targets.len());
     for target in targets {
-        projects.push(scan_repository(&target)?);
+        match scan_repository(&target) {
+            Ok(project) => projects.push(project),
+            Err(error) => projects.push(ProjectSnapshot {
+                id: target.id.clone(),
+                path: target.path.clone(),
+                runs: Vec::new(),
+                scan_errors: vec![format!("skipped repository: {error}")],
+            }),
+        }
     }
     Ok(ScopeSnapshot { projects })
 }
@@ -752,25 +813,65 @@ fn scan_repository(target: &RepositoryTarget) -> io::Result<ProjectSnapshot> {
         )));
     }
     let mut discovered = Vec::new();
+    let mut scan_errors = Vec::new();
+    match validate_directory_chain(&repository_root, &[".maco"]) {
+        Ok(None) => {
+            return Ok(ProjectSnapshot {
+                id: target.id.clone(),
+                path: target.path.clone(),
+                runs: Vec::new(),
+                scan_errors,
+            });
+        }
+        Ok(Some(_)) => {}
+        Err(error) => return Err(error),
+    }
     for (family, directory) in RUN_FAMILIES {
-        let Some(run_root) =
-            validate_directory_chain(&repository_root, &[".maco", directory, "runs"])?
-        else {
-            continue;
-        };
-        for run_dir in read_child_directories(&run_root)? {
-            if discovered.len() >= MAX_RUNS_PER_REPOSITORY {
-                return Err(invalid_data(format!(
-                    "Scope run discovery exceeds the {MAX_RUNS_PER_REPOSITORY} run limit in {}",
-                    repository_root.display()
-                )));
+        let run_root =
+            match validate_directory_chain(&repository_root, &[".maco", directory, "runs"]) {
+                Ok(Some(run_root)) => run_root,
+                Ok(None) => continue,
+                Err(error) => {
+                    scan_errors.push(format!("skipped family {family}: {error}"));
+                    continue;
+                }
+            };
+        let run_dirs = match read_child_directories(&run_root) {
+            Ok(run_dirs) => run_dirs,
+            Err(error) => {
+                scan_errors.push(format!("skipped family {family}: {error}"));
+                continue;
             }
-            let canonical_run = fs::canonicalize(&run_dir)?;
+        };
+        for run_dir in run_dirs {
+            if discovered.len() >= MAX_RUNS_PER_REPOSITORY {
+                scan_errors.push(format!(
+                    "skipped remaining runs: discovery exceeds the {MAX_RUNS_PER_REPOSITORY} run limit"
+                ));
+                break;
+            }
+            let canonical_run = match fs::canonicalize(&run_dir) {
+                Ok(canonical_run) => canonical_run,
+                Err(error) => {
+                    scan_errors.push(format!(
+                        "skipped run {family}/{}: {error}",
+                        run_dir
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("?")
+                    ));
+                    continue;
+                }
+            };
             if canonical_run != run_dir || !canonical_run.starts_with(&repository_root) {
-                return Err(invalid_data(format!(
-                    "Scope run directory escapes its canonical repository root: {}",
-                    run_dir.display()
-                )));
+                scan_errors.push(format!(
+                    "skipped run {family}/{}: directory escapes its canonical repository root",
+                    run_dir
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("?")
+                ));
+                continue;
             }
             let Some(run_name) = run_dir.file_name().and_then(|name| name.to_str()) else {
                 continue;
@@ -781,14 +882,27 @@ fn scan_repository(target: &RepositoryTarget) -> io::Result<ProjectSnapshot> {
             let modified = no_follow_metadata(&run_dir)
                 .and_then(|metadata| metadata.modified())
                 .unwrap_or(UNIX_EPOCH);
-            let (mut events, journal) = scan_run_events(target, family, run_name, &run_dir)?;
+            let (mut events, journal) = match scan_run_events(target, family, run_name, &run_dir) {
+                Ok(scanned) => scanned,
+                Err(error) => {
+                    scan_errors.push(format!("skipped run {family}/{run_name}: {error}"));
+                    continue;
+                }
+            };
             sort_and_deduplicate(&mut events);
+            let final_report_exists = match final_report_exists(family, &run_dir) {
+                Ok(exists) => exists,
+                Err(error) => {
+                    scan_errors.push(format!("skipped run {family}/{run_name}: {error}"));
+                    continue;
+                }
+            };
             discovered.push((
                 RunSummary {
                     family: family.to_string(),
                     run: run_name.to_string(),
                     run_dir: run_dir.clone(),
-                    final_report_exists: final_report_exists(family, &run_dir)?,
+                    final_report_exists,
                     modified_unix_seconds: unix_seconds(modified),
                     event_count: events.len(),
                     events,
@@ -810,6 +924,7 @@ fn scan_repository(target: &RepositoryTarget) -> io::Result<ProjectSnapshot> {
         id: target.id.clone(),
         path: target.path.clone(),
         runs: discovered.into_iter().map(|(run, _)| run).collect(),
+        scan_errors,
     })
 }
 
@@ -887,7 +1002,7 @@ fn scan_run_events(
     )?;
     read_queue_tsv(&run_dir.join("queue.tsv"), &target.id, run_id, &mut events)?;
     read_escalations(run_dir, &target.id, run_id, &mut events)?;
-    ensure_event_limit(&events)?;
+    ensure_event_limit(&mut events);
     Ok((events, None))
 }
 
@@ -2008,10 +2123,7 @@ fn read_children(
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
-            return Err(invalid_data(format!(
-                "Scope refuses symlinked artifact {}",
-                path.display()
-            )));
+            continue;
         }
         if include(&metadata, &path) {
             paths.push(path);
@@ -2150,22 +2262,14 @@ fn validate_directory_chain(root: &Path, components: &[&str]) -> io::Result<Opti
 }
 
 fn push_event(events: &mut Vec<NormalizedEvent>, event: NormalizedEvent) -> io::Result<()> {
-    if events.len() >= MAX_EVENTS_PER_RUN {
-        return Err(invalid_data(format!(
-            "Scope run exceeds the {MAX_EVENTS_PER_RUN} normalized event limit"
-        )));
+    if events.len() < MAX_EVENTS_PER_RUN {
+        events.push(event);
     }
-    events.push(event);
     Ok(())
 }
 
-fn ensure_event_limit(events: &[NormalizedEvent]) -> io::Result<()> {
-    if events.len() > MAX_EVENTS_PER_RUN {
-        return Err(invalid_data(format!(
-            "Scope run exceeds the {MAX_EVENTS_PER_RUN} normalized event limit"
-        )));
-    }
-    Ok(())
+fn ensure_event_limit(events: &mut Vec<NormalizedEvent>) {
+    events.truncate(MAX_EVENTS_PER_RUN);
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -2927,7 +3031,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn scanning_rejects_symlinked_artifacts() {
+    fn scanning_skips_symlinked_artifacts_without_poisoning_other_runs() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2939,9 +3043,26 @@ mod tests {
         let events_dir = temp.path().join(".maco/o2/runs/symlinked/events");
         fs::create_dir_all(&events_dir).expect("events dir");
         symlink(&outside, events_dir.join("orchestration.jsonl")).expect("journal symlink");
+        write(
+            &temp
+                .path()
+                .join(".maco/o2/runs/healthy/events/orchestration.jsonl"),
+            &journal_event("healthy-worker"),
+        );
 
-        let error = scan_repositories(&[target(temp.path())]).expect_err("reject journal symlink");
-        assert!(error.to_string().contains("symlinked artifact"));
+        let snapshot = scan_repositories(&[target(temp.path())]).expect("isolate journal symlink");
+        let project = &snapshot.projects[0];
+        assert!(project
+            .scan_errors
+            .iter()
+            .any(|error| error.contains("skipped run o2/symlinked")
+                && error.contains("symlinked artifact")));
+        assert!(project.runs.iter().all(|run| run.run != "symlinked"));
+        let events = snapshot
+            .events_for_run("repo-one", "o2", "healthy")
+            .expect("healthy run");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].node, "healthy-worker");
     }
 
     #[test]
@@ -2972,7 +3093,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn scanning_rejects_symlinked_fixed_intermediate_directories() {
+    fn scanning_isolates_symlinked_fixed_intermediate_directories() {
         use std::os::unix::fs::symlink;
 
         let maco_temp = tempfile::tempdir().expect("maco tempdir");
@@ -2981,16 +3102,160 @@ mod tests {
         let watched = maco_temp.path().join("watched");
         fs::create_dir(&watched).expect("watched repo");
         symlink(&outside_maco, watched.join(".maco")).expect("maco symlink");
-        let error = scan_repositories(&[target(&watched)]).expect_err("reject maco symlink");
-        assert!(error.to_string().contains("intermediate directory"));
+        let healthy = maco_temp.path().join("healthy");
+        write(
+            &healthy.join(".maco/o2/runs/ok/events/orchestration.jsonl"),
+            &journal_event("healthy-worker"),
+        );
+        let snapshot = scan_repositories(&[
+            RepositoryTarget {
+                id: "watched".to_string(),
+                path: watched.clone(),
+            },
+            RepositoryTarget {
+                id: "healthy".to_string(),
+                path: healthy,
+            },
+        ])
+        .expect("isolate maco symlink");
+        let watched_project = snapshot
+            .projects
+            .iter()
+            .find(|project| project.id == "watched")
+            .expect("watched project");
+        assert!(watched_project.runs.is_empty());
+        assert!(watched_project
+            .scan_errors
+            .iter()
+            .any(|error| error.contains("skipped repository")
+                && error.contains("intermediate directory")));
+        let healthy_events = snapshot
+            .events_for_run("healthy", "o2", "ok")
+            .expect("healthy repository");
+        assert_eq!(healthy_events[0].node, "healthy-worker");
 
         let events_temp = tempfile::tempdir().expect("events tempdir");
         let run = events_temp.path().join(".maco/o2/runs/run/events-parent");
         fs::create_dir_all(&run).expect("run directory");
         let run_root = events_temp.path().join(".maco/o2/runs/run");
         symlink(&run, run_root.join("events")).expect("events symlink");
-        let error =
-            scan_repositories(&[target(events_temp.path())]).expect_err("reject events symlink");
-        assert!(error.to_string().contains("intermediate directory"));
+        write(
+            &events_temp
+                .path()
+                .join(".maco/o2/runs/ok/events/orchestration.jsonl"),
+            &journal_event("healthy-worker"),
+        );
+        let snapshot =
+            scan_repositories(&[target(events_temp.path())]).expect("isolate events symlink");
+        let project = &snapshot.projects[0];
+        assert!(project
+            .scan_errors
+            .iter()
+            .any(|error| error.contains("skipped run o2/run")
+                && error.contains("intermediate directory")));
+        assert!(project.runs.iter().all(|run| run.run != "run"));
+        assert_eq!(
+            snapshot
+                .events_for_run("repo-one", "o2", "ok")
+                .expect("healthy run")[0]
+                .node,
+            "healthy-worker"
+        );
+    }
+
+    #[test]
+    fn event_cap_truncates_instead_of_erroring() {
+        let mut events = Vec::new();
+        for index in 0..(MAX_EVENTS_PER_RUN + 8) {
+            push_event(
+                &mut events,
+                NormalizedEvent {
+                    ts: "2026-07-20T00:00:00Z".to_string(),
+                    repo: "repo".to_string(),
+                    run: "run".to_string(),
+                    node: format!("node-{index}"),
+                    parent: None,
+                    role: OrchestrationRole::Worker,
+                    kind: OrchestrationEventKind::Status,
+                    payload: json!({}),
+                },
+            )
+            .expect("truncate event cap");
+        }
+        assert_eq!(events.len(), MAX_EVENTS_PER_RUN);
+        assert_eq!(MAX_EVENTS_PER_RUN, MAX_JOURNAL_RECORDS);
+    }
+
+    #[test]
+    fn cached_refresh_isolates_a_poisoned_run_from_other_repositories() {
+        let bad = tempfile::tempdir().expect("bad repo");
+        let good = tempfile::tempdir().expect("good repo");
+        write(
+            &good
+                .path()
+                .join(".maco/o2/runs/ok/events/orchestration.jsonl"),
+            &journal_event("good-worker"),
+        );
+        write(
+            &bad.path()
+                .join(".maco/o2/runs/ok/events/orchestration.jsonl"),
+            &journal_event("before-poison"),
+        );
+
+        let mut cache = CachedScope::new(vec![
+            RepositoryTarget {
+                id: "good".to_string(),
+                path: good.path().to_path_buf(),
+            },
+            RepositoryTarget {
+                id: "bad".to_string(),
+                path: bad.path().to_path_buf(),
+            },
+        ]);
+        assert!(cache.refresh().expect("initial refresh"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let journal = bad
+                .path()
+                .join(".maco/o2/runs/ok/events/orchestration.jsonl");
+            fs::remove_file(&journal).expect("remove journal");
+            symlink(bad.path().join("missing.jsonl"), journal).expect("poison journal");
+        }
+        #[cfg(not(unix))]
+        {
+            let journal = bad
+                .path()
+                .join(".maco/o2/runs/ok/events/orchestration.jsonl");
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&journal)
+                .expect("open journal")
+                .set_len(MAX_JOURNAL_BYTES + 1)
+                .expect("poison journal");
+        }
+
+        assert!(cache.refresh().expect("isolated refresh"));
+        let snapshot = cache.snapshot().expect("isolated snapshot");
+        assert_eq!(
+            snapshot
+                .events_for_run("good", "o2", "ok")
+                .expect("good run")[0]
+                .node,
+            "good-worker"
+        );
+        let bad_project = snapshot
+            .projects
+            .iter()
+            .find(|project| project.id == "bad")
+            .expect("bad project");
+        assert!(
+            bad_project.runs.iter().all(|run| run.run != "ok")
+                || bad_project
+                    .scan_errors
+                    .iter()
+                    .any(|error| error.contains("skipped"))
+        );
     }
 }

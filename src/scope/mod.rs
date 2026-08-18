@@ -65,12 +65,12 @@ impl ScanningDataSourceState {
         {
             return Ok(false);
         }
-        let changed = self
+        let refresh = self
             .cache
             .refresh()
-            .context("failed to refresh Scope repositories")?;
+            .context("failed to refresh Scope repositories");
         self.refresh_after = Some(Instant::now() + CACHE_REFRESH_INTERVAL);
-        Ok(changed)
+        refresh
     }
 }
 
