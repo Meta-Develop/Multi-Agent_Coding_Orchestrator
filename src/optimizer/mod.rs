@@ -55,6 +55,7 @@ pub use certification::{
     select_under_quality_constraint, CandidateBinding, CertificationPlan, CertificationResult,
     FailClosedCertifier, QualityCertifier, ScoredCandidate, SelectionOutcome, TaskBinding,
 };
+pub use drift::{AdaptationStore, DriftDetector, LedgerReserveRecalibrator, ReserveRecalibrator};
 pub use error::OptimizerError;
 pub use global_search::{
     ConstrainedTpeOptimizer, GlobalPolicyOptimizer, OptimizationHistory, PolicySearchSpace,
