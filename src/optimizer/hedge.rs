@@ -146,17 +146,15 @@ impl DelayedHedgePlanner {
         cancellation: &HedgeCancellation,
         state: &OptimizerState,
     ) -> Result<(), OptimizerError> {
-        sink.record(&InvocationRecord {
-            policy_id: cancellation.cancelled_policy.clone(),
-            candidate_id: super::ids::CandidateId::new(format!(
-                "hedge-cancel-{}",
-                cancellation.cancelled_policy
-            ))
-            .map_err(|_| OptimizerError::invalid("cancellation candidate id"))?,
-            started_at: cancellation.recorded_at,
-            finished_at: Some(cancellation.recorded_at),
-            quota_snapshot: state.budget.snapshot(cancellation.recorded_at),
-        })
+        let mut record = InvocationRecord::new(
+            cancellation.cancelled_policy.clone(),
+            super::ids::CandidateId::new(format!("hedge-cancel-{}", cancellation.cancelled_policy))
+                .map_err(|_| OptimizerError::invalid("cancellation candidate id"))?,
+            cancellation.recorded_at,
+            state.budget.snapshot(cancellation.recorded_at),
+        );
+        record.finished_at = Some(cancellation.recorded_at);
+        sink.record(&record)
     }
 }
 

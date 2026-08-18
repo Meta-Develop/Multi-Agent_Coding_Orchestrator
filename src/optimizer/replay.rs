@@ -559,28 +559,34 @@ mod tests {
             latency_micros: latency,
             attributed_chain: vec![
                 AttributedCost {
-                    invocation: InvocationRecord {
-                        policy_id: policy(id),
-                        candidate_id: CandidateId::new(id).expect("candidate"),
-                        started_at: TimestampMillis::from_millis(1),
-                        finished_at: Some(TimestampMillis::from_millis(2)),
-                        quota_snapshot: ResourceSnapshot {
-                            observed_at: TimestampMillis::from_millis(1),
-                            vector: ResourceVector::new(),
-                        },
+                    invocation: {
+                        let mut record = InvocationRecord::new(
+                            policy(id),
+                            CandidateId::new(id).expect("candidate"),
+                            TimestampMillis::from_millis(1),
+                            ResourceSnapshot {
+                                observed_at: TimestampMillis::from_millis(1),
+                                vector: ResourceVector::new(),
+                            },
+                        );
+                        record.finished_at = Some(TimestampMillis::from_millis(2));
+                        record
                     },
                     cost_micros: cost / 2,
                 },
                 AttributedCost {
-                    invocation: InvocationRecord {
-                        policy_id: policy(id),
-                        candidate_id: CandidateId::new(format!("{id}-repair")).expect("candidate"),
-                        started_at: TimestampMillis::from_millis(3),
-                        finished_at: Some(TimestampMillis::from_millis(4)),
-                        quota_snapshot: ResourceSnapshot {
-                            observed_at: TimestampMillis::from_millis(3),
-                            vector: ResourceVector::new(),
-                        },
+                    invocation: {
+                        let mut record = InvocationRecord::new(
+                            policy(id),
+                            CandidateId::new(format!("{id}-repair")).expect("candidate"),
+                            TimestampMillis::from_millis(3),
+                            ResourceSnapshot {
+                                observed_at: TimestampMillis::from_millis(3),
+                                vector: ResourceVector::new(),
+                            },
+                        );
+                        record.finished_at = Some(TimestampMillis::from_millis(4));
+                        record
                     },
                     cost_micros: cost - cost / 2,
                 },
