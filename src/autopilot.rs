@@ -4537,6 +4537,7 @@ fn blocker_label(blocker: ApplyBlocker) -> &'static str {
     match blocker {
         ApplyBlocker::DirtyPrimary => "dirty_primary",
         ApplyBlocker::StaleBase => "stale_base",
+        ApplyBlocker::PrimaryStateChanged => "primary_state_changed",
         ApplyBlocker::ApplyCheckFailed => "apply_check_failed",
         ApplyBlocker::ExcludedReference => "excluded_reference",
         ApplyBlocker::UnclaimedEdits => "unclaimed_edits",
