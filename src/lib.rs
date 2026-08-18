@@ -27,6 +27,7 @@ pub mod megafile;
 pub mod merge;
 pub(crate) mod merge_freshness;
 pub(crate) mod merge_semantic;
+pub mod optimizer;
 pub mod orchestration_event;
 pub mod orchestrator;
 pub(crate) mod pinned_exec;

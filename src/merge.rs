@@ -1846,6 +1846,7 @@ pub enum ApplyReadinessStatus {
 pub enum ApplyBlocker {
     DirtyPrimary,
     StaleBase,
+    PrimaryStateChanged,
     ApplyCheckFailed,
     ExcludedReference,
     UnclaimedEdits,
@@ -2870,7 +2871,9 @@ fn merge_apply_gate_denials(preview: &MergeApplyPreview) -> Result<Vec<GateDenia
 
 fn gate_check_source_for_apply_blocker(blocker: ApplyBlocker) -> GateCheckSource {
     match blocker {
-        ApplyBlocker::DirtyPrimary => GateCheckSource::PrimaryDrift,
+        ApplyBlocker::DirtyPrimary | ApplyBlocker::PrimaryStateChanged => {
+            GateCheckSource::PrimaryDrift
+        }
         ApplyBlocker::StaleBase => GateCheckSource::MergeScope,
         ApplyBlocker::ApplyCheckFailed => GateCheckSource::GitApplyCheck,
         ApplyBlocker::ExcludedReference | ApplyBlocker::UnclaimedEdits => {
@@ -5306,11 +5309,7 @@ fn dirty_primary_check(repo_root: &Path) -> Result<SafetyCheck> {
 }
 
 fn is_local_runtime_path(path: &Path) -> bool {
-    matches!(
-        path.components().next(),
-        Some(std::path::Component::Normal(name))
-            if name == OsStr::new(".maco") || name == OsStr::new(".maco-cache")
-    )
+    crate::repo_map::is_runtime_control_path(path)
 }
 
 fn stale_base_check(metadata: &WorktreeMergeMetadata) -> SafetyCheck {
@@ -6356,7 +6355,7 @@ fn classify_apply_safety(checks: SafetyChecks<'_>, forces: &MergeForceOptions) -
     let candidates = [
         (
             checks.primary_state_unchanged,
-            ApplyBlocker::ApplyCheckFailed,
+            ApplyBlocker::PrimaryStateChanged,
             false,
         ),
         (
@@ -7452,16 +7451,9 @@ fn initialize_isolated_index(
 }
 
 fn capture_git_environment(repo_root: &Path) -> Result<BTreeMap<String, String>> {
-    let allowed = [
-        "SystemRoot",
-        "WINDIR",
-        "COMSPEC",
-        "PATHEXT",
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-    ];
+    let allowed = ["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"];
     let mut environment = explicit_environment(&allowed);
+    pin_parsed_git_locale(&mut environment);
     let runtime_root = trusted_runtime_root(repo_root)?;
     environment.insert("PATH".to_string(), trusted_path_text()?);
     environment.insert("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string());
@@ -7477,6 +7469,17 @@ fn capture_git_environment(repo_root: &Path) -> Result<BTreeMap<String, String>>
     environment.insert("TMP".to_string(), runtime.clone());
     environment.insert("TEMP".to_string(), runtime);
     Ok(environment)
+}
+
+fn pin_parsed_git_locale(environment: &mut BTreeMap<String, String>) {
+    // git apply stderr is parsed with English-only patterns. Do not inherit
+    // ambient LANG/LC_* or those messages localize and path attribution is lost.
+    environment.remove("LANG");
+    environment.remove("LC_ALL");
+    environment.remove("LC_CTYPE");
+    environment.remove("LC_MESSAGES");
+    environment.insert("LC_ALL".to_string(), "C".to_string());
+    environment.insert("LANG".to_string(), "C".to_string());
 }
 
 fn validation_command_environment(environment_root: &Path) -> Result<BTreeMap<String, String>> {
@@ -8269,6 +8272,7 @@ fn blocker_label(blocker: ApplyBlocker) -> &'static str {
     match blocker {
         ApplyBlocker::DirtyPrimary => "dirty_primary",
         ApplyBlocker::StaleBase => "stale_base",
+        ApplyBlocker::PrimaryStateChanged => "primary_state_changed",
         ApplyBlocker::ApplyCheckFailed => "apply_check_failed",
         ApplyBlocker::ExcludedReference => "excluded_reference",
         ApplyBlocker::UnclaimedEdits => "unclaimed_edits",
@@ -10468,6 +10472,61 @@ mod tests {
     }
 
     #[test]
+    fn primary_state_drift_is_a_distinct_unforceable_blocker() {
+        let failed = SafetyCheck {
+            status: SafetyCheckStatus::Failed,
+            message: Some(
+                "primary repository state changed after the merge safety preview (HEAD)"
+                    .to_string(),
+            ),
+            paths: Vec::new(),
+        };
+        let passed = SafetyCheck {
+            status: SafetyCheckStatus::Passed,
+            message: None,
+            paths: Vec::new(),
+        };
+        let evidence = passed_validation_evidence_check();
+        let checks = SafetyChecks {
+            primary_state_unchanged: &failed,
+            dirty_primary: &passed,
+            stale_base: &passed,
+            apply_check: &passed,
+            unclaimed_edits: &passed,
+            validation: &passed,
+            validation_evidence: &evidence,
+            megafile: &passed,
+            validations: &[],
+            require_validation: false,
+            validation_commands: &[],
+            validation_related_paths: &[],
+        };
+
+        let readiness = classify_apply_safety(
+            checks,
+            &MergeForceOptions {
+                allow_dirty_primary: true,
+                allow_stale_base: true,
+                allow_apply_conflicts: true,
+                allow_unclaimed_edits: true,
+                ..MergeForceOptions::default()
+            },
+        );
+
+        assert_eq!(readiness.status, ApplyReadinessStatus::Blocked);
+        assert_eq!(readiness.blockers, vec![ApplyBlocker::PrimaryStateChanged]);
+        assert!(readiness.forced.is_empty());
+        assert_eq!(
+            gate_check_source_for_apply_blocker(ApplyBlocker::PrimaryStateChanged),
+            GateCheckSource::PrimaryDrift
+        );
+        assert_eq!(
+            blocker_label(ApplyBlocker::PrimaryStateChanged),
+            "primary_state_changed"
+        );
+    }
+
+    #[test]
     fn repo_common_lock_persists_file_and_kernel_unlocks_on_drop() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo_path = temp.path().join("repo");
@@ -11271,6 +11330,37 @@ error: src/lib.rs: does not match index
             parse_git_apply_error_paths(stderr),
             vec![PathBuf::from("README.md"), PathBuf::from("src/lib.rs")]
         );
+    }
+
+    #[test]
+    fn localized_git_apply_messages_do_not_parse() {
+        let stderr = "\
+Fehler: Patch fehlgeschlagen: README.md:1
+error: README.md: Patch lässt sich nicht anwenden
+";
+        assert!(parse_git_apply_error_paths(stderr).is_empty());
+    }
+
+    #[test]
+    fn isolated_git_environment_pins_c_locale() {
+        let mut inherited = BTreeMap::from([
+            ("LANG".to_string(), "de_DE.UTF-8".to_string()),
+            ("LC_ALL".to_string(), "de_DE.UTF-8".to_string()),
+            ("LC_CTYPE".to_string(), "de_DE.UTF-8".to_string()),
+            ("LC_MESSAGES".to_string(), "de_DE.UTF-8".to_string()),
+        ]);
+        pin_parsed_git_locale(&mut inherited);
+        assert_eq!(inherited.get("LC_ALL").map(String::as_str), Some("C"));
+        assert_eq!(inherited.get("LANG").map(String::as_str), Some("C"));
+        assert!(!inherited.contains_key("LC_CTYPE"));
+        assert!(!inherited.contains_key("LC_MESSAGES"));
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let environment = capture_git_environment(&repo_path).expect("capture git environment");
+        assert_eq!(environment.get("LC_ALL").map(String::as_str), Some("C"));
+        assert_eq!(environment.get("LANG").map(String::as_str), Some("C"));
     }
 
     #[test]
