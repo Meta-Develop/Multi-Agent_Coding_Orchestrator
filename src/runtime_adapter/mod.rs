@@ -8,10 +8,10 @@
 mod capabilities;
 
 pub use capabilities::{
-    parse_adapter_allowlist, registered_adapter_ids, AdapterId, BlockingPreActionCallback,
-    CapabilityMatrix, CapabilityMatrixCell, CapabilityMatrixRow, MatrixStatus, ModelCatalogSource,
-    RuntimeCapabilities, SessionResume, SideEffectConfinement, UsageReporting,
-    WorkspaceWritability,
+    parse_adapter_allowlist, registered_adapter_ids, AdapterId, AdapterTrustClass,
+    BlockingPreActionCallback, CapabilityMatrix, CapabilityMatrixCell, CapabilityMatrixRow,
+    MatrixStatus, ModelCatalogSource, PrivateRuntimeStateHome, RuntimeCapabilities, SessionResume,
+    SideEffectConfinement, UsageReporting, WorkspaceWritability,
 };
 
 use anyhow::{bail, Context, Result};
@@ -138,6 +138,65 @@ impl AgentRuntimeAdapter for ClaudeCodeAdapter {
 
     fn config(&self) -> &RuntimeAdapterConfig {
         &self.config
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexAdapter {
+    config: RuntimeAdapterConfig,
+}
+
+impl CodexAdapter {
+    pub fn from_environment() -> Self {
+        Self {
+            config: RuntimeAdapterConfig::from_adapter_environment(AdapterId::Codex),
+        }
+    }
+}
+
+impl AgentRuntimeAdapter for CodexAdapter {
+    fn adapter_id(&self) -> AdapterId {
+        AdapterId::Codex
+    }
+
+    fn config(&self) -> &RuntimeAdapterConfig {
+        &self.config
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeAdapter {
+    config: RuntimeAdapterConfig,
+}
+
+impl FakeAdapter {
+    pub fn from_environment() -> Self {
+        Self {
+            config: RuntimeAdapterConfig::from_adapter_environment(AdapterId::Fake),
+        }
+    }
+}
+
+impl AgentRuntimeAdapter for FakeAdapter {
+    fn adapter_id(&self) -> AdapterId {
+        AdapterId::Fake
+    }
+
+    fn config(&self) -> &RuntimeAdapterConfig {
+        &self.config
+    }
+}
+
+/// Construct the adapter for a registered id. Codex keeps an empty launch
+/// template so the existing execution path continues to own its argv.
+pub fn adapter_for(id: AdapterId) -> Box<dyn AgentRuntimeAdapter> {
+    match id {
+        AdapterId::Codex => Box::new(CodexAdapter::from_environment()),
+        AdapterId::Fake => Box::new(FakeAdapter::from_environment()),
+        AdapterId::Grok => Box::new(GrokAdapter::from_environment()),
+        AdapterId::Cursor => Box::new(CursorAdapter::from_environment()),
+        AdapterId::ClaudeCode => Box::new(ClaudeCodeAdapter::from_environment()),
+        AdapterId::GeminiCli => Box::new(GeminiAdapter::from_environment()),
     }
 }
 
@@ -852,6 +911,27 @@ mod tests {
         })?;
         assert_eq!(run.status, Some(0));
         assert_eq!(run.captured, b"stdin-prompt");
+        Ok(())
+    }
+
+    #[test]
+    fn registry_constructs_every_known_adapter_without_vendor_gates() -> Result<()> {
+        for id in AdapterId::ALL {
+            let adapter = adapter_for(id);
+            assert_eq!(adapter.adapter_id(), id);
+            assert_eq!(adapter.capabilities(), id.capabilities());
+            assert_eq!(
+                adapter.config().binary_path(),
+                Path::new(id.default_binary())
+            );
+            assert!(
+                !adapter.capabilities().admits_writable_release(),
+                "{id} writable admission must come from the capability descriptor"
+            );
+        }
+        let codex = adapter_for(AdapterId::Codex);
+        assert!(codex.config().argument_template.is_empty());
+        assert_eq!(codex.config().output_capture, OutputCaptureMode::OutputFile);
         Ok(())
     }
 

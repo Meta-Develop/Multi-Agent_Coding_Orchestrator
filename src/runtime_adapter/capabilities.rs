@@ -111,6 +111,60 @@ impl AdapterId {
             Self::GeminiCli => RuntimeCapabilities::GEMINI_CLI,
         }
     }
+
+    /// Current MACO trust posture. Only Codex is a trusted-system executable today.
+    pub const fn trust_class(self) -> AdapterTrustClass {
+        match self {
+            Self::Codex => AdapterTrustClass::TrustedSystem,
+            Self::Fake => AdapterTrustClass::LocalDeterministic,
+            Self::Grok | Self::Cursor | Self::ClaudeCode | Self::GeminiCli => {
+                AdapterTrustClass::ExplicitCustom
+            }
+        }
+    }
+
+    /// Observed private state home. `None` means this adapter has no staged runtime home.
+    pub const fn private_state_home(self) -> Option<PrivateRuntimeStateHome> {
+        match self {
+            Self::Codex => Some(PrivateRuntimeStateHome {
+                env_var: "CODEX_HOME",
+                relative_path: ".codex",
+            }),
+            Self::Grok => Some(PrivateRuntimeStateHome {
+                env_var: "GROK_HOME",
+                relative_path: ".grok",
+            }),
+            Self::Cursor => Some(PrivateRuntimeStateHome {
+                env_var: "CURSOR_CONFIG_DIR",
+                relative_path: ".cursor",
+            }),
+            Self::ClaudeCode => Some(PrivateRuntimeStateHome {
+                env_var: "CLAUDE_CONFIG_DIR",
+                relative_path: ".claude",
+            }),
+            Self::GeminiCli => Some(PrivateRuntimeStateHome {
+                env_var: "GEMINI_CLI_HOME",
+                relative_path: ".gemini",
+            }),
+            Self::Fake => None,
+        }
+    }
+}
+
+/// How MACO currently classifies the adapter executable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterTrustClass {
+    TrustedSystem,
+    ExplicitCustom,
+    LocalDeterministic,
+}
+
+/// Generalized `private_runtime_codex_home`: where this runtime keeps its state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PrivateRuntimeStateHome {
+    pub env_var: &'static str,
+    pub relative_path: &'static str,
 }
 
 impl From<RuntimeId> for AdapterId {
@@ -565,6 +619,33 @@ mod tests {
             vec![AdapterId::Grok, AdapterId::GeminiCli]
         );
         assert_eq!(parse_adapter_allowlist(Some("not-a-runtime")), Vec::new());
+    }
+
+    #[test]
+    fn observed_private_state_homes_are_declared_for_every_subprocess_runtime() {
+        let homes = [
+            (AdapterId::Codex, "CODEX_HOME", ".codex"),
+            (AdapterId::Grok, "GROK_HOME", ".grok"),
+            (AdapterId::Cursor, "CURSOR_CONFIG_DIR", ".cursor"),
+            (AdapterId::ClaudeCode, "CLAUDE_CONFIG_DIR", ".claude"),
+            (AdapterId::GeminiCli, "GEMINI_CLI_HOME", ".gemini"),
+        ];
+        for (adapter, env_var, relative_path) in homes {
+            let home = adapter
+                .private_state_home()
+                .unwrap_or_else(|| panic!("{adapter} is missing a private state home"));
+            assert_eq!(home.env_var, env_var);
+            assert_eq!(home.relative_path, relative_path);
+        }
+        assert_eq!(AdapterId::Fake.private_state_home(), None);
+        assert_eq!(
+            AdapterId::Codex.trust_class(),
+            AdapterTrustClass::TrustedSystem
+        );
+        assert_eq!(
+            AdapterId::ClaudeCode.trust_class(),
+            AdapterTrustClass::ExplicitCustom
+        );
     }
 
     #[test]
