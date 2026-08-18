@@ -132,6 +132,7 @@ pub(crate) struct AuthenticatedStateJournal<S: JournalSpec> {
     identity: JournalIdentity,
     records: Vec<JournalRecord>,
     record_bytes: u64,
+    head_dirty: bool,
     spec: PhantomData<S>,
 }
 
@@ -184,6 +185,7 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
             identity,
             records: Vec::new(),
             record_bytes: 0,
+            head_dirty: false,
             spec: PhantomData,
         };
         journal.verify_boundaries()?;
@@ -250,6 +252,7 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
                 identity,
                 records: Vec::new(),
                 record_bytes: 0,
+                head_dirty: false,
                 spec: PhantomData,
             }
         } else {
@@ -280,6 +283,7 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
                 identity: locator.identity,
                 records: Vec::new(),
                 record_bytes: 0,
+                head_dirty: false,
                 spec: PhantomData,
             }
         };
@@ -317,6 +321,7 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
             identity: expected.clone(),
             records: Vec::new(),
             record_bytes: 0,
+            head_dirty: false,
             spec: PhantomData,
         };
         journal.load_and_recover()?;
@@ -359,6 +364,7 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
             identity: expected.clone(),
             records: Vec::new(),
             record_bytes: 0,
+            head_dirty: false,
             spec: PhantomData,
         };
         journal.load_without_recovery()?;
@@ -434,6 +440,11 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
             bail!("{} journal reached its bounded record count", S::NAMESPACE);
         }
         self.verify_boundaries()?;
+        if self.head_dirty {
+            self.publish_head().context(
+                "checkpoint journal must rewrite a dirty head before appending another record",
+            )?;
+        }
         let sequence = u64::try_from(self.records.len())
             .context("checkpoint sequence overflowed")?
             .checked_add(1)
@@ -471,7 +482,7 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
             .checked_add(encoded_len)
             .context("journal byte total overflowed")?;
         self.records.push(record);
-        self.write_head()?;
+        self.publish_head()?;
         self.verify_boundaries()?;
         self.records
             .last()
@@ -670,6 +681,19 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
         self.write_head()
     }
 
+    fn publish_head(&mut self) -> Result<()> {
+        match self.write_head() {
+            Ok(()) => {
+                self.head_dirty = false;
+                Ok(())
+            }
+            Err(error) => {
+                self.head_dirty = true;
+                Err(error)
+            }
+        }
+    }
+
     fn write_head(&self) -> Result<()> {
         if self.records.is_empty() {
             bail!("checkpoint journal cannot publish an empty head");
@@ -694,6 +718,10 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
         encoded.push(b'\n');
         if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > S::MAX_RECORD_BYTES {
             bail!("{} journal head exceeds its byte bound", S::NAMESPACE);
+        }
+        #[cfg(test)]
+        if take_journal_head_write_fault() {
+            bail!("injected checkpoint journal head write failure");
         }
         durable_replace::<S>(&self.run_root, S::HEAD_FILE_NAME, &encoded, || {
             self.verify_boundaries()
@@ -1357,6 +1385,21 @@ fn validate_private_state_file<S: JournalSpec>(
 }
 
 #[cfg(test)]
+thread_local! {
+    static JOURNAL_HEAD_WRITE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn set_journal_head_write_fault() {
+    JOURNAL_HEAD_WRITE_FAULT.with(|slot| slot.set(true));
+}
+
+#[cfg(test)]
+fn take_journal_head_write_fault() -> bool {
+    JOURNAL_HEAD_WRITE_FAULT.with(|slot| slot.replace(false))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::artifacts::repository_auth_writer;
@@ -1506,5 +1549,34 @@ mod tests {
         assert_eq!(journal.records().len(), 2);
         assert!(!run.join(temp_name).exists());
         assert!(run.join(record_file_name(2)).exists());
+    }
+
+    #[test]
+    fn head_write_failure_then_retry_rewrites_dirty_head_instead_of_wedging() {
+        let (_temp, repo_path, auth) = auth_repo();
+        let mut journal = StateJournal::create(auth, "dirty-head").expect("create journal");
+        journal
+            .append("planned", None, &serde_json::json!({"v": 1}))
+            .expect("first append");
+        let identity = journal.identity().clone();
+
+        set_journal_head_write_fault();
+        let failed = journal
+            .append("command_started", Some("agent-a"), &serde_json::json!({"v": 2}))
+            .expect_err("injected head write failure");
+        assert!(failed.to_string().contains("injected checkpoint journal head write"));
+        assert!(journal.head_dirty);
+        assert_eq!(journal.records().len(), 2);
+
+        journal
+            .append("command_finished", Some("agent-a"), &serde_json::json!({"v": 3}))
+            .expect("retry append after transient head failure");
+        assert!(!journal.head_dirty);
+        assert_eq!(journal.records().len(), 3);
+        drop(journal);
+
+        let reopened = reopen(&repo_path, &identity).expect("reopen after recovered dirty head");
+        assert_eq!(reopened.records().len(), 3);
+        assert_eq!(reopened.records()[2].phase, "command_finished");
     }
 }
