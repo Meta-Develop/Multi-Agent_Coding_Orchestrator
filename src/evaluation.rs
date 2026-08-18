@@ -943,6 +943,8 @@ pub enum EvaluationError {
     ArithmeticOverflow { context: String },
     #[error("failed to serialize the declared-input binding: {message}")]
     DeclaredInputsSerialization { message: String },
+    #[error("invalid gate-policy corpus field '{field}': {message}")]
+    InvalidGatePolicyCorpus { field: String, message: String },
 }
 
 /// Run a manifest-bound evaluation request.
