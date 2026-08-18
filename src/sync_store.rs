@@ -2892,10 +2892,12 @@ mod tests {
         .expect_err("successor time mismatch")
         .to_string()
         .contains("audited lineage"));
-        assert!(ensure_supersession_time_not_future(std::slice::from_ref(&history), 119)
-            .expect_err("future lineage time")
-            .to_string()
-            .contains("ambiguous clock state"));
+        assert!(
+            ensure_supersession_time_not_future(std::slice::from_ref(&history), 119)
+                .expect_err("future lineage time")
+                .to_string()
+                .contains("ambiguous clock state")
+        );
         assert!(validate_claim_liveness(2, &[], &[], &[history])
             .expect_err("historical token reuse guard")
             .to_string()
