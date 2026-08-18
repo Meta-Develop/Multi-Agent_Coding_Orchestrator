@@ -242,6 +242,38 @@ impl Usage {
             total_tokens: input_tokens.saturating_add(output_tokens),
         }
     }
+
+    pub fn saturating_add(self, other: Self) -> Self {
+        let input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        let output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        Self {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens.saturating_add(output_tokens),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct ModelPricing {
+    pub input_usd_per_million_tokens: f64,
+    pub output_usd_per_million_tokens: f64,
+}
+
+impl ModelPricing {
+    pub fn cost_usd(self, usage: Usage) -> f64 {
+        const TOKENS_PER_MILLION: f64 = 1_000_000.0;
+        (usage.input_tokens as f64 * self.input_usd_per_million_tokens
+            + usage.output_tokens as f64 * self.output_usd_per_million_tokens)
+            / TOKENS_PER_MILLION
+    }
+
+    pub fn is_valid(self) -> bool {
+        self.input_usd_per_million_tokens.is_finite()
+            && self.input_usd_per_million_tokens >= 0.0
+            && self.output_usd_per_million_tokens.is_finite()
+            && self.output_usd_per_million_tokens >= 0.0
+    }
 }
 
 fn estimate_tokens(chars: usize) -> usize {

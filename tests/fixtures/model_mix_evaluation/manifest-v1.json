@@ -1,0 +1,130 @@
+{
+  "version": 1,
+  "experiment_id": "issue26-phase-a-readme-v1",
+  "evidence": {
+    "kind": "provisional_deterministic_fake_only",
+    "plan_basis": "hand_authored",
+    "real_provider_executed": false,
+    "observed_isolated_repository_state": false,
+    "requirement_four_comparability": "not_established_deferred_to_phase_b",
+    "eligible_for_production_economics": false,
+    "eligible_to_justify_named_default": false,
+    "eligible_for_production_or_default_decisions": false,
+    "notice": "provisional deterministic fake evidence over a hand-authored plan; no isolated repository state was observed, so Issue #26 requirement-4 comparability is not established and is deferred to Phase B; ineligible for production or default decisions"
+  },
+  "target": {
+    "spec_or_goal_id": "readme-model-mix-note-v1",
+    "spec_or_goal_digest": "sha256:2248287b2efaaf7ea6a7af665e432fa29da2678c89823b3ca17fd99306140b24",
+    "hand_authored_plan_digest": "sha256:33aa49c0f72bd7e8b8be5ee706bdac3840e9807c9d789821033f7d23a47378ce"
+  },
+  "repository_base_snapshot": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
+  "limits": {
+    "wall_time_seconds": 900,
+    "max_dispatches": 4
+  },
+  "held_out_validation": [
+    {
+      "id": "readme-contract",
+      "command": [
+        "cargo",
+        "test",
+        "evaluation::tests::committed_fixtures_match_the_deterministic_harness"
+      ]
+    },
+    {
+      "id": "provider-boundary",
+      "command": [
+        "cargo",
+        "test",
+        "evaluation::tests::real_provider_execution_has_opt_in_and_phase_a_refusal_gates"
+      ]
+    }
+  ],
+  "repetitions": 3,
+  "profiles": [
+    {
+      "id": "frontier-all-v1",
+      "role_models": {
+        "supervisor": {
+          "model": "fake-frontier-v1",
+          "reasoning_effort": "high"
+        },
+        "child_orchestrator": {
+          "model": "fake-frontier-v1",
+          "reasoning_effort": "high"
+        },
+        "worker": {
+          "model": "fake-frontier-v1",
+          "reasoning_effort": "medium"
+        },
+        "auditor": {
+          "model": "fake-frontier-v1",
+          "reasoning_effort": "high"
+        }
+      }
+    },
+    {
+      "id": "hybrid-frontier-economy-v1",
+      "role_models": {
+        "supervisor": {
+          "model": "fake-frontier-v1",
+          "reasoning_effort": "high"
+        },
+        "child_orchestrator": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "high"
+        },
+        "worker": {
+          "model": "fake-economy-v1",
+          "reasoning_effort": "medium"
+        },
+        "auditor": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "high"
+        }
+      }
+    },
+    {
+      "id": "balanced-all-v1",
+      "role_models": {
+        "supervisor": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "high"
+        },
+        "child_orchestrator": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "high"
+        },
+        "worker": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "medium"
+        },
+        "auditor": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "high"
+        }
+      }
+    },
+    {
+      "id": "economy-all-v1",
+      "role_models": {
+        "supervisor": {
+          "model": "fake-economy-v1",
+          "reasoning_effort": "high"
+        },
+        "child_orchestrator": {
+          "model": "fake-economy-v1",
+          "reasoning_effort": "high"
+        },
+        "worker": {
+          "model": "fake-economy-v1",
+          "reasoning_effort": "medium"
+        },
+        "auditor": {
+          "model": "fake-economy-v1",
+          "reasoning_effort": "high"
+        }
+      }
+    }
+  ]
+}

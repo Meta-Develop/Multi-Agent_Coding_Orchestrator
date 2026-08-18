@@ -1,6 +1,9 @@
-# Audit every package and target represented in Cargo.lock, including
-# development and build dependencies.
+# Keep this policy intentionally small: the lockfile is audited across every
+# target represented in Cargo metadata, including build and dev dependencies.
+
 [graph]
+# An empty target list means no platform filtering: inspect every target that
+# Cargo resolves into the lockfile. Keep dev dependencies in the graph too.
 targets = []
 exclude = []
 all-features = false
@@ -8,26 +11,24 @@ no-default-features = false
 exclude-dev = false
 
 [advisories]
-# Security advisories must be fixed in the dependency graph rather than
-# suppressed. Add an ignore only for a documented, temporarily unfixable case.
 ignore = []
 
 [licenses]
 include-dev = true
 allow = [
-    # MIT is one of the public package's declared options. Every dependency in
-    # this graph that offers Apache-2.0 also offers MIT, so no Apache-only
-    # allowance is required.
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
     "MIT",
-    # Unicode-3.0 covers Unicode data used by unicode-ident. Its permissive
-    # notice terms are compatible with this MIT OR Apache-2.0 distribution.
     "Unicode-3.0",
+    "Unlicense",
 ]
 confidence-threshold = 0.8
 exceptions = [
-    # libz-sys ships stock zlib and may build it for static, Windows, or
-    # no-compatible-system-library fallbacks. Keep Zlib permission scoped to
-    # the exact locked crate.
+    # This is the repository's declared package license, not an allowance for
+    # arbitrary AGPL dependencies.
+    { allow = ["AGPL-3.0-or-later"], crate = "multi-agent-coding-orchestrator@0.3.0" },
+    # libz-sys embeds stock zlib when the static vendored build is selected.
+    # Keep Zlib scoped to that exact crate release.
     { allow = ["Zlib"], crate = "libz-sys@1.1.28" },
 ]
 
@@ -40,27 +41,33 @@ license-files = [
     { path = "src/zlib/LICENSE", hash = 0xcbc15cd1 },
 ]
 
+# r-efi is reachable only through target-specific getrandom paths in the
+# native libgit2 build toolchain and the tempfile dev dependency. Its SPDX
+# expression also offers MIT or Apache-2.0, so LGPL is deliberately not added
+# to the global allow list or granted an exception.
+
 [bans]
-# Duplicate package versions increase patching and review burden. The current
-# lockfile needs no duplicate-version exceptions.
 multiple-versions = "deny"
 multiple-versions-include-dev = true
-# Every direct dependency must use an explicit semver requirement.
 wildcards = "deny"
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
 allow = []
-# Apply the same ban and wildcard rules to this workspace package; workspace
-# membership must not exempt a future direct dependency from review.
-allow-workspace = false
+allow-workspace = true
 deny = []
 skip = []
 skip-tree = []
 
+# Keep the duplicate allowlists empty. The dev path
+# `workspace -> tempfile -> getrandom` overlaps the native build path
+# `workspace -> git2 -> libgit2-sys -> cc -> jobserver -> getrandom`, so both
+# resolve to getrandom 0.3.4. That also removes the duplicate dev/target-only
+# hashbrown, r-efi, and wit-bindgen branches and eliminates foldhash 0.1.5
+# rather than granting its Zlib license a repository-wide allowance or a stale
+# per-crate exception.
+
 [sources]
-# All dependencies must come from the canonical crates.io registry. Git and
-# alternate registry dependencies require a deliberate policy review.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

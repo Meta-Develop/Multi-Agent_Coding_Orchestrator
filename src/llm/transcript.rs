@@ -92,8 +92,19 @@ impl Redactor {
     ) -> Self {
         let label = label.into();
         let value = value.into();
-        if !label.trim().is_empty() && !value.is_empty() {
+        if !label.trim().is_empty()
+            && !value.is_empty()
+            && !self.rules.iter().any(|rule| rule.value == value)
+        {
             self.rules.push(RedactionRule { label, value });
+            self.rules.sort_by(|left, right| {
+                right
+                    .value
+                    .len()
+                    .cmp(&left.value.len())
+                    .then_with(|| left.value.cmp(&right.value))
+                    .then_with(|| left.label.cmp(&right.label))
+            });
         }
         self
     }
@@ -294,6 +305,23 @@ mod tests {
         assert_eq!(redacted.summary.total_replacements, 3);
         assert_eq!(redacted.summary.by_label.get("repo"), Some(&1));
         assert_eq!(redacted.summary.by_label.get("secret"), Some(&2));
+    }
+
+    #[test]
+    fn redacts_overlapping_private_values_longest_first_and_deduplicates() {
+        let redactor = Redactor::new()
+            .with_private_value("short", "abc")
+            .with_private_value("long", "abcdef")
+            .with_private_value("duplicate", "abcdef")
+            .with_private_value("empty", "");
+
+        let redacted = redactor.redact("values abcdef and abc");
+
+        assert_eq!(redacted.text, "values <redacted:long> and <redacted:short>");
+        assert_eq!(redacted.summary.total_replacements, 2);
+        assert_eq!(redacted.summary.by_label.get("long"), Some(&1));
+        assert_eq!(redacted.summary.by_label.get("short"), Some(&1));
+        assert!(!redacted.text.contains("def"));
     }
 
     #[test]
