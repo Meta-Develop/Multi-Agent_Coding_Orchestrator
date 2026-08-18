@@ -195,6 +195,16 @@ fn handle_connection(
         return Ok(());
     };
 
+    if !request_host_is_loopback(request.host.as_deref()) {
+        return write_json_response(
+            &mut stream,
+            "403 Forbidden",
+            &json!({"error": "host not allowed"}),
+            &[],
+            config.max_json_response_bytes,
+        );
+    }
+
     if request.method != "GET" {
         return write_json_response(
             &mut stream,
@@ -548,6 +558,7 @@ struct Request {
     method: String,
     path: String,
     query: Option<String>,
+    host: Option<String>,
     last_event_id: Option<String>,
 }
 
@@ -605,6 +616,8 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
     }
     let mut last_event_id = None;
     let mut last_event_id_seen = false;
+    let mut host = None;
+    let mut host_seen = false;
     for line in header.lines().skip(1) {
         if line.is_empty() {
             break;
@@ -621,14 +634,55 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
             }
             last_event_id_seen = true;
             last_event_id = Some(value.trim().to_string());
+        } else if name.trim().eq_ignore_ascii_case("Host") {
+            if host_seen {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate Host header",
+                ));
+            }
+            host_seen = true;
+            host = Some(value.trim().to_string());
         }
     }
     Ok(Some(Request {
         method: method.to_string(),
         path: path.to_string(),
         query: query.map(str::to_string),
+        host,
         last_event_id,
     }))
+}
+
+fn request_host_is_loopback(host: Option<&str>) -> bool {
+    let Some(host) = host.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    matches!(
+        hostname_from_host_header(host)
+            .to_ascii_lowercase()
+            .as_str(),
+        "localhost" | "127.0.0.1" | "[::1]" | "::1"
+    )
+}
+
+fn hostname_from_host_header(host: &str) -> &str {
+    if host.eq_ignore_ascii_case("::1") {
+        return host;
+    }
+    if let Some(end) = host.find(']') {
+        return &host[..=end];
+    }
+    match host.rsplit_once(':') {
+        Some((name, port))
+            if !name.is_empty()
+                && !name.contains(':')
+                && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            name
+        }
+        _ => host,
+    }
 }
 
 fn write_request_too_large(stream: &mut TcpStream) -> io::Result<Option<Request>> {
@@ -1051,6 +1105,84 @@ mod tests {
         response
     }
 
+    fn http_get_with_host(address: SocketAddr, path: &str, host: Option<&str>) -> String {
+        let mut stream = TcpStream::connect(address).expect("connect to test server");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set test read timeout");
+        match host {
+            Some(host) => write!(
+                stream,
+                "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write hosted request"),
+            None => write!(stream, "GET {path} HTTP/1.1\r\nConnection: close\r\n\r\n")
+                .expect("write hostless request"),
+        }
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read hosted HTTP response");
+        response
+    }
+
+    #[test]
+    fn loopback_host_header_allows_only_local_names() {
+        for host in [
+            "localhost",
+            "LocalHost",
+            "localhost:7878",
+            "127.0.0.1",
+            "127.0.0.1:9",
+            "[::1]",
+            "[::1]:7878",
+            "::1",
+        ] {
+            assert!(
+                request_host_is_loopback(Some(host)),
+                "rejected loopback host {host}"
+            );
+        }
+        for host in [
+            None,
+            Some(""),
+            Some("attacker.example"),
+            Some("attacker.example:7878"),
+            Some("192.0.2.1"),
+            Some("[::]"),
+            Some("localhost.attacker.example"),
+            Some("127.0.0.1.nip.io"),
+        ] {
+            assert!(
+                !request_host_is_loopback(host),
+                "accepted non-loopback host {host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_loopback_or_missing_host_headers() {
+        let source: Arc<dyn ScopeDataSource> =
+            Arc::new(TestDataSource::new(json!({"projects": []}), Vec::new()));
+        let mut server = TestServer::start(source, test_config());
+
+        let allowed = http_get_with_host(server.address, "/api/projects", Some("127.0.0.1:7878"));
+        assert!(
+            allowed.starts_with("HTTP/1.1 200 OK"),
+            "loopback host rejected: {allowed}"
+        );
+
+        for host in [None, Some("attacker.example"), Some("192.0.2.1:7878")] {
+            let response = http_get_with_host(server.address, "/api/projects", host);
+            assert!(
+                response.starts_with("HTTP/1.1 403 Forbidden"),
+                "unexpected response for host {host:?}: {response}"
+            );
+            assert!(response.contains("host not allowed"));
+        }
+        server.stop();
+    }
+
     #[test]
     fn accepts_only_numeric_loopback_bind_addresses() {
         assert_eq!(
@@ -1109,6 +1241,7 @@ mod tests {
             method: "GET".to_string(),
             path: "/api/stream".to_string(),
             query: Some("repo=repo+space&family=o2%2Dautopilot&run=run%2Fone&since=41".to_string()),
+            host: Some("localhost".to_string()),
             last_event_id: None,
         })
         .expect("stream options");
@@ -1121,6 +1254,7 @@ mod tests {
             method: "GET".to_string(),
             path: "/api/stream".to_string(),
             query: Some("since=now".to_string()),
+            host: Some("localhost".to_string()),
             last_event_id: Some("9".to_string()),
         })
         .expect("Last-Event-ID override");
@@ -1137,6 +1271,7 @@ mod tests {
                     method: "GET".to_string(),
                     path: "/api/stream".to_string(),
                     query: Some(query.to_string()),
+                    host: Some("localhost".to_string()),
                     last_event_id: None,
                 })
                 .is_err(),
