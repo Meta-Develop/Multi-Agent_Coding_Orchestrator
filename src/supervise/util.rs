@@ -141,6 +141,33 @@ pub(super) fn is_parent_auditor_id(assignment: &OrchestratorAssignment, id: &str
         .is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
+pub(super) fn owning_assignment_id_for_dispatch_subject<'a>(
+    subject: &'a str,
+    assignment_ids: &'a [String],
+) -> &'a str {
+    if let Some(assignment_id) = assignment_ids
+        .iter()
+        .find(|assignment_id| assignment_id.as_str() == subject)
+    {
+        return assignment_id;
+    }
+    assignment_ids
+        .iter()
+        .find(|assignment_id| {
+            let Some(suffix) = subject.strip_prefix(assignment_id.as_str()) else {
+                return false;
+            };
+            suffix == "-review-auditor"
+                || suffix
+                    .strip_prefix("-review-auditor-lens-")
+                    .is_some_and(|index| {
+                        !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+        })
+        .map(String::as_str)
+        .unwrap_or(subject)
+}
+
 pub(super) fn path_is_covered_by_claim(path: &Path, claim: &Path) -> bool {
     path == claim || path.starts_with(claim)
 }

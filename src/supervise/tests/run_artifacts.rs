@@ -841,6 +841,105 @@ fn resume_refuses_dispatch_started_without_durable_completion_as_uncertain() {
     );
 }
 
+#[test]
+fn owning_assignment_id_maps_auditor_dispatch_subjects() {
+    let assignment_ids = vec!["child-a".to_string(), "child-b".to_string()];
+    assert_eq!(
+        owning_assignment_id_for_dispatch_subject("child-a", &assignment_ids),
+        "child-a"
+    );
+    assert_eq!(
+        owning_assignment_id_for_dispatch_subject("child-a-review-auditor", &assignment_ids),
+        "child-a"
+    );
+    assert_eq!(
+        owning_assignment_id_for_dispatch_subject("child-b-review-auditor-lens-2", &assignment_ids),
+        "child-b"
+    );
+    assert_eq!(
+        owning_assignment_id_for_dispatch_subject("orphan-review-auditor-lens-1", &assignment_ids),
+        "orphan-review-auditor-lens-1"
+    );
+}
+
+#[test]
+fn resume_attributes_incomplete_auditor_dispatch_to_owning_assignment() {
+    let (_temp, repo) = injected_repository();
+    let run_id = RunId::new("authenticated-resume-auditor-uncertain")
+        .expect("valid auditor uncertain run id");
+    let assignment = injected_assignment(false);
+    let plan = injected_plan(assignment.clone(), 0);
+    let ledger =
+        RunBudgetLedger::new(RunBudgetLimits::default()).expect("auditor uncertain budget ledger");
+    let writer = ArtifactRunWriter::reserve(
+        &repo,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "auditor-uncertain-resume-test",
+    )
+    .expect("reserve auditor uncertain artifact run");
+    let mut checkpoint = SupervisorCheckpointWriter::create(
+        &repo,
+        SupervisorCheckpointPreparation::new(
+            &run_id,
+            &current_head_oid(&repo).expect("auditor uncertain primary base"),
+            normalized_supervisor_plan_sha256(
+                &plan,
+                &SupervisorConsultantPlan::default(),
+                &AssignmentMetadata::new(),
+                &SupervisorPlanMetadata::default(),
+            )
+            .expect("auditor uncertain normalized plan"),
+            1,
+            &plan,
+            writer
+                .resume_binding()
+                .expect("auditor uncertain prepared binding"),
+            ledger.report().expect("auditor uncertain initial budget"),
+        ),
+    )
+    .expect("create auditor uncertain checkpoint");
+    checkpoint
+        .assignment_started(
+            &assignment,
+            0,
+            Some(
+                writer
+                    .resume_binding()
+                    .expect("auditor uncertain assignment binding"),
+            ),
+            ledger
+                .report()
+                .expect("auditor uncertain assignment budget"),
+        )
+        .expect("checkpoint auditor uncertain assignment start");
+    checkpoint
+        .dispatch_started(true, &review_lens_auditor_id(&assignment, 1), 1)
+        .expect("checkpoint auditor dispatch start");
+    drop(checkpoint);
+    drop(writer);
+
+    let snapshot = match open_supervisor_checkpoint(&repo, &run_id) {
+        Ok((_opened, snapshot)) => snapshot,
+        Err(error) => panic!("incomplete auditor dispatch must remain analyzable: {error:#}"),
+    };
+    assert_eq!(snapshot.uncertain_assignments, vec!["child-a"]);
+    assert!(
+        !snapshot
+            .uncertain_assignments
+            .iter()
+            .any(|id| id.contains("review-auditor")),
+        "synthetic auditor IDs must not appear as uncertain assignments: {:?}",
+        snapshot.uncertain_assignments
+    );
+
+    let collect = collect_supervisor_run(&repo, run_id.clone()).expect("collect auditor uncertain");
+    assert_eq!(collect.run_lifecycle, SupervisorRunLifecycle::Uncertain);
+    let refusal = resume_supervisor_run(&repo, run_id).expect("typed auditor uncertain refusal");
+    assert_eq!(refusal.lifecycle, SupervisorRunLifecycle::Uncertain);
+    assert_eq!(refusal.uncertain_assignments, vec!["child-a"]);
+}
+
 fn prepared_dispatch_evidence_checkpoint(
     repo: &Path,
     run_id: &RunId,
