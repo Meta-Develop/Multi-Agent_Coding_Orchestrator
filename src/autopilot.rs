@@ -15,8 +15,8 @@ use crate::{
     orchestrator::{RunId, SemanticCoordinationMode},
     planning,
     process_runner::{
-        run_process, CapturedBytes, EnvironmentMode, ProcessCancellation, ProcessOutput,
-        ProcessRunError, ProcessSpec, Shell, SideEffectConfinementProfile,
+        run_process_cancellable, CapturedBytes, EnvironmentMode, ProcessCancellation,
+        ProcessOutput, ProcessRunError, ProcessSpec, Shell, SideEffectConfinementProfile,
         StrictOfflineWorkspaceProfile,
     },
     publication::{
@@ -1869,11 +1869,14 @@ fn run_autopilot_plan_file_disabled_legacy(
                 break;
             }
         };
+        let validation_cancellation = options.cancellation.clone().unwrap_or_default();
         let mut hooks = PrepublicationHooks {
             prepare: |options| {
                 publication::prepare_pr_candidate_with_write_lease(options, &worktree_lease)
             },
-            validate: |worktree: PathBuf| run_validation_commands(&worktree, &plan),
+            validate: |worktree: PathBuf| {
+                run_validation_commands(&worktree, &plan, &validation_cancellation)
+            },
             review: review::review_pr_for_publication,
             publish: |options, evidence| {
                 publication::publish_prepared_pr_with_source_guard(
@@ -3168,13 +3171,24 @@ fn publication_effect_observed(report: &PrPublicationReport) -> bool {
         })
 }
 
-fn run_validation_commands(worktree: &Path, plan: &AutopilotPlan) -> Result<Vec<ValidationReport>> {
+fn run_validation_commands(
+    worktree: &Path,
+    plan: &AutopilotPlan,
+    cancellation: &ProcessCancellation,
+) -> Result<Vec<ValidationReport>> {
     let mut reports = Vec::new();
     for (index, validation) in plan.validation_commands.iter().enumerate() {
+        if cancellation.is_cancelled() {
+            bail!(
+                "autopilot validation cancelled before command {}",
+                index + 1
+            );
+        }
         let output = run_validation_process(
             worktree,
             &validation.command,
             validation.timeout_seconds.map(Duration::from_secs),
+            cancellation,
         )
         .with_context(|| format!("failed to run validation command {}", index + 1))?;
         let passed = output.safety_sensitive_succeeded();
@@ -3218,8 +3232,9 @@ fn run_validation_process(
     worktree: &Path,
     command_text: &str,
     timeout: Option<Duration>,
+    cancellation: &ProcessCancellation,
 ) -> Result<ProcessOutput, ProcessRunError> {
-    run_process(
+    run_process_cancellable(
         ProcessSpec::shell(
             "validation command",
             Shell::for_current_platform(),
@@ -3233,6 +3248,7 @@ fn run_validation_process(
             StrictOfflineWorkspaceProfile::read_write(worktree),
         ))
         .with_timeout(timeout),
+        cancellation,
     )
 }
 
@@ -6910,6 +6926,33 @@ mod tests {
             .expect_err("excessive repair attempts must fail");
         assert!(format!("{error:#}").contains("max_repair_attempts"));
         assert!(!repo.join(".maco/autopilot").exists());
+    }
+
+    #[test]
+    fn validation_commands_honor_caller_cancellation_between_commands() {
+        let cancellation = ProcessCancellation::new();
+        cancellation.cancel();
+        let mut plan = supervisor_profile_test_plan();
+        plan.validation_commands = vec![
+            AutopilotValidationCommand {
+                name: Some("first".to_string()),
+                command: "true".to_string(),
+                timeout_seconds: Some(600),
+            },
+            AutopilotValidationCommand {
+                name: Some("second".to_string()),
+                command: "true".to_string(),
+                timeout_seconds: Some(600),
+            },
+        ];
+
+        let error = run_validation_commands(Path::new("."), &plan, &cancellation)
+            .expect_err("cancelled validation must not start commands");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cancelled before command 1"),
+            "remaining commands must be skipped without waiting on timeouts: {message}"
+        );
     }
 
     #[cfg(unix)]
