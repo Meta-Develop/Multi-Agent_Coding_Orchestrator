@@ -1337,8 +1337,11 @@ fn module_path_for_file(file: &Path) -> Vec<String> {
         }
     }
 
-    for component in components {
-        if component == "lib" || component == "main" || component == "mod" {
+    let last_index = components.len().saturating_sub(1);
+    for (index, component) in components.into_iter().enumerate() {
+        // Only the file-stem component is a crate root alias. Directories named
+        // lib/main/mod are real modules and must stay in the path.
+        if index == last_index && matches!(component.as_str(), "lib" | "main" | "mod") {
             continue;
         }
         parts.push(component);
@@ -2047,5 +2050,85 @@ pub fn endpoint() {}
             }),
             source.len() - 1
         );
+    }
+
+    #[test]
+    fn module_path_strips_lib_main_mod_only_from_the_file_stem() {
+        assert_eq!(
+            module_path_for_file(Path::new("src/lib.rs")),
+            vec!["crate".to_string()]
+        );
+        assert_eq!(
+            module_path_for_file(Path::new("src/main.rs")),
+            vec!["crate".to_string()]
+        );
+        assert_eq!(
+            module_path_for_file(Path::new("src/main/config.rs")),
+            vec![
+                "crate".to_string(),
+                "main".to_string(),
+                "config".to_string()
+            ]
+        );
+        assert_eq!(
+            module_path_for_file(Path::new("src/lib/helpers.rs")),
+            vec![
+                "crate".to_string(),
+                "lib".to_string(),
+                "helpers".to_string()
+            ]
+        );
+        assert_eq!(
+            module_path_for_file(Path::new("src/main/mod.rs")),
+            vec!["crate".to_string(), "main".to_string()]
+        );
+        assert_eq!(
+            module_path_for_file(Path::new("tests/main.rs")),
+            vec!["tests".to_string()]
+        );
+        assert_eq!(
+            module_path_for_file(Path::new("src/mod/inner.rs")),
+            vec!["crate".to_string(), "mod".to_string(), "inner".to_string()]
+        );
+    }
+
+    #[test]
+    fn semantic_scan_keeps_directory_components_named_main_lib_or_mod() {
+        let (_temp, repo) = init_repo();
+        write_file(&repo, "src/lib.rs", "pub fn root() {}\n");
+        write_file(&repo, "src/main/config.rs", "pub fn cfg() {}\n");
+        write_file(&repo, "src/lib/helpers.rs", "pub fn help() {}\n");
+        write_file(&repo, "tests/main.rs", "fn harness() {}\n");
+
+        let map = scan_repository(&repo).expect("scan");
+        let module_path = |path: &str| {
+            map.files
+                .iter()
+                .find(|file| file.path == Path::new(path))
+                .map(|file| file.module_path.clone())
+                .expect(path)
+        };
+
+        assert_eq!(module_path("src/lib.rs"), vec!["crate".to_string()]);
+        assert_eq!(
+            module_path("src/main/config.rs"),
+            vec![
+                "crate".to_string(),
+                "main".to_string(),
+                "config".to_string()
+            ]
+        );
+        assert_eq!(
+            module_path("src/lib/helpers.rs"),
+            vec![
+                "crate".to_string(),
+                "lib".to_string(),
+                "helpers".to_string()
+            ]
+        );
+        assert_eq!(module_path("tests/main.rs"), vec!["tests".to_string()]);
+        assert!(map.symbols.iter().any(|symbol| {
+            symbol.name == "cfg" && symbol.qualified_path == vec!["crate", "main", "config", "cfg"]
+        }));
     }
 }
