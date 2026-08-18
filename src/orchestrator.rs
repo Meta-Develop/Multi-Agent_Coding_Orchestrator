@@ -3343,6 +3343,32 @@ fn verify_selected_worktree_binding(
     Ok(())
 }
 
+fn revalidate_ready_agent(
+    agent: &AgentPlan,
+    summary: &AgentRunSummary,
+    worktree: &SelectedWorktree,
+) -> Result<crate::collect_revalidation::RevalidationGuard> {
+    let claim = summary.claim.as_ref().with_context(|| {
+        format!(
+            "agent '{}' has no durable path claim for pre-mutation revalidation",
+            agent.id
+        )
+    })?;
+    crate::collect_revalidation::revalidate_claimed_worker(
+        worktree.path(),
+        &agent.id,
+        claim.token,
+        &claim.paths,
+        worktree.record(),
+    )
+    .with_context(|| {
+        format!(
+            "pre-mutation revalidation failed for agent '{}'",
+            agent.id
+        )
+    })
+}
+
 #[cfg(test)]
 fn install_candidate_boundary_failure_hook(
     agent_id: &str,
@@ -3522,6 +3548,11 @@ fn run_ready_agents(
             &summaries[index],
             &worktrees[index],
         )?;
+        let _revalidation = revalidate_ready_agent(
+            &plan.agents[index],
+            &summaries[index],
+            &worktrees[index],
+        )?;
         let spec = command_spec(
             &plan.agents[index],
             &summaries[index],
@@ -3535,6 +3566,11 @@ fn run_ready_agents(
     for index in ready {
         verify_selected_worktree_binding(
             manager,
+            &plan.agents[*index],
+            &summaries[*index],
+            &worktrees[*index],
+        )?;
+        let _revalidation = revalidate_ready_agent(
             &plan.agents[*index],
             &summaries[*index],
             &worktrees[*index],

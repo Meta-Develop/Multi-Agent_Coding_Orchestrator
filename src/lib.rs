@@ -7,6 +7,7 @@ pub(crate) mod authenticated_snapshot;
 pub mod autopilot;
 pub(crate) mod checkpoint_wire;
 pub mod cli;
+pub(crate) mod collect_revalidation;
 pub mod consult;
 pub mod decision_claim;
 pub(crate) mod effect_wal;

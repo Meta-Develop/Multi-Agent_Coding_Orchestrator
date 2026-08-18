@@ -6,14 +6,16 @@ use crate::{
         repository_authenticator_key_only,
         state_auth::{sha256_hex, AuthenticationDomain, RepositoryAuthBinding},
     },
-    authenticated_snapshot::{AuthenticatedSnapshotStore, SnapshotSpec},
+    authenticated_snapshot::{AuthenticatedSnapshot, AuthenticatedSnapshotStore, SnapshotSpec},
     live_claim::{
         claim_process_liveness, current_claim_process_identity, ClaimProcessIdentity,
         ClaimProcessLiveness,
     },
     megafile::{MegafileAssessment, MegafileStore, MegafileThresholds},
     orchestrator::RunId,
-    safe_state::{stable_checksum, FileIdentity, KernelStateLock, SafeRoot},
+    safe_state::{
+        stable_checksum, ExistingExclusiveLock, FileIdentity, KernelStateLock, SafeRoot,
+    },
     state_journal::JournalSpec,
     state_migration::{
         decode_checksumless_legacy_claims_state, finalize_legacy_retirement,
@@ -23,6 +25,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use git2::Repository;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -82,6 +85,98 @@ impl LockedClaimsSnapshot {
 
     pub(crate) fn verify(&self) -> Result<()> {
         self.state.verify(&self.lock)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExistingClaimBindingRequest {
+    pub agent_id: String,
+    pub token: ClaimToken,
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ExistingClaimRevalidationError {
+    #[error("existing authenticated claims state is unavailable or invalid")]
+    StateUnavailable {
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error("existing authenticated claims lock is busy")]
+    LockBusy,
+    #[error("existing authenticated claims lock is missing")]
+    LockMissing,
+    #[error("claim revalidation request count exceeds the {limit} entry bound")]
+    RequestLimit { limit: usize },
+    #[error("claim revalidation request for agent '{agent_id}' has noncanonical paths")]
+    NoncanonicalPaths { agent_id: String },
+    #[error(
+        "claim token {token} for agent '{agent_id}' was superseded by token {successor_token}"
+    )]
+    Superseded {
+        agent_id: String,
+        token: u64,
+        successor_token: u64,
+    },
+    #[error("claim token {token} for agent '{agent_id}' is no longer active")]
+    Released { agent_id: String, token: u64 },
+    #[error(
+        "claim token {token} for agent '{agent_id}' was replaced by token {actual_token} owned by '{actual_owner}'"
+    )]
+    Replaced {
+        agent_id: String,
+        token: u64,
+        actual_token: u64,
+        actual_owner: String,
+    },
+    #[error("claim token {token} owner mismatch: expected '{agent_id}', found '{actual_owner}'")]
+    OwnerMismatch {
+        agent_id: String,
+        token: u64,
+        actual_owner: String,
+    },
+    #[error("claim token {token} path binding mismatch for agent '{agent_id}'")]
+    PathsMismatch { agent_id: String, token: u64 },
+    #[error("claim token {token} for agent '{agent_id}' is not live: {state:?}")]
+    NotLive {
+        agent_id: String,
+        token: u64,
+        state: ClaimLivenessState,
+    },
+    #[error("authenticated claims state changed while its existing-only guard was held")]
+    StateChanged,
+}
+
+/// Retains the already-existing claims writer lock for one bounded batch of
+/// mutation authorities. Heartbeat, sweep, takeover, and release stay
+/// serialized while the guard is alive. This is the claims lock only; it must
+/// not acquire `managed_worktrees.lock`.
+#[must_use = "the claims guard must be retained for the protected operation"]
+#[derive(Debug)]
+pub(crate) struct ExistingClaimsGuard {
+    repo_path: PathBuf,
+    state: RepositoryStateRoot,
+    lock: RepositoryStateLock,
+    authenticated: AuthenticatedClaimsState,
+    requests: Vec<ExistingClaimBindingRequest>,
+    // Rechecks use the acquisition instant that already passed liveness.
+    // Re-aging while this guard blocks heartbeats would manufacture staleness.
+    validated_at_unix_seconds: u64,
+}
+
+impl ExistingClaimsGuard {
+    pub(crate) fn verify(&self) -> std::result::Result<(), ExistingClaimRevalidationError> {
+        let authenticated =
+            read_existing_authenticated_claims(&self.repo_path, &self.state, &self.lock)
+                .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?;
+        if authenticated != self.authenticated {
+            return Err(ExistingClaimRevalidationError::StateChanged);
+        }
+        verify_existing_claim_requests(
+            &authenticated,
+            &self.requests,
+            self.validated_at_unix_seconds,
+        )
     }
 }
 
@@ -402,6 +497,32 @@ impl RepositoryStateRoot {
         })
     }
 
+    fn open_existing(
+        repo: &Repository,
+        state_file: &'static str,
+        lock_file: &'static str,
+    ) -> Result<Self> {
+        let common_root = SafeRoot::open_existing(repo.commondir()).with_context(|| {
+            format!(
+                "Git common directory is not a safe current-user-owned directory: {}",
+                repo.commondir().display()
+            )
+        })?;
+        let binding = RepositoryStateBinding {
+            common_dir_path_checksum: stable_checksum(&filesystem_path_bytes(common_root.path())),
+            common_dir_identity: common_root.identity().clone(),
+        };
+        let root = SafeRoot::open_existing(common_root.path().join("maco").join("state"))
+            .context("existing MACO state root is absent or unsafe")?;
+        Ok(Self {
+            state_path: root.direct_child(state_file)?,
+            root,
+            state_file,
+            lock_file,
+            binding,
+        })
+    }
+
     pub(crate) fn state_path(&self) -> &Path {
         &self.state_path
     }
@@ -427,6 +548,32 @@ impl RepositoryStateRoot {
             state_file: self.state_file,
             lock_identity,
         })
+    }
+
+    fn lock_existing(
+        &self,
+    ) -> std::result::Result<RepositoryStateLock, ExistingClaimRevalidationError> {
+        let lock = match KernelStateLock::try_acquire_existing_exclusive_direct(
+            &self.root,
+            self.lock_file,
+        )
+        .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?
+        {
+            ExistingExclusiveLock::Acquired(lock) => lock,
+            ExistingExclusiveLock::Busy => return Err(ExistingClaimRevalidationError::LockBusy),
+            ExistingExclusiveLock::Missing => {
+                return Err(ExistingClaimRevalidationError::LockMissing)
+            }
+        };
+        let bound = RepositoryStateLock {
+            root_identity: self.root.identity().clone(),
+            state_file: self.state_file,
+            lock_identity: lock.identity().clone(),
+            _lock: lock,
+        };
+        self.verify_lock(&bound)
+            .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?;
+        Ok(bound)
     }
 
     #[cfg(test)]
@@ -534,6 +681,199 @@ fn finish_with_lock_verification<T>(result: Result<T>, verification: Result<()>)
             "operation also lost its stable lock-path binding: {lock_error:#}"
         ))),
     }
+}
+
+pub(crate) fn lock_existing_authenticated_claims(
+    repo_path: &Path,
+    requests: Vec<ExistingClaimBindingRequest>,
+) -> std::result::Result<ExistingClaimsGuard, ExistingClaimRevalidationError> {
+    if requests.is_empty() || requests.len() > MAX_SYNC_CLAIMS {
+        return Err(ExistingClaimRevalidationError::RequestLimit {
+            limit: MAX_SYNC_CLAIMS,
+        });
+    }
+    let repo = crate::git_repository::discover(repo_path).map_err(|source| {
+        ExistingClaimRevalidationError::StateUnavailable {
+            source: source.into(),
+        }
+    })?;
+    let state = RepositoryStateRoot::open_existing(&repo, "claims.json", "claims.lock")
+        .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?;
+    let lock = state.lock_existing()?;
+    let repo_path = repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf();
+    let authenticated = read_existing_authenticated_claims(&repo_path, &state, &lock)
+        .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?;
+    let validated_at_unix_seconds = current_unix_seconds()
+        .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?;
+    verify_existing_claim_requests(&authenticated, &requests, validated_at_unix_seconds)?;
+    Ok(ExistingClaimsGuard {
+        repo_path,
+        state,
+        lock,
+        authenticated,
+        requests,
+        validated_at_unix_seconds,
+    })
+}
+
+fn read_existing_authenticated_claims(
+    repo_path: &Path,
+    state: &RepositoryStateRoot,
+    lock: &RepositoryStateLock,
+) -> Result<AuthenticatedClaimsState> {
+    state.verify(lock)?;
+    if !state
+        .root
+        .direct_child_exists(ClaimsSnapshotSpec::ROOT_NAME)?
+    {
+        bail!("authenticated claims snapshot is absent; initialization or migration is required");
+    }
+    let authenticator = repository_authenticator_key_only(repo_path)?;
+    let snapshot = AuthenticatedSnapshotStore::<ClaimsSnapshotSpec, AuthenticatedClaimsState>::
+        read_existing_current(authenticator, CLAIMS_LOGICAL_ID)?;
+    validate_existing_authenticated_claims_snapshot(&snapshot)?;
+    state.verify(lock)?;
+    Ok(snapshot.value)
+}
+
+fn validate_existing_authenticated_claims_snapshot(
+    snapshot: &AuthenticatedSnapshot<AuthenticatedClaimsState>,
+) -> Result<()> {
+    if snapshot.value.version != 1
+        || snapshot.value.snapshot_revision != snapshot.generation
+        || snapshot.value.snapshot_revision != snapshot.token
+    {
+        bail!("authenticated claims snapshot binding or revision is inconsistent");
+    }
+    validate_sync_snapshot(&SyncSnapshot {
+        next_token: snapshot.value.next_token,
+        claims: snapshot.value.claims.clone(),
+    })?;
+    validate_claim_run_owners(&snapshot.value.claims, &snapshot.value.run_owners)?;
+    validate_claim_liveness(
+        snapshot.value.next_token,
+        &snapshot.value.claims,
+        &snapshot.value.liveness,
+        &snapshot.value.supersessions,
+    )
+}
+
+fn verify_existing_claim_requests(
+    state: &AuthenticatedClaimsState,
+    requests: &[ExistingClaimBindingRequest],
+    now: u64,
+) -> std::result::Result<(), ExistingClaimRevalidationError> {
+    ensure_supersession_time_not_future(&state.supersessions, now)
+        .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?;
+    let liveness = state
+        .liveness
+        .iter()
+        .map(|entry| (entry.token, entry))
+        .collect::<BTreeMap<_, _>>();
+
+    for request in requests {
+        let canonical = canonical_request_paths(&request.agent_id, &request.paths)?;
+        let Some(claim) = state
+            .claims
+            .iter()
+            .find(|claim| claim.token == request.token)
+        else {
+            if let Some(lineage) = state
+                .supersessions
+                .iter()
+                .find(|entry| entry.prior_token == request.token)
+            {
+                return Err(ExistingClaimRevalidationError::Superseded {
+                    agent_id: request.agent_id.clone(),
+                    token: request.token.get(),
+                    successor_token: lineage.successor_token.get(),
+                });
+            }
+            if let Some(replacement) = state.claims.iter().find(|active| {
+                active.paths.iter().any(|actual| {
+                    canonical
+                        .iter()
+                        .any(|expected| claim_paths_overlap(expected, actual))
+                })
+            }) {
+                return Err(ExistingClaimRevalidationError::Replaced {
+                    agent_id: request.agent_id.clone(),
+                    token: request.token.get(),
+                    actual_token: replacement.token.get(),
+                    actual_owner: replacement.agent_id.clone(),
+                });
+            }
+            return Err(ExistingClaimRevalidationError::Released {
+                agent_id: request.agent_id.clone(),
+                token: request.token.get(),
+            });
+        };
+        if claim.agent_id != request.agent_id {
+            return Err(ExistingClaimRevalidationError::OwnerMismatch {
+                agent_id: request.agent_id.clone(),
+                token: request.token.get(),
+                actual_owner: claim.agent_id.clone(),
+            });
+        }
+        let mut actual = claim.paths.clone();
+        actual.sort();
+        if actual != canonical {
+            return Err(ExistingClaimRevalidationError::PathsMismatch {
+                agent_id: request.agent_id.clone(),
+                token: request.token.get(),
+            });
+        }
+        let report = claim_liveness_report(claim.clone(), liveness.get(&claim.token).copied(), now)
+            .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?;
+        if !matches!(
+            report.state,
+            ClaimLivenessState::Fresh | ClaimLivenessState::HeartbeatDue
+        ) {
+            return Err(ExistingClaimRevalidationError::NotLive {
+                agent_id: request.agent_id.clone(),
+                token: request.token.get(),
+                state: report.state,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn canonical_request_paths(
+    agent_id: &str,
+    paths: &[PathBuf],
+) -> std::result::Result<Vec<PathBuf>, ExistingClaimRevalidationError> {
+    if paths.is_empty() || paths.len() > MAX_SYNC_PATHS {
+        return Err(ExistingClaimRevalidationError::NoncanonicalPaths {
+            agent_id: agent_id.to_string(),
+        });
+    }
+    let mut canonical = Vec::with_capacity(paths.len());
+    for path in paths {
+        let normalized = normalize_repo_relative_path(path).map_err(|_| {
+            ExistingClaimRevalidationError::NoncanonicalPaths {
+                agent_id: agent_id.to_string(),
+            }
+        })?;
+        if &normalized != path {
+            return Err(ExistingClaimRevalidationError::NoncanonicalPaths {
+                agent_id: agent_id.to_string(),
+            });
+        }
+        canonical.push(normalized);
+    }
+    canonical.sort();
+    canonical.dedup();
+    if canonical.len() != paths.len() {
+        return Err(ExistingClaimRevalidationError::NoncanonicalPaths {
+            agent_id: agent_id.to_string(),
+        });
+    }
+    Ok(canonical)
+}
+
+fn claim_paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
 }
 
 impl SyncStore {
@@ -2031,6 +2371,56 @@ mod tests {
 
     fn test_timing() -> ClaimTiming {
         ClaimTiming::new(10, 20).expect("valid test timing")
+    }
+
+    #[test]
+    fn issue_84_stale_claim_is_rejected_by_existing_only_gate() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        let claim = store
+            .claim_paths_with_timing_at("owner", ["src"], test_timing(), 100)
+            .expect("timed claim")
+            .claim;
+        let error = lock_existing_authenticated_claims(
+            &repo_path,
+            vec![ExistingClaimBindingRequest {
+                agent_id: claim.agent_id.clone(),
+                token: claim.token,
+                paths: claim.paths.clone(),
+            }],
+        )
+        .expect_err("stale claim must stop the harness");
+        assert!(error.to_string().contains("not live"));
+    }
+
+    #[test]
+    fn issue_84_takeover_lineage_rejects_superseded_token() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        let prior = store
+            .claim_paths_with_timing_at("owner", ["src"], test_timing(), 100)
+            .expect("timed claim")
+            .claim;
+        store
+            .sweep_stale_at(120)
+            .expect("persist takeover eligibility");
+        store
+            .takeover_at(prior.token, "successor", None, 121)
+            .expect("takeover");
+        let error = lock_existing_authenticated_claims(
+            &repo_path,
+            vec![ExistingClaimBindingRequest {
+                agent_id: prior.agent_id.clone(),
+                token: prior.token,
+                paths: prior.paths.clone(),
+            }],
+        )
+        .expect_err("superseded predecessor must stop the harness");
+        assert!(error.to_string().contains("superseded"));
     }
 
     fn authenticated_claims_state(store: &SyncStore) -> AuthenticatedClaimsState {

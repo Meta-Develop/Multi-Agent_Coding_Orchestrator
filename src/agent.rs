@@ -321,6 +321,20 @@ where
     let mut validation_results = Vec::new();
     let mut execution_error = None;
 
+    let _revalidation = crate::collect_revalidation::revalidate_claimed_worker(
+        &run.repo,
+        &run.agent_id,
+        run.claim.token,
+        &run.claimed_paths,
+        &run.selected.record,
+    )
+    .with_context(|| {
+        format!(
+            "pre-mutation revalidation failed for agent '{}'",
+            run.agent_id
+        )
+    })?;
+
     for patch in &response.proposal.patches {
         let result = apply_proposed_patch(
             &run.selected.record.path,
