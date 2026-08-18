@@ -61,7 +61,10 @@ pub use online_router::{OnlineRouter, RouterDecision};
 pub use policy::{PolicyEdge, PolicyGraph, PolicyNode, TransitionCondition, TransitionEvidence};
 pub use predictor::{PolicyOutcomeDistribution, PolicyPredictor};
 pub use quality::QualityContract;
-pub use resources::{ResourceObserver, ResourceSnapshot, ResourceVector};
+pub use resources::{
+    DispatchClass, DispatchDecision, DispatchRequest, ResourceObserver, ResourceSnapshot,
+    ResourceVector,
+};
 pub use state::OptimizerState;
 
 #[cfg(test)]
