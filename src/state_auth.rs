@@ -4,8 +4,9 @@
 //! binding evidence and domain-separated sign/verify operations.
 
 use crate::{
-    field_guide::FIELD_GUIDE_STATE_NAMESPACE,
-    follow_up_queue::GENERATED_FOLLOW_UP_QUEUE_ROOT_NAME,
+    field_guide::{FIELD_GUIDE_OPERATION_LOCK, FIELD_GUIDE_ROOT_LOCK, FIELD_GUIDE_STATE_NAMESPACE},
+    follow_up_queue::{GENERATED_FOLLOW_UP_QUEUE_ROOT_LOCK, GENERATED_FOLLOW_UP_QUEUE_ROOT_NAME},
+    megafile::{MEGAFILE_OPERATION_LOCK, MEGAFILE_ROOT_LOCK, MEGAFILE_STATE_NAMESPACE},
     safe_state::{
         identity_for_path, AtomicStateWriter, BoundedRegularReader, ExistingExclusiveLock,
         FileIdentity, KernelStateLock, SafeRoot,
@@ -35,41 +36,64 @@ const LEGACY_ARTIFACT_DOMAIN: &[u8] = b"MACO\0artifact-finalization\0hmac-sha256
 /// Direct children that cannot safely survive generation of a replacement
 /// repository authentication key. Keep this registry centralized so every
 /// first-key writer fails closed as new authenticated state consumers arrive.
-const AUTHENTICATED_STATE_CONSUMERS: &[(&str, &str)] = &[
-    (
-        "orchestration-checkpoints-v3",
-        "orchestration checkpoint journals",
-    ),
-    ("authenticated-effect-wals-v1", "authenticated effect WALs"),
-    (
-        "authenticated-claims-state-v1",
-        "authenticated claims state",
-    ),
-    (
-        "authenticated-semantic-state-v1",
-        "authenticated semantic coordination state",
-    ),
-    (
-        FIELD_GUIDE_STATE_NAMESPACE,
-        "authenticated field guide state",
-    ),
-    (
-        "authenticated-managed-worktrees-v1",
-        "authenticated managed worktree state",
-    ),
-    (
-        "authenticated-megafile-history-v1",
-        "authenticated megafile history",
-    ),
-    (
-        "state-migration-manifests-v1",
-        "authenticated state migration manifests",
-    ),
-    (
-        GENERATED_FOLLOW_UP_QUEUE_ROOT_NAME,
-        "authenticated generated follow-up queues",
-    ),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuthenticatedStateConsumerSource {
+    pub(crate) root_name: &'static str,
+    pub(crate) state_root_lock_names: &'static [&'static str],
+    description: &'static str,
+}
+
+const AUTHENTICATED_STATE_CONSUMERS: &[AuthenticatedStateConsumerSource] = &[
+    AuthenticatedStateConsumerSource {
+        root_name: "orchestration-checkpoints-v3",
+        state_root_lock_names: &[".journals.lock"],
+        description: "orchestration checkpoint journals",
+    },
+    AuthenticatedStateConsumerSource {
+        root_name: "authenticated-effect-wals-v1",
+        state_root_lock_names: &[".effect-wals.lock"],
+        description: "authenticated effect WALs",
+    },
+    AuthenticatedStateConsumerSource {
+        root_name: "authenticated-claims-state-v1",
+        state_root_lock_names: &[".authenticated-claims.lock"],
+        description: "authenticated claims state",
+    },
+    AuthenticatedStateConsumerSource {
+        root_name: "authenticated-semantic-state-v1",
+        state_root_lock_names: &[".authenticated-semantic.lock"],
+        description: "authenticated semantic coordination state",
+    },
+    AuthenticatedStateConsumerSource {
+        root_name: FIELD_GUIDE_STATE_NAMESPACE,
+        state_root_lock_names: &[FIELD_GUIDE_ROOT_LOCK, FIELD_GUIDE_OPERATION_LOCK],
+        description: "authenticated field guide state",
+    },
+    AuthenticatedStateConsumerSource {
+        root_name: "authenticated-managed-worktrees-v1",
+        state_root_lock_names: &[".authenticated-managed-worktrees.lock"],
+        description: "authenticated managed worktree state",
+    },
+    AuthenticatedStateConsumerSource {
+        root_name: MEGAFILE_STATE_NAMESPACE,
+        state_root_lock_names: &[MEGAFILE_ROOT_LOCK, MEGAFILE_OPERATION_LOCK],
+        description: "authenticated megafile history",
+    },
+    AuthenticatedStateConsumerSource {
+        root_name: "state-migration-manifests-v1",
+        state_root_lock_names: &[".state-migrations.lock"],
+        description: "authenticated state migration manifests",
+    },
+    AuthenticatedStateConsumerSource {
+        root_name: GENERATED_FOLLOW_UP_QUEUE_ROOT_NAME,
+        state_root_lock_names: &[GENERATED_FOLLOW_UP_QUEUE_ROOT_LOCK],
+        description: "authenticated generated follow-up queues",
+    },
 ];
+
+pub(crate) fn authenticated_state_consumers() -> &'static [AuthenticatedStateConsumerSource] {
+    AUTHENTICATED_STATE_CONSUMERS
+}
 
 #[cfg(test)]
 pub(crate) fn authentication_key_file_name() -> &'static str {
@@ -533,10 +557,11 @@ impl RepositoryAuthWriter {
 
 fn validate_registered_consumers_before_first_key(state_root: &SafeRoot) -> Result<()> {
     state_root.verify()?;
-    for (root_name, description) in AUTHENTICATED_STATE_CONSUMERS {
-        if state_root.direct_child_exists(root_name)? {
+    for source in authenticated_state_consumers() {
+        if state_root.direct_child_exists(source.root_name)? {
             bail!(
-                "repository authentication key is missing while {description} exist; refusing to establish a replacement key epoch"
+                "repository authentication key is missing while {} exist; refusing to establish a replacement key epoch",
+                source.description
             );
         }
     }

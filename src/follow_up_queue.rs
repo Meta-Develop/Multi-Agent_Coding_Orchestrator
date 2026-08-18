@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const GENERATED_FOLLOW_UP_QUEUE_ROOT_NAME: &str =
     "authenticated-generated-follow-up-queues-v1";
+pub(crate) const GENERATED_FOLLOW_UP_QUEUE_ROOT_LOCK: &str = ".generated-follow-up-queues.lock";
 
 const QUEUE_FORMAT_VERSION: u32 = 1;
 const SOURCE_CASCADE_DEPTH: u8 = 0;
@@ -48,7 +49,7 @@ impl JournalSpec for GeneratedFollowUpQueueJournalSpec {
     const FORMAT_VERSION: u32 = QUEUE_FORMAT_VERSION;
     const NAMESPACE: &'static str = "generated_follow_up_queue";
     const ROOT_NAME: &'static str = GENERATED_FOLLOW_UP_QUEUE_ROOT_NAME;
-    const ROOT_LOCK_NAME: &'static str = ".generated-follow-up-queues.lock";
+    const ROOT_LOCK_NAME: &'static str = GENERATED_FOLLOW_UP_QUEUE_ROOT_LOCK;
     const INSTANCE_LOCK_NAME: &'static str = ".generated-follow-up-queue.lock";
     const HEAD_FILE_NAME: &'static str = ".head.json";
     const RECORD_DOMAIN: AuthenticationDomain =

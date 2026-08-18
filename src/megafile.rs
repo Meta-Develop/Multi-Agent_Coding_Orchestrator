@@ -40,15 +40,17 @@ pub const MAX_CLAIM_TELEMETRY_TARGETS: usize = 1_024;
 const MAX_SNAPSHOT_ENVELOPE_BYTES: u64 = 64 * 1024;
 const MAX_ACCOUNTED_PHYSICAL_BYTES: u64 = 120 * 1024 * 1024;
 const MEGAFILE_LOGICAL_ID: &str = "megafile-history";
-const MEGAFILE_OPERATION_LOCK: &str = "megafile-history-operation-v1.lock";
+pub(crate) const MEGAFILE_STATE_NAMESPACE: &str = "authenticated-megafile-history-v1";
+pub(crate) const MEGAFILE_ROOT_LOCK: &str = ".authenticated-megafile-history.lock";
+pub(crate) const MEGAFILE_OPERATION_LOCK: &str = "megafile-history-operation-v1.lock";
 
 pub(crate) enum MegafileSnapshotSpec {}
 
 impl JournalSpec for MegafileSnapshotSpec {
     const FORMAT_VERSION: u32 = 1;
     const NAMESPACE: &'static str = "authenticated_megafile_history";
-    const ROOT_NAME: &'static str = "authenticated-megafile-history-v1";
-    const ROOT_LOCK_NAME: &'static str = ".authenticated-megafile-history.lock";
+    const ROOT_NAME: &'static str = MEGAFILE_STATE_NAMESPACE;
+    const ROOT_LOCK_NAME: &'static str = MEGAFILE_ROOT_LOCK;
     const INSTANCE_LOCK_NAME: &'static str = ".megafile-snapshot.lock";
     const HEAD_FILE_NAME: &'static str = ".head.json";
     const RECORD_DOMAIN: AuthenticationDomain =
