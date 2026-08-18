@@ -39,9 +39,9 @@ impl EffectfulExecutionCapability {
     }
 
     /// Create a managed worktree using this capability as the cleanliness
-    /// input. Public `WorktreeManager::create` remains fail-closed on this
-    /// tree until the worktree lane's derivation lands; this is the
-    /// capability-bearing path.
+    /// input. Public `WorktreeManager::create` now derives the same
+    /// cleanliness evidence when the target repository is already clean;
+    /// this remains the explicit capability-bearing path.
     pub fn create_managed_worktree(
         &self,
         manager: &WorktreeManager,
@@ -145,20 +145,38 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn public_create_without_the_capability_still_fails_closed() {
-        let temp = TempDir::new().expect("tempdir");
-        let (_, manager) = clean_repo(&temp).expect("clean repo");
-        let error = manager
+        let dirty = TempDir::new().expect("tempdir");
+        let (dirty_repo, dirty_manager) = clean_repo(&dirty).expect("clean repo");
+        fs::write(dirty_repo.join("README.md"), "dirty\n").expect("dirty");
+        let error = dirty_manager
             .create(WorktreeCreateOptions {
                 agent_id: "must-not-exist".to_string(),
                 branch: None,
                 base: None,
-                worktree_root: Some(temp.path().join("worktrees")),
+                worktree_root: Some(dirty.path().join("worktrees")),
             })
-            .expect_err("public create remains capability-bound");
+            .expect_err("public create remains fail-closed when cleanliness cannot be derived");
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("capability-bound"),
+            message.contains("dirty") || message.contains("clean"),
             "unexpected public create error: {error:#}"
         );
-        assert!(!temp.path().join("worktrees").exists());
+        assert!(!dirty.path().join("worktrees").exists());
+
+        // The worktree lane now derives cleanliness for public create on an
+        // already-clean repository. That is the intended combined contract;
+        // a pre-acquired capability token is no longer required for create.
+        let clean = TempDir::new().expect("tempdir");
+        let (_, clean_manager) = clean_repo(&clean).expect("clean repo");
+        let record = clean_manager
+            .create(WorktreeCreateOptions {
+                agent_id: "must-not-exist".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(clean.path().join("worktrees")),
+            })
+            .expect("public create derives cleanliness from a clean repository");
+        assert_eq!(record.name, "must-not-exist");
+        assert!(record.path.join("README.md").is_file());
     }
 }
