@@ -40,6 +40,8 @@ use std::{
 
 #[path = "codex_app_server.rs"]
 pub(crate) mod codex_app_server;
+#[allow(dead_code, unused_imports)]
+pub(crate) mod executor;
 
 pub use crate::protected_path::SandboxDenialRetryability;
 
@@ -1185,6 +1187,38 @@ pub fn run_external_agent_cancellable(
 }
 
 pub(crate) fn run_external_agent_cancellable_reviewed(
+    spec: &ExternalAgentCommand,
+    cancellation: &ProcessCancellation,
+    review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
+) -> ExternalAgentRun {
+    forward_local_external_agent_run(
+        &run_external_agent_cancellable_reviewed_local,
+        spec,
+        cancellation,
+        review_runtime,
+    )
+}
+
+fn forward_local_external_agent_run<Runner>(
+    runner: &Runner,
+    spec: &ExternalAgentCommand,
+    cancellation: &ProcessCancellation,
+    review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
+) -> ExternalAgentRun
+where
+    Runner: for<'review> Fn(
+            &ExternalAgentCommand,
+            &ProcessCancellation,
+            Option<ExternalPreActionReviewRuntime<'review>>,
+        ) -> ExternalAgentRun
+        + Send
+        + Sync
+        + ?Sized,
+{
+    executor::LocalExecutor.forward_existing_run(runner, spec, cancellation, review_runtime)
+}
+
+fn run_external_agent_cancellable_reviewed_local(
     spec: &ExternalAgentCommand,
     cancellation: &ProcessCancellation,
     review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
@@ -6542,6 +6576,79 @@ mod tests {
         assert!(error
             .to_string()
             .contains("does not guarantee a blocking MACO callback"));
+    }
+
+    #[test]
+    fn local_executor_forwards_the_concrete_reviewed_runner_once_without_changing_its_run() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let spec = ExternalAgentCommand::codex(
+            "/bin/false",
+            "/workspace",
+            "/workspace/prompt.md",
+            "/workspace/events.jsonl",
+            "/workspace/last-message.txt",
+            Duration::from_secs(7),
+        );
+        let cancellation = ProcessCancellation::new();
+        let context = test_review_context();
+        let mut journal = RecordingPreActionJournal::default();
+        let calls = AtomicUsize::new(0);
+        let journal_record = terminal_turn_journal_record(
+            context.run_id(),
+            "forwarding-test",
+            &codex_app_server::AppServerOutcome {
+                thread_id: "thread-forwarded".to_string(),
+                turn_id: "turn-forwarded".to_string(),
+                status: codex_app_server::TurnTerminalStatus::Completed,
+                completed_items: 0,
+                item_outcomes: Vec::new(),
+                refused_ceiling_expansions: 0,
+                gate_denials: Vec::new(),
+                final_message: Some("forwarded".to_string()),
+                auto_reviews: Vec::new(),
+                duplex_fallback_required: false,
+                messages_received: 1,
+                bytes_received: 1,
+            },
+            None,
+        );
+        let expected = failed_external_run(
+            &spec,
+            Instant::now(),
+            vec!["sentinel-command".to_string()],
+            true,
+            "sentinel-error".to_string(),
+        );
+        let runner =
+            |command: &ExternalAgentCommand,
+             forwarded_cancellation: &ProcessCancellation,
+             review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert!(std::ptr::eq(command, &spec));
+                assert!(std::ptr::eq(forwarded_cancellation, &cancellation));
+                let review_runtime = review_runtime.expect("borrowed review runtime forwarded");
+                assert!(std::ptr::eq(review_runtime.context, &context));
+                review_runtime
+                    .journal
+                    .append(&journal_record)
+                    .expect("forwarded journal remains usable");
+                expected.clone()
+            };
+
+        let actual = forward_local_external_agent_run(
+            &runner,
+            &spec,
+            &cancellation,
+            Some(ExternalPreActionReviewRuntime {
+                context: &context,
+                journal: &mut journal,
+            }),
+        );
+
+        assert_eq!(actual, expected);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.records, vec![journal_record]);
     }
 
     #[cfg(unix)]
