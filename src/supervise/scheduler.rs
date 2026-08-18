@@ -81,6 +81,48 @@ fn run_before_supervisor_final_report_persist_hook(report: &mut SupervisorFinalR
     });
 }
 
+#[cfg(test)]
+thread_local! {
+    static FORCE_DEGRADED_CHECKPOINT_FINALIZATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_force_degraded_checkpoint_finalization() {
+    FORCE_DEGRADED_CHECKPOINT_FINALIZATION.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+fn take_force_degraded_checkpoint_finalization() -> bool {
+    FORCE_DEGRADED_CHECKPOINT_FINALIZATION.with(|flag| flag.replace(false))
+}
+
+#[cfg(test)]
+static ABORT_ADMISSION_COMMIT_ON_SPAWN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_abort_admission_commit_on_spawn(remaining: usize) {
+    ABORT_ADMISSION_COMMIT_ON_SPAWN.store(remaining, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn take_abort_admission_commit_on_spawn() -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    loop {
+        let remaining = ABORT_ADMISSION_COMMIT_ON_SPAWN.load(SeqCst);
+        if remaining == 0 {
+            return false;
+        }
+        if ABORT_ADMISSION_COMMIT_ON_SPAWN
+            .compare_exchange(remaining, remaining - 1, SeqCst, SeqCst)
+            .is_ok()
+        {
+            return remaining == 1;
+        }
+    }
+}
+
 fn assignments_overlap(left: &OrchestratorAssignment, right: &OrchestratorAssignment) -> bool {
     left.assigned_paths.iter().any(|left_path| {
         right
@@ -1127,6 +1169,10 @@ fn run_concurrent_assignment_schedule(
                             sender: completion_sender,
                         };
                         let _concurrency_guard = concurrency.assignment_started();
+                        #[cfg(test)]
+                        if take_abort_admission_commit_on_spawn() {
+                            panic!("injected admission-commit abort before notify");
+                        }
                         execute_supervisor_assignment(AssignmentExecutionContext {
                             index,
                             concurrent_mode: true,
@@ -1174,12 +1220,33 @@ fn run_concurrent_assignment_schedule(
                     match spawn_result {
                         Ok(handle) => {
                             active.insert(index, handle);
-                            admission_receiver.recv().with_context(|| {
-                                format!(
+                            if let Err(error) = admission_receiver.recv() {
+                                cancellation.cancel();
+                                for (active_index, active_handle) in std::mem::take(&mut active) {
+                                    let mut outcome = match active_handle.join() {
+                                        Ok(outcome) => outcome,
+                                        Err(_) => AssignmentExecutionOutcome::fatal(format!(
+                                            "supervisor assignment '{}' thread panicked",
+                                            context.plan.assignments[active_index].id
+                                        )),
+                                    };
+                                    record_completed_assignment_checkpoint(
+                                        context,
+                                        active_index,
+                                        &outcome,
+                                    )?;
+                                    release_concurrent_assignment(
+                                        &mut outcome,
+                                        context.sync_store,
+                                        context.semantic_store,
+                                    );
+                                    progress.indexed_outcomes[active_index] = Some(outcome);
+                                }
+                                return Err(error).context(format!(
                                     "supervisor assignment '{}' ended before committing or declining budget admission",
                                     assignment.id
-                                )
-                            })?;
+                                ));
+                            }
                         }
                         Err(error) => {
                             cancellation.cancel();
@@ -1876,15 +1943,6 @@ impl CollectedSchedulerResources {
             ),
         }
     }
-
-    fn already_released(&self) -> ReleasedSchedulerResources {
-        ReleasedSchedulerResources {
-            released_claims: self.concurrently_released_claims.clone(),
-            release_errors: self.concurrent_release_errors.clone(),
-            released_semantic_intents: self.concurrently_released_semantic_intents.clone(),
-            semantic_release_errors: self.concurrent_semantic_release_errors.clone(),
-        }
-    }
 }
 
 fn planned_collected_scheduler_resources(
@@ -2029,9 +2087,9 @@ fn persist_supervisor_final_report(
         checkpoint
             .final_report_planned(&final_report, &report_bytes, artifact_binding)
             .context("failed to persist the terminal supervisor report plan")?;
-        release_after_terminal_record()
-            .context("failed to release scheduler resources after the durable terminal record")?;
     }
+    release_after_terminal_record()
+        .context("failed to release scheduler resources after the durable terminal record")?;
     artifact_writer
         .write_bytes(
             RunArtifactFamily::Supervise.final_report_relative_path(),
@@ -2567,32 +2625,12 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 release_per_assignment,
             };
             let scheduler_result = if max_concurrent_children == 1 {
-                if let Err(error) = run_serial_assignment_schedule(
+                run_serial_assignment_schedule(
                     &scheduler_context,
                     &mut progress,
                     &cancellation,
                     &serial_semantic_warn_intents,
-                ) {
-                    achieved_concurrency = progress.concurrency.finish();
-                    budget_prevented_dispatch |= progress.budget_prevented_dispatch;
-                    if let Ok(report) = budget_ledger.report() {
-                        if !report.new_dispatch_allowed {
-                            for index in &progress.budget_denied_assignment_indices {
-                                progress
-                                    .budget_degradation
-                                    .record_halt(&plan.assignments[*index].id, &report);
-                            }
-                        }
-                    }
-                    budget_denied_assignment_indices
-                        .extend(progress.budget_denied_assignment_indices);
-                    budget_degradations.append(&mut progress.budget_degradation.records);
-                    assignment_effort_bindings
-                        .append(&mut progress.budget_degradation.assignment_effort_bindings);
-                    circuit_breaker_trip = progress.circuit_breaker_trip;
-                    return Err(error);
-                }
-                Ok(())
+                )
             } else {
                 run_concurrent_assignment_schedule(
                     &scheduler_context,
@@ -2895,9 +2933,27 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         field_guide_mutation_failed,
     });
     apply_execution_target_reporting(&mut final_report, plan_metadata.execution_target.as_ref());
-    let checkpoint_finalization = match artifact_writer.resume_binding() {
+    let resume_binding = artifact_writer.resume_binding();
+    #[cfg(test)]
+    let resume_binding = if take_force_degraded_checkpoint_finalization() {
+        Err(anyhow!(
+            "artifact run is not at a resumable manifest boundary"
+        ))
+    } else {
+        resume_binding
+    };
+    let checkpoint_finalization = match resume_binding {
         Ok(binding) => {
-            checkpoint_writer.scheduler_closed(binding, budget_ledger.report()?)?;
+            // Bind the same snapshot already sealed into the final report.
+            // A second budget_ledger.report() can cross a 1-second boundary and
+            // diverge on elapsed_seconds / remaining.max_duration_seconds,
+            // making resume refuse a still-valid interrupted finalization.
+            checkpoint_writer.scheduler_closed(
+                binding,
+                final_report.run_budget.clone().context(
+                    "run budget accounting could not be finalized for the scheduler-closed checkpoint",
+                )?,
+            )?;
             true
         }
         Err(error)
@@ -2905,21 +2961,8 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 .to_string()
                 .contains("not at a resumable manifest boundary") =>
         {
-            let already_released = scheduler_resources.already_released();
-            final_report.claim_tokens = already_released
-                .released_claims
-                .iter()
-                .map(|claim| claim.token.get())
-                .collect();
-            final_report.semantic_intent_tokens = already_released
-                .released_semantic_intents
-                .iter()
-                .map(|intent| intent.token.get())
-                .collect();
-            final_report.released_claims = already_released.released_claims;
-            final_report.release_errors = already_released.release_errors;
-            final_report.released_semantic_intents = already_released.released_semantic_intents;
-            final_report.semantic_release_errors = already_released.semantic_release_errors;
+            // Keep the planned terminal release in the report. Persist still
+            // runs release_after_terminal_record even without a checkpoint.
             false
         }
         Err(error) => {
@@ -4484,6 +4527,42 @@ mod decomposition_tests {
         assert_eq!(
             kinds,
             vec![OrchestrationEventKind::Gate, OrchestrationEventKind::Status]
+        );
+    }
+
+    #[test]
+    fn persist_releases_terminal_claims_without_checkpoint_writer() {
+        let (_temp, repo) = test_repository();
+        let run_id =
+            RunId::new("degraded-terminal-release").expect("valid degraded persist run id");
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "scheduler-degraded-persist-test",
+        )
+        .expect("reserve degraded persist artifacts");
+        write_supervisor_final_schema(
+            &mut writer,
+            Path::new("schemas/supervisor-final-report.schema.json"),
+        )
+        .expect("write degraded persist schema fixture");
+        let _field_guide_store = FieldGuideStore::open(&repo, FieldGuideLimits::default())
+            .expect("initialize authenticated degraded persist fixture");
+        let mut journal = initialize_orchestration_event_journal(&repo, &run_id, None);
+        let plan = test_plan(Vec::new());
+        let report = build_supervisor_final_report(test_report_construction(&plan, run_id.clone()));
+        let released = std::sync::atomic::AtomicBool::new(false);
+
+        persist_supervisor_final_report(report, &mut journal, writer, None, || {
+            released.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("persist without a checkpoint writer");
+
+        assert!(
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            "terminal release must run even when checkpoint finalization is unavailable"
         );
     }
 }
