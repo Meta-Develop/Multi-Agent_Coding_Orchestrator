@@ -350,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn positive_voi_selects_the_probe() {
+    fn cheap_probe_without_information_gain_is_not_executed() {
         let mut predictor = ScriptedPredictor::new();
         predictor.insert(dist("worker", 50_000));
         predictor.insert(dist("probe", 100));
