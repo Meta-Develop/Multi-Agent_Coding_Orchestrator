@@ -1,0 +1,53 @@
+{
+  "version": 3,
+  "experiment_id": "scope-ui-demo-v1",
+  "evidence": {
+    "kind": "client_demo_fixture",
+    "eligible_for_production_or_default_decisions": false
+  },
+  "pareto_conclusion": { "status": "available" },
+  "profile_summaries": [
+    {
+      "profile_id": "frontier-all-v1",
+      "repetitions": 3,
+      "mean_cost_usd": 0.0367,
+      "mean_wall_time_ms": { "total": 1442455, "count": 3 },
+      "mean_churn_count": { "total": 18, "count": 3 },
+      "mean_quality": {
+        "held_out_basis_points": { "total": 26180, "count": 3 },
+        "breadth_basis_points": { "total": 30000, "count": 3 },
+        "anti_shortcut_basis_points": { "total": 19998, "count": 3 },
+        "overall_basis_points": { "total": 25589, "count": 3 }
+      },
+      "pareto_optimal": true
+    },
+    {
+      "profile_id": "balanced-all-v1",
+      "repetitions": 3,
+      "mean_cost_usd": 0.0748,
+      "mean_wall_time_ms": { "total": 1515474, "count": 3 },
+      "mean_churn_count": { "total": 20, "count": 3 },
+      "mean_quality": {
+        "held_out_basis_points": { "total": 25695, "count": 3 },
+        "breadth_basis_points": { "total": 26250, "count": 3 },
+        "anti_shortcut_basis_points": { "total": 24999, "count": 3 },
+        "overall_basis_points": { "total": 25659, "count": 3 }
+      },
+      "pareto_optimal": true
+    },
+    {
+      "profile_id": "economy-all-v1",
+      "repetitions": 3,
+      "mean_cost_usd": 0.0803,
+      "mean_wall_time_ms": { "total": 2195314, "count": 3 },
+      "mean_churn_count": { "total": 15, "count": 3 },
+      "mean_quality": {
+        "held_out_basis_points": { "total": 23271, "count": 3 },
+        "breadth_basis_points": { "total": 22500, "count": 3 },
+        "anti_shortcut_basis_points": { "total": 15000, "count": 3 },
+        "overall_basis_points": { "total": 21010, "count": 3 }
+      },
+      "pareto_optimal": false
+    }
+  ]
+}

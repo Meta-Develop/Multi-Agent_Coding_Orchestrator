@@ -1,0 +1,38 @@
+{
+  "version": 3,
+  "experiment_id": "scope-ui-runs-demo-v1",
+  "evidence": {
+    "kind": "client_demo_fixture",
+    "eligible_for_production_or_default_decisions": false
+  },
+  "runs": [
+    {
+      "profile_id": "cheap-high",
+      "metrics": {
+        "cost_usd": 0.01,
+        "wall_time_ms": 1000,
+        "churn_count": 1,
+        "quality": {
+          "held_out_basis_points": 8000,
+          "breadth_basis_points": 10000,
+          "anti_shortcut_basis_points": 8000,
+          "overall_basis_points": 8500
+        }
+      }
+    },
+    {
+      "profile_id": "expensive-perfect",
+      "metrics": {
+        "cost_usd": 1.0,
+        "wall_time_ms": 5000,
+        "churn_count": 4,
+        "quality": {
+          "held_out_basis_points": 10000,
+          "breadth_basis_points": 10000,
+          "anti_shortcut_basis_points": 10000,
+          "overall_basis_points": 10000
+        }
+      }
+    }
+  ]
+}
