@@ -183,6 +183,8 @@ pub struct SourceSpan {
     pub end_byte: usize,
     pub start_line: usize,
     pub end_line: usize,
+    /// Last line of the declaration signature (through `{` or `;`), not the body.
+    pub signature_end_line: usize,
 }
 
 pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<SemanticRepoMap> {
@@ -1057,13 +1059,26 @@ impl SourceIndex {
         let start = span.start();
         let end = span.end();
         let start_byte = self.offset(start);
-        let end_byte = self.offset(end);
+        let end_byte = self.offset(end).max(start_byte);
+        let start_line = start.line;
+        let end_line = end.line.max(start.line);
         SourceSpan {
             start_byte,
-            end_byte: end_byte.max(start_byte),
-            start_line: start.line,
-            end_line: end.line.max(start.line),
+            end_byte,
+            start_line,
+            end_line,
+            signature_end_line: self.signature_end_line(start_byte, end_byte, start_line),
         }
+    }
+
+    fn signature_end_line(&self, start_byte: usize, end_byte: usize, start_line: usize) -> usize {
+        let snippet = self.source.get(start_byte..end_byte).unwrap_or_default();
+        for (offset, line) in snippet.split_inclusive('\n').enumerate() {
+            if line.contains('{') || line.contains(';') {
+                return start_line.saturating_add(offset);
+            }
+        }
+        start_line
     }
 
     fn offset(&self, location: LineColumn) -> usize {
@@ -2124,5 +2139,25 @@ pub fn endpoint() {}
         assert!(map.symbols.iter().any(|symbol| {
             symbol.name == "cfg" && symbol.qualified_path == vec!["crate", "main", "config", "cfg"]
         }));
+    }
+
+    #[test]
+    fn signature_end_line_stops_at_the_declaration_brace() {
+        let (_temp, repo) = init_repo();
+        write_file(
+            &repo,
+            "src/lib.rs",
+            "pub fn foo(\n    x: i32,\n    y: i32,\n) -> i32 {\n    x + y\n}\n",
+        );
+
+        let map = scan_repository(&repo).expect("scan");
+        let function = map
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "foo")
+            .expect("function");
+        assert_eq!(function.span.start_line, 1);
+        assert_eq!(function.span.signature_end_line, 4);
+        assert!(function.span.end_line > function.span.signature_end_line);
     }
 }
