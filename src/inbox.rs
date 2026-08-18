@@ -1,3 +1,5 @@
+pub mod review_loop;
+
 use crate::{
     artifacts::{
         self, ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, RunArtifactFamily,

@@ -294,23 +294,36 @@ fn size_bytes(entry: &BoundedTreeEntry, kind: RepoEntryKind) -> Option<u64> {
     }
 }
 
+/// Runtime/control roots skipped by repository scans and merge dirty-primary
+/// checks. `.maco` does not match `.maco-cache` under component-wise
+/// `Path::starts_with`, so both must be listed.
+pub const REPOSITORY_RUNTIME_ROOTS: &[&str] = &[".maco", ".maco-cache", ".codex", ".agents/live"];
+
+const REPOSITORY_SCAN_IGNORED_ROOTS: &[&str] = &[
+    ".git",
+    "target",
+    ".agent/temp",
+    ".agent/storage",
+    ".agents/temp",
+    ".agents/storage",
+];
+
+pub fn is_runtime_control_path(path: &Path) -> bool {
+    path_is_under_any(path, REPOSITORY_RUNTIME_ROOTS)
+}
+
+pub fn is_ignored_scan_path(path: &Path) -> bool {
+    is_runtime_control_path(path) || path_is_under_any(path, REPOSITORY_SCAN_IGNORED_ROOTS)
+}
+
 fn is_ignored_path(path: &Path) -> bool {
-    path == Path::new(".git")
-        || path.starts_with(".git")
-        || path == Path::new(".maco")
-        || path.starts_with(".maco")
-        || path == Path::new("target")
-        || path.starts_with("target")
-        || path == Path::new(".agent/temp")
-        || path.starts_with(".agent/temp")
-        || path == Path::new(".agent/storage")
-        || path.starts_with(".agent/storage")
-        || path == Path::new(".agents/temp")
-        || path.starts_with(".agents/temp")
-        || path == Path::new(".agents/storage")
-        || path.starts_with(".agents/storage")
-        || path == Path::new(".agents/live")
-        || path.starts_with(".agents/live")
+    is_ignored_scan_path(path)
+}
+
+fn path_is_under_any(path: &Path, roots: &[&str]) -> bool {
+    roots
+        .iter()
+        .any(|root| path == Path::new(root) || path.starts_with(root))
 }
 
 fn category_for(path: &Path, kind: RepoEntryKind) -> String {
@@ -432,6 +445,10 @@ mod tests {
             .expect("write live claim");
         fs::write(repo_path.join(".maco/state/claims.json"), "{}\n").expect("write state");
         fs::write(repo_path.join("target/debug/output"), "generated\n").expect("write target");
+        fs::create_dir_all(repo_path.join(".maco-cache/objects")).expect("create cache");
+        fs::create_dir_all(repo_path.join(".codex/tmp")).expect("create codex");
+        fs::write(repo_path.join(".maco-cache/objects/blob"), "cache\n").expect("write cache blob");
+        fs::write(repo_path.join(".codex/tmp/session.rs"), "fn skip() {}\n").expect("write codex");
 
         let map = scan_repository(&repo_path).expect("scan");
         let paths = map
@@ -452,6 +469,22 @@ mod tests {
         assert!(!paths.iter().any(|path| path.starts_with(".agents/temp")));
         assert!(!paths.iter().any(|path| path.starts_with(".agents/storage")));
         assert!(!paths.iter().any(|path| path.starts_with(".agents/live")));
+        assert!(!paths.iter().any(|path| path.starts_with(".maco-cache")));
+        assert!(!paths.iter().any(|path| path.starts_with(".codex")));
+    }
+
+    #[test]
+    fn runtime_control_roots_do_not_treat_maco_as_maco_cache() {
+        assert!(is_runtime_control_path(Path::new(".maco")));
+        assert!(is_runtime_control_path(Path::new(".maco/state")));
+        assert!(is_runtime_control_path(Path::new(".maco-cache")));
+        assert!(is_runtime_control_path(Path::new(".maco-cache/objects")));
+        assert!(is_runtime_control_path(Path::new(".codex/session.json")));
+        assert!(is_runtime_control_path(Path::new(".agents/live/claims")));
+        assert!(!is_runtime_control_path(Path::new(".agents/docs")));
+        assert!(!is_runtime_control_path(Path::new("src/lib.rs")));
+        assert!(!is_ignored_scan_path(Path::new(".agents/docs/rules.md")));
+        assert!(is_ignored_scan_path(Path::new(".maco-cache/index")));
     }
 
     #[cfg(unix)]

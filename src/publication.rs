@@ -1,3 +1,6 @@
+pub mod forge_coordination;
+pub mod forge_transport;
+
 use crate::{
     artifacts::{repository_auth_writer, state_auth::sha256_hex},
     effect_wal::{EffectPhase, EffectWal},

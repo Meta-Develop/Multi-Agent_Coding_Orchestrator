@@ -138,6 +138,7 @@ impl Cli {
             Command::Agents(command) => command.run(),
             Command::Llm(command) => command.run(),
             Command::Evaluation(command) => command.run(),
+            Command::Optimizer(command) => command.run(),
         }
     }
 }
@@ -190,6 +191,8 @@ enum Command {
     Llm(LlmCommand),
     /// Generate deterministic model-mix fixture results from a versioned manifest.
     Evaluation(EvaluationCommand),
+    /// Inspect the optimizer policy library, replay snapshots, and preference profiles.
+    Optimizer(OptimizerCommand),
 }
 
 #[derive(Debug, Args)]
@@ -3447,6 +3450,307 @@ fn run_evaluation_command(args: RunEvaluationArgs) -> Result<()> {
         },
     )?;
     print_query_report(&results, args.json)
+}
+
+const MAX_OPTIMIZER_JSON_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug, Args)]
+struct OptimizerCommand {
+    #[command(subcommand)]
+    command: OptimizerSubcommand,
+}
+
+impl OptimizerCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            OptimizerSubcommand::Library(command) => command.run(),
+            OptimizerSubcommand::Preference(command) => command.run(),
+            OptimizerSubcommand::Replay(command) => command.run(),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum OptimizerSubcommand {
+    /// Inspect the fixed starter policy library.
+    Library(OptimizerLibraryCommand),
+    /// Select, inspect, and diff operator preference profiles.
+    Preference(OptimizerPreferenceCommand),
+    /// Inspect stored decision replay snapshots.
+    Replay(OptimizerReplayCommand),
+}
+
+#[derive(Debug, Args)]
+struct OptimizerLibraryCommand {
+    #[command(subcommand)]
+    command: OptimizerLibrarySubcommand,
+}
+
+impl OptimizerLibraryCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            OptimizerLibrarySubcommand::List(args) => {
+                let library = crate::optimizer::policy::PolicyLibrary::starter()
+                    .context("failed to construct starter policy library")?;
+                let ids: Vec<&str> = library.entries.keys().map(String::as_str).collect();
+                if args.json {
+                    print_query_report(&library, true)
+                } else {
+                    println!("policy library v{}", library.version);
+                    for id in ids {
+                        println!("{id}");
+                    }
+                    Ok(())
+                }
+            }
+            OptimizerLibrarySubcommand::Show(args) => {
+                let library = crate::optimizer::policy::PolicyLibrary::starter()
+                    .context("failed to construct starter policy library")?;
+                let id =
+                    crate::optimizer::ids::PolicyId::new(&args.id).context("invalid policy id")?;
+                let graph = library.get(&id).with_context(|| {
+                    format!("policy '{}' is not in the starter library", args.id)
+                })?;
+                print_query_report(graph, args.json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum OptimizerLibrarySubcommand {
+    /// List starter-library policy ids.
+    List(OptimizerJsonArgs),
+    /// Show one starter-library policy graph.
+    Show(OptimizerShowArgs),
+}
+
+#[derive(Debug, Args)]
+struct OptimizerJsonArgs {
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct OptimizerShowArgs {
+    #[arg(long)]
+    id: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct OptimizerPreferenceCommand {
+    #[command(subcommand)]
+    command: OptimizerPreferenceSubcommand,
+}
+
+impl OptimizerPreferenceCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            OptimizerPreferenceSubcommand::List(args) => {
+                let store = crate::optimizer::objective::PreferenceStore::open(&args.store);
+                print_query_report(&store.list()?, args.json)
+            }
+            OptimizerPreferenceSubcommand::Show(args) => {
+                let store = crate::optimizer::objective::PreferenceStore::open(&args.store);
+                print_query_report(&store.load(&args.id)?, args.json)
+            }
+            OptimizerPreferenceSubcommand::Set(args) => {
+                let bytes =
+                    BoundedRegularReader::read_tree_no_follow(&args.file, MAX_OPTIMIZER_JSON_BYTES)
+                        .with_context(|| {
+                            format!("failed to read preference file {}", args.file.display())
+                        })?;
+                let profile = crate::optimizer::objective::parse_preference_profile(&bytes)
+                    .context("invalid preference profile")?;
+                let store = crate::optimizer::objective::PreferenceStore::open(&args.store);
+                let path = store.save(&profile)?;
+                if args.r#default {
+                    store.set_project_default(profile.id.as_str())?;
+                }
+                print_query_report(
+                    &serde_json::json!({
+                        "id": profile.id.as_str(),
+                        "version": profile.version,
+                        "path": path,
+                    }),
+                    args.json,
+                )
+            }
+            OptimizerPreferenceSubcommand::Default(args) => {
+                let store = crate::optimizer::objective::PreferenceStore::open(&args.store);
+                if let Some(id) = args.id {
+                    store.set_project_default(&id)?;
+                }
+                print_query_report(&store.project_default()?, args.json)
+            }
+            OptimizerPreferenceSubcommand::Diff(args) => {
+                let store = crate::optimizer::objective::PreferenceStore::open(&args.store);
+                let left = store.load(&args.a)?;
+                let right = store.load(&args.b)?;
+                print_query_report(
+                    &crate::optimizer::objective::diff_profiles(&left, &right),
+                    args.json,
+                )
+            }
+            OptimizerPreferenceSubcommand::Preview(args) => {
+                let store = crate::optimizer::objective::PreferenceStore::open(&args.store);
+                let left = store.load(&args.a)?;
+                let right = store.load(&args.b)?;
+                let bytes = BoundedRegularReader::read_tree_no_follow(
+                    &args.decision,
+                    MAX_OPTIMIZER_JSON_BYTES,
+                )
+                .with_context(|| {
+                    format!("failed to read decision file {}", args.decision.display())
+                })?;
+                let candidates: Vec<crate::optimizer::objective::PreferenceCandidate> =
+                    serde_json::from_slice(&bytes).context("parse preference candidates")?;
+                let preview = crate::optimizer::objective::preview_profile_effect(
+                    &candidates,
+                    &left,
+                    &right,
+                    args.quality_threshold_bp,
+                )?;
+                if let Some(output) = args.html {
+                    let html = crate::optimizer::objective::render_preference_surface_html(
+                        &left,
+                        &right,
+                        Some(&preview),
+                    )?;
+                    std::fs::write(&output, html).with_context(|| {
+                        format!("failed to write preference HTML {}", output.display())
+                    })?;
+                }
+                print_query_report(&preview, args.json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum OptimizerPreferenceSubcommand {
+    /// List stored preference profiles.
+    List(OptimizerStoreArgs),
+    /// Show one preference profile.
+    Show(OptimizerPreferenceShowArgs),
+    /// Import a GUI- or CLI-authored preference profile.
+    Set(OptimizerPreferenceSetArgs),
+    /// Inspect or set the project-default profile.
+    Default(OptimizerPreferenceDefaultArgs),
+    /// Diff two stored profiles.
+    Diff(OptimizerPreferenceDiffArgs),
+    /// Preview selected policies under two profiles.
+    Preview(OptimizerPreferencePreviewArgs),
+}
+
+#[derive(Debug, Args)]
+struct OptimizerStoreArgs {
+    #[arg(long, default_value = ".maco/optimizer/preferences")]
+    store: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct OptimizerPreferenceShowArgs {
+    #[arg(long, default_value = ".maco/optimizer/preferences")]
+    store: PathBuf,
+    #[arg(long)]
+    id: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct OptimizerPreferenceSetArgs {
+    #[arg(long, default_value = ".maco/optimizer/preferences")]
+    store: PathBuf,
+    #[arg(long)]
+    file: PathBuf,
+    #[arg(long)]
+    r#default: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct OptimizerPreferenceDefaultArgs {
+    #[arg(long, default_value = ".maco/optimizer/preferences")]
+    store: PathBuf,
+    #[arg(long)]
+    id: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct OptimizerPreferenceDiffArgs {
+    #[arg(long, default_value = ".maco/optimizer/preferences")]
+    store: PathBuf,
+    #[arg(long)]
+    a: String,
+    #[arg(long)]
+    b: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct OptimizerPreferencePreviewArgs {
+    #[arg(long, default_value = ".maco/optimizer/preferences")]
+    store: PathBuf,
+    #[arg(long)]
+    a: String,
+    #[arg(long)]
+    b: String,
+    /// Recorded preference candidates (same JSON the GUI exports).
+    #[arg(long)]
+    decision: PathBuf,
+    #[arg(long, default_value_t = 8000)]
+    quality_threshold_bp: u16,
+    #[arg(long)]
+    html: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct OptimizerReplayCommand {
+    #[command(subcommand)]
+    command: OptimizerReplaySubcommand,
+}
+
+impl OptimizerReplayCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            OptimizerReplaySubcommand::Show(args) => {
+                let store = crate::optimizer::replay::FileReplayStore::open(&args.store);
+                let id = crate::optimizer::ids::PolicyId::new(&args.policy)
+                    .context("invalid policy id")?;
+                let record = crate::optimizer::replay::ReplayStore::load(&store, &id)?
+                    .with_context(|| format!("no replay record for {id}"))?;
+                print_query_report(&record, args.json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum OptimizerReplaySubcommand {
+    /// Show a stored replay snapshot.
+    Show(OptimizerReplayShowArgs),
+}
+
+#[derive(Debug, Args)]
+struct OptimizerReplayShowArgs {
+    #[arg(long, default_value = ".maco/optimizer/replay")]
+    store: PathBuf,
+    #[arg(long)]
+    policy: String,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
