@@ -1843,6 +1843,7 @@ pub enum ApplyReadinessStatus {
 pub enum ApplyBlocker {
     DirtyPrimary,
     StaleBase,
+    PrimaryStateChanged,
     ApplyCheckFailed,
     ExcludedReference,
     UnclaimedEdits,
@@ -2860,7 +2861,9 @@ fn merge_apply_gate_denials(preview: &MergeApplyPreview) -> Result<Vec<GateDenia
 
 fn gate_check_source_for_apply_blocker(blocker: ApplyBlocker) -> GateCheckSource {
     match blocker {
-        ApplyBlocker::DirtyPrimary => GateCheckSource::PrimaryDrift,
+        ApplyBlocker::DirtyPrimary | ApplyBlocker::PrimaryStateChanged => {
+            GateCheckSource::PrimaryDrift
+        }
         ApplyBlocker::StaleBase => GateCheckSource::MergeScope,
         ApplyBlocker::ApplyCheckFailed => GateCheckSource::GitApplyCheck,
         ApplyBlocker::ExcludedReference | ApplyBlocker::UnclaimedEdits => {
@@ -6342,7 +6345,7 @@ fn classify_apply_safety(checks: SafetyChecks<'_>, forces: &MergeForceOptions) -
     let candidates = [
         (
             checks.primary_state_unchanged,
-            ApplyBlocker::ApplyCheckFailed,
+            ApplyBlocker::PrimaryStateChanged,
             false,
         ),
         (
@@ -8259,6 +8262,7 @@ fn blocker_label(blocker: ApplyBlocker) -> &'static str {
     match blocker {
         ApplyBlocker::DirtyPrimary => "dirty_primary",
         ApplyBlocker::StaleBase => "stale_base",
+        ApplyBlocker::PrimaryStateChanged => "primary_state_changed",
         ApplyBlocker::ApplyCheckFailed => "apply_check_failed",
         ApplyBlocker::ExcludedReference => "excluded_reference",
         ApplyBlocker::UnclaimedEdits => "unclaimed_edits",
@@ -10449,6 +10453,61 @@ mod tests {
 
         assert_eq!(readiness.status, ApplyReadinessStatus::Blocked);
         assert_eq!(readiness.blockers, vec![ApplyBlocker::ApplyCheckFailed]);
+    }
+
+    #[test]
+    fn primary_state_drift_is_a_distinct_unforceable_blocker() {
+        let failed = SafetyCheck {
+            status: SafetyCheckStatus::Failed,
+            message: Some(
+                "primary repository state changed after the merge safety preview (HEAD)"
+                    .to_string(),
+            ),
+            paths: Vec::new(),
+        };
+        let passed = SafetyCheck {
+            status: SafetyCheckStatus::Passed,
+            message: None,
+            paths: Vec::new(),
+        };
+        let evidence = passed_validation_evidence_check();
+        let checks = SafetyChecks {
+            primary_state_unchanged: &failed,
+            dirty_primary: &passed,
+            stale_base: &passed,
+            apply_check: &passed,
+            unclaimed_edits: &passed,
+            validation: &passed,
+            validation_evidence: &evidence,
+            megafile: &passed,
+            validations: &[],
+            require_validation: false,
+            validation_commands: &[],
+            validation_related_paths: &[],
+        };
+
+        let readiness = classify_apply_safety(
+            checks,
+            &MergeForceOptions {
+                allow_dirty_primary: true,
+                allow_stale_base: true,
+                allow_apply_conflicts: true,
+                allow_unclaimed_edits: true,
+                ..MergeForceOptions::default()
+            },
+        );
+
+        assert_eq!(readiness.status, ApplyReadinessStatus::Blocked);
+        assert_eq!(readiness.blockers, vec![ApplyBlocker::PrimaryStateChanged]);
+        assert!(readiness.forced.is_empty());
+        assert_eq!(
+            gate_check_source_for_apply_blocker(ApplyBlocker::PrimaryStateChanged),
+            GateCheckSource::PrimaryDrift
+        );
+        assert_eq!(
+            blocker_label(ApplyBlocker::PrimaryStateChanged),
+            "primary_state_changed"
+        );
     }
 
     #[test]
