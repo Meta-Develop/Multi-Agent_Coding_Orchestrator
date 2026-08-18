@@ -3595,29 +3595,27 @@ fn run_ready_agents(
     }
 
     let mut handles = Vec::with_capacity(prepared.len());
-    let spawn_result = (|| -> Result<()> {
-        for (index, spec) in prepared {
-            handles.push((
-                index,
-                thread::spawn(move || (index, run_agent_command(spec))),
-            ));
-            #[cfg(test)]
-            fail_after_ready_agent_spawn(&plan.agents[index].id)?;
+    for (index, spec) in prepared {
+        handles.push((
+            index,
+            thread::spawn(move || (index, run_agent_command(spec))),
+        ));
+        #[cfg(test)]
+        if let Err(error) = fail_after_ready_agent_spawn(&plan.agents[index].id) {
+            let _ = join_ready_agent_handles(handles);
+            return Err(error);
         }
-        Ok(())
-    })();
-    if let Err(error) = spawn_result {
-        let _ = join_ready_agent_handles(handles);
-        return Err(error);
     }
     Ok(join_ready_agent_handles(handles))
 }
 
+type ReadyAgentHandle = (
+    usize,
+    std::thread::JoinHandle<(usize, Result<CommandRunResult, ProcessRunError>)>,
+);
+
 fn join_ready_agent_handles(
-    handles: Vec<(
-        usize,
-        std::thread::JoinHandle<(usize, Result<CommandRunResult, ProcessRunError>)>,
-    )>,
+    handles: Vec<ReadyAgentHandle>,
 ) -> Vec<(usize, Result<CommandRunResult, ProcessRunError>)> {
     let mut outcomes = Vec::with_capacity(handles.len());
     for (index, handle) in handles {
