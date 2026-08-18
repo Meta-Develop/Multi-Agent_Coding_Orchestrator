@@ -12,8 +12,8 @@ use crate::{
     artifacts::{
         repository_auth_writer, repository_authenticator_key_only,
         state_auth::{
-            sha256_hex, AuthenticationDomain, AuthenticationTag, BoundStateLock,
-            RepositoryAuthBinding, RepositoryAuthWriter, RepositoryAuthenticator,
+            authenticated_state_consumers, sha256_hex, AuthenticationDomain, AuthenticationTag,
+            BoundStateLock, RepositoryAuthBinding, RepositoryAuthWriter, RepositoryAuthenticator,
         },
     },
     authenticated_snapshot::{AuthenticatedSnapshotStore, SnapshotSpec},
@@ -25,7 +25,7 @@ use crate::{
         validate_legacy_semantic_payload, ResolvedSemanticSymbol, SemanticIntent,
         SemanticIntentToken, SemanticSnapshotSpec,
     },
-    state_journal::{AuthenticatedStateJournal, JournalIdentity, JournalSpec, JOURNAL_ROOT_NAME},
+    state_journal::{AuthenticatedStateJournal, JournalIdentity, JournalSpec},
     sync::{PathClaim, SyncCoordinator, SyncSnapshot},
     sync_store::{validate_state_path, ClaimsSnapshotSpec},
     worktree::ManagedSnapshotSpec,
@@ -1424,15 +1424,9 @@ fn missing_manifest_entry(store: &str, file: &str) -> LegacyStateEntry {
 }
 
 fn is_known_authenticated_directory(name: &str) -> bool {
-    matches!(
-        name,
-        MANIFEST_ROOT_NAME
-            | JOURNAL_ROOT_NAME
-            | "authenticated-effect-wals-v1"
-            | "authenticated-claims-state-v1"
-            | "authenticated-semantic-state-v1"
-            | "authenticated-managed-worktrees-v1"
-    )
+    authenticated_state_consumers()
+        .iter()
+        .any(|source| source.root_name == name)
 }
 
 fn is_known_state_file(name: &str) -> bool {
@@ -1443,17 +1437,10 @@ fn is_known_state_file(name: &str) -> bool {
 
 fn is_known_lock_name(name: &str) -> bool {
     LEGACY_LOCKS.contains(&name)
-        || matches!(
-            name,
-            AUTH_KEY_LOCK
-                | "repository-mutation.lock"
-                | ".journals.lock"
-                | ".effect-wals.lock"
-                | ".state-migrations.lock"
-                | ".authenticated-claims.lock"
-                | ".authenticated-semantic.lock"
-                | ".authenticated-managed-worktrees.lock"
-        )
+        || matches!(name, AUTH_KEY_LOCK | "repository-mutation.lock")
+        || authenticated_state_consumers()
+            .iter()
+            .any(|source| source.state_root_lock_names.contains(&name))
         || name
             .strip_prefix("managed-worktree-")
             .and_then(|tail| tail.strip_suffix(".execution.lock"))
@@ -2564,7 +2551,16 @@ fn revalidate_legacy_state(
 }
 
 fn manifest_exists(state_root: &SafeRoot) -> Result<bool> {
-    state_root.direct_child_exists(MANIFEST_ROOT_NAME)
+    if !state_root.direct_child_exists(MANIFEST_ROOT_NAME)? {
+        return Ok(false);
+    }
+    let manifest_root = SafeRoot::open_existing(state_root.direct_child(MANIFEST_ROOT_NAME)?)?;
+    let has_entries = !manifest_root
+        .direct_child_names_bounded(MAX_STATE_ENTRIES)?
+        .is_empty();
+    manifest_root.verify()?;
+    state_root.verify()?;
+    Ok(has_entries)
 }
 
 fn load_transaction_if_present(
@@ -2756,11 +2752,13 @@ fn apply_migration(
         );
     }
 
-    // A pre-existing legacy authentication lock has already been proven idle;
-    // release only that descriptor before the canonical key writer acquires
-    // the same inode. All consumer locks remain held until return.
-    if let Some(index) = locks.iter().position(|lock| lock.name == AUTH_KEY_LOCK) {
-        locks.remove(index);
+    // These pre-existing locks have already been proven idle. Release their
+    // descriptors before the canonical key and manifest writers reacquire the
+    // same inodes. Every other consumer lock remains held until return.
+    for writer_lock in [AUTH_KEY_LOCK, StateMigrationManifestSpec::ROOT_LOCK_NAME] {
+        if let Some(index) = locks.iter().position(|lock| lock.name == writer_lock) {
+            locks.remove(index);
+        }
     }
     verify_preflight_repository_binding(preflight)?;
     let key_preexisted = preflight.state_root.direct_child_exists(AUTH_KEY_FILE)?;
@@ -3825,6 +3823,104 @@ mod tests {
         let repeated = migrate_repository_state(&path, true).expect("idempotent apply");
         assert_eq!(repeated.status, StateMigrationStatus::AlreadyApplied);
         assert_eq!(repeated.transaction_phase, Some(MigrationPhase::Completed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registered_authenticated_consumer_roots_and_state_locks_migrate_across_all_modes() {
+        let (_temp, path, state) = empty_repository_state();
+        let writer = repository_auth_writer(&path).expect("bootstrap repository authentication");
+        drop(writer);
+
+        let binding = expected_bindings_for(&path).repository_state;
+        let mut claims = LegacyClaimsState {
+            version: 2,
+            checksum: String::new(),
+            repository: binding,
+            next_token: 2,
+            claims: vec![PathClaim {
+                token: ClaimToken::from_u64(1),
+                agent_id: "registered-consumer-migration-test".to_string(),
+                paths: vec![PathBuf::from("src")],
+            }],
+        };
+        claims.checksum = stable_checksum(
+            &serde_json::to_vec(&(
+                claims.version,
+                &claims.repository,
+                claims.next_token,
+                &claims.claims,
+            ))
+            .expect("claims checksum payload"),
+        );
+        AtomicStateWriter::write_direct(
+            &state,
+            "claims.json",
+            &serde_json::to_vec_pretty(&claims).expect("claims JSON"),
+        )
+        .expect("claims state");
+        KernelStateLock::acquire_direct(&state, "claims.lock").expect("claims lock");
+
+        let sources = crate::artifacts::state_auth::authenticated_state_consumers();
+        assert_eq!(sources.len(), 9, "all authenticated consumer sources");
+        let registered_roots = sources
+            .iter()
+            .map(|source| source.root_name)
+            .collect::<BTreeSet<_>>();
+        for required in [
+            "authenticated-field-guide-state-v1",
+            "authenticated-megafile-history-v1",
+            "authenticated-generated-follow-up-queues-v1",
+        ] {
+            assert!(
+                registered_roots.contains(required),
+                "missing authenticated consumer root {required}"
+            );
+        }
+        let registered_state_root_locks = sources
+            .iter()
+            .flat_map(|source| source.state_root_lock_names.iter().copied())
+            .collect::<BTreeSet<_>>();
+        for required in [
+            ".authenticated-field-guide.lock",
+            "field-guide-operation-v1.lock",
+            ".authenticated-megafile-history.lock",
+            "megafile-history-operation-v1.lock",
+            ".generated-follow-up-queues.lock",
+        ] {
+            assert!(
+                registered_state_root_locks.contains(required),
+                "missing authenticated consumer state-root lock {required}"
+            );
+        }
+
+        for source in sources {
+            SafeRoot::open_or_create(state.path().join(source.root_name))
+                .expect("registered authenticated consumer root");
+            for lock_name in source.state_root_lock_names {
+                KernelStateLock::acquire_direct(&state, lock_name)
+                    .expect("registered authenticated consumer state-root lock");
+            }
+        }
+        make_legacy_permissions(state.path());
+
+        let dry = migrate_repository_state(&path, false).expect("registered-source dry run");
+        assert_eq!(dry.status, StateMigrationStatus::Ready);
+        assert_eq!(dry.mode, StateMigrationMode::DryRun);
+
+        let applied = migrate_repository_state(&path, true).expect("registered-source apply");
+        assert_eq!(applied.status, StateMigrationStatus::Applied);
+        assert_eq!(applied.mode, StateMigrationMode::Apply);
+
+        let repeated_dry =
+            migrate_repository_state(&path, false).expect("registered-source repeated dry run");
+        assert_eq!(repeated_dry.status, StateMigrationStatus::AlreadyApplied);
+        assert_eq!(repeated_dry.mode, StateMigrationMode::DryRun);
+
+        let repeated_apply =
+            migrate_repository_state(&path, true).expect("registered-source repeated apply");
+        assert_eq!(repeated_apply.status, StateMigrationStatus::AlreadyApplied);
+        assert_eq!(repeated_apply.mode, StateMigrationMode::Apply);
     }
 
     #[cfg(unix)]

@@ -29,7 +29,8 @@ use std::{
 pub const FIELD_GUIDE_STATE_NAMESPACE: &str = "authenticated-field-guide-state-v1";
 
 const FIELD_GUIDE_LOGICAL_ID: &str = "field-guide";
-const FIELD_GUIDE_OPERATION_LOCK: &str = "field-guide-operation-v1.lock";
+pub(crate) const FIELD_GUIDE_ROOT_LOCK: &str = ".authenticated-field-guide.lock";
+pub(crate) const FIELD_GUIDE_OPERATION_LOCK: &str = "field-guide-operation-v1.lock";
 const FIELD_GUIDE_STATE_VERSION: u32 = 1;
 const FIELD_GUIDE_ENTRY_VERSION: u32 = 1;
 const MAX_FIELD_GUIDE_ENTRIES: usize = 4_096;
@@ -96,7 +97,7 @@ impl JournalSpec for FieldGuideSnapshotSpec {
     const FORMAT_VERSION: u32 = 1;
     const NAMESPACE: &'static str = "authenticated_field_guide";
     const ROOT_NAME: &'static str = FIELD_GUIDE_STATE_NAMESPACE;
-    const ROOT_LOCK_NAME: &'static str = ".authenticated-field-guide.lock";
+    const ROOT_LOCK_NAME: &'static str = FIELD_GUIDE_ROOT_LOCK;
     const INSTANCE_LOCK_NAME: &'static str = ".field-guide-snapshot.lock";
     const HEAD_FILE_NAME: &'static str = ".head.json";
     const RECORD_DOMAIN: AuthenticationDomain =
