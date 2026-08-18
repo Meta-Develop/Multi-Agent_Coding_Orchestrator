@@ -36,6 +36,14 @@ fn injected_codex_runtime_catalog(slugs: &[&str]) -> RuntimeModelCatalog {
     )
 }
 
+fn install_named_test_models(models: &[&str]) -> InstalledModelCapabilityPolicy {
+    let entries = models
+        .iter()
+        .map(|model| (*model, ModelCapabilityClass::CriticalJudgment))
+        .collect::<Vec<_>>();
+    install_test_fixture_models(&entries).expect("test fixture capability policy")
+}
+
 #[cfg(unix)]
 fn mandatory_control_test_workspace() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("temporary mandatory-control workspace");

@@ -1242,11 +1242,18 @@ pub(super) fn apply_role_model_selection(
     catalog: &RuntimeModelCatalog,
 ) -> Result<ExternalAgentCommand> {
     let configured = effective_role_model_selection(plan, role);
-    let selection = catalog
-        .resolve_role_model_selection(&configured, runtime)?
-        .selection;
-    validate_known_judgment_role_model(role, selection.model.as_deref())?;
-    Ok(command.with_model_selection(selection.model, selection.reasoning_effort))
+    let resolution = catalog.resolve_role_model_selection(&configured, runtime)?;
+    authorize_resolved_judgment_model(
+        role,
+        configured.model.as_deref(),
+        resolution.selection.model.as_deref(),
+        resolution.observation,
+        runtime,
+    )?;
+    Ok(command.with_model_selection(
+        resolution.selection.model,
+        resolution.selection.reasoning_effort,
+    ))
 }
 
 pub(super) fn runtime_resolved_prompt_plan(
@@ -1257,13 +1264,17 @@ pub(super) fn runtime_resolved_prompt_plan(
     let mut resolved = plan.clone();
     for role in [AgentRole::ChildOrchestrator, AgentRole::Worker] {
         let configured = effective_role_model_selection(plan, role);
-        let selection = catalog
-            .resolve_role_model_selection(&configured, runtime)?
-            .selection;
+        let resolution = catalog.resolve_role_model_selection(&configured, runtime)?;
         if role != AgentRole::Worker {
-            validate_known_judgment_role_model(role, selection.model.as_deref())?;
+            authorize_resolved_judgment_model(
+                role,
+                configured.model.as_deref(),
+                resolution.selection.model.as_deref(),
+                resolution.observation,
+                runtime,
+            )?;
         }
-        resolved.role_models.insert(role, selection);
+        resolved.role_models.insert(role, resolution.selection);
     }
     Ok(resolved)
 }
@@ -1757,6 +1768,11 @@ mod regression_tests {
 
     #[test]
     fn review_lens_dispatch_preserves_distinct_runtime_selection_and_scope() -> Result<()> {
+        let _capability = install_test_fixture_models(&[
+            ("model-alpha", ModelCapabilityClass::CriticalJudgment),
+            ("model-beta", ModelCapabilityClass::CriticalJudgment),
+        ])
+        .expect("review-lens fixture capability policy");
         let assignment = OrchestratorAssignment {
             id: "child-decorrelated".to_string(),
             runtime: None,

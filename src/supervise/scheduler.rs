@@ -3766,6 +3766,9 @@ mod decomposition_tests {
 
     #[test]
     fn serial_scheduler_directly_dispatches_and_completes_fake_assignment() {
+        // Fake dispatch keeps the provisional default model's configured
+        // capability evidence; it does not treat an empty resolved slug as
+        // authority by itself.
         with_valid_schedule_context!(
             context,
             vec![test_assignment("serial-child", "README.md")],

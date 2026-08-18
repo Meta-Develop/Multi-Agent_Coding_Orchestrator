@@ -236,17 +236,41 @@ pub fn default_model_capability_policy() -> ModelCapabilityPolicy {
     }
 }
 
-fn installed_policy() -> &'static Mutex<Option<ModelCapabilityPolicy>> {
-    static POLICY: OnceLock<Mutex<Option<ModelCapabilityPolicy>>> = OnceLock::new();
-    POLICY.get_or_init(|| Mutex::new(None))
+#[derive(Default)]
+struct InstalledPolicyOverlays {
+    next_id: u64,
+    overlays: BTreeMap<u64, ModelCapabilityPolicy>,
+}
+
+fn installed_policy() -> &'static Mutex<InstalledPolicyOverlays> {
+    static POLICY: OnceLock<Mutex<InstalledPolicyOverlays>> = OnceLock::new();
+    POLICY.get_or_init(|| Mutex::new(InstalledPolicyOverlays::default()))
+}
+
+fn merge_capability_overlay(base: &mut ModelCapabilityPolicy, overlay: &ModelCapabilityPolicy) {
+    for entry in &overlay.models {
+        base.models.retain(|existing| existing.model != entry.model);
+        base.models.push(entry.clone());
+    }
+    if !overlay.id.trim().is_empty() {
+        base.id = overlay.id.clone();
+    }
+    if overlay.version > 0 {
+        base.version = overlay.version;
+    }
+    if !overlay.source.is_empty() {
+        base.source = overlay.source.clone();
+    }
 }
 
 pub fn current_model_capability_policy() -> ModelCapabilityPolicy {
-    installed_policy()
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
-        .unwrap_or_else(default_model_capability_policy)
+    let mut policy = default_model_capability_policy();
+    if let Ok(guard) = installed_policy().lock() {
+        for overlay in guard.overlays.values() {
+            merge_capability_overlay(&mut policy, overlay);
+        }
+    }
+    policy
 }
 
 pub fn install_model_capability_policy(
@@ -256,19 +280,25 @@ pub fn install_model_capability_policy(
     let mut guard = installed_policy()
         .lock()
         .expect("model capability policy lock");
-    let previous = guard.replace(policy);
-    Ok(InstalledModelCapabilityPolicy { previous })
+    let id = guard.next_id;
+    guard.next_id = guard.next_id.saturating_add(1);
+    guard.overlays.insert(id, policy);
+    Ok(InstalledModelCapabilityPolicy { id })
 }
 
-/// Restores the previous installed policy when dropped.
+/// Removes this install's overlay when dropped.
+///
+/// Overlays are merged onto the shipped default by install id, not by replacing a
+/// single process-global policy. Concurrent test fixtures therefore cannot wipe
+/// each other by restoring `None`.
 pub struct InstalledModelCapabilityPolicy {
-    previous: Option<ModelCapabilityPolicy>,
+    id: u64,
 }
 
 impl Drop for InstalledModelCapabilityPolicy {
     fn drop(&mut self) {
         if let Ok(mut guard) = installed_policy().lock() {
-            *guard = self.previous.take();
+            guard.overlays.remove(&self.id);
         }
     }
 }
@@ -369,6 +399,35 @@ pub fn validate_budget_model_degradation(
     )
 }
 
+/// Authorize the model that a catalog resolution actually selected.
+///
+/// A concrete resolved slug must have trusted capability evidence. Runtime-default
+/// selection (`None` after a real-runtime fallback) is not evidence. Fake
+/// configurations may keep configured evidence: an explicit local fake harness
+/// claims no provider model, and a trusted configured slug remains evidence even
+/// when the fake catalog does not expose it.
+pub fn authorize_resolved_judgment_model(
+    role: AgentRole,
+    configured_model: Option<&str>,
+    resolved_model: Option<&str>,
+    observation: super::ModelResolutionObservation,
+    runtime: super::SupervisorRuntime,
+) -> Result<()> {
+    if let Some(model) = resolved_model {
+        return validate_known_judgment_role_model(role, Some(model));
+    }
+    match (runtime, observation) {
+        (
+            super::SupervisorRuntime::Fake,
+            super::ModelResolutionObservation::LocalDeterministicFake,
+        ) => Ok(()),
+        (super::SupervisorRuntime::Fake, _) => {
+            validate_known_judgment_role_model(role, configured_model)
+        }
+        _ => validate_known_judgment_role_model(role, None),
+    }
+}
+
 /// Fail-closed authority check for a resolved role/model pair.
 ///
 /// Missing model identity and unknown/ineligible slugs cannot grant judgment
@@ -431,6 +490,7 @@ pub fn install_test_fixture_models(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::supervise::{ModelResolutionObservation, SupervisorRuntime};
 
     #[test]
     fn default_policy_ranks_luna_above_ineligible_terra() {
@@ -510,13 +570,75 @@ mod tests {
 
     #[test]
     fn fixture_overlay_restores_previous_policy() {
-        let _guard =
-            install_test_fixture_models(&[("priced-model", ModelCapabilityClass::GeneralJudgment)])
-                .expect("install fixture");
-        validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("priced-model"))
+        let probe = "policy-restore-probe-model";
+        let _guard = install_test_fixture_models(&[(probe, ModelCapabilityClass::GeneralJudgment)])
+            .expect("install fixture");
+        validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some(probe))
             .expect("fixture model is authorized");
         drop(_guard);
-        validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("priced-model"))
+        validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some(probe))
             .expect_err("overlay must not leak");
+    }
+
+    #[test]
+    fn concurrent_fixture_overlays_do_not_wipe_each_other() {
+        let first = install_test_fixture_models(&[(
+            "overlay-a-model",
+            ModelCapabilityClass::GeneralJudgment,
+        )])
+        .expect("install first overlay");
+        let second = install_test_fixture_models(&[(
+            "overlay-b-model",
+            ModelCapabilityClass::CriticalJudgment,
+        )])
+        .expect("install second overlay");
+        validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("overlay-a-model"))
+            .expect("first overlay remains visible");
+        validate_known_judgment_role_model(AgentRole::Auditor, Some("overlay-b-model"))
+            .expect("second overlay is visible");
+        drop(first);
+        validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("overlay-a-model"))
+            .expect_err("dropped overlay must not leak");
+        validate_known_judgment_role_model(AgentRole::Auditor, Some("overlay-b-model"))
+            .expect("surviving overlay must outlive a sibling drop");
+        drop(second);
+        validate_known_judgment_role_model(AgentRole::Auditor, Some("overlay-b-model"))
+            .expect_err("second overlay must not leak");
+    }
+
+    #[test]
+    fn fake_runtime_keeps_configured_evidence_when_slug_is_not_observable() {
+        authorize_resolved_judgment_model(
+            AgentRole::ChildOrchestrator,
+            Some("gpt-5.6-sol"),
+            None,
+            ModelResolutionObservation::RuntimeDefault,
+            SupervisorRuntime::Fake,
+        )
+        .expect("configured sol remains evidence on the fake runtime");
+        authorize_resolved_judgment_model(
+            AgentRole::ChildOrchestrator,
+            Some("codex-only-model"),
+            None,
+            ModelResolutionObservation::LocalDeterministicFake,
+            SupervisorRuntime::Fake,
+        )
+        .expect("explicit fake harness claims no provider model");
+        authorize_resolved_judgment_model(
+            AgentRole::ChildOrchestrator,
+            Some("preferred-model"),
+            None,
+            ModelResolutionObservation::RuntimeDefault,
+            SupervisorRuntime::Codex,
+        )
+        .expect_err("runtime-default on a real runtime is not capability evidence");
+        authorize_resolved_judgment_model(
+            AgentRole::Auditor,
+            Some("unknown-model"),
+            Some("unknown-model"),
+            ModelResolutionObservation::PreferredModel,
+            SupervisorRuntime::Codex,
+        )
+        .expect_err("unknown resolved slugs stay fail-closed");
     }
 }
