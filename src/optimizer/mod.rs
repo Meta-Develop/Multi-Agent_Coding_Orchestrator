@@ -56,7 +56,9 @@ pub use certification::{
     FailClosedCertifier, QualityCertifier, ScoredCandidate, SelectionOutcome, TaskBinding,
 };
 pub use error::OptimizerError;
-pub use global_search::{GlobalPolicyOptimizer, OptimizationHistory, PolicySearchSpace};
+pub use global_search::{
+    ConstrainedTpeOptimizer, GlobalPolicyOptimizer, OptimizationHistory, PolicySearchSpace,
+};
 pub use online_router::{OnlineRouter, RouterDecision};
 pub use policy::{PolicyEdge, PolicyGraph, PolicyNode, TransitionCondition, TransitionEvidence};
 pub use predictor::{PolicyOutcomeDistribution, PolicyPredictor};
