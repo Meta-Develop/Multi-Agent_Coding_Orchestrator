@@ -1472,12 +1472,13 @@ impl WorktreeManager {
 
     pub fn create_with_retention(
         &self,
-        _options: WorktreeCreateOptions,
-        _retention: WorktreeRetentionPolicy,
+        options: WorktreeCreateOptions,
+        retention: WorktreeRetentionPolicy,
     ) -> Result<WorktreeRecord> {
-        bail!(
-            "managed worktree creation is unsupported without a capability-bound repository cleanliness input"
-        );
+        let cleanliness = self.acquire_repository_cleanliness().with_context(|| {
+            "managed worktree creation requires a clean repository; `maco worktree create` derives the cleanliness capability automatically when the target repository is already clean"
+        })?;
+        self.create_with_repository_cleanliness_and_retention(options, retention, &cleanliness)
     }
 
     /// Captures repository-bound cleanliness evidence for effectful managed
@@ -12041,7 +12042,12 @@ mod tests {
             .remove("worker", false, true)
             .expect_err("non-force removal must fail closed");
 
-        assert!(create_error.to_string().contains("capability-bound"));
+        let create_message = format!("{create_error:#}");
+        assert!(
+            create_message.contains("failed to open repository")
+                && create_message.contains("cleanliness capability"),
+            "{create_message}"
+        );
         assert!(remove_error.to_string().contains("capability-bound"));
         assert_eq!(fs::read_dir(temp.path()).expect("read temp").count(), 0);
     }
@@ -12323,6 +12329,35 @@ mod tests {
         )
         .expect("inspect created worktree")
         .is_empty());
+        assert_eq!(
+            manager.list_managed_verified().expect("list worktrees"),
+            vec![record]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn public_create_derives_cleanliness_from_a_clean_repository() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+
+        let record = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "public-create-worker".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root),
+            })
+            .expect("public create derives cleanliness from a clean repository");
+
+        assert_eq!(record.name, "public-create-worker");
+        assert_eq!(record.branch, "maco/public-create-worker");
+        assert!(record.path.join("README.md").is_file());
         assert_eq!(
             manager.list_managed_verified().expect("list worktrees"),
             vec![record]
