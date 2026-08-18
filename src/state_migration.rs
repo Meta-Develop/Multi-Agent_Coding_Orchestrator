@@ -1211,7 +1211,10 @@ fn preflight_legacy_state(
         let path = state_root.direct_child(&name)?;
         let metadata = fs::symlink_metadata(&path)?;
         let identity = identity_for_path(&path)?;
-        if root_entries.insert(name.clone(), identity.clone()).is_some() {
+        if root_entries
+            .insert(name.clone(), identity.clone())
+            .is_some()
+        {
             bail!("legacy state root contains a duplicate entry name");
         }
         if metadata.file_type().is_dir() {
@@ -4004,14 +4007,17 @@ mod tests {
     #[test]
     fn publication_transaction_journals_are_inventoried_and_retired_across_all_modes() {
         let (_temp, path, state) = repository_with_claims();
-        let journals = state.join(LEGACY_PUBLICATION_TRANSACTIONS_DIR).join("legacy");
+        let journals = state
+            .join(LEGACY_PUBLICATION_TRANSACTIONS_DIR)
+            .join("legacy");
         fs::create_dir_all(&journals).expect("legacy publication journals");
         let record = journals.join("00000000000000000001.json");
         fs::write(&record, b"legacy plaintext must remain untouched\n").expect("legacy record");
         make_legacy_permissions(&state);
 
         assert!(
-            !legacy_publication_journals_are_retired(&path).expect("pre-migration retirement query"),
+            !legacy_publication_journals_are_retired(&path)
+                .expect("pre-migration retirement query"),
             "unsigned leftover journals are not retired"
         );
 
@@ -4027,8 +4033,7 @@ mod tests {
         assert_eq!(applied.status, StateMigrationStatus::Applied);
         assert_eq!(applied.mode, StateMigrationMode::Apply);
         assert!(
-            legacy_publication_journals_are_retired(&path)
-                .expect("applied retirement query"),
+            legacy_publication_journals_are_retired(&path).expect("applied retirement query"),
             "signed migration must retire leftover publication journals"
         );
         assert_eq!(

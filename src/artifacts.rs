@@ -4582,12 +4582,20 @@ mod tests {
                 .expect("reserve writer");
         let path = Path::new("notes/private.txt");
         let first = writer
-            .write_bytes(path, b"private evidence\n", ArtifactFileDisposition::PrivateEvidence)
+            .write_bytes(
+                path,
+                b"private evidence\n",
+                ArtifactFileDisposition::PrivateEvidence,
+            )
             .expect("write private evidence");
         let before = fs::read(writer.run_dir().join(path)).expect("read before mismatch");
 
         let error = writer
-            .write_bytes(path, b"now publishable\n", ArtifactFileDisposition::Publishable)
+            .write_bytes(
+                path,
+                b"now publishable\n",
+                ArtifactFileDisposition::Publishable,
+            )
             .expect_err("disposition change must fail");
         assert!(error.to_string().contains("cannot change file disposition"));
         assert_eq!(
@@ -4598,9 +4606,16 @@ mod tests {
         assert_eq!(writer.total_bytes, first.bytes);
 
         let rewritten = writer
-            .write_bytes(path, b"still private\n", ArtifactFileDisposition::PrivateEvidence)
+            .write_bytes(
+                path,
+                b"still private\n",
+                ArtifactFileDisposition::PrivateEvidence,
+            )
             .expect("same-disposition overwrite");
-        assert_eq!(rewritten.disposition, ArtifactFileDisposition::PrivateEvidence);
+        assert_eq!(
+            rewritten.disposition,
+            ArtifactFileDisposition::PrivateEvidence
+        );
         assert_eq!(
             fs::read(writer.run_dir().join(path)).expect("read same-disposition overwrite"),
             b"still private\n"

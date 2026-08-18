@@ -3361,8 +3361,7 @@ mod tests {
             &owner_last,
             "# Claim: owner-last\n\n- Claim ID: `owner-last`\n- Date: `2026-05-19`\n- Status: `active`\n- Owned files, regions, devices, or services:\n  - `src/cli.rs`: test\n- Owner: `worker-a`\n",
         )?;
-        let owner_last_report =
-            heartbeat_with_clock(temp.path(), "owner-last", "worker-a", &now)?;
+        let owner_last_report = heartbeat_with_clock(temp.path(), "owner-last", "worker-a", &now)?;
         assert_eq!(owner_last_report.status.as_deref(), Some("active"));
         let owner_last_text = std::fs::read_to_string(&owner_last)?;
         assert!(owner_last_text.contains("- Heartbeat: `2026-05-20T00:30:00Z`"));

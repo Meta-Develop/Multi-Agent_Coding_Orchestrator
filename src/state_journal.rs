@@ -1562,14 +1562,24 @@ mod tests {
 
         set_journal_head_write_fault();
         let failed = journal
-            .append("command_started", Some("agent-a"), &serde_json::json!({"v": 2}))
+            .append(
+                "command_started",
+                Some("agent-a"),
+                &serde_json::json!({"v": 2}),
+            )
             .expect_err("injected head write failure");
-        assert!(failed.to_string().contains("injected checkpoint journal head write"));
+        assert!(failed
+            .to_string()
+            .contains("injected checkpoint journal head write"));
         assert!(journal.head_dirty);
         assert_eq!(journal.records().len(), 2);
 
         journal
-            .append("command_finished", Some("agent-a"), &serde_json::json!({"v": 3}))
+            .append(
+                "command_finished",
+                Some("agent-a"),
+                &serde_json::json!({"v": 3}),
+            )
             .expect("retry append after transient head failure");
         assert!(!journal.head_dirty);
         assert_eq!(journal.records().len(), 3);

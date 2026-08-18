@@ -7315,7 +7315,9 @@ mod tests {
             patch_dir: None,
         })
         .expect_err("later setup failure must abort the batch");
-        assert!(error.to_string().contains("injected ready-agent setup failure"));
+        assert!(error
+            .to_string()
+            .contains("injected ready-agent setup failure"));
         assert!(
             !marker.exists(),
             "pre-validation must stop earlier agents from spawning"

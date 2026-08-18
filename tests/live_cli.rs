@@ -187,7 +187,8 @@ fn heartbeat_accepts_owner_last_and_owner_before_owned_files_layouts() -> Result
         "--json",
     ])?;
     assert_eq!(last["status"], "active");
-    let last_text = fs::read_to_string(claim_path(repo, "owner-last")).context("read owner-last")?;
+    let last_text =
+        fs::read_to_string(claim_path(repo, "owner-last")).context("read owner-last")?;
     assert!(last_text.contains("  - `src/cli.rs`: last-line owner layout"));
 
     let before = run_success_json(&[
