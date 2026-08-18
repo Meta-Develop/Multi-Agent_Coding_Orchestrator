@@ -7,10 +7,8 @@ use std::sync::Mutex;
 use super::action::{CanonicalEffort, RuntimeModelId};
 use super::error::OptimizerError;
 use super::ids::{CatalogVersion, PolicyId, ResourceDimensionId, RuntimeSlug, TimestampMillis};
-use super::resources::{Quantity, ResourceVector};
-use super::safe_set::{
-    EvaluationFidelity, InMemorySafeSetStore, PromotionDecisionKind, PromotionEvent, TaskClass,
-};
+use super::resources::ResourceVector;
+use super::safe_set::{EvaluationFidelity, InMemorySafeSetStore, PromotionEvent, TaskClass};
 use super::telemetry::InvocationRecord;
 
 pub trait DriftDetector {
@@ -66,7 +64,7 @@ impl DecayedBernoulli {
         if self.weighted_trials_micro == 0 {
             return 0;
         }
-        ((self.weighted_successes_micro * 10_000) / self.weighted_trials_micro.min(u64::MAX)) as u16
+        ((self.weighted_successes_micro * 10_000) / self.weighted_trials_micro) as u16
     }
 
     pub fn wilson_lcb_bp(&self) -> u16 {
@@ -519,9 +517,9 @@ mod tests {
         BackendId, CandidateId, ModelFamilyId, PolicyId, ProviderId, ResourceDimensionId,
     };
     use crate::optimizer::resources::{
-        ObservationKind, ResourceDimension, ResourceObservation, ResourceSnapshot,
+        ObservationKind, Quantity, ResourceDimension, ResourceObservation, ResourceSnapshot,
     };
-    use crate::optimizer::safe_set::PromotionThreshold;
+    use crate::optimizer::safe_set::{PromotionDecisionKind, PromotionThreshold};
     use crate::optimizer::telemetry::InvocationRecord;
 
     fn identity(slug: &str, version: &str) -> RuntimeModelId {
