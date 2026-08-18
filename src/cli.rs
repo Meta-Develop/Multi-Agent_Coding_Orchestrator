@@ -3952,6 +3952,19 @@ fn run_merge_apply_controller(
         MergeApplyOptions {
             preview: preview_options,
             candidate_validation_commands,
+            reviewed_watermark: match args.reviewed_watermark {
+                Some(path) => {
+                    let bytes = std::fs::read(&path).with_context(|| {
+                        format!("failed to read reviewed watermark {}", path.display())
+                    })?;
+                    let value: serde_json::Value = serde_json::from_slice(&bytes)
+                        .context("reviewed watermark is not valid JSON")?;
+                    Some(
+                        crate::merge_freshness::reviewed_merge_preview_watermark_from_json(&value)?,
+                    )
+                }
+                None => None,
+            },
         },
         validation_evidence,
         megafile_policy,
@@ -4085,6 +4098,9 @@ struct MergeApplyArgs {
     /// Apply an eligible merge lifecycle reap; requires --auto-reap-merged.
     #[arg(long, requires = "auto_reap_merged")]
     apply_auto_reap: bool,
+    /// Previously reviewed merge preview JSON or nested freshness watermark.
+    #[arg(long, value_name = "PATH")]
+    reviewed_watermark: Option<PathBuf>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -5263,7 +5279,18 @@ fn print_merge_candidate(candidate: &MergeCandidate, json: bool) -> Result<()> {
 
 fn print_merge_preview(preview: &MergeApplyPreview, json: bool) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(preview)?);
+        let watermark =
+            crate::merge_freshness::MergePreviewFreshnessWatermark::capture_from_candidate(
+                &preview.candidate,
+            )?;
+        let mut value = serde_json::to_value(preview)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "freshness_watermark".to_string(),
+                serde_json::to_value(watermark)?,
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         print_merge_candidate(&preview.candidate, false)?;
         println!("Readiness: {:?}", preview.safety.readiness.status);
@@ -6984,6 +7011,7 @@ mod tests {
             decomposition_target: None,
             decomposition_run_id: None,
             megafile_thresholds: MegafileThresholdArgs::default(),
+            reviewed_watermark: None,
             forces: MergeForceArgs {
                 force_dirty_primary: false,
                 force_stale_base: false,
@@ -7115,6 +7143,7 @@ mod tests {
             decomposition_target: None,
             decomposition_run_id: None,
             megafile_thresholds: MegafileThresholdArgs::default(),
+            reviewed_watermark: None,
             forces: MergeForceArgs {
                 force_dirty_primary: false,
                 force_stale_base: false,
@@ -7178,6 +7207,7 @@ mod tests {
             decomposition_target: None,
             decomposition_run_id: None,
             megafile_thresholds: MegafileThresholdArgs::default(),
+            reviewed_watermark: None,
             forces: MergeForceArgs {
                 force_dirty_primary: false,
                 force_stale_base: true,

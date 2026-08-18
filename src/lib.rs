@@ -25,6 +25,7 @@ pub mod llm;
 pub mod machine_global;
 pub mod megafile;
 pub mod merge;
+pub(crate) mod merge_freshness;
 pub(crate) mod merge_semantic;
 pub mod orchestration_event;
 pub mod orchestrator;

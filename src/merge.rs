@@ -119,6 +119,9 @@ pub struct MergePreviewOptions {
 pub struct MergeApplyOptions {
     pub preview: MergePreviewOptions,
     pub candidate_validation_commands: Vec<CandidateValidationCommand>,
+    /// Previously reviewed preview watermark. When present, apply recaptures
+    /// current HEADs and refuses if the primary or source side drifted.
+    pub reviewed_watermark: Option<crate::merge_freshness::MergePreviewFreshnessWatermark>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2731,6 +2734,12 @@ pub fn merge_apply_report_with_megafile_policy(
         validation_evidence,
         megafile_policy.clone(),
     )?;
+    if let Some(reviewed) = options.reviewed_watermark.as_ref() {
+        let current = crate::merge_freshness::MergePreviewFreshnessWatermark::capture_from_candidate(
+            &preview.candidate,
+        )?;
+        crate::merge_freshness::refuse_if_drifted(reviewed, &current)?;
+    }
     let recorded_collision_paths =
         record_merge_collision_decision(&preview, &megafile_policy.thresholds)?;
     if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
@@ -9446,6 +9455,7 @@ mod tests {
             MergeApplyOptions {
                 preview: megafile_preview_options(&repo_path, claims.clone(), Vec::new(), true),
                 candidate_validation_commands: Vec::new(),
+                reviewed_watermark: None,
             },
             ValidationEvidenceBundle::default(),
             policy.clone(),
@@ -9470,6 +9480,7 @@ mod tests {
             MergeApplyOptions {
                 preview: megafile_preview_options(&repo_path, claims, Vec::new(), false),
                 candidate_validation_commands: Vec::new(),
+                reviewed_watermark: None,
             },
             ValidationEvidenceBundle::default(),
             policy.clone(),
@@ -9545,6 +9556,7 @@ mod tests {
                 MergeApplyOptions {
                     preview: megafile_preview_options(&repo_path, claims, Vec::new(), false),
                     candidate_validation_commands: Vec::new(),
+                    reviewed_watermark: None,
                 },
                 ValidationEvidenceBundle::default(),
                 policy.clone(),
@@ -9590,6 +9602,7 @@ mod tests {
                     false,
                 ),
                 candidate_validation_commands: Vec::new(),
+                reviewed_watermark: None,
             },
             ValidationEvidenceBundle::default(),
             policy.clone(),
@@ -9637,6 +9650,7 @@ mod tests {
                     false,
                 ),
                 candidate_validation_commands: Vec::new(),
+                reviewed_watermark: None,
             },
             ValidationEvidenceBundle::default(),
             policy,
@@ -9718,6 +9732,7 @@ mod tests {
         let report = merge_apply_report(MergeApplyOptions {
             preview: semantic_preview_options(&repo_path, "src/shared.rs"),
             candidate_validation_commands: Vec::new(),
+            reviewed_watermark: None,
         })
         .expect("build blocked apply report");
         assert_eq!(report.status, MergeApplyReportStatus::Blocked);
