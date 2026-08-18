@@ -915,6 +915,36 @@ mod tests {
     }
 
     #[test]
+    fn non_codex_adapters_do_not_hardcode_codex_launch_or_writable_gates() -> Result<()> {
+        for id in AdapterId::ALL {
+            if id == AdapterId::Codex {
+                continue;
+            }
+            let config = RuntimeAdapterConfig::defaults_for(id);
+            assert_ne!(
+                config.binary_path(),
+                Path::new("codex"),
+                "{id} must not launch the Codex binary"
+            );
+            assert!(
+                config
+                    .argument_template
+                    .iter()
+                    .all(|token| !token.to_ascii_lowercase().contains("codex")),
+                "{id} launch template still names Codex"
+            );
+            assert_eq!(
+                id.capabilities().writable_refusal(),
+                Some("blocking_pre_action_callback != All"),
+                "{id} writable gate must be capability-derived, not vendor-named"
+            );
+        }
+        // Codex remains the unresolved default by operator policy.
+        assert_eq!(resolve_runtime(None, None), RuntimeId::Codex);
+        Ok(())
+    }
+
+    #[test]
     fn registry_constructs_every_known_adapter_without_vendor_gates() -> Result<()> {
         for id in AdapterId::ALL {
             let adapter = adapter_for(id);
