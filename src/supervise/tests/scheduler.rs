@@ -1187,6 +1187,69 @@ fn serial_assignment_terminal_checkpoint_precedes_claim_release() {
 }
 
 #[test]
+fn serial_scheduler_error_after_completion_collects_outcomes_and_releases_claims() {
+    let (temp, repo_path) = injected_repository();
+    let assignments = vec![
+        injected_named_assignment("serial-collect-a", "README.md"),
+        injected_named_assignment("serial-collect-b", "src/lib.rs"),
+    ];
+    let plan = injected_multi_plan(assignments.clone(), 0);
+    let run_id = RunId::new("serial-collect-after-error").expect("valid serial collect run id");
+    let options = injected_options(&repo_path, temp.path(), run_id.as_str());
+    let runner = {
+        let assignments = assignments.clone();
+        let run_id = run_id.clone();
+        move |command: &ExternalAgentCommand| {
+            let id = injected_command_assignment_id(command);
+            if id == "serial-collect-a" {
+                install_checkpoint_failure(run_id.as_str(), "assignment_started");
+            }
+            let assignment = assignments
+                .iter()
+                .find(|assignment| assignment.id == id)
+                .expect("serial collect assignment");
+            write_injected_assignment_report(command, assignment);
+            injected_verified_run(command)
+        }
+    };
+
+    let report = run_supervisor_plan_with_concurrent_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        1,
+        &runner,
+    )
+    .expect("serial scheduling error remains reportable after collecting completed work");
+
+    assert!(!report.success);
+    assert_eq!(
+        report
+            .orchestrator_reports
+            .iter()
+            .map(|child| child.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["serial-collect-a"]
+    );
+    assert_eq!(report.released_claims.len(), 1);
+    assert_eq!(report.released_claims[0].agent_id, "serial-collect-a");
+    assert!(report.release_errors.is_empty());
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.message.contains("assignment_started")),
+        "scheduler error must remain visible in the final report: {:#?}",
+        report.findings
+    );
+    assert!(SyncStore::open(&repo_path)
+        .expect("open claims after serial collect")
+        .snapshot()
+        .expect("snapshot claims after serial collect")
+        .is_empty());
+}
+
+#[test]
 fn concurrent_assignment_terminal_checkpoint_precedes_claim_release() {
     let (temp, repo_path) = injected_repository();
     let assignments = vec![

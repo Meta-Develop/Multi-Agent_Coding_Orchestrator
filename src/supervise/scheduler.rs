@@ -2567,32 +2567,12 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 release_per_assignment,
             };
             let scheduler_result = if max_concurrent_children == 1 {
-                if let Err(error) = run_serial_assignment_schedule(
+                run_serial_assignment_schedule(
                     &scheduler_context,
                     &mut progress,
                     &cancellation,
                     &serial_semantic_warn_intents,
-                ) {
-                    achieved_concurrency = progress.concurrency.finish();
-                    budget_prevented_dispatch |= progress.budget_prevented_dispatch;
-                    if let Ok(report) = budget_ledger.report() {
-                        if !report.new_dispatch_allowed {
-                            for index in &progress.budget_denied_assignment_indices {
-                                progress
-                                    .budget_degradation
-                                    .record_halt(&plan.assignments[*index].id, &report);
-                            }
-                        }
-                    }
-                    budget_denied_assignment_indices
-                        .extend(progress.budget_denied_assignment_indices);
-                    budget_degradations.append(&mut progress.budget_degradation.records);
-                    assignment_effort_bindings
-                        .append(&mut progress.budget_degradation.assignment_effort_bindings);
-                    circuit_breaker_trip = progress.circuit_breaker_trip;
-                    return Err(error);
-                }
-                Ok(())
+                )
             } else {
                 run_concurrent_assignment_schedule(
                     &scheduler_context,
