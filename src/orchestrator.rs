@@ -114,6 +114,52 @@ static CHECKPOINT_EVENT_FAILURE_HOOK: std::sync::OnceLock<
     std::sync::Mutex<Vec<CheckpointEventFailureHook>>,
 > = std::sync::OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    static READY_AGENT_SETUP_FAULT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    static READY_AGENT_POST_SPAWN_FAULT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_ready_agent_setup_fault(agent_id: impl Into<String>) {
+    READY_AGENT_SETUP_FAULT.with(|slot| *slot.borrow_mut() = Some(agent_id.into()));
+}
+
+#[cfg(test)]
+fn take_ready_agent_setup_fault(agent_id: &str) -> bool {
+    READY_AGENT_SETUP_FAULT.with(|slot| {
+        if slot.borrow().as_deref() == Some(agent_id) {
+            slot.borrow_mut().take();
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+fn set_ready_agent_post_spawn_fault(agent_id: impl Into<String>) {
+    READY_AGENT_POST_SPAWN_FAULT.with(|slot| *slot.borrow_mut() = Some(agent_id.into()));
+}
+
+#[cfg(test)]
+fn fail_after_ready_agent_spawn(agent_id: &str) -> Result<()> {
+    let triggered = READY_AGENT_POST_SPAWN_FAULT.with(|slot| {
+        if slot.borrow().as_deref() == Some(agent_id) {
+            slot.borrow_mut().take();
+            true
+        } else {
+            false
+        }
+    });
+    if triggered {
+        bail!("injected ready-agent post-spawn setup failure for '{agent_id}'");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OrchestrationExecutionRuntime {
     Verified,
@@ -3531,7 +3577,7 @@ fn run_ready_agents(
         return Ok(vec![(index, run_agent_command(spec))]);
     }
 
-    let mut handles = Vec::with_capacity(ready.len());
+    let mut prepared = Vec::with_capacity(ready.len());
     for index in ready {
         verify_selected_worktree_binding(
             manager,
@@ -3545,13 +3591,34 @@ fn run_ready_agents(
             &worktrees[*index],
             runtime,
         )?;
-        let index = *index;
-        handles.push((
-            index,
-            thread::spawn(move || (index, run_agent_command(spec))),
-        ));
+        prepared.push((*index, spec));
     }
 
+    let mut handles = Vec::with_capacity(prepared.len());
+    let spawn_result = (|| -> Result<()> {
+        for (index, spec) in prepared {
+            handles.push((
+                index,
+                thread::spawn(move || (index, run_agent_command(spec))),
+            ));
+            #[cfg(test)]
+            fail_after_ready_agent_spawn(&plan.agents[index].id)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = spawn_result {
+        let _ = join_ready_agent_handles(handles);
+        return Err(error);
+    }
+    Ok(join_ready_agent_handles(handles))
+}
+
+fn join_ready_agent_handles(
+    handles: Vec<(
+        usize,
+        std::thread::JoinHandle<(usize, Result<CommandRunResult, ProcessRunError>)>,
+    )>,
+) -> Vec<(usize, Result<CommandRunResult, ProcessRunError>)> {
     let mut outcomes = Vec::with_capacity(handles.len());
     for (index, handle) in handles {
         let outcome = handle.join().unwrap_or_else(|_| {
@@ -3569,9 +3636,8 @@ fn run_ready_agents(
         });
         outcomes.push(outcome);
     }
-
     outcomes.sort_by_key(|(index, _)| *index);
-    Ok(outcomes)
+    outcomes
 }
 
 fn inspect_captured_agent_changes(
@@ -4484,6 +4550,10 @@ fn command_spec(
     worktree: &SelectedWorktree,
     runtime: OrchestrationExecutionRuntime,
 ) -> Result<CommandRunSpec> {
+    #[cfg(test)]
+    if take_ready_agent_setup_fault(&agent.id) {
+        bail!("injected ready-agent setup failure for '{}'", agent.id);
+    }
     let recorded = summary
         .worktree
         .as_ref()
@@ -7202,6 +7272,118 @@ mod tests {
             .acquire_write_execution_lease("agent-a")
             .expect("successful run releases write lease");
         drop(released);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mid_batch_setup_failure_does_not_spawn_earlier_agents() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+        fs::write(repo_path.join("b.txt"), "b\n").expect("write b");
+        commit_all(&repo, "initial commit").expect("commit");
+        let marker = temp.path().join("agent-a-ran");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agents": [
+                    {
+                        "id": "agent-a",
+                        "paths": ["a.txt"],
+                        "command": format!("printf ran > '{}'; sleep 30", marker.display())
+                    },
+                    {
+                        "id": "agent-b",
+                        "paths": ["b.txt"],
+                        "command": "true"
+                    }
+                ]
+            }))
+            .expect("encode plan"),
+        )
+        .expect("write plan");
+
+        set_ready_agent_setup_fault("agent-b");
+        let error = run_plan_file(OrchestrationRunOptions {
+            repo: repo_path.clone(),
+            plan_file,
+            keep_claims: false,
+            jobs: 2,
+            patch_dir: None,
+        })
+        .expect_err("later setup failure must abort the batch");
+        assert!(error.to_string().contains("injected ready-agent setup failure"));
+        assert!(
+            !marker.exists(),
+            "pre-validation must stop earlier agents from spawning"
+        );
+        assert_eq!(
+            SyncStore::open(&repo_path)
+                .expect("open store")
+                .snapshot()
+                .expect("snapshot"),
+            Vec::<PathClaim>::new()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mid_batch_post_spawn_failure_joins_already_spawned_agents_before_return() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+        fs::write(repo_path.join("b.txt"), "b\n").expect("write b");
+        commit_all(&repo, "initial commit").expect("commit");
+        let marker = temp.path().join("agent-a-ran");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agents": [
+                    {
+                        "id": "agent-a",
+                        "paths": ["a.txt"],
+                        "command": format!("printf ran > '{}'", marker.display())
+                    },
+                    {
+                        "id": "agent-b",
+                        "paths": ["b.txt"],
+                        "command": "true"
+                    }
+                ]
+            }))
+            .expect("encode plan"),
+        )
+        .expect("write plan");
+
+        set_ready_agent_post_spawn_fault("agent-a");
+        let error = run_plan_file(OrchestrationRunOptions {
+            repo: repo_path.clone(),
+            plan_file,
+            keep_claims: false,
+            jobs: 2,
+            patch_dir: None,
+        })
+        .expect_err("post-spawn setup failure must abort after joining");
+        assert!(error
+            .to_string()
+            .contains("injected ready-agent post-spawn setup failure"));
+        assert!(
+            marker.exists(),
+            "already-spawned agent must run to completion while its claims are still held"
+        );
+        assert_eq!(
+            SyncStore::open(&repo_path)
+                .expect("open store")
+                .snapshot()
+                .expect("snapshot"),
+            Vec::<PathClaim>::new()
+        );
     }
 
     #[cfg(unix)]
