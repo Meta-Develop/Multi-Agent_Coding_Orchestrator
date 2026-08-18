@@ -1,15 +1,53 @@
-use anyhow::{Context, Result};
+use crate::safe_state::BoundedRegularReader;
+use anyhow::{bail, Context, Result};
+#[cfg(test)]
 use git2::Repository;
 use proc_macro2::{LineColumn, Span};
 use quote::ToTokens;
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
-    fs,
+    fs::{self, File, OpenOptions},
     path::{Component, Path, PathBuf},
+};
+
+#[cfg(target_os = "linux")]
+use std::os::unix::{
+    ffi::OsStrExt,
+    fs::OpenOptionsExt,
+    io::{AsRawFd, FromRawFd},
 };
 use syn::{
     spanned::Spanned, Attribute, Expr, ImplItem, Item, Lit, Meta, TraitItem, UseTree, Visibility,
+};
+
+const MAX_SEMANTIC_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SEMANTIC_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SEMANTIC_SCAN_ENTRIES: usize = 100_000;
+const MAX_SEMANTIC_DIRECTORY_DEPTH: usize = 128;
+const MAX_SEMANTIC_PATH_BYTES: usize = 16 * 1024;
+const MAX_SEMANTIC_PATH_COMPONENTS: usize = 129;
+const MAX_SEMANTIC_RETAINED_PATH_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct SemanticScanLimits {
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+    max_entries: usize,
+    max_depth: usize,
+    max_path_bytes: usize,
+    max_path_components: usize,
+    max_retained_path_bytes: usize,
+}
+
+const DEFAULT_SEMANTIC_SCAN_LIMITS: SemanticScanLimits = SemanticScanLimits {
+    max_file_bytes: MAX_SEMANTIC_FILE_BYTES,
+    max_total_bytes: MAX_SEMANTIC_TOTAL_BYTES,
+    max_entries: MAX_SEMANTIC_SCAN_ENTRIES,
+    max_depth: MAX_SEMANTIC_DIRECTORY_DEPTH,
+    max_path_bytes: MAX_SEMANTIC_PATH_BYTES,
+    max_path_components: MAX_SEMANTIC_PATH_COMPONENTS,
+    max_retained_path_bytes: MAX_SEMANTIC_RETAINED_PATH_BYTES,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -148,20 +186,19 @@ pub struct SourceSpan {
 }
 
 pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<SemanticRepoMap> {
-    let repo = Repository::discover(repo_path.as_ref()).with_context(|| {
-        format!(
-            "failed to discover repository from {}",
-            repo_path.as_ref().display()
-        )
-    })?;
+    scan_repository_with_limits(repo_path.as_ref(), DEFAULT_SEMANTIC_SCAN_LIMITS)
+}
+
+fn scan_repository_with_limits(
+    repo_path: &Path,
+    limits: SemanticScanLimits,
+) -> Result<SemanticRepoMap> {
+    let repo = crate::git_repository::discover(repo_path)
+        .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
     let root = repo
         .workdir()
         .context("semantic repository map requires a non-bare repository")?
         .to_path_buf();
-
-    let mut rust_files = Vec::new();
-    collect_rust_files(&root, &root, &mut rust_files)?;
-    rust_files.sort();
 
     let mut map = SemanticRepoMap {
         root: root.clone(),
@@ -173,8 +210,20 @@ pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<SemanticRepoMap> {
         errors: Vec::new(),
     };
 
-    for file in rust_files {
-        scan_rust_file(&root, &file, &mut map);
+    let mut rust_files = Vec::new();
+    collect_rust_files(&root, &mut rust_files, limits)?;
+    rust_files.sort();
+
+    let mut total_source_bytes = 0u64;
+    for file in &rust_files {
+        scan_rust_file(
+            &root,
+            file,
+            &rust_files,
+            &mut map,
+            &mut total_source_bytes,
+            limits,
+        )?;
     }
 
     sort_map(&mut map);
@@ -265,51 +314,277 @@ where
     }
 }
 
-fn collect_rust_files(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    let mut children = fs::read_dir(directory)
-        .with_context(|| format!("failed to read directory {}", directory.display()))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("failed to read directory entry in {}", directory.display()))?;
+fn collect_rust_files(
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+    limits: SemanticScanLimits,
+) -> Result<()> {
+    if limits.max_file_bytes == 0
+        || limits.max_total_bytes == 0
+        || limits.max_entries == 0
+        || limits.max_depth == 0
+        || limits.max_path_bytes == 0
+        || limits.max_path_components == 0
+        || limits.max_retained_path_bytes == 0
+    {
+        bail!("semantic repository scan limits must be positive");
+    }
+    let mut entries = 0usize;
+    let mut retained_path_bytes = 0usize;
+    collect_rust_files_bounded(root, files, &mut entries, &mut retained_path_bytes, limits)
+}
 
-    children.sort_by_key(|entry| entry.file_name());
+#[cfg(target_os = "linux")]
+fn collect_rust_files_bounded(
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+    entries: &mut usize,
+    retained_path_bytes: &mut usize,
+    limits: SemanticScanLimits,
+) -> Result<()> {
+    let directory = open_semantic_directory(root)?;
+    collect_rust_files_from_directory(
+        &directory,
+        Path::new(""),
+        0,
+        files,
+        entries,
+        retained_path_bytes,
+        limits,
+    )
+}
 
+#[cfg(target_os = "linux")]
+fn collect_rust_files_from_directory(
+    directory: &File,
+    relative_directory: &Path,
+    depth: usize,
+    files: &mut Vec<PathBuf>,
+    entries: &mut usize,
+    retained_path_bytes: &mut usize,
+    limits: SemanticScanLimits,
+) -> Result<()> {
+    if depth > limits.max_depth {
+        bail!("semantic repository scan exceeded its directory depth limit");
+    }
+    let mut names = Vec::new();
+    let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    let children = fs::read_dir(&descriptor_path)
+        .context("failed to enumerate semantic repository directory")?;
     for child in children {
-        let path = child.path();
-        let relative = path
-            .strip_prefix(root)
-            .with_context(|| format!("failed to relativize {}", path.display()))?
-            .to_path_buf();
+        let child = child.context("failed to enumerate semantic repository entry")?;
+        *entries = entries
+            .checked_add(1)
+            .context("semantic repository entry count overflow")?;
+        if *entries > limits.max_entries {
+            bail!("semantic repository scan exceeded its entry limit");
+        }
+        names.push(child.file_name());
+    }
+    names.sort();
 
+    for name in names {
+        let relative = bounded_semantic_child_path(relative_directory, Path::new(&name), limits)?;
         if is_ignored_path(&relative) {
             continue;
         }
-
-        let metadata = fs::symlink_metadata(&path)
-            .with_context(|| format!("failed to inspect {}", path.display()))?;
-        if metadata.is_dir() {
-            collect_rust_files(root, &path, files)?;
-        } else if metadata.is_file() && has_rust_extension(&path) {
-            files.push(relative);
+        let name_c = std::ffi::CString::new(name.as_bytes())
+            .context("semantic repository entry name contains a NUL byte")?;
+        let stat = semantic_fstatat_no_follow(directory.as_raw_fd(), &name_c)?;
+        match stat.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => {
+                if depth >= limits.max_depth {
+                    bail!("semantic repository scan exceeded its directory depth limit");
+                }
+                let child = open_semantic_child_directory(directory, &name_c, &stat)?;
+                collect_rust_files_from_directory(
+                    &child,
+                    &relative,
+                    depth + 1,
+                    files,
+                    entries,
+                    retained_path_bytes,
+                    limits,
+                )?;
+            }
+            libc::S_IFREG if has_rust_extension(&relative) => {
+                retain_semantic_path(files, relative, retained_path_bytes, limits)?;
+            }
+            libc::S_IFREG | libc::S_IFLNK => {}
+            _ => {}
         }
     }
-
     Ok(())
 }
 
-fn scan_rust_file(root: &Path, file: &Path, map: &mut SemanticRepoMap) {
-    let full_path = root.join(file);
-    let source = match fs::read_to_string(&full_path) {
+#[cfg(target_os = "linux")]
+fn open_semantic_directory(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    options
+        .open(path)
+        .context("failed to open semantic repository root without following links")
+}
+
+#[cfg(target_os = "linux")]
+fn open_semantic_child_directory(
+    parent: &File,
+    name: &std::ffi::CStr,
+    expected: &libc::stat,
+) -> Result<File> {
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY
+                | libc::O_DIRECTORY
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to open semantic repository directory safely");
+    }
+    let directory = unsafe { File::from_raw_fd(fd) };
+    let opened = directory
+        .metadata()
+        .context("failed to verify semantic repository directory")?;
+    use std::os::unix::fs::MetadataExt;
+    if opened.dev() != expected.st_dev
+        || opened.ino() != expected.st_ino
+        || opened.file_type().is_symlink()
+        || !opened.is_dir()
+    {
+        bail!("semantic repository directory identity changed during traversal");
+    }
+    Ok(directory)
+}
+
+#[cfg(target_os = "linux")]
+fn semantic_fstatat_no_follow(fd: i32, name: &std::ffi::CStr) -> Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            fd,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect semantic repository entry safely");
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn collect_rust_files_bounded(
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+    entries: &mut usize,
+    retained_path_bytes: &mut usize,
+    limits: SemanticScanLimits,
+) -> Result<()> {
+    collect_rust_files_portable(root, root, 0, files, entries, retained_path_bytes, limits)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn collect_rust_files_portable(
+    root: &Path,
+    directory: &Path,
+    depth: usize,
+    files: &mut Vec<PathBuf>,
+    entries: &mut usize,
+    retained_path_bytes: &mut usize,
+    limits: SemanticScanLimits,
+) -> Result<()> {
+    if depth > limits.max_depth {
+        bail!("semantic repository scan exceeded its directory depth limit");
+    }
+    let metadata = fs::symlink_metadata(directory)
+        .context("failed to inspect semantic repository directory")?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("semantic repository traversal encountered an unsafe directory");
+    }
+    let mut children = Vec::new();
+    for child in fs::read_dir(directory).context("failed to read semantic repository directory")? {
+        let child = child.context("failed to read semantic repository entry")?;
+        *entries = entries
+            .checked_add(1)
+            .context("semantic repository entry count overflow")?;
+        if *entries > limits.max_entries {
+            bail!("semantic repository scan exceeded its entry limit");
+        }
+        children.push(child);
+    }
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        let child_name = child.file_name();
+        let relative_directory = directory
+            .strip_prefix(root)
+            .context("failed to relativize semantic repository directory")?;
+        let relative =
+            bounded_semantic_child_path(relative_directory, Path::new(&child_name), limits)?;
+        let path = root.join(&relative);
+        if is_ignored_path(&relative) {
+            continue;
+        }
+        let metadata =
+            fs::symlink_metadata(&path).context("failed to inspect semantic repository entry")?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_rust_files_portable(
+                root,
+                &path,
+                depth + 1,
+                files,
+                entries,
+                retained_path_bytes,
+                limits,
+            )?;
+        } else if metadata.is_file() && has_rust_extension(&relative) {
+            retain_semantic_path(files, relative, retained_path_bytes, limits)?;
+        }
+    }
+    Ok(())
+}
+
+fn scan_rust_file(
+    root: &Path,
+    file: &Path,
+    repository_files: &[PathBuf],
+    map: &mut SemanticRepoMap,
+    total_source_bytes: &mut u64,
+    limits: SemanticScanLimits,
+) -> Result<()> {
+    let source = match read_semantic_source(root, file, limits.max_file_bytes) {
         Ok(source) => source,
-        Err(error) => {
+        Err(_) => {
             map.errors.push(SemanticScanError {
                 file: file.to_path_buf(),
                 kind: SemanticScanErrorKind::Read,
-                message: format!("failed to read {}: {error}", file.display()),
+                message: "source file was refused by bounded no-follow UTF-8 scan limits"
+                    .to_string(),
                 span: None,
             });
-            return;
+            return Ok(());
         }
     };
+    let source_bytes = u64::try_from(source.len()).unwrap_or(u64::MAX);
+    let new_total = total_source_bytes
+        .checked_add(source_bytes)
+        .context("semantic repository source aggregate byte count overflowed")?;
+    if new_total > limits.max_total_bytes {
+        bail!("semantic repository source aggregate byte limit was exceeded");
+    }
+    *total_source_bytes = new_total;
 
     let module_path = module_path_for_file(file);
     map.files.push(SemanticFile {
@@ -329,13 +604,13 @@ fn scan_rust_file(root: &Path, file: &Path, map: &mut SemanticRepoMap) {
                 message: error.to_string(),
                 span: Some(source_index.span(error.span())),
             });
-            return;
+            return Ok(());
         }
     };
 
     let mut scanner = FileScanner {
-        root,
         file,
+        repository_files,
         source_index,
         symbols: &mut map.symbols,
         imports: &mut map.imports,
@@ -343,11 +618,65 @@ fn scan_rust_file(root: &Path, file: &Path, map: &mut SemanticRepoMap) {
         dependencies: &mut map.dependencies,
     };
     scanner.scan_items(&syntax.items, &module_path, None);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_semantic_source(root: &Path, file: &Path, max_bytes: u64) -> Result<String> {
+    BoundedRegularReader::read_relative_utf8(root, file, max_bytes)
+}
+
+#[cfg(not(unix))]
+fn read_semantic_source(root: &Path, file: &Path, max_bytes: u64) -> Result<String> {
+    BoundedRegularReader::read_utf8(root.join(file), max_bytes)
+}
+
+fn bounded_semantic_child_path(
+    parent: &Path,
+    child: &Path,
+    limits: SemanticScanLimits,
+) -> Result<PathBuf> {
+    let separator_bytes = usize::from(!parent.as_os_str().is_empty());
+    let path_bytes = parent
+        .as_os_str()
+        .len()
+        .checked_add(separator_bytes)
+        .and_then(|bytes| bytes.checked_add(child.as_os_str().len()))
+        .context("semantic repository path byte count overflow")?;
+    if path_bytes > limits.max_path_bytes {
+        bail!("semantic repository scan exceeded its relative path byte limit");
+    }
+    let path_components = parent
+        .components()
+        .count()
+        .checked_add(child.components().count())
+        .context("semantic repository path component count overflow")?;
+    if path_components > limits.max_path_components {
+        bail!("semantic repository scan exceeded its relative path component limit");
+    }
+    Ok(parent.join(child))
+}
+
+fn retain_semantic_path(
+    files: &mut Vec<PathBuf>,
+    path: PathBuf,
+    retained_path_bytes: &mut usize,
+    limits: SemanticScanLimits,
+) -> Result<()> {
+    let new_total = retained_path_bytes
+        .checked_add(path.as_os_str().len())
+        .context("semantic repository retained path byte count overflow")?;
+    if new_total > limits.max_retained_path_bytes {
+        bail!("semantic repository scan exceeded its retained path byte limit");
+    }
+    *retained_path_bytes = new_total;
+    files.push(path);
+    Ok(())
 }
 
 struct FileScanner<'a> {
-    root: &'a Path,
     file: &'a Path,
+    repository_files: &'a [PathBuf],
     source_index: SourceIndex,
     symbols: &'a mut Vec<SemanticSymbol>,
     imports: &'a mut Vec<SemanticImport>,
@@ -392,7 +721,7 @@ impl FileScanner<'_> {
                         None
                     } else {
                         resolve_module_file(
-                            self.root,
+                            self.repository_files,
                             self.file,
                             &name,
                             module_path_attribute(&item_mod.attrs),
@@ -635,7 +964,7 @@ impl FileScanner<'_> {
         let visibility_text = visibility_text(visibility);
         let imports = flatten_use_tree(tree);
         for import in imports {
-            let to_file = resolve_import_file(self.root, module_path, &import.path);
+            let to_file = resolve_import_file(self.repository_files, module_path, &import.path);
             self.imports.push(SemanticImport {
                 file: self.file.to_path_buf(),
                 module_path: module_path.to_vec(),
@@ -817,23 +1146,23 @@ fn use_path_with_ident(prefix: &[String], ident: &str) -> String {
 }
 
 fn resolve_module_file(
-    root: &Path,
+    repository_files: &[PathBuf],
     file: &Path,
     module_name: &str,
     path_attribute: Option<String>,
 ) -> Option<PathBuf> {
     if let Some(path_attribute) = path_attribute {
-        return resolve_path_attribute_file(root, file, &path_attribute);
+        return resolve_path_attribute_file(repository_files, file, &path_attribute);
     }
 
     let base = module_base_path(file);
     let flat = base.join(format!("{module_name}.rs"));
-    if root.join(&flat).is_file() {
+    if repository_files.binary_search(&flat).is_ok() {
         return Some(flat);
     }
 
     let nested = base.join(module_name).join("mod.rs");
-    if root.join(&nested).is_file() {
+    if repository_files.binary_search(&nested).is_ok() {
         return Some(nested);
     }
 
@@ -859,19 +1188,27 @@ fn module_path_attribute(attrs: &[Attribute]) -> Option<String> {
     })
 }
 
-fn resolve_path_attribute_file(root: &Path, file: &Path, path_attribute: &str) -> Option<PathBuf> {
+fn resolve_path_attribute_file(
+    repository_files: &[PathBuf],
+    file: &Path,
+    path_attribute: &str,
+) -> Option<PathBuf> {
     let base = file.parent().unwrap_or_else(|| Path::new(""));
     let candidate = normalize_relative_path(&base.join(path_attribute));
-    if root.join(&candidate).is_file() {
+    if repository_files.binary_search(&candidate).is_ok() {
         Some(candidate)
     } else {
         None
     }
 }
 
-fn resolve_import_file(root: &Path, module_path: &[String], import_path: &str) -> Option<PathBuf> {
+fn resolve_import_file(
+    repository_files: &[PathBuf],
+    module_path: &[String],
+    import_path: &str,
+) -> Option<PathBuf> {
     let absolute_path = absolute_import_path(module_path, import_path)?;
-    resolve_module_segments(root, &absolute_path)
+    resolve_module_segments(repository_files, &absolute_path)
 }
 
 fn absolute_import_path(module_path: &[String], import_path: &str) -> Option<Vec<String>> {
@@ -905,13 +1242,16 @@ fn absolute_import_path(module_path: &[String], import_path: &str) -> Option<Vec
     }
 }
 
-fn resolve_module_segments(root: &Path, absolute_path: &[String]) -> Option<PathBuf> {
+fn resolve_module_segments(
+    repository_files: &[PathBuf],
+    absolute_path: &[String],
+) -> Option<PathBuf> {
     if absolute_path.first().map(String::as_str) != Some("crate") {
         return None;
     }
 
     for end in (1..=absolute_path.len()).rev() {
-        if let Some(file) = module_segments_to_file(root, &absolute_path[..end]) {
+        if let Some(file) = module_segments_to_file(repository_files, &absolute_path[..end]) {
             return Some(file);
         }
     }
@@ -919,14 +1259,14 @@ fn resolve_module_segments(root: &Path, absolute_path: &[String]) -> Option<Path
     None
 }
 
-fn module_segments_to_file(root: &Path, segments: &[String]) -> Option<PathBuf> {
+fn module_segments_to_file(repository_files: &[PathBuf], segments: &[String]) -> Option<PathBuf> {
     if segments.first().map(String::as_str) != Some("crate") {
         return None;
     }
 
     if segments.len() == 1 {
         for candidate in [PathBuf::from("src/lib.rs"), PathBuf::from("src/main.rs")] {
-            if root.join(&candidate).is_file() {
+            if repository_files.binary_search(&candidate).is_ok() {
                 return Some(candidate);
             }
         }
@@ -939,7 +1279,7 @@ fn module_segments_to_file(root: &Path, segments: &[String]) -> Option<PathBuf> 
         flat.push(segment);
     }
     flat.set_extension("rs");
-    if root.join(&flat).is_file() {
+    if repository_files.binary_search(&flat).is_ok() {
         return Some(flat);
     }
 
@@ -948,7 +1288,7 @@ fn module_segments_to_file(root: &Path, segments: &[String]) -> Option<PathBuf> 
         nested.push(segment);
     }
     nested.push("mod.rs");
-    if root.join(&nested).is_file() {
+    if repository_files.binary_search(&nested).is_ok() {
         return Some(nested);
     }
 
@@ -1202,6 +1542,155 @@ mod tests {
             .iter()
             .filter(|symbol| symbol.kind == kind)
             .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn semantic_scan_skips_links_fifo_and_external_escape_without_reading_contents() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = init_repo();
+        write_file(&repo, "src/lib.rs", "pub fn local() {}\n");
+        let external = temp.path().join("external");
+        fs::create_dir(&external).expect("create external directory");
+        fs::write(
+            external.join("secret.rs"),
+            "pub fn ultra_secret_external_contents() {}\n",
+        )
+        .expect("write external secret");
+        symlink(&external, repo.join("src/escape")).expect("create directory escape");
+        symlink(
+            external.join("secret.rs"),
+            repo.join("src/external-link.rs"),
+        )
+        .expect("create file escape");
+        let fifo = repo.join("src/nonregular.rs");
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("fifo path");
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+
+        let map = scan_repository(&repo).expect("bounded semantic scan");
+
+        assert_eq!(
+            map.files
+                .iter()
+                .map(|file| file.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("src/lib.rs")]
+        );
+        assert!(map
+            .symbols
+            .iter()
+            .all(|symbol| symbol.name != "ultra_secret_external_contents"));
+        assert!(map
+            .errors
+            .iter()
+            .all(|error| !error.message.contains("ultra_secret_external_contents")));
+    }
+
+    #[test]
+    fn semantic_scan_bounds_huge_invalid_utf8_aggregate_entries_and_depth() {
+        let (_temp, repo) = init_repo();
+        write_file(&repo, "src/a.rs", "pub fn a() {}\n");
+        write_file(&repo, "src/b.rs", "pub fn b() {}\n");
+        let huge = repo.join("src/huge.rs");
+        File::create(&huge)
+            .expect("create sparse huge source")
+            .set_len(MAX_SEMANTIC_FILE_BYTES + 1)
+            .expect("size sparse huge source");
+        fs::write(repo.join("src/invalid.rs"), [0xff, 0xfe]).expect("write invalid UTF-8");
+
+        let default_map = scan_repository(&repo).expect("default bounded scan");
+        for refused in ["src/huge.rs", "src/invalid.rs"] {
+            assert!(default_map.errors.iter().any(|error| {
+                error.file == Path::new(refused) && error.kind == SemanticScanErrorKind::Read
+            }));
+        }
+        assert!(default_map.errors.iter().all(|error| {
+            !error.message.contains(repo.to_string_lossy().as_ref())
+                && !error.message.contains("pub fn")
+        }));
+
+        let aggregate = scan_repository_with_limits(
+            &repo,
+            SemanticScanLimits {
+                max_file_bytes: 64,
+                max_total_bytes: 16,
+                max_entries: 100,
+                max_depth: 16,
+                ..DEFAULT_SEMANTIC_SCAN_LIMITS
+            },
+        )
+        .expect_err("aggregate source budget must fail closed");
+        assert!(aggregate.to_string().contains("aggregate byte limit"));
+
+        let entries = scan_repository_with_limits(
+            &repo,
+            SemanticScanLimits {
+                max_file_bytes: 64,
+                max_total_bytes: 1024,
+                max_entries: 2,
+                max_depth: 16,
+                ..DEFAULT_SEMANTIC_SCAN_LIMITS
+            },
+        )
+        .expect_err("entry budget must fail closed");
+        assert!(entries.to_string().contains("entry limit"));
+
+        let nested = repo.join("deep/a/b");
+        fs::create_dir_all(&nested).expect("create deep tree");
+        fs::write(nested.join("deep.rs"), "pub fn deep() {}\n").expect("write deep source");
+        let depth = scan_repository_with_limits(
+            &repo,
+            SemanticScanLimits {
+                max_file_bytes: 64,
+                max_total_bytes: 1024,
+                max_entries: 100,
+                max_depth: 1,
+                ..DEFAULT_SEMANTIC_SCAN_LIMITS
+            },
+        )
+        .expect_err("depth budget must fail closed");
+        assert!(depth.to_string().contains("depth limit"));
+    }
+
+    #[test]
+    fn semantic_scan_bounds_relative_and_retained_path_memory() {
+        let (_temp, repo) = init_repo();
+        write_file(&repo, "src/a.rs", "pub fn a() {}\n");
+        write_file(&repo, "src/b.rs", "pub fn b() {}\n");
+
+        let path_bytes = scan_repository_with_limits(
+            &repo,
+            SemanticScanLimits {
+                max_path_bytes: 7,
+                ..DEFAULT_SEMANTIC_SCAN_LIMITS
+            },
+        )
+        .expect_err("relative path byte budget must fail closed");
+        assert!(path_bytes.to_string().contains("relative path byte limit"));
+
+        let components = scan_repository_with_limits(
+            &repo,
+            SemanticScanLimits {
+                max_path_components: 1,
+                ..DEFAULT_SEMANTIC_SCAN_LIMITS
+            },
+        )
+        .expect_err("relative path component budget must fail closed");
+        assert!(components
+            .to_string()
+            .contains("relative path component limit"));
+
+        let retained = scan_repository_with_limits(
+            &repo,
+            SemanticScanLimits {
+                max_retained_path_bytes: 10,
+                ..DEFAULT_SEMANTIC_SCAN_LIMITS
+            },
+        )
+        .expect_err("retained path byte budget must fail closed");
+        assert!(retained.to_string().contains("retained path byte limit"));
     }
 
     #[test]

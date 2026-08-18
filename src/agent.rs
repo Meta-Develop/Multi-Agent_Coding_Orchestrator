@@ -7,26 +7,39 @@ use crate::{
         self, MergeApplyPreview, MergeCandidate, MergeCollectOptions, MergeForceOptions,
         MergePreviewOptions, ValidationReport, ValidationStatus,
     },
+    process_runner::{
+        read_bounded_regular_file_nofollow, resolve_existing_path_without_symlinks, run_process,
+        CapturedBytes, EnvironmentMode, ProcessSpec, Shell, SideEffectConfinementProfile,
+        StdinMode, StrictOfflineWorkspaceProfile,
+    },
     sync::{normalize_repo_relative_path, PathClaim},
     sync_store::SyncStore,
     worktree::{normalize_agent_id, WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
 };
 use anyhow::{bail, Context, Result};
-use git2::{Repository, StatusOptions};
+#[cfg(test)]
+use git2::Repository;
+use git2::StatusOptions;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
-    fs,
-    io::Write,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
-    thread,
+    process::ExitStatus,
     time::{Duration, Instant},
 };
 
 const DEFAULT_MODEL: &str = "deterministic-fake";
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
+const OUTPUT_CAPTURE_LIMIT_BYTES: usize = OUTPUT_CHAR_LIMIT * 4;
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_PROMPT_EXCERPT_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentExecutionRuntime {
+    Verified,
+    #[cfg(test)]
+    NonpublishableSimulation,
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentRunOptions {
@@ -174,6 +187,37 @@ pub fn run_agent_with_provider<P>(
 where
     P: LlmProvider,
 {
+    run_agent_with_provider_runtime(options, provider, AgentExecutionRuntime::Verified)
+}
+
+#[cfg(test)]
+fn run_agent_with_provider_simulation<P>(
+    options: AgentRunOptions,
+    provider: &mut P,
+) -> Result<AgentRunReport>
+where
+    P: LlmProvider,
+{
+    run_agent_with_provider_runtime(
+        options,
+        provider,
+        AgentExecutionRuntime::NonpublishableSimulation,
+    )
+}
+
+fn run_agent_with_provider_runtime<P>(
+    options: AgentRunOptions,
+    provider: &mut P,
+    runtime: AgentExecutionRuntime,
+) -> Result<AgentRunReport>
+where
+    P: LlmProvider,
+{
+    if runtime == AgentExecutionRuntime::Verified {
+        bail!(
+            "agent assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
+        );
+    }
     let repo = discover_repo_root(&options.repo)?;
     let agent_id = normalize_agent_id(&options.agent_id)?;
     let claimed_paths = normalize_claimed_paths(options.claimed_paths)?;
@@ -201,15 +245,11 @@ where
         claim: claim.clone(),
         provider_command_policy: options.provider_command_policy,
         command_timeout: options.command_timeout,
+        runtime,
         provider,
     });
 
-    let keep_claims = options.keep_claims
-        && result
-            .as_ref()
-            .map(|report| report.success)
-            .unwrap_or(false);
-    let (released_claims, release_errors) = if keep_claims {
+    let (released_claims, release_errors) = if options.keep_claims {
         (Vec::new(), Vec::new())
     } else {
         match store.release(claim_token) {
@@ -252,6 +292,7 @@ where
     claim: PathClaim,
     provider_command_policy: ProviderCommandPolicy,
     command_timeout: Duration,
+    runtime: AgentExecutionRuntime,
     provider: &'a mut P,
 }
 
@@ -261,7 +302,7 @@ where
 {
     let capabilities = run.provider.capabilities();
     let prompt = build_prompt(
-        &run.repo,
+        &run.selected.record.path,
         &run.agent_id,
         &run.task,
         &run.claimed_paths,
@@ -281,7 +322,12 @@ where
     let mut execution_error = None;
 
     for patch in &response.proposal.patches {
-        let result = apply_proposed_patch(&run.selected.record.path, patch, &run.claimed_paths);
+        let result = apply_proposed_patch(
+            &run.selected.record.path,
+            patch,
+            &run.claimed_paths,
+            run.runtime,
+        );
         if !result.success && execution_error.is_none() {
             execution_error = result.error.clone();
         }
@@ -314,8 +360,12 @@ where
             .iter()
             .filter(|command| command.purpose != CommandPurpose::Validate)
         {
-            let result =
-                run_proposed_command(&run.selected.record.path, command, run.command_timeout);
+            let result = run_proposed_command(
+                &run.selected.record.path,
+                command,
+                run.command_timeout,
+                run.runtime,
+            );
             if !result.success && execution_error.is_none() {
                 execution_error = result.error.clone();
             }
@@ -334,8 +384,12 @@ where
             .iter()
             .filter(|command| command.purpose == CommandPurpose::Validate)
         {
-            let result =
-                run_proposed_command(&run.selected.record.path, command, run.command_timeout);
+            let result = run_proposed_command(
+                &run.selected.record.path,
+                command,
+                run.command_timeout,
+                run.runtime,
+            );
             validations.push(validation_report_for_command(&result));
             if !result.success && execution_error.is_none() {
                 execution_error = result.error.clone();
@@ -349,8 +403,12 @@ where
 
     if execution_error.is_none() {
         for validation in &run.validation_commands {
-            let result =
-                run_validation_command(&run.selected.record.path, validation, run.command_timeout);
+            let result = run_validation_command(
+                &run.selected.record.path,
+                validation,
+                run.command_timeout,
+                run.runtime,
+            );
             validations.push(validation_report_for_command(&result));
             if !result.success && execution_error.is_none() {
                 execution_error = result.error.clone();
@@ -380,6 +438,7 @@ where
             validations,
         },
         forces: MergeForceOptions::default(),
+        require_validation: false,
     })?;
 
     let boundary_error = if candidate.unclaimed_changed_paths.is_empty() {
@@ -431,10 +490,20 @@ fn build_prompt(
 
     for path in claimed_paths {
         context = context.with_claimed_path(path.clone(), "agent run claim");
-        let full_path = repo.join(path);
+        let full_path = match resolve_existing_path_without_symlinks(repo, path) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to resolve claimed prompt path {}", path.display())
+                });
+            }
+        };
         if full_path.is_file() {
-            let content = fs::read_to_string(&full_path)
+            let content = read_bounded_regular_file_nofollow(&full_path, MAX_PROMPT_EXCERPT_BYTES)
                 .with_context(|| format!("failed to read prompt path {}", path.display()))?;
+            let content = String::from_utf8(content)
+                .with_context(|| format!("prompt path is not UTF-8 text: {}", path.display()))?;
             context = context.with_repo_excerpt(RepoExcerpt::new(path.clone(), content));
         }
     }
@@ -481,12 +550,16 @@ fn select_worktree(
         );
     }
 
-    let record = manager.create(WorktreeCreateOptions {
+    let create_options = WorktreeCreateOptions {
         agent_id: agent_id.to_string(),
         branch: None,
         base: None,
         worktree_root: None,
-    })?;
+    };
+    #[cfg(test)]
+    let record = manager.create_for_test(create_options)?;
+    #[cfg(not(test))]
+    let record = manager.create(create_options)?;
     Ok(SelectedWorktree {
         record,
         reused: false,
@@ -494,7 +567,7 @@ fn select_worktree(
 }
 
 fn ensure_clean_worktree(record: &WorktreeRecord) -> Result<()> {
-    let repo = Repository::open(&record.path).with_context(|| {
+    let repo = crate::git_repository::open(&record.path).with_context(|| {
         format!(
             "failed to inspect existing worktree '{}' at {}",
             record.name,
@@ -543,6 +616,7 @@ fn apply_proposed_patch(
     worktree_path: &Path,
     patch: &ProposedPatch,
     claimed_paths: &[PathBuf],
+    runtime: AgentExecutionRuntime,
 ) -> PatchApplicationReport {
     let normalized_path = match normalize_repo_relative_path(&patch.path) {
         Ok(path) => path,
@@ -592,7 +666,7 @@ fn apply_proposed_patch(
         };
     }
 
-    match run_git_apply(worktree_path, &patch.unified_diff) {
+    match run_git_apply(worktree_path, &patch.unified_diff, runtime) {
         Ok(result) => PatchApplicationReport {
             path: normalized_path,
             success: result.status.is_some_and(|status| status.success()),
@@ -750,6 +824,7 @@ fn run_proposed_command(
     worktree_path: &Path,
     command: &ProposedCommand,
     timeout: Duration,
+    runtime: AgentExecutionRuntime,
 ) -> CommandExecutionReport {
     run_command(
         worktree_path,
@@ -759,6 +834,7 @@ fn run_proposed_command(
             working_directory: command.working_directory.clone(),
             timeout,
         },
+        runtime,
     )
 }
 
@@ -766,6 +842,7 @@ fn run_validation_command(
     worktree_path: &Path,
     validation: &AgentValidationCommand,
     timeout: Duration,
+    runtime: AgentExecutionRuntime,
 ) -> CommandExecutionReport {
     run_command(
         worktree_path,
@@ -775,10 +852,15 @@ fn run_validation_command(
             working_directory: validation.working_directory.clone(),
             timeout,
         },
+        runtime,
     )
 }
 
-fn run_command(worktree_path: &Path, spec: CommandSpec) -> CommandExecutionReport {
+fn run_command(
+    worktree_path: &Path,
+    spec: CommandSpec,
+    runtime: AgentExecutionRuntime,
+) -> CommandExecutionReport {
     let normalized_cwd = match normalize_optional_working_directory(spec.working_directory.as_ref())
     {
         Ok(path) => path,
@@ -803,34 +885,60 @@ fn run_command(worktree_path: &Path, spec: CommandSpec) -> CommandExecutionRepor
         .map(|path| worktree_path.join(path))
         .unwrap_or_else(|| worktree_path.to_path_buf());
     let started = Instant::now();
-    let mut command = shell_command(&spec.command);
-    configure_timeout_process_control(&mut command);
-    let spawn_result = command
-        .current_dir(&full_cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+    let process_spec = ProcessSpec::shell(
+        "agent command",
+        Shell::for_current_platform(),
+        spec.command.clone(),
+        full_cwd,
+        OUTPUT_CAPTURE_LIMIT_BYTES,
+    )
+    .with_environment(EnvironmentMode::ClearAndSet(sandbox_environment()))
+    .with_timeout(Some(spec.timeout));
+    let result = run_process(match runtime {
+        AgentExecutionRuntime::Verified => process_spec
+            .with_private_runtime_home(true)
+            .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+                StrictOfflineWorkspaceProfile::read_write(worktree_path),
+            )),
+        #[cfg(test)]
+        AgentExecutionRuntime::NonpublishableSimulation => process_spec
+            .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
+    });
 
-    match spawn_result.and_then(|child| wait_for_command(child, started, spec.timeout)) {
+    match result {
         Ok(output) => {
-            let success = output.status.is_some_and(|status| status.success())
-                && !output.timed_out
-                && output.process_error.is_none();
+            let success = match runtime {
+                AgentExecutionRuntime::Verified => output.safety_sensitive_succeeded(),
+                #[cfg(test)]
+                AgentExecutionRuntime::NonpublishableSimulation => {
+                    output.status.is_some_and(|status| status.success())
+                        && !output.timed_out
+                        && output.process_error.is_none()
+                        && output.stdin_error.is_none()
+                }
+            };
             CommandExecutionReport {
                 command: spec.command,
                 purpose: spec.purpose,
                 working_directory: normalized_cwd,
                 success,
                 exit_code: output.status.and_then(|status| status.code()),
-                duration_ms: output.duration_ms,
+                duration_ms: output.duration_ms(),
                 timed_out: output.timed_out,
                 timeout_seconds: spec.timeout.as_secs(),
-                stdout: output.stdout,
-                stderr: output.stderr,
+                stdout: summarize_output(&output.stdout),
+                stderr: summarize_output(&output.stderr),
                 error: if success {
                     None
                 } else if let Some(error) = output.process_error {
                     Some(error)
+                } else if runtime == AgentExecutionRuntime::Verified
+                    && !output.safety_evidence_verified()
+                {
+                    Some(format!(
+                        "command safety evidence was not verified: process_tree={:?}; side_effects={:?}",
+                        output.process_tree, output.side_effects
+                    ))
                 } else if output.timed_out {
                     Some(format!(
                         "command timed out after {} seconds",
@@ -860,125 +968,6 @@ fn run_command(worktree_path: &Path, spec: CommandSpec) -> CommandExecutionRepor
     }
 }
 
-fn wait_for_command(
-    mut child: Child,
-    started: Instant,
-    timeout: Duration,
-) -> std::io::Result<TimedCommandOutput> {
-    loop {
-        if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
-            return Ok(TimedCommandOutput {
-                status: Some(output.status),
-                duration_ms: duration_millis(started.elapsed()),
-                timed_out: false,
-                stdout: summarize_output(&output.stdout),
-                stderr: summarize_output(&output.stderr),
-                process_error: None,
-            });
-        }
-
-        if started.elapsed() >= timeout {
-            let process_error = terminate_child_on_timeout(&mut child);
-            let output = child.wait_with_output()?;
-            return Ok(TimedCommandOutput {
-                status: Some(output.status),
-                duration_ms: duration_millis(started.elapsed()),
-                timed_out: true,
-                stdout: summarize_output(&output.stdout),
-                stderr: summarize_output(&output.stderr),
-                process_error,
-            });
-        }
-
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-#[derive(Debug, Clone)]
-struct TimedCommandOutput {
-    status: Option<ExitStatus>,
-    duration_ms: u64,
-    timed_out: bool,
-    stdout: OutputSummary,
-    stderr: OutputSummary,
-    process_error: Option<String>,
-}
-
-fn configure_timeout_process_control(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = command;
-    }
-}
-
-fn terminate_child_on_timeout(child: &mut Child) -> Option<String> {
-    #[cfg(unix)]
-    {
-        terminate_unix_process_group(child)
-    }
-
-    #[cfg(not(unix))]
-    {
-        child
-            .kill()
-            .err()
-            .map(|error| format!("command timed out but process kill failed: {error}"))
-    }
-}
-
-#[cfg(unix)]
-fn terminate_unix_process_group(child: &mut Child) -> Option<String> {
-    let pid = child.id();
-    let term_error = send_unix_process_group_signal(pid, "TERM").err();
-    let deadline = Instant::now() + Duration::from_millis(100);
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => return term_error.map(|error| error.to_string()),
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(error) => return Some(format!("command timed out but wait failed: {error}")),
-        }
-    }
-
-    let kill_result = send_unix_process_group_signal(pid, "KILL").or_else(|_| child.kill());
-    kill_result.err().map(|error| {
-        if let Some(term_error) = term_error {
-            format!(
-                "command timed out but process group termination failed: {term_error}; kill failed: {error}"
-            )
-        } else {
-            format!("command timed out but process group kill failed: {error}")
-        }
-    })
-}
-
-#[cfg(unix)]
-fn send_unix_process_group_signal(pid: u32, signal: &str) -> std::io::Result<()> {
-    let status = Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(unix_process_group_target(pid))
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "kill -{signal} {} exited with {status}",
-            unix_process_group_target(pid)
-        )))
-    }
-}
-
-#[cfg(unix)]
-fn unix_process_group_target(pid: u32) -> String {
-    format!("-{pid}")
-}
-
 fn normalize_optional_working_directory(path: Option<&PathBuf>) -> Result<Option<PathBuf>> {
     let Some(path) = path else {
         return Ok(None);
@@ -1004,39 +993,65 @@ fn validation_report_for_command(result: &CommandExecutionReport) -> ValidationR
     }
 }
 
-fn run_git_apply(worktree_path: &Path, patch: &str) -> Result<ProcessOutput> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .arg("apply")
-        .arg("--whitespace=nowarn")
-        .arg("--binary")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to start git apply in {}", worktree_path.display()))?;
-
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .context("failed to open git apply stdin")?;
-        stdin
-            .write_all(patch.as_bytes())
-            .context("failed to write provider patch to git apply")?;
+fn run_git_apply(
+    worktree_path: &Path,
+    patch: &str,
+    runtime: AgentExecutionRuntime,
+) -> Result<ProcessOutput> {
+    let process_spec = ProcessSpec::direct(
+        "git apply",
+        "git",
+        ["apply", "--whitespace=nowarn", "--binary", "-"],
+        worktree_path,
+        OUTPUT_CAPTURE_LIMIT_BYTES,
+    )
+    .with_environment(EnvironmentMode::ClearAndSet(sandbox_environment()))
+    .with_stdin(StdinMode::Bytes(patch.as_bytes().to_vec()));
+    let output = run_process(match runtime {
+        AgentExecutionRuntime::Verified => process_spec
+            .with_private_runtime_home(true)
+            .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+                StrictOfflineWorkspaceProfile::read_write(worktree_path),
+            )),
+        #[cfg(test)]
+        AgentExecutionRuntime::NonpublishableSimulation => process_spec
+            .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
+    })
+    .with_context(|| format!("failed to run git apply in {}", worktree_path.display()))?;
+    let succeeded = match runtime {
+        AgentExecutionRuntime::Verified => output.safety_sensitive_succeeded(),
+        #[cfg(test)]
+        AgentExecutionRuntime::NonpublishableSimulation => {
+            output.status.is_some_and(|status| status.success())
+                && !output.timed_out
+                && output.process_error.is_none()
+                && output.stdin_error.is_none()
+        }
+    };
+    if !succeeded {
+        if let Some(error) = output
+            .stdin_error
+            .as_deref()
+            .or(output.process_error.as_deref())
+        {
+            bail!("{error}");
+        }
+        bail!(
+            "git apply was not safely verified: exit={:?}; process_tree={:?}; side_effects={:?}",
+            output.status.and_then(|status| status.code()),
+            output.process_tree,
+            output.side_effects
+        );
     }
-
-    let output = child
-        .wait_with_output()
-        .context("failed to wait for git apply")?;
     Ok(ProcessOutput {
-        status: Some(output.status),
+        status: output.status,
         stdout: summarize_output(&output.stdout),
         stderr: summarize_output(&output.stderr),
     })
 }
+
+#[cfg(test)]
+use std::fs;
 
 #[derive(Debug, Clone)]
 struct ProcessOutput {
@@ -1045,30 +1060,24 @@ struct ProcessOutput {
     stderr: OutputSummary,
 }
 
-fn shell_command(command: &str) -> Command {
-    #[cfg(target_os = "windows")]
-    {
-        let mut shell = Command::new("cmd");
-        shell.arg("/C").arg(command);
-        shell
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let mut shell = Command::new("sh");
-        shell.arg("-c").arg(command);
-        shell
+fn summarize_output(output: &CapturedBytes) -> OutputSummary {
+    let summary = output.summarize_chars(OUTPUT_CHAR_LIMIT);
+    OutputSummary {
+        text: summary.text,
+        truncated: summary.truncated,
     }
 }
 
-fn summarize_output(output: &[u8]) -> OutputSummary {
-    let text = String::from_utf8_lossy(output);
-    let mut chars = text.chars();
-    let value = chars.by_ref().take(OUTPUT_CHAR_LIMIT).collect::<String>();
-    OutputSummary {
-        text: value,
-        truncated: chars.next().is_some(),
-    }
+fn sandbox_environment() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "PATH".to_string(),
+            "/run/current-system/sw/bin:/usr/bin:/bin".to_string(),
+        ),
+        ("LANG".to_string(), "C.UTF-8".to_string()),
+        ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+        ("TERM".to_string(), "dumb".to_string()),
+    ])
 }
 
 fn duration_millis(duration: std::time::Duration) -> u64 {
@@ -1081,7 +1090,7 @@ fn duration_millis(duration: std::time::Duration) -> u64 {
 }
 
 fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
-    let repo = Repository::discover(repo_path)
+    let repo = crate::git_repository::discover(repo_path)
         .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
     repo.workdir()
         .map(Path::to_path_buf)
@@ -1120,7 +1129,7 @@ mod tests {
             )),
         );
 
-        let report = run_agent_with_provider(
+        let report = run_agent_with_provider_simulation(
             AgentRunOptions {
                 repo: repo_path.clone(),
                 agent_id: "agent-a".to_string(),
@@ -1168,7 +1177,7 @@ mod tests {
             )),
         );
 
-        let report = run_agent_with_provider(
+        let report = run_agent_with_provider_simulation(
             AgentRunOptions {
                 repo: repo_path.clone(),
                 agent_id: "agent-a".to_string(),
@@ -1217,7 +1226,7 @@ mod tests {
             )),
         );
 
-        let report = run_agent_with_provider(
+        let report = run_agent_with_provider_simulation(
             AgentRunOptions {
                 repo: repo_path.clone(),
                 agent_id: "agent-a".to_string(),
@@ -1252,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn allowed_provider_command_timeout_fails_and_releases_claim() -> Result<()> {
+    fn allowed_provider_command_timeout_with_keep_claims_leaves_claim_active() -> Result<()> {
         let temp = TempDir::new().context("tempdir")?;
         let repo_path = create_committed_repo(temp.path())?;
         let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
@@ -1262,7 +1271,7 @@ mod tests {
                 .with_command(ProposedCommand::new("sleep 2", CommandPurpose::Implement)),
         );
 
-        let report = run_agent_with_provider(
+        let report = run_agent_with_provider_simulation(
             AgentRunOptions {
                 repo: repo_path.clone(),
                 agent_id: "agent-a".to_string(),
@@ -1287,7 +1296,12 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("timed out"));
-        assert!(SyncStore::open(&repo_path)?.snapshot()?.is_empty());
+        let active_claims = SyncStore::open(&repo_path)?.snapshot()?;
+        assert_eq!(active_claims.len(), 1);
+        assert_eq!(active_claims[0].agent_id, "agent-a");
+        assert_eq!(active_claims[0].paths, vec![PathBuf::from("README.md")]);
+        assert!(report.released_claims.is_empty());
+        assert!(report.release_errors.is_empty());
 
         Ok(())
     }
@@ -1312,7 +1326,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             )),
         );
 
-        let report = run_agent_with_provider(
+        let report = run_agent_with_provider_simulation(
             AgentRunOptions {
                 repo: repo_path.clone(),
                 agent_id: "agent-a".to_string(),
@@ -1361,7 +1375,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             "pub fn ok() -> bool { true }\n",
         )
         .context("write lib")?;
-        let repo = Repository::open(&repo_path).context("open repo")?;
+        let repo = crate::git_repository::open(&repo_path).context("open repo")?;
         commit_all(&repo, "initial commit")?;
         Ok(repo_path)
     }

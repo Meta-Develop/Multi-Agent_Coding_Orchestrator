@@ -344,7 +344,7 @@ fn insert_claim(
     Ok(())
 }
 
-fn paths_overlap(a: &Path, b: &Path) -> bool {
+pub(crate) fn paths_overlap(a: &Path, b: &Path) -> bool {
     a == b || a.starts_with(b) || b.starts_with(a)
 }
 
