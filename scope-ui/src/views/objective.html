@@ -1,0 +1,82 @@
+<section id="objectiveView" class="page-panel" hidden aria-label="Objective preview">
+  <div class="panel-heading">
+    <span class="section-label">Objective preview</span>
+    <span class="hint">client-side re-score · no writes</span>
+  </div>
+  <p class="page-copy">
+    Named weight profiles are not a compile-time-only curiosity: this page
+    re-scores a recorded evaluation summary or results document under weights
+    you propose. It does not persist a profile, does not call a write endpoint,
+    and does not select a runtime. The CLI and JSON surfaces remain the
+    authority.
+  </p>
+  <div class="toolbar" style="border-radius: 0.7rem;">
+    <div class="field">
+      <label for="objectiveId">Profile id</label>
+      <input id="objectiveId" type="text" value="maco-default-v1" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="objectiveLabel">Label</label>
+      <input id="objectiveLabel" type="text" value="MACO default (50/25/25 quality)" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="objectiveFile">Evaluation JSON</label>
+      <input id="objectiveFile" type="file" accept="application/json,.json">
+    </div>
+    <div class="inline-actions">
+      <button id="objectiveDemo" type="button">Load demo profiles</button>
+      <button id="objectiveExport" class="secondary" type="button">Export profile JSON</button>
+    </div>
+  </div>
+  <div class="weight-grid">
+    <div class="field">
+      <label for="weightHeldOut">Held-out %</label>
+      <input id="weightHeldOut" type="number" min="0" max="100" step="1" value="50">
+    </div>
+    <div class="field">
+      <label for="weightBreadth">Breadth %</label>
+      <input id="weightBreadth" type="number" min="0" max="100" step="1" value="25">
+    </div>
+    <div class="field">
+      <label for="weightAntiShortcut">Anti-shortcut %</label>
+      <input id="weightAntiShortcut" type="number" min="0" max="100" step="1" value="25">
+    </div>
+    <p class="constraint-note">Quality weights sum: <span id="qualityWeightSum">100</span> (must be 100)</p>
+    <div class="field">
+      <label for="axisQuality">Axis · quality</label>
+      <input id="axisQuality" type="number" min="0" max="100" step="1" value="100">
+    </div>
+    <div class="field">
+      <label for="axisCost">Axis · cost</label>
+      <input id="axisCost" type="number" min="0" max="100" step="1" value="0">
+    </div>
+    <div class="field">
+      <label for="axisLatency">Axis · latency</label>
+      <input id="axisLatency" type="number" min="0" max="100" step="1" value="0">
+    </div>
+    <div class="field">
+      <label for="axisRework">Axis · rework</label>
+      <input id="axisRework" type="number" min="0" max="100" step="1" value="0">
+    </div>
+    <p class="constraint-note">Selection axes sum: <span id="axisWeightSum">100</span></p>
+  </div>
+  <div id="objectiveWinner" class="banner winner">No evaluation loaded.</div>
+  <p id="objectiveStatus" class="page-copy"></p>
+  <p id="objectiveNotice" class="page-copy"></p>
+  <p id="objectiveError" class="error" role="alert"></p>
+  <div class="workspace" style="min-height: auto; display: block; border-radius: 0 0 0.7rem 0.7rem;">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Profile</th>
+          <th>Recorded quality</th>
+          <th>Preview quality</th>
+          <th>Mean cost</th>
+          <th>Scalar</th>
+          <th>Preview frontier</th>
+        </tr>
+      </thead>
+      <tbody id="objectiveBody"></tbody>
+    </table>
+  </div>
+</section>

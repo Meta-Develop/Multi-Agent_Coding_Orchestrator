@@ -36,6 +36,7 @@ struct ScanningDataSource {
 struct ScanningDataSourceState {
     cache: CachedScope,
     projects: Option<Value>,
+    projects_dirty: bool,
     refresh_after: Option<Instant>,
 }
 
@@ -45,6 +46,7 @@ impl ScanningDataSource {
             state: Mutex::new(ScanningDataSourceState {
                 cache: CachedScope::new(repositories),
                 projects: None,
+                projects_dirty: false,
                 refresh_after: None,
             }),
         }
@@ -65,24 +67,27 @@ impl ScanningDataSourceState {
         {
             return Ok(false);
         }
-        let changed = self
+        let refresh = self
             .cache
             .refresh()
-            .context("failed to refresh Scope repositories")?;
+            .context("failed to refresh Scope repositories");
+        if let Ok(changed) = &refresh {
+            self.projects_dirty |= *changed;
+        }
         self.refresh_after = Some(Instant::now() + CACHE_REFRESH_INTERVAL);
-        Ok(changed)
+        refresh
     }
 }
 
 impl ScopeDataSource for ScanningDataSource {
     fn projects(&self) -> Result<Value> {
         let mut state = self.state()?;
-        let changed = state.refresh_if_due()?;
-        if changed || state.projects.is_none() {
-            state.projects = Some(
-                serde_json::to_value(state.cache.snapshot()?)
-                    .context("failed to serialize Scope projects")?,
-            );
+        state.refresh_if_due()?;
+        if state.projects_dirty || state.projects.is_none() {
+            let projects = serde_json::to_value(state.cache.snapshot()?)
+                .context("failed to serialize Scope projects")?;
+            state.projects = Some(projects);
+            state.projects_dirty = false;
         }
         state
             .projects
@@ -422,6 +427,61 @@ mod tests {
                 .expect("refreshed run")
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn events_refresh_preserves_projects_invalidation() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("fixture-repo");
+        let first_journal = repo.join(".maco/o2/runs/run-1/events/orchestration.jsonl");
+        fs::create_dir_all(first_journal.parent().expect("first journal parent"))
+            .expect("first fixture event directory");
+        fs::write(
+            &first_journal,
+            concat!(
+                r#"{"ts":"2026-07-20T12:00:00Z","repo":"fixture-repo","run":"run-1","node":"worker-1","parent":null,"role":"worker","kind":"status","payload":{}}"#,
+                "\n"
+            ),
+        )
+        .expect("first fixture journal");
+
+        let targets =
+            resolve_repositories(&options(vec![repo.clone()], None)).expect("fixture target");
+        let source = ScanningDataSource::new(targets);
+        let initial_projects = source.projects().expect("initial projects");
+        assert_eq!(
+            initial_projects["projects"][0]["runs"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let second_journal = repo.join(".maco/o2/runs/run-2/events/orchestration.jsonl");
+        fs::create_dir_all(second_journal.parent().expect("second journal parent"))
+            .expect("second fixture event directory");
+        fs::write(
+            &second_journal,
+            concat!(
+                r#"{"ts":"2026-07-20T12:00:01Z","repo":"fixture-repo","run":"run-2","node":"worker-2","parent":null,"role":"worker","kind":"status","payload":{}}"#,
+                "\n"
+            ),
+        )
+        .expect("second fixture journal");
+
+        source.state().expect("source state").refresh_after = None;
+        let events = source
+            .events("fixture-repo", "o2", "run-2")
+            .expect("refreshed events")
+            .expect("new run events");
+        assert_eq!(events.len(), 1);
+
+        let refreshed_projects = source.projects().expect("refreshed projects");
+        assert_eq!(
+            refreshed_projects["projects"][0]["runs"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
         );
     }
 
