@@ -71,6 +71,100 @@ fn cli_sync_status_reports_live_supervise_run_ownership() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn cli_sync_heartbeat_sweep_and_takeover_preserve_exclusive_ownership() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let claim = run_success_json([
+        "sync",
+        "claim",
+        "owner",
+        "src",
+        "--repo",
+        repo,
+        "--heartbeat-interval-seconds",
+        "1",
+        "--stale-after-seconds",
+        "2",
+        "--json",
+    ])?;
+    assert_eq!(claim["token"], 1);
+    assert_eq!(claim["agent_id"], "owner");
+
+    let liveness = run_success_json(["sync", "liveness", "--repo", repo, "--json"])?;
+    assert_eq!(liveness[0]["claim_id"], "claim-00000000000000000001");
+    assert_eq!(liveness[0]["heartbeat_interval_seconds"], 1);
+    assert_eq!(liveness[0]["stale_after_seconds"], 2);
+
+    let wrong_owner = Command::new(BIN)
+        .args([
+            "sync",
+            "heartbeat",
+            "1",
+            "not-owner",
+            "--repo",
+            repo,
+            "--json",
+        ])
+        .output()
+        .context("wrong-owner heartbeat")?;
+    assert!(!wrong_owner.status.success());
+    assert!(String::from_utf8_lossy(&wrong_owner.stderr).contains("does not exactly match"));
+
+    let heartbeat =
+        run_success_json(["sync", "heartbeat", "1", "owner", "--repo", repo, "--json"])?;
+    assert_eq!(heartbeat["state"], "fresh");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    let sweep = run_success_json(["sync", "sweep", "--repo", repo, "--json"])?;
+    assert_eq!(
+        sweep["newly_takeover_eligible"][0],
+        "claim-00000000000000000001"
+    );
+    let owner = run_success_json(["sync", "owner", "src/lib.rs", "--repo", repo, "--json"])?;
+    assert_eq!(owner["owner"], "owner");
+
+    let late_heartbeat = Command::new(BIN)
+        .args(["sync", "heartbeat", "1", "owner", "--repo", repo, "--json"])
+        .output()
+        .context("late heartbeat")?;
+    assert!(!late_heartbeat.status.success());
+    assert!(String::from_utf8_lossy(&late_heartbeat.stderr).contains("cannot be revived"));
+
+    let takeover = run_success_json([
+        "sync",
+        "takeover",
+        "1",
+        "successor",
+        "--repo",
+        repo,
+        "--json",
+    ])?;
+    assert_eq!(takeover["claim"]["token"], 2);
+    assert_eq!(takeover["claim"]["agent_id"], "successor");
+    assert_eq!(
+        takeover["lineage"]["prior_claim_id"],
+        "claim-00000000000000000001"
+    );
+    assert_eq!(
+        takeover["liveness"]["supersedes"],
+        "claim-00000000000000000001"
+    );
+    let status = run_success_json(["sync", "status", "--repo", repo, "--json"])?;
+    assert_eq!(status.as_array().context("claim status")?.len(), 1);
+    assert_eq!(status[0]["token"], 2);
+    assert_eq!(status[0]["agent_id"], "successor");
+    let history = run_success_json(["sync", "history", "--repo", repo, "--json"])?;
+    assert_eq!(history.as_array().context("history")?.len(), 1);
+    assert_eq!(history[0]["prior_agent_id"], "owner");
+    assert_eq!(history[0]["successor_agent_id"], "successor");
+    run_success_json(["sync", "release", "2", "--repo", repo, "--json"])?;
+    let history_after_release = run_success_json(["sync", "history", "--repo", repo, "--json"])?;
+    assert_eq!(history_after_release, history);
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_issue33_quarantine_then_attested_migration_restores_claim_consumers() -> Result<()> {
