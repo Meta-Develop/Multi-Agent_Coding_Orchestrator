@@ -12,6 +12,7 @@ pub mod consult;
 pub mod decision_claim;
 pub(crate) mod effect_wal;
 pub mod evaluation;
+pub mod execution_capability;
 pub mod external_agent;
 pub mod field_guide;
 #[cfg(any(windows, test))]
