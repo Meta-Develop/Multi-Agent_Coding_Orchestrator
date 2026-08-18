@@ -135,11 +135,11 @@ pub struct RuntimeAdapterConfig {
 
 impl RuntimeAdapterConfig {
     pub fn defaults(runtime: RuntimeId) -> Self {
-        let (binary, template) = match runtime {
+        let (binary, template, output_capture) = match runtime {
             RuntimeId::Grok => (
                 "grok",
                 vec![
-                    "--prompt".into(),
+                    "-p".into(),
                     "{prompt}".into(),
                     "--model".into(),
                     "{model}".into(),
@@ -147,9 +147,11 @@ impl RuntimeAdapterConfig {
                     "{effort}".into(),
                     "--cwd".into(),
                     "{cwd}".into(),
-                    "--output".into(),
-                    "{output}".into(),
+                    "--output-format".into(),
+                    "plain".into(),
                 ],
+                // grok prints the headless response to stdout; there is no --output file flag.
+                OutputCaptureMode::Stdout,
             ),
             RuntimeId::Cursor => (
                 "cursor-agent",
@@ -165,15 +167,20 @@ impl RuntimeAdapterConfig {
                     "--output".into(),
                     "{output}".into(),
                 ],
+                OutputCaptureMode::default(),
             ),
-            _ => (runtime.default_binary(), Vec::new()),
+            _ => (
+                runtime.default_binary(),
+                Vec::new(),
+                OutputCaptureMode::default(),
+            ),
         };
         Self {
             binary: Some(PathBuf::from(binary)),
             argument_template: template,
             env_passthrough: Vec::new(),
             working_dir_flag: None,
-            output_capture: OutputCaptureMode::default(),
+            output_capture,
         }
     }
 
@@ -349,6 +356,121 @@ mod tests {
         assert_eq!(
             resolve_runtime(Some(RuntimeId::Cursor), Some(RuntimeId::Grok)),
             RuntimeId::Cursor
+        );
+    }
+
+    fn launch_context<'a>(
+        prompt: &'a Path,
+        model: Option<&'a str>,
+        effort: Option<&'a str>,
+        cwd: &'a Path,
+        output: &'a Path,
+    ) -> LaunchContext<'a> {
+        LaunchContext {
+            prompt,
+            model,
+            effort,
+            cwd,
+            output,
+        }
+    }
+
+    #[test]
+    fn grok_defaults_match_real_cli_and_capture_stdout() -> Result<()> {
+        let config = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+        assert_eq!(config.binary_path(), Path::new("grok"));
+        assert_eq!(config.output_capture, OutputCaptureMode::Stdout);
+        assert_eq!(
+            config.argument_template,
+            [
+                "-p",
+                "{prompt}",
+                "--model",
+                "{model}",
+                "--effort",
+                "{effort}",
+                "--cwd",
+                "{cwd}",
+                "--output-format",
+                "plain",
+            ]
+        );
+
+        let spec = config.render(&launch_context(
+            Path::new("prompt.txt"),
+            Some("grok-4.6"),
+            Some("high"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert_eq!(
+            spec.argv,
+            [
+                "-p",
+                "prompt.txt",
+                "--model",
+                "grok-4.6",
+                "--effort",
+                "high",
+                "--cwd",
+                "/tmp/work",
+                "--output-format",
+                "plain",
+            ]
+        );
+        assert_eq!(spec.output_capture, OutputCaptureMode::Stdout);
+        assert!(!spec
+            .argv
+            .iter()
+            .any(|arg| arg == "--prompt" || arg == "--output"));
+        Ok(())
+    }
+
+    #[test]
+    fn grok_argument_template_override_replaces_the_whole_default() -> Result<()> {
+        let config = RuntimeAdapterConfig {
+            argument_template: vec!["--prompt-file".into(), "{prompt}".into()],
+            ..RuntimeAdapterConfig::defaults(RuntimeId::Grok)
+        };
+        let spec = config.render(&launch_context(
+            Path::new("prompt.txt"),
+            Some("grok-4.6"),
+            Some("high"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert_eq!(spec.argv, ["--prompt-file", "prompt.txt"]);
+        assert_eq!(spec.output_capture, OutputCaptureMode::Stdout);
+        Ok(())
+    }
+
+    #[test]
+    fn grok_from_environment_keeps_defaults_without_overrides() {
+        assert_eq!(
+            RuntimeAdapterConfig::from_environment(RuntimeId::Grok),
+            RuntimeAdapterConfig::defaults(RuntimeId::Grok)
+        );
+    }
+
+    #[test]
+    fn cursor_defaults_keep_file_output_capture() {
+        let config = RuntimeAdapterConfig::defaults(RuntimeId::Cursor);
+        assert_eq!(config.binary_path(), Path::new("cursor-agent"));
+        assert_eq!(config.output_capture, OutputCaptureMode::OutputFile);
+        assert_eq!(
+            config.argument_template,
+            [
+                "-p",
+                "{prompt}",
+                "--model",
+                "{model}",
+                "--effort",
+                "{effort}",
+                "--workspace",
+                "{cwd}",
+                "--output",
+                "{output}",
+            ]
         );
     }
 
