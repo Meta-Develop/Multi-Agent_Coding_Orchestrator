@@ -265,8 +265,10 @@ mod tests {
             .expect("edge");
         graph.validate().expect("valid");
 
-        let mut evidence = TransitionEvidence::default();
-        evidence.localized_failure = true;
+        let evidence = TransitionEvidence {
+            localized_failure: true,
+            ..TransitionEvidence::default()
+        };
         let next = graph.take_transition(&start, &evidence).expect("next");
         assert_eq!(next.as_str(), "repair");
     }
@@ -304,8 +306,10 @@ mod tests {
             })
             .expect("edge");
 
-        let mut evidence = TransitionEvidence::default();
-        evidence.structural_failure = true;
+        let evidence = TransitionEvidence {
+            structural_failure: true,
+            ..TransitionEvidence::default()
+        };
         let next = graph.take_transition(&start, &evidence).expect("next");
         assert_eq!(next.as_str(), "restart");
         assert_eq!(

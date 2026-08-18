@@ -13,7 +13,7 @@ use super::ids::{
     CandidateId, ContractId, EvidenceId, RequirementId, ReviewId, RuntimeSlug, TaskId,
     TimestampMillis, ValidatorId, VerifierProfileId,
 };
-use super::quality::{QualityContract, RequirementStatus, ReviewLens, ValidatorKind};
+use super::quality::{QualityContract, RequirementStatus, ReviewLens};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskBinding {
@@ -525,7 +525,7 @@ pub fn select_under_quality_constraint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::optimizer::quality::{RequirementContract, ValidatorBinding};
+    use crate::optimizer::quality::{RequirementContract, ValidatorBinding, ValidatorKind};
     use std::path::PathBuf;
 
     fn now() -> TimestampMillis {

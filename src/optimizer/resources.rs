@@ -332,7 +332,9 @@ fn quantile(samples: &[Quantity], quantile_bp: u16) -> Quantity {
     }
     let mut ordered = samples.to_vec();
     ordered.sort();
-    let rank = (u64::from(quantile_bp).saturating_mul(ordered.len() as u64) + 9_999) / 10_000;
+    let rank = u64::from(quantile_bp)
+        .saturating_mul(ordered.len() as u64)
+        .div_ceil(10_000);
     let index = rank.saturating_sub(1).min(ordered.len() as u64 - 1) as usize;
     ordered[index]
 }
