@@ -1187,6 +1187,38 @@ fn serial_assignment_terminal_checkpoint_precedes_claim_release() {
 }
 
 #[test]
+fn degraded_manifest_boundary_finalization_still_releases_serial_claims() {
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_named_assignment("degraded-serial", "README.md");
+    let plan = injected_multi_plan(vec![assignment.clone()], 0);
+    let options = injected_options(&repo_path, temp.path(), "degraded-serial-release");
+    let runner = move |command: &ExternalAgentCommand| {
+        write_injected_assignment_report(command, &assignment);
+        injected_verified_run(command)
+    };
+    set_force_degraded_checkpoint_finalization();
+
+    let report = run_supervisor_plan_with_concurrent_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        1,
+        &runner,
+    )
+    .expect("degraded finalization remains reportable");
+
+    assert!(report.success, "degraded finalization report: {report:#?}");
+    assert_eq!(report.released_claims.len(), 1);
+    assert_eq!(report.released_claims[0].agent_id, "degraded-serial");
+    assert!(report.release_errors.is_empty());
+    assert!(SyncStore::open(&repo_path)
+        .expect("open claims after degraded finalization")
+        .snapshot()
+        .expect("snapshot claims after degraded finalization")
+        .is_empty());
+}
+
+#[test]
 fn serial_scheduler_error_after_completion_collects_outcomes_and_releases_claims() {
     let (temp, repo_path) = injected_repository();
     let assignments = vec![
