@@ -1,0 +1,1339 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/merge-preview-report-v1.schema.json",
+  "title": "MACO Merge Preview Report v1",
+  "description": "Contract for `maco merge preview --json`. The version is carried by this schema identity; the runtime report has no version member.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "candidate",
+    "safety",
+    "freshness_watermark"
+  ],
+  "properties": {
+    "candidate": {
+      "$ref": "#/$defs/candidate"
+    },
+    "safety": {
+      "$ref": "#/$defs/safety"
+    },
+    "freshness_watermark": {
+      "$ref": "#/$defs/freshnessWatermark"
+    }
+  },
+  "$defs": {
+    "basePreview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate",
+        "safety"
+      ],
+      "properties": {
+        "candidate": {
+          "$ref": "#/$defs/candidate"
+        },
+        "safety": {
+          "$ref": "#/$defs/safety"
+        }
+      }
+    },
+    "agentId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "oid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "nullableOid": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/oid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "freshnessWatermark": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "primary",
+        "source",
+        "candidate"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "const": 1
+        },
+        "primary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "head",
+            "index_digest",
+            "worktree_digest"
+          ],
+          "properties": {
+            "head": {
+              "$ref": "#/$defs/nullableOid"
+            },
+            "index_digest": {
+              "$ref": "#/$defs/nullableOid"
+            },
+            "worktree_digest": {
+              "$ref": "#/$defs/oid"
+            }
+          }
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "agent_id",
+            "head"
+          ],
+          "properties": {
+            "agent_id": {
+              "$ref": "#/$defs/agentId"
+            },
+            "head": {
+              "$ref": "#/$defs/nullableOid"
+            }
+          }
+        },
+        "candidate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "diff_oid",
+            "snapshot_tree_oid"
+          ],
+          "properties": {
+            "diff_oid": {
+              "$ref": "#/$defs/oid"
+            },
+            "snapshot_tree_oid": {
+              "$ref": "#/$defs/oid"
+            }
+          }
+        }
+      }
+    },
+    "repositoryRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?![\\\\/])(?![A-Za-z]:)(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$))[^\\u0000-\\u001F]+$",
+      "description": "Canonical repository-relative path. Native path spelling and non-UTF-8 escape text remain producer-defined."
+    },
+    "nullableRepositoryRelativePath": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/repositoryRelativePath"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "opaqueLocalPath": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque local path emitted by the current producer. Consumers must not persist or publish it as repository identity."
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metadata",
+        "claimed_paths",
+        "changed_paths",
+        "changes",
+        "unclaimed_changed_paths",
+        "diff",
+        "validations",
+        "validation_binding"
+      ],
+      "properties": {
+        "metadata": {
+          "$ref": "#/$defs/metadata"
+        },
+        "claimed_paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/repositoryRelativePath"
+          }
+        },
+        "changed_paths": {
+          "type": "array",
+          "maxItems": 8192,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/repositoryRelativePath"
+          }
+        },
+        "changes": {
+          "type": "array",
+          "maxItems": 8192,
+          "items": {
+            "$ref": "#/$defs/change"
+          }
+        },
+        "unclaimed_changed_paths": {
+          "type": "array",
+          "maxItems": 8192,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/repositoryRelativePath"
+          }
+        },
+        "diff": {
+          "$ref": "#/$defs/diff"
+        },
+        "validations": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/validationReport"
+          }
+        },
+        "validation_binding": {
+          "$ref": "#/$defs/validationBinding"
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent_id",
+        "worktree_path",
+        "branch",
+        "primary_repo_root",
+        "primary_head",
+        "agent_head",
+        "merge_base",
+        "base_matches_primary"
+      ],
+      "properties": {
+        "agent_id": {
+          "$ref": "#/$defs/agentId"
+        },
+        "worktree_path": {
+          "$ref": "#/$defs/opaqueLocalPath"
+        },
+        "branch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "primary_repo_root": {
+          "$ref": "#/$defs/opaqueLocalPath"
+        },
+        "primary_head": {
+          "$ref": "#/$defs/nullableOid"
+        },
+        "agent_head": {
+          "$ref": "#/$defs/nullableOid"
+        },
+        "merge_base": {
+          "$ref": "#/$defs/nullableOid"
+        },
+        "base_matches_primary": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "kind"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/repositoryRelativePath"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "added",
+            "modified",
+            "deleted",
+            "renamed",
+            "typechange",
+            "untracked",
+            "conflicted",
+            "unknown"
+          ]
+        }
+      }
+    },
+    "diff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "summary",
+        "full"
+      ],
+      "properties": {
+        "summary": {
+          "$ref": "#/$defs/outputSummary"
+        },
+        "full": {
+          "type": "string"
+        }
+      }
+    },
+    "outputSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text",
+        "truncated"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "maxLength": 32768
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      }
+    },
+    "validationReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "status",
+        "message",
+        "paths"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "not_run",
+            "passed",
+            "failed",
+            "skipped"
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 65536
+        },
+        "paths": {
+          "type": "array",
+          "maxItems": 8192,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/repositoryRelativePath"
+          }
+        }
+      }
+    },
+    "validationBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "agent_id",
+        "primary_head",
+        "agent_head",
+        "merge_base",
+        "diff_oid"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "const": 1
+        },
+        "agent_id": {
+          "$ref": "#/$defs/agentId"
+        },
+        "primary_head": {
+          "$ref": "#/$defs/nullableOid"
+        },
+        "agent_head": {
+          "$ref": "#/$defs/nullableOid"
+        },
+        "merge_base": {
+          "$ref": "#/$defs/nullableOid"
+        },
+        "diff_oid": {
+          "$ref": "#/$defs/oid"
+        }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "primary_state_unchanged",
+        "dirty_primary",
+        "stale_base",
+        "apply_check",
+        "unclaimed_edits",
+        "validation",
+        "validation_evidence",
+        "megafile",
+        "megafile_warnings",
+        "megafile_decomposition_target",
+        "megafile_decomposition_evidence",
+        "megafile_blocking",
+        "validation_required",
+        "candidate_validation_commands",
+        "force_options",
+        "apply_mode",
+        "semantic_conflicts",
+        "readiness"
+      ],
+      "properties": {
+        "primary_state_unchanged": {
+          "$ref": "#/$defs/safetyCheck"
+        },
+        "dirty_primary": {
+          "$ref": "#/$defs/safetyCheck"
+        },
+        "stale_base": {
+          "$ref": "#/$defs/safetyCheck"
+        },
+        "apply_check": {
+          "$ref": "#/$defs/safetyCheck"
+        },
+        "unclaimed_edits": {
+          "$ref": "#/$defs/safetyCheck"
+        },
+        "validation": {
+          "$ref": "#/$defs/safetyCheck"
+        },
+        "validation_evidence": {
+          "$ref": "#/$defs/validationEvidenceCheck"
+        },
+        "megafile": {
+          "$ref": "#/$defs/safetyCheck"
+        },
+        "megafile_warnings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/megafileAssessment"
+          }
+        },
+        "megafile_decomposition_target": {
+          "$ref": "#/$defs/nullableRepositoryRelativePath"
+        },
+        "megafile_decomposition_evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/verifiedDecompositionEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "megafile_blocking": {
+          "type": "boolean"
+        },
+        "validation_required": {
+          "type": "boolean"
+        },
+        "candidate_validation_commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "force_options": {
+          "$ref": "#/$defs/forceOptions"
+        },
+        "apply_mode": {
+          "type": "string",
+          "enum": [
+            "none",
+            "direct",
+            "three_way"
+          ]
+        },
+        "semantic_conflicts": {
+          "$ref": "#/$defs/semanticConflicts"
+        },
+        "readiness": {
+          "$ref": "#/$defs/readiness"
+        }
+      }
+    },
+    "safetyCheckStatus": {
+      "type": "string",
+      "enum": [
+        "passed",
+        "failed",
+        "skipped"
+      ]
+    },
+    "safetyCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "message",
+        "paths"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/safetyCheckStatus"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/repositoryRelativePath"
+          }
+        }
+      }
+    },
+    "validationEvidenceCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "binding_status",
+        "message",
+        "paths"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/safetyCheckStatus"
+        },
+        "binding_status": {
+          "type": "string",
+          "enum": [
+            "not_required",
+            "no_passed_report",
+            "bound",
+            "unbound",
+            "mismatched"
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/repositoryRelativePath"
+          }
+        }
+      }
+    },
+    "forceOptions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allow_dirty_primary",
+        "allow_stale_base",
+        "allow_unclaimed_edits",
+        "allow_validation_failures",
+        "allow_apply_conflicts"
+      ],
+      "properties": {
+        "allow_dirty_primary": {
+          "type": "boolean"
+        },
+        "allow_stale_base": {
+          "type": "boolean"
+        },
+        "allow_unclaimed_edits": {
+          "type": "boolean"
+        },
+        "allow_validation_failures": {
+          "type": "boolean"
+        },
+        "allow_apply_conflicts": {
+          "type": "boolean"
+        }
+      }
+    },
+    "applyBlocker": {
+      "type": "string",
+      "enum": [
+        "dirty_primary",
+        "stale_base",
+        "apply_check_failed",
+        "excluded_reference",
+        "unclaimed_edits",
+        "validation_missing",
+        "validation_not_run",
+        "validation_skipped",
+        "validation_failed"
+      ]
+    },
+    "readiness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "blockers",
+        "forced",
+        "details"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "safe",
+            "forced",
+            "blocked"
+          ]
+        },
+        "blockers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/applyBlocker"
+          }
+        },
+        "forced": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/applyBlocker"
+          }
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/blockerDetail"
+          }
+        }
+      }
+    },
+    "blockerDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "disposition",
+        "check_status",
+        "paths",
+        "message",
+        "validation_reports",
+        "validation_commands",
+        "next_safe_operation"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/applyBlocker"
+        },
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "blocked",
+            "forced"
+          ]
+        },
+        "check_status": {
+          "$ref": "#/$defs/safetyCheckStatus"
+        },
+        "paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/repositoryRelativePath"
+          }
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "validation_reports": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/validationReport"
+          }
+        },
+        "validation_commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "next_safe_operation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "fileSizeSample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "bytes",
+        "lines"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/repositoryRelativePath"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lines": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "megafileSignal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "observed",
+        "threshold"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "file_bytes",
+            "file_lines",
+            "growth_bytes",
+            "growth_lines",
+            "claim_count",
+            "collision_count"
+          ]
+        },
+        "observed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "threshold": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "megafileAssessment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "path",
+        "is_megafile",
+        "signals",
+        "latest_sample",
+        "previous_sample",
+        "growth_bytes",
+        "growth_lines",
+        "claims_in_window",
+        "collisions_in_window",
+        "accepted_decompositions"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "const": 1
+        },
+        "path": {
+          "$ref": "#/$defs/repositoryRelativePath"
+        },
+        "is_megafile": {
+          "type": "boolean"
+        },
+        "signals": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/megafileSignal"
+          }
+        },
+        "latest_sample": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/fileSizeSample"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "previous_sample": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/fileSizeSample"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "growth_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "growth_lines": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "claims_in_window": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "collisions_in_window": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "accepted_decompositions": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "verifiedDecompositionEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "orchestrator_id",
+        "worker_id",
+        "target_path",
+        "replacement_paths",
+        "supervisor_candidate_binding"
+      ],
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "orchestrator_id": {
+          "$ref": "#/$defs/agentId"
+        },
+        "worker_id": {
+          "$ref": "#/$defs/agentId"
+        },
+        "target_path": {
+          "$ref": "#/$defs/repositoryRelativePath"
+        },
+        "replacement_paths": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/repositoryRelativePath"
+          }
+        },
+        "supervisor_candidate_binding": {
+          "$ref": "#/$defs/validationBinding"
+        }
+      }
+    },
+    "semanticConflicts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "advisory",
+        "status",
+        "risk",
+        "confidence",
+        "degraded",
+        "conflict_paths",
+        "overlaps"
+      ],
+      "properties": {
+        "advisory": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "no_conflict",
+            "classified",
+            "degraded"
+          ]
+        },
+        "risk": {
+          "$ref": "#/$defs/semanticRisk"
+        },
+        "confidence": {
+          "$ref": "#/$defs/semanticConfidence"
+        },
+        "degraded": {
+          "type": "boolean"
+        },
+        "notes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "string"
+          }
+        },
+        "conflict_paths": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/repositoryRelativePath"
+          }
+        },
+        "overlaps": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/semanticOverlap"
+          }
+        }
+      }
+    },
+    "semanticRisk": {
+      "type": "string",
+      "enum": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "unknown"
+      ]
+    },
+    "semanticConfidence": {
+      "type": "string",
+      "enum": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "semanticOverlap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "kind",
+        "risk",
+        "confidence",
+        "primary",
+        "candidate",
+        "common_symbols",
+        "common_impls",
+        "common_modules",
+        "impacted_files",
+        "dependency_impacts"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/repositoryRelativePath"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "import_only",
+            "formatting_only",
+            "signature_level",
+            "symbol_level",
+            "impl_level",
+            "module_level",
+            "file_level",
+            "unresolved"
+          ]
+        },
+        "risk": {
+          "$ref": "#/$defs/semanticRisk"
+        },
+        "confidence": {
+          "$ref": "#/$defs/semanticConfidence"
+        },
+        "primary": {
+          "$ref": "#/$defs/semanticSide"
+        },
+        "candidate": {
+          "$ref": "#/$defs/semanticSide"
+        },
+        "common_symbols": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/semanticSymbol"
+          }
+        },
+        "common_impls": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/semanticSymbol"
+          }
+        },
+        "common_modules": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "impacted_files": {
+          "type": "array",
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/repositoryRelativePath"
+          }
+        },
+        "dependency_impacts": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/conflictDependencyImpact"
+          }
+        },
+        "notes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "semanticSide": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "touched_symbols",
+        "touched_impls",
+        "touched_modules",
+        "touched_imports",
+        "formatting_only",
+        "import_only",
+        "signature_level",
+        "current_line_ranges",
+        "base_line_ranges"
+      ],
+      "properties": {
+        "touched_symbols": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/semanticSymbol"
+          }
+        },
+        "touched_impls": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/semanticSymbol"
+          }
+        },
+        "touched_modules": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "touched_imports": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/semanticImport"
+          }
+        },
+        "formatting_only": {
+          "type": "boolean"
+        },
+        "import_only": {
+          "type": "boolean"
+        },
+        "signature_level": {
+          "type": "boolean"
+        },
+        "current_line_ranges": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/lineRange"
+          }
+        },
+        "base_line_ranges": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/lineRange"
+          }
+        }
+      }
+    },
+    "semanticSymbol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "qualified_path",
+        "kind",
+        "visibility",
+        "impl_target",
+        "impl_trait",
+        "file"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "qualified_path": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "module",
+            "function",
+            "struct",
+            "enum",
+            "trait",
+            "impl",
+            "method",
+            "const",
+            "type_alias"
+          ]
+        },
+        "visibility": {
+          "type": "string",
+          "minLength": 1
+        },
+        "impl_target": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "impl_trait": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file": {
+          "$ref": "#/$defs/repositoryRelativePath"
+        }
+      }
+    },
+    "semanticImport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "alias",
+        "glob",
+        "visibility"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "alias": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "glob": {
+          "type": "boolean"
+        },
+        "visibility": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "lineRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start_line",
+        "end_line"
+      ],
+      "properties": {
+        "start_line": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_line": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "sourceSpan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start_byte",
+        "end_byte",
+        "start_line",
+        "end_line"
+      ],
+      "properties": {
+        "start_byte": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_byte": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "start_line": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_line": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "from_file",
+        "from_module",
+        "to",
+        "to_file",
+        "kind",
+        "span"
+      ],
+      "properties": {
+        "from_file": {
+          "$ref": "#/$defs/repositoryRelativePath"
+        },
+        "from_module": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "to": {
+          "type": "string",
+          "minLength": 1
+        },
+        "to_file": {
+          "$ref": "#/$defs/nullableRepositoryRelativePath"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "import",
+            "module_declaration",
+            "inline_module"
+          ]
+        },
+        "span": {
+          "$ref": "#/$defs/sourceSpan"
+        }
+      }
+    },
+    "dependencyImpact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "direction",
+        "changed_path",
+        "related_file",
+        "dependency"
+      ],
+      "properties": {
+        "direction": {
+          "type": "string",
+          "enum": [
+            "incoming",
+            "outgoing"
+          ]
+        },
+        "changed_path": {
+          "$ref": "#/$defs/repositoryRelativePath"
+        },
+        "related_file": {
+          "$ref": "#/$defs/nullableRepositoryRelativePath"
+        },
+        "dependency": {
+          "$ref": "#/$defs/dependency"
+        }
+      }
+    },
+    "conflictDependencyImpact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "side",
+        "impact"
+      ],
+      "properties": {
+        "side": {
+          "type": "string",
+          "enum": [
+            "primary",
+            "candidate"
+          ]
+        },
+        "impact": {
+          "$ref": "#/$defs/dependencyImpact"
+        }
+      }
+    }
+  }
+}

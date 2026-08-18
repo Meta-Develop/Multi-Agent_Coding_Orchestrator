@@ -53,7 +53,8 @@ use crate::{
     supervise::{self, SupervisorRunOptions},
     sync::{normalize_repo_relative_path, ClaimToken},
     sync_store::{
-        ClaimStatusReport, ClaimTelemetryOutcome, MegafileClaimWarning, OwnerReport, SyncStore,
+        ClaimLivenessReport, ClaimStatusReport, ClaimTelemetryOutcome, ClaimTiming,
+        MegafileClaimWarning, OwnerReport, SyncStore,
     },
     worktree::{
         sweep_workspace_worktrees, worktree_report_path_text, RepositoryInfo,
@@ -2599,13 +2600,15 @@ impl SyncCommand {
             SyncSubcommand::Claim(args) => {
                 let store = SyncStore::open(args.repo)?;
                 let configured_thresholds = args.thresholds.configured_thresholds();
+                let timing = args.timing.timing()?.unwrap_or_default();
                 let outcome = match configured_thresholds {
-                    Some(thresholds) => store.claim_paths_with_telemetry_thresholds(
+                    Some(thresholds) => store.claim_paths_with_telemetry_thresholds_and_timing(
                         &args.agent_id,
                         args.paths,
                         thresholds,
+                        timing,
                     )?,
-                    None => store.claim_paths_with_telemetry(&args.agent_id, args.paths)?,
+                    None => store.claim_paths_with_timing(&args.agent_id, args.paths, timing)?,
                 };
                 print_claim_telemetry_outcome(&outcome, args.json)
             }
@@ -2629,6 +2632,39 @@ impl SyncCommand {
                 let claims = store.status_snapshot()?;
                 print_claim_statuses(&claims, args.json)
             }
+            SyncSubcommand::Liveness(args) => {
+                let store = SyncStore::open(args.repo)?;
+                let claims = store.liveness_snapshot()?;
+                print_claim_liveness(&claims, args.json)
+            }
+            SyncSubcommand::Heartbeat(args) => {
+                let store = SyncStore::open(args.repo)?;
+                let report = store.heartbeat(
+                    ClaimToken::from_u64(args.token),
+                    &args.agent_id,
+                    args.timing.timing()?,
+                )?;
+                print_query_report(&report, args.json)
+            }
+            SyncSubcommand::Sweep(args) => {
+                let store = SyncStore::open(args.repo)?;
+                let report = store.sweep_stale()?;
+                print_query_report(&report, args.json)
+            }
+            SyncSubcommand::Takeover(args) => {
+                let store = SyncStore::open(args.repo)?;
+                let report = store.takeover(
+                    ClaimToken::from_u64(args.prior_token),
+                    &args.agent_id,
+                    args.timing.timing()?,
+                )?;
+                print_query_report(&report, args.json)
+            }
+            SyncSubcommand::History(args) => {
+                let store = SyncStore::open(args.repo)?;
+                let history = store.supersession_history()?;
+                print_query_report(&history, args.json)
+            }
         }
     }
 }
@@ -2645,6 +2681,16 @@ enum SyncSubcommand {
     Owner(OwnerSyncArgs),
     /// List active path claims.
     Status(StatusSyncArgs),
+    /// List bounded heartbeat and takeover state for active claims.
+    Liveness(StatusSyncArgs),
+    /// Refresh one exact-owner claim heartbeat.
+    Heartbeat(HeartbeatSyncArgs),
+    /// Mark stale claims takeover-eligible without releasing their paths.
+    Sweep(SweepSyncArgs),
+    /// Atomically replace one takeover-eligible claim with a successor.
+    Takeover(TakeoverSyncArgs),
+    /// List the bounded durable claim-supersession audit history.
+    History(StatusSyncArgs),
 }
 
 #[derive(Debug, Args)]
@@ -2659,6 +2705,8 @@ struct ClaimSyncArgs {
     paths: Vec<PathBuf>,
     #[command(flatten)]
     thresholds: MegafileThresholdArgs,
+    #[command(flatten)]
+    timing: ClaimTimingArgs,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -2705,6 +2753,68 @@ struct StatusSyncArgs {
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args, Default)]
+struct ClaimTimingArgs {
+    /// Desired heartbeat interval in seconds. Must be paired with --stale-after-seconds.
+    #[arg(long, requires = "stale_after_seconds")]
+    heartbeat_interval_seconds: Option<u64>,
+    /// Age in seconds at which a claim becomes stale. Must be paired with --heartbeat-interval-seconds.
+    #[arg(long, requires = "heartbeat_interval_seconds")]
+    stale_after_seconds: Option<u64>,
+}
+
+impl ClaimTimingArgs {
+    fn timing(&self) -> Result<Option<ClaimTiming>> {
+        match (self.heartbeat_interval_seconds, self.stale_after_seconds) {
+            (None, None) => Ok(None),
+            (Some(heartbeat), Some(stale)) => Ok(Some(ClaimTiming::new(heartbeat, stale)?)),
+            _ => bail!("heartbeat interval and stale threshold must be configured together"),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct HeartbeatSyncArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Active claim token to refresh.
+    token: u64,
+    /// Exact stable agent id recorded on the claim.
+    agent_id: String,
+    #[command(flatten)]
+    timing: ClaimTimingArgs,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct SweepSyncArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct TakeoverSyncArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Exact active predecessor token observed as takeover-eligible.
+    prior_token: u64,
+    /// Stable agent id for the successor claim.
+    agent_id: String,
+    #[command(flatten)]
+    timing: ClaimTimingArgs,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -4146,6 +4256,19 @@ fn run_merge_apply_controller(
         MergeApplyOptions {
             preview: preview_options,
             candidate_validation_commands,
+            reviewed_watermark: match args.reviewed_watermark {
+                Some(path) => {
+                    let bytes = std::fs::read(&path).with_context(|| {
+                        format!("failed to read reviewed watermark {}", path.display())
+                    })?;
+                    let value: serde_json::Value = serde_json::from_slice(&bytes)
+                        .context("reviewed watermark is not valid JSON")?;
+                    Some(
+                        crate::merge_freshness::reviewed_merge_preview_watermark_from_json(&value)?,
+                    )
+                }
+                None => None,
+            },
         },
         validation_evidence,
         megafile_policy,
@@ -4279,6 +4402,9 @@ struct MergeApplyArgs {
     /// Apply an eligible merge lifecycle reap; requires --auto-reap-merged.
     #[arg(long, requires = "auto_reap_merged")]
     apply_auto_reap: bool,
+    /// Previously reviewed merge preview JSON or nested freshness watermark.
+    #[arg(long, value_name = "PATH")]
+    reviewed_watermark: Option<PathBuf>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -5457,7 +5583,18 @@ fn print_merge_candidate(candidate: &MergeCandidate, json: bool) -> Result<()> {
 
 fn print_merge_preview(preview: &MergeApplyPreview, json: bool) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(preview)?);
+        let watermark =
+            crate::merge_freshness::MergePreviewFreshnessWatermark::capture_from_candidate(
+                &preview.candidate,
+            )?;
+        let mut value = serde_json::to_value(preview)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "freshness_watermark".to_string(),
+                serde_json::to_value(watermark)?,
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         print_merge_candidate(&preview.candidate, false)?;
         println!("Readiness: {:?}", preview.safety.readiness.status);
@@ -6316,6 +6453,34 @@ fn print_claim_statuses(claims: &[ClaimStatusReport], json: bool) -> Result<()> 
     Ok(())
 }
 
+fn print_claim_liveness(claims: &[ClaimLivenessReport], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(claims)?);
+    } else if claims.is_empty() {
+        println!("No active claims.");
+    } else {
+        for report in claims {
+            println!(
+                "{}\t{}\t{:?}\theartbeat={}\tstale_after={}\tsupersedes={}",
+                report.claim_id,
+                report.claim.agent_id,
+                report.state,
+                report
+                    .heartbeat_unix_seconds
+                    .map_or_else(|| "<unknown>".to_string(), |value| value.to_string()),
+                report
+                    .stale_after_seconds
+                    .map_or_else(|| "<unknown>".to_string(), |value| value.to_string()),
+                report.supersedes.as_deref().unwrap_or("<none>"),
+            );
+            if let Some(ambiguity) = &report.ambiguity {
+                println!("  Ambiguity: {ambiguity}");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn print_owner_report(report: &OwnerReport, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(report)?);
@@ -7150,6 +7315,7 @@ mod tests {
             decomposition_target: None,
             decomposition_run_id: None,
             megafile_thresholds: MegafileThresholdArgs::default(),
+            reviewed_watermark: None,
             forces: MergeForceArgs {
                 force_dirty_primary: false,
                 force_stale_base: false,
@@ -7281,6 +7447,7 @@ mod tests {
             decomposition_target: None,
             decomposition_run_id: None,
             megafile_thresholds: MegafileThresholdArgs::default(),
+            reviewed_watermark: None,
             forces: MergeForceArgs {
                 force_dirty_primary: false,
                 force_stale_base: false,
@@ -7344,6 +7511,7 @@ mod tests {
             decomposition_target: None,
             decomposition_run_id: None,
             megafile_thresholds: MegafileThresholdArgs::default(),
+            reviewed_watermark: None,
             forces: MergeForceArgs {
                 force_dirty_primary: false,
                 force_stale_base: true,

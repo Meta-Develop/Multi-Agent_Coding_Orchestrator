@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/repository-map-v1.schema.json",
+  "title": "MACO Repository Map v1",
+  "description": "Contract for `maco repo map --json`. The schema version is carried by this schema identity because the runtime artifact has no version member.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "root",
+    "entries"
+  ],
+  "properties": {
+    "root": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque producer-reported repository root. Current runtimes emit a host-local absolute path."
+    },
+    "entries": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": {
+        "$ref": "#/$defs/entry"
+      }
+    }
+  },
+  "$defs": {
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "kind",
+        "size_bytes",
+        "category",
+        "git_status"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/repositoryRelativePath"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "directory",
+            "file",
+            "symlink",
+            "other"
+          ]
+        },
+        "size_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "directory",
+            "agent_context",
+            "git",
+            "lockfile",
+            "rust",
+            "markdown",
+            "toml",
+            "json",
+            "nix",
+            "yaml",
+            "shell",
+            "text",
+            "unknown"
+          ]
+        },
+        "git_status": {
+          "type": "string",
+          "enum": [
+            "directory",
+            "clean",
+            "modified",
+            "added",
+            "deleted",
+            "renamed",
+            "untracked",
+            "conflicted"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "directory"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "size_bytes": {
+                "const": null
+              },
+              "category": {
+                "const": "directory"
+              },
+              "git_status": {
+                "const": "directory"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "file",
+                  "symlink"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "size_bytes": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "other"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "size_bytes": {
+                "const": null
+              },
+              "git_status": {
+                "const": "untracked"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "repositoryRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?![\\\\/])(?![A-Za-z]:)(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$))[^\\u0000-\\u001F]+$",
+      "description": "Repository-relative path. maxLength is a conservative character bound over the producer's 4096-byte limit."
+    }
+  }
+}
