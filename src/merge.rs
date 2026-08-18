@@ -2735,9 +2735,10 @@ pub fn merge_apply_report_with_megafile_policy(
         megafile_policy.clone(),
     )?;
     if let Some(reviewed) = options.reviewed_watermark.as_ref() {
-        let current = crate::merge_freshness::MergePreviewFreshnessWatermark::capture_from_candidate(
-            &preview.candidate,
-        )?;
+        let current =
+            crate::merge_freshness::MergePreviewFreshnessWatermark::capture_from_candidate(
+                &preview.candidate,
+            )?;
         crate::merge_freshness::refuse_if_drifted(reviewed, &current)?;
     }
     let recorded_collision_paths =

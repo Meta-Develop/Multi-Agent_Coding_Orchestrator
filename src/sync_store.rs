@@ -13,9 +13,7 @@ use crate::{
     },
     megafile::{MegafileAssessment, MegafileStore, MegafileThresholds},
     orchestrator::RunId,
-    safe_state::{
-        stable_checksum, ExistingExclusiveLock, FileIdentity, KernelStateLock, SafeRoot,
-    },
+    safe_state::{stable_checksum, ExistingExclusiveLock, FileIdentity, KernelStateLock, SafeRoot},
     state_journal::JournalSpec,
     state_migration::{
         decode_checksumless_legacy_claims_state, finalize_legacy_retirement,
@@ -25,13 +23,13 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use git2::Repository;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+use thiserror::Error;
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;

@@ -115,12 +115,11 @@ pub(crate) fn revalidate_claimed_worker(
             source,
         }
     })?;
-    let repo_path = primary_repository_path(repo).map_err(|source| {
-        RevalidationError::WorktreeUnavailable {
+    let repo_path =
+        primary_repository_path(repo).map_err(|source| RevalidationError::WorktreeUnavailable {
             agent_id: agent_id.to_string(),
             source,
-        }
-    })?;
+        })?;
     revalidate_existing_worker_batch(
         &repo_path,
         vec![RevalidationRequest {
@@ -220,10 +219,12 @@ fn verify_head_and_branch(
             agent_id: agent_id.to_string(),
         });
     }
-    let head = repo.head().map_err(|source| RevalidationError::WorktreeUnavailable {
-        agent_id: agent_id.to_string(),
-        source: source.into(),
-    })?;
+    let head = repo
+        .head()
+        .map_err(|source| RevalidationError::WorktreeUnavailable {
+            agent_id: agent_id.to_string(),
+            source: source.into(),
+        })?;
     let actual_branch = head
         .shorthand()
         .ok()
@@ -600,7 +601,9 @@ mod tests {
         )?)
     }
 
-    fn recursive_regular_bytes(root: &Path) -> Result<std::collections::BTreeMap<PathBuf, Vec<u8>>> {
+    fn recursive_regular_bytes(
+        root: &Path,
+    ) -> Result<std::collections::BTreeMap<PathBuf, Vec<u8>>> {
         fn visit(
             root: &Path,
             current: &Path,

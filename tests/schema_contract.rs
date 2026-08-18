@@ -36,7 +36,11 @@ fn load_json(path: &Path) -> Result<Value> {
     serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
 }
 
-fn validate(schema: &Value, instance: &Value, schemas: &std::collections::BTreeMap<String, Value>) -> Result<(), String> {
+fn validate(
+    schema: &Value,
+    instance: &Value,
+    schemas: &std::collections::BTreeMap<String, Value>,
+) -> Result<(), String> {
     validate_at(schema, schema, instance, "$", schemas)
 }
 
@@ -102,7 +106,13 @@ fn validate_at(
     ) {
         for (key, property_schema) in properties {
             if let Some(value) = object.get(key) {
-                validate_at(root, property_schema, value, &format!("{path}.{key}"), schemas)?;
+                validate_at(
+                    root,
+                    property_schema,
+                    value,
+                    &format!("{path}.{key}"),
+                    schemas,
+                )?;
             }
         }
     }
@@ -205,7 +215,8 @@ fn regex_lite(pattern: &str) -> impl Fn(&str) -> bool {
     let pattern = pattern.to_string();
     move |text: &str| {
         if pattern == "^(0|[1-9][0-9]*)$" {
-            return text == "0" || (!text.starts_with('0') && text.chars().all(|ch| ch.is_ascii_digit()));
+            return text == "0"
+                || (!text.starts_with('0') && text.chars().all(|ch| ch.is_ascii_digit()));
         }
         if pattern.starts_with('^') && pattern.ends_with('$') && !pattern.contains('[') {
             let exact = &pattern[1..pattern.len() - 1];
@@ -225,7 +236,10 @@ fn published_schemas_and_fixtures_follow_the_manifest_contract() -> Result<()> {
     assert_eq!(manifest.contracts.len(), 5);
     let mut schemas = std::collections::BTreeMap::new();
     for contract in &manifest.contracts {
-        schemas.insert(contract.schema.clone(), load_json(&schema_dir.join(&contract.schema))?);
+        schemas.insert(
+            contract.schema.clone(),
+            load_json(&schema_dir.join(&contract.schema))?,
+        );
     }
 
     let mut seen_schemas = 0usize;

@@ -3361,12 +3361,7 @@ fn revalidate_ready_agent(
         &claim.paths,
         worktree.record(),
     )
-    .with_context(|| {
-        format!(
-            "pre-mutation revalidation failed for agent '{}'",
-            agent.id
-        )
-    })
+    .with_context(|| format!("pre-mutation revalidation failed for agent '{}'", agent.id))
 }
 
 #[cfg(test)]
@@ -3548,11 +3543,8 @@ fn run_ready_agents(
             &summaries[index],
             &worktrees[index],
         )?;
-        let _revalidation = revalidate_ready_agent(
-            &plan.agents[index],
-            &summaries[index],
-            &worktrees[index],
-        )?;
+        let _revalidation =
+            revalidate_ready_agent(&plan.agents[index], &summaries[index], &worktrees[index])?;
         let spec = command_spec(
             &plan.agents[index],
             &summaries[index],
@@ -3570,11 +3562,8 @@ fn run_ready_agents(
             &summaries[*index],
             &worktrees[*index],
         )?;
-        let _revalidation = revalidate_ready_agent(
-            &plan.agents[*index],
-            &summaries[*index],
-            &worktrees[*index],
-        )?;
+        let _revalidation =
+            revalidate_ready_agent(&plan.agents[*index], &summaries[*index], &worktrees[*index])?;
         let spec = command_spec(
             &plan.agents[*index],
             &summaries[*index],
