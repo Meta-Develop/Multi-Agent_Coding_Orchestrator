@@ -70,6 +70,7 @@ const LEGACY_LOCKS: [&str; 3] = [
     "semantic_intents.lock",
     "managed_worktrees.lock",
 ];
+pub(crate) const LEGACY_PUBLICATION_TRANSACTIONS_DIR: &str = "publication-transactions";
 
 pub(crate) enum StateMigrationManifestSpec {}
 
@@ -140,6 +141,8 @@ pub(crate) struct StateMigrationManifest {
     pub version: u32,
     pub repository: RepositoryAuthBinding,
     pub entries: Vec<LegacyStateEntry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inventoried_directories: BTreeMap<String, FileIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -764,6 +767,50 @@ fn write_pretty_fenced<T: Serialize>(
     AtomicStateWriter::write_direct_fenced(root, name, &bytes, verify)
 }
 
+/// True when a completed signed migration inventoried the leftover
+/// `publication-transactions` directory and that same directory inode is
+/// still present. Publication treats that as retirement: the plaintext
+/// journals stay on disk as evidence and no longer block authenticated
+/// external effects.
+pub(crate) fn legacy_publication_journals_are_retired(repo_path: &Path) -> Result<bool> {
+    let repository = crate::git_repository::discover(repo_path)?;
+    let common_root = match SafeRoot::open_existing(repository.commondir()) {
+        Ok(root) => root,
+        Err(_) => return Ok(false),
+    };
+    let state_path = common_root.path().join("maco/state");
+    let state_root = match SafeRoot::open_existing(&state_path) {
+        Ok(root) => root,
+        Err(_) => return Ok(false),
+    };
+    if !manifest_exists(&state_root)? {
+        return Ok(false);
+    }
+    if !state_root.direct_child_exists(LEGACY_PUBLICATION_TRANSACTIONS_DIR)? {
+        return Ok(false);
+    }
+    let authenticator = repository_authenticator_key_only(repo_path)?;
+    authenticator.verify_epoch()?;
+    let store = AuthenticatedSnapshotStore::<
+        StateMigrationManifestSpec,
+        StateMigrationManifest,
+    >::open_instance(authenticator, MANIFEST_INSTANCE_ID)?;
+    let manifest = &store.current().value;
+    if manifest.repository != store.identity().repository {
+        bail!("signed migration manifest repository binding is inconsistent");
+    }
+    let Some(expected) = manifest
+        .inventoried_directories
+        .get(LEGACY_PUBLICATION_TRANSACTIONS_DIR)
+    else {
+        return Ok(false);
+    };
+    let path = state_root.direct_child(LEGACY_PUBLICATION_TRANSACTIONS_DIR)?;
+    let metadata = fs::symlink_metadata(&path)?;
+    validate_owned_directory(&metadata, &path)?;
+    Ok(&identity_for_path(&path)? == expected)
+}
+
 /// Returns legacy bytes only when the signed migration manifest binds the
 /// exact repository, inode, size, digest, store name, and file name. A legacy
 /// file without that evidence is never treated as trusted first-use state.
@@ -908,6 +955,7 @@ struct LegacyPreflight {
     original_file_modes: BTreeMap<String, u32>,
     entries: Vec<LegacyStateEntry>,
     retired_tombstones: BTreeMap<String, (FileIdentity, String)>,
+    inventoried_directories: BTreeMap<String, FileIdentity>,
     root_entries: BTreeMap<String, FileIdentity>,
     existing_lock_names: Vec<String>,
     expected_bindings: ExpectedLegacyBindings,
@@ -1154,6 +1202,7 @@ fn preflight_legacy_state(
     let mut original_file_modes = BTreeMap::new();
     let mut existing_lock_names = Vec::new();
     let mut observed_files = BTreeSet::new();
+    let mut inventoried_directories = BTreeMap::new();
     let mut root_entries = BTreeMap::new();
     for name in state_root.direct_child_names_bounded(MAX_STATE_ENTRIES)? {
         let name = name
@@ -1162,14 +1211,21 @@ fn preflight_legacy_state(
         let path = state_root.direct_child(&name)?;
         let metadata = fs::symlink_metadata(&path)?;
         let identity = identity_for_path(&path)?;
-        if root_entries.insert(name.clone(), identity).is_some() {
+        if root_entries.insert(name.clone(), identity.clone()).is_some() {
             bail!("legacy state root contains a duplicate entry name");
         }
         if metadata.file_type().is_dir() {
-            if !is_known_authenticated_directory(&name) {
+            if !is_known_state_directory(&name) {
                 bail!("unexpected directory in legacy state root: {name}");
             }
             validate_owned_directory(&metadata, &path)?;
+            if is_known_legacy_directory(&name)
+                && inventoried_directories
+                    .insert(name.clone(), identity)
+                    .is_some()
+            {
+                bail!("legacy state root contains a duplicate inventoried directory");
+            }
             continue;
         }
         if !is_known_state_file(&name) {
@@ -1262,6 +1318,7 @@ fn preflight_legacy_state(
         original_file_modes,
         entries,
         retired_tombstones,
+        inventoried_directories,
         root_entries,
         existing_lock_names,
         expected_bindings,
@@ -1427,6 +1484,14 @@ fn is_known_authenticated_directory(name: &str) -> bool {
     authenticated_state_consumers()
         .iter()
         .any(|source| source.root_name == name)
+}
+
+fn is_known_legacy_directory(name: &str) -> bool {
+    name == LEGACY_PUBLICATION_TRANSACTIONS_DIR
+}
+
+fn is_known_state_directory(name: &str) -> bool {
+    is_known_authenticated_directory(name) || is_known_legacy_directory(name)
 }
 
 fn is_known_state_file(name: &str) -> bool {
@@ -2520,6 +2585,16 @@ fn revalidate_preflight(preflight: &LegacyPreflight) -> Result<()> {
         }
         revalidate_legacy_state(entry, &bytes, &preflight.expected_bindings)?;
     }
+    for (name, identity) in &preflight.inventoried_directories {
+        let path = preflight.state_root.direct_child(name)?;
+        let metadata = fs::symlink_metadata(&path).with_context(|| {
+            format!("inventoried legacy directory disappeared during migration preflight: {name}")
+        })?;
+        validate_owned_directory(&metadata, &path)?;
+        if &identity_for_path(&path)? != identity {
+            bail!("inventoried legacy directory changed during migration preflight: {name}");
+        }
+    }
     preflight.state_root.verify()
 }
 
@@ -2787,6 +2862,7 @@ fn apply_migration(
         version: MIGRATION_VERSION,
         repository: binding,
         entries: preflight.entries.clone(),
+        inventoried_directories: preflight.inventoried_directories.clone(),
     };
     let authenticator = writer.into_authenticator()?;
     verify_migration_authenticator_binding(preflight, &authenticator)?;
@@ -2951,6 +3027,7 @@ fn verify_existing_manifest(
         || snapshot.value.version != MIGRATION_VERSION
         || snapshot.value.repository != store.identity().repository
         || snapshot.value.entries != preflight.entries
+        || snapshot.value.inventoried_directories != preflight.inventoried_directories
     {
         bail!("signed state migration manifest does not match the current legacy state");
     }
@@ -3106,7 +3183,7 @@ fn revalidate_exact_state_root_inventory(
             .map_err(|_| anyhow::anyhow!("migration state entry name is not UTF-8"))?;
         let path = preflight.state_root.direct_child(&name)?;
         let metadata = fs::symlink_metadata(&path)?;
-        if is_known_authenticated_directory(&name) {
+        if is_known_state_directory(&name) {
             validate_owned_directory(&metadata, &path)?;
         } else if is_known_state_file(&name) {
             validate_owned_regular_file(&metadata, &path, file_bound(&name))?;
@@ -3223,7 +3300,7 @@ fn harden_state(preflight: &LegacyPreflight, locks: &[MigrationHeldLock]) -> Res
     revalidate_exact_state_root_inventory(preflight, locks, false, false)?;
     let expected = expected_state_root_inventory(preflight, locks)?;
     for (name, identity) in &expected {
-        let (kind, mode) = if is_known_authenticated_directory(name) {
+        let (kind, mode) = if is_known_state_directory(name) {
             (DirectChildType::Directory, 0o700)
         } else if is_known_state_file(name) {
             (DirectChildType::SingleLinkRegularFile, 0o600)
@@ -3272,7 +3349,7 @@ fn state_is_hardened(preflight: &LegacyPreflight, locks: &[MigrationHeldLock]) -
     for (name, identity) in expected_state_root_inventory(preflight, locks)? {
         let path = preflight.state_root.direct_child(&name)?;
         let metadata = fs::symlink_metadata(&path)?;
-        if is_known_authenticated_directory(&name) {
+        if is_known_state_directory(&name) {
             validate_owned_directory(&metadata, &path)?;
             if identity_for_path(&path)? != identity || file_mode(&metadata) != 0o700 {
                 return Ok(false);
@@ -3921,6 +3998,55 @@ mod tests {
             migrate_repository_state(&path, true).expect("registered-source repeated apply");
         assert_eq!(repeated_apply.status, StateMigrationStatus::AlreadyApplied);
         assert_eq!(repeated_apply.mode, StateMigrationMode::Apply);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_transaction_journals_are_inventoried_and_retired_across_all_modes() {
+        let (_temp, path, state) = repository_with_claims();
+        let journals = state.join(LEGACY_PUBLICATION_TRANSACTIONS_DIR).join("legacy");
+        fs::create_dir_all(&journals).expect("legacy publication journals");
+        let record = journals.join("00000000000000000001.json");
+        fs::write(&record, b"legacy plaintext must remain untouched\n").expect("legacy record");
+        make_legacy_permissions(&state);
+
+        assert!(
+            !legacy_publication_journals_are_retired(&path).expect("pre-migration retirement query"),
+            "unsigned leftover journals are not retired"
+        );
+
+        let dry = migrate_repository_state(&path, false).expect("publication-journal dry run");
+        assert_eq!(dry.status, StateMigrationStatus::Ready);
+        assert_eq!(dry.mode, StateMigrationMode::DryRun);
+        assert!(
+            !legacy_publication_journals_are_retired(&path).expect("dry-run retirement query"),
+            "dry-run must not retire leftover journals"
+        );
+
+        let applied = migrate_repository_state(&path, true).expect("publication-journal apply");
+        assert_eq!(applied.status, StateMigrationStatus::Applied);
+        assert_eq!(applied.mode, StateMigrationMode::Apply);
+        assert!(
+            legacy_publication_journals_are_retired(&path)
+                .expect("applied retirement query"),
+            "signed migration must retire leftover publication journals"
+        );
+        assert_eq!(
+            fs::read(&record).expect("legacy record remains after apply"),
+            b"legacy plaintext must remain untouched\n"
+        );
+
+        let repeated_dry =
+            migrate_repository_state(&path, false).expect("publication-journal repeated dry run");
+        assert_eq!(repeated_dry.status, StateMigrationStatus::AlreadyApplied);
+        let repeated_apply =
+            migrate_repository_state(&path, true).expect("publication-journal repeated apply");
+        assert_eq!(repeated_apply.status, StateMigrationStatus::AlreadyApplied);
+        assert!(legacy_publication_journals_are_retired(&path).expect("repeated retirement query"));
+        assert_eq!(
+            fs::read(&record).expect("legacy record remains after re-verify"),
+            b"legacy plaintext must remain untouched\n"
+        );
     }
 
     #[cfg(unix)]
