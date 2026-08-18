@@ -57,9 +57,12 @@ jobs:
         run: |
           rustup toolchain install "${MSRV}" --profile minimal
 
+          # Capture rustc output fully before parsing. Piping a still-writing
+          # rustc into `awk ... exit` (or head/grep -m) raises SIGPIPE under
+          # Actions' `set -o pipefail` and fails the step with exit 141.
+          rustc_verbose="$(rustc +"${MSRV}" --version --verbose)"
           actual_release="$(
-            rustc +"${MSRV}" --version --verbose |
-              awk '$1 == "release:" { print $2; exit }'
+            awk '$1 == "release:" { print $2; exit }' <<< "${rustc_verbose}"
           )"
           expected_release="${MSRV}"
           if [[ "${expected_release}" =~ ^[0-9]+\.[0-9]+$ ]]; then
@@ -70,6 +73,6 @@ jobs:
             exit 1
           fi
 
-          rustc +"${MSRV}" --version --verbose
+          printf '%s\n' "${rustc_verbose}"
           cargo +"${MSRV}" --version --verbose
           cargo +"${MSRV}" check --locked --all-targets
