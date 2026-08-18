@@ -1014,6 +1014,7 @@ mod tests {
                 expected_latency_micros: 2_000,
                 quality_lower_confidence_bp: 1,
                 certified_probability_bp: 1,
+                details: crate::optimizer::predictor::OutcomeDistributionDetails::default(),
             })
             .expect("evaluate");
         assert_eq!(value.risk_adjusted_cost_micros, 6_000);
