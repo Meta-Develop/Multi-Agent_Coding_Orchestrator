@@ -1433,20 +1433,7 @@ fn has_rust_extension(path: &Path) -> bool {
 }
 
 fn is_ignored_path(path: &Path) -> bool {
-    path == Path::new(".git")
-        || path.starts_with(".git")
-        || path == Path::new(".maco")
-        || path.starts_with(".maco")
-        || path == Path::new("target")
-        || path.starts_with("target")
-        || path == Path::new(".agent/temp")
-        || path.starts_with(".agent/temp")
-        || path == Path::new(".agent/storage")
-        || path.starts_with(".agent/storage")
-        || path == Path::new(".agents/temp")
-        || path.starts_with(".agents/temp")
-        || path == Path::new(".agents/storage")
-        || path.starts_with(".agents/storage")
+    crate::repo_map::is_ignored_scan_path(path)
 }
 
 fn normalize_query_path(root: &Path, path: &Path) -> PathBuf {
@@ -1949,10 +1936,13 @@ pub fn endpoint() {}
         write_file(&repo, "src/a.rs", "pub fn alpha() {}\n");
         write_file(&repo, "target/generated.rs", "pub fn generated() {}\n");
         write_file(&repo, ".maco/state/skipped.rs", "pub fn skipped() {}\n");
+        write_file(&repo, ".maco-cache/generated.rs", "pub fn cached() {}\n");
+        write_file(&repo, ".codex/session.rs", "pub fn session() {}\n");
         write_file(&repo, ".agent/temp/skipped.rs", "pub fn skipped() {}\n");
         write_file(&repo, ".agent/storage/skipped.rs", "pub fn skipped() {}\n");
         write_file(&repo, ".agents/temp/skipped.rs", "pub fn skipped() {}\n");
         write_file(&repo, ".agents/storage/skipped.rs", "pub fn skipped() {}\n");
+        write_file(&repo, ".agents/live/claims/worker.rs", "pub fn live() {}\n");
         write_file(&repo, ".agents/docs/context.rs", "pub fn context() {}\n");
 
         let map = scan_repository(&repo).expect("scan");
@@ -1976,6 +1966,10 @@ pub fn endpoint() {}
                 .collect::<Vec<_>>(),
             vec!["context", "alpha", "zed"]
         );
+        assert!(map
+            .symbols
+            .iter()
+            .all(|symbol| !matches!(symbol.name.as_str(), "cached" | "session" | "live")));
     }
 
     #[test]

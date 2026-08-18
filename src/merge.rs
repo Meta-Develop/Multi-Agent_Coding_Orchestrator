@@ -5296,11 +5296,7 @@ fn dirty_primary_check(repo_root: &Path) -> Result<SafetyCheck> {
 }
 
 fn is_local_runtime_path(path: &Path) -> bool {
-    matches!(
-        path.components().next(),
-        Some(std::path::Component::Normal(name))
-            if name == OsStr::new(".maco") || name == OsStr::new(".maco-cache")
-    )
+    crate::repo_map::is_runtime_control_path(path)
 }
 
 fn stale_base_check(metadata: &WorktreeMergeMetadata) -> SafetyCheck {
