@@ -1034,8 +1034,8 @@ struct UseImport {
 
 #[derive(Debug, Clone)]
 struct SourceIndex {
+    source: String,
     line_starts: Vec<usize>,
-    source_len: usize,
 }
 
 impl SourceIndex {
@@ -1048,8 +1048,8 @@ impl SourceIndex {
         }
 
         Self {
+            source: source.to_string(),
             line_starts,
-            source_len: source.len(),
         }
     }
 
@@ -1076,10 +1076,22 @@ impl SourceIndex {
             .line_starts
             .get(line_index)
             .copied()
-            .unwrap_or(self.source_len);
+            .unwrap_or(self.source.len());
+        let line_end = self
+            .line_starts
+            .get(line_index + 1)
+            .copied()
+            .unwrap_or(self.source.len());
+        let line = self.source.get(line_start..line_end).unwrap_or_default();
+        // proc-macro2 LineColumn::column counts UTF-8 characters, not bytes.
+        let byte_in_line = line
+            .char_indices()
+            .nth(location.column)
+            .map(|(index, _)| index)
+            .unwrap_or(line.len());
         line_start
-            .saturating_add(location.column)
-            .min(self.source_len)
+            .saturating_add(byte_in_line)
+            .min(self.source.len())
     }
 }
 
@@ -1980,5 +1992,60 @@ pub fn endpoint() {}
                 && symbol.name == "OK"
                 && symbol.file == Path::new("src/good.rs")
         }));
+    }
+
+    #[test]
+    fn source_spans_use_byte_offsets_on_non_ascii_lines() {
+        let source = "/* héllo */ fn f() {}\nuse crate::api; /* café */\n";
+        let (_temp, repo) = init_repo();
+        write_file(&repo, "src/lib.rs", source);
+
+        let map = scan_repository(&repo).expect("scan");
+        let function = map
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "f")
+            .expect("function symbol");
+        let import = map
+            .imports
+            .iter()
+            .find(|import| import.path == "crate::api")
+            .expect("import");
+
+        let expected_fn = source.find("fn f() {}").expect("function text");
+        let expected_use = source.find("use crate::api;").expect("import text");
+        assert_eq!(function.span.start_byte, expected_fn);
+        assert_eq!(
+            &source[function.span.start_byte..function.span.end_byte],
+            "fn f() {}"
+        );
+        assert_eq!(import.span.start_byte, expected_use);
+        assert_eq!(
+            &source[import.span.start_byte..import.span.end_byte],
+            "use crate::api;"
+        );
+        assert!(source.is_char_boundary(function.span.start_byte));
+        assert!(source.is_char_boundary(function.span.end_byte));
+        assert!(source.is_char_boundary(import.span.start_byte));
+        assert!(source.is_char_boundary(import.span.end_byte));
+    }
+
+    #[test]
+    fn source_index_converts_char_columns_to_byte_offsets() {
+        let source = "/* héllo */ fn f() {}\n";
+        let index = SourceIndex::new(source);
+        let start = source.find("fn").expect("fn");
+        let location = LineColumn {
+            line: 1,
+            column: source[..start].chars().count(),
+        };
+        assert_eq!(index.offset(location), start);
+        assert_eq!(
+            index.offset(LineColumn {
+                line: 1,
+                column: source.chars().count() - 1
+            }),
+            source.len() - 1
+        );
     }
 }
