@@ -40,6 +40,7 @@ struct ServerConfig {
     accept_poll_interval: Duration,
     stream_poll_interval: Duration,
     stream_heartbeat_interval: Duration,
+    simulate_spawn_failure: bool,
 }
 
 impl ServerConfig {
@@ -53,6 +54,7 @@ impl ServerConfig {
             accept_poll_interval: ACCEPT_POLL_INTERVAL,
             stream_poll_interval: STREAM_POLL_INTERVAL,
             stream_heartbeat_interval: STREAM_HEARTBEAT_INTERVAL,
+            simulate_spawn_failure: false,
         }
     }
 }
@@ -146,12 +148,7 @@ fn serve_listener_with_config(
                 };
                 let source = Arc::clone(&source);
                 let connection_shutdown = Arc::clone(&shutdown);
-                thread::Builder::new()
-                    .name("maco-scope-http".to_string())
-                    .spawn(move || {
-                        let _permit = permit;
-                        let _ = handle_connection(stream, source, connection_shutdown, config);
-                    })?;
+                start_connection_thread(stream, source, connection_shutdown, config, permit);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(config.accept_poll_interval);
@@ -180,6 +177,33 @@ impl ConnectionPermit {
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn start_connection_thread(
+    mut stream: TcpStream,
+    source: Arc<dyn ScopeDataSource>,
+    shutdown: Arc<AtomicBool>,
+    config: ServerConfig,
+    permit: ConnectionPermit,
+) {
+    if config.simulate_spawn_failure {
+        let _permit = permit;
+        let _ = write_spawn_unavailable(&mut stream);
+        return;
+    }
+    let mut reply = stream.try_clone().ok();
+    if thread::Builder::new()
+        .name("maco-scope-http".to_string())
+        .spawn(move || {
+            let _permit = permit;
+            let _ = handle_connection(stream, source, shutdown, config);
+        })
+        .is_err()
+    {
+        if let Some(reply) = reply.as_mut() {
+            let _ = write_spawn_unavailable(reply);
+        }
     }
 }
 
@@ -734,6 +758,19 @@ fn write_json_response<T: Serialize + ?Sized>(
     )
 }
 
+fn write_spawn_unavailable(stream: &mut TcpStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(OVER_CAPACITY_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(OVER_CAPACITY_IO_TIMEOUT))?;
+    drain_request_headers(stream);
+    write_json_response(
+        stream,
+        "503 Service Unavailable",
+        &json!({"error": "failed to start Scope connection"}),
+        &["Retry-After: 1"],
+        MAX_JSON_RESPONSE_BYTES,
+    )
+}
+
 fn write_over_capacity(stream: &mut TcpStream) -> io::Result<()> {
     stream.set_read_timeout(Some(OVER_CAPACITY_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(OVER_CAPACITY_IO_TIMEOUT))?;
@@ -1031,6 +1068,7 @@ mod tests {
             accept_poll_interval: Duration::from_millis(1),
             stream_poll_interval: Duration::from_millis(5),
             stream_heartbeat_interval: Duration::from_millis(20),
+            simulate_spawn_failure: false,
         }
     }
 
@@ -1379,6 +1417,35 @@ mod tests {
         assert!(response.contains("var projectionGroups = new Map()"));
         assert!(response.contains("state.view === \"repository\""));
         assert!(response.contains("state.view === \"combined\""));
+        server.stop();
+    }
+
+    #[test]
+    fn spawn_failure_refuses_one_connection_and_keeps_accepting() {
+        let source: Arc<dyn ScopeDataSource> =
+            Arc::new(TestDataSource::new(json!({"projects": []}), Vec::new()));
+        let mut fail_config = test_config();
+        fail_config.simulate_spawn_failure = true;
+        let mut failing = TestServer::start(Arc::clone(&source), fail_config);
+        let refused = http_get(failing.address, "/api/projects");
+        assert!(
+            refused.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "spawn failure should not terminate the listener: {refused}"
+        );
+        assert!(refused.contains("failed to start Scope connection"));
+        let still_listening = http_get(failing.address, "/api/projects");
+        assert!(
+            still_listening.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "accept loop exited after spawn failure: {still_listening}"
+        );
+        failing.stop();
+
+        let mut server = TestServer::start(source, test_config());
+        let recovered = http_get(server.address, "/api/projects");
+        assert!(
+            recovered.starts_with("HTTP/1.1 200 OK"),
+            "healthy listener should still serve: {recovered}"
+        );
         server.stop();
     }
 
