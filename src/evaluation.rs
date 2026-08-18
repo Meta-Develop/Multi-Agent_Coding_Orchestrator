@@ -8,6 +8,7 @@ use crate::{
     artifacts::state_auth::sha256_hex,
     autopilot::{AutopilotProfileBindingReport, AutopilotProfileBindingStatus},
     llm::provider::Usage,
+    objective_profile::{default_objective_profile, ObjectiveProfile, ObjectiveProfileBinding},
     supervise::{
         AgentRole, Finding, FindingSeverity, ProcessObservation, RoleBindingObservation,
         RoleEconomicsProfile, RoleModelSelection, RoleUsageObservation, RoleUsageReport,
@@ -40,9 +41,6 @@ pub const DISPATCH_COMPARABILITY_NOTICE: &str = "comparison is scoped to MACO-di
      selections; it does not establish that the provider executed profiles differently";
 
 const BASIS_POINTS: u32 = 10_000;
-const HELD_OUT_WEIGHT_PERCENT: u32 = 50;
-const BREADTH_WEIGHT_PERCENT: u32 = 25;
-const ANTI_SHORTCUT_WEIGHT_PERCENT: u32 = 25;
 
 /// A reproducible target for an early evaluation over a hand-authored supervisor plan.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -711,6 +709,8 @@ pub struct EvaluationResults {
     pub profile_summaries: Vec<ProfileSummary>,
     pub pareto_conclusion: ParetoConclusion,
     pub pareto_frontier: Vec<ParetoPoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective_profile: Option<ObjectiveProfileBinding>,
 }
 
 impl EvaluationResults {
@@ -734,6 +734,7 @@ impl EvaluationResults {
             profile_summaries: self.profile_summaries.clone(),
             pareto_conclusion: self.pareto_conclusion.clone(),
             pareto_frontier: self.pareto_frontier.clone(),
+            objective_profile: self.objective_profile.clone(),
         }
     }
 }
@@ -753,6 +754,8 @@ pub struct EvaluationSummary {
     pub profile_summaries: Vec<ProfileSummary>,
     pub pareto_conclusion: ParetoConclusion,
     pub pareto_frontier: Vec<ParetoPoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective_profile: Option<ObjectiveProfileBinding>,
 }
 
 impl EvaluationSummary {
@@ -1025,6 +1028,7 @@ fn run_deterministic_fake(
         profile_summaries,
         pareto_conclusion,
         pareto_frontier,
+        objective_profile: Some(bound_objective_profile(&default_objective_profile())?),
     };
     validate_results_against_manifest(manifest, &results)?;
     Ok(results)
@@ -2689,14 +2693,26 @@ fn calculate_quality(
         u64::from(review.anti_shortcut.checks_passed),
         u64::from(review.anti_shortcut.checks_run),
     );
-    let weighted = held_out_basis_points * HELD_OUT_WEIGHT_PERCENT
-        + breadth_basis_points * BREADTH_WEIGHT_PERCENT
-        + anti_shortcut_basis_points * ANTI_SHORTCUT_WEIGHT_PERCENT;
+    let overall_basis_points = default_objective_profile().overall_quality_basis_points(
+        held_out_basis_points,
+        breadth_basis_points,
+        anti_shortcut_basis_points,
+    );
     Ok(QualityScore {
         held_out_basis_points,
         breadth_basis_points,
         anti_shortcut_basis_points,
-        overall_basis_points: weighted / 100,
+        overall_basis_points,
+    })
+}
+
+/// Bind the objective profile that produced `overall` quality so later
+/// re-weighting cannot silently rewrite this experiment.
+pub fn bound_objective_profile(
+    profile: &ObjectiveProfile,
+) -> Result<ObjectiveProfileBinding, EvaluationError> {
+    profile.binding().map_err(|error| {
+        invalid_results("objective_profile", error.to_string())
     })
 }
 
@@ -2939,6 +2955,7 @@ fn evaluation_summaries_equivalent(left: &EvaluationSummary, right: &EvaluationS
         && profile_summaries_equivalent(&left.profile_summaries, &right.profile_summaries)
         && left.pareto_conclusion == right.pareto_conclusion
         && pareto_frontiers_equivalent(&left.pareto_frontier, &right.pareto_frontier)
+        && left.objective_profile == right.objective_profile
 }
 
 fn role_usage_maps_equivalent(
