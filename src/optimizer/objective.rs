@@ -1008,13 +1008,13 @@ mod tests {
             profile: PreferenceProfile::shipped_default(),
         };
         let value = evaluator
-            .evaluate(&PolicyOutcomeDistribution {
-                policy_id: policy("p1"),
-                expected_cost_micros: 10_000,
-                expected_latency_micros: 2_000,
-                quality_lower_confidence_bp: 1,
-                certified_probability_bp: 1,
-            })
+            .evaluate(&PolicyOutcomeDistribution::new(
+                policy("p1"),
+                10_000,
+                2_000,
+                1,
+                1,
+            ))
             .expect("evaluate");
         assert_eq!(value.risk_adjusted_cost_micros, 6_000);
         assert_eq!(value.tail_latency_micros, 2_000);

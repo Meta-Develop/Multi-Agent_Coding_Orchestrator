@@ -980,6 +980,7 @@ mod tests {
             end_byte: 1,
             start_line: 1,
             end_line: 1,
+            signature_end_line: 1,
         }
     }
 
