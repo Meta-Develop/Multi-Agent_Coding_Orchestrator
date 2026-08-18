@@ -183,6 +183,8 @@ pub struct SourceSpan {
     pub end_byte: usize,
     pub start_line: usize,
     pub end_line: usize,
+    /// Last line of the declaration signature (through `{` or `;`), not the body.
+    pub signature_end_line: usize,
 }
 
 pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<SemanticRepoMap> {
@@ -1034,8 +1036,8 @@ struct UseImport {
 
 #[derive(Debug, Clone)]
 struct SourceIndex {
+    source: String,
     line_starts: Vec<usize>,
-    source_len: usize,
 }
 
 impl SourceIndex {
@@ -1048,8 +1050,8 @@ impl SourceIndex {
         }
 
         Self {
+            source: source.to_string(),
             line_starts,
-            source_len: source.len(),
         }
     }
 
@@ -1057,13 +1059,26 @@ impl SourceIndex {
         let start = span.start();
         let end = span.end();
         let start_byte = self.offset(start);
-        let end_byte = self.offset(end);
+        let end_byte = self.offset(end).max(start_byte);
+        let start_line = start.line;
+        let end_line = end.line.max(start.line);
         SourceSpan {
             start_byte,
-            end_byte: end_byte.max(start_byte),
-            start_line: start.line,
-            end_line: end.line.max(start.line),
+            end_byte,
+            start_line,
+            end_line,
+            signature_end_line: self.signature_end_line(start_byte, end_byte, start_line),
         }
+    }
+
+    fn signature_end_line(&self, start_byte: usize, end_byte: usize, start_line: usize) -> usize {
+        let snippet = self.source.get(start_byte..end_byte).unwrap_or_default();
+        for (offset, line) in snippet.split_inclusive('\n').enumerate() {
+            if line.contains('{') || line.contains(';') {
+                return start_line.saturating_add(offset);
+            }
+        }
+        start_line
     }
 
     fn offset(&self, location: LineColumn) -> usize {
@@ -1076,10 +1091,22 @@ impl SourceIndex {
             .line_starts
             .get(line_index)
             .copied()
-            .unwrap_or(self.source_len);
+            .unwrap_or(self.source.len());
+        let line_end = self
+            .line_starts
+            .get(line_index + 1)
+            .copied()
+            .unwrap_or(self.source.len());
+        let line = self.source.get(line_start..line_end).unwrap_or_default();
+        // proc-macro2 LineColumn::column counts UTF-8 characters, not bytes.
+        let byte_in_line = line
+            .char_indices()
+            .nth(location.column)
+            .map(|(index, _)| index)
+            .unwrap_or(line.len());
         line_start
-            .saturating_add(location.column)
-            .min(self.source_len)
+            .saturating_add(byte_in_line)
+            .min(self.source.len())
     }
 }
 
@@ -1325,8 +1352,11 @@ fn module_path_for_file(file: &Path) -> Vec<String> {
         }
     }
 
-    for component in components {
-        if component == "lib" || component == "main" || component == "mod" {
+    let last_index = components.len().saturating_sub(1);
+    for (index, component) in components.into_iter().enumerate() {
+        // Only the file-stem component is a crate root alias. Directories named
+        // lib/main/mod are real modules and must stay in the path.
+        if index == last_index && matches!(component.as_str(), "lib" | "main" | "mod") {
             continue;
         }
         parts.push(component);
@@ -1418,20 +1448,7 @@ fn has_rust_extension(path: &Path) -> bool {
 }
 
 fn is_ignored_path(path: &Path) -> bool {
-    path == Path::new(".git")
-        || path.starts_with(".git")
-        || path == Path::new(".maco")
-        || path.starts_with(".maco")
-        || path == Path::new("target")
-        || path.starts_with("target")
-        || path == Path::new(".agent/temp")
-        || path.starts_with(".agent/temp")
-        || path == Path::new(".agent/storage")
-        || path.starts_with(".agent/storage")
-        || path == Path::new(".agents/temp")
-        || path.starts_with(".agents/temp")
-        || path == Path::new(".agents/storage")
-        || path.starts_with(".agents/storage")
+    crate::repo_map::is_ignored_scan_path(path)
 }
 
 fn normalize_query_path(root: &Path, path: &Path) -> PathBuf {
@@ -1934,10 +1951,13 @@ pub fn endpoint() {}
         write_file(&repo, "src/a.rs", "pub fn alpha() {}\n");
         write_file(&repo, "target/generated.rs", "pub fn generated() {}\n");
         write_file(&repo, ".maco/state/skipped.rs", "pub fn skipped() {}\n");
+        write_file(&repo, ".maco-cache/generated.rs", "pub fn cached() {}\n");
+        write_file(&repo, ".codex/session.rs", "pub fn session() {}\n");
         write_file(&repo, ".agent/temp/skipped.rs", "pub fn skipped() {}\n");
         write_file(&repo, ".agent/storage/skipped.rs", "pub fn skipped() {}\n");
         write_file(&repo, ".agents/temp/skipped.rs", "pub fn skipped() {}\n");
         write_file(&repo, ".agents/storage/skipped.rs", "pub fn skipped() {}\n");
+        write_file(&repo, ".agents/live/claims/worker.rs", "pub fn live() {}\n");
         write_file(&repo, ".agents/docs/context.rs", "pub fn context() {}\n");
 
         let map = scan_repository(&repo).expect("scan");
@@ -1961,6 +1981,10 @@ pub fn endpoint() {}
                 .collect::<Vec<_>>(),
             vec!["context", "alpha", "zed"]
         );
+        assert!(map
+            .symbols
+            .iter()
+            .all(|symbol| !matches!(symbol.name.as_str(), "cached" | "session" | "live")));
     }
 
     #[test]
@@ -1980,5 +2004,160 @@ pub fn endpoint() {}
                 && symbol.name == "OK"
                 && symbol.file == Path::new("src/good.rs")
         }));
+    }
+
+    #[test]
+    fn source_spans_use_byte_offsets_on_non_ascii_lines() {
+        let source = "/* héllo */ fn f() {}\nuse crate::api; /* café */\n";
+        let (_temp, repo) = init_repo();
+        write_file(&repo, "src/lib.rs", source);
+
+        let map = scan_repository(&repo).expect("scan");
+        let function = map
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "f")
+            .expect("function symbol");
+        let import = map
+            .imports
+            .iter()
+            .find(|import| import.path == "crate::api")
+            .expect("import");
+
+        let expected_fn = source.find("fn f() {}").expect("function text");
+        let expected_use = source.find("use crate::api;").expect("import text");
+        assert_eq!(function.span.start_byte, expected_fn);
+        assert_eq!(
+            &source[function.span.start_byte..function.span.end_byte],
+            "fn f() {}"
+        );
+        assert_eq!(import.span.start_byte, expected_use);
+        assert_eq!(
+            &source[import.span.start_byte..import.span.end_byte],
+            "use crate::api;"
+        );
+        assert!(source.is_char_boundary(function.span.start_byte));
+        assert!(source.is_char_boundary(function.span.end_byte));
+        assert!(source.is_char_boundary(import.span.start_byte));
+        assert!(source.is_char_boundary(import.span.end_byte));
+    }
+
+    #[test]
+    fn source_index_converts_char_columns_to_byte_offsets() {
+        let source = "/* héllo */ fn f() {}\n";
+        let index = SourceIndex::new(source);
+        let start = source.find("fn").expect("fn");
+        let location = LineColumn {
+            line: 1,
+            column: source[..start].chars().count(),
+        };
+        assert_eq!(index.offset(location), start);
+        assert_eq!(
+            index.offset(LineColumn {
+                line: 1,
+                column: source.chars().count() - 1
+            }),
+            source.len() - 1
+        );
+    }
+
+    #[test]
+    fn module_path_strips_lib_main_mod_only_from_the_file_stem() {
+        assert_eq!(
+            module_path_for_file(Path::new("src/lib.rs")),
+            vec!["crate".to_string()]
+        );
+        assert_eq!(
+            module_path_for_file(Path::new("src/main.rs")),
+            vec!["crate".to_string()]
+        );
+        assert_eq!(
+            module_path_for_file(Path::new("src/main/config.rs")),
+            vec![
+                "crate".to_string(),
+                "main".to_string(),
+                "config".to_string()
+            ]
+        );
+        assert_eq!(
+            module_path_for_file(Path::new("src/lib/helpers.rs")),
+            vec![
+                "crate".to_string(),
+                "lib".to_string(),
+                "helpers".to_string()
+            ]
+        );
+        assert_eq!(
+            module_path_for_file(Path::new("src/main/mod.rs")),
+            vec!["crate".to_string(), "main".to_string()]
+        );
+        assert_eq!(
+            module_path_for_file(Path::new("tests/main.rs")),
+            vec!["tests".to_string()]
+        );
+        assert_eq!(
+            module_path_for_file(Path::new("src/mod/inner.rs")),
+            vec!["crate".to_string(), "mod".to_string(), "inner".to_string()]
+        );
+    }
+
+    #[test]
+    fn semantic_scan_keeps_directory_components_named_main_lib_or_mod() {
+        let (_temp, repo) = init_repo();
+        write_file(&repo, "src/lib.rs", "pub fn root() {}\n");
+        write_file(&repo, "src/main/config.rs", "pub fn cfg() {}\n");
+        write_file(&repo, "src/lib/helpers.rs", "pub fn help() {}\n");
+        write_file(&repo, "tests/main.rs", "fn harness() {}\n");
+
+        let map = scan_repository(&repo).expect("scan");
+        let module_path = |path: &str| {
+            map.files
+                .iter()
+                .find(|file| file.path == Path::new(path))
+                .map(|file| file.module_path.clone())
+                .expect(path)
+        };
+
+        assert_eq!(module_path("src/lib.rs"), vec!["crate".to_string()]);
+        assert_eq!(
+            module_path("src/main/config.rs"),
+            vec![
+                "crate".to_string(),
+                "main".to_string(),
+                "config".to_string()
+            ]
+        );
+        assert_eq!(
+            module_path("src/lib/helpers.rs"),
+            vec![
+                "crate".to_string(),
+                "lib".to_string(),
+                "helpers".to_string()
+            ]
+        );
+        assert_eq!(module_path("tests/main.rs"), vec!["tests".to_string()]);
+        assert!(map.symbols.iter().any(|symbol| {
+            symbol.name == "cfg" && symbol.qualified_path == vec!["crate", "main", "config", "cfg"]
+        }));
+    }
+
+    #[test]
+    fn signature_end_line_stops_at_the_declaration_brace() {
+        let (_temp, repo) = init_repo();
+        write_file(
+            &repo,
+            "src/lib.rs",
+            "pub fn foo(\n    x: i32,\n    y: i32,\n) -> i32 {\n    x + y\n}\n",
+        );
+
+        let map = scan_repository(&repo).expect("scan");
+        let function = map
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "foo")
+            .expect("function");
+        assert_eq!(function.span.start_line, 1);
+        assert_eq!(function.span.signature_end_line, 4);
+        assert!(function.span.end_line > function.span.signature_end_line);
     }
 }

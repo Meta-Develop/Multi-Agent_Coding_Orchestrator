@@ -1,0 +1,28 @@
+<section id="catalogView" class="page-panel" hidden aria-label="Run catalog">
+  <div class="panel-heading">
+    <span class="section-label">Run catalog</span>
+    <span id="catalogSummary" class="hint">Discovering…</span>
+    <button id="catalogRefresh" type="button">Refresh</button>
+  </div>
+  <p class="page-copy">
+    Read-only inventory from <code>/api/projects</code>. Opening a run jumps to the
+    live observer with the existing filter contract (<code>repo</code>,
+    <code>family</code>, <code>run</code>).
+  </p>
+  <p id="catalogError" class="error" role="alert"></p>
+  <div class="workspace" style="min-height: auto; display: block; border-radius: 0 0 0.7rem 0.7rem;">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Project</th>
+          <th>Family</th>
+          <th>Run</th>
+          <th>Events</th>
+          <th>Final report</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="catalogBody"></tbody>
+    </table>
+  </div>
+</section>
