@@ -2701,84 +2701,84 @@ mod tests {
         assert!(sent_interrupt(&transport));
     }
 
+    fn assert_mid_turn_fault_sends_interrupt(
+        label: &str,
+        extra: ReaderEvent,
+        matches_error: impl Fn(&AppServerError) -> bool,
+    ) {
+        let mut incoming = FakeTransport::from_values(base_messages()).incoming;
+        incoming.insert(0, extra);
+        let mut transport = FakeTransport {
+            incoming,
+            sent: Vec::new(),
+            reads: None,
+            force_timeout: false,
+        };
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test(label)),
+            || false,
+        )
+        .expect_err(label);
+        assert!(
+            matches_error(&error),
+            "{label} produced unexpected error: {error:?}"
+        );
+        assert!(
+            sent_interrupt(&transport),
+            "{label} must interrupt the in-flight turn"
+        );
+    }
+
     #[test]
     fn mid_turn_protocol_faults_send_interrupt_once_ids_are_known() {
-        let cases: [(&str, Vec<ReaderEvent>, fn(&AppServerError) -> bool); 4] = [
-            (
-                "unsupported method",
-                vec![ReaderEvent::Line(
-                    json!({
-                        "method": "item/newVendorProgress",
-                        "params": {"threadId": "thread-1", "turnId": "turn-1"}
-                    })
-                    .to_string()
-                    .into_bytes(),
-                )],
-                |error| {
-                    matches!(
-                        error,
-                        AppServerError::Unexpected { phase: "turn", message }
-                            if message.contains("unsupported method")
-                    )
-                },
+        assert_mid_turn_fault_sends_interrupt(
+            "unsupported method",
+            ReaderEvent::Line(
+                json!({
+                    "method": "item/newVendorProgress",
+                    "params": {"threadId": "thread-1", "turnId": "turn-1"}
+                })
+                .to_string()
+                .into_bytes(),
             ),
-            (
-                "malformed JSON",
-                vec![ReaderEvent::Line(b"{not-json".to_vec())],
-                |error| matches!(error, AppServerError::Malformed { phase: "turn", .. }),
+            |error| {
+                matches!(
+                    error,
+                    AppServerError::Unexpected { phase: "turn", message }
+                        if message.contains("unsupported method")
+                )
+            },
+        );
+        assert_mid_turn_fault_sends_interrupt(
+            "malformed JSON",
+            ReaderEvent::Line(b"{not-json".to_vec()),
+            |error| matches!(error, AppServerError::Malformed { phase: "turn", .. }),
+        );
+        assert_mid_turn_fault_sends_interrupt(
+            "remote error",
+            ReaderEvent::Line(
+                json!({
+                    "method": "error",
+                    "params": {"message": "child exploded"}
+                })
+                .to_string()
+                .into_bytes(),
             ),
-            (
-                "remote error",
-                vec![ReaderEvent::Line(
-                    json!({
-                        "method": "error",
-                        "params": {"message": "child exploded"}
-                    })
-                    .to_string()
-                    .into_bytes(),
-                )],
-                |error| matches!(error, AppServerError::Remote { phase: "turn", .. }),
-            ),
-            (
-                "transport failure",
-                vec![ReaderEvent::Failed("pipe broken".to_string())],
-                |error| {
-                    matches!(
-                        error,
-                        AppServerError::Transport { message } if message.contains("pipe broken")
-                    )
-                },
-            ),
-        ];
-
-        for (label, extra, matches_error) in cases {
-            let mut incoming = FakeTransport::from_values(base_messages()).incoming;
-            for event in extra.into_iter().rev() {
-                incoming.insert(0, event);
-            }
-            let mut transport = FakeTransport {
-                incoming,
-                sent: Vec::new(),
-                reads: None,
-                force_timeout: false,
-            };
-            let error = run_app_server_turn(
-                &mut transport,
-                &test_turn(),
-                AppServerLimits::default(),
-                &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test(label)),
-                || false,
-            )
-            .expect_err(label);
-            assert!(
-                matches_error(&error),
-                "{label} produced unexpected error: {error:?}"
-            );
-            assert!(
-                sent_interrupt(&transport),
-                "{label} must interrupt the in-flight turn"
-            );
-        }
+            |error| matches!(error, AppServerError::Remote { phase: "turn", .. }),
+        );
+        assert_mid_turn_fault_sends_interrupt(
+            "transport failure",
+            ReaderEvent::Failed("pipe broken".to_string()),
+            |error| {
+                matches!(
+                    error,
+                    AppServerError::Transport { message } if message.contains("pipe broken")
+                )
+            },
+        );
     }
 
     #[test]
