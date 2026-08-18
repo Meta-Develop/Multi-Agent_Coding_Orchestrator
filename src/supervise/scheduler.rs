@@ -2897,7 +2897,16 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     apply_execution_target_reporting(&mut final_report, plan_metadata.execution_target.as_ref());
     let checkpoint_finalization = match artifact_writer.resume_binding() {
         Ok(binding) => {
-            checkpoint_writer.scheduler_closed(binding, budget_ledger.report()?)?;
+            // Bind the same snapshot already sealed into the final report.
+            // A second budget_ledger.report() can cross a 1-second boundary and
+            // diverge on elapsed_seconds / remaining.max_duration_seconds,
+            // making resume refuse a still-valid interrupted finalization.
+            checkpoint_writer.scheduler_closed(
+                binding,
+                final_report.run_budget.clone().context(
+                    "run budget accounting could not be finalized for the scheduler-closed checkpoint",
+                )?,
+            )?;
             true
         }
         Err(error)
