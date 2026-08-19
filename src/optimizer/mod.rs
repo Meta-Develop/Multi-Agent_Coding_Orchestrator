@@ -33,6 +33,7 @@ pub mod hedge;
 pub mod ids;
 pub mod objective;
 pub mod online_router;
+pub mod operator_labels;
 pub mod policy;
 pub mod predictor;
 pub mod quality;
