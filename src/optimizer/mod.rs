@@ -31,6 +31,7 @@ pub mod certification;
 mod digest;
 pub mod drift;
 pub mod error;
+pub mod evidence_pool;
 pub mod explanation;
 pub mod failure_classifier;
 pub mod feasibility;
