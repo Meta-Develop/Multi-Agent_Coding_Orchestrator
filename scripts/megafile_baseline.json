@@ -1,0 +1,70 @@
+{
+  "src/artifacts.rs": {
+    "lines": 6227,
+    "bytes": 244063
+  },
+  "src/autopilot.rs": {
+    "lines": 8002,
+    "bytes": 321777
+  },
+  "src/cli.rs": {
+    "lines": 7906,
+    "bytes": 285958
+  },
+  "src/evaluation.rs": {
+    "lines": 4790,
+    "bytes": 187845
+  },
+  "src/external_agent.rs": {
+    "lines": 10528,
+    "bytes": 398455
+  },
+  "src/inbox.rs": {
+    "lines": 6233,
+    "bytes": 219829
+  },
+  "src/live_claim.rs": {
+    "lines": 4785,
+    "bytes": 171964
+  },
+  "src/merge.rs": {
+    "lines": 11434,
+    "bytes": 420757
+  },
+  "src/orchestrator.rs": {
+    "lines": 9998,
+    "bytes": 371331
+  },
+  "src/process_runner.rs": {
+    "lines": 14896,
+    "bytes": 559505
+  },
+  "src/publication.rs": {
+    "lines": 12405,
+    "bytes": 474565
+  },
+  "src/review.rs": {
+    "lines": 8143,
+    "bytes": 301565
+  },
+  "src/safe_state.rs": {
+    "lines": 6316,
+    "bytes": 229507
+  },
+  "src/state_migration.rs": {
+    "lines": 4424,
+    "bytes": 165973
+  },
+  "src/supervise.rs": {
+    "lines": 4480,
+    "bytes": 157068
+  },
+  "src/supervise/scheduler.rs": {
+    "lines": 4489,
+    "bytes": 183370
+  },
+  "src/worktree.rs": {
+    "lines": 19039,
+    "bytes": 774419
+  }
+}

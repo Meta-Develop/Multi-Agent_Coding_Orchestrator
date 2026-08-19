@@ -34,6 +34,9 @@ jobs:
       - name: Check tracked path portability
         run: python3 scripts/check_repository_portability.py
 
+      - name: Check megafile baseline
+        run: python3 scripts/check_megafile_baseline.py
+
   linux:
     name: Linux fmt, check, clippy, and test
     runs-on: ubuntu-latest
