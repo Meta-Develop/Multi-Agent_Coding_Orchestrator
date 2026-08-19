@@ -623,12 +623,15 @@ fn scan_rust_file(
     Ok(())
 }
 
-#[cfg(unix)]
+// The hardened descriptor-relative reader exists only on Linux. Every other
+// platform, including other Unix targets, must use the portable bounded
+// reader, so this gate is `target_os`, not `unix`.
+#[cfg(target_os = "linux")]
 fn read_semantic_source(root: &Path, file: &Path, max_bytes: u64) -> Result<String> {
     BoundedRegularReader::read_relative_utf8(root, file, max_bytes)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn read_semantic_source(root: &Path, file: &Path, max_bytes: u64) -> Result<String> {
     BoundedRegularReader::read_utf8(root.join(file), max_bytes)
 }
@@ -1603,6 +1606,17 @@ mod tests {
             .errors
             .iter()
             .all(|error| !error.message.contains("ultra_secret_external_contents")));
+    }
+
+    #[test]
+    fn read_semantic_source_reads_a_regular_file_on_every_platform() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        let relative = Path::new("sample.txt");
+        fs::write(root.join(relative), "hello semantic source\n").expect("write file");
+        let contents = read_semantic_source(root, relative, MAX_SEMANTIC_FILE_BYTES)
+            .expect("read regular file");
+        assert_eq!(contents, "hello semantic source\n");
     }
 
     #[test]
