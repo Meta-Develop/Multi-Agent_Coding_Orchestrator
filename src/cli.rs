@@ -4371,6 +4371,20 @@ fn reap_merged_managed_worktrees(repo: &Path) -> Result<Option<WorktreeLifecycle
         return Ok(None);
     }
 
+    let state_path = git.commondir().join("maco").join("state");
+    match std::fs::symlink_metadata(&state_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect managed worktree state at {}",
+                    state_path.display()
+                )
+            })
+        }
+    }
+
     let manager = WorktreeManager::new(repo);
     let candidate_agent_ids = manager
         .list()
@@ -7720,6 +7734,10 @@ mod tests {
         assert!(reap_merged_managed_worktrees(&repo_path)
             .expect("reap should succeed")
             .is_none());
+        assert!(
+            !repo_path.join(".git/maco").exists(),
+            "completion reap must not create MACO state in a repository that never used managed worktrees"
+        );
     }
 
     #[test]
