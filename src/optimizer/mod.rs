@@ -20,6 +20,7 @@
 //! the #146 boundary). The core depends on capabilities, not CLI assumptions.
 
 pub mod action;
+pub mod calibration;
 pub mod catalog;
 pub mod certification;
 pub mod difficulty;

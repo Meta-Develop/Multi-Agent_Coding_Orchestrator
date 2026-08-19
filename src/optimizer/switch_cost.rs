@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 
 use super::action::{ModelAction, RestartMode};
 use super::error::OptimizerError;
-use super::ids::TimestampMillis;
 use super::objective::{ObjectiveEvaluator, ObjectiveValue};
 use super::policy::PolicyGraph;
 use super::predictor::{feature_keys, feature_text, primary_action, SampleCell};
@@ -448,7 +447,7 @@ mod tests {
     };
     use crate::optimizer::ids::{
         BackendId, CatalogVersion, ModelFamilyId, PolicyId, PolicyNodeId, ProviderId, RuntimeSlug,
-        VerifierProfileId,
+        TimestampMillis, VerifierProfileId,
     };
     use crate::optimizer::policy::PolicyNode;
     use crate::optimizer::predictor::{insert_text, PolicyOutcomeDistribution};

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use super::action::CanonicalEffort;
+use super::calibration::{constrain_candidates, CalibrationAuditor, CalibrationResponse};
 use super::error::OptimizerError;
 use super::explanation::{
     effort_rank, CandidatePrediction, ComparedPolicy, DecisionDiagnostics, DecisionExplanation,
@@ -198,6 +199,8 @@ pub struct SafeContextualRouter {
     voi: Option<Box<dyn ValueOfInformation + Send + Sync>>,
     config: RouterConfig,
     switch_costs: SwitchCostModel,
+    calibration: Option<CalibrationResponse>,
+    baseline_policy: Option<PolicyId>,
 }
 
 impl SafeContextualRouter {
@@ -214,6 +217,8 @@ impl SafeContextualRouter {
             voi: None,
             config,
             switch_costs: SwitchCostModel::new(),
+            calibration: None,
+            baseline_policy: None,
         }
     }
 
@@ -224,6 +229,16 @@ impl SafeContextualRouter {
 
     pub fn with_switch_costs(mut self, switch_costs: SwitchCostModel) -> Self {
         self.switch_costs = switch_costs;
+        self
+    }
+
+    pub fn with_calibration(
+        mut self,
+        response: CalibrationResponse,
+        baseline: Option<PolicyId>,
+    ) -> Self {
+        self.calibration = Some(response);
+        self.baseline_policy = baseline;
         self
     }
 
@@ -353,6 +368,30 @@ impl OnlineRouter for SafeContextualRouter {
         .record_on(&mut diagnostics, None);
         diagnostics.oscillation_count =
             Some(oscillation_count(&trajectory_identities(state, candidates)));
+
+        let restricted;
+        let candidates: &[PolicyGraph] = if let Some(response) = &self.calibration {
+            CalibrationAuditor::record_on(&mut diagnostics, response);
+            match response.selection_constraint() {
+                super::calibration::SelectionConstraint::FailClosed => {
+                    return Ok(infeasible(state, diagnostics, "calibration_fail_closed"));
+                }
+                super::calibration::SelectionConstraint::RestrictToBaseline => {
+                    restricted =
+                        constrain_candidates(candidates, response, self.baseline_policy.as_ref())
+                            .into_iter()
+                            .cloned()
+                            .collect::<Vec<_>>();
+                    if restricted.is_empty() {
+                        return Ok(infeasible(state, diagnostics, "calibration_no_baseline"));
+                    }
+                    &restricted
+                }
+                super::calibration::SelectionConstraint::Unrestricted => candidates,
+            }
+        } else {
+            candidates
+        };
 
         if candidates.is_empty() {
             return Ok(infeasible(state, diagnostics, "no_candidates"));
@@ -1696,6 +1735,50 @@ mod tests {
         assert_eq!(
             decision.router.selected_policy().map(PolicyId::as_str),
             Some("current")
+        );
+    }
+
+    #[test]
+    fn calibration_fail_closed_is_infeasible_and_records_the_metric() {
+        let mut predictor = ScriptedPredictor::new();
+        predictor.insert(dist("cheap", 9_500, 10, 10, 1, 1));
+        let response = crate::optimizer::calibration::CalibrationResponse {
+            fail_closed: true,
+            triggering_metric: Some("ece_bp".into()),
+            steps: vec![
+                crate::optimizer::calibration::MiscalibrationStep::FailClosed {
+                    metric: "ece_bp".into(),
+                },
+            ],
+            ..crate::optimizer::calibration::CalibrationResponse::default()
+        };
+        let decision = router(predictor)
+            .with_calibration(response, None)
+            .select(
+                &capable_state(),
+                &[execute_policy(
+                    "cheap",
+                    "model-a",
+                    CanonicalEffort::Low,
+                    RestartMode::Continuation,
+                )],
+            )
+            .expect("select");
+        assert!(matches!(
+            decision,
+            RouterDecision::Infeasible {
+                ref reason,
+                ..
+            } if reason == "calibration_fail_closed"
+        ));
+        assert!(!decision.may_publish());
+        assert_eq!(
+            decision.diagnostics().calibration_metric.as_deref(),
+            Some("ece_bp")
+        );
+        assert_eq!(
+            decision.diagnostics().calibration_step.as_deref(),
+            Some("fail_closed")
         );
     }
 }

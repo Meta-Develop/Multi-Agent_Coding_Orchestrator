@@ -103,6 +103,10 @@ pub struct DecisionDiagnostics {
     pub decision_overhead_micros: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overhead_degraded: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_metric: Option<String>,
 }
 
 impl DecisionDiagnostics {
@@ -136,6 +140,8 @@ impl DecisionDiagnostics {
             difficulty_upper_bp: None,
             decision_overhead_micros: None,
             overhead_degraded: None,
+            calibration_step: None,
+            calibration_metric: None,
         }
     }
 

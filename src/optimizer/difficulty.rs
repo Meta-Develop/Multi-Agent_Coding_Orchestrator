@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::error::OptimizerError;
 use super::explanation::DecisionDiagnostics;
 use super::features::{keys, FeatureBag};
-use super::ids::{PolicyId, TimestampMillis};
+use super::ids::PolicyId;
 use super::online_router::{
     CheckpointDecision, CheckpointRouter, ContinuationKind, OnlineRouter, RouterDecision,
     SafeContextualRouter,
@@ -624,7 +624,7 @@ mod tests {
     use crate::optimizer::features::FeatureValue;
     use crate::optimizer::ids::{
         BackendId, CatalogVersion, FeatureId, ModelFamilyId, PolicyNodeId, ProviderId, RuntimeSlug,
-        VerifierProfileId,
+        TimestampMillis, VerifierProfileId,
     };
     use crate::optimizer::online_router::{RouterConfig, TailRiskObjective};
     use crate::optimizer::policy::PolicyNode;
