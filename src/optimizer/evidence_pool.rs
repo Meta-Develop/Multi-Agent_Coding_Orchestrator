@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use super::digest::sha256_hex;
 use super::error::OptimizerError;
 use super::features::{FeatureBag, FeatureValue};
-use super::ids::{CatalogVersion, FeatureId, PolicyId, TimestampMillis};
+use super::ids::{CatalogVersion, PolicyId, TimestampMillis};
 use super::policy::PolicyGraph;
 use super::predictor::{HierarchicalPolicyPredictor, HierarchyKey};
 use super::state::OptimizerState;
@@ -473,7 +473,20 @@ fn compact_records(records: &mut Vec<PortableEvidenceRecord>, max_records: usize
             })
             .or_insert(record);
     }
-    let mut compacted: Vec<PortableEvidenceRecord> = merged.into_values().collect();
+    let mut compacted = Vec::new();
+    for mut record in merged.into_values() {
+        if let Ok(hash) = record.body.content_hash() {
+            record.content_hash = hash;
+            compacted.push(record);
+        }
+    }
+    compacted.sort_by(|left, right| {
+        right
+            .body
+            .observation_count
+            .cmp(&left.body.observation_count)
+            .then_with(|| left.content_hash.as_str().cmp(right.content_hash.as_str()))
+    });
     if compacted.len() > max_records {
         compacted.truncate(max_records);
     }
@@ -562,7 +575,8 @@ mod tests {
         RestartMode, ReviewTopology, RuntimeModelId, TopologySpec, WorkerTopology,
     };
     use crate::optimizer::ids::{
-        BackendId, ModelFamilyId, PolicyNodeId, ProviderId, RuntimeSlug, VerifierProfileId,
+        BackendId, FeatureId, ModelFamilyId, PolicyNodeId, ProviderId, RuntimeSlug,
+        VerifierProfileId,
     };
     use crate::optimizer::policy::PolicyNode;
     use crate::optimizer::predictor::{feature_keys, insert_text, PolicyPredictor};
@@ -856,5 +870,25 @@ mod tests {
             reloaded.records[0].content_hash,
             corpus.records[0].content_hash
         );
+    }
+
+    #[test]
+    fn compact_recomputes_content_hashes_and_bounds_retention() {
+        let mut pool = EvidencePool::new();
+        let first = export_record(&request("repo-a", true, "p1")).expect("first");
+        let second = export_record(&request("repo-a", true, "p1")).expect("second");
+        let other = export_record(&request("repo-b", false, "p2")).expect("other");
+        pool.record_local(first).expect("record first");
+        pool.record_local(second).expect("record second");
+        pool.record_local(other).expect("record other");
+        pool.compact(1);
+        assert_eq!(pool.local.len(), 1);
+        let kept = &pool.local[0];
+        assert_eq!(
+            kept.content_hash,
+            kept.body.content_hash().expect("rehashed")
+        );
+        assert_eq!(kept.body.observation_count, 2);
+        assert_eq!(kept.body.cell.hashed_repository, hash_identity("repo-a"));
     }
 }

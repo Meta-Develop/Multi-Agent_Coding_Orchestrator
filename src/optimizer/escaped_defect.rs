@@ -14,7 +14,7 @@ use super::error::OptimizerError;
 use super::evidence_pool::{ClosedToken, ContentHash, TaxonomyCell};
 use super::failure_classifier::TrajectoryLabel;
 use super::ids::{ContractId, PolicyId, RequirementId, TimestampMillis, ValidatorId};
-use super::quality::{QualityContract, ValidatorBinding, ValidatorKind};
+use super::quality::{QualityContract, ValidatorBinding};
 use super::telemetry::PolicyExecutionId;
 
 /// Why the declared contract failed to catch a later defect.
@@ -444,7 +444,7 @@ pub fn cannot_certify() -> Result<Infallible, OptimizerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::optimizer::quality::{RequirementContract, RequirementStatus};
+    use crate::optimizer::quality::{RequirementContract, RequirementStatus, ValidatorKind};
     use std::path::PathBuf;
 
     fn cell() -> TaxonomyCell {
@@ -714,6 +714,25 @@ mod tests {
             EscapeSource::SamplingReaudit
         ));
         assert!(cannot_certify().is_err());
+    }
+
+    #[test]
+    fn escaped_defect_must_bind_a_certified_execution() {
+        let version = contract_version(&contract()).expect("version");
+        let mut ledger = EscapedDefectLedger::new();
+        let error = ledger
+            .record_escape(
+                escape(
+                    "d-unbound",
+                    "exec-missing",
+                    &version,
+                    MissingConditionClass::ValidatorAbsent,
+                    EscapeSource::PostRunSignal,
+                ),
+                None,
+            )
+            .expect_err("unbound");
+        assert!(error.to_string().contains("certified execution"));
     }
 
     #[test]

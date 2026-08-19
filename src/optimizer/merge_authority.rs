@@ -272,20 +272,6 @@ pub struct MergeDecision {
     pub explanation: String,
 }
 
-impl MergeDecision {
-    pub fn refuse(request: &MergeRequest, reason: impl Into<String>) -> Self {
-        Self {
-            auto_merge_requested: request.requested,
-            auto_merge_performed: false,
-            independence: assess_independence(&request.producer, &request.reviewer),
-            lenses: aggregate_lenses(&request.lenses),
-            failed_checks: Vec::new(),
-            never_auto_merge: never_auto_merge_reason(&request.changed_paths),
-            explanation: reason.into(),
-        }
-    }
-}
-
 /// Default-deny merge authority. `auto_merge_performed` is true only when
 /// every recorded gate passes for an independent reviewer.
 pub fn decide_merge(request: &MergeRequest) -> Result<MergeDecision, OptimizerError> {
@@ -572,6 +558,14 @@ mod tests {
             creds.never_auto_merge,
             Some(NeverAutoMergeClass::PermissionsOrCredentials)
         );
+
+        request.changed_paths = vec![PathBuf::from("src/protected_path.rs")];
+        let protected = decide_merge(&request).expect("protected");
+        assert_eq!(
+            protected.never_auto_merge,
+            Some(NeverAutoMergeClass::ProtectedPath)
+        );
+        assert!(!protected.auto_merge_performed);
     }
 
     #[test]

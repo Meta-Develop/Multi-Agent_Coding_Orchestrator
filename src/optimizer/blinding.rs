@@ -131,17 +131,12 @@ pub struct DerivedLabel {
     pub blinding: BlindingState,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProducerVisibility {
+    #[default]
     Hidden,
     Revealed,
-}
-
-impl Default for ProducerVisibility {
-    fn default() -> Self {
-        Self::Hidden
-    }
 }
 
 /// Human review/approval payload. Producer identity is absent unless toggled.
