@@ -24,6 +24,10 @@ use super::predictor::{
 };
 use super::resources::Quantity;
 use super::state::{OptimizerState, PosteriorSummary};
+use super::switch_cost::{
+    apply_switch_cost, current_action_from_candidates, estimate_switch, oscillation_count,
+    trajectory_identities, SwitchCostEstimate, SwitchCostModel,
+};
 use super::taxonomy::{classify, TaxonomySpec};
 use super::trajectory::{TrajectoryEvent, TrajectoryObservation};
 use super::value_of_information::{
@@ -193,6 +197,7 @@ pub struct SafeContextualRouter {
     objective: Box<dyn ObjectiveEvaluator + Send + Sync>,
     voi: Option<Box<dyn ValueOfInformation + Send + Sync>>,
     config: RouterConfig,
+    switch_costs: SwitchCostModel,
 }
 
 impl SafeContextualRouter {
@@ -208,11 +213,17 @@ impl SafeContextualRouter {
             objective,
             voi: None,
             config,
+            switch_costs: SwitchCostModel::new(),
         }
     }
 
     pub fn with_voi(mut self, voi: Box<dyn ValueOfInformation + Send + Sync>) -> Self {
         self.voi = Some(voi);
+        self
+    }
+
+    pub fn with_switch_costs(mut self, switch_costs: SwitchCostModel) -> Self {
+        self.switch_costs = switch_costs;
         self
     }
 
@@ -235,13 +246,17 @@ impl SafeContextualRouter {
         predicted: &[(usize, PolicyOutcomeDistribution)],
     ) -> Result<ClassifiedCandidates, OptimizerError> {
         let mut classified = ClassifiedCandidates::default();
+        let previous = current_action_from_candidates(state, candidates);
         for (index, distribution) in predicted {
             let policy = &candidates[*index];
             let feasibility = self
                 .feasibility
                 .check_predicted(state, policy, distribution)?;
+            let switch = estimate_switch(&self.switch_costs, previous, policy);
             let objective = if feasibility.feasible {
-                Some(self.objective.evaluate(distribution)?)
+                let mut value = self.objective.evaluate(distribution)?;
+                apply_switch_cost(&mut value, &switch, self.switch_costs.hysteresis());
+                Some(value)
             } else {
                 None
             };
@@ -250,6 +265,7 @@ impl SafeContextualRouter {
                 distribution: distribution.clone(),
                 feasibility,
                 objective,
+                switch,
             });
         }
         Ok(classified)
@@ -335,6 +351,8 @@ impl OnlineRouter for SafeContextualRouter {
             &TaxonomySpec::v1(),
         )
         .record_on(&mut diagnostics, None);
+        diagnostics.oscillation_count =
+            Some(oscillation_count(&trajectory_identities(state, candidates)));
 
         if candidates.is_empty() {
             return Ok(infeasible(state, diagnostics, "no_candidates"));
@@ -546,6 +564,7 @@ struct ClassifiedCandidate {
     distribution: PolicyOutcomeDistribution,
     feasibility: super::feasibility::FeasibilityResult,
     objective: Option<ObjectiveValue>,
+    switch: SwitchCostEstimate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -742,6 +761,7 @@ fn four_way_comparison(
         })
         .or_else(|| candidates.first());
     let current_action = current.and_then(primary_action);
+    let previous = current_action_from_candidates(state, candidates);
 
     let mut comparison = EscalationComparison {
         same_model_higher_effort: None,
@@ -755,8 +775,15 @@ fn four_way_comparison(
         let Some(action) = primary_action(policy) else {
             if is_clean_restart(policy) {
                 if let Ok(predicted) = router.predictor.predict(state, policy) {
-                    if let Ok(objective) = router.objective.evaluate(&predicted) {
-                        comparison.clean_restart = Some(compared(policy, &predicted, &objective));
+                    if let Ok(mut objective) = router.objective.evaluate(&predicted) {
+                        let switch = estimate_switch(&router.switch_costs, previous, policy);
+                        apply_switch_cost(
+                            &mut objective,
+                            &switch,
+                            router.switch_costs.hysteresis(),
+                        );
+                        comparison.clean_restart =
+                            Some(compared(policy, &predicted, &objective, &switch));
                     }
                 }
             }
@@ -772,10 +799,12 @@ fn four_way_comparison(
         let Ok(predicted) = router.predictor.predict(state, policy) else {
             continue;
         };
-        let Ok(objective) = router.objective.evaluate(&predicted) else {
+        let Ok(mut objective) = router.objective.evaluate(&predicted) else {
             continue;
         };
-        let slot = compared(policy, &predicted, &objective);
+        let switch = estimate_switch(&router.switch_costs, previous, policy);
+        apply_switch_cost(&mut objective, &switch, router.switch_costs.hysteresis());
+        let slot = compared(policy, &predicted, &objective, &switch);
         if is_clean_restart(policy) {
             comparison.clean_restart = Some(slot);
         } else if same_model && higher {
@@ -793,6 +822,7 @@ fn compared(
     policy: &PolicyGraph,
     predicted: &PolicyOutcomeDistribution,
     objective: &ObjectiveValue,
+    switch: &SwitchCostEstimate,
 ) -> ComparedPolicy {
     let action = primary_action(policy);
     ComparedPolicy {
@@ -805,6 +835,7 @@ fn compared(
             .unwrap_or_default(),
         objective_value_micros: objective.risk_adjusted_cost_micros,
         quality_lcb_bp: predicted.quality_lower_confidence_bp,
+        switch_cost_micros: switch.total_cost_micros,
     }
 }
 
@@ -864,6 +895,9 @@ fn select_policy(
             );
             diagnostics.record_consumption(dimension.as_str(), Quantity::new(expected));
         }
+        diagnostics.switch_cost_micros = Some(entry.switch.total_cost_micros);
+        diagnostics.switch_class = Some(entry.switch.class.as_str().to_string());
+        diagnostics.switch_observation = Some(entry.switch.observation_label().to_string());
     }
     diagnostics.continuation = continuation.map(str::to_string);
     diagnostics.escalation_comparison = escalation;
@@ -1516,7 +1550,88 @@ mod tests {
         assert!(comparison.different_model_same_effort.is_some());
         assert!(comparison.different_model_higher_effort.is_some());
         assert!(comparison.clean_restart.is_some());
+        assert_eq!(
+            comparison
+                .same_model_higher_effort
+                .as_ref()
+                .expect("same")
+                .switch_cost_micros,
+            0
+        );
+        assert!(
+            comparison
+                .different_model_same_effort
+                .as_ref()
+                .expect("other")
+                .switch_cost_micros
+                > 0
+        );
+        assert!(
+            comparison
+                .clean_restart
+                .as_ref()
+                .expect("restart")
+                .switch_cost_micros
+                > 0
+        );
         assert!(decision.router.explanation().diagnostics_json().is_some());
+    }
+
+    #[test]
+    fn switch_smaller_than_switch_cost_is_not_selected() {
+        let mut predictor = ScriptedPredictor::new();
+        predictor.insert(dist("keep", 9_500, 5_000, 5_000, 50, 1));
+        predictor.insert(dist("swap", 9_500, 4_900, 4_900, 40, 1));
+        let mut state = capable_state();
+        insert_text(
+            &mut state.task_features,
+            feature_keys::CURRENT_POLICY,
+            "keep",
+        );
+        let decision = router(predictor)
+            .select(
+                &state,
+                &[
+                    execute_policy(
+                        "keep",
+                        "model-a",
+                        CanonicalEffort::Low,
+                        RestartMode::Continuation,
+                    ),
+                    execute_policy(
+                        "swap",
+                        "model-b",
+                        CanonicalEffort::Low,
+                        RestartMode::Continuation,
+                    ),
+                ],
+            )
+            .expect("select");
+        assert_eq!(
+            decision.selected_policy().map(PolicyId::as_str),
+            Some("keep")
+        );
+        let swap = decision
+            .diagnostics()
+            .candidate_predictions
+            .iter()
+            .find(|pred| pred.policy.as_str() == "swap")
+            .expect("swap pred");
+        let keep = decision
+            .diagnostics()
+            .candidate_predictions
+            .iter()
+            .find(|pred| pred.policy.as_str() == "keep")
+            .expect("keep pred");
+        assert!(
+            swap.objective_value_micros.unwrap_or(0) > keep.objective_value_micros.unwrap_or(0),
+            "switch cost must dominate the 100µs predicted gain"
+        );
+        assert_eq!(
+            decision.diagnostics().switch_class.as_deref(),
+            Some("continue")
+        );
+        assert_eq!(decision.diagnostics().switch_cost_micros, Some(0));
     }
 
     #[test]

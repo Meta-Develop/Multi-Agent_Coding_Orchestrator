@@ -83,6 +83,14 @@ pub struct DecisionDiagnostics {
     pub recommendation_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_observations: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_cost_micros: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_observation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oscillation_count: Option<u32>,
 }
 
 impl DecisionDiagnostics {
@@ -106,6 +114,10 @@ impl DecisionDiagnostics {
             taxonomy_confidence_bp: None,
             recommendation_source: None,
             evidence_observations: None,
+            switch_cost_micros: None,
+            switch_class: None,
+            switch_observation: None,
+            oscillation_count: None,
         }
     }
 
@@ -192,6 +204,8 @@ pub struct ComparedPolicy {
     pub effort: String,
     pub objective_value_micros: i64,
     pub quality_lcb_bp: u16,
+    #[serde(default)]
+    pub switch_cost_micros: i64,
 }
 
 pub(crate) fn role_label(role: &AgentRole) -> String {
