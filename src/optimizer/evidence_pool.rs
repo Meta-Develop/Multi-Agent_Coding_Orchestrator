@@ -82,6 +82,10 @@ fn scrub_error(class: ScrubClass, detail: impl Into<String>) -> OptimizerError {
 pub struct ContentHash(String);
 
 impl ContentHash {
+    pub fn from_hex(hex: impl Into<String>) -> Self {
+        Self(hex.into())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
