@@ -39,6 +39,7 @@ pub mod features;
 pub mod global_search;
 pub mod hedge;
 pub mod ids;
+pub mod merge_authority;
 pub mod objective;
 pub mod online_router;
 pub mod policy;
