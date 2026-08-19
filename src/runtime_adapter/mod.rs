@@ -995,6 +995,15 @@ mod tests {
         Ok(())
     }
 
+    const VERIFY_INSTALLED_CLIS_ENV: &str = "MACO_VERIFY_INSTALLED_CLIS";
+
+    fn installed_cli_verification_enabled() -> bool {
+        matches!(
+            env::var(VERIFY_INSTALLED_CLIS_ENV).as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        )
+    }
+
     fn installed_cli_help(binary: &str) -> Option<String> {
         let output = Command::new(binary).arg("--help").output().ok()?;
         let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -1006,76 +1015,144 @@ mod tests {
         }
     }
 
-    #[test]
-    fn grok_template_flags_are_present_on_the_installed_cli() {
-        let Some(help) = installed_cli_help("grok") else {
-            return;
-        };
-        for flag in ["--prompt-file", "--model", "--cwd", "--output-format"] {
-            assert!(help.contains(flag), "installed grok help missing {flag}");
+    fn require_installed_cli_help(binary: &str) -> String {
+        installed_cli_help(binary)
+            .unwrap_or_else(|| panic!("{VERIFY_INSTALLED_CLIS_ENV}=1 requires `{binary}` on PATH"))
+    }
+
+    fn assert_help_contains(help: &str, flags: &[&str], label: &str) {
+        for flag in flags {
+            assert!(help.contains(flag), "{label} missing {flag}");
         }
+    }
+
+    fn assert_grok_help_contract(help: &str, label: &str) {
+        assert_help_contains(
+            help,
+            &["--prompt-file", "--model", "--cwd", "--output-format"],
+            label,
+        );
         assert!(
             help.contains("--effort") || help.contains("--reasoning-effort"),
-            "installed grok help missing effort flag"
+            "{label} missing effort flag"
         );
         assert!(
             help.contains("models"),
-            "installed grok help missing models catalog command"
+            "{label} missing models catalog command"
+        );
+    }
+
+    fn assert_cursor_help_contract(help: &str, label: &str) {
+        assert_help_contains(
+            help,
+            &[
+                "--print",
+                "--model",
+                "--workspace",
+                "--output-format",
+                "--trust",
+            ],
+            label,
+        );
+        assert!(
+            !help.contains("--effort <"),
+            "{label} grew a standalone --effort flag; revisit the adapter template"
+        );
+    }
+
+    fn assert_claude_help_contract(help: &str, label: &str) {
+        assert_help_contains(
+            help,
+            &[
+                "--print",
+                "--output-format",
+                "--model",
+                "--effort",
+                "--resume",
+                "--permission-mode",
+            ],
+            label,
+        );
+    }
+
+    fn assert_gemini_help_contract(help: &str, label: &str) {
+        assert_help_contains(
+            help,
+            &["--prompt", "--model", "--output-format", "--resume"],
+            label,
         );
     }
 
     #[test]
-    fn cursor_template_flags_are_present_on_the_installed_cli() {
-        let Some(help) = installed_cli_help("cursor-agent") else {
+    fn grok_template_flags_are_present_in_the_pinned_help_fixture() {
+        assert_grok_help_contract(
+            include_str!("fixtures/grok-help.txt"),
+            "pinned grok help fixture",
+        );
+    }
+
+    #[test]
+    fn cursor_template_flags_are_present_in_the_pinned_help_fixture() {
+        assert_cursor_help_contract(
+            include_str!("fixtures/cursor-agent-help.txt"),
+            "pinned cursor-agent help fixture",
+        );
+    }
+
+    #[test]
+    fn claude_template_flags_are_present_in_the_pinned_help_fixture() {
+        assert_claude_help_contract(
+            include_str!("fixtures/claude-help.txt"),
+            "pinned claude help fixture",
+        );
+    }
+
+    #[test]
+    fn gemini_template_flags_are_present_in_the_pinned_help_fixture() {
+        assert_gemini_help_contract(
+            include_str!("fixtures/gemini-help.txt"),
+            "pinned gemini help fixture",
+        );
+    }
+
+    #[test]
+    fn grok_template_flags_are_present_on_the_installed_cli() {
+        if !installed_cli_verification_enabled() {
             return;
-        };
-        for flag in [
-            "--print",
-            "--model",
-            "--workspace",
-            "--output-format",
-            "--trust",
-        ] {
-            assert!(
-                help.contains(flag),
-                "installed cursor-agent help missing {flag}"
-            );
         }
-        assert!(
-            !help.contains("--effort <"),
-            "cursor-agent grew a standalone --effort flag; revisit the adapter template"
+        assert_grok_help_contract(&require_installed_cli_help("grok"), "installed grok help");
+    }
+
+    #[test]
+    fn cursor_template_flags_are_present_on_the_installed_cli() {
+        if !installed_cli_verification_enabled() {
+            return;
+        }
+        assert_cursor_help_contract(
+            &require_installed_cli_help("cursor-agent"),
+            "installed cursor-agent help",
         );
     }
 
     #[test]
     fn claude_template_flags_are_present_on_the_installed_cli() {
-        let Some(help) = installed_cli_help("claude") else {
+        if !installed_cli_verification_enabled() {
             return;
-        };
-        for flag in ["--print", "--output-format", "--model", "--effort"] {
-            assert!(help.contains(flag), "installed claude help missing {flag}");
         }
-        assert!(
-            help.contains("--resume"),
-            "installed claude help missing session resume"
-        );
-        assert!(
-            help.contains("--permission-mode"),
-            "installed claude help missing permission-mode"
+        assert_claude_help_contract(
+            &require_installed_cli_help("claude"),
+            "installed claude help",
         );
     }
 
     #[test]
     fn gemini_template_flags_are_present_on_the_installed_cli() {
-        let Some(help) = installed_cli_help("gemini") else {
+        if !installed_cli_verification_enabled() {
             return;
-        };
-        for flag in ["--prompt", "--model", "--output-format"] {
-            assert!(help.contains(flag), "installed gemini help missing {flag}");
         }
-        assert!(
-            help.contains("--resume"),
-            "installed gemini help missing session resume"
+        assert_gemini_help_contract(
+            &require_installed_cli_help("gemini"),
+            "installed gemini help",
         );
     }
 }
