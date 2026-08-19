@@ -91,6 +91,18 @@ pub struct DecisionDiagnostics {
     pub switch_observation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oscillation_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty_score_bp: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty_lower_bp: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty_upper_bp: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_overhead_micros: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overhead_degraded: Option<bool>,
 }
 
 impl DecisionDiagnostics {
@@ -118,6 +130,12 @@ impl DecisionDiagnostics {
             switch_class: None,
             switch_observation: None,
             oscillation_count: None,
+            stage_path: None,
+            difficulty_score_bp: None,
+            difficulty_lower_bp: None,
+            difficulty_upper_bp: None,
+            decision_overhead_micros: None,
+            overhead_degraded: None,
         }
     }
 

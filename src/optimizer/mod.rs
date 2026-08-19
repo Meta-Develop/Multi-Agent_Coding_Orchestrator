@@ -22,6 +22,7 @@
 pub mod action;
 pub mod catalog;
 pub mod certification;
+pub mod difficulty;
 pub mod drift;
 pub mod error;
 pub mod explanation;
