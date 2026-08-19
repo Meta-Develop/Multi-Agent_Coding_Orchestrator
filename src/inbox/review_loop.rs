@@ -4,6 +4,11 @@
 //! dispositions, advances a digest-chained bounded state machine, emits
 //! conservative readiness evidence, and constructs one typed PR-comment
 //! publication effect. A readiness proof is deliberately not merge authority.
+//!
+//! [`open_review_loop`] is the production entry: observe a pull request through
+//! a [`ForgeTransport`], construct [`ReviewLoopState`], and evaluate readiness.
+//! Callers that want a user-facing path still have to wire that function from
+//! `maco review`, a supervisor role, or a workflow. This module does not merge.
 
 use crate::{
     artifacts::state_auth::sha256_hex,
@@ -1939,6 +1944,25 @@ fn derive_attempt_id(
     Ok(format!("attempt:{digest}"))
 }
 
+/// Observe a pull request and construct the initial review-loop state.
+///
+/// This is the production entry a CLI subcommand, supervisor role, or
+/// workflow should call. It does not persist state, dispatch fix work,
+/// or grant merge authority.
+/// [`ReviewLoopReadinessProof::grants_merge_permission`] stays false.
+pub fn open_review_loop<T>(
+    transport: &T,
+    item: &ForgeItem,
+    policy: ReviewLoopPolicy,
+    trusted_not_after: &ForgeTimestamp,
+) -> Result<ReviewLoopState>
+where
+    T: ForgeTransport + ?Sized,
+{
+    let snapshot = FrozenReviewSnapshot::observe(transport, item, trusted_not_after)?;
+    ReviewLoopState::new(policy, snapshot, trusted_not_after)
+}
+
 impl ReviewLoopState {
     pub fn new(
         policy: ReviewLoopPolicy,
@@ -3826,5 +3850,47 @@ mod tests {
         let colliding_request =
             ForgeEffectRequest::append_comment(colliding_effect).expect("typed collision request");
         assert!(transport.execute(&colliding_request).is_err());
+    }
+
+    #[test]
+    fn open_review_loop_observes_through_the_transport_and_does_not_grant_merge() {
+        let human = actor("actor:human", "alice", ReportedActorKind::Human);
+        let bot = actor("actor:bot", "review-bot", ReportedActorKind::Bot);
+        let check_actor = actor("actor:checks", "checks-bot", ReportedActorKind::Bot);
+        let policy = policy(&human, &bot, &check_actor);
+        let current = item();
+        let snapshot = PullRequestReviewSnapshot::new(
+            current.clone(),
+            timestamp(),
+            vec![review(
+                "review:open",
+                human.clone(),
+                ForgeReviewState::Approved,
+            )],
+            Vec::new(),
+            vec![check("check:open", check_actor.clone())],
+        )
+        .expect("valid ready snapshot");
+        let request = ForgeObservationRequest::pull_request_review_snapshot(current.clone())
+            .expect("valid observation request");
+        let mut transport = FakeForgeTransport::new();
+        transport
+            .register_observation(
+                request,
+                ForgeObservation::PullRequestReviewSnapshot(snapshot),
+            )
+            .expect("register exact observation");
+
+        let state = open_review_loop(&transport, &current, policy, &timestamp())
+            .expect("open review loop from transport");
+        assert_eq!(state.phase(), ReviewLoopPhase::Ready);
+        match state.readiness().expect("readiness") {
+            ReviewLoopReadinessEvaluation::Ready(proof) => {
+                assert!(!proof.grants_merge_permission());
+            }
+            ReviewLoopReadinessEvaluation::Blocked(blocked) => {
+                panic!("expected ready observation, got blockers {blocked:?}");
+            }
+        }
     }
 }
