@@ -1162,12 +1162,12 @@ pub(super) fn provisional_default_role_model_selection(role: AgentRole) -> RoleM
     let (reasoning_effort, budget_degrade_models, on_exhausted) = match role {
         AgentRole::Supervisor => (
             "xhigh",
-            vec![BALANCED_PROFILE_MODEL, ECONOMY_PROFILE_MODEL],
+            vec![ECONOMY_PROFILE_MODEL],
             TerminalUnavailableModelFallback::RuntimeDefault,
         ),
         AgentRole::ChildOrchestrator | AgentRole::Auditor => (
             "xhigh",
-            vec![BALANCED_PROFILE_MODEL, ECONOMY_PROFILE_MODEL],
+            vec![ECONOMY_PROFILE_MODEL],
             TerminalUnavailableModelFallback::RuntimeDefault,
         ),
         AgentRole::Worker => (
@@ -1242,10 +1242,18 @@ pub(super) fn apply_role_model_selection(
     catalog: &RuntimeModelCatalog,
 ) -> Result<ExternalAgentCommand> {
     let configured = effective_role_model_selection(plan, role);
-    let selection = catalog
-        .resolve_role_model_selection(&configured, runtime)?
-        .selection;
-    Ok(command.with_model_selection(selection.model, selection.reasoning_effort))
+    let resolution = catalog.resolve_role_model_selection(&configured, runtime)?;
+    authorize_resolved_judgment_model(
+        role,
+        configured.model.as_deref(),
+        resolution.selection.model.as_deref(),
+        resolution.observation,
+        runtime,
+    )?;
+    Ok(command.with_model_selection(
+        resolution.selection.model,
+        resolution.selection.reasoning_effort,
+    ))
 }
 
 pub(super) fn runtime_resolved_prompt_plan(
@@ -1256,10 +1264,17 @@ pub(super) fn runtime_resolved_prompt_plan(
     let mut resolved = plan.clone();
     for role in [AgentRole::ChildOrchestrator, AgentRole::Worker] {
         let configured = effective_role_model_selection(plan, role);
-        let selection = catalog
-            .resolve_role_model_selection(&configured, runtime)?
-            .selection;
-        resolved.role_models.insert(role, selection);
+        let resolution = catalog.resolve_role_model_selection(&configured, runtime)?;
+        if role != AgentRole::Worker {
+            authorize_resolved_judgment_model(
+                role,
+                configured.model.as_deref(),
+                resolution.selection.model.as_deref(),
+                resolution.observation,
+                runtime,
+            )?;
+        }
+        resolved.role_models.insert(role, resolution.selection);
     }
     Ok(resolved)
 }
@@ -1286,6 +1301,7 @@ pub(super) fn apply_review_lens_model_selection(
             .with_model_provider(None)
             .with_model_selection(None, None));
     }
+    validate_known_judgment_role_model(AgentRole::Auditor, Some(model))?;
     let resolved_effort = resolve_reasoning_effort(
         AgentRole::Auditor,
         assignment_reasoning_effort,
@@ -1752,6 +1768,11 @@ mod regression_tests {
 
     #[test]
     fn review_lens_dispatch_preserves_distinct_runtime_selection_and_scope() -> Result<()> {
+        let _capability = install_test_fixture_models(&[
+            ("model-alpha", ModelCapabilityClass::CriticalJudgment),
+            ("model-beta", ModelCapabilityClass::CriticalJudgment),
+        ])
+        .expect("review-lens fixture capability policy");
         let assignment = OrchestratorAssignment {
             id: "child-decorrelated".to_string(),
             runtime: None,

@@ -592,5 +592,22 @@
       "notice": "comparison is scoped to MACO-dispatched model selections; it does not establish that the provider executed profiles differently"
     }
   },
-  "pareto_frontier": []
+  "pareto_frontier": [],
+  "objective_profile": {
+    "id": "maco-default-objective-v1",
+    "version": 1,
+    "content_hash": "64a1962f8f603c668ecb15713baf7541b3f33899a4f8159026dafa3004c092c8",
+    "quality": {
+      "held_out_percent": 50,
+      "breadth_percent": 25,
+      "anti_shortcut_percent": 25
+    },
+    "tradeoffs": {
+      "monetary_cost_percent": 100,
+      "quota_consumption_percent": 0,
+      "latency_percent": 0,
+      "retry_rework_percent": 0,
+      "human_review_percent": 0
+    }
+  }
 }

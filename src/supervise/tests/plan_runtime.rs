@@ -1226,6 +1226,8 @@ fn admitted_nested_assignment_retains_ordinary_pipeline_and_acceptance_evidence(
 
 #[test]
 fn role_selection_produces_distinct_launched_role_argv() {
+    let _capability =
+        install_named_test_models(&["planner-model", "worker-model", "auditor-model"]);
     let mut plan = parse_supervisor_plan_with_consultant(
         std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
     )
@@ -1488,10 +1490,9 @@ fn single_slug_profile_with_budget_chains_round_trips_through_plan_json() {
         loaded.plan.role_models[&AgentRole::ChildOrchestrator].unavailable_model_fallback,
         UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
             models: Vec::new(),
-            budget_degrade_models: vec![
-                BALANCED_PROFILE_MODEL.to_string(),
-                ECONOMY_PROFILE_MODEL.to_string(),
-            ],
+            // gpt-5.6-terra is recorded as ineligible in the shipped capability
+            // policy, so the default degrade ladder may only name luna.
+            budget_degrade_models: vec![ECONOMY_PROFILE_MODEL.to_string()],
             on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
         })
     );
@@ -1720,6 +1721,7 @@ fn unavailable_model_fallback_is_a_runtime_aware_command_contract() {
         )
     };
     let missing_catalog = injected_codex_runtime_catalog(&["different-model"]);
+    let _capability = install_named_test_models(&["preferred-model"]);
 
     let runtime_default = apply_role_model_selection(
         base_command(),
@@ -1728,9 +1730,12 @@ fn unavailable_model_fallback_is_a_runtime_aware_command_contract() {
         SupervisorRuntime::Codex,
         &missing_catalog,
     )
-    .expect("known unavailable model uses the configured runtime default");
-    assert_eq!(runtime_default.model, None);
-    assert_eq!(runtime_default.reasoning_effort.as_deref(), Some("high"));
+    .expect_err("runtime-default selection is not capability evidence");
+    assert!(
+        format!("{runtime_default:#}")
+            .contains("runtime-default model selection is not capability evidence"),
+        "{runtime_default:#}"
+    );
 
     plan.role_models
         .get_mut(&AgentRole::ChildOrchestrator)
@@ -1771,7 +1776,9 @@ fn unavailable_model_fallback_is_a_runtime_aware_command_contract() {
 }
 
 #[test]
-fn known_unavailable_child_runtime_default_reaches_production_app_server_argv_before_dispatch() {
+fn known_unavailable_child_runtime_default_is_refused_as_capability_evidence() {
+    let _capability =
+        install_named_test_models(&["unavailable-child-model", "available-auditor-model"]);
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
@@ -1807,47 +1814,10 @@ fn known_unavailable_child_runtime_default_reaches_production_app_server_argv_be
         "known-unavailable-child-runtime-default",
     );
     let catalog = injected_codex_runtime_catalog(&["available-auditor-model"]);
-    let mut child_seen = false;
-    let mut auditor_seen = false;
-    let mut runner = |command: &ExternalAgentCommand| {
-        let name = command
-            .output_last_message
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or_default();
-        if name.contains("review-auditor") {
-            auditor_seen = true;
-            assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
-            let argv = crate::external_agent::command_argv(command)
-                .into_iter()
-                .map(|argument| argument.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            assert!(argv
-                .windows(2)
-                .any(|arguments| arguments == ["-m", "available-auditor-model"]));
-            let child = injected_child_report(&assignment);
-            write_injected_json(
-                &command.output_last_message,
-                &injected_auditor_report(&assignment, &child),
-            );
-        } else {
-            child_seen = true;
-            assert_eq!(command.workspace_access, WorkspaceAccess::ReadWrite);
-            assert!(command.model.is_none());
-            let argv = crate::external_agent::app_server_command_argv(command)
-                .into_iter()
-                .map(|argument| argument.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            assert!(
-                !argv.iter().any(|argument| argument.starts_with("model=")),
-                "known-unavailable child model remained pinned in app-server argv: {argv:?}"
-            );
-            assert!(argv
-                .windows(2)
-                .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"high\""] }));
-            write_injected_assignment_report(command, &assignment);
-        }
-        injected_verified_run(command)
+    let mut invocations = 0usize;
+    let mut runner = |_command: &ExternalAgentCommand| {
+        invocations = invocations.saturating_add(1);
+        panic!("runtime-default model selection must not reach dispatch")
     };
 
     let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
@@ -1858,42 +1828,24 @@ fn known_unavailable_child_runtime_default_reaches_production_app_server_argv_be
         Ok(catalog),
         &mut runner,
     )
-    .expect("run production command path with unavailable child model");
+    .expect("runtime-default capability refusal should produce a finalized report");
 
-    assert!(report.success, "unexpected failed report: {report:#?}");
-    assert!(child_seen);
-    assert!(auditor_seen);
-    assert_eq!(
-        report
-            .role_economics_profile
-            .as_ref()
-            .map(|profile| profile.model_availability),
-        Some(RoleModelAvailability::Unavailable)
+    assert_eq!(invocations, 0);
+    assert!(!report.success);
+    assert!(
+        report.findings.iter().any(|finding| {
+            finding
+                .message
+                .contains("runtime-default model selection is not capability evidence")
+        }),
+        "expected capability refusal, got {report:#?}"
     );
-    let binding = &report
-        .role_economics_profile
-        .as_ref()
-        .and_then(|profile| profile.execution.as_ref())
-        .expect("execution metadata")
-        .role_bindings[&AgentRole::ChildOrchestrator];
-    assert_eq!(
-        binding.configured_model.as_deref(),
-        Some("unavailable-child-model")
-    );
-    assert!(binding.resolved_model.is_none());
-    assert_eq!(binding.resolved_reasoning_effort.as_deref(), Some("high"));
-    assert_eq!(
-        binding.observation,
-        RoleBindingObservation::RuntimeDefaultResolved
-    );
-    assert!(binding
-        .unavailable_reason
-        .as_deref()
-        .is_some_and(|reason| reason.contains("not process-observable")));
 }
 
 #[test]
 fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor() {
+    let _capability =
+        install_named_test_models(&["available-child-model", "unavailable-auditor-model"]);
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
@@ -2058,6 +2010,7 @@ fn known_unavailable_child_fail_closed_reaches_production_core_without_dispatch_
 
 #[test]
 fn local_deterministic_fake_fallback_reaches_shared_supervisor_core_without_external_dispatch() {
+    // Fake harness fallback is configured execution, not a provider-model claim.
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment, 0);
@@ -2411,6 +2364,7 @@ fn supervisor_derives_review_coverage_from_assignment_and_run_report() {
 
 #[test]
 fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
+    let _capability = install_named_test_models(&["model-alpha", "model-beta"]);
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
@@ -2453,7 +2407,8 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
     ]);
     let options = injected_options(&repo_path, temp.path(), "stacked-review-lenses-execute");
     let run_id = options.run_id.clone();
-    let catalog = injected_codex_runtime_catalog(&["model-alpha", "model-beta"]);
+    let catalog =
+        injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL, "model-alpha", "model-beta"]);
     let mut lens_commands = Vec::new();
     let mut lens_prompts = Vec::new();
     let mut runner = |command: &ExternalAgentCommand| {
@@ -2581,6 +2536,7 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
 
 #[test]
 fn unavailable_lens_runtime_selection_is_reported_and_journaled_procedurally() {
+    let _capability = install_named_test_models(&["child-model"]);
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
@@ -2743,4 +2699,82 @@ fn supervisor_input_loader_accepts_direct_regular_files_and_refuses_unsafe_input
     let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("fifo path");
     assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
     assert!(load_supervisor_plan_file(&fifo).is_err());
+}
+
+#[test]
+fn provider_planning_session_lowers_recursive_tree_and_binds_run_identity() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    git2::Repository::init(repo).expect("init repo");
+    std::fs::create_dir_all(repo.join("src")).expect("src dir");
+    std::fs::write(repo.join("src/alpha.rs"), "pub fn alpha_task() {}\n").expect("alpha");
+    std::fs::write(repo.join("src/beta.rs"), "pub fn beta_task() {}\n").expect("beta");
+    let config = crate::planning::ProviderPlanningConfig::new("lower", "planner-model");
+    let provider_plan = crate::planning::ProviderRecursiveTaskPlan {
+        assignments: vec![crate::planning::ProviderTaskAssignmentTree {
+            id: "parent".to_string(),
+            task: "Coordinate alpha and beta".to_string(),
+            fragment_ids: vec!["fragment-001".to_string(), "fragment-002".to_string()],
+            assigned_paths: vec![PathBuf::from("src/alpha.rs"), PathBuf::from("src/beta.rs")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            child_assignments: vec![
+                crate::planning::ProviderTaskAssignmentTree {
+                    id: "alpha".to_string(),
+                    task: "Update alpha".to_string(),
+                    fragment_ids: vec!["fragment-001".to_string()],
+                    assigned_paths: vec![PathBuf::from("src/alpha.rs")],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: Vec::new(),
+                    child_assignments: Vec::new(),
+                },
+                crate::planning::ProviderTaskAssignmentTree {
+                    id: "beta".to_string(),
+                    task: "Update beta".to_string(),
+                    fragment_ids: vec!["fragment-002".to_string()],
+                    assigned_paths: vec![PathBuf::from("src/beta.rs")],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: Vec::new(),
+                    child_assignments: Vec::new(),
+                },
+            ],
+        }],
+    };
+    let mut provider = crate::llm::fake::FakeProvider::new("fake-planner", "planner-model");
+    provider
+        .push_json_response("lower-proposal", &provider_plan)
+        .expect("script recursive plan");
+    let session = crate::planning::propose_task_decomposition_with_provider(
+        repo,
+        "",
+        "- Update alpha behavior.\n- Update beta behavior.",
+        &mut provider,
+        &config,
+    )
+    .expect("provider session");
+
+    let plan = supervisor_plan_from_task_planning_session(
+        "",
+        "- Update alpha behavior.\n- Update beta behavior.",
+        &session,
+    )
+    .expect("lower provider session");
+    assert_eq!(plan.assignments.len(), 3);
+    assert_eq!(plan.assignments[0].id, "parent");
+    assert!(plan.assignments[0].worker_assignments.is_empty());
+    assert_eq!(plan.assignments[1].id, "alpha");
+    assert_eq!(plan.assignments[1].worker_assignments.len(), 1);
+    assert_eq!(plan.assignments[2].id, "beta");
+
+    let run_id = crate::orchestrator::RunId::new("provider-bind-run").expect("valid run id");
+    let bound = bind_provider_task_planning_session_to_supervisor_run(
+        "",
+        "- Update alpha behavior.\n- Update beta behavior.",
+        &session,
+        run_id.clone(),
+    )
+    .expect("bind provider session");
+    assert_eq!(bound.execution_binding.run_id(), &run_id);
+    assert_eq!(bound.plan.assignments.len(), 3);
+    assert!(bound.document.get("assignments").is_some());
 }
