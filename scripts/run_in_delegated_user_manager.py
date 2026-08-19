@@ -209,10 +209,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
-    command = list(args.command)
-    if command and command[0] == "--":
-        command = command[1:]
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # Split on the first "--" ourselves instead of relying on
+    # argparse.REMAINDER: whether a leading "--" is consumed by argparse or
+    # handed through to REMAINDER differs between Python versions, which made
+    # the same invocation work locally and fail on CI.
+    if "--" in raw:
+        separator = raw.index("--")
+        parser.parse_args(raw[:separator])
+        command = raw[separator + 1 :]
+    else:
+        command = list(parser.parse_args(raw).command)
     if not command:
         parser.error("a command is required after --")
     try:

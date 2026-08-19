@@ -223,11 +223,16 @@ def validate_msrv_workflow(source: str, manifest_version: str) -> None:
         check_commands, 'rustup toolchain install "${MSRV}" --profile minimal'
     )
     require_command(check_commands, 'actual_release="$(')
+    # The rustc output is captured into a variable before parsing. Piping a
+    # still-writing rustc into `awk ... exit` raises SIGPIPE under Actions'
+    # `set -o pipefail` and fails the step with exit 141, so the contract is
+    # capture-then-parse rather than a live pipe.
     require_command(
-        check_commands, 'rustc +"${MSRV}" --version --verbose |'
+        check_commands, 'rustc_verbose="$(rustc +"${MSRV}" --version --verbose)"'
     )
     require_command(
-        check_commands, 'awk \'$1 == "release:" { print $2; exit }\''
+        check_commands,
+        'awk \'$1 == "release:" { print $2; exit }\' <<< "${rustc_verbose}"',
     )
     require_command(check_commands, 'expected_release="${MSRV}"')
     require_command(
@@ -241,7 +246,8 @@ def validate_msrv_workflow(source: str, manifest_version: str) -> None:
         check_steps[0],
         'if [[ "${actual_release}" != "${expected_release}" ]]; then',
     )
-    require_command(check_commands, 'rustc +"${MSRV}" --version --verbose')
+    # Same capture-then-parse contract for the recorded toolchain evidence.
+    require_command(check_commands, 'printf \'%s\\n\' "${rustc_verbose}"')
     require_command(
         check_commands, 'cargo +"${MSRV}" check --locked --all-targets'
     )
