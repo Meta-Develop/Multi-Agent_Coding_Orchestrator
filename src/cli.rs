@@ -614,46 +614,56 @@ impl OrchestrateCommand {
     fn run(self) -> Result<()> {
         match self.command {
             OrchestrateSubcommand::Run(args) => {
-                let summary = orchestrator::run_plan_file_with_controls(
-                    OrchestrationRunOptions {
-                        repo: args.repo,
-                        plan_file: args.plan_file,
-                        keep_claims: args.keep_claims,
-                        jobs: args.jobs,
-                        patch_dir: args.patch_dir,
-                    },
-                    OrchestrationRunControls {
-                        run_id: args.run_id.map(RunId::new).transpose()?,
-                        checkpoint_dir: args.checkpoint_dir,
-                        worktree_reuse_policy: args.reuse,
-                        semantic_coordination: args.semantic_coordination,
-                    },
-                )?;
-                print_orchestration_summary(&summary, args.json)?;
-                if !summary.success {
-                    if let Some(agent_id) = summary.first_failed_agent() {
-                        bail!("orchestration failed for agent '{agent_id}'");
+                let json = args.json;
+                let reap_repo = args.repo.clone();
+                let outcome = (|| {
+                    let summary = orchestrator::run_plan_file_with_controls(
+                        OrchestrationRunOptions {
+                            repo: args.repo,
+                            plan_file: args.plan_file,
+                            keep_claims: args.keep_claims,
+                            jobs: args.jobs,
+                            patch_dir: args.patch_dir,
+                        },
+                        OrchestrationRunControls {
+                            run_id: args.run_id.map(RunId::new).transpose()?,
+                            checkpoint_dir: args.checkpoint_dir,
+                            worktree_reuse_policy: args.reuse,
+                            semantic_coordination: args.semantic_coordination,
+                        },
+                    )?;
+                    print_orchestration_summary(&summary, json)?;
+                    if !summary.success {
+                        if let Some(agent_id) = summary.first_failed_agent() {
+                            bail!("orchestration failed for agent '{agent_id}'");
+                        }
+                        bail!("orchestration failed");
                     }
-                    bail!("orchestration failed");
-                }
-                Ok(())
+                    Ok(())
+                })();
+                finish_with_merged_worktree_reap(&reap_repo, json, outcome)
             }
             OrchestrateSubcommand::Resume(args) => {
-                let summary = orchestrator::resume_plan_file(OrchestrationResumeOptions {
-                    checkpoint_file: args.checkpoint_file,
-                    repo: args.repo,
-                    plan_file: args.plan_file,
-                    jobs: args.jobs,
-                    patch_dir: args.patch_dir,
-                })?;
-                print_orchestration_summary(&summary, args.json)?;
-                if !summary.success {
-                    if let Some(agent_id) = summary.first_failed_agent() {
-                        bail!("orchestration failed for agent '{agent_id}'");
+                let json = args.json;
+                let reap_repo = args.repo.clone().unwrap_or_else(|| PathBuf::from("."));
+                let outcome = (|| {
+                    let summary = orchestrator::resume_plan_file(OrchestrationResumeOptions {
+                        checkpoint_file: args.checkpoint_file,
+                        repo: args.repo,
+                        plan_file: args.plan_file,
+                        jobs: args.jobs,
+                        patch_dir: args.patch_dir,
+                    })?;
+                    print_orchestration_summary(&summary, json)?;
+                    if !summary.success {
+                        if let Some(agent_id) = summary.first_failed_agent() {
+                            bail!("orchestration failed for agent '{agent_id}'");
+                        }
+                        bail!("orchestration failed");
                     }
-                    bail!("orchestration failed");
-                }
-                Ok(())
+                    Ok(())
+                })();
+                finish_with_merged_worktree_reap(&reap_repo, json, outcome)
             }
             OrchestrateSubcommand::Collect(args) => {
                 let report = collect_orchestration_results(
@@ -872,6 +882,8 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     .and_then(|plan| plan.assignments.first().and_then(|a| a.runtime))
                     .unwrap_or(supervise::SupervisorRuntime::Codex)
             });
+            let json = args.json;
+            let reap_repo = resolved_repo.clone();
             let options = SupervisorRunOptions {
                 repo: resolved_repo,
                 plan_file,
@@ -894,43 +906,46 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     correction_correlation_id: resolved_run_id.as_str().to_string(),
                 }),
             };
-            let report = match (goal_spec, resume_existing) {
-                (Some(goal_spec), true) => {
-                    supervise::resume_supervisor_goal_spec_cascade_with_concurrency_policy(
-                        options,
-                        "",
-                        &goal_spec,
-                        args.max_concurrent_children,
-                    )?
+            let outcome = (|| {
+                let report = match (goal_spec, resume_existing) {
+                    (Some(goal_spec), true) => {
+                        supervise::resume_supervisor_goal_spec_cascade_with_concurrency_policy(
+                            options,
+                            "",
+                            &goal_spec,
+                            args.max_concurrent_children,
+                        )?
+                    }
+                    (Some(goal_spec), false) => {
+                        supervise::run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_worktree_opt_in(
+                            options,
+                            "",
+                            &goal_spec,
+                            args.max_concurrent_children,
+                            args.allow_primary_worktree,
+                        )?
+                    }
+                    (None, true) => {
+                        supervise::resume_supervisor_plan_file_cascade_with_concurrency_policy(
+                            options,
+                            args.max_concurrent_children,
+                        )?
+                    }
+                    (None, false) => {
+                        supervise::run_supervisor_plan_file_cascade_with_concurrency_policy_and_primary_worktree_opt_in(
+                            options,
+                            args.max_concurrent_children,
+                            args.allow_primary_worktree,
+                        )?
+                    }
+                };
+                print_query_report(&report, json)?;
+                if !report.follow_up_cascade_success {
+                    bail!("supervise run failed");
                 }
-                (Some(goal_spec), false) => {
-                    supervise::run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_worktree_opt_in(
-                        options,
-                        "",
-                        &goal_spec,
-                        args.max_concurrent_children,
-                        args.allow_primary_worktree,
-                    )?
-                }
-                (None, true) => {
-                    supervise::resume_supervisor_plan_file_cascade_with_concurrency_policy(
-                        options,
-                        args.max_concurrent_children,
-                    )?
-                }
-                (None, false) => {
-                    supervise::run_supervisor_plan_file_cascade_with_concurrency_policy_and_primary_worktree_opt_in(
-                        options,
-                        args.max_concurrent_children,
-                        args.allow_primary_worktree,
-                    )?
-                }
-            };
-            print_query_report(&report, args.json)?;
-            if !report.follow_up_cascade_success {
-                bail!("supervise run failed");
-            }
-            Ok(())
+                Ok(())
+            })();
+            finish_with_merged_worktree_reap(&reap_repo, json, outcome)
         }
         SuperviseSubcommand::Reaudit(args) => {
             let resolved = resolve_run_id_for_run(
@@ -1718,6 +1733,7 @@ impl AutopilotCommand {
                 print_query_report(&plan, args.json)
             }
             AutopilotSubcommand::Run(args) => {
+                let json = args.json;
                 let budget_overrides = args.budget.limits();
                 let budget_max_duration_seconds = args.budget.max_duration_seconds();
                 let (plan_file, goal_spec) = match (args.task_file, args.from_goal) {
@@ -1742,6 +1758,7 @@ impl AutopilotCommand {
                     args.json,
                 )?;
                 let parent_node = args.parent_node.map(Into::into);
+                let reap_repo = resolved.repo.clone();
                 let options = AutopilotRunOptions {
                     repo: resolved.repo,
                     plan_file,
@@ -1760,29 +1777,34 @@ impl AutopilotCommand {
                     owner: "maco-autopilot".to_string(),
                     correction_correlation_id: resolved.run_id.as_str().to_string(),
                 });
-                let report = match goal_spec {
-                    Some(goal_spec) => {
-                        autopilot::run_autopilot_goal_spec_with_profile_retention_and_parent(
-                            options,
-                            "",
-                            &goal_spec,
-                            profile,
-                            retention,
-                            parent_node,
-                        )?
+                let outcome = (|| {
+                    let report = match goal_spec {
+                        Some(goal_spec) => {
+                            autopilot::run_autopilot_goal_spec_with_profile_retention_and_parent(
+                                options,
+                                "",
+                                &goal_spec,
+                                profile,
+                                retention,
+                                parent_node,
+                            )?
+                        }
+                        None => {
+                            autopilot::run_autopilot_plan_file_with_profile_retention_and_parent(
+                                options,
+                                profile,
+                                retention,
+                                parent_node,
+                            )?
+                        }
+                    };
+                    print_query_report(&report, json)?;
+                    if !report.success {
+                        bail!("autopilot run failed");
                     }
-                    None => autopilot::run_autopilot_plan_file_with_profile_retention_and_parent(
-                        options,
-                        profile,
-                        retention,
-                        parent_node,
-                    )?,
-                };
-                print_query_report(&report, args.json)?;
-                if !report.success {
-                    bail!("autopilot run failed");
-                }
-                Ok(())
+                    Ok(())
+                })();
+                finish_with_merged_worktree_reap(&reap_repo, json, outcome)
             }
             AutopilotSubcommand::Status(args) => {
                 let report = autopilot::autopilot_status(args.repo, RunId::new(&args.run_id)?)?;
@@ -2150,29 +2172,36 @@ impl AgentCommand {
         match self.command {
             AgentSubcommand::Run(args) => {
                 let json = args.json;
-                if json {
-                    let failure_context = AgentRunFailureContext::from_args(&args);
-                    match run_agent_from_args(args) {
-                        Ok(report) => {
-                            print_agent_run_report(&report, true)?;
-                            if !report.success {
-                                bail!("{}", report.error.as_deref().unwrap_or("agent run failed"));
+                let reap_repo = args.repo.clone();
+                let outcome = (|| {
+                    if json {
+                        let failure_context = AgentRunFailureContext::from_args(&args);
+                        match run_agent_from_args(args) {
+                            Ok(report) => {
+                                print_agent_run_report(&report, true)?;
+                                if !report.success {
+                                    bail!(
+                                        "{}",
+                                        report.error.as_deref().unwrap_or("agent run failed")
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                let report = failure_context.into_report(error.to_string());
+                                print_agent_run_failure_report(&report)?;
+                                bail!("{}", report.error);
                             }
                         }
-                        Err(error) => {
-                            let report = failure_context.into_report(error.to_string());
-                            print_agent_run_failure_report(&report)?;
-                            bail!("{}", report.error);
+                    } else {
+                        let report = run_agent_from_args(args)?;
+                        print_agent_run_report(&report, false)?;
+                        if !report.success {
+                            bail!("{}", report.error.as_deref().unwrap_or("agent run failed"));
                         }
                     }
-                } else {
-                    let report = run_agent_from_args(args)?;
-                    print_agent_run_report(&report, false)?;
-                    if !report.success {
-                        bail!("{}", report.error.as_deref().unwrap_or("agent run failed"));
-                    }
-                }
-                Ok(())
+                    Ok(())
+                })();
+                finish_with_merged_worktree_reap(&reap_repo, json, outcome)
             }
         }
     }
@@ -4315,6 +4344,88 @@ fn run_merge_apply_controller(
         }
     }
     deliver_report(&report, json)
+}
+
+/// Reap authenticated managed worktrees whose branches are fully contained in
+/// the current local HEAD branch. Dirty, claimed, leased, and unmerged lanes
+/// stay in place. Candidate selectors disable pathname-only orphan pruning so
+/// this completion hook cannot demand a machine-global binding.
+fn reap_merged_managed_worktrees(repo: &Path) -> Result<Option<WorktreeLifecycleReport>> {
+    let git = crate::git_repository::open(repo).with_context(|| {
+        format!(
+            "failed to open repository {} for merged worktree reaping",
+            repo.display()
+        )
+    })?;
+    let head = match git.head() {
+        Ok(head) => head,
+        Err(_) => return Ok(None),
+    };
+    if !head.is_branch() {
+        return Ok(None);
+    }
+    let Ok(trunk_ref) = head.name().map(str::to_owned) else {
+        return Ok(None);
+    };
+    if !trunk_ref.starts_with("refs/heads/") {
+        return Ok(None);
+    }
+
+    let manager = WorktreeManager::new(repo);
+    let candidate_agent_ids = manager
+        .list()
+        .context("failed to list managed worktrees for merged reaping")?
+        .into_iter()
+        .map(|record| record.name)
+        .collect::<BTreeSet<_>>();
+    if candidate_agent_ids.is_empty() {
+        return Ok(None);
+    }
+
+    manager
+        .lifecycle(WorktreeLifecycleOptions {
+            apply: true,
+            auto_reap_merged: true,
+            candidate_agent_ids: Some(candidate_agent_ids),
+            merged_into_reference: Some(trunk_ref),
+            ..WorktreeLifecycleOptions::default()
+        })
+        .map(Some)
+        .context("merged-lane worktree reaping failed")
+}
+
+fn print_merged_worktree_reap_summary(report: &WorktreeLifecycleReport, json: bool) {
+    if json {
+        return;
+    }
+    let Some(gc) = report.worktree_gc.as_ref() else {
+        return;
+    };
+    println!(
+        "Merged worktree reap: considered={} removed={} protected={} retained={}",
+        gc.considered_count, gc.removed_count, gc.protected_count, gc.retained_count
+    );
+}
+
+fn finish_with_merged_worktree_reap(repo: &Path, json: bool, outcome: Result<()>) -> Result<()> {
+    let reap = match reap_merged_managed_worktrees(repo) {
+        Ok(Some(report)) => {
+            print_merged_worktree_reap_summary(&report, json);
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(error) => Err(error),
+    };
+    match (outcome, reap) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(error).context(
+            "command succeeded, but merged worktree reaping failed; do not blindly retry the command",
+        ),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(reap_error)) => Err(primary).context(format!(
+            "merged worktree reaping also failed: {reap_error:#}"
+        )),
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -7538,6 +7649,179 @@ mod tests {
         assert_eq!(gc.entries[0].status, WorktreeGcStatus::Removed);
         assert_eq!(gc.entries[0].reason, WorktreeGcReason::FinishedBranch);
         assert!(!worktree.path.exists());
+    }
+
+    fn init_committed_repo(repo_path: &Path) -> git2::Signature<'static> {
+        WorktreeManager::init_repository(repo_path, "main").expect("init repository");
+        fs::write(repo_path.join("README.md"), "# Before\n").expect("write README");
+        let repo = crate::git_repository::open(repo_path).expect("open repository");
+        let mut index = repo.index().expect("open index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("stage README");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("commit fixture");
+        signature
+    }
+
+    fn commit_worktree_file(
+        worktree: &Path,
+        relative: &str,
+        contents: &str,
+        message: &str,
+        signature: &Signature<'_>,
+    ) {
+        fs::write(worktree.join(relative), contents).expect("write worktree file");
+        let repo = crate::git_repository::open(worktree).expect("open worktree");
+        let mut index = repo.index().expect("open worktree index");
+        index
+            .add_path(Path::new(relative))
+            .expect("stage worktree file");
+        index.write().expect("write worktree index");
+        let tree_id = index.write_tree().expect("write worktree tree");
+        let tree = repo.find_tree(tree_id).expect("find worktree tree");
+        let parent = repo
+            .head()
+            .expect("worktree HEAD")
+            .peel_to_commit()
+            .expect("worktree parent");
+        repo.commit(
+            Some("HEAD"),
+            signature,
+            signature,
+            message,
+            &tree,
+            &[&parent],
+        )
+        .expect("commit worktree file");
+    }
+
+    fn create_test_lane(repo_path: &Path, agent_id: &str) -> WorktreeRecord {
+        WorktreeManager::new(repo_path)
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: agent_id.to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create test worktree")
+    }
+
+    #[test]
+    fn completion_reap_skips_when_no_managed_worktrees_exist() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        init_committed_repo(&repo_path);
+        assert!(reap_merged_managed_worktrees(&repo_path)
+            .expect("reap should succeed")
+            .is_none());
+    }
+
+    #[test]
+    fn completion_reap_removes_merged_and_preserves_unmerged_and_dirty_worktrees() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let signature = init_committed_repo(&repo_path);
+        let merged = create_test_lane(&repo_path, "agent-merged");
+        let unmerged = create_test_lane(&repo_path, "agent-unmerged");
+        let dirty = create_test_lane(&repo_path, "agent-dirty");
+
+        commit_worktree_file(
+            &merged.path,
+            "merged.txt",
+            "merged\n",
+            "merged work",
+            &signature,
+        );
+        commit_worktree_file(
+            &unmerged.path,
+            "unmerged.txt",
+            "unmerged\n",
+            "unmerged work",
+            &signature,
+        );
+        fs::write(dirty.path.join("README.md"), "# dirty local work\n").expect("dirty worktree");
+
+        let primary = crate::git_repository::open(&repo_path).expect("reopen primary");
+        let lane_oid = primary
+            .find_branch("maco/agent-merged", git2::BranchType::Local)
+            .expect("merged lane branch")
+            .get()
+            .target()
+            .expect("merged lane target");
+        primary
+            .reference("refs/heads/main", lane_oid, true, "absorb merged lane")
+            .expect("advance trunk to merged lane");
+        let lane_commit = primary.find_commit(lane_oid).expect("merged lane commit");
+        primary
+            .reset(lane_commit.as_object(), git2::ResetType::Hard, None)
+            .expect("refresh primary after absorbing merged lane");
+        drop(lane_commit);
+        drop(primary);
+
+        let report = reap_merged_managed_worktrees(&repo_path)
+            .expect("reap leak scenarios")
+            .expect("managed lanes should enable lifecycle");
+        let gc = report
+            .worktree_gc
+            .as_ref()
+            .expect("merged auto-reap should run GC");
+        assert_eq!(gc.considered_count, 3, "{gc:#?}");
+        assert_eq!(gc.removed_count, 1, "{gc:#?}");
+        assert_eq!(gc.protected_count, 1, "{gc:#?}");
+        assert_eq!(gc.retained_count, 1, "{gc:#?}");
+
+        let merged_entry = gc
+            .entries
+            .iter()
+            .find(|entry| entry.name == "agent-merged")
+            .expect("merged entry");
+        assert_eq!(merged_entry.status, WorktreeGcStatus::Removed);
+        assert_eq!(merged_entry.reason, WorktreeGcReason::FinishedBranch);
+        assert!(!merged.path.exists(), "merged worktree must be reclaimed");
+
+        let unmerged_entry = gc
+            .entries
+            .iter()
+            .find(|entry| entry.name == "agent-unmerged")
+            .expect("unmerged entry");
+        assert_eq!(unmerged_entry.status, WorktreeGcStatus::Retained);
+        assert_eq!(unmerged_entry.reason, WorktreeGcReason::UnmergedBranch);
+        assert!(
+            unmerged.path.exists(),
+            "unmerged work must not be destroyed without opt-in"
+        );
+
+        let dirty_entry = gc
+            .entries
+            .iter()
+            .find(|entry| entry.name == "agent-dirty")
+            .expect("dirty entry");
+        assert_eq!(dirty_entry.status, WorktreeGcStatus::Protected);
+        assert_eq!(dirty_entry.reason, WorktreeGcReason::Dirty);
+        assert!(
+            dirty.path.exists(),
+            "dirty worktree must remain until cleaned or explicitly forced"
+        );
+
+        let primary = crate::git_repository::open(&repo_path).expect("reopen after reap");
+        assert!(
+            primary
+                .find_branch("maco/agent-merged", git2::BranchType::Local)
+                .is_ok(),
+            "GC retains merged branch refs; unpinning the worktree is what makes later deletion possible"
+        );
+        assert!(primary
+            .find_branch("maco/agent-unmerged", git2::BranchType::Local)
+            .is_ok());
+        assert!(primary
+            .find_branch("maco/agent-dirty", git2::BranchType::Local)
+            .is_ok());
     }
 
     #[test]
