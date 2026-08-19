@@ -11676,19 +11676,110 @@ struct BoundedGitContext<'a> {
     objects_target: &'a Path,
 }
 
-#[cfg(all(target_os = "linux", not(test)))]
-fn bounded_status_runtime_root(_worktree: &Path) -> Result<SafeRoot> {
-    SafeRoot::open_or_create(PathBuf::from(format!(
-        "/tmp/maco-worktree-status-{}",
-        unsafe { libc::geteuid() }
-    )))
+#[cfg(target_os = "linux")]
+const BOUNDED_STATUS_RUNTIME_ROOT_ENV: &str = "MACO_BOUNDED_STATUS_RUNTIME_ROOT";
+
+#[cfg(target_os = "linux")]
+struct BoundedStatusRuntimeRootConfig {
+    explicit_root: Option<PathBuf>,
+    tmpdir: Option<PathBuf>,
+    prefer_shared_tmp: bool,
 }
 
-#[cfg(all(target_os = "linux", test))]
-fn bounded_status_runtime_root(worktree: &Path) -> Result<SafeRoot> {
+#[cfg(target_os = "linux")]
+impl BoundedStatusRuntimeRootConfig {
+    fn from_env() -> Self {
+        Self {
+            explicit_root: std::env::var_os(BOUNDED_STATUS_RUNTIME_ROOT_ENV).map(PathBuf::from),
+            tmpdir: std::env::var_os("TMPDIR").map(PathBuf::from),
+            // Tests keep a per-worktree root so they do not share /tmp with one another.
+            prefer_shared_tmp: !cfg!(test),
+        }
+    }
+
+    fn candidate_paths(&self, worktree: &Path) -> Result<Vec<PathBuf>> {
+        if let Some(path) = &self.explicit_root {
+            return Ok(vec![require_configured_bounded_status_runtime_root(
+                path,
+                BOUNDED_STATUS_RUNTIME_ROOT_ENV,
+            )?]);
+        }
+        let mut candidates = Vec::new();
+        if self.prefer_shared_tmp {
+            if let Some(tmpdir) = &self.tmpdir {
+                if !tmpdir.as_os_str().is_empty() {
+                    push_unique_path(
+                        &mut candidates,
+                        tmpdir.join(shared_bounded_status_runtime_root_name()),
+                    );
+                }
+            }
+            if existing_paths_share_device(Path::new("/tmp"), worktree) {
+                push_unique_path(
+                    &mut candidates,
+                    PathBuf::from(format!(
+                        "/tmp/{}",
+                        shared_bounded_status_runtime_root_name()
+                    )),
+                );
+            }
+        }
+        push_unique_path(
+            &mut candidates,
+            worktree_local_bounded_status_runtime_root(worktree)?,
+        );
+        Ok(candidates)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_status_runtime_user_id() -> u32 {
+    // SAFETY: geteuid is a pure credential query with no memory side effects.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(target_os = "linux")]
+fn shared_bounded_status_runtime_root_name() -> String {
+    format!("maco-worktree-status-{}", bounded_status_runtime_user_id())
+}
+
+#[cfg(target_os = "linux")]
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn require_configured_bounded_status_runtime_root(path: &Path, source: &str) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        bail!(
+            "{source} is set but empty; bounded-status runtime root must be a directory on the same filesystem as the worktree"
+        );
+    }
+    Ok(path.to_path_buf())
+}
+
+#[cfg(target_os = "linux")]
+fn existing_path_device(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| crate::safe_state::device_id_to_u64(metadata.dev()))
+}
+
+#[cfg(target_os = "linux")]
+fn existing_paths_share_device(left: &Path, right: &Path) -> bool {
+    match (existing_path_device(left), existing_path_device(right)) {
+        (Some(left_device), Some(right_device)) => left_device == right_device,
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn worktree_local_bounded_status_runtime_root(worktree: &Path) -> Result<PathBuf> {
     let repository = crate::git_repository::open(worktree).with_context(|| {
         format!(
-            "failed to open test bounded-status repository {}",
+            "failed to open bounded-status repository {} while placing a same-filesystem runtime root",
             worktree.display()
         )
     })?;
@@ -11696,20 +11787,118 @@ fn bounded_status_runtime_root(worktree: &Path) -> Result<SafeRoot> {
     let common_ancestor = worktree
         .ancestors()
         .find(|ancestor| common_dir.starts_with(ancestor))
-        .context("test worktree and Git common directory have no common ancestor")?;
+        .context(
+            "worktree and Git common directory have no common ancestor for bounded-status runtime root",
+        )?;
     let outside_worktree = if common_ancestor == worktree {
         common_ancestor
             .parent()
-            .context("test worktree common ancestor has no parent")?
+            .context("worktree common ancestor has no parent for bounded-status runtime root")?
     } else {
         common_ancestor
     };
     let anchor = outside_worktree
         .ancestors()
         .find(|ancestor| ancestor.to_str().is_some())
-        .context("test worktree has no UTF-8 ancestor for its private status alias")?;
+        .context("worktree has no UTF-8 ancestor for its private status alias")?;
     let binding = stable_checksum(worktree.as_os_str().as_bytes());
-    SafeRoot::open_or_create(anchor.join(format!(".maco-test-worktree-status-{binding}")))
+    let directory_name = if cfg!(test) {
+        format!(".maco-test-worktree-status-{binding}")
+    } else {
+        format!(
+            ".maco-worktree-status-{}-{binding}",
+            bounded_status_runtime_user_id()
+        )
+    };
+    Ok(anchor.join(directory_name))
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_bounded_status_runtime_root_on_worktree_filesystem(
+    worktree: &Path,
+    root: &SafeRoot,
+) -> Result<()> {
+    let Some(worktree_device) = existing_path_device(worktree) else {
+        bail!(
+            "failed to inspect worktree {} while validating bounded-status runtime root {}",
+            worktree.display(),
+            root.path().display()
+        );
+    };
+    if worktree_device == root.identity().device {
+        return Ok(());
+    }
+    bail!(
+        "bounded-status runtime root {} is on a different filesystem from worktree {} \
+         (runtime-root device {}, worktree device {}). \
+         Containment requires the staged worktree symlink to stay on one filesystem. \
+         Set {BOUNDED_STATUS_RUNTIME_ROOT_ENV} to a directory on the worktree filesystem, \
+         or set TMPDIR to a directory on that filesystem.",
+        root.path().display(),
+        worktree.display(),
+        root.identity().device,
+        worktree_device
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn open_usable_bounded_status_runtime_root(worktree: &Path, path: &Path) -> Result<SafeRoot> {
+    let root = SafeRoot::open_or_create(path).with_context(|| {
+        format!(
+            "bounded-status runtime root {} is unusable; set {BOUNDED_STATUS_RUNTIME_ROOT_ENV} \
+             to a writable directory on the same filesystem as {}",
+            path.display(),
+            worktree.display()
+        )
+    })?;
+    ensure_bounded_status_runtime_root_on_worktree_filesystem(worktree, &root).with_context(
+        || {
+            format!(
+                "bounded-status runtime root {} cannot be used for worktree {}",
+                root.path().display(),
+                worktree.display()
+            )
+        },
+    )?;
+    Ok(root)
+}
+
+#[cfg(target_os = "linux")]
+fn open_bounded_status_runtime_root(
+    worktree: &Path,
+    config: &BoundedStatusRuntimeRootConfig,
+) -> Result<SafeRoot> {
+    let candidates = config.candidate_paths(worktree)?;
+    let explicit = config.explicit_root.is_some();
+    let mut last_error: Option<anyhow::Error> = None;
+    for path in &candidates {
+        match open_usable_bounded_status_runtime_root(worktree, path) {
+            Ok(root) => return Ok(root),
+            Err(error) if explicit => {
+                return Err(error.context(format!(
+                    "{BOUNDED_STATUS_RUNTIME_ROOT_ENV}={path} is unusable",
+                    path = path.display()
+                )));
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match last_error {
+        Some(error) => Err(error).context(format!(
+            "no usable bounded-status runtime root for worktree {}; set {BOUNDED_STATUS_RUNTIME_ROOT_ENV} \
+             to a writable directory on the worktree filesystem",
+            worktree.display()
+        )),
+        None => bail!(
+            "no bounded-status runtime root candidate for worktree {}; set {BOUNDED_STATUS_RUNTIME_ROOT_ENV}",
+            worktree.display()
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_status_runtime_root(worktree: &Path) -> Result<SafeRoot> {
+    open_bounded_status_runtime_root(worktree, &BoundedStatusRuntimeRootConfig::from_env())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -11893,6 +12082,198 @@ mod tests {
             vec![PathBuf::from("README.md"), PathBuf::from("src/lib.rs")]
         );
         assert!(parse_nul_paths(b"../escape\0", 2).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn init_bounded_status_runtime_root_repo(temp: &TempDir) -> PathBuf {
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        repo_path
+    }
+
+    #[cfg(target_os = "linux")]
+    fn canonical_target_dir() -> Option<PathBuf> {
+        fs::canonicalize(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target")).ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn path_on_other_filesystem(reference: &Path) -> Option<PathBuf> {
+        let mut candidates = vec![PathBuf::from("/tmp")];
+        if let Some(target) = canonical_target_dir() {
+            candidates.push(target);
+        }
+        candidates.into_iter().find(|candidate| {
+            candidate.is_dir() && !existing_paths_share_device(reference, candidate)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_runtime_root_uses_an_explicit_override() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = init_bounded_status_runtime_root_repo(&temp);
+        let override_root = temp.path().join("override-status-root");
+        let config = BoundedStatusRuntimeRootConfig {
+            explicit_root: Some(override_root.clone()),
+            tmpdir: Some(temp.path().join("ignored-tmpdir")),
+            prefer_shared_tmp: true,
+        };
+        let root = open_bounded_status_runtime_root(&repo_path, &config).expect("open override");
+        assert_eq!(root.path(), override_root.as_path());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_runtime_root_honors_tmpdir_when_shared_tmp_is_enabled() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = init_bounded_status_runtime_root_repo(&temp);
+        let tmpdir = temp.path().join("status-tmp");
+        fs::create_dir(&tmpdir).expect("tmpdir");
+        let config = BoundedStatusRuntimeRootConfig {
+            explicit_root: None,
+            tmpdir: Some(tmpdir.clone()),
+            prefer_shared_tmp: true,
+        };
+        let root = open_bounded_status_runtime_root(&repo_path, &config).expect("open tmpdir root");
+        assert_eq!(
+            root.path(),
+            tmpdir
+                .join(shared_bounded_status_runtime_root_name())
+                .as_path()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_runtime_root_fails_closed_when_the_explicit_root_is_empty() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = init_bounded_status_runtime_root_repo(&temp);
+        let config = BoundedStatusRuntimeRootConfig {
+            explicit_root: Some(PathBuf::new()),
+            tmpdir: None,
+            prefer_shared_tmp: true,
+        };
+        let error = open_bounded_status_runtime_root(&repo_path, &config)
+            .expect_err("empty explicit root must fail closed");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(BOUNDED_STATUS_RUNTIME_ROOT_ENV),
+            "unexpected empty-root error: {message}"
+        );
+        assert!(
+            message.contains("empty"),
+            "unexpected empty-root error: {message}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_runtime_root_fails_closed_when_the_explicit_root_is_a_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = init_bounded_status_runtime_root_repo(&temp);
+        let file_root = temp.path().join("not-a-directory");
+        fs::write(&file_root, b"nope").expect("write file root");
+        let config = BoundedStatusRuntimeRootConfig {
+            explicit_root: Some(file_root),
+            tmpdir: None,
+            prefer_shared_tmp: true,
+        };
+        let error = open_bounded_status_runtime_root(&repo_path, &config)
+            .expect_err("file explicit root must fail closed");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(BOUNDED_STATUS_RUNTIME_ROOT_ENV),
+            "unexpected file-root error: {message}"
+        );
+        assert!(
+            message.contains("unusable"),
+            "unexpected file-root error: {message}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_runtime_root_fails_closed_when_the_explicit_root_crosses_filesystems() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = init_bounded_status_runtime_root_repo(&temp);
+        let Some(foreign_parent) = path_on_other_filesystem(temp.path()) else {
+            return;
+        };
+        let foreign_root = foreign_parent.join(format!(
+            "maco-test-bounded-status-crossfs-{}",
+            std::process::id()
+        ));
+        let config = BoundedStatusRuntimeRootConfig {
+            explicit_root: Some(foreign_root.clone()),
+            tmpdir: None,
+            prefer_shared_tmp: true,
+        };
+        let error = open_bounded_status_runtime_root(&repo_path, &config)
+            .expect_err("cross-filesystem explicit root must fail closed");
+        let _ = fs::remove_dir_all(&foreign_root);
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("different filesystem"),
+            "unexpected cross-filesystem error: {message}"
+        );
+        assert!(
+            message.contains(BOUNDED_STATUS_RUNTIME_ROOT_ENV),
+            "cross-filesystem error must name the override: {message}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_runtime_root_skips_an_unusable_tmpdir_and_uses_a_worktree_local_root() {
+        let Some(host) = canonical_target_dir() else {
+            return;
+        };
+        if existing_paths_share_device(&host, Path::new("/tmp")) {
+            return;
+        }
+        let temp = TempDir::new_in(&host).expect("tempdir on target filesystem");
+        let repo_path = init_bounded_status_runtime_root_repo(&temp);
+        let foreign_parent = PathBuf::from("/tmp");
+        let config = BoundedStatusRuntimeRootConfig {
+            explicit_root: None,
+            tmpdir: Some(foreign_parent.clone()),
+            prefer_shared_tmp: true,
+        };
+        let root = open_bounded_status_runtime_root(&repo_path, &config)
+            .expect("unusable TMPDIR must fall back to a same-filesystem root");
+        assert_eq!(
+            existing_path_device(root.path()),
+            existing_path_device(&repo_path),
+            "fallback root {} is not on the worktree filesystem",
+            root.path().display()
+        );
+        assert!(
+            !root.path().starts_with(&foreign_parent),
+            "fallback still used the unusable TMPDIR {}",
+            root.path().display()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_runtime_root_test_default_stays_isolated_from_shared_tmp() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = init_bounded_status_runtime_root_repo(&temp);
+        let root = bounded_status_runtime_root(&repo_path).expect("test default root");
+        assert!(
+            !root
+                .path()
+                .ends_with(shared_bounded_status_runtime_root_name()),
+            "test default used the shared per-user tmp root {}",
+            root.path().display()
+        );
+        assert!(
+            root.path().starts_with(temp.path()),
+            "test default root {} was not isolated next to the fixture",
+            root.path().display()
+        );
     }
 
     #[test]
