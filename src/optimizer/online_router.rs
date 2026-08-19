@@ -24,6 +24,7 @@ use super::predictor::{
 };
 use super::resources::Quantity;
 use super::state::{OptimizerState, PosteriorSummary};
+use super::taxonomy::{classify, TaxonomySpec};
 use super::trajectory::{TrajectoryEvent, TrajectoryObservation};
 use super::value_of_information::{
     is_probe_policy, EvidenceHandoff, ValueOfInformation, VoyDecision,
@@ -328,6 +329,12 @@ impl OnlineRouter for SafeContextualRouter {
             .collect();
         let mut diagnostics = DecisionDiagnostics::new(state.horizon.now, candidate_ids);
         diagnostics.fill_reserves(&state.budget.snapshot(state.horizon.now));
+        classify(
+            &state.task_features,
+            &state.repo_features,
+            &TaxonomySpec::v1(),
+        )
+        .record_on(&mut diagnostics, None);
 
         if candidates.is_empty() {
             return Ok(infeasible(state, diagnostics, "no_candidates"));

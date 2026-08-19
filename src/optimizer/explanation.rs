@@ -73,6 +73,16 @@ pub struct DecisionDiagnostics {
     pub candidate_predictions: Vec<CandidatePrediction>,
     pub continuation: Option<String>,
     pub escalation_comparison: Option<EscalationComparison>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taxonomy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taxonomy_cell: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taxonomy_confidence_bp: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_observations: Option<u32>,
 }
 
 impl DecisionDiagnostics {
@@ -91,6 +101,11 @@ impl DecisionDiagnostics {
             candidate_predictions: Vec::new(),
             continuation: None,
             escalation_comparison: None,
+            taxonomy_version: None,
+            taxonomy_cell: None,
+            taxonomy_confidence_bp: None,
+            recommendation_source: None,
+            evidence_observations: None,
         }
     }
 

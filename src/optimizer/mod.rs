@@ -42,6 +42,7 @@ pub mod resources;
 pub mod safe_set;
 pub mod shadow;
 pub mod state;
+pub mod taxonomy;
 pub mod telemetry;
 pub mod trajectory;
 pub mod value_of_information;
