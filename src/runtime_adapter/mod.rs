@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     env,
+    ffi::OsString,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -435,6 +436,18 @@ impl RuntimeAdapterConfig {
             env,
             output_capture: self.output_capture,
         })
+    }
+
+    /// Fail-closed argv for a subprocess runtime. Callers must propagate the
+    /// error: an empty vector is a successful Codex/empty-template render, not a
+    /// substitute for a configuration failure.
+    pub fn render_os_argv(&self, context: &LaunchContext<'_>) -> Result<Vec<OsString>> {
+        Ok(self
+            .render(context)?
+            .argv
+            .into_iter()
+            .map(OsString::from)
+            .collect())
     }
 
     /// Small scripted-transport seam used by adapter conformance tests and diagnostics.
@@ -857,6 +870,101 @@ mod tests {
         assert!(error
             .to_string()
             .contains("maco-definitely-missing-runtime"));
+    }
+
+    #[test]
+    fn unconfigured_binary_render_is_an_error_not_an_empty_argv() {
+        let config = RuntimeAdapterConfig {
+            binary: Some(PathBuf::new()),
+            ..RuntimeAdapterConfig::defaults(RuntimeId::Grok)
+        };
+        let error = config
+            .render_os_argv(&launch_context(
+                Path::new("prompt.txt"),
+                Some("grok-4.6"),
+                Some("high"),
+                Path::new("/tmp/work"),
+                Path::new("out.txt"),
+            ))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("runtime adapter binary is not configured"));
+    }
+
+    #[test]
+    fn unknown_placeholder_render_is_an_error_not_an_empty_argv() {
+        let config = RuntimeAdapterConfig {
+            argument_template: vec!["--flag".into(), "{unknown}".into()],
+            ..RuntimeAdapterConfig::defaults(RuntimeId::Grok)
+        };
+        let error = config
+            .render_os_argv(&launch_context(
+                Path::new("prompt.txt"),
+                Some("grok-4.6"),
+                Some("high"),
+                Path::new("/tmp/work"),
+                Path::new("out.txt"),
+            ))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unknown runtime adapter placeholder '{unknown}'"));
+    }
+
+    #[test]
+    fn missing_prompt_text_file_render_is_an_error_not_an_empty_argv() {
+        let config = RuntimeAdapterConfig {
+            argument_template: vec!["--prompt".into(), "{prompt_text}".into()],
+            ..RuntimeAdapterConfig::defaults(RuntimeId::Grok)
+        };
+        let error = config
+            .render_os_argv(&launch_context(
+                Path::new("maco-missing-adapter-prompt.txt"),
+                Some("grok-4.6"),
+                Some("high"),
+                Path::new("/tmp/work"),
+                Path::new("out.txt"),
+            ))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("maco-missing-adapter-prompt.txt"),
+            "unexpected render error: {message}"
+        );
+        assert!(
+            message.contains("{prompt_text}") || message.contains("prompt"),
+            "unexpected render error: {message}"
+        );
+    }
+
+    #[test]
+    fn successful_render_os_argv_preserves_the_template() -> Result<()> {
+        let argv = RuntimeAdapterConfig::defaults(RuntimeId::Grok).render_os_argv(
+            &launch_context(
+                Path::new("prompt.txt"),
+                Some("grok-4.6"),
+                Some("high"),
+                Path::new("/tmp/work"),
+                Path::new("out.txt"),
+            ),
+        )?;
+        assert_eq!(
+            argv,
+            [
+                OsString::from("--prompt-file"),
+                OsString::from("prompt.txt"),
+                OsString::from("--model"),
+                OsString::from("grok-4.6"),
+                OsString::from("--effort"),
+                OsString::from("high"),
+                OsString::from("--cwd"),
+                OsString::from("/tmp/work"),
+                OsString::from("--output-format"),
+                OsString::from("plain"),
+            ]
+        );
+        Ok(())
     }
 
     #[cfg(unix)]
