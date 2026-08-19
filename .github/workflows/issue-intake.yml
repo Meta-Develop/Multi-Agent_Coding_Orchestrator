@@ -43,7 +43,7 @@ jobs:
 
       - name: Check out repository for read-only analysis
         if: ${{ steps.triage_gate.outputs.enabled == 'true' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Triage issue
         if: ${{ steps.triage_gate.outputs.enabled == 'true' }}
