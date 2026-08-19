@@ -579,7 +579,11 @@ fn env_passthrough_names_from_operator_list(raw: &str) -> Vec<String> {
 /// Parse a comma-separated passthrough list and refuse any denied name.
 pub fn parse_env_passthrough_list(raw: &str) -> Result<Vec<String>> {
     let mut names = Vec::new();
-    for name in raw.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+    for name in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
         screen_env_passthrough_name(name)?;
         if !names.iter().any(|existing| existing == name) {
             names.push(name.to_string());
@@ -861,7 +865,10 @@ mod tests {
     fn prompt_text_refuses_an_argv_oversized_file() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let prompt = dir.path().join("prompt.txt");
-        fs::write(&prompt, vec![b'a'; (MAX_PROMPT_TEXT_ARGV_BYTES as usize) + 1])?;
+        fs::write(
+            &prompt,
+            vec![b'a'; (MAX_PROMPT_TEXT_ARGV_BYTES as usize) + 1],
+        )?;
         let config = RuntimeAdapterConfig::defaults_for(AdapterId::GeminiCli);
         let error = config
             .render(&launch_context(
@@ -1098,7 +1105,9 @@ mod tests {
     #[test]
     fn operator_env_list_drops_shell_startup_and_loader_hooks() {
         assert_eq!(
-            env_passthrough_names_from_operator_list("PATH,BASH_ENV, ENV, LD_PRELOAD,,DYLD_INSERT_LIBRARIES"),
+            env_passthrough_names_from_operator_list(
+                "PATH,BASH_ENV, ENV, LD_PRELOAD,,DYLD_INSERT_LIBRARIES"
+            ),
             vec!["PATH".to_string()]
         );
         assert!(env_passthrough_names_from_operator_list("BASH_ENV,LD_LIBRARY_PATH").is_empty());
@@ -1107,14 +1116,25 @@ mod tests {
     #[test]
     fn parse_env_passthrough_list_refuses_denied_names() {
         assert_eq!(parse_env_passthrough_list("PATH").unwrap(), vec!["PATH"]);
-        let error = parse_env_passthrough_list("PATH,BASH_ENV").unwrap_err().to_string();
+        let error = parse_env_passthrough_list("PATH,BASH_ENV")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("BASH_ENV"), "{error}");
-        assert!(error.contains("refused runtime adapter env passthrough"), "{error}");
-        let preload = parse_env_passthrough_list("LD_PRELOAD").unwrap_err().to_string();
+        assert!(
+            error.contains("refused runtime adapter env passthrough"),
+            "{error}"
+        );
+        let preload = parse_env_passthrough_list("LD_PRELOAD")
+            .unwrap_err()
+            .to_string();
         assert!(preload.contains("LD_PRELOAD"), "{preload}");
-        let dyld = parse_env_passthrough_list("DYLD_LIBRARY_PATH").unwrap_err().to_string();
+        let dyld = parse_env_passthrough_list("DYLD_LIBRARY_PATH")
+            .unwrap_err()
+            .to_string();
         assert!(dyld.contains("DYLD_LIBRARY_PATH"), "{dyld}");
-        let credential = parse_env_passthrough_list("OPENAI_API_KEY").unwrap_err().to_string();
+        let credential = parse_env_passthrough_list("OPENAI_API_KEY")
+            .unwrap_err()
+            .to_string();
         assert!(credential.contains("OPENAI_API_KEY"), "{credential}");
     }
 
@@ -1229,15 +1249,14 @@ mod tests {
 
     #[test]
     fn successful_render_os_argv_preserves_the_template() -> Result<()> {
-        let argv = RuntimeAdapterConfig::defaults(RuntimeId::Grok).render_os_argv(
-            &launch_context(
+        let argv =
+            RuntimeAdapterConfig::defaults(RuntimeId::Grok).render_os_argv(&launch_context(
                 Path::new("prompt.txt"),
                 Some("grok-4.6"),
                 Some("high"),
                 Path::new("/tmp/work"),
                 Path::new("out.txt"),
-            ),
-        )?;
+            ))?;
         assert_eq!(
             argv,
             [
