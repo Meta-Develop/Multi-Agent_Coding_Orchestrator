@@ -354,12 +354,10 @@ impl RuntimeAdapterConfig {
             config.argument_template = args.split_whitespace().map(str::to_string).collect();
         }
         if let Ok(names) = env::var(format!("{prefix}_ENV")) {
-            config.env_passthrough = names
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect();
+            // Drop denied names here so the live insert in external_agent.rs
+            // cannot reinstate them. Remaining names are still refused at
+            // render if a caller constructs the config directly.
+            config.env_passthrough = env_passthrough_names_from_operator_list(&names);
         }
         if let Ok(flag) = env::var(format!("{prefix}_CWD_FLAG")) {
             config.working_dir_flag = Some(flag);
@@ -424,11 +422,7 @@ impl RuntimeAdapterConfig {
         if let Some(flag) = &self.working_dir_flag {
             argv.extend([flag.clone(), context.cwd.display().to_string()]);
         }
-        let env = self
-            .env_passthrough
-            .iter()
-            .filter_map(|name| env::var(name).ok().map(|value| (name.clone(), value)))
-            .collect();
+        let env = collect_screened_passthrough_env(&self.env_passthrough)?;
         Ok(LaunchSpec {
             program: binary.to_path_buf(),
             argv,
@@ -536,6 +530,104 @@ pub struct AdapterRun {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub captured: Vec<u8>,
+}
+
+/// Operator `MACO_<RUNTIME>_ENV` lists are comma-separated. Empty names are
+/// dropped; denied names are omitted so a live insert after `allowed_env`
+/// cannot reinstate them.
+fn env_passthrough_names_from_operator_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .filter(|name| denied_passthrough_env_reason(name).is_none())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Parse a comma-separated passthrough list and refuse any denied name.
+pub fn parse_env_passthrough_list(raw: &str) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for name in raw.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+        screen_env_passthrough_name(name)?;
+        if !names.iter().any(|existing| existing == name) {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+/// Refuse a passthrough name that would undo worker environment hardening.
+pub fn screen_env_passthrough_name(name: &str) -> Result<()> {
+    if let Some(reason) = denied_passthrough_env_reason(name) {
+        bail!("refused runtime adapter env passthrough '{name}': {reason}");
+    }
+    Ok(())
+}
+
+fn collect_screened_passthrough_env(names: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut environment = BTreeMap::new();
+    for name in names {
+        screen_env_passthrough_name(name)?;
+        if let Ok(value) = env::var(name) {
+            environment.insert(name.clone(), value);
+        }
+    }
+    Ok(environment)
+}
+
+fn denied_passthrough_env_reason(name: &str) -> Option<&'static str> {
+    if name.is_empty()
+        || name.len() > 256
+        || name.contains('=')
+        || name.contains('\0')
+        || name.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Some("malformed environment variable name");
+    }
+    let bytes = name.as_bytes();
+    if bytes.starts_with(b"LD_") || bytes.starts_with(b"DYLD_") || bytes.starts_with(b"MALLOC_") {
+        return Some("dynamic-loader or allocator hook");
+    }
+    match name {
+        "BASH_ENV"
+        | "ENV"
+        | "SHELLOPTS"
+        | "BASHOPTS"
+        | "KSH_ENV"
+        | "ZDOTDIR"
+        | "PYTHONPATH"
+        | "PYTHONHOME"
+        | "PYTHONSTARTUP"
+        | "PYTHONINSPECT"
+        | "PYTHONUSERBASE"
+        | "PERL5OPT"
+        | "PERL5LIB"
+        | "PERLLIB"
+        | "PERL5DB"
+        | "RUBYOPT"
+        | "RUBYLIB"
+        | "NODE_OPTIONS"
+        | "NODE_PATH"
+        | "GCONV_PATH"
+        | "LOCPATH"
+        | "JAVA_TOOL_OPTIONS"
+        | "_JAVA_OPTIONS"
+        | "JDK_JAVA_OPTIONS"
+        | "CLASSPATH"
+        | "LUA_PATH"
+        | "LUA_CPATH"
+        | "LUA_INIT"
+        | "PHPRC"
+        | "PHP_INI_SCAN_DIR"
+        | "RUSTC_WRAPPER"
+        | "RUSTC_WORKSPACE_WRAPPER"
+        | "GIT_EXEC_PATH"
+        | "GIT_TEMPLATE_DIR" => Some("shell-startup or interpreter code-loading hook"),
+        "OPENAI_API_KEY" | "CODEX_API_KEY" | "CODEX_ACCESS_TOKEN" => {
+            Some("credential name tracked by the redactor")
+        }
+        _ => None,
+    }
 }
 
 fn resolve_binary(binary: &Path) -> Result<PathBuf> {
@@ -850,6 +942,52 @@ mod tests {
         );
         assert!(spec.env.contains_key("PATH"));
         Ok(())
+    }
+
+    #[test]
+    fn operator_env_list_drops_shell_startup_and_loader_hooks() {
+        assert_eq!(
+            env_passthrough_names_from_operator_list("PATH,BASH_ENV, ENV, LD_PRELOAD,,DYLD_INSERT_LIBRARIES"),
+            vec!["PATH".to_string()]
+        );
+        assert!(env_passthrough_names_from_operator_list("BASH_ENV,LD_LIBRARY_PATH").is_empty());
+    }
+
+    #[test]
+    fn parse_env_passthrough_list_refuses_denied_names() {
+        assert_eq!(parse_env_passthrough_list("PATH").unwrap(), vec!["PATH"]);
+        let error = parse_env_passthrough_list("PATH,BASH_ENV").unwrap_err().to_string();
+        assert!(error.contains("BASH_ENV"), "{error}");
+        assert!(error.contains("refused runtime adapter env passthrough"), "{error}");
+        let preload = parse_env_passthrough_list("LD_PRELOAD").unwrap_err().to_string();
+        assert!(preload.contains("LD_PRELOAD"), "{preload}");
+        let dyld = parse_env_passthrough_list("DYLD_LIBRARY_PATH").unwrap_err().to_string();
+        assert!(dyld.contains("DYLD_LIBRARY_PATH"), "{dyld}");
+        let credential = parse_env_passthrough_list("OPENAI_API_KEY").unwrap_err().to_string();
+        assert!(credential.contains("OPENAI_API_KEY"), "{credential}");
+    }
+
+    #[test]
+    fn render_refuses_unscreened_passthrough_environment() {
+        let config = RuntimeAdapterConfig {
+            env_passthrough: vec!["BASH_ENV".into()],
+            ..RuntimeAdapterConfig::defaults(RuntimeId::Grok)
+        };
+        let error = config
+            .render(&launch_context(
+                Path::new("prompt.txt"),
+                Some("grok-4.6"),
+                Some("high"),
+                Path::new("/tmp/work"),
+                Path::new("out.txt"),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("BASH_ENV"), "{error}");
+        assert!(
+            error.contains("refused runtime adapter env passthrough"),
+            "{error}"
+        );
     }
 
     #[test]
