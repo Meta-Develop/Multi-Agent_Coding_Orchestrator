@@ -623,14 +623,8 @@ fn scan_rust_file(
     Ok(())
 }
 
-#[cfg(unix)]
 fn read_semantic_source(root: &Path, file: &Path, max_bytes: u64) -> Result<String> {
     BoundedRegularReader::read_relative_utf8(root, file, max_bytes)
-}
-
-#[cfg(not(unix))]
-fn read_semantic_source(root: &Path, file: &Path, max_bytes: u64) -> Result<String> {
-    BoundedRegularReader::read_utf8(root.join(file), max_bytes)
 }
 
 fn bounded_semantic_child_path(
