@@ -1727,6 +1727,7 @@ impl WorktreeManager {
                 .join(requested_root)
         };
         let root = SafeRoot::open_or_create_managed(&requested_root)?;
+        crate::lane_build::ensure_lane_build_configuration(root.path())?;
         let worktree_path = root.direct_child(&name)?;
 
         if find_worktree(&repo, &name)?.is_some() {
@@ -2371,6 +2372,9 @@ impl WorktreeManager {
             .transpose()?;
         let restrict_to_requested_root = options.worktree_root.is_some();
         let worktree_root = resolve_worktree_root(&repo, options.worktree_root.clone())?;
+        if !options.dry_run {
+            crate::lane_build::ensure_lane_build_configuration(&worktree_root)?;
+        }
         let allowed_untracked_paths =
             normalize_gc_allowed_untracked_paths(&options.allowed_untracked_paths)?;
         let active_claims = active_claim_agent_ids(&repo)?;
@@ -3754,7 +3758,7 @@ fn reconcile_managed_worktree_lifecycle(
         let root = SafeRoot::open_existing(&root_path)?;
         let git_registered = git_registered_worktree_names_for_reconciliation(repo, root.path())?;
         for child_name in root.direct_child_names_bounded(MAX_MANAGED_RECORDS)? {
-            if child_name.to_string_lossy().starts_with(".maco-") {
+            if is_reserved_worktree_root_child(&child_name) {
                 continue;
             }
             let Some(name) = child_name.to_str() else {
@@ -4947,7 +4951,7 @@ fn resolve_sweep_repository(
     .map_err(|error| sweep_failure(WorktreeSweepFailureKind::RepositoryAssociation, error))?;
     let mut lane_associations = BTreeMap::new();
     for lane_name in lane_names {
-        if lane_name.to_string_lossy().starts_with(".maco-") {
+        if is_reserved_worktree_root_child(&lane_name) {
             continue;
         }
         let lane_path = group_root.join(&lane_name);
@@ -7242,7 +7246,7 @@ fn prune_unregistered_worktree_directories(
     let git_registered = git_registered_worktree_names(repo, root.path())?;
     let mut orphans = Vec::new();
     for child_name in root.direct_child_names_bounded(MAX_MANAGED_RECORDS)? {
-        if child_name.to_string_lossy().starts_with(".maco-") {
+        if is_reserved_worktree_root_child(&child_name) {
             continue;
         }
         let Some(name) = child_name.to_str() else {
@@ -10121,6 +10125,12 @@ fn validate_branch_name(branch_name: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn is_reserved_worktree_root_child(name: impl AsRef<OsStr>) -> bool {
+    let name = name.as_ref();
+    name.to_string_lossy().starts_with(".maco-")
+        || crate::lane_build::is_lane_build_config_directory(name)
 }
 
 fn default_worktree_root(repo: &Repository) -> PathBuf {
@@ -18375,6 +18385,52 @@ mod tests {
             .is_err());
         assert!(!registry.records.contains_key(&binding.name));
         assert!(!registry.operations.contains_key(&binding.name));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_writes_lane_build_config_outside_the_lane_and_gc_does_not_prune_it() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = create_gc_worktree(&manager, "lane-build-config", &worktree_root);
+
+        let config_path = crate::lane_build::lane_build_config_path(&worktree_root);
+        let contents = fs::read_to_string(&config_path).expect("lane cargo config");
+        assert_eq!(contents, crate::lane_build::lane_cargo_config_contents());
+        assert!(
+            !created.path.join(".cargo/config.toml").exists()
+                || fs::read_to_string(created.path.join(".cargo/config.toml"))
+                    .expect("lane checkout cargo config")
+                    == fs::read_to_string(
+                        Path::new(env!("CARGO_MANIFEST_DIR")).join(".cargo/config.toml")
+                    )
+                    .expect("primary cargo config"),
+            "lane checkout must keep the tracked primary Cargo config"
+        );
+        assert!(
+            !config_path.starts_with(&created.path),
+            "lane build config must not live inside the disposable checkout"
+        );
+
+        let report = manager
+            .gc(gc_options(Some(worktree_root.clone()), false))
+            .expect("gc after lane create");
+        assert!(
+            config_path.exists(),
+            "reserved .cargo sibling must survive orphan prune"
+        );
+        assert!(
+            !report
+                .entries
+                .iter()
+                .any(|entry| entry.name == crate::lane_build::LANE_BUILD_CONFIG_DIR),
+            "lane Cargo config must not be classified as a worktree: {report:#?}"
+        );
     }
 
     fn create_gc_worktree(
