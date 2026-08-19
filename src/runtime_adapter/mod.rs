@@ -389,16 +389,11 @@ impl RuntimeAdapterConfig {
             .iter()
             .any(|token| token == "{prompt_text}")
         {
-            std::fs::read_to_string(context.prompt).with_context(|| {
-                format!(
-                    "failed to read prompt file {} for {{prompt_text}}",
-                    context.prompt.display()
-                )
-            })?
+            read_prompt_text_for_argv(context.prompt)?
         } else {
             String::new()
         };
-        let mut values = BTreeMap::from([
+        let values = BTreeMap::from([
             ("prompt", context.prompt.display().to_string()),
             ("prompt_text", prompt_text),
             ("model", context.model.unwrap_or_default().to_string()),
@@ -413,11 +408,14 @@ impl RuntimeAdapterConfig {
                 continue;
             };
             let value = values
-                .remove(name)
+                .get(name)
+                .cloned()
                 .with_context(|| format!("unknown runtime adapter placeholder '{{{name}}}'"))?;
-            if !value.is_empty() {
-                argv.push(value);
+            if value.is_empty() {
+                drop_empty_placeholder_pair(&mut argv);
+                continue;
             }
+            argv.push(value);
         }
         if let Some(flag) = &self.working_dir_flag {
             argv.extend([flag.clone(), context.cwd.display().to_string()]);
@@ -530,6 +528,40 @@ pub struct AdapterRun {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub captured: Vec<u8>,
+}
+
+/// Linux `MAX_ARG_STRLEN` is 32 pages (131072). Stay one byte under so a
+/// `{prompt_text}` argv element cannot hit `E2BIG` on that cap.
+const MAX_PROMPT_TEXT_ARGV_BYTES: u64 = 131_072 - 1;
+
+fn read_prompt_text_for_argv(path: &Path) -> Result<String> {
+    let text = crate::safe_state::BoundedRegularReader::read_utf8(path, MAX_PROMPT_TEXT_ARGV_BYTES)
+        .with_context(|| {
+            format!(
+                "failed to read prompt file {} for {{prompt_text}}",
+                path.display()
+            )
+        })?;
+    if text.contains('\0') {
+        bail!(
+            "prompt file {} for {{prompt_text}} contains a NUL byte and cannot be passed as argv",
+            path.display()
+        );
+    }
+    Ok(text)
+}
+
+fn drop_empty_placeholder_pair(argv: &mut Vec<String>) {
+    if argv
+        .last()
+        .is_some_and(|token| is_paired_option_flag(token))
+    {
+        argv.pop();
+    }
+}
+
+fn is_paired_option_flag(token: &str) -> bool {
+    token.starts_with('-') && token != "-" && token != "--" && !token.contains('=')
 }
 
 /// Operator `MACO_<RUNTIME>_ENV` lists are comma-separated. Empty names are
@@ -726,6 +758,125 @@ mod tests {
         );
         assert_eq!(spec.output_capture, OutputCaptureMode::Stdout);
         assert!(!spec.argv.iter().any(|arg| arg == "--output"));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_model_drops_the_preceding_flag_instead_of_shifting_argv() -> Result<()> {
+        let spec = RuntimeAdapterConfig::defaults(RuntimeId::Grok).render(&launch_context(
+            Path::new("prompt.txt"),
+            None,
+            Some("high"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert_eq!(
+            spec.argv,
+            [
+                "--prompt-file",
+                "prompt.txt",
+                "--effort",
+                "high",
+                "--cwd",
+                "/tmp/work",
+                "--output-format",
+                "plain",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_model_and_effort_drop_both_flag_pairs() -> Result<()> {
+        let spec = RuntimeAdapterConfig::defaults(RuntimeId::Grok).render(&launch_context(
+            Path::new("prompt.txt"),
+            None,
+            None,
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert_eq!(
+            spec.argv,
+            [
+                "--prompt-file",
+                "prompt.txt",
+                "--cwd",
+                "/tmp/work",
+                "--output-format",
+                "plain",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_cursor_model_drops_the_preceding_flag() -> Result<()> {
+        let spec = RuntimeAdapterConfig::defaults(RuntimeId::Cursor).render(&launch_context(
+            Path::new("prompt.txt"),
+            None,
+            Some("high"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert_eq!(
+            spec.argv,
+            [
+                "-p",
+                "--trust",
+                "--workspace",
+                "/tmp/work",
+                "--output-format",
+                "text",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_placeholders_render_the_same_value() -> Result<()> {
+        let config = RuntimeAdapterConfig {
+            argument_template: vec![
+                "--model".into(),
+                "{model}".into(),
+                "--fallback-model".into(),
+                "{model}".into(),
+            ],
+            ..RuntimeAdapterConfig::defaults(RuntimeId::Grok)
+        };
+        let spec = config.render(&launch_context(
+            Path::new("prompt.txt"),
+            Some("grok-4.6"),
+            Some("high"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert_eq!(
+            spec.argv,
+            ["--model", "grok-4.6", "--fallback-model", "grok-4.6"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_text_refuses_an_argv_oversized_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let prompt = dir.path().join("prompt.txt");
+        fs::write(&prompt, vec![b'a'; (MAX_PROMPT_TEXT_ARGV_BYTES as usize) + 1])?;
+        let config = RuntimeAdapterConfig::defaults_for(AdapterId::GeminiCli);
+        let error = config
+            .render(&launch_context(
+                &prompt,
+                Some("gemini-2.5-pro"),
+                None,
+                Path::new("/tmp/work"),
+                Path::new("out.txt"),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("bounded read limit") || error.contains("{prompt_text}"),
+            "unexpected render error: {error}"
+        );
         Ok(())
     }
 
