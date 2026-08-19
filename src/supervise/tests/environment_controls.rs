@@ -544,6 +544,7 @@ fn issue32_auditor_is_read_only_while_incoming_report_remains_writable() {
     assert_eq!(command.output_last_message, report_path);
 
     let argv = crate::external_agent::command_argv(&command)
+        .expect("command argv")
         .into_iter()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect::<Vec<_>>();

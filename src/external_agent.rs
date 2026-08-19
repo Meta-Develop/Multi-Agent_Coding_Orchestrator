@@ -1428,7 +1428,18 @@ fn run_external_agent_runtime(
     let mut argv = if duplex_review_required {
         Vec::new()
     } else {
-        command_argv_with_controls(&target_spec, &target_controls)
+        match command_argv_with_controls(&target_spec, &target_controls) {
+            Ok(argv) => argv,
+            Err(error) => {
+                return failed_external_run(
+                    spec,
+                    started,
+                    command_display(&resolved_program, &[]),
+                    false,
+                    format!("runtime adapter launch configuration is invalid: {error:#}"),
+                );
+            }
+        }
     };
     let mut bound_argv_digest = if duplex_review_required {
         None
@@ -1737,6 +1748,15 @@ fn run_external_agent_runtime(
     let mut external_environment = allowed_env(spec.invocation, program_trust);
     if let Some(config) = &target_spec.runtime_adapter {
         for key in &config.env_passthrough {
+            if runtime_adapter_env_passthrough_is_denied(key) {
+                return failed_external_run(
+                    spec,
+                    started,
+                    command_display(&resolved_program, &[]),
+                    false,
+                    format!("runtime adapter env passthrough refused the protected variable {key}"),
+                );
+            }
             if let Ok(value) = env::var(key) {
                 external_environment.insert(key.clone(), value);
             }
@@ -5919,7 +5939,7 @@ fn append_external_error(existing: Option<String>, next: Option<String>) -> Opti
 }
 
 #[cfg(test)]
-pub(crate) fn command_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
+pub(crate) fn command_argv(spec: &ExternalAgentCommand) -> Result<Vec<OsString>> {
     let controls =
         protected_worktree_controls(spec).unwrap_or_else(|_| ProtectedWorktreeControls {
             writable_artifact_root: required_parent(&spec.output_last_message)
@@ -5931,7 +5951,7 @@ pub(crate) fn command_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
 }
 
 #[cfg(test)]
-pub(crate) fn app_server_command_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
+pub(crate) fn app_server_command_argv(spec: &ExternalAgentCommand) -> Result<Vec<OsString>> {
     let controls =
         protected_worktree_controls(spec).unwrap_or_else(|_| ProtectedWorktreeControls {
             writable_artifact_root: required_parent(&spec.output_last_message)
@@ -5939,24 +5959,45 @@ pub(crate) fn app_server_command_argv(spec: &ExternalAgentCommand) -> Vec<OsStri
                 .map(PathBuf::from),
             ..ProtectedWorktreeControls::default()
         });
-    codex_app_server_argv(spec, &controls)
+    Ok(codex_app_server_argv(spec, &controls))
 }
 
 fn command_argv_with_controls(
     spec: &ExternalAgentCommand,
     controls: &ProtectedWorktreeControls,
-) -> Vec<OsString> {
+) -> Result<Vec<OsString>> {
     match spec.invocation {
-        ExternalAgentInvocation::CodexSupervisor => codex_supervisor_argv(spec, controls),
-        ExternalAgentInvocation::CodexConsultant => codex_consultant_argv(spec, controls),
-        ExternalAgentInvocation::ClaudeConsultant => claude_consultant_argv(),
+        ExternalAgentInvocation::CodexSupervisor => Ok(codex_supervisor_argv(spec, controls)),
+        ExternalAgentInvocation::CodexConsultant => Ok(codex_consultant_argv(spec, controls)),
+        ExternalAgentInvocation::ClaudeConsultant => Ok(claude_consultant_argv()),
         ExternalAgentInvocation::Grok | ExternalAgentInvocation::Cursor => {
             runtime_adapter_argv(spec)
         }
     }
 }
 
-fn runtime_adapter_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
+const RUNTIME_ADAPTER_DENIED_ENV: &[&str] = &[
+    "BASH_ENV",
+    "ENV",
+    "CDPATH",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "IFS",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "PATH",
+];
+
+fn runtime_adapter_env_passthrough_is_denied(name: &str) -> bool {
+    name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+        || RUNTIME_ADAPTER_DENIED_ENV.contains(&name)
+}
+
+fn runtime_adapter_argv(spec: &ExternalAgentCommand) -> Result<Vec<OsString>> {
     let config = spec.runtime_adapter.clone().unwrap_or_else(|| {
         RuntimeAdapterConfig::defaults(match spec.invocation {
             ExternalAgentInvocation::Grok => RuntimeId::Grok,
@@ -5964,16 +6005,18 @@ fn runtime_adapter_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
             _ => RuntimeId::Codex,
         })
     });
-    config
+    Ok(config
         .render(&LaunchContext {
             prompt: &spec.prompt,
             model: spec.model.as_deref(),
             effort: spec.reasoning_effort.as_deref(),
             cwd: &spec.cwd,
             output: &spec.output_last_message,
-        })
-        .map(|launch| launch.argv.into_iter().map(OsString::from).collect())
-        .unwrap_or_default()
+        })?
+        .argv
+        .into_iter()
+        .map(OsString::from)
+        .collect())
 }
 
 fn codex_supervisor_argv(
@@ -8294,6 +8337,7 @@ printf '{"type":"done"}\n'
             Duration::from_secs(1),
         );
         let actual = command_argv(&command)
+            .expect("command argv")
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
@@ -8364,6 +8408,7 @@ printf '{"type":"done"}\n'
             Some("high\"\nweb_search=\"live".to_string()),
         );
         let actual = command_argv(&command)
+            .expect("command argv")
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
@@ -8381,6 +8426,30 @@ printf '{"type":"done"}\n'
         assert!(!actual
             .iter()
             .any(|argument| argument == "web_search=\"live\""));
+    }
+
+    #[test]
+    fn runtime_adapter_argv_propagates_render_failure() {
+        let mut command = ExternalAgentCommand::codex(
+            "codex",
+            "/workspace",
+            "/run/prompt.md",
+            "/run/events.jsonl",
+            "/run/report.json",
+            Duration::from_secs(1),
+        )
+        .with_runtime_adapter(
+            RuntimeId::Grok,
+            RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+        );
+        // with_runtime_adapter copies program into config.binary — force empty after:
+        if let Some(config) = command.runtime_adapter.as_mut() {
+            config.binary = Some(PathBuf::new());
+        }
+        let error = runtime_adapter_argv(&command).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("runtime adapter binary is not configured"));
     }
 
     #[test]
@@ -9926,8 +9995,8 @@ printf '{"type":"done"}\n'
             Duration::from_secs(1),
         );
 
-        let raw_argv = command_argv(&raw);
-        let replacement_argv = command_argv(&replacement);
+        let raw_argv = command_argv(&raw)?;
+        let replacement_argv = command_argv(&replacement)?;
         let cd_index = raw_argv
             .iter()
             .position(|argument| argument == "--cd")

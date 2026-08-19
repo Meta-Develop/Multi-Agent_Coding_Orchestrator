@@ -1881,11 +1881,11 @@ mod regression_tests {
         );
         assert_eq!(report_command.model.as_deref(), Some("model-beta"));
         assert_eq!(report_command.reasoning_effort.as_deref(), Some("max"));
-        let diff_argv = crate::external_agent::command_argv(&diff_command)
+        let diff_argv = crate::external_agent::command_argv(&diff_command)?
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        let report_argv = crate::external_agent::command_argv(&report_command)
+        let report_argv = crate::external_agent::command_argv(&report_command)?
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();

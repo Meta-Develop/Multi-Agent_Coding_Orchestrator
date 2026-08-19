@@ -1286,10 +1286,12 @@ fn role_selection_produces_distinct_launched_role_argv() {
     )
     .expect("runtime catalog contains the configured auditor selection");
     let child_argv = crate::external_agent::command_argv(&child)
+        .expect("command argv")
         .into_iter()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     let auditor_argv = crate::external_agent::command_argv(&auditor)
+        .expect("command argv")
         .into_iter()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
@@ -1417,6 +1419,7 @@ fn no_override_selects_single_slug_effort_profile_for_every_role() {
     )
     .expect("apply no-override child selection");
     let child_argv = crate::external_agent::app_server_command_argv(&child)
+        .expect("command argv")
         .into_iter()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
@@ -1439,6 +1442,7 @@ fn no_override_selects_single_slug_effort_profile_for_every_role() {
     )
     .expect("apply no-override auditor selection");
     let auditor_argv = crate::external_agent::command_argv(&auditor)
+        .expect("command argv")
         .into_iter()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
@@ -1819,6 +1823,7 @@ fn known_unavailable_child_runtime_default_reaches_production_app_server_argv_be
             auditor_seen = true;
             assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
             let argv = crate::external_agent::command_argv(command)
+                .expect("command argv")
                 .into_iter()
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
@@ -1835,6 +1840,7 @@ fn known_unavailable_child_runtime_default_reaches_production_app_server_argv_be
             assert_eq!(command.workspace_access, WorkspaceAccess::ReadWrite);
             assert!(command.model.is_none());
             let argv = crate::external_agent::app_server_command_argv(command)
+                .expect("command argv")
                 .into_iter()
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
@@ -1946,6 +1952,7 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
                 .expect("read resolved auditor prompt")
                 .contains("Reasoning effort: xhigh"));
             let argv = crate::external_agent::command_argv(command)
+                .expect("command argv")
                 .into_iter()
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
@@ -1964,6 +1971,7 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
             child_seen = true;
             assert_eq!(command.workspace_access, WorkspaceAccess::ReadWrite);
             let argv = crate::external_agent::app_server_command_argv(command)
+                .expect("command argv")
                 .into_iter()
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();

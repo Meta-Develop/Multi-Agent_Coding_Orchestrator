@@ -256,6 +256,11 @@ pub struct RuntimeAdapterConfig {
     pub feed_prompt_on_stdin: bool,
 }
 
+/// Same bound as the live prompt path in `external_agent`.
+const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+/// Linux `MAX_ARG_STRLEN` is 131072; refuse a single argv element above this.
+const MAX_SINGLE_ARGUMENT_BYTES: usize = 128 * 1024;
+
 impl RuntimeAdapterConfig {
     pub fn defaults(runtime: RuntimeId) -> Self {
         Self::defaults_for(AdapterId::from_runtime(runtime))
@@ -390,16 +395,33 @@ impl RuntimeAdapterConfig {
             .iter()
             .any(|token| token == "{prompt_text}")
         {
-            std::fs::read_to_string(context.prompt).with_context(|| {
+            let bytes = crate::process_runner::read_bounded_regular_file_nofollow(
+                context.prompt,
+                MAX_PROMPT_BYTES,
+            )
+            .with_context(|| {
                 format!(
                     "failed to read prompt file {} for {{prompt_text}}",
                     context.prompt.display()
                 )
-            })?
+            })?;
+            let prompt_text = String::from_utf8(bytes).with_context(|| {
+                format!(
+                    "prompt file {} for {{prompt_text}} is not valid UTF-8",
+                    context.prompt.display()
+                )
+            })?;
+            if prompt_text.len() > MAX_SINGLE_ARGUMENT_BYTES {
+                bail!(
+                    "prompt is too large to pass as a single command-line argument; \
+                     the runtime should take the prompt on stdin instead"
+                );
+            }
+            prompt_text
         } else {
             String::new()
         };
-        let mut values = BTreeMap::from([
+        let values = BTreeMap::from([
             ("prompt", context.prompt.display().to_string()),
             ("prompt_text", prompt_text),
             ("model", context.model.unwrap_or_default().to_string()),
@@ -408,17 +430,28 @@ impl RuntimeAdapterConfig {
             ("output", context.output.display().to_string()),
         ]);
         let mut argv = Vec::new();
+        let mut from_placeholder = Vec::new();
         for token in &self.argument_template {
             let Some(name) = token.strip_prefix('{').and_then(|v| v.strip_suffix('}')) else {
                 argv.push(token.clone());
+                from_placeholder.push(false);
                 continue;
             };
             let value = values
-                .remove(name)
+                .get(name)
+                .cloned()
                 .with_context(|| format!("unknown runtime adapter placeholder '{{{name}}}'"))?;
-            if !value.is_empty() {
-                argv.push(value);
+            if value.is_empty() {
+                if from_placeholder.last() == Some(&false)
+                    && argv.last().is_some_and(|prev| prev.starts_with('-'))
+                {
+                    argv.pop();
+                    from_placeholder.pop();
+                }
+                continue;
             }
+            argv.push(value);
+            from_placeholder.push(true);
         }
         if let Some(flag) = &self.working_dir_flag {
             argv.extend([flag.clone(), context.cwd.display().to_string()]);
@@ -803,6 +836,121 @@ mod tests {
             ))
             .unwrap_err();
         assert!(error.to_string().contains("maco-missing-gemini-prompt.txt"));
+    }
+
+    #[test]
+    fn grok_defaults_drop_the_model_flag_when_no_model_is_resolved() -> Result<()> {
+        let config = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+        let spec = config.render(&launch_context(
+            Path::new("prompt.txt"),
+            None,
+            Some("high"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert_eq!(
+            spec.argv,
+            [
+                "--prompt-file",
+                "prompt.txt",
+                "--effort",
+                "high",
+                "--cwd",
+                "/tmp/work",
+                "--output-format",
+                "plain",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unresolved_effort_drops_its_flag_too() -> Result<()> {
+        let config = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+        let spec = config.render(&launch_context(
+            Path::new("prompt.txt"),
+            Some("grok-4"),
+            None,
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert!(!spec.argv.iter().any(|arg| arg == "--effort"));
+        assert!(spec
+            .argv
+            .windows(2)
+            .any(|pair| pair == ["--model", "grok-4"]));
+        assert!(spec.argv.iter().any(|arg| arg == "--prompt-file"));
+        assert!(spec.argv.iter().any(|arg| arg == "--cwd"));
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_placeholder_renders_the_same_value_twice() -> Result<()> {
+        let config = RuntimeAdapterConfig {
+            argument_template: vec![
+                "--model".into(),
+                "{model}".into(),
+                "--fallback-model".into(),
+                "{model}".into(),
+            ],
+            ..RuntimeAdapterConfig::defaults(RuntimeId::Grok)
+        };
+        let spec = config.render(&launch_context(
+            Path::new("prompt.txt"),
+            Some("m"),
+            None,
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert_eq!(spec.argv, ["--model", "m", "--fallback-model", "m"]);
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_placeholder_is_still_rejected() {
+        let config = RuntimeAdapterConfig {
+            argument_template: vec!["{nope}".into()],
+            ..RuntimeAdapterConfig::defaults(RuntimeId::Grok)
+        };
+        let error = config
+            .render(&launch_context(
+                Path::new("prompt.txt"),
+                None,
+                None,
+                Path::new("/tmp/work"),
+                Path::new("out.txt"),
+            ))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unknown runtime adapter placeholder"));
+    }
+
+    #[test]
+    fn oversized_prompt_text_is_refused_rather_than_passed_as_one_argument() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let prompt = dir.path().join("prompt.txt");
+        fs::write(&prompt, vec![b'x'; MAX_SINGLE_ARGUMENT_BYTES + 1])?;
+        let config = RuntimeAdapterConfig {
+            argument_template: vec!["--prompt".into(), "{prompt_text}".into()],
+            ..RuntimeAdapterConfig::defaults(RuntimeId::Grok)
+        };
+        let error = config
+            .render(&launch_context(
+                &prompt,
+                None,
+                None,
+                Path::new("/tmp/work"),
+                Path::new("out.txt"),
+            ))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("too large to pass as a single command-line argument"),
+            "{message}"
+        );
+        assert!(message.contains("stdin"), "{message}");
+        Ok(())
     }
 
     #[test]

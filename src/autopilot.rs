@@ -4804,6 +4804,7 @@ mod tests {
         );
         let command = CommandRunRecord {
             command: crate::external_agent::command_argv(&command)
+                .expect("command argv")
                 .into_iter()
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect(),
