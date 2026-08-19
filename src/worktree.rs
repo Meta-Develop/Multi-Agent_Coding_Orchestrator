@@ -11530,7 +11530,18 @@ fn validate_bounded_git_text_inputs_bound(
     })
 }
 
-#[cfg(unix)]
+fn path_from_git_bytes(raw: &[u8]) -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        Ok(PathBuf::from(OsString::from_vec(raw.to_vec())))
+    }
+    #[cfg(not(unix))]
+    {
+        let text = std::str::from_utf8(raw).context("Git path is not valid UTF-8")?;
+        Ok(PathBuf::from(text))
+    }
+}
+
 fn parse_porcelain_v1_z(bytes: &[u8], max_entries: usize) -> Result<Vec<(PathBuf, [u8; 2])>> {
     let mut records = Vec::new();
     for raw in bytes
@@ -11547,7 +11558,7 @@ fn parse_porcelain_v1_z(bytes: &[u8], max_entries: usize) -> Result<Vec<(PathBuf
         {
             bail!("bounded worktree status returned malformed status bytes");
         }
-        let path = PathBuf::from(OsString::from_vec(raw[3..].to_vec()));
+        let path = path_from_git_bytes(&raw[3..])?;
         if path.as_os_str().is_empty()
             || path.is_absolute()
             || path
@@ -11564,14 +11575,13 @@ fn parse_porcelain_v1_z(bytes: &[u8], max_entries: usize) -> Result<Vec<(PathBuf
     Ok(records)
 }
 
-#[cfg(unix)]
 fn parse_nul_paths(bytes: &[u8], max_entries: usize) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for raw in bytes
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
     {
-        let path = PathBuf::from(OsString::from_vec(raw.to_vec()));
+        let path = path_from_git_bytes(raw)?;
         if path.as_os_str().is_empty()
             || path.is_absolute()
             || path
@@ -11588,16 +11598,6 @@ fn parse_nul_paths(bytes: &[u8], max_entries: usize) -> Result<Vec<PathBuf>> {
     paths.sort();
     paths.dedup();
     Ok(paths)
-}
-
-#[cfg(not(unix))]
-fn parse_nul_paths(_bytes: &[u8], _max_entries: usize) -> Result<Vec<PathBuf>> {
-    bail!("lossless bounded Git inventory parsing is unsupported on this platform")
-}
-
-#[cfg(not(unix))]
-fn parse_porcelain_v1_z(_bytes: &[u8], _max_entries: usize) -> Result<Vec<(PathBuf, [u8; 2])>> {
-    bail!("lossless bounded Git status parsing is unsupported on this platform")
 }
 
 fn finish_with_status_lock_verification<T>(

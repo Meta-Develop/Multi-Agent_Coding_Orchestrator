@@ -886,7 +886,6 @@ pub struct DirectoryBindingGuard {
     path: PathBuf,
     directory: File,
     identity: FileIdentity,
-    #[cfg(unix)]
     generation: fs::Metadata,
 }
 
@@ -976,7 +975,28 @@ impl DirectoryBindingGuard {
                 directory,
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let directory = open_windows_directory(&path)?;
+            let metadata = directory.metadata().with_context(|| {
+                format!("failed to inspect directory binding {}", path.display())
+            })?;
+            if !metadata.file_type().is_dir() {
+                bail!(
+                    "directory binding target is not a directory: {}",
+                    path.display()
+                );
+            }
+            ensure_not_link_or_reparse(&path, &metadata)?;
+            let identity = identity_from_open_handle(&directory, &path)?;
+            Ok(Self {
+                path,
+                identity,
+                generation: metadata,
+                directory,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = path;
             bail!("verified directory pathname bindings are unsupported on this platform")
@@ -1000,7 +1020,7 @@ impl DirectoryBindingGuard {
             read_bounded_file(&mut file, &self.path.join(&relative), max_bytes)
         }
         #[cfg(not(target_os = "linux"))]
-        bail!("descriptor-relative mount-confined reads require Linux openat2")
+        BoundedRegularReader::read_relative(&self.path, relative, max_bytes)
     }
 
     pub(crate) fn read_relative_optional(
@@ -1033,7 +1053,7 @@ impl DirectoryBindingGuard {
             read_bounded_file(&mut file, &self.path.join(&relative), max_bytes).map(Some)
         }
         #[cfg(not(target_os = "linux"))]
-        bail!("descriptor-relative mount-confined reads require Linux openat2")
+        BoundedRegularReader::read_relative_optional(&self.path, relative, max_bytes)
     }
 
     pub fn verify(&self) -> Result<()> {
@@ -1066,7 +1086,44 @@ impl DirectoryBindingGuard {
             }
             Ok(())
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let held = self.directory.metadata().with_context(|| {
+                format!(
+                    "failed to inspect held directory binding {}",
+                    self.path.display()
+                )
+            })?;
+            if !held.file_type().is_dir()
+                || identity_from_open_handle(&self.directory, &self.path)? != self.identity
+                || !same_file_generation(&self.generation, &held)
+            {
+                bail!("held directory binding changed: {}", self.path.display());
+            }
+            let rebound_directory = open_windows_directory(&self.path).with_context(|| {
+                format!(
+                    "directory pathname binding disappeared: {}",
+                    self.path.display()
+                )
+            })?;
+            let rebound = rebound_directory.metadata().with_context(|| {
+                format!(
+                    "failed to inspect rebound directory binding {}",
+                    self.path.display()
+                )
+            })?;
+            if !rebound.file_type().is_dir()
+                || identity_from_open_handle(&rebound_directory, &self.path)? != self.identity
+                || !same_file_generation(&self.generation, &rebound)
+            {
+                bail!(
+                    "directory pathname binding changed: {}",
+                    self.path.display()
+                );
+            }
+            Ok(())
+        }
+        #[cfg(not(any(unix, windows)))]
         bail!("verified directory pathname bindings are unsupported on this platform")
     }
 }
@@ -1117,10 +1174,6 @@ impl BoundedTreeWalker {
             } else {
                 None
             };
-            #[cfg(not(target_os = "linux"))]
-            if limits.same_device {
-                bail!("mount-confined bounded tree walks require Linux statx mount identities");
-            }
             let deadline = Instant::now()
                 .checked_add(limits.max_duration)
                 .context("bounded tree walk deadline overflowed")?;
@@ -1145,11 +1198,208 @@ impl BoundedTreeWalker {
             Ok(entries)
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            walk_bound_windows(root_binding, limits, action)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (root_binding, limits, &mut action);
             bail!("descriptor-relative bounded tree walks are unsupported on this platform")
         }
+    }
+}
+
+#[cfg(windows)]
+fn walk_bound_windows<F>(
+    root_binding: &DirectoryBindingGuard,
+    limits: BoundedTreeWalkLimits,
+    mut action: F,
+) -> Result<Vec<BoundedTreeEntry>>
+where
+    F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
+{
+    let limits = limits.validate()?;
+    let deadline = Instant::now()
+        .checked_add(limits.max_duration)
+        .context("bounded tree walk deadline overflowed")?;
+    let mut budget = InventoryBudget {
+        remaining_entries: limits.max_entries,
+        total_path_bytes: 0,
+        deadline,
+    };
+    let mut entries = Vec::new();
+    walk_bound_windows_dir(
+        root_binding,
+        Path::new(""),
+        0,
+        root_binding.identity.device,
+        limits,
+        &mut budget,
+        &mut action,
+        &mut entries,
+    )?;
+    budget.ensure_before_deadline("after repository traversal")?;
+    root_binding.verify()?;
+    Ok(entries)
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn walk_bound_windows_dir<F>(
+    root_binding: &DirectoryBindingGuard,
+    relative_directory: &Path,
+    depth: usize,
+    root_device: u64,
+    limits: BoundedTreeWalkLimits,
+    budget: &mut InventoryBudget,
+    action: &mut F,
+    entries: &mut Vec<BoundedTreeEntry>,
+) -> Result<()>
+where
+    F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
+{
+    budget.ensure_before_deadline("before directory enumeration")?;
+    let current_path = if relative_directory.as_os_str().is_empty() {
+        root_binding.path.clone()
+    } else {
+        root_binding.path.join(relative_directory)
+    };
+    let mut names = Vec::new();
+    for entry in fs::read_dir(&current_path).with_context(|| {
+        format!(
+            "failed to enumerate repository directory {}",
+            current_path.display()
+        )
+    })? {
+        budget.ensure_before_deadline("during directory enumeration")?;
+        budget.consume_entry()?;
+        names.push(entry?.file_name());
+    }
+    names.sort();
+    for name in names {
+        budget.ensure_before_deadline("during entry inspection")?;
+        let relative = relative_directory.join(&name);
+        let entry_depth = depth.saturating_add(1);
+        if entry_depth > limits.max_depth {
+            bail!(
+                "repository inventory exceeded its maximum depth of {} at {}",
+                limits.max_depth,
+                relative.display()
+            );
+        }
+        budget.consume_path(&relative, limits)?;
+        let full_path = root_binding.path.join(&relative);
+        let snapshot =
+            crate::file_identity::open_windows_path_identity(&full_path).with_context(|| {
+                format!("failed to inspect repository entry {}", relative.display())
+            })?;
+        if limits.same_device && snapshot.identity.device != root_device {
+            bail!(
+                "repository inventory refused a cross-device entry: {}",
+                relative.display()
+            );
+        }
+        let file_type = snapshot.metadata.file_type();
+        let reparse = snapshot.metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0;
+        let kind =
+            if file_type.is_symlink() || (reparse && !file_type.is_dir() && !file_type.is_file()) {
+                BoundedTreeEntryKind::Symlink
+            } else if file_type.is_dir() && !reparse {
+                BoundedTreeEntryKind::Directory
+            } else if file_type.is_file() && !reparse {
+                BoundedTreeEntryKind::RegularFile
+            } else if reparse {
+                BoundedTreeEntryKind::Symlink
+            } else {
+                BoundedTreeEntryKind::Special
+            };
+        let (modified_seconds, modified_nanoseconds) =
+            system_time_parts(snapshot.metadata.modified().ok());
+        let (changed_seconds, changed_nanoseconds) =
+            system_time_parts(snapshot.metadata.created().ok());
+        let entry = BoundedTreeEntry {
+            relative_path: relative.clone(),
+            kind,
+            size_bytes: snapshot.metadata.len(),
+            hard_link_count: u64::from(snapshot.number_of_links),
+            unix_mode: 0,
+            identity: FileIdentity {
+                device: snapshot.identity.device,
+                file: snapshot.identity.file,
+            },
+            modified_seconds,
+            modified_nanoseconds,
+            changed_seconds,
+            changed_nanoseconds,
+        };
+        let decision = (action)(&entry)?;
+        budget.ensure_before_deadline("after repository inventory callback")?;
+        if matches!(
+            decision,
+            BoundedTreeWalkAction::Record | BoundedTreeWalkAction::RecordAndDescend
+        ) {
+            entries.push(entry.clone());
+        }
+        if decision == BoundedTreeWalkAction::RecordAndDescend {
+            if kind != BoundedTreeEntryKind::Directory {
+                bail!(
+                    "bounded tree walk requested descent through a non-directory: {}",
+                    relative.display()
+                );
+            }
+            if entry_depth >= limits.max_depth {
+                bail!(
+                    "repository inventory refused to descend beyond depth {} at {}",
+                    limits.max_depth,
+                    relative.display()
+                );
+            }
+            walk_bound_windows_dir(
+                root_binding,
+                &relative,
+                entry_depth,
+                root_device,
+                limits,
+                budget,
+                action,
+                entries,
+            )?;
+        }
+        let rebound =
+            crate::file_identity::open_windows_path_identity(&full_path).with_context(|| {
+                format!(
+                    "failed to revalidate repository entry after traversal: {}",
+                    relative.display()
+                )
+            })?;
+        if (FileIdentity {
+            device: rebound.identity.device,
+            file: rebound.identity.file,
+        }) != entry.identity
+        {
+            bail!(
+                "repository entry changed during bounded traversal: {}",
+                relative.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn system_time_parts(time: Option<SystemTime>) -> (i64, i64) {
+    let Some(time) = time else {
+        return (0, 0);
+    };
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+            i64::from(duration.subsec_nanos()),
+        ),
+        Err(_) => (0, 0),
     }
 }
 
@@ -1266,8 +1516,14 @@ impl BoundedRegularReader {
             read_bounded_file(&mut file, &root.join(&relative), max_bytes)
         }
 
-        #[cfg(not(target_os = "linux"))]
-        bail!("mount-confined repository-relative reads require Linux openat2")
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            let mut file = open_relative_regular_unix_allow_mounts(&root, &relative)?;
+            read_bounded_file(&mut file, &root.join(&relative), max_bytes)
+        }
+
+        #[cfg(not(unix))]
+        Self::read(root.join(relative), max_bytes)
     }
 
     pub fn read_relative_utf8(
@@ -1327,13 +1583,39 @@ impl BoundedRegularReader {
         }
 
         #[cfg(not(target_os = "linux"))]
-        bail!("mount-confined repository-relative reads require Linux openat2")
+        read_relative_optional_portable(&root, &relative, max_bytes)
     }
 
     pub fn identity(path: impl AsRef<Path>) -> Result<FileIdentity> {
         let path = path.as_ref();
         let file = open_regular_no_follow(path, false)?;
         identity_from_file(&file, path)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_relative_optional_portable(
+    root: &Path,
+    relative: &Path,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>> {
+    match BoundedRegularReader::read_relative(root, relative, max_bytes) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error)
+            if error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => {
+            let path = root.join(relative);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => Ok(None),
+                _ => Err(error),
+            }
+        }
     }
 }
 
@@ -2451,6 +2733,38 @@ fn open_unix_directory(path: &Path) -> Result<File> {
         current = unsafe { File::from_raw_fd(fd) };
     }
     Ok(current)
+}
+
+#[cfg(windows)]
+fn open_windows_directory(path: &Path) -> Result<File> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let path = absolute_normalized(path)?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let directory = options.open(&path).with_context(|| {
+        format!(
+            "failed to open directory without following reparse points: {}",
+            path.display()
+        )
+    })?;
+    let metadata = directory
+        .metadata()
+        .with_context(|| format!("failed to inspect directory {}", path.display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!(
+            "directory open target is not a directory: {}",
+            path.display()
+        );
+    }
+    ensure_not_link_or_reparse(&path, &metadata)?;
+    Ok(directory)
 }
 
 #[cfg(unix)]
@@ -4566,14 +4880,12 @@ struct TreeBudget {
     remaining_entries: usize,
 }
 
-#[cfg(unix)]
 struct InventoryBudget {
     remaining_entries: usize,
     total_path_bytes: usize,
     deadline: Instant,
 }
 
-#[cfg(unix)]
 impl InventoryBudget {
     fn consume_entry(&mut self) -> Result<()> {
         self.remaining_entries = self
@@ -4584,7 +4896,7 @@ impl InventoryBudget {
     }
 
     fn consume_path(&mut self, path: &Path, limits: BoundedTreeWalkLimits) -> Result<()> {
-        let bytes = path.as_os_str().as_bytes().len();
+        let bytes = path.as_os_str().len();
         if bytes == 0 || bytes > limits.max_path_bytes {
             bail!(
                 "repository inventory path exceeds its {}-byte limit: {}",
@@ -5485,6 +5797,38 @@ mod tests {
             .expect_err("repository-relative reader must not cross into procfs");
 
         assert!(format!("{error:#}").contains("mount-confined"));
+    }
+
+    #[test]
+    fn repository_relative_reader_reads_regular_utf8_and_preserves_directory_scopes() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("src")).expect("create source directory");
+        fs::write(root.join("src/lib.rs"), "hello\n").expect("write source");
+
+        assert_eq!(
+            BoundedRegularReader::read_relative_utf8(&root, "src/lib.rs", 64).expect("read source"),
+            "hello\n"
+        );
+        assert_eq!(
+            BoundedRegularReader::read_relative_optional_utf8(&root, "missing.rs", 64)
+                .expect("missing file"),
+            None
+        );
+        assert_eq!(
+            BoundedRegularReader::read_relative_optional_utf8(&root, "src", 64)
+                .expect("directory scope"),
+            None
+        );
+
+        let binding = DirectoryBindingGuard::bind(&root).expect("bind repository root");
+        assert_eq!(
+            binding
+                .read_relative(Path::new("src/lib.rs"), 64)
+                .expect("bound relative read"),
+            b"hello\n"
+        );
+        binding.verify().expect("directory binding remains stable");
     }
 
     #[cfg(target_os = "linux")]
