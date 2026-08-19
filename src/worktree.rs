@@ -187,7 +187,11 @@ pub struct PendingWorktreeOperation {
 pub struct WorktreeRetentionPolicy {
     pub max_age: Option<Duration>,
     pub max_count: Option<usize>,
-    /// Maximum apparent bytes retained across newest age/count survivors.
+    /// Maximum apparent bytes retained across value-density survivors.
+    ///
+    /// Ranking is GreedyDual-Size / Landlord: rebuild cost per retained byte,
+    /// with recency as the tie-breaker when cost is unknown or equal. This
+    /// field remains a hard size bound on top of that ranking.
     pub max_total_bytes: Option<u64>,
 }
 
@@ -2658,14 +2662,26 @@ impl WorktreeManager {
                 untracked_paths,
                 apparent_worktree_bytes: size.worktree_bytes,
                 apparent_target_bytes: size.target_bytes,
+                rebuild_cost_ms: load_lane_rebuild_cost(&verified.path),
             });
         }
 
         let now = unix_now_nanos()?;
         candidates.sort_by(|left, right| {
-            gc_created_at(&right.binding)
-                .cmp(&gc_created_at(&left.binding))
-                .then_with(|| left.binding.name.cmp(&right.binding.name))
+            cmp_retention_keep_order(
+                &RetentionKeepKey {
+                    rebuild_cost_ms: left.rebuild_cost_ms,
+                    apparent_bytes: left.apparent_worktree_bytes,
+                    created_at_unix_nanos: gc_created_at(&left.binding),
+                    name: &left.binding.name,
+                },
+                &RetentionKeepKey {
+                    rebuild_cost_ms: right.rebuild_cost_ms,
+                    apparent_bytes: right.apparent_worktree_bytes,
+                    created_at_unix_nanos: gc_created_at(&right.binding),
+                    name: &right.binding.name,
+                },
+            )
         });
         let mut retention_state = WorktreeGcRetentionState::default();
         for mut candidate in candidates {
@@ -4584,6 +4600,7 @@ struct RegisteredWorktreePreviewCandidate {
     created_at_unix_nanos: i64,
     untracked_paths: Vec<PathBuf>,
     size: WorktreeGcSizeEstimate,
+    rebuild_cost_ms: Option<u64>,
 }
 
 /// Classifies Git-registered repository-local lanes that predate the
@@ -4780,18 +4797,29 @@ fn preview_registered_repository_local_worktrees(
             name: name.to_string(),
             branch,
             branch_merged,
-            path,
+            path: path.clone(),
             created_at_unix_nanos,
             untracked_paths,
             size,
+            rebuild_cost_ms: load_lane_rebuild_cost(&path),
         });
     }
 
     candidates.sort_by(|left, right| {
-        right
-            .created_at_unix_nanos
-            .cmp(&left.created_at_unix_nanos)
-            .then_with(|| left.name.cmp(&right.name))
+        cmp_retention_keep_order(
+            &RetentionKeepKey {
+                rebuild_cost_ms: left.rebuild_cost_ms,
+                apparent_bytes: left.size.worktree_bytes,
+                created_at_unix_nanos: left.created_at_unix_nanos,
+                name: &left.name,
+            },
+            &RetentionKeepKey {
+                rebuild_cost_ms: right.rebuild_cost_ms,
+                apparent_bytes: right.size.worktree_bytes,
+                created_at_unix_nanos: right.created_at_unix_nanos,
+                name: &right.name,
+            },
+        )
     });
     let mut retention_state = WorktreeGcRetentionState::default();
     for candidate in candidates {
@@ -5378,6 +5406,7 @@ struct WorktreeGcCandidate {
     untracked_paths: Vec<PathBuf>,
     apparent_worktree_bytes: u64,
     apparent_target_bytes: Option<u64>,
+    rebuild_cost_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -5768,6 +5797,88 @@ fn worktree_path_native_bytes(path: &Path) -> usize {
 
 fn gc_created_at(binding: &ManagedWorktreeBinding) -> i64 {
     binding.created_at_unix_nanos.unwrap_or(0)
+}
+
+const LANE_REBUILD_COST_RELATIVE: &str = ".maco/lane-rebuild-cost.json";
+const MAX_LANE_REBUILD_COST_BYTES: u64 = 4096;
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LaneRebuildCostRecord {
+    rebuild_cost_ms: u64,
+}
+
+/// Records the measured wall-clock of the build that produced a lane `target/`.
+///
+/// The sidecar lives under `.maco/`, which worktree status already excludes, so
+/// recording cost does not dirty the lane against GC.
+pub fn record_lane_rebuild_cost(worktree_path: &Path, rebuild_cost_ms: u64) -> Result<()> {
+    let path = worktree_path.join(LANE_REBUILD_COST_RELATIVE);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create lane rebuild-cost directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let encoded = serde_json::to_vec(&LaneRebuildCostRecord { rebuild_cost_ms })
+        .context("failed to encode lane rebuild cost")?;
+    fs::write(&path, encoded)
+        .with_context(|| format!("failed to write lane rebuild cost {}", path.display()))?;
+    Ok(())
+}
+
+/// Loads a recorded rebuild cost, or `None` when the lane has no usable record.
+pub fn load_lane_rebuild_cost(worktree_path: &Path) -> Option<u64> {
+    let path = worktree_path.join(LANE_REBUILD_COST_RELATIVE);
+    let metadata = fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_LANE_REBUILD_COST_BYTES {
+        return None;
+    }
+    let bytes = fs::read(&path).ok()?;
+    serde_json::from_slice::<LaneRebuildCostRecord>(&bytes)
+        .ok()
+        .map(|record| record.rebuild_cost_ms)
+}
+
+/// Landlord / GreedyDual-Size keep order: higher rebuild-cost per byte first.
+///
+/// Unknown cost falls back to recency so existing age/count/size tests keep
+/// their newest-prefix behavior until a lane records a rebuild cost.
+#[derive(Clone, Copy)]
+struct RetentionKeepKey<'a> {
+    rebuild_cost_ms: Option<u64>,
+    apparent_bytes: u64,
+    created_at_unix_nanos: i64,
+    name: &'a str,
+}
+
+fn cmp_retention_keep_order(
+    left: &RetentionKeepKey<'_>,
+    right: &RetentionKeepKey<'_>,
+) -> std::cmp::Ordering {
+    match (left.rebuild_cost_ms, right.rebuild_cost_ms) {
+        (Some(left_cost), Some(right_cost)) => {
+            let left_density =
+                u128::from(left_cost).saturating_mul(u128::from(right.apparent_bytes.max(1)));
+            let right_density =
+                u128::from(right_cost).saturating_mul(u128::from(left.apparent_bytes.max(1)));
+            right_density
+                .cmp(&left_density)
+                .then_with(|| {
+                    left.created_at_unix_nanos
+                        .cmp(&right.created_at_unix_nanos)
+                        .reverse()
+                })
+                .then_with(|| left.name.cmp(right.name))
+        }
+        _ => left
+            .created_at_unix_nanos
+            .cmp(&right.created_at_unix_nanos)
+            .reverse()
+            .then_with(|| left.name.cmp(right.name)),
+    }
 }
 
 fn worktree_retention_is_configured(retention: WorktreeRetentionPolicy) -> bool {
@@ -14003,6 +14114,115 @@ mod tests {
             .iter()
             .any(|entry| entry.name == "agent-new-gc"
                 && entry.reason == WorktreeGcReason::TargetRemoved));
+    }
+
+    #[test]
+    fn retention_keep_order_prefers_higher_rebuild_cost_per_byte() {
+        use std::cmp::Ordering;
+        let expensive = RetentionKeepKey {
+            rebuild_cost_ms: Some(35 * 60 * 1000),
+            apparent_bytes: 6_900,
+            created_at_unix_nanos: 1,
+            name: "expensive-old",
+        };
+        let cheap = RetentionKeepKey {
+            rebuild_cost_ms: Some(2 * 60 * 1000),
+            apparent_bytes: 6_900,
+            created_at_unix_nanos: 2,
+            name: "cheap-new",
+        };
+        assert_eq!(
+            cmp_retention_keep_order(&expensive, &cheap),
+            Ordering::Less,
+            "expensive-to-rebuild lane must sort ahead of a same-sized cheap lane"
+        );
+        let old = RetentionKeepKey {
+            rebuild_cost_ms: None,
+            apparent_bytes: 100,
+            created_at_unix_nanos: 1,
+            name: "old",
+        };
+        let new = RetentionKeepKey {
+            rebuild_cost_ms: None,
+            apparent_bytes: 100,
+            created_at_unix_nanos: 2,
+            name: "new",
+        };
+        assert_eq!(
+            cmp_retention_keep_order(&old, &new),
+            Ordering::Greater,
+            "unknown cost must keep recency (newest first)"
+        );
+        let old_known = RetentionKeepKey {
+            rebuild_cost_ms: Some(1),
+            ..old
+        };
+        assert_eq!(
+            cmp_retention_keep_order(&old_known, &new),
+            Ordering::Greater,
+            "mixed known/unknown cost must not invert recency"
+        );
+    }
+
+    #[test]
+    fn lane_rebuild_cost_sidecar_round_trips_and_ignores_garbage() {
+        let temp = TempDir::new().expect("tempdir");
+        let lane = temp.path().join("lane");
+        fs::create_dir(&lane).expect("lane");
+        assert_eq!(load_lane_rebuild_cost(&lane), None);
+        record_lane_rebuild_cost(&lane, 2_100_000).expect("record");
+        assert_eq!(load_lane_rebuild_cost(&lane), Some(2_100_000));
+        fs::write(lane.join(LANE_REBUILD_COST_RELATIVE), "{not-json").expect("corrupt");
+        assert_eq!(load_lane_rebuild_cost(&lane), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_size_retention_keeps_expensive_rebuild_ahead_of_newer_cheap_lane() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let expensive = create_gc_worktree(&manager, "cost-expensive", &worktree_root);
+        fs::create_dir_all(expensive.path.join("target/debug")).expect("expensive target");
+        fs::write(
+            expensive.path.join("target/debug/artifact"),
+            vec![b'e'; 32 * 1024],
+        )
+        .expect("expensive artifact");
+        record_lane_rebuild_cost(&expensive.path, 35 * 60 * 1000).expect("expensive cost");
+        let cheap = create_gc_worktree(&manager, "cost-cheap", &worktree_root);
+        fs::create_dir_all(cheap.path.join("target/debug")).expect("cheap target");
+        fs::write(
+            cheap.path.join("target/debug/artifact"),
+            vec![b'c'; 32 * 1024],
+        )
+        .expect("cheap artifact");
+        record_lane_rebuild_cost(&cheap.path, 2 * 60 * 1000).expect("cheap cost");
+        let expensive_size = gc_worktree_size_estimate(&expensive.path).expect("expensive size");
+        let cheap_size = gc_worktree_size_estimate(&cheap.path).expect("cheap size");
+        let budget = expensive_size.worktree_bytes.max(cheap_size.worktree_bytes);
+
+        let mut options = gc_options(Some(worktree_root), false);
+        options.remove_targets = false;
+        options.retention.max_total_bytes = Some(budget);
+        let report = manager
+            .gc_with_target_liveness(options, |_| WorktreeTargetLiveness::Clear)
+            .expect("cost-aware GC");
+
+        assert_eq!(report.removed_count, 1, "{report:#?}");
+        assert_eq!(report.retained_count, 1, "{report:#?}");
+        let removed = report
+            .entries
+            .iter()
+            .find(|entry| entry.status == WorktreeGcStatus::Removed)
+            .expect("removed entry");
+        assert_eq!(removed.name, cheap.name);
+        assert!(expensive.path.exists());
+        assert!(!cheap.path.exists());
     }
 
     #[cfg(target_os = "linux")]
