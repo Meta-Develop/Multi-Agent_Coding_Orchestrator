@@ -1610,35 +1610,42 @@ impl ResolvedSystemdSandbox {
             return Ok(());
         }
 
+        // Inventory writable files first. A hard-link alias is impossible unless some
+        // writable regular file already has nlink>1, so skip walking (possibly huge)
+        // disjoint read-only trees such as a whole repository mounted only for Git.
         let mut remaining = MAX_SANDBOX_ENTRY_SCAN;
-        let mut protected_inodes: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
-        for root in protected_roots {
-            scan_sandbox_regular_files(&root, false, &mut remaining, |path, metadata| {
-                if self.effective_path_access(path)? == Some(SandboxMountAccess::ReadOnly) {
-                    protected_inodes
+        let mut writable_multilink_inodes: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
+        for root in &writable_roots {
+            scan_sandbox_regular_files(root, true, &mut remaining, |path, metadata| {
+                if self.effective_path_access(path)? == Some(SandboxMountAccess::ReadWrite)
+                    && metadata.nlink() > 1
+                {
+                    writable_multilink_inodes
                         .entry((metadata.dev(), metadata.ino()))
                         .or_insert_with(|| path.to_path_buf());
                 }
                 Ok(())
             })?;
         }
-        for file in &self.visible_read_only_files {
+        for file in &self.visible_read_write_files {
             let metadata = fs::symlink_metadata(file)?;
-            if self.effective_path_access(file)? == Some(SandboxMountAccess::ReadOnly) {
-                protected_inodes
+            if self.effective_path_access(file)? == Some(SandboxMountAccess::ReadWrite)
+                && metadata.nlink() > 1
+            {
+                writable_multilink_inodes
                     .entry((metadata.dev(), metadata.ino()))
-                    .or_insert_with(|| file.clone());
+                    .or_insert(file.clone());
             }
         }
+        if writable_multilink_inodes.is_empty() {
+            return Ok(());
+        }
 
-        let reject_writable_alias = |path: &Path,
-                                     metadata: &fs::Metadata,
-                                     protected_inodes: &BTreeMap<(u64, u64), PathBuf>|
-         -> std::io::Result<()> {
-            if self.effective_path_access(path)? != Some(SandboxMountAccess::ReadWrite) {
+        let reject_protected_alias = |path: &Path, metadata: &fs::Metadata| -> std::io::Result<()> {
+            if self.effective_path_access(path)? != Some(SandboxMountAccess::ReadOnly) {
                 return Ok(());
             }
-            if protected_inodes.contains_key(&(metadata.dev(), metadata.ino())) {
+            if writable_multilink_inodes.contains_key(&(metadata.dev(), metadata.ino())) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!(
@@ -1649,14 +1656,14 @@ impl ResolvedSystemdSandbox {
             }
             Ok(())
         };
-        for root in writable_roots {
-            scan_sandbox_regular_files(&root, true, &mut remaining, |path, metadata| {
-                reject_writable_alias(path, metadata, &protected_inodes)
+        for root in protected_roots {
+            scan_sandbox_regular_files(&root, false, &mut remaining, |path, metadata| {
+                reject_protected_alias(path, metadata)
             })?;
         }
-        for file in &self.visible_read_write_files {
+        for file in &self.visible_read_only_files {
             let metadata = fs::symlink_metadata(file)?;
-            reject_writable_alias(file, &metadata, &protected_inodes)?;
+            reject_protected_alias(file, &metadata)?;
         }
         Ok(())
     }

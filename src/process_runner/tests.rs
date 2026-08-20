@@ -939,6 +939,39 @@ fn protected_alias_scan_skips_read_only_roots_without_a_writable_surface() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn protected_alias_scan_skips_disjoint_read_only_roots_when_writable_files_are_single_link() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("writable-runtime");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::write(workspace.join("index"), "staged\n").expect("single-link writable file");
+    // Absent on purpose: a fail-if-traversed sentinel for a huge disjoint read-only tree
+    // such as a whole repository mounted only so Git can read the worktree.
+    let disjoint_read_only_root = temp.path().join("disjoint-large-read-only-root");
+    let sandbox = ResolvedSystemdSandbox {
+        kind: SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+        workspace_root: workspace.clone(),
+        current_dir: workspace,
+        workspace_access: WorkspaceAccess::ReadWrite,
+        visible_read_only_roots: vec![disjoint_read_only_root],
+        visible_read_only_files: Vec::new(),
+        visible_read_write_roots: Vec::new(),
+        visible_read_write_files: Vec::new(),
+        external_codex_writable_file_capabilities: Vec::new(),
+        writable_artifact_roots: Vec::new(),
+        hidden_roots: Vec::new(),
+        isolated_host_view: false,
+        resource_limits: ProcessResourceLimits::default(),
+        path_identities: Vec::new(),
+        mount_checks: Vec::new(),
+    };
+
+    sandbox
+        .verify_protected_read_only_hardlink_scope()
+        .expect("single-link writable files must not inventory a disjoint read-only tree");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn protected_alias_scan_ignores_special_entries_but_preserves_writable_checks() {
     use std::os::unix::net::UnixListener;
 
