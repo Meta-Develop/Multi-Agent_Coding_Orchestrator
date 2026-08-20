@@ -1,0 +1,9 @@
+Usage: agent [options] [command] [prompt...]
+
+Options:
+  -p, --print                  Print responses to console
+  --output-format <format>     Output format (only works with --print): text |
+                               json | stream-json
+  --model <model>              Model to use
+  --trust                      Trust the current workspace without prompting
+  --workspace <path-or-name>   Workspace directory or saved workspace name
