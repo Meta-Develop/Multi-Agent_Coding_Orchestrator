@@ -965,6 +965,7 @@ fn cli_claim_conflict_still_emits_json_summary() -> Result<()> {
 
 #[test]
 fn cli_worktree_diff_uses_active_claims_for_json() -> Result<()> {
+    support::require_containment!("cli_worktree_diff_uses_active_claims_for_json");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -1034,6 +1035,9 @@ fn cli_worktree_pending_on_fresh_repo_creates_no_maco_state() -> Result<()> {
 
 #[test]
 fn cli_worktree_create_derives_cleanliness_capability_on_clean_repo() -> Result<()> {
+    support::require_containment!(
+        "cli_worktree_create_derives_cleanliness_capability_on_clean_repo"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -1055,6 +1059,9 @@ fn cli_worktree_create_derives_cleanliness_capability_on_clean_repo() -> Result<
 
 #[test]
 fn cli_worktree_create_refuses_dirty_primary_with_actionable_error() -> Result<()> {
+    support::require_containment!(
+        "cli_worktree_create_refuses_dirty_primary_with_actionable_error"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -1231,6 +1238,7 @@ fn cli_semantic_coord_release_agent_json() -> Result<()> {
 
 #[test]
 fn cli_merge_preview_blocks_unclaimed_edits_json() -> Result<()> {
+    support::require_containment!("cli_merge_preview_blocks_unclaimed_edits_json");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;

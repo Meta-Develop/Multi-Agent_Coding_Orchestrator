@@ -1,3 +1,5 @@
+mod support;
+
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 use serde_json::Value;
@@ -143,6 +145,7 @@ fn merge_arbitrate_refuses_duplicate_sides_before_repository_or_runner_access() 
 
 #[test]
 fn merge_apply_accepts_external_validation_report_and_applies() -> Result<()> {
+    support::require_containment!("merge_apply_accepts_external_validation_report_and_applies");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -187,6 +190,9 @@ fn merge_apply_accepts_external_validation_report_and_applies() -> Result<()> {
 
 #[test]
 fn merge_apply_required_validation_accepts_exact_candidate_binding() -> Result<()> {
+    support::require_containment!(
+        "merge_apply_required_validation_accepts_exact_candidate_binding"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -237,6 +243,7 @@ fn merge_apply_required_validation_accepts_exact_candidate_binding() -> Result<(
 
 #[test]
 fn merge_preview_required_validation_rejects_legacy_unbound_pass() -> Result<()> {
+    support::require_containment!("merge_preview_required_validation_rejects_legacy_unbound_pass");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -286,6 +293,9 @@ fn merge_preview_required_validation_rejects_legacy_unbound_pass() -> Result<()>
 
 #[test]
 fn merge_apply_rejects_stale_binding_after_agent_candidate_changes() -> Result<()> {
+    support::require_containment!(
+        "merge_apply_rejects_stale_binding_after_agent_candidate_changes"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -343,6 +353,9 @@ fn merge_apply_rejects_stale_binding_after_agent_candidate_changes() -> Result<(
 
 #[test]
 fn merge_apply_revalidates_clean_committed_primary_after_candidate_validation() -> Result<()> {
+    support::require_containment!(
+        "merge_apply_revalidates_clean_committed_primary_after_candidate_validation"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -398,6 +411,7 @@ fn merge_apply_revalidates_clean_committed_primary_after_candidate_validation() 
 #[cfg(target_os = "linux")]
 #[test]
 fn merge_apply_refuses_when_repo_common_lock_is_held() -> Result<()> {
+    support::require_containment!("merge_apply_refuses_when_repo_common_lock_is_held");
     use std::os::unix::fs::PermissionsExt;
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -474,6 +488,7 @@ fn merge_apply_refuses_when_repo_common_lock_is_held() -> Result<()> {
 
 #[test]
 fn pr_publish_cannot_run_while_merge_apply_validates_candidate() -> Result<()> {
+    support::require_containment!("pr_publish_cannot_run_while_merge_apply_validates_candidate");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -552,6 +567,7 @@ fn pr_publish_cannot_run_while_merge_apply_validates_candidate() -> Result<()> {
 
 #[test]
 fn merge_apply_refuses_malformed_repo_common_lock() -> Result<()> {
+    support::require_containment!("merge_apply_refuses_malformed_repo_common_lock");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -595,6 +611,7 @@ fn merge_apply_refuses_malformed_repo_common_lock() -> Result<()> {
 #[cfg(unix)]
 #[test]
 fn merge_apply_refuses_symlink_repository_lock_file() -> Result<()> {
+    support::require_containment!("merge_apply_refuses_symlink_repository_lock_file");
     use std::os::unix::fs::symlink;
 
     let temp = TempDir::new().context("tempdir")?;
@@ -633,6 +650,7 @@ fn merge_apply_refuses_symlink_repository_lock_file() -> Result<()> {
 #[cfg(unix)]
 #[test]
 fn merge_apply_refuses_symlink_repository_state_directory() -> Result<()> {
+    support::require_containment!("merge_apply_refuses_symlink_repository_state_directory");
     use std::os::unix::fs::symlink;
 
     let temp = TempDir::new().context("tempdir")?;
@@ -677,6 +695,7 @@ fn merge_apply_refuses_symlink_repository_state_directory() -> Result<()> {
 
 #[test]
 fn merge_apply_overwrites_unlocked_stale_owner_record() -> Result<()> {
+    support::require_containment!("merge_apply_overwrites_unlocked_stale_owner_record");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -715,6 +734,7 @@ fn merge_apply_overwrites_unlocked_stale_owner_record() -> Result<()> {
 
 #[test]
 fn merge_apply_json_reports_dirty_primary_blocker() -> Result<()> {
+    support::require_containment!("merge_apply_json_reports_dirty_primary_blocker");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -756,6 +776,7 @@ fn merge_apply_json_reports_dirty_primary_blocker() -> Result<()> {
 
 #[test]
 fn merge_preview_reports_stale_base_and_apply_conflict_paths() -> Result<()> {
+    support::require_containment!("merge_preview_reports_stale_base_and_apply_conflict_paths");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -816,6 +837,7 @@ fn merge_preview_reports_stale_base_and_apply_conflict_paths() -> Result<()> {
 
 #[test]
 fn merge_preview_reports_unclaimed_edits_with_paths() -> Result<()> {
+    support::require_containment!("merge_preview_reports_unclaimed_edits_with_paths");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -854,6 +876,7 @@ fn merge_preview_reports_unclaimed_edits_with_paths() -> Result<()> {
 
 #[test]
 fn merge_preview_reports_committed_worktree_change() -> Result<()> {
+    support::require_containment!("merge_preview_reports_committed_worktree_change");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -894,6 +917,9 @@ fn merge_preview_reports_committed_worktree_change() -> Result<()> {
 
 #[test]
 fn merge_validation_failure_blocks_and_force_only_forces_validation() -> Result<()> {
+    support::require_containment!(
+        "merge_validation_failure_blocks_and_force_only_forces_validation"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -976,6 +1002,9 @@ fn merge_validation_failure_blocks_and_force_only_forces_validation() -> Result<
 
 #[test]
 fn merge_preview_required_validation_blocks_missing_not_run_and_skipped_evidence() -> Result<()> {
+    support::require_containment!(
+        "merge_preview_required_validation_blocks_missing_not_run_and_skipped_evidence"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -1060,6 +1089,9 @@ fn merge_preview_required_validation_blocks_missing_not_run_and_skipped_evidence
 
 #[test]
 fn merge_apply_candidate_validation_failure_blocks_before_primary_apply() -> Result<()> {
+    support::require_containment!(
+        "merge_apply_candidate_validation_failure_blocks_before_primary_apply"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -1110,6 +1142,9 @@ fn merge_apply_candidate_validation_failure_blocks_before_primary_apply() -> Res
 
 #[test]
 fn merge_apply_rejects_successful_validation_that_mutates_candidate_sandbox() -> Result<()> {
+    support::require_containment!(
+        "merge_apply_rejects_successful_validation_that_mutates_candidate_sandbox"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -1150,6 +1185,9 @@ fn merge_apply_rejects_successful_validation_that_mutates_candidate_sandbox() ->
 #[cfg(target_os = "linux")]
 #[test]
 fn merge_apply_kills_setsid_validation_descendant_before_accepting_success() -> Result<()> {
+    support::require_containment!(
+        "merge_apply_kills_setsid_validation_descendant_before_accepting_success"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -1198,6 +1236,9 @@ fn merge_apply_kills_setsid_validation_descendant_before_accepting_success() -> 
 
 #[test]
 fn merge_apply_rejects_successful_validation_that_mutates_initialized_submodule() -> Result<()> {
+    support::require_containment!(
+        "merge_apply_rejects_successful_validation_that_mutates_initialized_submodule"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let dependency_path = temp.path().join("dependency");
     fs::create_dir_all(&dependency_path).context("create dependency repo")?;
@@ -1338,6 +1379,9 @@ fn merge_preview_preserves_non_utf8_claimed_path_and_emits_ascii_json() -> Resul
 
 #[test]
 fn merge_preview_ignores_ambient_git_repository_and_index_overrides() -> Result<()> {
+    support::require_containment!(
+        "merge_preview_ignores_ambient_git_repository_and_index_overrides"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let decoy_path = create_committed_repo(&temp.path().join("decoy-root"))?;
@@ -1399,6 +1443,9 @@ fn merge_preview_ignores_ambient_git_repository_and_index_overrides() -> Result<
 
 #[test]
 fn merge_preview_candidate_capture_does_not_write_unreachable_real_objects() -> Result<()> {
+    support::require_containment!(
+        "merge_preview_candidate_capture_does_not_write_unreachable_real_objects"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -1431,6 +1478,7 @@ fn merge_preview_candidate_capture_does_not_write_unreachable_real_objects() -> 
 
 #[test]
 fn megafile_merge_defaults_to_typed_warn_only_and_opt_in_blocking() -> Result<()> {
+    support::require_containment!("megafile_merge_defaults_to_typed_warn_only_and_opt_in_blocking");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -1523,6 +1571,7 @@ fn megafile_merge_defaults_to_typed_warn_only_and_opt_in_blocking() -> Result<()
 
 #[test]
 fn merge_apply_records_collision_history_at_the_blocked_decision() -> Result<()> {
+    support::require_containment!("merge_apply_records_collision_history_at_the_blocked_decision");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -1629,6 +1678,9 @@ fn decomposition_cli_rejects_bare_target_and_unpaired_run_before_worktree_lookup
 
 #[test]
 fn authenticated_megafile_read_failure_refuses_merge_before_primary_apply() -> Result<()> {
+    support::require_containment!(
+        "authenticated_megafile_read_failure_refuses_merge_before_primary_apply"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
