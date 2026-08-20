@@ -1,0 +1,90 @@
+{
+  "changed_paths": [
+    "src/api.rs"
+  ],
+  "touched_files": [
+    {
+      "path": "src/api.rs",
+      "module_path": [
+        "crate",
+        "api"
+      ],
+      "byte_len": 48,
+      "line_count": 2
+    }
+  ],
+  "touched_symbols": [
+    {
+      "id": "src/api.rs:0:Api",
+      "file": "src/api.rs",
+      "name": "Api",
+      "qualified_path": [
+        "crate",
+        "api",
+        "Api"
+      ],
+      "kind": "struct",
+      "visibility": "public",
+      "parent_symbol": null,
+      "impl_target": null,
+      "impl_trait": null,
+      "span": {
+        "start_byte": 0,
+        "end_byte": 15,
+        "start_line": 1,
+        "end_line": 1
+      }
+    }
+  ],
+  "dependency_impacts": [
+    {
+      "direction": "incoming",
+      "changed_path": "src/api.rs",
+      "related_file": "src/lib.rs",
+      "dependency": {
+        "from_file": "src/lib.rs",
+        "from_module": [
+          "crate"
+        ],
+        "to": "crate::api",
+        "to_file": "src/api.rs",
+        "kind": "module_declaration",
+        "span": {
+          "start_byte": 0,
+          "end_byte": 12,
+          "start_line": 1,
+          "end_line": 1
+        }
+      }
+    }
+  ],
+  "impacted_files": [
+    "src/lib.rs"
+  ],
+  "errors": [],
+  "megafile_hotspots": [
+    {
+      "version": 1,
+      "path": "src/api.rs",
+      "is_megafile": true,
+      "signals": [
+        {
+          "kind": "file_lines",
+          "observed": 4200,
+          "threshold": 4000
+        }
+      ],
+      "latest_sample": {
+        "path": "src/api.rs",
+        "bytes": 480000,
+        "lines": 4200
+      },
+      "previous_sample": null,
+      "growth_bytes": 0,
+      "growth_lines": 0,
+      "claims_in_window": 1,
+      "collisions_in_window": 0,
+      "accepted_decompositions": 0
+    }
+  ]
+}

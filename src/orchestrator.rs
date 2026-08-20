@@ -1,23 +1,125 @@
 use crate::{
+    artifacts::{
+        repository_auth_writer, repository_authenticator_key_only,
+        state_auth::{
+            sensitive_state_root, AuthenticationDomain, AuthenticationTag, RepositoryAuthenticator,
+        },
+        validate_repository_authenticated_state,
+    },
+    checkpoint_wire::{
+        decode_agent_checkpoint, decode_run_checkpoint, encode_agent_checkpoint,
+        encode_run_checkpoint, LosslessPath,
+    },
+    merge::capture_worktree_diff_from_commit,
+    process_runner::{
+        run_process, trusted_system_executable, CapturedBytes, EnvironmentMode, ProcessRunError,
+        ProcessSpec, Shell, SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile,
+        WorkspaceAccess,
+    },
+    safe_state::BoundedRegularReader,
+    secure_output::{ReservedOutputFile, SecureOutputRoot},
+    semantic_coord::{
+        SemanticConflict, SemanticCoordinationReport, SemanticIntent, SemanticIntentRequest,
+        SemanticIntentStore, SemanticIntentToken,
+    },
+    state_journal::{JournalIdentity, StateJournal},
     sync::{normalize_repo_relative_path, ClaimToken, PathClaim},
     sync_store::SyncStore,
-    worktree::{normalize_agent_id, WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
+    worktree::{
+        normalize_agent_id, ManagedWorktreeWriteLease, WorktreeCreateOptions, WorktreeManager,
+        WorktreeRecord,
+    },
 };
 use anyhow::{bail, Context, Result};
-use git2::{Oid, Repository, ResetType};
+use git2::{Delta, DiffOptions, Oid, Repository, ResetType};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
-    io::Write,
+    ffi::{OsStr, OsString},
+    fs,
     path::{Path, PathBuf},
-    process::{self, Child, Command, ExitStatus, Stdio},
+    process::{self, ExitStatus},
+    sync::atomic::{AtomicU64, Ordering},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
-const CHECKPOINT_STATE_VERSION: u32 = 1;
+const OUTPUT_CAPTURE_LIMIT_BYTES: usize = OUTPUT_CHAR_LIMIT * 4;
+const CHECKPOINT_STATE_VERSION: u32 = 3;
+const GIT_COMMAND_CAPTURE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const PATCH_OUTPUT_MAX_BYTES: usize = 64 * 1024 * 1024;
+const CHECKPOINT_REFERENCE_MAX_BYTES: usize = 64 * 1024;
+const CANDIDATE_BINDING_VERSION: u32 = 1;
+const CANDIDATE_CAPTURE_ATTEMPTS: usize = 3;
+const CANDIDATE_MAX_CHANGED_PATHS: usize = 8 * 1024;
+const CANDIDATE_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const CANDIDATE_MAX_SINGLE_FILE_BYTES: usize = 16 * 1024 * 1024;
+const COMBINED_CANDIDATE_MAX_PATCHES: usize = 256;
+const COMBINED_CANDIDATE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const PLAN_MAX_VALIDATION_COMMANDS_PER_SCOPE: usize = 128;
+const PLAN_MAX_TOTAL_VALIDATION_COMMANDS: usize = 4 * 1024;
+const PLAN_MAX_DEPENDENCY_EDGES: usize = 4 * 1024;
+const PLAN_MAX_BYTES: usize = 4 * 1024 * 1024;
+const PLAN_MAX_COMMAND_BYTES: usize = 1024 * 1024;
+const PLAN_MAX_STRING_BYTES: usize = 256 * 1024;
+const PLAN_MAX_ID_BYTES: usize = 256;
+const PLAN_MAX_ENV_KEY_BYTES: usize = 1024;
+const PLAN_MAX_ENV_ENTRIES_PER_SCOPE: usize = 1024;
+const PLAN_MAX_TOTAL_ENV_ENTRIES: usize = 16 * 1024;
+const PLAN_MAX_TOTAL_PATHS: usize = 16 * 1024;
+const PLAN_MAX_PATH_BYTES: usize = 4 * 1024;
+const PLAN_MAX_PATH_COMPONENTS: usize = 256;
+const PLAN_MAX_TOTAL_SEMANTIC_ITEMS: usize = 16 * 1024;
+const PLAN_MAX_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
+const CHECKPOINT_REFERENCE_DOMAIN: AuthenticationDomain =
+    AuthenticationDomain::new(b"MACO\0orchestration-checkpoint-reference\0v3\0");
+const CHECKPOINT_SNAPSHOT_PHASE_PREFIX: &str = "snapshot_";
+const PHASE_PLANNED: &str = "planned";
+const PHASE_CLAIM_ACQUIRED: &str = "claim_acquired";
+const PHASE_WORKTREE_PREPARED: &str = "worktree_prepared";
+const PHASE_COMMAND_STARTED: &str = "command_started";
+const PHASE_COMMAND_COMPLETED: &str = "command_completed";
+const PHASE_CANDIDATE_CAPTURED: &str = "candidate_captured";
+const PHASE_VALIDATION_STARTED: &str = "validation_started";
+const PHASE_VALIDATED: &str = "validated";
+const PHASE_REPO_VALIDATION_STARTED: &str = "repo_validation_started";
+const PHASE_REPO_VALIDATED: &str = "repo_validated";
+const PHASE_RELEASED: &str = "released";
+const PHASE_FINAL: &str = "final";
+static REPO_VALIDATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+struct CandidateBoundaryFailureHook {
+    agent_id: String,
+    reached: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static CANDIDATE_BOUNDARY_FAILURE_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<CandidateBoundaryFailureHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+#[derive(PartialEq, Eq)]
+struct CheckpointEventFailureHook {
+    run_id: String,
+    phase: String,
+}
+
+#[cfg(test)]
+static CHECKPOINT_EVENT_FAILURE_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Vec<CheckpointEventFailureHook>>,
+> = std::sync::OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrchestrationExecutionRuntime {
+    Verified,
+    #[cfg(test)]
+    NonpublishableSimulation,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestrationPlan {
@@ -30,6 +132,8 @@ pub struct OrchestrationPlan {
 pub struct AgentPlan {
     pub id: String,
     pub paths: Vec<PathBuf>,
+    pub semantic_symbols: Vec<String>,
+    pub semantic_modules: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub timeout: Option<Duration>,
     pub command: String,
@@ -57,6 +161,15 @@ pub enum WorktreeReusePolicy {
     Reset,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticCoordinationMode {
+    #[default]
+    Off,
+    Warn,
+    Block,
+}
+
 #[derive(Debug, Clone)]
 pub struct OrchestrationRunOptions {
     pub repo: PathBuf,
@@ -71,6 +184,7 @@ pub struct OrchestrationRunControls {
     pub run_id: Option<RunId>,
     pub checkpoint_dir: Option<PathBuf>,
     pub worktree_reuse_policy: Option<WorktreeReusePolicy>,
+    pub semantic_coordination: SemanticCoordinationMode,
 }
 
 #[derive(Debug, Clone)]
@@ -132,12 +246,36 @@ pub struct RunCheckpoint {
     pub plan_snapshot: Option<CheckpointPlanSnapshot>,
     pub keep_claims: bool,
     pub worktree_reuse_policy: WorktreeReusePolicy,
+    #[serde(default)]
+    pub semantic_coordination: SemanticCoordinationMode,
     pub success: bool,
     pub agents: Vec<AgentCheckpoint>,
     pub repo_validation: Vec<ValidationRunSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_validation_target: Option<RepoValidationTargetBinding>,
     pub released_claims: Vec<PathClaim>,
     pub release_errors: Vec<String>,
+    #[serde(default)]
+    pub released_semantic_intents: Vec<SemanticIntent>,
+    #[serde(default)]
+    pub semantic_release_errors: Vec<String>,
     pub updated_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatedCheckpointReference {
+    version: u32,
+    repository_hint: LosslessPath,
+    journal: JournalIdentity,
+    mac: AuthenticationTag,
+}
+
+#[derive(Serialize)]
+struct CheckpointReferenceMacPayload<'a> {
+    version: u32,
+    repository_hint: &'a LosslessPath,
+    journal: &'a JournalIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -146,9 +284,17 @@ pub struct AgentCheckpoint {
     pub status: AgentRunStatus,
     pub worktree: Option<CheckpointWorktreeRecord>,
     pub claim: Option<PathClaim>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_intent: Option<SemanticIntent>,
+    #[serde(default)]
+    pub semantic_conflicts: Vec<SemanticConflict>,
     pub changed_paths: Vec<PathBuf>,
     pub unclaimed_changed_paths: Vec<PathBuf>,
     pub validation: Vec<ValidationRunSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_binding: Option<AgentCandidateBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_completed_binding: Option<CompletedCommandStateBinding>,
     pub error: Option<String>,
 }
 
@@ -170,6 +316,10 @@ pub struct CheckpointPlanSnapshot {
 pub struct CheckpointAgentPlanSnapshot {
     pub id: String,
     pub paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub semantic_symbols: Vec<String>,
+    #[serde(default)]
+    pub semantic_modules: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub timeout_seconds: Option<u64>,
     pub command: String,
@@ -210,6 +360,8 @@ impl From<&AgentPlan> for CheckpointAgentPlanSnapshot {
         Self {
             id: agent.id.clone(),
             paths: agent.paths.clone(),
+            semantic_symbols: agent.semantic_symbols.clone(),
+            semantic_modules: agent.semantic_modules.clone(),
             env: agent.env.clone(),
             timeout_seconds: agent.timeout.map(|timeout| timeout.as_secs()),
             command: agent.command.clone(),
@@ -243,11 +395,16 @@ pub struct OrchestrationSummary {
     pub plan_file: PathBuf,
     pub keep_claims: bool,
     pub worktree_reuse_policy: WorktreeReusePolicy,
+    pub semantic_coordination: SemanticCoordinationMode,
     pub success: bool,
     pub agents: Vec<AgentRunSummary>,
     pub repo_validation: Vec<ValidationRunSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_validation_target: Option<RepoValidationTargetBinding>,
     pub released_claims: Vec<PathClaim>,
     pub release_errors: Vec<String>,
+    pub released_semantic_intents: Vec<SemanticIntent>,
+    pub semantic_release_errors: Vec<String>,
 }
 
 impl OrchestrationSummary {
@@ -270,6 +427,8 @@ pub struct AgentRunSummary {
     pub worktree: Option<WorktreeRecord>,
     pub worktree_reused: bool,
     pub claim: Option<PathClaim>,
+    pub semantic_intent: Option<SemanticIntent>,
+    pub semantic_conflicts: Vec<SemanticConflict>,
     pub status: AgentRunStatus,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
@@ -280,6 +439,10 @@ pub struct AgentRunSummary {
     pub stdout: OutputSummary,
     pub stderr: OutputSummary,
     pub validation: Vec<ValidationRunSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_binding: Option<AgentCandidateBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_completed_binding: Option<CompletedCommandStateBinding>,
     pub error: Option<String>,
 }
 
@@ -295,6 +458,8 @@ impl AgentRunSummary {
             worktree: None,
             worktree_reused: false,
             claim: None,
+            semantic_intent: None,
+            semantic_conflicts: Vec::new(),
             status: AgentRunStatus::Pending,
             exit_code: None,
             duration_ms: None,
@@ -305,9 +470,70 @@ impl AgentRunSummary {
             stdout: OutputSummary::default(),
             stderr: OutputSummary::default(),
             validation: Vec::new(),
+            candidate_binding: None,
+            command_completed_binding: None,
             error: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AgentCandidateBinding {
+    pub version: u32,
+    pub base_oid: String,
+    pub head_oid: String,
+    pub state_oid: String,
+    pub diff_oid: String,
+    pub changed_paths: Vec<PathBuf>,
+    pub patch_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletedCommandStateBinding {
+    pub version: u32,
+    pub base_oid: String,
+    pub head_oid: String,
+    pub state_oid: String,
+    pub changed_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoValidationTargetKind {
+    CombinedCandidate,
+    BaseNoChanges,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RepoValidationTargetBinding {
+    pub version: u32,
+    pub kind: RepoValidationTargetKind,
+    pub base_oid: String,
+    pub combined_diff_oid: String,
+    pub changed_paths: Vec<PathBuf>,
+    pub candidate_count: usize,
+    pub patch_count: usize,
+    pub aggregate_patch_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CandidateStateSnapshot {
+    base_oid: Oid,
+    head_oid: Oid,
+    index_entries_oid: Oid,
+    index_flags_oid: Oid,
+    index_diff_oid: Oid,
+    worktree_diff_oid: Oid,
+    status_oid: Oid,
+    untracked_oid: Oid,
+    changed_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct CapturedCandidate {
+    binding: AgentCandidateBinding,
+    patch: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -357,6 +583,10 @@ struct RawPlan {
 struct RawAgentPlan {
     id: String,
     paths: Vec<PathBuf>,
+    #[serde(default)]
+    semantic_symbols: Vec<String>,
+    #[serde(default)]
+    semantic_modules: Vec<String>,
     command: String,
     #[serde(default)]
     depends_on: Vec<String>,
@@ -393,12 +623,262 @@ struct RawValidationCommandDetails {
 
 pub fn load_plan(path: impl AsRef<Path>) -> Result<OrchestrationPlan> {
     let path = path.as_ref();
-    let contents = fs::read_to_string(path)
+    let contents = BoundedRegularReader::read_tree_no_follow(path, PLAN_MAX_BYTES as u64)
         .with_context(|| format!("failed to read orchestration plan {}", path.display()))?;
-    let raw: RawPlan = serde_json::from_str(&contents)
+    let raw: RawPlan = serde_json::from_slice(&contents)
         .with_context(|| format!("failed to parse orchestration plan {}", path.display()))?;
-
+    validate_raw_plan_bounds(&raw)?;
     validate_plan(raw)
+}
+
+fn validate_raw_plan_bounds(raw: &RawPlan) -> Result<()> {
+    if raw.agents.len() > COMBINED_CANDIDATE_MAX_PATCHES {
+        bail!(
+            "orchestration plan exceeds the configured {} agent limit",
+            COMBINED_CANDIDATE_MAX_PATCHES
+        );
+    }
+    validate_bounded_timeout(raw.default_timeout_seconds, "default timeout")?;
+
+    let mut total_string_bytes = 0_usize;
+    let mut total_paths = 0_usize;
+    let mut total_env_entries = 0_usize;
+    let mut total_semantic_items = 0_usize;
+    let mut total_dependency_edges = 0_usize;
+    let mut total_validation_commands = raw.repo_validation_commands.len();
+    if total_validation_commands > PLAN_MAX_VALIDATION_COMMANDS_PER_SCOPE {
+        bail!(
+            "repo validation exceeds the configured {} command limit",
+            PLAN_MAX_VALIDATION_COMMANDS_PER_SCOPE
+        );
+    }
+    for command in &raw.repo_validation_commands {
+        validate_raw_validation_bounds(
+            command,
+            &mut total_string_bytes,
+            &mut total_paths,
+            &mut total_env_entries,
+        )?;
+    }
+
+    for agent in &raw.agents {
+        if agent.validation_commands.len() > PLAN_MAX_VALIDATION_COMMANDS_PER_SCOPE {
+            bail!(
+                "agent validation exceeds the configured {} command limit",
+                PLAN_MAX_VALIDATION_COMMANDS_PER_SCOPE
+            );
+        }
+        total_validation_commands = total_validation_commands
+            .checked_add(agent.validation_commands.len())
+            .context("orchestration validation command count overflowed")?;
+        account_plan_string(
+            &mut total_string_bytes,
+            &agent.id,
+            PLAN_MAX_ID_BYTES,
+            "agent id",
+        )?;
+        account_plan_string(
+            &mut total_string_bytes,
+            &agent.command,
+            PLAN_MAX_COMMAND_BYTES,
+            "agent command",
+        )?;
+        total_paths = total_paths
+            .checked_add(agent.paths.len())
+            .context("orchestration plan path count overflowed")?;
+        if let Some(path) = &agent.working_directory {
+            total_paths = total_paths
+                .checked_add(1)
+                .context("orchestration plan path count overflowed")?;
+            validate_bounded_plan_path(path, "agent working_directory")?;
+        }
+        for path in &agent.paths {
+            validate_bounded_plan_path(path, "agent path")?;
+        }
+        total_semantic_items = total_semantic_items
+            .checked_add(agent.semantic_symbols.len())
+            .and_then(|total| total.checked_add(agent.semantic_modules.len()))
+            .context("orchestration semantic item count overflowed")?;
+        for item in agent
+            .semantic_symbols
+            .iter()
+            .chain(agent.semantic_modules.iter())
+        {
+            account_plan_string(
+                &mut total_string_bytes,
+                item,
+                PLAN_MAX_STRING_BYTES,
+                "semantic item",
+            )?;
+        }
+        total_dependency_edges = total_dependency_edges
+            .checked_add(agent.depends_on.len())
+            .context("orchestration dependency edge count overflowed")?;
+        for dependency in &agent.depends_on {
+            account_plan_string(
+                &mut total_string_bytes,
+                dependency,
+                PLAN_MAX_ID_BYTES,
+                "dependency id",
+            )?;
+        }
+        validate_bounded_env(&agent.env, &mut total_string_bytes, &mut total_env_entries)?;
+        validate_bounded_timeout(agent.timeout_seconds, "agent timeout")?;
+        for command in &agent.validation_commands {
+            validate_raw_validation_bounds(
+                command,
+                &mut total_string_bytes,
+                &mut total_paths,
+                &mut total_env_entries,
+            )?;
+        }
+    }
+
+    if total_paths > PLAN_MAX_TOTAL_PATHS {
+        bail!(
+            "orchestration plan exceeds the configured {} total path limit",
+            PLAN_MAX_TOTAL_PATHS
+        );
+    }
+    if total_env_entries > PLAN_MAX_TOTAL_ENV_ENTRIES {
+        bail!(
+            "orchestration plan exceeds the configured {} total environment-entry limit",
+            PLAN_MAX_TOTAL_ENV_ENTRIES
+        );
+    }
+    if total_semantic_items > PLAN_MAX_TOTAL_SEMANTIC_ITEMS {
+        bail!(
+            "orchestration plan exceeds the configured {} total semantic-item limit",
+            PLAN_MAX_TOTAL_SEMANTIC_ITEMS
+        );
+    }
+    if total_dependency_edges > PLAN_MAX_DEPENDENCY_EDGES {
+        bail!(
+            "orchestration plan exceeds the configured {} dependency-edge limit",
+            PLAN_MAX_DEPENDENCY_EDGES
+        );
+    }
+    if total_validation_commands > PLAN_MAX_TOTAL_VALIDATION_COMMANDS {
+        bail!(
+            "orchestration plan exceeds the configured {} total validation-command limit",
+            PLAN_MAX_TOTAL_VALIDATION_COMMANDS
+        );
+    }
+    Ok(())
+}
+
+fn validate_raw_validation_bounds(
+    raw: &RawValidationCommand,
+    total_string_bytes: &mut usize,
+    total_paths: &mut usize,
+    total_env_entries: &mut usize,
+) -> Result<()> {
+    match raw {
+        RawValidationCommand::Shell(command) => account_plan_string(
+            total_string_bytes,
+            command,
+            PLAN_MAX_COMMAND_BYTES,
+            "validation command",
+        ),
+        RawValidationCommand::Detailed(details) => {
+            if let Some(name) = &details.name {
+                account_plan_string(
+                    total_string_bytes,
+                    name,
+                    PLAN_MAX_STRING_BYTES,
+                    "validation name",
+                )?;
+            }
+            account_plan_string(
+                total_string_bytes,
+                &details.command,
+                PLAN_MAX_COMMAND_BYTES,
+                "validation command",
+            )?;
+            if let Some(path) = &details.working_directory {
+                *total_paths = total_paths
+                    .checked_add(1)
+                    .context("orchestration plan path count overflowed")?;
+                validate_bounded_plan_path(path, "validation working_directory")?;
+            }
+            validate_bounded_env(&details.env, total_string_bytes, total_env_entries)?;
+            validate_bounded_timeout(details.timeout_seconds, "validation timeout")
+        }
+    }
+}
+
+fn validate_bounded_env(
+    env: &BTreeMap<String, String>,
+    total_string_bytes: &mut usize,
+    total_env_entries: &mut usize,
+) -> Result<()> {
+    if env.len() > PLAN_MAX_ENV_ENTRIES_PER_SCOPE {
+        bail!(
+            "orchestration environment scope exceeds the configured {} entry limit",
+            PLAN_MAX_ENV_ENTRIES_PER_SCOPE
+        );
+    }
+    *total_env_entries = total_env_entries
+        .checked_add(env.len())
+        .context("orchestration environment-entry count overflowed")?;
+    for (key, value) in env {
+        account_plan_string(
+            total_string_bytes,
+            key,
+            PLAN_MAX_ENV_KEY_BYTES,
+            "environment key",
+        )?;
+        account_plan_string(
+            total_string_bytes,
+            value,
+            PLAN_MAX_STRING_BYTES,
+            "environment value",
+        )?;
+    }
+    Ok(())
+}
+
+fn account_plan_string(
+    total: &mut usize,
+    value: &str,
+    per_value_limit: usize,
+    label: &str,
+) -> Result<()> {
+    if value.len() > per_value_limit {
+        bail!("{label} exceeds the configured {per_value_limit} byte limit");
+    }
+    *total = total
+        .checked_add(value.len())
+        .context("orchestration plan total string bytes overflowed")?;
+    if *total > PLAN_MAX_BYTES {
+        bail!(
+            "orchestration plan strings exceed the configured {} byte aggregate limit",
+            PLAN_MAX_BYTES
+        );
+    }
+    Ok(())
+}
+
+fn validate_bounded_plan_path(path: &Path, label: &str) -> Result<()> {
+    if candidate_path_bytes(path).len() > PLAN_MAX_PATH_BYTES
+        || path.components().count() > PLAN_MAX_PATH_COMPONENTS
+    {
+        bail!(
+            "{label} exceeds the configured path byte or component limit: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_bounded_timeout(timeout: Option<u64>, label: &str) -> Result<()> {
+    if timeout.is_some_and(|seconds| seconds == 0 || seconds > PLAN_MAX_TIMEOUT_SECONDS) {
+        bail!(
+            "{label} must be between 1 and {} seconds",
+            PLAN_MAX_TIMEOUT_SECONDS
+        );
+    }
+    Ok(())
 }
 
 pub fn run_plan_file(options: OrchestrationRunOptions) -> Result<OrchestrationSummary> {
@@ -410,7 +890,31 @@ pub fn run_plan_file_with_controls(
     controls: OrchestrationRunControls,
 ) -> Result<OrchestrationSummary> {
     let plan = load_plan(&options.plan_file)?;
-    run_plan_with_controls(plan, options, controls)
+    run_plan_with_controls_runtime(
+        plan,
+        options,
+        controls,
+        OrchestrationExecutionRuntime::Verified,
+    )
+}
+
+#[cfg(test)]
+fn run_plan_file_with_controls_simulation(
+    options: OrchestrationRunOptions,
+    controls: OrchestrationRunControls,
+) -> Result<OrchestrationSummary> {
+    let plan = load_plan(&options.plan_file)?;
+    run_plan_with_controls_runtime(
+        plan,
+        options,
+        controls,
+        OrchestrationExecutionRuntime::NonpublishableSimulation,
+    )
+}
+
+#[cfg(test)]
+fn run_plan_file_simulation(options: OrchestrationRunOptions) -> Result<OrchestrationSummary> {
+    run_plan_file_with_controls_simulation(options, OrchestrationRunControls::default())
 }
 
 pub fn run_plan(
@@ -425,379 +929,591 @@ pub fn run_plan_with_controls(
     options: OrchestrationRunOptions,
     controls: OrchestrationRunControls,
 ) -> Result<OrchestrationSummary> {
+    run_plan_with_controls_runtime(
+        plan,
+        options,
+        controls,
+        OrchestrationExecutionRuntime::Verified,
+    )
+}
+
+fn run_plan_with_controls_runtime(
+    plan: OrchestrationPlan,
+    options: OrchestrationRunOptions,
+    controls: OrchestrationRunControls,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<OrchestrationSummary> {
+    if runtime == OrchestrationExecutionRuntime::Verified {
+        bail!(
+            "orchestration assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
+        );
+    }
     if options.jobs == 0 {
         bail!("orchestration jobs must be at least 1");
     }
 
-    let repo = discover_repo_root(&options.repo)?;
-    let run_id = resolve_run_id(&controls)?;
-    let repo_head = current_head_oid(&repo)?;
-    let worktree_reuse_policy = controls
-        .worktree_reuse_policy
-        .unwrap_or(plan.worktree_reuse_policy);
-    let manager = WorktreeManager::new(&repo);
-    let store = SyncStore::open(&repo)?;
-    let mut summaries = plan
-        .agents
-        .iter()
-        .map(AgentRunSummary::pending)
-        .collect::<Vec<_>>();
-    let mut repo_validation = Vec::new();
-    let mut acquired_tokens = Vec::new();
+    let early_cleanup_errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cleanup_error_sink = early_cleanup_errors.clone();
+    let result = (|| -> Result<OrchestrationSummary> {
+        let repo = discover_repo_root(&options.repo)?;
+        let run_id = resolve_run_id(&controls)?;
+        let repo_head = current_head_oid(&repo)?;
+        let worktree_reuse_policy = controls
+            .worktree_reuse_policy
+            .unwrap_or(plan.worktree_reuse_policy);
+        let manager = WorktreeManager::new(&repo);
+        let store = SyncStore::open(&repo)?;
+        let semantic_store = SemanticIntentStore::open(&repo)?;
+        let semantic_coordination = controls.semantic_coordination;
+        let mut summaries = plan
+            .agents
+            .iter()
+            .map(AgentRunSummary::pending)
+            .collect::<Vec<_>>();
+        let mut repo_validation = Vec::new();
+        let mut repo_validation_target = None;
+        let mut claim_cleanup = ClaimCleanupGuard::new(store.clone(), cleanup_error_sink.clone());
+        let mut semantic_cleanup =
+            SemanticCleanupGuard::new(semantic_store.clone(), cleanup_error_sink.clone());
+        if options.keep_claims {
+            claim_cleanup.disarm_keep();
+            semantic_cleanup.disarm_keep();
+        }
+        let mut checkpoint_writer =
+            prepare_run_checkpoint_writer(&controls, &run_id, &repo, &summaries)?;
+        if let Some(writer) = checkpoint_writer.as_mut() {
+            writer.event(
+                PHASE_PLANNED,
+                None,
+                &serde_json::json!({
+                    "repo_head": repo_head.to_string(),
+                    "plan_recorded": true,
+                }),
+            )?;
+        }
 
-    let worktrees = select_worktrees(&manager, &store, &repo_head, &plan, worktree_reuse_policy)?;
-    for (summary, worktree) in summaries.iter_mut().zip(worktrees) {
-        summary.worktree_reused = worktree.reused;
-        summary.worktree = Some(worktree.record);
-    }
-    write_checkpoint_if_configured(
-        &controls,
-        RunCheckpointStage::WorktreesSelected,
-        &run_id,
-        CheckpointView {
-            repo: &repo,
-            repo_head: &repo_head,
-            plan_file: &options.plan_file,
-            plan: &plan,
-            keep_claims: options.keep_claims,
-            worktree_reuse_policy,
-            success: false,
-            agents: &summaries,
-            repo_validation: &repo_validation,
-            released_claims: &[],
-            release_errors: &[],
-        },
-    )?;
+        let worktrees =
+            select_worktrees(&manager, &store, &repo_head, &plan, worktree_reuse_policy)?;
+        if let Some(writer) = checkpoint_writer.as_ref() {
+            writer.reject_inside_worktrees(&worktrees)?;
+        }
+        for (summary, worktree) in summaries.iter_mut().zip(&worktrees) {
+            summary.worktree_reused = worktree.reused;
+            summary.worktree = Some(worktree.record().clone());
+            if let Some(writer) = checkpoint_writer.as_mut() {
+                writer.event(PHASE_WORKTREE_PREPARED, Some(&summary.id), &true)?;
+            }
+        }
+        write_checkpoint_if_configured(
+            &controls,
+            RunCheckpointStage::WorktreesSelected,
+            &run_id,
+            checkpoint_writer.as_mut(),
+            CheckpointView {
+                repo: &repo,
+                repo_head: &repo_head,
+                plan_file: &options.plan_file,
+                plan: &plan,
+                keep_claims: options.keep_claims,
+                worktree_reuse_policy,
+                success: false,
+                agents: &summaries,
+                repo_validation: &repo_validation,
+                repo_validation_target: repo_validation_target.as_ref(),
+                released_claims: &[],
+                release_errors: &[],
+                released_semantic_intents: &[],
+                semantic_release_errors: &[],
+            },
+        )?;
 
-    for (index, agent) in plan.agents.iter().enumerate() {
-        let claim = match store.claim_paths(&agent.id, agent.paths.iter()) {
-            Ok(claim) => claim,
-            Err(error) => {
-                summaries[index].status = AgentRunStatus::Failed;
-                summaries[index].error = Some(format!("failed to claim paths: {error}"));
-                for (skipped_index, skipped) in summaries.iter_mut().enumerate() {
-                    if skipped_index != index && skipped.status == AgentRunStatus::Pending {
-                        skipped.status = AgentRunStatus::Skipped;
-                        skipped.error = Some(format!(
-                            "skipped because paths could not be claimed for agent '{}'",
-                            agent.id
-                        ));
+        for (index, agent) in plan.agents.iter().enumerate() {
+            match store.claim_paths(&agent.id, agent.paths.iter()) {
+                Ok(claim) => {
+                    claim_cleanup.track(claim.token);
+                    summaries[index].claim = Some(claim);
+                    if let Some(writer) = checkpoint_writer.as_mut() {
+                        writer.event(PHASE_CLAIM_ACQUIRED, Some(&agent.id), &true)?;
                     }
                 }
-                let (released_claims, release_errors) = if options.keep_claims {
-                    (Vec::new(), Vec::new())
-                } else {
-                    release_claims(&store, acquired_tokens)
-                };
-                write_checkpoint_if_configured(
-                    &controls,
-                    RunCheckpointStage::Final,
-                    &run_id,
-                    CheckpointView {
-                        repo: &repo,
-                        repo_head: &repo_head,
-                        plan_file: &options.plan_file,
-                        plan: &plan,
-                        keep_claims: options.keep_claims,
-                        worktree_reuse_policy,
-                        success: false,
-                        agents: &summaries,
-                        repo_validation: &repo_validation,
-                        released_claims: &released_claims,
-                        release_errors: &release_errors,
-                    },
-                )?;
-                return Ok(OrchestrationSummary {
-                    run_id,
-                    repo,
-                    plan_file: options.plan_file,
-                    keep_claims: options.keep_claims,
-                    worktree_reuse_policy,
-                    success: false,
-                    agents: summaries,
-                    repo_validation,
-                    released_claims,
-                    release_errors,
-                });
+                Err(error) => {
+                    fail_summary(
+                        &mut summaries[index],
+                        format!("failed to claim paths for agent '{}': {error}", agent.id),
+                    );
+                }
             }
-        };
-        acquired_tokens.push(claim.token);
-        summaries[index].claim = Some(claim);
-    }
-    write_checkpoint_if_configured(
-        &controls,
-        RunCheckpointStage::ClaimsAcquired,
-        &run_id,
-        CheckpointView {
-            repo: &repo,
-            repo_head: &repo_head,
-            plan_file: &options.plan_file,
-            plan: &plan,
-            keep_claims: options.keep_claims,
-            worktree_reuse_policy,
-            success: false,
-            agents: &summaries,
-            repo_validation: &repo_validation,
-            released_claims: &[],
-            release_errors: &[],
-        },
-    )?;
+        }
+        if semantic_coordination != SemanticCoordinationMode::Off {
+            coordinate_semantic_intents(
+                &semantic_store,
+                &plan,
+                &mut summaries,
+                semantic_coordination,
+                semantic_cleanup.tokens_mut(),
+            );
+        }
+        write_checkpoint_if_configured(
+            &controls,
+            RunCheckpointStage::ClaimsAcquired,
+            &run_id,
+            checkpoint_writer.as_mut(),
+            CheckpointView {
+                repo: &repo,
+                repo_head: &repo_head,
+                plan_file: &options.plan_file,
+                plan: &plan,
+                keep_claims: options.keep_claims,
+                worktree_reuse_policy,
+                success: false,
+                agents: &summaries,
+                repo_validation: &repo_validation,
+                repo_validation_target: repo_validation_target.as_ref(),
+                released_claims: &[],
+                release_errors: &[],
+                released_semantic_intents: &[],
+                semantic_release_errors: &[],
+            },
+        )?;
 
-    run_agent_schedule(
-        &plan,
-        &mut summaries,
-        options.jobs,
-        options.patch_dir.as_deref(),
-    )?;
-    if summaries
-        .iter()
-        .all(|summary| summary.status == AgentRunStatus::Succeeded)
-    {
-        repo_validation = run_repo_validation_commands(&plan, &repo);
-    }
-    write_checkpoint_if_configured(
-        &controls,
-        RunCheckpointStage::AgentsCompleted,
-        &run_id,
-        CheckpointView {
-            repo: &repo,
-            repo_head: &repo_head,
-            plan_file: &options.plan_file,
-            plan: &plan,
-            keep_claims: options.keep_claims,
-            worktree_reuse_policy,
-            success: false,
-            agents: &summaries,
-            repo_validation: &repo_validation,
-            released_claims: &[],
-            release_errors: &[],
-        },
-    )?;
-
-    let (released_claims, release_errors) = if options.keep_claims {
-        (Vec::new(), Vec::new())
-    } else {
-        release_claims(&store, acquired_tokens)
-    };
-    let success = release_errors.is_empty()
-        && summaries
+        let captured_candidates = run_agent_schedule_with_patch_dir(
+            &AgentScheduleContext {
+                manager: &manager,
+                plan: &plan,
+                worktrees: &worktrees,
+                jobs: options.jobs,
+                base_oid: &repo_head,
+                runtime,
+            },
+            &mut summaries,
+            options.patch_dir.as_deref(),
+            checkpoint_writer.as_mut(),
+        )?;
+        if summaries
             .iter()
             .all(|summary| summary.status == AgentRunStatus::Succeeded)
-        && repo_validation
-            .iter()
-            .all(|summary| summary.status == AgentRunStatus::Succeeded);
-    write_checkpoint_if_configured(
-        &controls,
-        RunCheckpointStage::Final,
-        &run_id,
-        CheckpointView {
-            repo: &repo,
-            repo_head: &repo_head,
-            plan_file: &options.plan_file,
-            plan: &plan,
+        {
+            if let Some(writer) = checkpoint_writer.as_mut() {
+                writer.event(
+                    PHASE_REPO_VALIDATION_STARTED,
+                    None,
+                    &serde_json::json!({ "agent_count": summaries.len() }),
+                )?;
+            }
+            let outcome = run_repo_validation_commands(
+                &plan,
+                &repo,
+                &manager,
+                &worktrees,
+                &repo_head,
+                &captured_candidates,
+                runtime,
+            );
+            repo_validation = outcome.summaries;
+            repo_validation_target = outcome.target;
+            if let Some(writer) = checkpoint_writer.as_mut() {
+                writer.event(
+                    PHASE_REPO_VALIDATED,
+                    None,
+                    &serde_json::json!({
+                        "validation_count": repo_validation.len(),
+                        "has_target": repo_validation_target.is_some(),
+                    }),
+                )?;
+            }
+        }
+        write_checkpoint_if_configured(
+            &controls,
+            RunCheckpointStage::AgentsCompleted,
+            &run_id,
+            checkpoint_writer.as_mut(),
+            CheckpointView {
+                repo: &repo,
+                repo_head: &repo_head,
+                plan_file: &options.plan_file,
+                plan: &plan,
+                keep_claims: options.keep_claims,
+                worktree_reuse_policy,
+                success: false,
+                agents: &summaries,
+                repo_validation: &repo_validation,
+                repo_validation_target: repo_validation_target.as_ref(),
+                released_claims: &[],
+                release_errors: &[],
+                released_semantic_intents: &[],
+                semantic_release_errors: &[],
+            },
+        )?;
+
+        let (released_claims, release_errors) = if options.keep_claims {
+            claim_cleanup.disarm_keep();
+            (Vec::new(), Vec::new())
+        } else {
+            claim_cleanup.release()
+        };
+        let (released_semantic_intents, semantic_release_errors) = if options.keep_claims {
+            semantic_cleanup.disarm_keep();
+            (Vec::new(), Vec::new())
+        } else {
+            semantic_cleanup.release()
+        };
+        if let Some(writer) = checkpoint_writer.as_mut() {
+            writer.event(
+                PHASE_RELEASED,
+                None,
+                &serde_json::json!({
+                    "claim_count": released_claims.len(),
+                    "claim_errors": &release_errors,
+                    "semantic_intent_count": released_semantic_intents.len(),
+                    "semantic_errors": &semantic_release_errors,
+                    "kept": options.keep_claims,
+                }),
+            )?;
+        }
+        let success = release_errors.is_empty()
+            && semantic_release_errors.is_empty()
+            && repo_validation_target.is_some()
+            && summaries
+                .iter()
+                .all(|summary| summary.status == AgentRunStatus::Succeeded)
+            && repo_validation
+                .iter()
+                .all(|summary| summary.status == AgentRunStatus::Succeeded);
+        write_checkpoint_if_configured(
+            &controls,
+            RunCheckpointStage::Final,
+            &run_id,
+            checkpoint_writer.as_mut(),
+            CheckpointView {
+                repo: &repo,
+                repo_head: &repo_head,
+                plan_file: &options.plan_file,
+                plan: &plan,
+                keep_claims: options.keep_claims,
+                worktree_reuse_policy,
+                success,
+                agents: &summaries,
+                repo_validation: &repo_validation,
+                repo_validation_target: repo_validation_target.as_ref(),
+                released_claims: &released_claims,
+                release_errors: &release_errors,
+                released_semantic_intents: &released_semantic_intents,
+                semantic_release_errors: &semantic_release_errors,
+            },
+        )?;
+
+        Ok(OrchestrationSummary {
+            run_id,
+            repo,
+            plan_file: options.plan_file,
             keep_claims: options.keep_claims,
             worktree_reuse_policy,
+            semantic_coordination,
             success,
-            agents: &summaries,
-            repo_validation: &repo_validation,
-            released_claims: &released_claims,
-            release_errors: &release_errors,
-        },
-    )?;
-
-    Ok(OrchestrationSummary {
-        run_id,
-        repo,
-        plan_file: options.plan_file,
-        keep_claims: options.keep_claims,
-        worktree_reuse_policy,
-        success,
-        agents: summaries,
-        repo_validation,
-        released_claims,
-        release_errors,
-    })
+            agents: summaries,
+            repo_validation,
+            repo_validation_target,
+            released_claims,
+            release_errors,
+            released_semantic_intents,
+            semantic_release_errors,
+        })
+    })();
+    finish_with_early_cleanup(result, &early_cleanup_errors)
 }
 
 pub fn resume_plan_file(options: OrchestrationResumeOptions) -> Result<OrchestrationSummary> {
+    resume_plan_file_runtime(options, OrchestrationExecutionRuntime::Verified)
+}
+
+#[cfg(test)]
+fn resume_plan_file_simulation(
+    options: OrchestrationResumeOptions,
+) -> Result<OrchestrationSummary> {
+    resume_plan_file_runtime(
+        options,
+        OrchestrationExecutionRuntime::NonpublishableSimulation,
+    )
+}
+
+fn resume_plan_file_runtime(
+    options: OrchestrationResumeOptions,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<OrchestrationSummary> {
     if options.jobs == 0 {
         bail!("orchestration jobs must be at least 1");
     }
 
-    let checkpoint = read_run_checkpoint(&options.checkpoint_file)?;
-    let checkpoint_dir = options
-        .checkpoint_file
-        .parent()
-        .map(Path::to_path_buf)
-        .context("checkpoint file must have a parent directory")?;
-    let expected_checkpoint_path = checkpoint_path(&checkpoint_dir, &checkpoint.run_id);
-    if expected_checkpoint_path != options.checkpoint_file {
-        bail!(
-            "checkpoint file {} does not match run id '{}'; expected {}",
-            options.checkpoint_file.display(),
-            checkpoint.run_id.as_str(),
-            expected_checkpoint_path.display()
-        );
-    }
+    let early_cleanup_errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cleanup_error_sink = early_cleanup_errors.clone();
+    let result = (|| -> Result<OrchestrationSummary> {
+        let OpenedRunCheckpoint {
+            checkpoint,
+            repo,
+            writer,
+        } = open_run_checkpoint(&options.checkpoint_file, options.repo.as_deref())?;
+        let mut checkpoint_writer = Some(writer);
+        let checkpoint_dir = options
+            .checkpoint_file
+            .parent()
+            .map(Path::to_path_buf)
+            .context("checkpoint file must have a parent directory")?;
+        let repo_head = current_head_oid(&repo)?;
+        let plan_file = options
+            .plan_file
+            .clone()
+            .unwrap_or_else(|| checkpoint.plan_file.clone());
+        let plan = load_plan(&plan_file)?;
 
-    let checkpoint_repo = discover_repo_root(&checkpoint.repo).with_context(|| {
-        format!(
-            "failed to validate checkpoint repository {}",
-            checkpoint.repo.display()
-        )
-    })?;
-    let repo = match options.repo.as_deref() {
-        Some(repo) => {
-            let repo = discover_repo_root(repo)?;
-            if repo != checkpoint_repo {
-                bail!(
-                    "checkpoint belongs to repository {}, but resume was requested for {}",
-                    checkpoint_repo.display(),
-                    repo.display()
-                );
-            }
-            repo
+        validate_checkpoint_for_resume(&checkpoint, &plan, &repo_head)?;
+        let manager = WorktreeManager::new(&repo);
+        let store = SyncStore::open(&repo)?;
+        let semantic_store = SemanticIntentStore::open(&repo)?;
+        let mut summaries = summaries_from_checkpoint(&plan, &checkpoint)?;
+        let worktrees = validate_resume_worktrees(
+            &manager,
+            &plan,
+            &checkpoint,
+            &mut summaries,
+            &repo_head,
+            runtime,
+        )?;
+        if let Some(writer) = checkpoint_writer.as_ref() {
+            writer.reject_inside_worktrees(&worktrees)?;
         }
-        None => checkpoint_repo,
-    };
-    let repo_head = current_head_oid(&repo)?;
-    let plan_file = options
-        .plan_file
-        .clone()
-        .unwrap_or_else(|| checkpoint.plan_file.clone());
-    let plan = load_plan(&plan_file)?;
 
-    validate_checkpoint_for_resume(&checkpoint, &plan, &repo_head)?;
-    let manager = WorktreeManager::new(&repo);
-    let store = SyncStore::open(&repo)?;
-    let mut summaries = summaries_from_checkpoint(&plan, &checkpoint)?;
-    validate_resume_worktrees(&manager, &plan, &checkpoint, &mut summaries, &repo_head)?;
+        if checkpoint.stage == RunCheckpointStage::Final {
+            return Ok(summary_from_parts(SummaryParts {
+                run_id: checkpoint.run_id,
+                repo,
+                plan_file,
+                keep_claims: checkpoint.keep_claims,
+                worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+                semantic_coordination: checkpoint.semantic_coordination,
+                summaries,
+                repo_validation: checkpoint.repo_validation,
+                repo_validation_target: checkpoint.repo_validation_target,
+                released_claims: checkpoint.released_claims,
+                release_errors: checkpoint.release_errors,
+                released_semantic_intents: checkpoint.released_semantic_intents,
+                semantic_release_errors: checkpoint.semantic_release_errors,
+            }));
+        }
 
-    if checkpoint.stage == RunCheckpointStage::Final {
-        return Ok(summary_from_parts(SummaryParts {
-            run_id: checkpoint.run_id,
+        let controls = OrchestrationRunControls {
+            run_id: Some(checkpoint.run_id.clone()),
+            checkpoint_dir: Some(checkpoint_dir),
+            worktree_reuse_policy: Some(checkpoint.worktree_reuse_policy),
+            semantic_coordination: checkpoint.semantic_coordination,
+        };
+        let mut claim_cleanup = ClaimCleanupGuard::new(store.clone(), cleanup_error_sink.clone());
+        let mut semantic_cleanup =
+            SemanticCleanupGuard::new(semantic_store.clone(), cleanup_error_sink.clone());
+        if checkpoint.keep_claims {
+            claim_cleanup.disarm_keep();
+            semantic_cleanup.disarm_keep();
+        }
+        let acquired_tokens = acquire_resume_claims(&store, &plan, &mut summaries);
+        claim_cleanup.set_tokens(acquired_tokens);
+        if let Some(writer) = checkpoint_writer.as_mut() {
+            for summary in &summaries {
+                if summary.claim.is_some() {
+                    writer.event(PHASE_CLAIM_ACQUIRED, Some(&summary.id), &true)?;
+                }
+            }
+        }
+        let (active_semantic_tokens, semantic_coordination_needed) =
+            active_checkpoint_semantic_tokens(&semantic_store, &mut summaries)?;
+        semantic_cleanup.set_tokens(active_semantic_tokens);
+        let had_pending_agents = summaries
+            .iter()
+            .any(|summary| summary.status == AgentRunStatus::Pending);
+        if checkpoint.semantic_coordination != SemanticCoordinationMode::Off
+            && had_pending_agents
+            && semantic_coordination_needed
+        {
+            coordinate_semantic_intents(
+                &semantic_store,
+                &plan,
+                &mut summaries,
+                checkpoint.semantic_coordination,
+                semantic_cleanup.tokens_mut(),
+            );
+        }
+
+        write_checkpoint_if_configured(
+            &controls,
+            RunCheckpointStage::ClaimsAcquired,
+            &Some(checkpoint.run_id.clone()),
+            checkpoint_writer.as_mut(),
+            CheckpointView {
+                repo: &repo,
+                repo_head: &repo_head,
+                plan_file: &plan_file,
+                plan: &plan,
+                keep_claims: checkpoint.keep_claims,
+                worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+                success: false,
+                agents: &summaries,
+                repo_validation: &checkpoint.repo_validation,
+                repo_validation_target: checkpoint.repo_validation_target.as_ref(),
+                released_claims: &[],
+                release_errors: &[],
+                released_semantic_intents: &[],
+                semantic_release_errors: &[],
+            },
+        )?;
+
+        let captured_candidates = run_agent_schedule_with_patch_dir(
+            &AgentScheduleContext {
+                manager: &manager,
+                plan: &plan,
+                worktrees: &worktrees,
+                jobs: options.jobs,
+                base_oid: &repo_head,
+                runtime,
+            },
+            &mut summaries,
+            options.patch_dir.as_deref(),
+            checkpoint_writer.as_mut(),
+        )?;
+        let (repo_validation, repo_validation_target) = if summaries
+            .iter()
+            .all(|summary| summary.status == AgentRunStatus::Succeeded)
+        {
+            if let Some(writer) = checkpoint_writer.as_mut() {
+                writer.event(
+                    PHASE_REPO_VALIDATION_STARTED,
+                    None,
+                    &serde_json::json!({ "agent_count": summaries.len() }),
+                )?;
+            }
+            let outcome = run_repo_validation_commands(
+                &plan,
+                &repo,
+                &manager,
+                &worktrees,
+                &repo_head,
+                &captured_candidates,
+                runtime,
+            );
+            if let Some(writer) = checkpoint_writer.as_mut() {
+                writer.event(
+                    PHASE_REPO_VALIDATED,
+                    None,
+                    &serde_json::json!({
+                        "validation_count": outcome.summaries.len(),
+                        "has_target": outcome.target.is_some(),
+                    }),
+                )?;
+            }
+            (outcome.summaries, outcome.target)
+        } else {
+            (
+                checkpoint.repo_validation.clone(),
+                checkpoint.repo_validation_target.clone(),
+            )
+        };
+
+        write_checkpoint_if_configured(
+            &controls,
+            RunCheckpointStage::AgentsCompleted,
+            &Some(checkpoint.run_id.clone()),
+            checkpoint_writer.as_mut(),
+            CheckpointView {
+                repo: &repo,
+                repo_head: &repo_head,
+                plan_file: &plan_file,
+                plan: &plan,
+                keep_claims: checkpoint.keep_claims,
+                worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+                success: false,
+                agents: &summaries,
+                repo_validation: &repo_validation,
+                repo_validation_target: repo_validation_target.as_ref(),
+                released_claims: &[],
+                release_errors: &[],
+                released_semantic_intents: &[],
+                semantic_release_errors: &[],
+            },
+        )?;
+
+        let (released_claims, release_errors) = if checkpoint.keep_claims {
+            claim_cleanup.disarm_keep();
+            (Vec::new(), Vec::new())
+        } else {
+            claim_cleanup.release()
+        };
+        let (released_semantic_intents, semantic_release_errors) = if checkpoint.keep_claims {
+            semantic_cleanup.disarm_keep();
+            (Vec::new(), Vec::new())
+        } else {
+            semantic_cleanup.release()
+        };
+        if let Some(writer) = checkpoint_writer.as_mut() {
+            writer.event(
+                PHASE_RELEASED,
+                None,
+                &serde_json::json!({
+                    "claim_count": released_claims.len(),
+                    "claim_errors": &release_errors,
+                    "semantic_intent_count": released_semantic_intents.len(),
+                    "semantic_errors": &semantic_release_errors,
+                    "kept": checkpoint.keep_claims,
+                }),
+            )?;
+        }
+        let success = release_errors.is_empty()
+            && semantic_release_errors.is_empty()
+            && repo_validation_target.is_some()
+            && summaries
+                .iter()
+                .all(|summary| summary.status == AgentRunStatus::Succeeded)
+            && repo_validation
+                .iter()
+                .all(|summary| summary.status == AgentRunStatus::Succeeded);
+
+        write_checkpoint_if_configured(
+            &controls,
+            RunCheckpointStage::Final,
+            &Some(checkpoint.run_id.clone()),
+            checkpoint_writer.as_mut(),
+            CheckpointView {
+                repo: &repo,
+                repo_head: &repo_head,
+                plan_file: &plan_file,
+                plan: &plan,
+                keep_claims: checkpoint.keep_claims,
+                worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+                success,
+                agents: &summaries,
+                repo_validation: &repo_validation,
+                repo_validation_target: repo_validation_target.as_ref(),
+                released_claims: &released_claims,
+                release_errors: &release_errors,
+                released_semantic_intents: &released_semantic_intents,
+                semantic_release_errors: &semantic_release_errors,
+            },
+        )?;
+
+        Ok(OrchestrationSummary {
+            run_id: Some(checkpoint.run_id),
             repo,
             plan_file,
             keep_claims: checkpoint.keep_claims,
             worktree_reuse_policy: checkpoint.worktree_reuse_policy,
-            summaries,
-            repo_validation: checkpoint.repo_validation,
-            released_claims: checkpoint.released_claims,
-            release_errors: checkpoint.release_errors,
-        }));
-    }
-
-    let acquired_tokens = acquire_resume_claims(&store, &plan, &mut summaries)?;
-    let controls = OrchestrationRunControls {
-        run_id: Some(checkpoint.run_id.clone()),
-        checkpoint_dir: Some(checkpoint_dir),
-        worktree_reuse_policy: Some(checkpoint.worktree_reuse_policy),
-    };
-
-    write_checkpoint_if_configured(
-        &controls,
-        RunCheckpointStage::ClaimsAcquired,
-        &Some(checkpoint.run_id.clone()),
-        CheckpointView {
-            repo: &repo,
-            repo_head: &repo_head,
-            plan_file: &plan_file,
-            plan: &plan,
-            keep_claims: checkpoint.keep_claims,
-            worktree_reuse_policy: checkpoint.worktree_reuse_policy,
-            success: false,
-            agents: &summaries,
-            repo_validation: &checkpoint.repo_validation,
-            released_claims: &[],
-            release_errors: &[],
-        },
-    )?;
-
-    let had_pending_agents = summaries
-        .iter()
-        .any(|summary| summary.status == AgentRunStatus::Pending);
-    run_agent_schedule(
-        &plan,
-        &mut summaries,
-        options.jobs,
-        options.patch_dir.as_deref(),
-    )?;
-    let repo_validation = if summaries
-        .iter()
-        .all(|summary| summary.status == AgentRunStatus::Succeeded)
-    {
-        if had_pending_agents || checkpoint.repo_validation.is_empty() {
-            run_repo_validation_commands(&plan, &repo)
-        } else {
-            checkpoint.repo_validation.clone()
-        }
-    } else {
-        checkpoint.repo_validation.clone()
-    };
-
-    write_checkpoint_if_configured(
-        &controls,
-        RunCheckpointStage::AgentsCompleted,
-        &Some(checkpoint.run_id.clone()),
-        CheckpointView {
-            repo: &repo,
-            repo_head: &repo_head,
-            plan_file: &plan_file,
-            plan: &plan,
-            keep_claims: checkpoint.keep_claims,
-            worktree_reuse_policy: checkpoint.worktree_reuse_policy,
-            success: false,
-            agents: &summaries,
-            repo_validation: &repo_validation,
-            released_claims: &[],
-            release_errors: &[],
-        },
-    )?;
-
-    let (released_claims, release_errors) = if checkpoint.keep_claims {
-        (Vec::new(), Vec::new())
-    } else {
-        release_claims(&store, acquired_tokens)
-    };
-    let success = release_errors.is_empty()
-        && summaries
-            .iter()
-            .all(|summary| summary.status == AgentRunStatus::Succeeded)
-        && repo_validation
-            .iter()
-            .all(|summary| summary.status == AgentRunStatus::Succeeded);
-
-    write_checkpoint_if_configured(
-        &controls,
-        RunCheckpointStage::Final,
-        &Some(checkpoint.run_id.clone()),
-        CheckpointView {
-            repo: &repo,
-            repo_head: &repo_head,
-            plan_file: &plan_file,
-            plan: &plan,
-            keep_claims: checkpoint.keep_claims,
-            worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+            semantic_coordination: checkpoint.semantic_coordination,
             success,
-            agents: &summaries,
-            repo_validation: &repo_validation,
-            released_claims: &released_claims,
-            release_errors: &release_errors,
-        },
-    )?;
-
-    Ok(OrchestrationSummary {
-        run_id: Some(checkpoint.run_id),
-        repo,
-        plan_file,
-        keep_claims: checkpoint.keep_claims,
-        worktree_reuse_policy: checkpoint.worktree_reuse_policy,
-        success,
-        agents: summaries,
-        repo_validation,
-        released_claims,
-        release_errors,
-    })
+            agents: summaries,
+            repo_validation,
+            repo_validation_target,
+            released_claims,
+            release_errors,
+            released_semantic_intents,
+            semantic_release_errors,
+        })
+    })();
+    finish_with_early_cleanup(result, &early_cleanup_errors)
 }
 
 fn validate_checkpoint_for_resume(
@@ -871,8 +1587,207 @@ fn validate_checkpoint_for_resume(
                 );
             }
         }
+        if checkpoint_agent.status == AgentRunStatus::Succeeded
+            && checkpoint_agent.candidate_binding.is_none()
+            && checkpoint_agent.command_completed_binding.is_none()
+        {
+            bail!(
+                "checkpoint '{}' completed agent '{}' is missing candidate validation binding metadata; start a new run",
+                checkpoint.run_id.as_str(),
+                checkpoint_agent.id
+            );
+        }
+        if let Some(binding) = checkpoint_agent.candidate_binding.as_ref() {
+            validate_serialized_agent_binding(binding, agent, repo_head)?;
+            if checkpoint_agent.changed_paths != binding.changed_paths {
+                bail!(
+                    "checkpoint '{}' candidate paths for completed agent '{}' do not match its serialized binding",
+                    checkpoint.run_id.as_str(),
+                    checkpoint_agent.id
+                );
+            }
+        }
+        if let Some(binding) = checkpoint_agent.command_completed_binding.as_ref() {
+            validate_serialized_completed_binding(binding, agent, repo_head)?;
+            if checkpoint_agent.candidate_binding.is_none()
+                && checkpoint_agent.changed_paths != binding.changed_paths
+            {
+                bail!(
+                    "checkpoint '{}' completed-command paths for agent '{}' do not match its exact state binding",
+                    checkpoint.run_id.as_str(),
+                    checkpoint_agent.id
+                );
+            }
+        }
     }
 
+    if let Some(target) = checkpoint.repo_validation_target.as_ref() {
+        validate_serialized_repo_validation_target(target, checkpoint, repo_head)?;
+    } else if checkpoint.stage == RunCheckpointStage::Final
+        && checkpoint
+            .agents
+            .iter()
+            .all(|agent| agent.status == AgentRunStatus::Succeeded)
+    {
+        bail!(
+            "checkpoint '{}' has successful candidates but no combined repo-validation target binding; start a new run",
+            checkpoint.run_id.as_str()
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_serialized_agent_binding(
+    binding: &AgentCandidateBinding,
+    agent: &AgentPlan,
+    repo_head: &Oid,
+) -> Result<()> {
+    if binding.version != CANDIDATE_BINDING_VERSION {
+        bail!(
+            "agent '{}' uses unsupported candidate binding version {}",
+            agent.id,
+            binding.version
+        );
+    }
+    if binding.base_oid != repo_head.to_string() {
+        bail!(
+            "agent '{}' candidate binding was captured from a different run base",
+            agent.id
+        );
+    }
+    for (label, value) in [
+        ("base", binding.base_oid.as_str()),
+        ("head", binding.head_oid.as_str()),
+        ("state", binding.state_oid.as_str()),
+        ("diff", binding.diff_oid.as_str()),
+    ] {
+        let oid = Oid::from_str(value)
+            .with_context(|| format!("agent '{}' candidate {label} OID is invalid", agent.id))?;
+        if oid.to_string() != value {
+            bail!(
+                "agent '{}' candidate {label} OID is not canonical",
+                agent.id
+            );
+        }
+    }
+    if binding.patch_bytes >= PATCH_OUTPUT_MAX_BYTES as u64 {
+        bail!(
+            "agent '{}' candidate patch reached the configured byte boundary",
+            agent.id
+        );
+    }
+    if binding.changed_paths.len() > CANDIDATE_MAX_CHANGED_PATHS {
+        bail!(
+            "agent '{}' candidate changed-path count exceeded its bound",
+            agent.id
+        );
+    }
+    for path in &binding.changed_paths {
+        let normalized = normalize_repo_relative_path(path)?;
+        if &normalized != path {
+            bail!("agent '{}' candidate path is not normalized", agent.id);
+        }
+    }
+    Ok(())
+}
+
+fn validate_serialized_completed_binding(
+    binding: &CompletedCommandStateBinding,
+    agent: &AgentPlan,
+    repo_head: &Oid,
+) -> Result<()> {
+    if binding.version != CANDIDATE_BINDING_VERSION || binding.base_oid != repo_head.to_string() {
+        bail!(
+            "agent '{}' completed command uses an unsupported or stale state binding",
+            agent.id
+        );
+    }
+    for (label, value) in [
+        ("base", binding.base_oid.as_str()),
+        ("head", binding.head_oid.as_str()),
+        ("state", binding.state_oid.as_str()),
+    ] {
+        let oid = Oid::from_str(value).with_context(|| {
+            format!(
+                "agent '{}' completed-command {label} OID is invalid",
+                agent.id
+            )
+        })?;
+        if oid.to_string() != value {
+            bail!(
+                "agent '{}' completed-command {label} OID is not canonical",
+                agent.id
+            );
+        }
+    }
+    if binding.changed_paths.len() > CANDIDATE_MAX_CHANGED_PATHS {
+        bail!(
+            "agent '{}' completed-command changed-path count exceeded its bound",
+            agent.id
+        );
+    }
+    for path in &binding.changed_paths {
+        if &normalize_repo_relative_path(path)? != path {
+            bail!(
+                "agent '{}' completed-command path is not normalized",
+                agent.id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_serialized_repo_validation_target(
+    target: &RepoValidationTargetBinding,
+    checkpoint: &RunCheckpoint,
+    repo_head: &Oid,
+) -> Result<()> {
+    if target.version != CANDIDATE_BINDING_VERSION || target.base_oid != repo_head.to_string() {
+        bail!("checkpoint repo-validation target has an unsupported or stale binding");
+    }
+    let diff_oid = Oid::from_str(&target.combined_diff_oid)
+        .context("checkpoint repo-validation combined diff OID is invalid")?;
+    if diff_oid.to_string() != target.combined_diff_oid {
+        bail!("checkpoint repo-validation combined diff OID is not canonical");
+    }
+    let successful = checkpoint
+        .agents
+        .iter()
+        .filter(|agent| agent.status == AgentRunStatus::Succeeded)
+        .collect::<Vec<_>>();
+    let mut changed_paths = BTreeSet::new();
+    let mut patch_count = 0_usize;
+    let mut aggregate_patch_bytes = 0_u64;
+    for agent in &successful {
+        let binding = agent
+            .candidate_binding
+            .as_ref()
+            .context("successful checkpoint agent is missing its candidate binding")?;
+        if binding.patch_bytes > 0 {
+            patch_count += 1;
+        }
+        aggregate_patch_bytes = aggregate_patch_bytes
+            .checked_add(binding.patch_bytes)
+            .context("checkpoint candidate byte count overflowed")?;
+        changed_paths.extend(binding.changed_paths.iter().cloned());
+    }
+    let changed_paths = changed_paths.into_iter().collect::<Vec<_>>();
+    let expected_kind = if changed_paths.is_empty() {
+        RepoValidationTargetKind::BaseNoChanges
+    } else {
+        RepoValidationTargetKind::CombinedCandidate
+    };
+    if target.kind != expected_kind
+        || target.candidate_count != successful.len()
+        || target.patch_count != patch_count
+        || target.aggregate_patch_bytes != aggregate_patch_bytes
+        || target.changed_paths != changed_paths
+        || target.aggregate_patch_bytes >= COMBINED_CANDIDATE_MAX_BYTES as u64
+        || target.patch_count > COMBINED_CANDIDATE_MAX_PATCHES
+    {
+        bail!("checkpoint repo-validation target does not match its successful candidate set");
+    }
     Ok(())
 }
 
@@ -889,9 +1804,13 @@ fn summaries_from_checkpoint(
             summary.worktree = checkpoint_agent.worktree.as_ref().map(WorktreeRecord::from);
             summary.worktree_reused = summary.worktree.is_some();
             summary.claim = checkpoint_agent.claim.clone();
+            summary.semantic_intent = checkpoint_agent.semantic_intent.clone();
+            summary.semantic_conflicts = checkpoint_agent.semantic_conflicts.clone();
             summary.changed_paths = checkpoint_agent.changed_paths.clone();
             summary.unclaimed_changed_paths = checkpoint_agent.unclaimed_changed_paths.clone();
             summary.validation = checkpoint_agent.validation.clone();
+            summary.candidate_binding = checkpoint_agent.candidate_binding.clone();
+            summary.command_completed_binding = checkpoint_agent.command_completed_binding.clone();
             summary.error = checkpoint_agent.error.clone();
             Ok(summary)
         })
@@ -904,12 +1823,14 @@ fn validate_resume_worktrees(
     checkpoint: &RunCheckpoint,
     summaries: &mut [AgentRunSummary],
     repo_head: &Oid,
-) -> Result<()> {
-    let records = manager
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<Vec<SelectedWorktree>> {
+    let registered_names = manager
         .list()?
         .into_iter()
-        .map(|record| (record.name.clone(), record))
-        .collect::<BTreeMap<_, _>>();
+        .map(|record| record.name)
+        .collect::<BTreeSet<_>>();
+    let mut selected = Vec::with_capacity(plan.agents.len());
 
     for ((agent, checkpoint_agent), summary) in plan
         .agents
@@ -924,14 +1845,24 @@ fn validate_resume_worktrees(
                 agent.id
             );
         };
-        let Some(current) = records.get(&recorded.name) else {
+        if !registered_names.contains(&recorded.name) {
             bail!(
                 "checkpoint '{}' references missing worktree '{}' for agent '{}'; restore the worktree or start a new run",
                 checkpoint.run_id.as_str(),
                 recorded.name,
                 agent.id
             );
-        };
+        }
+        let lease = manager
+            .acquire_write_execution_lease(&recorded.name)
+            .with_context(|| {
+                format!(
+                    "checkpoint '{}' could not reacquire the exclusive execution lease for worktree '{}'",
+                    checkpoint.run_id.as_str(),
+                    recorded.name
+                )
+            })?;
+        let current = lease.record();
         if current.path != recorded.path || current.branch != recorded.branch {
             bail!(
                 "checkpoint '{}' worktree metadata for agent '{}' is stale; expected {} on branch {}, found {} on branch {}",
@@ -944,33 +1875,50 @@ fn validate_resume_worktrees(
             );
         }
 
-        let worktree_repo = Repository::open(&current.path).with_context(|| {
+        let primary_verified = manager
+            .get_managed_verified(&recorded.name)
+            .with_context(|| {
+                format!(
+                    "checkpoint '{}' managed worktree binding for agent '{}' is invalid",
+                    checkpoint.run_id.as_str(),
+                    agent.id
+                )
+            })?;
+        if &primary_verified != current {
+            bail!(
+                "checkpoint '{}' managed worktree record or Git backlink for agent '{}' changed while its write lease was held",
+                checkpoint.run_id.as_str(),
+                agent.id
+            );
+        }
+
+        let worktree_repo = crate::git_repository::open(&current.path).with_context(|| {
             format!(
                 "failed to inspect checkpoint worktree '{}' at {}",
                 current.name,
                 current.path.display()
             )
         })?;
-        let worktree_head = head_oid(&worktree_repo)
-            .with_context(|| format!("failed to inspect HEAD for worktree '{}'", current.name))?;
-        if &worktree_head != repo_head {
-            bail!(
-                "checkpoint '{}' worktree '{}' is based on {}, but primary HEAD is {}; start a new run or restore the checkpoint base",
-                checkpoint.run_id.as_str(),
-                current.name,
-                worktree_head,
-                repo_head
-            );
-        }
-
-        let changed_paths = collect_status_paths(&worktree_repo).with_context(|| {
-            format!(
-                "failed to inspect changes for checkpoint worktree '{}'",
-                current.name
-            )
-        })?;
         match checkpoint_agent.status {
             AgentRunStatus::Pending => {
+                let worktree_head = head_oid(&worktree_repo).with_context(|| {
+                    format!("failed to inspect HEAD for worktree '{}'", current.name)
+                })?;
+                if &worktree_head != repo_head {
+                    bail!(
+                        "checkpoint '{}' pending worktree '{}' is at {}, but primary HEAD is {}; start a new run or restore the checkpoint base",
+                        checkpoint.run_id.as_str(),
+                        current.name,
+                        worktree_head,
+                        repo_head
+                    );
+                }
+                let changed_paths = collect_status_paths(&worktree_repo).with_context(|| {
+                    format!(
+                        "failed to inspect changes for checkpoint worktree '{}'",
+                        current.name
+                    )
+                })?;
                 if !changed_paths.is_empty() {
                     bail!(
                         "checkpoint '{}' marks agent '{}' as pending, but its worktree has changes; clean the worktree or start a new run",
@@ -980,6 +1928,19 @@ fn validate_resume_worktrees(
                 }
             }
             AgentRunStatus::Succeeded => {
+                ensure_worktree_descends_from_base(
+                    &worktree_repo,
+                    repo_head,
+                    checkpoint.run_id.as_str(),
+                    &current.name,
+                )?;
+                let changed_paths = collect_paths_changed_since_base(&worktree_repo, repo_head)
+                    .with_context(|| {
+                        format!(
+                            "failed to inspect changes for checkpoint worktree '{}'",
+                            current.name
+                        )
+                    })?;
                 if changed_paths != checkpoint_agent.changed_paths {
                     bail!(
                         "checkpoint '{}' changed paths for completed agent '{}' no longer match the worktree; start a new run or restore the checkpoint state",
@@ -1006,11 +1967,128 @@ fn validate_resume_worktrees(
                         agent.id
                     );
                 }
+                let state = capture_consistent_candidate_state(&current.path, repo_head, runtime)
+                    .with_context(|| {
+                        format!(
+                            "checkpoint '{}' completed agent '{}' candidate state could not be recaptured",
+                            checkpoint.run_id.as_str(),
+                            agent.id
+                        )
+                    })?;
+                if let Some(binding) = checkpoint_agent.candidate_binding.as_ref() {
+                    ensure_candidate_binding_matches_state(binding, &state).with_context(|| {
+                        format!(
+                            "checkpoint '{}' completed agent '{}' candidate binding drifted",
+                            checkpoint.run_id.as_str(),
+                            agent.id
+                        )
+                    })?;
+                } else {
+                    checkpoint_agent
+                        .command_completed_binding
+                        .as_ref()
+                        .with_context(|| {
+                            format!(
+                                "checkpoint '{}' completed agent '{}' is missing all exact state binding evidence",
+                                checkpoint.run_id.as_str(),
+                                agent.id
+                            )
+                        })?
+                        .verify_state(&state)
+                        .with_context(|| {
+                            format!(
+                                "checkpoint '{}' completed agent '{}' command state binding drifted",
+                                checkpoint.run_id.as_str(),
+                                agent.id
+                            )
+                        })?;
+                }
+                let before_patch_capture = manager
+                    .get_managed_verified(&recorded.name)
+                    .with_context(|| {
+                        format!(
+                            "checkpoint '{}' managed worktree binding for agent '{}' changed before exact candidate recapture",
+                            checkpoint.run_id.as_str(),
+                            agent.id
+                        )
+                    })?;
+                if &before_patch_capture != current {
+                    bail!(
+                        "checkpoint '{}' managed worktree record for agent '{}' drifted before exact candidate recapture",
+                        checkpoint.run_id.as_str(),
+                        agent.id
+                    );
+                }
+                if let Some(binding) = checkpoint_agent.candidate_binding.as_ref() {
+                    let captured = capture_bound_candidate(
+                        &current.path,
+                        repo_head,
+                        &state,
+                        runtime,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "checkpoint '{}' completed agent '{}' exact candidate could not be recaptured",
+                            checkpoint.run_id.as_str(),
+                            agent.id
+                        )
+                    })?;
+                    if &captured.binding != binding {
+                        bail!(
+                            "checkpoint '{}' completed agent '{}' exact candidate no longer matches its serialized binding",
+                            checkpoint.run_id.as_str(),
+                            agent.id
+                        );
+                    }
+                }
             }
             AgentRunStatus::Failed | AgentRunStatus::Skipped => {}
         }
+        let after_validation = manager
+            .get_managed_verified(&recorded.name)
+            .with_context(|| {
+                format!(
+                    "checkpoint '{}' managed worktree binding for agent '{}' changed during resume validation",
+                    checkpoint.run_id.as_str(),
+                    agent.id
+                )
+            })?;
+        if &after_validation != current {
+            bail!(
+                "checkpoint '{}' managed worktree record for agent '{}' drifted during resume validation",
+                checkpoint.run_id.as_str(),
+                agent.id
+            );
+        }
         summary.worktree = Some(current.clone());
         summary.worktree_reused = true;
+        selected.push(SelectedWorktree {
+            lease,
+            reused: true,
+        });
+    }
+
+    Ok(selected)
+}
+
+fn ensure_worktree_descends_from_base(
+    repo: &Repository,
+    base_oid: &Oid,
+    run_id: &str,
+    worktree_name: &str,
+) -> Result<()> {
+    let worktree_head = head_oid(repo)
+        .with_context(|| format!("failed to inspect HEAD for worktree '{worktree_name}'"))?;
+    let merge_base = repo.merge_base(*base_oid, worktree_head).with_context(|| {
+        format!("failed to verify base commit {base_oid} for checkpoint worktree '{worktree_name}'")
+    })?;
+    if merge_base != *base_oid {
+        bail!(
+            "checkpoint '{}' worktree '{}' does not descend from primary HEAD {}; start a new run or restore the checkpoint base",
+            run_id,
+            worktree_name,
+            base_oid
+        );
     }
 
     Ok(())
@@ -1020,30 +2098,39 @@ fn acquire_resume_claims(
     store: &SyncStore,
     plan: &OrchestrationPlan,
     summaries: &mut [AgentRunSummary],
-) -> Result<Vec<ClaimToken>> {
+) -> Vec<ClaimToken> {
     let mut tokens = Vec::new();
 
     for (agent, summary) in plan.agents.iter().zip(summaries.iter_mut()) {
-        if let Some(active_claim) = find_active_resume_claim(store, agent, summary.claim.as_ref())?
-        {
-            summary.claim = Some(active_claim.clone());
-            tokens.push(active_claim.token);
-            continue;
-        }
-
-        let claim = store
-            .claim_paths(&agent.id, agent.paths.iter())
-            .with_context(|| {
+        match find_active_resume_claim(store, agent, summary.claim.as_ref()) {
+            Ok(Some(active_claim)) => {
+                summary.claim = Some(active_claim.clone());
+                tokens.push(active_claim.token);
+            }
+            Ok(None) => match store.claim_paths(&agent.id, agent.paths.iter()) {
+                Ok(claim) => {
+                    tokens.push(claim.token);
+                    summary.claim = Some(claim);
+                }
+                Err(error) => fail_summary(
+                    summary,
+                    format!(
+                        "failed to acquire resume claim for agent '{}' on checkpoint paths: {error}",
+                        agent.id
+                    ),
+                ),
+            },
+            Err(error) => fail_summary(
+                summary,
                 format!(
-                    "failed to acquire resume claim for agent '{}' on checkpoint paths",
+                    "failed to validate resume claim for agent '{}' on checkpoint paths: {error}",
                     agent.id
-                )
-            })?;
-        tokens.push(claim.token);
-        summary.claim = Some(claim);
+                ),
+            ),
+        }
     }
 
-    Ok(tokens)
+    tokens
 }
 
 fn find_active_resume_claim(
@@ -1090,16 +2177,121 @@ fn paths_match(left: &[PathBuf], right: &[PathBuf]) -> bool {
     left.iter().collect::<BTreeSet<_>>() == right.iter().collect::<BTreeSet<_>>()
 }
 
+fn active_checkpoint_semantic_tokens(
+    store: &SemanticIntentStore,
+    summaries: &mut [AgentRunSummary],
+) -> Result<(Vec<SemanticIntentToken>, bool)> {
+    let active_intents = store.snapshot()?;
+    let active_keys = active_intents
+        .iter()
+        .map(|intent| (intent.token, intent.agent_id.clone()))
+        .collect::<BTreeSet<_>>();
+    let tokens = summaries
+        .iter()
+        .filter_map(|summary| summary.semantic_intent.as_ref())
+        .filter(|intent| active_keys.contains(&(intent.token, intent.agent_id.clone())))
+        .map(|intent| intent.token)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut coordination_needed = false;
+    for summary in summaries {
+        if summary.status != AgentRunStatus::Pending {
+            continue;
+        }
+        let active = summary
+            .semantic_intent
+            .as_ref()
+            .is_some_and(|intent| active_keys.contains(&(intent.token, intent.agent_id.clone())));
+        if !active {
+            summary.semantic_intent = None;
+            summary.semantic_conflicts.clear();
+            coordination_needed = true;
+        }
+    }
+    Ok((tokens, coordination_needed))
+}
+
+fn coordinate_semantic_intents(
+    store: &SemanticIntentStore,
+    plan: &OrchestrationPlan,
+    summaries: &mut [AgentRunSummary],
+    mode: SemanticCoordinationMode,
+    acquired_tokens: &mut Vec<SemanticIntentToken>,
+) {
+    let mut planned_preview_intents = Vec::new();
+    for (index, agent) in plan.agents.iter().enumerate() {
+        if summaries[index].status != AgentRunStatus::Pending
+            || summaries[index].semantic_intent.is_some()
+        {
+            continue;
+        }
+        let request = semantic_request_for_agent(agent);
+        let report = match mode {
+            SemanticCoordinationMode::Off => return,
+            SemanticCoordinationMode::Warn => {
+                store.preview_with_additional_active(request, &planned_preview_intents)
+            }
+            SemanticCoordinationMode::Block => store.claim(request),
+        };
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => {
+                fail_summary(
+                    &mut summaries[index],
+                    format!("semantic coordination failed: {error}"),
+                );
+                continue;
+            }
+        };
+        attach_semantic_report(&mut summaries[index], &report);
+        if mode == SemanticCoordinationMode::Warn {
+            planned_preview_intents.push(report.intent.clone());
+        } else if report.persisted {
+            acquired_tokens.push(report.intent.token);
+        }
+        if mode == SemanticCoordinationMode::Block && report.has_blocking_conflicts {
+            fail_summary(
+                &mut summaries[index],
+                format!(
+                    "semantic coordination blocked intent with {} blocking conflict(s)",
+                    report.blocking_conflict_count
+                ),
+            );
+        }
+    }
+}
+
+fn semantic_request_for_agent(agent: &AgentPlan) -> SemanticIntentRequest {
+    SemanticIntentRequest {
+        agent_id: agent.id.clone(),
+        paths: agent.paths.clone(),
+        symbols: agent.semantic_symbols.clone(),
+        modules: agent.semantic_modules.clone(),
+        task_file: None,
+        notes: Vec::new(),
+    }
+}
+
+fn attach_semantic_report(summary: &mut AgentRunSummary, report: &SemanticCoordinationReport) {
+    summary.semantic_intent = Some(report.intent.clone());
+    summary.semantic_conflicts = report.conflicts.clone();
+}
+
 struct SummaryParts {
     run_id: RunId,
     repo: PathBuf,
     plan_file: PathBuf,
     keep_claims: bool,
     worktree_reuse_policy: WorktreeReusePolicy,
+    semantic_coordination: SemanticCoordinationMode,
     summaries: Vec<AgentRunSummary>,
     repo_validation: Vec<ValidationRunSummary>,
+    repo_validation_target: Option<RepoValidationTargetBinding>,
     released_claims: Vec<PathClaim>,
     release_errors: Vec<String>,
+    released_semantic_intents: Vec<SemanticIntent>,
+    semantic_release_errors: Vec<String>,
 }
 
 fn summary_from_parts(parts: SummaryParts) -> OrchestrationSummary {
@@ -1109,12 +2301,18 @@ fn summary_from_parts(parts: SummaryParts) -> OrchestrationSummary {
         plan_file,
         keep_claims,
         worktree_reuse_policy,
+        semantic_coordination,
         summaries,
         repo_validation,
+        repo_validation_target,
         released_claims,
         release_errors,
+        released_semantic_intents,
+        semantic_release_errors,
     } = parts;
     let success = release_errors.is_empty()
+        && semantic_release_errors.is_empty()
+        && repo_validation_target.is_some()
         && summaries
             .iter()
             .all(|summary| summary.status == AgentRunStatus::Succeeded)
@@ -1128,17 +2326,27 @@ fn summary_from_parts(parts: SummaryParts) -> OrchestrationSummary {
         plan_file,
         keep_claims,
         worktree_reuse_policy,
+        semantic_coordination,
         success,
         agents: summaries,
         repo_validation,
+        repo_validation_target,
         released_claims,
         release_errors,
+        released_semantic_intents,
+        semantic_release_errors,
     }
 }
 
 fn validate_plan(raw: RawPlan) -> Result<OrchestrationPlan> {
     if raw.agents.is_empty() {
         bail!("orchestration plan must include at least one agent");
+    }
+    if raw.agents.len() > COMBINED_CANDIDATE_MAX_PATCHES {
+        bail!(
+            "orchestration plan exceeds the configured {} agent limit",
+            COMBINED_CANDIDATE_MAX_PATCHES
+        );
     }
     if matches!(raw.default_timeout_seconds, Some(0)) {
         bail!("default timeout must be greater than zero seconds");
@@ -1213,6 +2421,8 @@ fn validate_plan(raw: RawPlan) -> Result<OrchestrationPlan> {
         agents.push(AgentPlan {
             id,
             paths,
+            semantic_symbols: normalize_semantic_items(raw_agent.semantic_symbols),
+            semantic_modules: normalize_semantic_items(raw_agent.semantic_modules),
             env: raw_agent.env,
             timeout,
             command,
@@ -1223,6 +2433,31 @@ fn validate_plan(raw: RawPlan) -> Result<OrchestrationPlan> {
     }
 
     validate_dependencies(&agents, &seen_agents)?;
+    let dependency_edges = agents.iter().try_fold(0_usize, |total, agent| {
+        total
+            .checked_add(agent.depends_on.len())
+            .context("orchestration dependency edge count overflowed")
+    })?;
+    if dependency_edges > PLAN_MAX_DEPENDENCY_EDGES {
+        bail!(
+            "orchestration plan exceeds the configured {} dependency-edge limit",
+            PLAN_MAX_DEPENDENCY_EDGES
+        );
+    }
+    let total_validation_commands =
+        agents
+            .iter()
+            .try_fold(repo_validation_commands.len(), |total, agent| {
+                total
+                    .checked_add(agent.validation_commands.len())
+                    .context("orchestration validation command count overflowed")
+            })?;
+    if total_validation_commands > PLAN_MAX_TOTAL_VALIDATION_COMMANDS {
+        bail!(
+            "orchestration plan exceeds the configured {} total validation-command limit",
+            PLAN_MAX_TOTAL_VALIDATION_COMMANDS
+        );
+    }
 
     Ok(OrchestrationPlan {
         agents,
@@ -1236,6 +2471,12 @@ fn normalize_validation_commands(
     default_timeout_seconds: Option<u64>,
     context_label: &str,
 ) -> Result<Vec<ValidationCommandPlan>> {
+    if raw_commands.len() > PLAN_MAX_VALIDATION_COMMANDS_PER_SCOPE {
+        bail!(
+            "{context_label} exceeds the configured {} command limit",
+            PLAN_MAX_VALIDATION_COMMANDS_PER_SCOPE
+        );
+    }
     raw_commands
         .into_iter()
         .enumerate()
@@ -1297,8 +2538,11 @@ fn validate_optional_name(name: Option<&str>) -> Result<()> {
 }
 
 fn validate_timeout_seconds(seconds: u64) -> Result<u64> {
-    if seconds == 0 {
-        bail!("timeout must be greater than zero seconds");
+    if seconds == 0 || seconds > PLAN_MAX_TIMEOUT_SECONDS {
+        bail!(
+            "timeout must be between 1 and {} seconds",
+            PLAN_MAX_TIMEOUT_SECONDS
+        );
     }
 
     Ok(seconds)
@@ -1401,6 +2645,16 @@ fn normalize_plan_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     Ok(collapse_covered_paths(paths))
 }
 
+fn normalize_semantic_items(items: Vec<String>) -> Vec<String> {
+    items
+        .into_iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn collapse_covered_paths(paths: BTreeSet<PathBuf>) -> Vec<PathBuf> {
     let mut collapsed: Vec<PathBuf> = Vec::new();
     for path in paths {
@@ -1424,10 +2678,20 @@ struct PlanPathOwner {
     path: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct SelectedWorktree {
-    record: WorktreeRecord,
+    lease: ManagedWorktreeWriteLease,
     reused: bool,
+}
+
+impl SelectedWorktree {
+    fn record(&self) -> &WorktreeRecord {
+        self.lease.record()
+    }
+
+    fn path(&self) -> &Path {
+        self.lease.path()
+    }
 }
 
 fn select_worktrees(
@@ -1445,25 +2709,33 @@ fn select_worktrees(
     let mut selected = Vec::with_capacity(plan.agents.len());
 
     for agent in &plan.agents {
-        if let Some(record) = existing.remove(&agent.id) {
+        if let Some(discovered) = existing.remove(&agent.id) {
             if policy == WorktreeReusePolicy::Fresh {
                 bail!(
                     "worktree reuse policy 'fresh' requires no existing worktree for agent '{}' at {}",
                     agent.id,
-                    record.path.display()
+                    discovered.path.display()
                 );
             }
+            let lease = manager
+                .acquire_write_execution_lease(&agent.id)
+                .with_context(|| {
+                    format!(
+                        "failed to acquire exclusive execution lease for worktree '{}'",
+                        agent.id
+                    )
+                })?;
             match policy {
                 WorktreeReusePolicy::Reset => {
-                    reset_reusable_worktree(store, agent, &record, primary_head)?;
+                    reset_reusable_worktree(store, agent, lease.record(), primary_head)?;
                 }
                 WorktreeReusePolicy::Clean | WorktreeReusePolicy::Required => {
-                    ensure_reusable_worktree(&record, primary_head)?;
+                    ensure_reusable_worktree(lease.record(), primary_head)?;
                 }
                 WorktreeReusePolicy::Fresh => {}
             }
             selected.push(SelectedWorktree {
-                record,
+                lease,
                 reused: true,
             });
             continue;
@@ -1475,14 +2747,32 @@ fn select_worktrees(
             );
         }
 
-        let record = manager.create(WorktreeCreateOptions {
+        let create_options = WorktreeCreateOptions {
             agent_id: agent.id.clone(),
             branch: None,
             base: None,
             worktree_root: None,
+        };
+        #[cfg(test)]
+        manager.create_for_test(create_options)?;
+        #[cfg(not(test))]
+        manager.create(create_options)?;
+        let lease = manager
+            .acquire_write_execution_lease(&agent.id)
+            .with_context(|| {
+                format!(
+                    "failed to acquire exclusive execution lease for newly created worktree '{}'",
+                    agent.id
+                )
+            })?;
+        ensure_reusable_worktree(lease.record(), primary_head).with_context(|| {
+            format!(
+                "newly created worktree '{}' changed before its execution lease was acquired",
+                agent.id
+            )
         })?;
         selected.push(SelectedWorktree {
-            record,
+            lease,
             reused: false,
         });
     }
@@ -1491,7 +2781,7 @@ fn select_worktrees(
 }
 
 fn ensure_reusable_worktree(record: &WorktreeRecord, primary_head: &Oid) -> Result<()> {
-    let repo = Repository::open(&record.path).with_context(|| {
+    let repo = crate::git_repository::open(&record.path).with_context(|| {
         format!(
             "failed to inspect existing worktree '{}' at {}",
             record.name,
@@ -1529,7 +2819,7 @@ fn reset_reusable_worktree(
     primary_head: &Oid,
 ) -> Result<()> {
     ensure_no_active_reset_claims(store, agent)?;
-    let repo = Repository::open(&record.path).with_context(|| {
+    let repo = crate::git_repository::open(&record.path).with_context(|| {
         format!(
             "failed to inspect existing worktree '{}' at {}",
             record.name,
@@ -1595,1989 +2885,633 @@ fn ensure_no_active_reset_claims(store: &SyncStore, agent: &AgentPlan) -> Result
     Ok(())
 }
 
-fn run_agent_schedule(
-    plan: &OrchestrationPlan,
-    summaries: &mut [AgentRunSummary],
-    jobs: usize,
+fn prepare_patch_outputs(
     patch_dir: Option<&Path>,
+    plan: &OrchestrationPlan,
+    summaries: &[AgentRunSummary],
+    worktrees: &[SelectedWorktree],
+) -> Result<Vec<Option<ReservedOutputFile>>> {
+    let mut outputs = (0..summaries.len()).map(|_| None).collect::<Vec<_>>();
+    let Some(patch_dir) = patch_dir else {
+        return Ok(outputs);
+    };
+    let root = SecureOutputRoot::open_or_create(patch_dir)?;
+    for worktree in worktrees {
+        root.reject_inside(worktree.path())?;
+    }
+    for (index, (agent, summary)) in plan.agents.iter().zip(summaries).enumerate() {
+        if summary.status != AgentRunStatus::Pending {
+            continue;
+        }
+        match root.reserve(OsString::from(format!("{}.patch", agent.id)).as_os_str()) {
+            Ok(output) => outputs[index] = Some(output),
+            Err(error) => {
+                let cleanup = cleanup_unused_patch_outputs(outputs);
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(error.context(format!(
+                        "also failed to clean partially reserved patch outputs: {cleanup:#}"
+                    ))),
+                };
+            }
+        }
+    }
+    Ok(outputs)
+}
+
+fn cleanup_unused_patch_outputs(outputs: Vec<Option<ReservedOutputFile>>) -> Result<()> {
+    let mut errors = Vec::new();
+    for output in outputs.into_iter().flatten() {
+        let path = output.path().to_path_buf();
+        if let Err(error) = output.remove() {
+            errors.push(format!(
+                "failed to clean unused patch {}: {error:#}",
+                path.display()
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", errors.join("; "))
+    }
+}
+
+#[derive(Debug)]
+struct PatchOutputGuard {
+    output: Option<ReservedOutputFile>,
+}
+
+impl PatchOutputGuard {
+    fn new(output: ReservedOutputFile) -> Self {
+        Self {
+            output: Some(output),
+        }
+    }
+
+    fn take(&mut self) -> Option<ReservedOutputFile> {
+        self.output.take()
+    }
+}
+
+impl Drop for PatchOutputGuard {
+    fn drop(&mut self) {
+        if let Some(output) = self.output.take() {
+            let _ = output.remove();
+        }
+    }
+}
+
+struct AgentScheduleContext<'a> {
+    manager: &'a WorktreeManager,
+    plan: &'a OrchestrationPlan,
+    worktrees: &'a [SelectedWorktree],
+    jobs: usize,
+    base_oid: &'a Oid,
+    runtime: OrchestrationExecutionRuntime,
+}
+
+fn run_agent_schedule_with_patch_dir(
+    context: &AgentScheduleContext<'_>,
+    summaries: &mut [AgentRunSummary],
+    patch_dir: Option<&Path>,
+    checkpoint_writer: Option<&mut RunCheckpointWriter>,
+) -> Result<Vec<Option<CapturedCandidate>>> {
+    let mut patch_outputs =
+        prepare_patch_outputs(patch_dir, context.plan, summaries, context.worktrees)?;
+    let mut captured_candidates = vec![None; summaries.len()];
+    let schedule_result = run_agent_schedule(
+        context,
+        summaries,
+        &mut patch_outputs,
+        &mut captured_candidates,
+        checkpoint_writer,
+    );
+    let cleanup_result = cleanup_unused_patch_outputs(patch_outputs);
+    match (schedule_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(captured_candidates),
+        (Err(schedule), Ok(())) => Err(schedule),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(schedule), Err(cleanup)) => Err(schedule.context(format!(
+            "also failed to clean unused patch reservations: {cleanup:#}"
+        ))),
+    }
+}
+
+fn run_agent_schedule(
+    context: &AgentScheduleContext<'_>,
+    summaries: &mut [AgentRunSummary],
+    patch_outputs: &mut [Option<ReservedOutputFile>],
+    captured_candidates: &mut [Option<CapturedCandidate>],
+    mut checkpoint_writer: Option<&mut RunCheckpointWriter>,
 ) -> Result<()> {
-    let jobs = jobs.max(1);
+    if context.worktrees.len() != summaries.len()
+        || context.worktrees.len() != context.plan.agents.len()
+        || captured_candidates.len() != summaries.len()
+    {
+        bail!("selected worktree lease set does not match the orchestration plan");
+    }
+    for (index, worktree) in context.worktrees.iter().enumerate() {
+        if worktree.record().name != context.plan.agents[index].id
+            || summaries[index].worktree.as_ref() != Some(worktree.record())
+        {
+            bail!(
+                "selected worktree lease for agent '{}' does not match its run summary",
+                context.plan.agents[index].id
+            );
+        }
+    }
+    let jobs = context.jobs.max(1);
     let mut remaining = summaries
         .iter()
         .enumerate()
         .filter(|(_, summary)| summary.status == AgentRunStatus::Pending)
         .map(|(index, _)| index)
         .collect::<BTreeSet<_>>();
-    let mut succeeded = summaries
-        .iter()
-        .filter(|summary| summary.status == AgentRunStatus::Succeeded)
-        .map(|summary| summary.id.clone())
-        .collect::<BTreeSet<_>>();
 
-    if let Some(failed_id) = summaries
-        .iter()
-        .find(|summary| summary.status == AgentRunStatus::Failed)
-        .map(|summary| summary.id.clone())
-    {
-        for index in remaining {
-            summaries[index].status = AgentRunStatus::Skipped;
-            summaries[index].error = Some(format!("skipped because agent '{}' failed", failed_id));
+    for index in 0..summaries.len() {
+        if summaries[index].status != AgentRunStatus::Succeeded {
+            continue;
         }
-        return Ok(());
+        let expected = capture_selected_candidate_state(
+            context.manager,
+            &context.plan.agents[index],
+            &summaries[index],
+            &context.worktrees[index],
+            context.base_oid,
+            context.runtime,
+        )
+        .with_context(|| {
+            format!(
+                "failed to recapture completed candidate for agent '{}'",
+                summaries[index].id
+            )
+        })?;
+        let candidate_binding = summaries[index].candidate_binding.clone();
+        let completed_binding = summaries[index].command_completed_binding.clone();
+        match (&candidate_binding, &completed_binding) {
+            (Some(binding), _) => ensure_candidate_binding_matches_state(binding, &expected)?,
+            (None, Some(binding)) => binding.verify_state(&expected)?,
+            (None, None) => bail!(
+                "completed agent '{}' is missing exact command or candidate state binding evidence",
+                summaries[index].id
+            ),
+        }
+        if let Some(writer) = checkpoint_writer.as_deref_mut() {
+            writer.agent_event(
+                PHASE_VALIDATION_STARTED,
+                &summaries[index].id,
+                &AgentCheckpoint::from(&summaries[index]),
+            )?;
+        }
+        let state_intact = run_agent_validation_commands(
+            &context.plan.agents[index],
+            &mut summaries[index],
+            &context.worktrees[index],
+            context.manager,
+            &expected,
+            context.base_oid,
+            context.runtime,
+        );
+        if let Some(writer) = checkpoint_writer.as_deref_mut() {
+            writer.agent_event(
+                PHASE_VALIDATED,
+                &summaries[index].id,
+                &AgentCheckpoint::from(&summaries[index]),
+            )?;
+        }
+        if !state_intact || summaries[index].status != AgentRunStatus::Succeeded {
+            bail!(
+                "completed agent '{}' failed mandatory resume validation; start a new run after resolving the validation failure",
+                summaries[index].id
+            );
+        }
+        let captured = capture_selected_bound_candidate(
+            context.manager,
+            &context.plan.agents[index],
+            &summaries[index],
+            &context.worktrees[index],
+            context.base_oid,
+            &expected,
+            context.runtime,
+        )?;
+        if let Some(binding) = candidate_binding.as_ref() {
+            if &captured.binding != binding {
+                bail!(
+                    "completed agent '{}' candidate patch no longer matches its checkpoint binding",
+                    summaries[index].id
+                );
+            }
+        }
+        summaries[index].changed_paths = captured.binding.changed_paths.clone();
+        summaries[index].unclaimed_changed_paths = summaries[index]
+            .changed_paths
+            .iter()
+            .filter(|path| {
+                !context.plan.agents[index]
+                    .paths
+                    .iter()
+                    .any(|claim| path_is_covered_by_claim(path, claim))
+            })
+            .cloned()
+            .collect();
+        if !summaries[index].unclaimed_changed_paths.is_empty() {
+            bail!(
+                "completed agent '{}' exact recovery contains unclaimed paths",
+                summaries[index].id
+            );
+        }
+        summaries[index].candidate_binding = Some(captured.binding.clone());
+        if let Some(writer) = checkpoint_writer.as_deref_mut() {
+            writer.agent_event(
+                PHASE_CANDIDATE_CAPTURED,
+                &summaries[index].id,
+                &AgentCheckpoint::from(&summaries[index]),
+            )?;
+        }
+        captured_candidates[index] = Some(captured);
     }
 
     while !remaining.is_empty() {
-        let ready = remaining
-            .iter()
-            .copied()
-            .filter(|index| {
-                plan.agents[*index]
-                    .depends_on
-                    .iter()
-                    .all(|dependency| succeeded.contains(dependency))
-            })
-            .take(jobs)
-            .collect::<Vec<_>>();
+        propagate_dependency_failures(context.plan, summaries, &mut remaining);
+        if remaining.is_empty() {
+            break;
+        }
+
+        let ready = ready_agent_indices(context.plan, summaries, &remaining, jobs);
 
         if ready.is_empty() {
-            for index in remaining {
+            for index in std::mem::take(&mut remaining) {
+                let unresolved = dependency_statuses(context.plan, summaries, index)
+                    .into_iter()
+                    .filter(|(_, status)| *status != AgentRunStatus::Succeeded)
+                    .map(|(dependency, status)| {
+                        format!("'{dependency}' ({})", agent_status_label(status))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 summaries[index].status = AgentRunStatus::Skipped;
-                summaries[index].error =
-                    Some("skipped because dependencies could not be satisfied".to_string());
+                summaries[index].error = Some(format!(
+                    "skipped because the scheduler could not resolve dependencies: {unresolved}"
+                ));
             }
             break;
         }
 
-        let outcomes = run_ready_agents(plan, summaries, &ready)?;
-        let mut failed_agent = None;
+        for index in &ready {
+            verify_selected_worktree_binding(
+                context.manager,
+                &context.plan.agents[*index],
+                &summaries[*index],
+                &context.worktrees[*index],
+            )?;
+            if let Some(writer) = checkpoint_writer.as_deref_mut() {
+                writer.agent_event(
+                    PHASE_COMMAND_STARTED,
+                    &summaries[*index].id,
+                    &AgentCheckpoint::from(&summaries[*index]),
+                )?;
+            }
+        }
+        let outcomes = run_ready_agents(
+            context.manager,
+            context.plan,
+            summaries,
+            context.worktrees,
+            &ready,
+            context.runtime,
+        )?;
 
         for (index, run_result) in outcomes {
             apply_command_result(&mut summaries[index], run_result);
-            if summaries[index].status == AgentRunStatus::Succeeded {
-                run_agent_validation_commands(&plan.agents[index], &mut summaries[index]);
-            }
-            inspect_agent_changes(&plan.agents[index], &mut summaries[index], patch_dir);
-            remaining.remove(&index);
-
-            if summaries[index].status == AgentRunStatus::Succeeded {
-                succeeded.insert(summaries[index].id.clone());
-            } else if failed_agent.is_none() {
-                failed_agent = Some(summaries[index].id.clone());
-            }
-        }
-
-        if let Some(failed_agent) = failed_agent {
-            for index in remaining {
-                summaries[index].status = AgentRunStatus::Skipped;
-                summaries[index].error =
-                    Some(format!("skipped because agent '{failed_agent}' failed"));
-            }
-            break;
-        }
-    }
-
-    Ok(())
-}
-
-fn run_ready_agents(
-    plan: &OrchestrationPlan,
-    summaries: &[AgentRunSummary],
-    ready: &[usize],
-) -> Result<Vec<(usize, std::io::Result<CommandRunResult>)>> {
-    if ready.len() == 1 {
-        let index = ready[0];
-        let spec = command_spec(&plan.agents[index], &summaries[index])?;
-        return Ok(vec![(index, run_agent_command(spec))]);
-    }
-
-    let mut handles = Vec::with_capacity(ready.len());
-    for index in ready {
-        let spec = command_spec(&plan.agents[*index], &summaries[*index])?;
-        let index = *index;
-        handles.push((
-            index,
-            thread::spawn(move || (index, run_agent_command(spec))),
-        ));
-    }
-
-    let mut outcomes = Vec::with_capacity(handles.len());
-    for (index, handle) in handles {
-        let outcome = handle.join().unwrap_or_else(|_| {
-            (
-                index,
-                Ok(CommandRunResult {
-                    status: None,
-                    duration_ms: 0,
-                    timed_out: false,
-                    stdout: OutputSummary::default(),
-                    stderr: OutputSummary::default(),
-                    process_error: Some("agent command runner panicked".to_string()),
-                }),
-            )
-        });
-        outcomes.push(outcome);
-    }
-
-    outcomes.sort_by_key(|(index, _)| *index);
-    Ok(outcomes)
-}
-
-fn inspect_agent_changes(
-    agent: &AgentPlan,
-    summary: &mut AgentRunSummary,
-    patch_dir: Option<&Path>,
-) {
-    let Some(worktree) = summary.worktree.as_ref() else {
-        fail_summary(summary, "agent has no selected worktree");
-        return;
-    };
-    let worktree_path = worktree.path.clone();
-
-    let repo = match Repository::open(&worktree_path) {
-        Ok(repo) => repo,
-        Err(error) => {
-            fail_summary(
-                summary,
-                format!(
-                    "failed to inspect worktree changes at {}: {error}",
-                    worktree_path.display()
-                ),
+            let expected_state = capture_selected_candidate_state(
+                context.manager,
+                &context.plan.agents[index],
+                &summaries[index],
+                &context.worktrees[index],
+                context.base_oid,
+                context.runtime,
             );
-            return;
+            let expected_state = match expected_state {
+                Ok(state) => {
+                    summaries[index].changed_paths = state.changed_paths.clone();
+                    summaries[index].unclaimed_changed_paths = state
+                        .changed_paths
+                        .iter()
+                        .filter(|path| {
+                            !context.plan.agents[index]
+                                .paths
+                                .iter()
+                                .any(|claim| path_is_covered_by_claim(path, claim))
+                        })
+                        .cloned()
+                        .collect();
+                    summaries[index].command_completed_binding =
+                        Some(CompletedCommandStateBinding::from_state(&state)?);
+                    if let Some(writer) = checkpoint_writer.as_deref_mut() {
+                        writer.agent_event(
+                            PHASE_COMMAND_COMPLETED,
+                            &summaries[index].id,
+                            &AgentCheckpoint::from(&summaries[index]),
+                        )?;
+                    }
+                    Some(state)
+                }
+                Err(error) => {
+                    #[cfg(test)]
+                    notify_candidate_boundary_failure(&context.plan.agents[index].id);
+                    fail_summary(
+                        &mut summaries[index],
+                        format!("failed to bind candidate before validation: {error}"),
+                    );
+                    None
+                }
+            };
+            let mut state_intact = expected_state.is_some();
+            if summaries[index].status == AgentRunStatus::Succeeded {
+                if let Some(expected_state) = expected_state.as_ref() {
+                    if let Some(writer) = checkpoint_writer.as_deref_mut() {
+                        writer.agent_event(
+                            PHASE_VALIDATION_STARTED,
+                            &summaries[index].id,
+                            &AgentCheckpoint::from(&summaries[index]),
+                        )?;
+                    }
+                    state_intact = run_agent_validation_commands(
+                        &context.plan.agents[index],
+                        &mut summaries[index],
+                        &context.worktrees[index],
+                        context.manager,
+                        expected_state,
+                        context.base_oid,
+                        context.runtime,
+                    );
+                    if let Some(writer) = checkpoint_writer.as_deref_mut() {
+                        writer.agent_event(
+                            PHASE_VALIDATED,
+                            &summaries[index].id,
+                            &AgentCheckpoint::from(&summaries[index]),
+                        )?;
+                    }
+                }
+            }
+            let patch_output = patch_outputs[index].take();
+            let captured = if state_intact {
+                expected_state.as_ref().and_then(|expected_state| {
+                    match capture_selected_bound_candidate(
+                        context.manager,
+                        &context.plan.agents[index],
+                        &summaries[index],
+                        &context.worktrees[index],
+                        context.base_oid,
+                        expected_state,
+                        context.runtime,
+                    ) {
+                        Ok(captured) => Some(captured),
+                        Err(error) => {
+                            fail_summary(
+                                &mut summaries[index],
+                                format!("failed to finalize bound candidate: {error}"),
+                            );
+                            None
+                        }
+                    }
+                })
+            } else {
+                None
+            };
+            if let Some(captured) = captured {
+                summaries[index].candidate_binding = Some(captured.binding.clone());
+                inspect_captured_agent_changes(
+                    &context.plan.agents[index],
+                    &mut summaries[index],
+                    &captured,
+                    patch_output,
+                );
+                if let Some(writer) = checkpoint_writer.as_deref_mut() {
+                    writer.agent_event(
+                        PHASE_CANDIDATE_CAPTURED,
+                        &summaries[index].id,
+                        &AgentCheckpoint::from(&summaries[index]),
+                    )?;
+                }
+                if summaries[index].status == AgentRunStatus::Succeeded {
+                    captured_candidates[index] = Some(captured);
+                }
+            } else {
+                inspect_agent_paths_without_patch(
+                    &context.plan.agents[index],
+                    &mut summaries[index],
+                    context.manager,
+                    &context.worktrees[index],
+                    context.base_oid,
+                    patch_output,
+                );
+            }
+            remaining.remove(&index);
         }
-    };
-
-    let changed_paths = match collect_status_paths(&repo) {
-        Ok(paths) => paths,
-        Err(error) => {
-            fail_summary(summary, format!("failed to collect changed paths: {error}"));
-            return;
-        }
-    };
-    let unclaimed_changed_paths = changed_paths
-        .iter()
-        .filter(|path| {
-            !agent
-                .paths
-                .iter()
-                .any(|claim| path_is_covered_by_claim(path, claim))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-
-    summary.changed_paths = changed_paths;
-    summary.unclaimed_changed_paths = unclaimed_changed_paths;
-
-    if !summary.unclaimed_changed_paths.is_empty() {
-        let paths = summary
-            .unclaimed_changed_paths
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        fail_summary(
-            summary,
-            format!("agent changed paths outside its claims: {paths}"),
-        );
-    }
-
-    if let Some(patch_dir) = patch_dir {
-        match write_agent_patch(&worktree_path, &agent.id, patch_dir) {
-            Ok(Some(path)) => summary.patch_path = Some(path),
-            Ok(None) => {}
-            Err(error) => fail_summary(summary, format!("failed to write patch: {error}")),
-        }
-    }
-}
-
-fn fail_summary(summary: &mut AgentRunSummary, message: impl Into<String>) {
-    summary.status = AgentRunStatus::Failed;
-    let message = message.into();
-    summary.error = match summary.error.take() {
-        Some(existing) => Some(format!("{existing}; {message}")),
-        None => Some(message),
-    };
-}
-
-fn collect_status_paths(repo: &Repository) -> Result<Vec<PathBuf>> {
-    let mut options = git2::StatusOptions::new();
-    options
-        .include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .renames_head_to_index(true)
-        .renames_index_to_workdir(true);
-    let statuses = repo
-        .statuses(Some(&mut options))
-        .context("failed to inspect git status")?;
-    let mut paths = BTreeSet::new();
-    for entry in statuses.iter() {
-        let path = entry.path().context("git status path is not valid UTF-8")?;
-        paths.insert(PathBuf::from(path));
-    }
-    let mut paths = paths.into_iter().collect::<Vec<_>>();
-    paths.sort();
-    Ok(paths)
-}
-
-fn path_is_covered_by_claim(path: &Path, claim: &Path) -> bool {
-    path == claim || path.starts_with(claim)
-}
-
-fn write_agent_patch(
-    worktree_path: &Path,
-    agent_id: &str,
-    patch_dir: &Path,
-) -> Result<Option<PathBuf>> {
-    fs::create_dir_all(patch_dir)
-        .with_context(|| format!("failed to create patch directory {}", patch_dir.display()))?;
-    mark_untracked_intent_to_add(worktree_path)?;
-
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .arg("diff")
-        .arg("--binary")
-        .arg("HEAD")
-        .output()
-        .with_context(|| format!("failed to run git diff in {}", worktree_path.display()))?;
-    if !output.status.success() {
-        bail!(
-            "git diff failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    if output.stdout.is_empty() {
-        return Ok(None);
-    }
-
-    let patch_path = patch_dir.join(format!("{agent_id}.patch"));
-    fs::write(&patch_path, output.stdout)
-        .with_context(|| format!("failed to write patch {}", patch_path.display()))?;
-    Ok(Some(patch_path))
-}
-
-fn mark_untracked_intent_to_add(worktree_path: &Path) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .arg("ls-files")
-        .arg("--others")
-        .arg("--exclude-standard")
-        .arg("-z")
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to list untracked files in {}",
-                worktree_path.display()
-            )
-        })?;
-    if !output.status.success() {
-        bail!(
-            "git ls-files failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let paths = output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .collect::<Vec<_>>();
-    if paths.is_empty() {
-        return Ok(());
-    }
-
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(worktree_path)
-        .arg("add")
-        .arg("-N")
-        .arg("--");
-    for path in paths {
-        command.arg(String::from_utf8_lossy(path).as_ref());
-    }
-
-    let output = command.output().with_context(|| {
-        format!(
-            "failed to mark untracked files in {}",
-            worktree_path.display()
-        )
-    })?;
-    if !output.status.success() {
-        bail!(
-            "git add -N failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
     }
 
     Ok(())
 }
 
-fn command_spec(agent: &AgentPlan, summary: &AgentRunSummary) -> Result<CommandRunSpec> {
-    let worktree = summary
+fn verify_selected_worktree_binding(
+    manager: &WorktreeManager,
+    agent: &AgentPlan,
+    summary: &AgentRunSummary,
+    worktree: &SelectedWorktree,
+) -> Result<()> {
+    let recorded = summary
         .worktree
         .as_ref()
-        .with_context(|| format!("agent '{}' has no selected worktree", summary.id))?;
-    let working_directory = agent
-        .working_directory
-        .as_ref()
-        .map(|path| worktree.path.join(path))
-        .unwrap_or_else(|| worktree.path.clone());
-
-    Ok(CommandRunSpec {
-        command: agent.command.clone(),
-        working_directory,
-        env: agent.env.clone(),
-        timeout: agent.timeout,
-    })
-}
-
-fn run_agent_validation_commands(agent: &AgentPlan, summary: &mut AgentRunSummary) {
-    let Some(worktree) = summary.worktree.as_ref() else {
-        fail_summary(summary, "agent has no selected worktree for validation");
-        return;
-    };
-    let worktree_path = worktree.path.clone();
-
-    for validation in &agent.validation_commands {
-        let run_summary = run_validation_command(validation, &worktree_path);
-        if run_summary.status != AgentRunStatus::Succeeded {
-            fail_summary(
-                summary,
-                validation_failure_message("agent validation", &run_summary),
-            );
-        }
-        summary.validation.push(run_summary);
-        if summary.status != AgentRunStatus::Succeeded {
-            break;
-        }
-    }
-}
-
-fn run_repo_validation_commands(
-    plan: &OrchestrationPlan,
-    repo: &Path,
-) -> Vec<ValidationRunSummary> {
-    let mut summaries = Vec::new();
-    for validation in &plan.repo_validation_commands {
-        let run_summary = run_validation_command(validation, repo);
-        let failed = run_summary.status != AgentRunStatus::Succeeded;
-        summaries.push(run_summary);
-        if failed {
-            break;
-        }
-    }
-    summaries
-}
-
-fn run_validation_command(validation: &ValidationCommandPlan, root: &Path) -> ValidationRunSummary {
-    let working_directory = validation
-        .working_directory
-        .as_ref()
-        .map(|path| root.join(path))
-        .unwrap_or_else(|| root.to_path_buf());
-    let result = run_agent_command(CommandRunSpec {
-        command: validation.command.clone(),
-        working_directory,
-        env: validation.env.clone(),
-        timeout: validation.timeout,
-    });
-    validation_summary_from_result(validation, result)
-}
-
-fn validation_summary_from_result(
-    validation: &ValidationCommandPlan,
-    result: std::io::Result<CommandRunResult>,
-) -> ValidationRunSummary {
-    let mut summary = ValidationRunSummary {
-        name: validation.name.clone(),
-        command: validation.command.clone(),
-        working_directory: validation.working_directory.clone(),
-        timeout_seconds: validation.timeout.map(|timeout| timeout.as_secs()),
-        status: AgentRunStatus::Pending,
-        exit_code: None,
-        duration_ms: None,
-        timed_out: false,
-        stdout: OutputSummary::default(),
-        stderr: OutputSummary::default(),
-        error: None,
-    };
-
-    match result {
-        Ok(result) => {
-            summary.exit_code = result.status.and_then(|status| status.code());
-            summary.duration_ms = Some(result.duration_ms);
-            summary.timed_out = result.timed_out;
-            summary.stdout = result.stdout;
-            summary.stderr = result.stderr;
-            if let Some(error) = result.process_error {
-                summary.status = AgentRunStatus::Failed;
-                summary.error = Some(error);
-            } else if result.timed_out {
-                summary.status = AgentRunStatus::Failed;
-                summary.error = Some(match summary.timeout_seconds {
-                    Some(seconds) => {
-                        format!("validation command timed out after {seconds} seconds")
-                    }
-                    None => "validation command timed out".to_string(),
-                });
-            } else if result.status.is_some_and(|status| status.success()) {
-                summary.status = AgentRunStatus::Succeeded;
-            } else {
-                summary.status = AgentRunStatus::Failed;
-                summary.error = Some(match result.status.and_then(|status| status.code()) {
-                    Some(code) => format!("validation command exited with status {code}"),
-                    None => "validation command terminated without an exit code".to_string(),
-                });
-            }
-        }
-        Err(error) => {
-            summary.status = AgentRunStatus::Failed;
-            summary.error = Some(format!("failed to run validation command: {error}"));
-        }
-    }
-
-    summary
-}
-
-fn validation_failure_message(scope: &str, summary: &ValidationRunSummary) -> String {
-    let label = summary.name.as_deref().unwrap_or(summary.command.as_str());
-    let reason = summary
-        .error
-        .as_deref()
-        .unwrap_or("validation command failed");
-    format!("{scope} '{label}' failed: {reason}")
-}
-
-#[derive(Debug, Clone)]
-struct CommandRunSpec {
-    command: String,
-    working_directory: PathBuf,
-    env: BTreeMap<String, String>,
-    timeout: Option<Duration>,
-}
-
-fn run_agent_command(spec: CommandRunSpec) -> std::io::Result<CommandRunResult> {
-    let started = Instant::now();
-    let mut command = shell_command(&spec.command);
-    configure_timeout_process_control(&mut command);
-    let mut child = command
-        .current_dir(&spec.working_directory)
-        .envs(&spec.env)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let output = if let Some(timeout) = spec.timeout {
-        loop {
-            if child.try_wait()?.is_some() {
-                let output = child.wait_with_output()?;
-                break TimedOutput {
-                    status: Some(output.status),
-                    timed_out: false,
-                    stdout: output.stdout,
-                    stderr: output.stderr,
-                    process_error: None,
-                };
-            }
-
-            if command_timed_out(started, timeout) {
-                let process_error = terminate_child_on_timeout(&mut child);
-                let output = child.wait_with_output()?;
-                break TimedOutput {
-                    status: Some(output.status),
-                    timed_out: true,
-                    stdout: output.stdout,
-                    stderr: output.stderr,
-                    process_error,
-                };
-            }
-
-            thread::sleep(Duration::from_millis(25));
-        }
-    } else {
-        let output = child.wait_with_output()?;
-        TimedOutput {
-            status: Some(output.status),
-            timed_out: false,
-            stdout: output.stdout,
-            stderr: output.stderr,
-            process_error: None,
-        }
-    };
-
-    Ok(CommandRunResult {
-        status: output.status,
-        duration_ms: duration_millis(started.elapsed()),
-        timed_out: output.timed_out,
-        stdout: summarize_output(&output.stdout),
-        stderr: summarize_output(&output.stderr),
-        process_error: output.process_error,
-    })
-}
-
-fn command_timed_out(started: Instant, timeout: Duration) -> bool {
-    started.elapsed() >= timeout
-}
-
-fn configure_timeout_process_control(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = command;
-    }
-}
-
-fn terminate_child_on_timeout(child: &mut Child) -> Option<String> {
-    #[cfg(unix)]
-    {
-        terminate_unix_process_group(child)
-    }
-
-    #[cfg(not(unix))]
-    {
-        child
-            .kill()
-            .err()
-            .map(|error| format!("command timed out but process kill failed: {error}"))
-    }
-}
-
-#[cfg(unix)]
-fn terminate_unix_process_group(child: &mut Child) -> Option<String> {
-    let pid = child.id();
-    let term_error = send_unix_process_group_signal(pid, "TERM").err();
-    let deadline = Instant::now() + Duration::from_millis(100);
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => return term_error.map(|error| error.to_string()),
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(error) => return Some(format!("command timed out but wait failed: {error}")),
-        }
-    }
-
-    let kill_result = send_unix_process_group_signal(pid, "KILL").or_else(|_| child.kill());
-    kill_result.err().map(|error| {
-        if let Some(term_error) = term_error {
-            format!(
-                "command timed out but process group termination failed: {term_error}; kill failed: {error}"
-            )
-        } else {
-            format!("command timed out but process group kill failed: {error}")
-        }
-    })
-}
-
-#[cfg(unix)]
-fn send_unix_process_group_signal(pid: u32, signal: &str) -> std::io::Result<()> {
-    let status = Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(unix_process_group_target(pid))
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "kill -{signal} {} exited with {status}",
-            unix_process_group_target(pid)
-        )))
-    }
-}
-
-#[cfg(unix)]
-fn unix_process_group_target(pid: u32) -> String {
-    format!("-{pid}")
-}
-
-fn shell_command(command: &str) -> Command {
-    #[cfg(target_os = "windows")]
-    {
-        let mut shell = Command::new("cmd");
-        shell.arg("/C").arg(command);
-        shell
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let mut shell = Command::new("sh");
-        shell.arg("-c").arg(command);
-        shell
-    }
-}
-
-#[derive(Debug, Clone)]
-struct CommandRunResult {
-    status: Option<ExitStatus>,
-    duration_ms: u64,
-    timed_out: bool,
-    stdout: OutputSummary,
-    stderr: OutputSummary,
-    process_error: Option<String>,
-}
-
-#[derive(Debug)]
-struct TimedOutput {
-    status: Option<ExitStatus>,
-    timed_out: bool,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    process_error: Option<String>,
-}
-
-fn apply_command_result(summary: &mut AgentRunSummary, result: std::io::Result<CommandRunResult>) {
-    match result {
-        Ok(result) => {
-            summary.exit_code = result.status.and_then(|status| status.code());
-            summary.duration_ms = Some(result.duration_ms);
-            summary.timed_out = result.timed_out;
-            summary.stdout = result.stdout;
-            summary.stderr = result.stderr;
-            if let Some(error) = result.process_error {
-                summary.status = AgentRunStatus::Failed;
-                summary.error = Some(error);
-            } else if result.timed_out {
-                summary.status = AgentRunStatus::Failed;
-                summary.error = Some(match summary.timeout_seconds {
-                    Some(seconds) => format!("command timed out after {seconds} seconds"),
-                    None => "command timed out".to_string(),
-                });
-            } else if result.status.is_some_and(|status| status.success()) {
-                summary.status = AgentRunStatus::Succeeded;
-                summary.error = None;
-            } else {
-                summary.status = AgentRunStatus::Failed;
-                summary.error = Some(match result.status.and_then(|status| status.code()) {
-                    Some(code) => format!("command exited with status {code}"),
-                    None => "command terminated without an exit code".to_string(),
-                });
-            }
-        }
-        Err(error) => {
-            summary.status = AgentRunStatus::Failed;
-            summary.error = Some(format!("failed to run command: {error}"));
-        }
-    }
-}
-
-fn duration_millis(duration: Duration) -> u64 {
-    let millis = duration.as_millis();
-    if millis > u64::MAX as u128 {
-        u64::MAX
-    } else {
-        millis as u64
-    }
-}
-
-fn summarize_output(output: &[u8]) -> OutputSummary {
-    let text = String::from_utf8_lossy(output);
-    let mut chars = text.chars();
-    let value = chars.by_ref().take(OUTPUT_CHAR_LIMIT).collect::<String>();
-    OutputSummary {
-        text: value,
-        truncated: chars.next().is_some(),
-    }
-}
-
-struct CheckpointView<'a> {
-    repo: &'a Path,
-    repo_head: &'a Oid,
-    plan_file: &'a Path,
-    plan: &'a OrchestrationPlan,
-    keep_claims: bool,
-    worktree_reuse_policy: WorktreeReusePolicy,
-    success: bool,
-    agents: &'a [AgentRunSummary],
-    repo_validation: &'a [ValidationRunSummary],
-    released_claims: &'a [PathClaim],
-    release_errors: &'a [String],
-}
-
-pub fn write_run_checkpoint(directory: &Path, checkpoint: &RunCheckpoint) -> Result<PathBuf> {
-    fs::create_dir_all(directory).with_context(|| {
-        format!(
-            "failed to create checkpoint directory {}",
-            directory.display()
-        )
-    })?;
-    let path = checkpoint_path(directory, &checkpoint.run_id);
-    let temp_path = temp_checkpoint_path(&path);
-    let result = write_checkpoint_file(&temp_path, &path, checkpoint);
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    result?;
-    Ok(path)
-}
-
-pub fn read_run_checkpoint(path: &Path) -> Result<RunCheckpoint> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read checkpoint {}", path.display()))?;
-    let checkpoint: RunCheckpoint = serde_json::from_str(&contents)
-        .with_context(|| format!("failed to parse checkpoint {}", path.display()))?;
-    if checkpoint.version != CHECKPOINT_STATE_VERSION {
+        .with_context(|| format!("agent '{}' has no selected worktree binding", agent.id))?;
+    if recorded != worktree.record() || worktree.record().name != agent.id {
         bail!(
-            "unsupported checkpoint version {} in {}",
-            checkpoint.version,
-            path.display()
+            "agent '{}' selected worktree does not match its held write lease",
+            agent.id
         );
     }
-    Ok(checkpoint)
-}
-
-pub fn checkpoint_path(directory: &Path, run_id: &RunId) -> PathBuf {
-    directory.join(format!("{}.json", run_id.as_str()))
-}
-
-fn write_checkpoint_if_configured(
-    controls: &OrchestrationRunControls,
-    stage: RunCheckpointStage,
-    run_id: &Option<RunId>,
-    view: CheckpointView<'_>,
-) -> Result<()> {
-    let Some(directory) = controls.checkpoint_dir.as_deref() else {
-        return Ok(());
-    };
-    let Some(run_id) = run_id.clone() else {
-        return Ok(());
-    };
-
-    let checkpoint = RunCheckpoint {
-        version: CHECKPOINT_STATE_VERSION,
-        run_id,
-        stage,
-        repo: view.repo.to_path_buf(),
-        repo_head: Some(view.repo_head.to_string()),
-        plan_file: view.plan_file.to_path_buf(),
-        plan_snapshot: Some(CheckpointPlanSnapshot::from(view.plan)),
-        keep_claims: view.keep_claims,
-        worktree_reuse_policy: view.worktree_reuse_policy,
-        success: view.success,
-        agents: view.agents.iter().map(AgentCheckpoint::from).collect(),
-        repo_validation: view.repo_validation.to_vec(),
-        released_claims: view.released_claims.to_vec(),
-        release_errors: view.release_errors.to_vec(),
-        updated_unix_ms: unix_time_millis(),
-    };
-    write_run_checkpoint(directory, &checkpoint)?;
+    let verified = manager
+        .get_managed_verified(&agent.id)
+        .with_context(|| format!("agent '{}' managed worktree binding is invalid", agent.id))?;
+    if &verified != worktree.record() {
+        bail!(
+            "agent '{}' managed worktree record or Git backlink changed while its write lease was held",
+            agent.id
+        );
+    }
     Ok(())
 }
 
-impl From<&AgentRunSummary> for AgentCheckpoint {
-    fn from(summary: &AgentRunSummary) -> Self {
-        Self {
-            id: summary.id.clone(),
-            status: summary.status,
-            worktree: summary
-                .worktree
-                .as_ref()
-                .map(CheckpointWorktreeRecord::from),
-            claim: summary.claim.clone(),
-            changed_paths: summary.changed_paths.clone(),
-            unclaimed_changed_paths: summary.unclaimed_changed_paths.clone(),
-            validation: summary.validation.clone(),
-            error: summary.error.clone(),
-        }
-    }
-}
-
-impl From<&WorktreeRecord> for CheckpointWorktreeRecord {
-    fn from(record: &WorktreeRecord) -> Self {
-        Self {
-            name: record.name.clone(),
-            path: record.path.clone(),
-            branch: record.branch.clone(),
-        }
-    }
-}
-
-impl From<&CheckpointWorktreeRecord> for WorktreeRecord {
-    fn from(record: &CheckpointWorktreeRecord) -> Self {
-        Self {
-            name: record.name.clone(),
-            path: record.path.clone(),
-            branch: record.branch.clone(),
-        }
-    }
-}
-
-fn write_checkpoint_file(
-    temp_path: &Path,
-    checkpoint_path: &Path,
-    checkpoint: &RunCheckpoint,
-) -> Result<()> {
-    let mut file = File::create(temp_path).with_context(|| {
+fn revalidate_ready_agent(
+    agent: &AgentPlan,
+    summary: &AgentRunSummary,
+    worktree: &SelectedWorktree,
+) -> Result<crate::collect_revalidation::RevalidationGuard> {
+    let claim = summary.claim.as_ref().with_context(|| {
         format!(
-            "failed to create temporary checkpoint {}",
-            temp_path.display()
+            "agent '{}' has no durable path claim for pre-mutation revalidation",
+            agent.id
         )
     })?;
-    serde_json::to_writer_pretty(&mut file, checkpoint).with_context(|| {
-        format!(
-            "failed to write temporary checkpoint {}",
-            temp_path.display()
-        )
-    })?;
-    file.write_all(b"\n").with_context(|| {
-        format!(
-            "failed to finish temporary checkpoint {}",
-            temp_path.display()
-        )
-    })?;
-    file.sync_all().with_context(|| {
-        format!(
-            "failed to flush temporary checkpoint {}",
-            temp_path.display()
-        )
-    })?;
-    drop(file);
-    fs::rename(temp_path, checkpoint_path).with_context(|| {
-        format!(
-            "failed to replace checkpoint {} with {}",
-            checkpoint_path.display(),
-            temp_path.display()
-        )
-    })
-}
-
-fn temp_checkpoint_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("checkpoint.json");
-    path.with_file_name(format!(".{file_name}.{}.tmp", process::id()))
-}
-
-fn resolve_run_id(controls: &OrchestrationRunControls) -> Result<Option<RunId>> {
-    match (&controls.run_id, &controls.checkpoint_dir) {
-        (Some(run_id), _) => Ok(Some(run_id.clone())),
-        (None, Some(_)) => generated_run_id().map(Some),
-        (None, None) => Ok(None),
-    }
-}
-
-fn generated_run_id() -> Result<RunId> {
-    RunId::new(format!("run-{}-{}", unix_time_millis(), process::id()))
-}
-
-fn unix_time_millis() -> u64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration_millis(duration),
-        Err(_) => 0,
-    }
-}
-
-fn release_claims(store: &SyncStore, tokens: Vec<ClaimToken>) -> (Vec<PathClaim>, Vec<String>) {
-    let mut released = Vec::new();
-    let mut errors = Vec::new();
-
-    for token in tokens {
-        match store.release(token) {
-            Ok(claim) => released.push(claim),
-            Err(error) => errors.push(format!("failed to release claim {}: {error}", token.get())),
-        }
-    }
-
-    (released, errors)
-}
-
-fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
-    let repo = Repository::discover(repo_path)
-        .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
-    repo.workdir()
-        .map(Path::to_path_buf)
-        .context("orchestration requires a non-bare repository")
-}
-
-fn current_head_oid(repo_path: &Path) -> Result<Oid> {
-    let repo = Repository::open(repo_path)
-        .with_context(|| format!("failed to open repository {}", repo_path.display()))?;
-    head_oid(&repo)
-}
-
-fn head_oid(repo: &Repository) -> Result<Oid> {
-    let head = repo
-        .head()
-        .context("repository has no committed HEAD; create an initial commit first")?;
-    let commit = head
-        .peel_to_commit()
-        .context("failed to peel HEAD to a commit")?;
-    Ok(commit.id())
+    crate::collect_revalidation::revalidate_claimed_worker(
+        worktree.path(),
+        &agent.id,
+        claim.token,
+        &claim.paths,
+        worktree.record(),
+    )
+    .with_context(|| format!("pre-mutation revalidation failed for agent '{}'", agent.id))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::sync_store::SyncStore;
-    use crate::worktree::WorktreeManager;
-    use git2::{Oid, Repository, Signature};
-    use tempfile::TempDir;
+fn install_candidate_boundary_failure_hook(
+    agent_id: &str,
+) -> (
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::SyncSender<()>,
+) {
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let hook = CANDIDATE_BOUNDARY_FAILURE_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    let mut slot = hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        slot.is_none(),
+        "candidate boundary failure hook already installed"
+    );
+    *slot = Some(CandidateBoundaryFailureHook {
+        agent_id: agent_id.to_string(),
+        reached: reached_tx,
+        release: release_rx,
+    });
+    (reached_rx, release_tx)
+}
 
-    #[test]
-    fn load_plan_normalizes_agent_ids_and_paths() {
-        let temp = TempDir::new().expect("tempdir");
-        let plan_path = temp.path().join("plan.json");
-        fs::write(
-            &plan_path,
-            r#"{
-              "agents": [
-                {
-                  "id": " agent-a ",
-                  "paths": ["src/../README.md", "src"],
-                  "command": " echo ok "
-                }
-              ]
-            }"#,
-        )
-        .expect("write plan");
-
-        let plan = load_plan(&plan_path).expect("load plan");
-
-        assert_eq!(plan.agents[0].id, "agent-a");
-        assert_eq!(
-            plan.agents[0].paths,
-            vec![PathBuf::from("README.md"), PathBuf::from("src")]
-        );
-        assert_eq!(plan.agents[0].command, "echo ok");
-    }
-
-    #[test]
-    fn load_plan_accepts_dependencies_env_working_directory_and_timeout() {
-        let temp = TempDir::new().expect("tempdir");
-        let plan_path = temp.path().join("plan.json");
-        fs::write(
-            &plan_path,
-            r#"{
-              "default_timeout_seconds": 30,
-              "agents": [
-                {"id": "agent-a", "paths": ["src"], "command": "echo a"},
-                {
-                  "id": "agent-b",
-                  "paths": ["README.md"],
-                  "depends_on": ["agent-a"],
-                  "working_directory": "src",
-                  "env": {"MACO_TEST": "ok"},
-                  "timeout_seconds": 5,
-                  "command": "echo b"
-                }
-              ]
-            }"#,
-        )
-        .expect("write plan");
-
-        let plan = load_plan(&plan_path).expect("load plan");
-
-        assert_eq!(plan.agents[0].timeout, Some(Duration::from_secs(30)));
-        assert_eq!(plan.worktree_reuse_policy, WorktreeReusePolicy::Clean);
-        assert!(plan.repo_validation_commands.is_empty());
-        assert!(plan.agents[0].validation_commands.is_empty());
-        assert_eq!(plan.agents[1].depends_on, vec!["agent-a"]);
-        assert_eq!(plan.agents[1].working_directory, Some(PathBuf::from("src")));
-        assert_eq!(
-            plan.agents[1].env.get("MACO_TEST").map(String::as_str),
-            Some("ok")
-        );
-        assert_eq!(plan.agents[1].timeout, Some(Duration::from_secs(5)));
-    }
-
-    #[test]
-    fn load_plan_accepts_validation_commands_and_reuse_policy() {
-        let temp = TempDir::new().expect("tempdir");
-        let plan_path = temp.path().join("plan.json");
-        fs::write(
-            &plan_path,
-            r#"{
-              "worktree_reuse_policy": "required",
-              "repo_validation_commands": [
-                "cargo fmt -- --check",
-                {
-                  "name": "unit tests",
-                  "command": "cargo test",
-                  "working_directory": "src",
-                  "env": {"RUST_BACKTRACE": "1"},
-                  "timeout_seconds": 20
-                }
-              ],
-              "agents": [
-                {
-                  "id": "agent-a",
-                  "paths": ["src"],
-                  "command": "true",
-                  "validation_commands": [
-                    {"name": "agent check", "command": "cargo check", "timeout_seconds": 10}
-                  ]
-                }
-              ]
-            }"#,
-        )
-        .expect("write plan");
-
-        let plan = load_plan(&plan_path).expect("load plan");
-
-        assert_eq!(plan.worktree_reuse_policy, WorktreeReusePolicy::Required);
-        assert_eq!(plan.repo_validation_commands.len(), 2);
-        assert_eq!(
-            plan.repo_validation_commands[1].working_directory,
-            Some(PathBuf::from("src"))
-        );
-        assert_eq!(
-            plan.repo_validation_commands[1]
-                .env
-                .get("RUST_BACKTRACE")
-                .map(String::as_str),
-            Some("1")
-        );
-        assert_eq!(
-            plan.agents[0].validation_commands[0].timeout,
-            Some(Duration::from_secs(10))
-        );
-    }
-
-    #[test]
-    fn worktree_reuse_policy_defaults_and_accepts_reset_policy() {
-        let temp = TempDir::new().expect("tempdir");
-        let plan_path = temp.path().join("plan.json");
-        fs::write(
-            &plan_path,
-            r#"{"agents":[{"id":"agent-a","paths":["src"],"command":"true"}]}"#,
-        )
-        .expect("write plan");
-        let plan = load_plan(&plan_path).expect("load plan");
-        assert_eq!(plan.worktree_reuse_policy, WorktreeReusePolicy::Clean);
-
-        fs::write(
-            &plan_path,
-            r#"{"worktree_reuse_policy":"reset","agents":[{"id":"agent-a","paths":["src"],"command":"true"}]}"#,
-        )
-        .expect("write reset plan");
-        let plan = load_plan(&plan_path).expect("load reset plan");
-        assert_eq!(plan.worktree_reuse_policy, WorktreeReusePolicy::Reset);
-    }
-
-    #[test]
-    fn load_plan_rejects_invalid_completion_criteria() {
-        let cases = [
-            (
-                r#"{"agents":[]}"#,
-                "orchestration plan must include at least one agent",
-            ),
-            (
-                r#"{"agents":[{"id":"agent-a","paths":[],"command":"echo a"}]}"#,
-                "path claims cannot be empty",
-            ),
-            (
-                r#"{"agents":[{"id":"agent-a","paths":["src"],"command":"   "}]}"#,
-                "command cannot be empty",
-            ),
-            (
-                r#"{"agents":[{"id":"agent-a","paths":["/tmp"],"command":"echo a"}]}"#,
-                "repository-relative",
-            ),
-            (
-                r#"{"agents":[{"id":"agent-a","paths":["../src"],"command":"echo a"}]}"#,
-                "escape repository",
-            ),
-            (
-                r#"{"agents":[{"id":"agent-a","paths":["src"],"command":"echo a"},{"id":"agent-a","paths":["README.md"],"command":"echo b"}]}"#,
-                "duplicate agent id",
-            ),
-            (
-                r#"{"agents":[{"id":"agent-a","paths":["src"],"command":"echo a","depends_on":["agent-missing"]}]}"#,
-                "depends on unknown agent",
-            ),
-            (
-                r#"{"agents":[{"id":"agent-a","paths":["src"],"command":"echo a","depends_on":["agent-a"]}]}"#,
-                "cannot depend on itself",
-            ),
-            (
-                r#"{"default_timeout_seconds":0,"agents":[{"id":"agent-a","paths":["src"],"command":"echo a"}]}"#,
-                "default timeout",
-            ),
-        ];
-
-        for (contents, expected) in cases {
-            let temp = TempDir::new().expect("tempdir");
-            let plan_path = temp.path().join("plan.json");
-            fs::write(&plan_path, contents).expect("write plan");
-
-            let error = load_plan(&plan_path).expect_err("plan should fail");
-            let rendered = format!("{error:#}");
-
-            assert!(
-                rendered.contains(expected),
-                "expected '{expected}' in '{rendered}'"
-            );
+#[cfg(test)]
+fn notify_candidate_boundary_failure(agent_id: &str) {
+    let hook = CANDIDATE_BOUNDARY_FAILURE_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    let selected = {
+        let mut slot = hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot.take() {
+            Some(hook) if hook.agent_id == agent_id => Some(hook),
+            Some(other) => {
+                *slot = Some(other);
+                None
+            }
+            None => None,
         }
-    }
-
-    #[test]
-    fn load_plan_rejects_dependency_cycles() {
-        let temp = TempDir::new().expect("tempdir");
-        let plan_path = temp.path().join("plan.json");
-        fs::write(
-            &plan_path,
-            r#"{
-              "agents": [
-                {"id": "agent-a", "paths": ["src"], "command": "echo a", "depends_on": ["agent-b"]},
-                {"id": "agent-b", "paths": ["README.md"], "command": "echo b", "depends_on": ["agent-a"]}
-              ]
-            }"#,
-        )
-        .expect("write plan");
-
-        let error = load_plan(&plan_path).expect_err("cycle should fail");
-
-        assert!(error.to_string().contains("dependency cycle"));
-    }
-
-    #[test]
-    fn load_plan_rejects_overlapping_agent_paths() {
-        let temp = TempDir::new().expect("tempdir");
-        let plan_path = temp.path().join("plan.json");
-        fs::write(
-            &plan_path,
-            r#"{
-              "agents": [
-                {"id": "agent-a", "paths": ["src"], "command": "echo a"},
-                {"id": "agent-b", "paths": ["src/lib.rs"], "command": "echo b"}
-              ]
-            }"#,
-        )
-        .expect("write plan");
-
-        let error = load_plan(&plan_path).expect_err("overlap should fail");
-
-        assert!(error.to_string().contains("overlaps"));
-    }
-
-    #[test]
-    fn run_plan_creates_worktree_runs_command_and_releases_claims() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
-        fs::create_dir_all(repo_path.join("src")).expect("create src");
-        fs::write(repo_path.join("src/lib.rs"), "pub fn ok() {}\n").expect("write lib");
-        commit_all(&repo, "initial commit").expect("commit");
-        let plan_file = temp.path().join("plan.json");
-        fs::write(
-            &plan_file,
-            r#"{
-              "agents": [
-                {
-                  "id": "agent-a",
-                  "paths": ["src"],
-                  "command": "git rev-parse --is-inside-work-tree"
-                }
-              ]
-            }"#,
-        )
-        .expect("write plan");
-
-        let summary = run_plan_file(OrchestrationRunOptions {
-            repo: repo_path.clone(),
-            plan_file,
-            keep_claims: false,
-            jobs: 1,
-            patch_dir: None,
-        })
-        .expect("run plan");
-
-        assert!(summary.success);
-        assert_eq!(summary.agents[0].status, AgentRunStatus::Succeeded);
-        assert_eq!(summary.agents[0].stdout.text.trim(), "true");
-        assert_eq!(summary.released_claims.len(), 1);
-        assert_eq!(
-            SyncStore::open(&repo_path)
-                .expect("open store")
-                .snapshot()
-                .expect("snapshot"),
-            Vec::<PathClaim>::new()
-        );
-    }
-
-    #[test]
-    fn run_plan_reports_failed_command_and_releases_claims() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
-        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
-        commit_all(&repo, "initial commit").expect("commit");
-        let plan_file = temp.path().join("plan.json");
-        fs::write(
-            &plan_file,
-            r#"{
-              "agents": [
-                {"id": "agent-a", "paths": ["README.md"], "command": "false"}
-              ]
-            }"#,
-        )
-        .expect("write plan");
-
-        let summary = run_plan_file(OrchestrationRunOptions {
-            repo: repo_path.clone(),
-            plan_file,
-            keep_claims: false,
-            jobs: 1,
-            patch_dir: None,
-        })
-        .expect("run plan");
-
-        assert!(!summary.success);
-        assert_eq!(summary.first_failed_agent(), Some("agent-a"));
-        assert_eq!(summary.agents[0].status, AgentRunStatus::Failed);
-        assert_eq!(
-            SyncStore::open(&repo_path)
-                .expect("open store")
-                .snapshot()
-                .expect("snapshot"),
-            Vec::<PathClaim>::new()
-        );
-    }
-
-    #[test]
-    fn run_plan_reports_claim_conflict_as_summary() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
-        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
-        commit_all(&repo, "initial commit").expect("commit");
-        SyncStore::open(&repo_path)
-            .expect("open store")
-            .claim_paths("other-agent", ["README.md"])
-            .expect("preclaim");
-        let plan_file = temp.path().join("plan.json");
-        fs::write(
-            &plan_file,
-            r#"{
-              "agents": [
-                {"id": "agent-a", "paths": ["README.md"], "command": "echo should-not-run"}
-              ]
-            }"#,
-        )
-        .expect("write plan");
-
-        let summary = run_plan_file(OrchestrationRunOptions {
-            repo: repo_path.clone(),
-            plan_file,
-            keep_claims: false,
-            jobs: 1,
-            patch_dir: None,
-        })
-        .expect("run plan");
-
-        assert!(!summary.success);
-        assert_eq!(summary.first_failed_agent(), Some("agent-a"));
-        assert!(summary.agents[0]
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("failed to claim paths"));
-        assert_eq!(
-            SyncStore::open(&repo_path)
-                .expect("open store")
-                .owner_of("README.md")
-                .expect("owner")
-                .owner,
-            Some("other-agent".to_string())
-        );
-    }
-
-    #[test]
-    fn run_plan_reports_unclaimed_changes_and_releases_claims() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
-        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
-        fs::write(repo_path.join("Cargo.toml"), "[package]\n").expect("write cargo");
-        commit_all(&repo, "initial commit").expect("commit");
-        let plan_file = temp.path().join("plan.json");
-        fs::write(
-            &plan_file,
-            r#"{
-              "agents": [
-                {
-                  "id": "agent-a",
-                  "paths": ["README.md"],
-                  "command": "printf 'changed\n' > Cargo.toml"
-                }
-              ]
-            }"#,
-        )
-        .expect("write plan");
-
-        let summary = run_plan_file(OrchestrationRunOptions {
-            repo: repo_path.clone(),
-            plan_file,
-            keep_claims: false,
-            jobs: 1,
-            patch_dir: None,
-        })
-        .expect("run plan");
-
-        assert!(!summary.success);
-        assert_eq!(summary.first_failed_agent(), Some("agent-a"));
-        assert_eq!(
-            summary.agents[0].unclaimed_changed_paths,
-            vec![PathBuf::from("Cargo.toml")]
-        );
-        assert_eq!(
-            SyncStore::open(&repo_path)
-                .expect("open store")
-                .snapshot()
-                .expect("snapshot"),
-            Vec::<PathClaim>::new()
-        );
-    }
-
-    #[test]
-    fn run_plan_writes_patch_for_claimed_changes() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        let patch_dir = temp.path().join("patches");
-        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
-        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
-        commit_all(&repo, "initial commit").expect("commit");
-        let plan_file = temp.path().join("plan.json");
-        fs::write(
-            &plan_file,
-            r#"{
-              "agents": [
-                {
-                  "id": "agent-a",
-                  "paths": ["README.md"],
-                  "command": "printf '# Changed\n' > README.md"
-                }
-              ]
-            }"#,
-        )
-        .expect("write plan");
-
-        let summary = run_plan_file(OrchestrationRunOptions {
-            repo: repo_path,
-            plan_file,
-            keep_claims: false,
-            jobs: 1,
-            patch_dir: Some(patch_dir.clone()),
-        })
-        .expect("run plan");
-
-        assert!(summary.success);
-        assert_eq!(
-            summary.agents[0].changed_paths,
-            vec![PathBuf::from("README.md")]
-        );
-        assert_eq!(
-            summary.agents[0].patch_path,
-            Some(patch_dir.join("agent-a.patch"))
-        );
-        let patch = fs::read_to_string(patch_dir.join("agent-a.patch")).expect("read patch");
-        assert!(patch.contains("# Changed"));
-    }
-
-    #[test]
-    fn run_plan_times_out_and_skips_dependents() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
-        fs::create_dir_all(repo_path.join("src")).expect("create src");
-        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
-        fs::write(repo_path.join("src/lib.rs"), "pub fn ok() {}\n").expect("write lib");
-        commit_all(&repo, "initial commit").expect("commit");
-        let plan_file = temp.path().join("plan.json");
-        fs::write(
-            &plan_file,
-            r#"{
-              "agents": [
-                {
-                  "id": "agent-a",
-                  "paths": ["README.md"],
-                  "timeout_seconds": 1,
-                  "command": "sleep 5"
-                },
-                {
-                  "id": "agent-b",
-                  "paths": ["src"],
-                  "depends_on": ["agent-a"],
-                  "command": "echo should-not-run"
-                }
-              ]
-            }"#,
-        )
-        .expect("write plan");
-
-        let summary = run_plan_file(OrchestrationRunOptions {
-            repo: repo_path,
-            plan_file,
-            keep_claims: false,
-            jobs: 2,
-            patch_dir: None,
-        })
-        .expect("run plan");
-
-        assert!(!summary.success);
-        assert_eq!(summary.agents[0].status, AgentRunStatus::Failed);
-        assert!(summary.agents[0].timed_out);
-        assert_eq!(summary.agents[1].status, AgentRunStatus::Skipped);
-    }
-
-    #[test]
-    fn agent_validation_failure_is_reported_with_bounded_output() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
-        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
-        commit_all(&repo, "initial commit").expect("commit");
-        let plan_file = temp.path().join("plan.json");
-        fs::write(
-            &plan_file,
-            r#"{
-              "agents": [
-                {
-                  "id": "agent-a",
-                  "paths": ["README.md"],
-                  "command": "true",
-                  "validation_commands": [
-                    {"name": "check", "command": "printf 'validation failed' >&2; false"}
-                  ]
-                }
-              ]
-            }"#,
-        )
-        .expect("write plan");
-
-        let summary = run_plan_file(OrchestrationRunOptions {
-            repo: repo_path,
-            plan_file,
-            keep_claims: false,
-            jobs: 1,
-            patch_dir: None,
-        })
-        .expect("run plan");
-
-        assert!(!summary.success);
-        assert_eq!(summary.agents[0].status, AgentRunStatus::Failed);
-        assert_eq!(summary.agents[0].validation.len(), 1);
-        assert_eq!(
-            summary.agents[0].validation[0].status,
-            AgentRunStatus::Failed
-        );
-        assert_eq!(
-            summary.agents[0].validation[0].stderr.text,
-            "validation failed"
-        );
-        assert!(!summary.agents[0].validation[0].stderr.truncated);
-        assert!(summary.agents[0]
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("agent validation 'check' failed"));
-    }
-
-    #[test]
-    fn repo_validation_failure_is_reported_in_summary() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
-        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
-        commit_all(&repo, "initial commit").expect("commit");
-        let plan_file = temp.path().join("plan.json");
-        fs::write(
-            &plan_file,
-            r#"{
-              "repo_validation_commands": [
-                {"name": "repo check", "command": "printf 'repo failed' >&2; false"}
-              ],
-              "agents": [
-                {"id": "agent-a", "paths": ["README.md"], "command": "true"}
-              ]
-            }"#,
-        )
-        .expect("write plan");
-
-        let summary = run_plan_file(OrchestrationRunOptions {
-            repo: repo_path,
-            plan_file,
-            keep_claims: false,
-            jobs: 1,
-            patch_dir: None,
-        })
-        .expect("run plan");
-
-        assert!(!summary.success);
-        assert_eq!(summary.agents[0].status, AgentRunStatus::Succeeded);
-        assert_eq!(summary.repo_validation.len(), 1);
-        assert_eq!(summary.repo_validation[0].status, AgentRunStatus::Failed);
-        assert_eq!(summary.repo_validation[0].stderr.text, "repo failed");
-    }
-
-    #[test]
-    fn resume_skips_completed_agent_and_runs_pending_dependent() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        let checkpoint_dir = temp.path().join("checkpoints");
-        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
-        fs::write(repo_path.join("a.txt"), "start\n").expect("write a");
-        fs::write(repo_path.join("b.txt"), "start\n").expect("write b");
-        commit_all(&repo, "initial commit").expect("commit");
-
-        let manager = WorktreeManager::new(&repo_path);
-        let agent_a_worktree = manager
-            .create(WorktreeCreateOptions {
-                agent_id: "agent-a".to_string(),
-                branch: None,
-                base: None,
-                worktree_root: None,
-            })
-            .expect("create agent-a worktree");
-        let agent_b_worktree = manager
-            .create(WorktreeCreateOptions {
-                agent_id: "agent-b".to_string(),
-                branch: None,
-                base: None,
-                worktree_root: None,
-            })
-            .expect("create agent-b worktree");
-        fs::write(agent_a_worktree.path.join("a.txt"), "done\n").expect("write agent a output");
-
-        let plan_file = temp.path().join("plan.json");
-        fs::write(
-            &plan_file,
-            r#"{
-              "agents": [
-                {
-                  "id": "agent-a",
-                  "paths": ["a.txt"],
-                  "command": "printf 'rerun\n' >> a.txt"
-                },
-                {
-                  "id": "agent-b",
-                  "paths": ["b.txt"],
-                  "depends_on": ["agent-a"],
-                  "command": "printf 'done\n' > b.txt"
-                }
-              ]
-            }"#,
-        )
-        .expect("write plan");
-        let plan = load_plan(&plan_file).expect("load plan");
-        let store = SyncStore::open(&repo_path).expect("open store");
-        let claim_a = store
-            .claim_paths("agent-a", ["a.txt"])
-            .expect("claim agent a");
-        let claim_b = store
-            .claim_paths("agent-b", ["b.txt"])
-            .expect("claim agent b");
-        let run_id = RunId::new("resume-skip").expect("run id");
-        let checkpoint = RunCheckpoint {
-            version: CHECKPOINT_STATE_VERSION,
-            run_id: run_id.clone(),
-            stage: RunCheckpointStage::ClaimsAcquired,
-            repo: repo_path.clone(),
-            repo_head: Some(current_head_oid(&repo_path).expect("head").to_string()),
-            plan_file: plan_file.clone(),
-            plan_snapshot: Some(CheckpointPlanSnapshot::from(&plan)),
-            keep_claims: false,
-            worktree_reuse_policy: WorktreeReusePolicy::Clean,
-            success: false,
-            agents: vec![
-                AgentCheckpoint {
-                    id: "agent-a".to_string(),
-                    status: AgentRunStatus::Succeeded,
-                    worktree: Some(CheckpointWorktreeRecord::from(&agent_a_worktree)),
-                    claim: Some(claim_a),
-                    changed_paths: vec![PathBuf::from("a.txt")],
-                    unclaimed_changed_paths: Vec::new(),
-                    validation: Vec::new(),
-                    error: None,
-                },
-                AgentCheckpoint {
-                    id: "agent-b".to_string(),
-                    status: AgentRunStatus::Pending,
-                    worktree: Some(CheckpointWorktreeRecord::from(&agent_b_worktree)),
-                    claim: Some(claim_b),
-                    changed_paths: Vec::new(),
-                    unclaimed_changed_paths: Vec::new(),
-                    validation: Vec::new(),
-                    error: None,
-                },
-            ],
-            repo_validation: Vec::new(),
-            released_claims: Vec::new(),
-            release_errors: Vec::new(),
-            updated_unix_ms: 1,
-        };
-        let checkpoint_file =
-            write_run_checkpoint(&checkpoint_dir, &checkpoint).expect("write checkpoint");
-
-        let summary = resume_plan_file(OrchestrationResumeOptions {
-            checkpoint_file,
-            repo: Some(repo_path.clone()),
-            plan_file: Some(plan_file),
-            jobs: 1,
-            patch_dir: None,
-        })
-        .expect("resume");
-
-        assert!(summary.success);
-        assert_eq!(summary.agents[0].status, AgentRunStatus::Succeeded);
-        assert_eq!(summary.agents[1].status, AgentRunStatus::Succeeded);
-        assert_eq!(
-            fs::read_to_string(agent_a_worktree.path.join("a.txt")).expect("read a"),
-            "done\n"
-        );
-        assert_eq!(
-            fs::read_to_string(agent_b_worktree.path.join("b.txt")).expect("read b"),
-            "done\n"
-        );
-        assert_eq!(store.snapshot().expect("snapshot"), Vec::<PathClaim>::new());
-        let final_checkpoint =
-            read_run_checkpoint(&checkpoint_path(&checkpoint_dir, &run_id)).expect("checkpoint");
-        assert_eq!(final_checkpoint.stage, RunCheckpointStage::Final);
-        assert!(final_checkpoint.success);
-    }
-
-    #[test]
-    fn resume_refuses_changed_plan_snapshot() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        let checkpoint_dir = temp.path().join("checkpoints");
-        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
-        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
-        commit_all(&repo, "initial commit").expect("commit");
-        let worktree = WorktreeManager::new(&repo_path)
-            .create(WorktreeCreateOptions {
-                agent_id: "agent-a".to_string(),
-                branch: None,
-                base: None,
-                worktree_root: None,
-            })
-            .expect("create worktree");
-        let plan_file = temp.path().join("plan.json");
-        fs::write(
-            &plan_file,
-            r#"{"agents":[{"id":"agent-a","paths":["README.md"],"command":"true"}]}"#,
-        )
-        .expect("write plan");
-        let plan = load_plan(&plan_file).expect("load plan");
-        let run_id = RunId::new("changed-plan").expect("run id");
-        let checkpoint = RunCheckpoint {
-            version: CHECKPOINT_STATE_VERSION,
-            run_id,
-            stage: RunCheckpointStage::WorktreesSelected,
-            repo: repo_path.clone(),
-            repo_head: Some(current_head_oid(&repo_path).expect("head").to_string()),
-            plan_file: plan_file.clone(),
-            plan_snapshot: Some(CheckpointPlanSnapshot::from(&plan)),
-            keep_claims: false,
-            worktree_reuse_policy: WorktreeReusePolicy::Clean,
-            success: false,
-            agents: vec![AgentCheckpoint {
-                id: "agent-a".to_string(),
-                status: AgentRunStatus::Pending,
-                worktree: Some(CheckpointWorktreeRecord::from(&worktree)),
-                claim: None,
-                changed_paths: Vec::new(),
-                unclaimed_changed_paths: Vec::new(),
-                validation: Vec::new(),
-                error: None,
-            }],
-            repo_validation: Vec::new(),
-            released_claims: Vec::new(),
-            release_errors: Vec::new(),
-            updated_unix_ms: 1,
-        };
-        let checkpoint_file =
-            write_run_checkpoint(&checkpoint_dir, &checkpoint).expect("write checkpoint");
-        fs::write(
-            &plan_file,
-            r#"{"agents":[{"id":"agent-a","paths":["README.md"],"command":"false"}]}"#,
-        )
-        .expect("rewrite plan");
-
-        let error = resume_plan_file(OrchestrationResumeOptions {
-            checkpoint_file,
-            repo: Some(repo_path),
-            plan_file: Some(plan_file),
-            jobs: 1,
-            patch_dir: None,
-        })
-        .expect_err("resume should reject changed plan");
-
-        assert!(error.to_string().contains("does not match"));
-    }
-
-    #[test]
-    fn reuse_reset_moves_clean_stale_worktree_to_current_head() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
-        fs::write(repo_path.join("README.md"), "# v1\n").expect("write readme");
-        commit_all(&repo, "initial commit").expect("commit");
-        let worktree = WorktreeManager::new(&repo_path)
-            .create(WorktreeCreateOptions {
-                agent_id: "agent-a".to_string(),
-                branch: None,
-                base: None,
-                worktree_root: None,
-            })
-            .expect("create worktree");
-        fs::write(repo_path.join("README.md"), "# v2\n").expect("update readme");
-        let current_head = commit_all(&repo, "advance primary").expect("commit update");
-        let plan_file = temp.path().join("plan.json");
-        fs::write(
-            &plan_file,
-            r#"{
-              "worktree_reuse_policy": "reset",
-              "agents": [
-                {"id": "agent-a", "paths": ["README.md"], "command": "grep '# v2' README.md"}
-              ]
-            }"#,
-        )
-        .expect("write plan");
-
-        let summary = run_plan_file(OrchestrationRunOptions {
-            repo: repo_path,
-            plan_file,
-            keep_claims: false,
-            jobs: 1,
-            patch_dir: None,
-        })
-        .expect("run plan");
-
-        assert!(summary.success);
-        assert!(summary.agents[0].worktree_reused);
-        let worktree_repo = Repository::open(worktree.path).expect("open worktree");
-        assert_eq!(
-            head_oid(&worktree_repo).expect("worktree head"),
-            current_head
-        );
-    }
-
-    #[test]
-    fn reuse_reset_refuses_dirty_worktree() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
-        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
-        commit_all(&repo, "initial commit").expect("commit");
-        let worktree = WorktreeManager::new(&repo_path)
-            .create(WorktreeCreateOptions {
-                agent_id: "agent-a".to_string(),
-                branch: None,
-                base: None,
-                worktree_root: None,
-            })
-            .expect("create worktree");
-        fs::write(worktree.path.join("scratch.txt"), "untracked\n").expect("write untracked");
-        let plan_file = temp.path().join("plan.json");
-        fs::write(
-            &plan_file,
-            r#"{
-              "worktree_reuse_policy": "reset",
-              "agents": [
-                {"id": "agent-a", "paths": ["README.md"], "command": "true"}
-              ]
-            }"#,
-        )
-        .expect("write plan");
-
-        let error = run_plan_file(OrchestrationRunOptions {
-            repo: repo_path,
-            plan_file,
-            keep_claims: false,
-            jobs: 1,
-            patch_dir: None,
-        })
-        .expect_err("reset should refuse dirty worktree");
-
-        assert!(error.to_string().contains("dirty or untracked"));
-    }
-
-    #[test]
-    fn reuse_reset_refuses_active_claims() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
-        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
-        commit_all(&repo, "initial commit").expect("commit");
-        WorktreeManager::new(&repo_path)
-            .create(WorktreeCreateOptions {
-                agent_id: "agent-a".to_string(),
-                branch: None,
-                base: None,
-                worktree_root: None,
-            })
-            .expect("create worktree");
-        SyncStore::open(&repo_path)
-            .expect("open store")
-            .claim_paths("agent-a", ["README.md"])
-            .expect("claim");
-        let plan_file = temp.path().join("plan.json");
-        fs::write(
-            &plan_file,
-            r#"{
-              "worktree_reuse_policy": "reset",
-              "agents": [
-                {"id": "agent-a", "paths": ["README.md"], "command": "true"}
-              ]
-            }"#,
-        )
-        .expect("write plan");
-
-        let error = run_plan_file(OrchestrationRunOptions {
-            repo: repo_path,
-            plan_file,
-            keep_claims: false,
-            jobs: 1,
-            patch_dir: None,
-        })
-        .expect_err("reset should refuse active claim");
-
-        assert!(error.to_string().contains("active claim"));
-    }
-
-    #[test]
-    fn checkpoint_helpers_round_trip_serialized_state() {
-        let temp = TempDir::new().expect("tempdir");
-        let run_id = RunId::new("run-1").expect("run id");
-        let checkpoint = RunCheckpoint {
-            version: CHECKPOINT_STATE_VERSION,
-            run_id: run_id.clone(),
-            stage: RunCheckpointStage::Final,
-            repo: PathBuf::from("repo"),
-            repo_head: Some("0123456789012345678901234567890123456789".to_string()),
-            plan_file: PathBuf::from("plan.json"),
-            plan_snapshot: Some(CheckpointPlanSnapshot {
-                worktree_reuse_policy: WorktreeReusePolicy::Clean,
-                repo_validation_commands: Vec::new(),
-                agents: vec![CheckpointAgentPlanSnapshot {
-                    id: "agent-a".to_string(),
-                    paths: vec![PathBuf::from("README.md")],
-                    env: BTreeMap::new(),
-                    timeout_seconds: None,
-                    command: "true".to_string(),
-                    depends_on: Vec::new(),
-                    working_directory: None,
-                    validation_commands: Vec::new(),
-                }],
-            }),
-            keep_claims: false,
-            worktree_reuse_policy: WorktreeReusePolicy::Clean,
-            success: true,
-            agents: vec![AgentCheckpoint {
-                id: "agent-a".to_string(),
-                status: AgentRunStatus::Succeeded,
-                worktree: Some(CheckpointWorktreeRecord {
-                    name: "agent-a".to_string(),
-                    path: PathBuf::from("worktrees/agent-a"),
-                    branch: "maco/agent-a".to_string(),
-                }),
-                claim: None,
-                changed_paths: vec![PathBuf::from("README.md")],
-                unclaimed_changed_paths: Vec::new(),
-                validation: Vec::new(),
-                error: None,
-            }],
-            repo_validation: Vec::new(),
-            released_claims: Vec::new(),
-            release_errors: Vec::new(),
-            updated_unix_ms: 1,
-        };
-
-        let path = write_run_checkpoint(temp.path(), &checkpoint).expect("write checkpoint");
-        assert_eq!(path, checkpoint_path(temp.path(), &run_id));
-        let loaded = read_run_checkpoint(&path).expect("read checkpoint");
-        assert_eq!(loaded, checkpoint);
-    }
-
-    #[test]
-    fn checkpoint_controls_write_final_run_state() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        let checkpoint_dir = temp.path().join("checkpoints");
-        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
-        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
-        commit_all(&repo, "initial commit").expect("commit");
-        let plan_file = temp.path().join("plan.json");
-        fs::write(
-            &plan_file,
-            r#"{"agents":[{"id":"agent-a","paths":["README.md"],"command":"true"}]}"#,
-        )
-        .expect("write plan");
-        let run_id = RunId::new("checkpoint-test").expect("run id");
-
-        let summary = run_plan_file_with_controls(
-            OrchestrationRunOptions {
-                repo: repo_path,
-                plan_file,
-                keep_claims: false,
-                jobs: 1,
-                patch_dir: None,
-            },
-            OrchestrationRunControls {
-                run_id: Some(run_id.clone()),
-                checkpoint_dir: Some(checkpoint_dir.clone()),
-                worktree_reuse_policy: None,
-            },
-        )
-        .expect("run plan");
-
-        assert!(summary.success);
-        let checkpoint =
-            read_run_checkpoint(&checkpoint_path(&checkpoint_dir, &run_id)).expect("checkpoint");
-        assert_eq!(checkpoint.stage, RunCheckpointStage::Final);
-        assert!(checkpoint.success);
-        assert_eq!(checkpoint.agents[0].id, "agent-a");
-    }
-
-    #[test]
-    fn process_control_helpers_are_deterministic() {
-        let started = Instant::now() - Duration::from_millis(5);
-        assert!(command_timed_out(started, Duration::from_millis(1)));
-
-        #[cfg(unix)]
-        assert_eq!(unix_process_group_target(42), "-42");
-    }
-
-    fn commit_all(repo: &Repository, message: &str) -> Result<Oid> {
-        let mut index = repo.index().context("open index")?;
-        index
-            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
-            .context("add all")?;
-        index.write().context("write index")?;
-        let tree_id = index.write_tree().context("write tree")?;
-        let tree = repo.find_tree(tree_id).context("find tree")?;
-        let signature =
-            Signature::now("maco test", "maco-test@example.invalid").context("signature")?;
-        let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
-        let parents = parent.iter().collect::<Vec<_>>();
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            message,
-            &tree,
-            &parents,
-        )
-        .context("commit")
+    };
+    if let Some(selected) = selected {
+        let _ = selected.reached.send(());
+        let _ = selected.release.recv_timeout(Duration::from_secs(15));
     }
 }
+
+fn capture_selected_candidate_state(
+    manager: &WorktreeManager,
+    agent: &AgentPlan,
+    summary: &AgentRunSummary,
+    worktree: &SelectedWorktree,
+    base_oid: &Oid,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<CandidateStateSnapshot> {
+    verify_selected_worktree_binding(manager, agent, summary, worktree)?;
+    let state = capture_consistent_candidate_state(worktree.path(), base_oid, runtime)?;
+    verify_selected_worktree_binding(manager, agent, summary, worktree)?;
+    Ok(state)
+}
+
+fn capture_selected_bound_candidate(
+    manager: &WorktreeManager,
+    agent: &AgentPlan,
+    summary: &AgentRunSummary,
+    worktree: &SelectedWorktree,
+    base_oid: &Oid,
+    expected_state: &CandidateStateSnapshot,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<CapturedCandidate> {
+    verify_selected_worktree_binding(manager, agent, summary, worktree)?;
+    let captured = capture_bound_candidate(worktree.path(), base_oid, expected_state, runtime)?;
+    verify_selected_worktree_binding(manager, agent, summary, worktree)?;
+    Ok(captured)
+}
+
+fn propagate_dependency_failures(
+    plan: &OrchestrationPlan,
+    summaries: &mut [AgentRunSummary],
+    remaining: &mut BTreeSet<usize>,
+) {
+    loop {
+        let blocked = remaining
+            .iter()
+            .copied()
+            .filter_map(|index| {
+                let blockers = dependency_statuses(plan, summaries, index)
+                    .into_iter()
+                    .filter(|(_, status)| {
+                        matches!(status, AgentRunStatus::Failed | AgentRunStatus::Skipped)
+                    })
+                    .collect::<Vec<_>>();
+                (!blockers.is_empty()).then_some((index, blockers))
+            })
+            .collect::<Vec<_>>();
+        if blocked.is_empty() {
+            return;
+        }
+
+        for (index, blockers) in blocked {
+            let detail = blockers
+                .into_iter()
+                .map(|(dependency, status)| {
+                    format!("'{dependency}' ({})", agent_status_label(status))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            summaries[index].status = AgentRunStatus::Skipped;
+            summaries[index].error = Some(format!(
+                "skipped because dependencies did not succeed: {detail}"
+            ));
+            remaining.remove(&index);
+        }
+    }
+}
+
+fn ready_agent_indices(
+    plan: &OrchestrationPlan,
+    summaries: &[AgentRunSummary],
+    remaining: &BTreeSet<usize>,
+    jobs: usize,
+) -> Vec<usize> {
+    remaining
+        .iter()
+        .copied()
+        .filter(|index| {
+            plan.agents[*index].depends_on.iter().all(|dependency| {
+                summary_status_by_id(summaries, dependency) == Some(AgentRunStatus::Succeeded)
+            })
+        })
+        .take(jobs.max(1))
+        .collect()
+}
+
+fn dependency_statuses<'a>(
+    plan: &'a OrchestrationPlan,
+    summaries: &[AgentRunSummary],
+    index: usize,
+) -> Vec<(&'a str, AgentRunStatus)> {
+    plan.agents[index]
+        .depends_on
+        .iter()
+        .map(|dependency| {
+            (
+                dependency.as_str(),
+                summary_status_by_id(summaries, dependency).unwrap_or(AgentRunStatus::Pending),
+            )
+        })
+        .collect()
+}
+
+include!("orchestrator/part2.rs");
+
+#[cfg(test)]
+mod tests;

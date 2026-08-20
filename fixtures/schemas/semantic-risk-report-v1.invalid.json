@@ -1,0 +1,34 @@
+{
+  "changed_paths": [
+    "src/api.rs"
+  ],
+  "touched_files": [],
+  "touched_symbols": [],
+  "dependency_impacts": [
+    {
+      "direction": "sideways",
+      "changed_path": "src/api.rs",
+      "related_file": "src/lib.rs",
+      "dependency": {
+        "from_file": "src/lib.rs",
+        "from_module": [
+          "crate"
+        ],
+        "to": "crate::api",
+        "to_file": "src/api.rs",
+        "kind": "module_declaration",
+        "span": {
+          "start_byte": 0,
+          "end_byte": 12,
+          "start_line": 1,
+          "end_line": 1
+        }
+      }
+    }
+  ],
+  "impacted_files": [
+    "src/lib.rs"
+  ],
+  "errors": [],
+  "megafile_hotspots": []
+}

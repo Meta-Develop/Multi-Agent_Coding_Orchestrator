@@ -1,0 +1,71 @@
+{
+  "schema_version": 4,
+  "name": "provisional-phase-a-hybrid-model-tier-v2",
+  "evidence": "fixture process-observed execution evidence",
+  "evidence_notice": "fixture only",
+  "production_eligible": false,
+  "model_availability": "available",
+  "overridden_roles": [],
+  "role_models": {
+    "supervisor": { "model": "gpt-fixture", "reasoning_effort": "xhigh", "unavailable_model_fallback": "runtime_default" },
+    "child_orchestrator": { "model": "gpt-fixture", "reasoning_effort": "xhigh", "unavailable_model_fallback": "runtime_default" },
+    "worker": { "model": "gpt-fixture", "reasoning_effort": "medium", "unavailable_model_fallback": "runtime_default" },
+    "gate_classifier": { "model": "gpt-fixture", "reasoning_effort": "high", "unavailable_model_fallback": "local_deterministic_fake" },
+    "auditor": { "model": "gpt-fixture", "reasoning_effort": "xhigh", "unavailable_model_fallback": "runtime_default" }
+  },
+  "model_catalog_observation": "consulted",
+  "execution": {
+    "assignment_count": 2,
+    "started_assignment_count": 2,
+    "completed_assignment_count": 2,
+    "concurrency": {
+      "configured_max_concurrent_children": 2,
+      "policy_input_observation": "scheduler_observed",
+      "policy_input": "{\"entrypoint_bound\":8,\"plan\":{\"max_concurrent_children\":6},\"cli\":{\"provider_inflight_limit\":4},\"effective\":{\"max_concurrent_children\":6,\"provider_inflight_limit\":4},\"provider_inflight_bound\":4,\"provider_inflight_source\":\"configured\",\"host\":{\"memory_available_mib\":4096,\"memory_available_source\":\"configured\",\"memory_per_child_mib\":1024,\"memory_bound\":4,\"fd_available\":256,\"fd_available_source\":\"configured\",\"fds_per_child\":128,\"fd_bound\":2,\"disk_available_mib\":4096,\"disk_available_source\":\"configured\",\"disk_per_child_mib\":512,\"disk_bound\":8,\"fallback_children\":1,\"resolved_bound\":2},\"resolved_bound\":2}",
+      "policy_input_details": {
+        "entrypoint_bound": 8,
+        "plan": { "max_concurrent_children": 6 },
+        "cli": { "provider_inflight_limit": 4 },
+        "effective": { "max_concurrent_children": 6, "provider_inflight_limit": 4 },
+        "provider_inflight_bound": 4,
+        "provider_inflight_source": "configured",
+        "host": {
+          "memory_available_mib": 4096,
+          "memory_available_source": "configured",
+          "memory_per_child_mib": 1024,
+          "memory_bound": 4,
+          "fd_available": 256,
+          "fd_available_source": "configured",
+          "fds_per_child": 128,
+          "fd_bound": 2,
+          "disk_available_mib": 4096,
+          "disk_available_source": "configured",
+          "disk_per_child_mib": 512,
+          "disk_bound": 8,
+          "fallback_children": 1,
+          "resolved_bound": 2
+        },
+        "resolved_bound": 2
+      },
+      "policy_input_unavailable_reason": null,
+      "achieved_max_concurrent_children": 2,
+      "achieved_mean_concurrent_children": 1.75,
+      "achieved_mean_observation": "scheduler_observed",
+      "achieved_mean_unavailable_reason": null
+    },
+    "role_bindings": {
+      "supervisor": { "configured_model": "gpt-fixture", "configured_reasoning_effort": "xhigh", "resolved_model": "gpt-fixture", "resolved_reasoning_effort": "xhigh", "observation": "runtime_catalog_resolved", "resolution_observation": "preferred_model", "configured_model_chain": ["gpt-fixture"], "resolved_candidate_index": 0 },
+      "child_orchestrator": { "configured_model": "gpt-fixture", "configured_reasoning_effort": "xhigh", "resolved_model": "gpt-fixture", "resolved_reasoning_effort": "xhigh", "observation": "runtime_catalog_resolved", "resolution_observation": "preferred_model", "configured_model_chain": ["gpt-fixture"], "resolved_candidate_index": 0 },
+      "worker": { "configured_model": "gpt-fixture", "configured_reasoning_effort": "medium", "resolved_model": "gpt-fixture", "resolved_reasoning_effort": "medium", "observation": "runtime_catalog_resolved", "resolution_observation": "preferred_model", "configured_model_chain": ["gpt-fixture"], "resolved_candidate_index": 0 },
+      "gate_classifier": { "configured_model": "gpt-fixture", "configured_reasoning_effort": "high", "resolved_model": "gpt-fixture", "resolved_reasoning_effort": "high", "observation": "runtime_catalog_resolved", "resolution_observation": "preferred_model", "configured_model_chain": ["gpt-fixture"], "resolved_candidate_index": 0 },
+      "auditor": { "configured_model": "gpt-fixture", "configured_reasoning_effort": "xhigh", "resolved_model": "gpt-fixture", "resolved_reasoning_effort": "xhigh", "observation": "runtime_catalog_resolved", "resolution_observation": "preferred_model", "configured_model_chain": ["gpt-fixture"], "resolved_candidate_index": 0 }
+    },
+    "budget_degradations": [],
+    "usage": {
+      "total_usage": { "input_tokens": 1200, "output_tokens": 300, "total_tokens": 1500 },
+      "total_cost_usd": 0.0125,
+      "usage_complete": true,
+      "observation": "supervisor_aggregate"
+    }
+  }
+}

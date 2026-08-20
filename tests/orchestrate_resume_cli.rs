@@ -24,7 +24,29 @@ fn orchestrate_resume_uses_checkpoint_defaults_and_reports_json() -> Result<()> 
     )
     .context("write plan")?;
 
-    let run_summary = run_success_json(&[
+    let unsupported = Command::new(BIN)
+        .args([
+            "orchestrate",
+            "run",
+            plan_path.to_str().context("plan path utf8")?,
+            "--repo",
+            repo,
+            "--checkpoint-dir",
+            checkpoint_dir.to_str().context("checkpoint dir utf8")?,
+            "--run-id",
+            run_id,
+            "--json",
+        ])
+        .output()
+        .context("run unsupported orchestration")?;
+    if !unsupported.status.success() {
+        assert!(String::from_utf8_lossy(&unsupported.stderr)
+            .contains("orchestration assignment creation is temporarily unsupported"));
+        assert!(!checkpoint_dir.exists());
+        return Ok(());
+    }
+
+    let (run_summary, verified_backend_available) = run_json_regardless(&[
         "orchestrate",
         "run",
         plan_path.to_str().context("plan path utf8")?,
@@ -36,11 +58,46 @@ fn orchestrate_resume_uses_checkpoint_defaults_and_reports_json() -> Result<()> 
         run_id,
         "--json",
     ])?;
-    assert_eq!(run_summary["success"], true);
     assert_eq!(run_summary["run_id"], run_id);
 
     let checkpoint_path = checkpoint_dir.join(format!("{run_id}.json"));
     assert!(checkpoint_path.exists());
+    let checkpoint: Value =
+        serde_json::from_slice(&fs::read(&checkpoint_path)?).context("parse written checkpoint")?;
+    assert_eq!(checkpoint["version"], 3);
+    assert_eq!(checkpoint["journal"]["run_id"], run_id);
+    assert_eq!(checkpoint["mac"].as_str().map(str::len), Some(64));
+    assert!(checkpoint.get("plan_file").is_none());
+
+    if !verified_backend_available {
+        assert_eq!(run_summary["success"], false);
+        assert_eq!(run_summary["agents"][0]["status"], "failed");
+        let error = run_summary["agents"][0]["error"]
+            .as_str()
+            .context("orchestration error")?;
+        assert!(
+            error.contains("process-tree ownership") || error.contains("containment"),
+            "unexpected fail-closed error: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(repo_path.join("README.md"))?,
+            "# Smoke\n"
+        );
+        return Ok(());
+    }
+
+    assert_eq!(run_summary["success"], true);
+    assert_eq!(run_summary["agents"][0]["candidate_binding"]["version"], 1);
+    assert_eq!(
+        run_summary["agents"][0]["candidate_binding"]["changed_paths"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        run_summary["repo_validation_target"]["kind"],
+        "base_no_changes"
+    );
+    assert_eq!(run_summary["repo_validation_target"]["candidate_count"], 1);
+    assert_eq!(run_summary["repo_validation_target"]["patch_count"], 0);
 
     let resume_summary = run_success_json(&[
         "orchestrate",
@@ -63,6 +120,14 @@ fn orchestrate_resume_uses_checkpoint_defaults_and_reports_json() -> Result<()> 
     );
     assert_eq!(resume_summary["agents"][0]["id"], "agent-a");
     assert_eq!(resume_summary["agents"][0]["status"], "succeeded");
+    assert_eq!(
+        resume_summary["agents"][0]["candidate_binding"],
+        run_summary["agents"][0]["candidate_binding"]
+    );
+    assert_eq!(
+        resume_summary["repo_validation_target"],
+        run_summary["repo_validation_target"]
+    );
 
     let renamed_checkpoint = checkpoint_dir.join("renamed.json");
     fs::copy(&checkpoint_path, &renamed_checkpoint).context("copy checkpoint")?;
@@ -94,6 +159,18 @@ fn run_success_json(args: &[&str]) -> Result<Value> {
     }
 
     serde_json::from_slice(&output.stdout).context("parse json")
+}
+
+fn run_json_regardless(args: &[&str]) -> Result<(Value, bool)> {
+    let output = Command::new(BIN).args(args).output().context("run maco")?;
+    let report = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "parse orchestration json from stdout: {} stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })?;
+    Ok((report, output.status.success()))
 }
 
 fn create_committed_repo(root: &Path) -> Result<std::path::PathBuf> {

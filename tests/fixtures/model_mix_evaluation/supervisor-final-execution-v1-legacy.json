@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "run_id": "fixture-run-v1",
+  "role_economics_profile": {
+    "name": "legacy-profile-without-execution",
+    "evidence": "legacy fixture",
+    "evidence_notice": "no execution telemetry was retained",
+    "production_eligible": false,
+    "model_availability": "available",
+    "overridden_roles": [],
+    "role_models": {
+      "supervisor": { "model": "configured-only", "reasoning_effort": "xhigh", "unavailable_model_fallback": "fail_closed" },
+      "child_orchestrator": { "model": "configured-only", "reasoning_effort": "xhigh", "unavailable_model_fallback": "fail_closed" },
+      "worker": { "model": "configured-only", "reasoning_effort": "medium", "unavailable_model_fallback": "fail_closed" },
+      "gate_classifier": { "model": "configured-only", "reasoning_effort": "high", "unavailable_model_fallback": "fail_closed" },
+      "auditor": { "model": "configured-only", "reasoning_effort": "xhigh", "unavailable_model_fallback": "fail_closed" }
+    }
+  }
+}

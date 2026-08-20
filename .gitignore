@@ -1,6 +1,8 @@
 /target
 /.maco
 /.maco-cache
+/.worktrees/
+/.worktrees-quarantine-*/
 /.agents/live/claims/worker-*.md
 /.agents/temp/*
 /.agents/storage/*

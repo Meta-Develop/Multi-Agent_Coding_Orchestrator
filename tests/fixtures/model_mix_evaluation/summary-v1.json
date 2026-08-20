@@ -1,0 +1,596 @@
+{
+  "version": 3,
+  "manifest_version": 1,
+  "experiment_id": "issue26-phase-a-readme-v1",
+  "fake_seed": 26,
+  "evidence": {
+    "kind": "provisional_deterministic_fake_only",
+    "plan_basis": "hand_authored",
+    "real_provider_executed": false,
+    "observed_isolated_repository_state": false,
+    "requirement_four_comparability": "not_established_deferred_to_phase_b",
+    "eligible_for_production_economics": false,
+    "eligible_to_justify_named_default": false,
+    "eligible_for_production_or_default_decisions": false,
+    "notice": "provisional deterministic fake evidence over a hand-authored plan; no isolated repository state was observed, so Issue #26 requirement-4 comparability is not established and is deferred to Phase B; ineligible for production or default decisions"
+  },
+  "declared_inputs_digest": "fnv1a64:e7da008318253760",
+  "dispatch_comparability_claim": {
+    "scope": "dispatch",
+    "provider_execution_difference_established": false,
+    "notice": "comparison is scoped to MACO-dispatched model selections; it does not establish that the provider executed profiles differently"
+  },
+  "dispatch_comparisons": [
+    {
+      "left_profile_id": "frontier-all-v1",
+      "right_profile_id": "hybrid-frontier-economy-v1",
+      "repetition": 0,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    },
+    {
+      "left_profile_id": "frontier-all-v1",
+      "right_profile_id": "balanced-all-v1",
+      "repetition": 0,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    },
+    {
+      "left_profile_id": "frontier-all-v1",
+      "right_profile_id": "economy-all-v1",
+      "repetition": 0,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    },
+    {
+      "left_profile_id": "hybrid-frontier-economy-v1",
+      "right_profile_id": "balanced-all-v1",
+      "repetition": 0,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    },
+    {
+      "left_profile_id": "hybrid-frontier-economy-v1",
+      "right_profile_id": "economy-all-v1",
+      "repetition": 0,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    },
+    {
+      "left_profile_id": "balanced-all-v1",
+      "right_profile_id": "economy-all-v1",
+      "repetition": 0,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    },
+    {
+      "left_profile_id": "frontier-all-v1",
+      "right_profile_id": "hybrid-frontier-economy-v1",
+      "repetition": 1,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    },
+    {
+      "left_profile_id": "frontier-all-v1",
+      "right_profile_id": "balanced-all-v1",
+      "repetition": 1,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    },
+    {
+      "left_profile_id": "frontier-all-v1",
+      "right_profile_id": "economy-all-v1",
+      "repetition": 1,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    },
+    {
+      "left_profile_id": "hybrid-frontier-economy-v1",
+      "right_profile_id": "balanced-all-v1",
+      "repetition": 1,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    },
+    {
+      "left_profile_id": "hybrid-frontier-economy-v1",
+      "right_profile_id": "economy-all-v1",
+      "repetition": 1,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    },
+    {
+      "left_profile_id": "balanced-all-v1",
+      "right_profile_id": "economy-all-v1",
+      "repetition": 1,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    },
+    {
+      "left_profile_id": "frontier-all-v1",
+      "right_profile_id": "hybrid-frontier-economy-v1",
+      "repetition": 2,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    },
+    {
+      "left_profile_id": "frontier-all-v1",
+      "right_profile_id": "balanced-all-v1",
+      "repetition": 2,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    },
+    {
+      "left_profile_id": "frontier-all-v1",
+      "right_profile_id": "economy-all-v1",
+      "repetition": 2,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    },
+    {
+      "left_profile_id": "hybrid-frontier-economy-v1",
+      "right_profile_id": "balanced-all-v1",
+      "repetition": 2,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    },
+    {
+      "left_profile_id": "hybrid-frontier-economy-v1",
+      "right_profile_id": "economy-all-v1",
+      "repetition": 2,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    },
+    {
+      "left_profile_id": "balanced-all-v1",
+      "right_profile_id": "economy-all-v1",
+      "repetition": 2,
+      "comparability": "incomparable",
+      "execution_telemetry_comparability": "incomparable",
+      "unavailable_reason": "not_process_observable: one or both runs lack complete supervisor execution telemetry schema v2, resolved role bindings, achieved concurrency, or aggregate usage"
+    }
+  ],
+  "profile_summaries": [
+    {
+      "profile_id": "frontier-all-v1",
+      "repetitions": 3,
+      "aggregate_role_usage": {
+        "supervisor": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 2524,
+            "output_tokens": 1424,
+            "total_tokens": 3948
+          },
+          "cost_usd": 0.01870136,
+          "observation": "synthetic_fake"
+        },
+        "child_orchestrator": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 3869,
+            "output_tokens": 2159,
+            "total_tokens": 6028
+          },
+          "cost_usd": 0.02861341,
+          "observation": "synthetic_fake"
+        },
+        "worker": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 4504,
+            "output_tokens": 1578,
+            "total_tokens": 6082
+          },
+          "cost_usd": 0.03120506,
+          "observation": "synthetic_fake"
+        },
+        "auditor": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 4227,
+            "output_tokens": 2443,
+            "total_tokens": 6670
+          },
+          "cost_usd": 0.031450530000000004,
+          "observation": "synthetic_fake"
+        }
+      },
+      "aggregate_usage": {
+        "input_tokens": 15124,
+        "output_tokens": 7604,
+        "total_tokens": 22728
+      },
+      "aggregate_cost_usd": 0.10997036,
+      "mean_cost_usd": 0.03665678666666667,
+      "mean_wall_time_ms": {
+        "total": 1442455,
+        "count": 3
+      },
+      "mean_churn_count": {
+        "total": 18,
+        "count": 3
+      },
+      "mean_conflict_count": {
+        "total": 9,
+        "count": 3
+      },
+      "mean_loc_added": {
+        "total": 635,
+        "count": 3
+      },
+      "mean_loc_deleted": {
+        "total": 338,
+        "count": 3
+      },
+      "mean_diff_bytes": {
+        "total": 36961,
+        "count": 3
+      },
+      "mean_quality": {
+        "held_out_basis_points": {
+          "total": 26180,
+          "count": 3
+        },
+        "breadth_basis_points": {
+          "total": 30000,
+          "count": 3
+        },
+        "anti_shortcut_basis_points": {
+          "total": 19998,
+          "count": 3
+        },
+        "overall_basis_points": {
+          "total": 25589,
+          "count": 3
+        }
+      },
+      "pareto_optimal": false
+    },
+    {
+      "profile_id": "hybrid-frontier-economy-v1",
+      "repetitions": 3,
+      "aggregate_role_usage": {
+        "supervisor": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 3275,
+            "output_tokens": 2115,
+            "total_tokens": 5390
+          },
+          "cost_usd": 0.024867249999999997,
+          "observation": "synthetic_fake"
+        },
+        "child_orchestrator": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 3438,
+            "output_tokens": 1603,
+            "total_tokens": 5041
+          },
+          "cost_usd": 0.04611424,
+          "observation": "synthetic_fake"
+        },
+        "worker": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 3531,
+            "output_tokens": 1953,
+            "total_tokens": 5484
+          },
+          "cost_usd": 0.05581392,
+          "observation": "synthetic_fake"
+        },
+        "auditor": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 3198,
+            "output_tokens": 1698,
+            "total_tokens": 4896
+          },
+          "cost_usd": 0.046739340000000004,
+          "observation": "synthetic_fake"
+        }
+      },
+      "aggregate_usage": {
+        "input_tokens": 13442,
+        "output_tokens": 7369,
+        "total_tokens": 20811
+      },
+      "aggregate_cost_usd": 0.17353475000000002,
+      "mean_cost_usd": 0.05784491666666667,
+      "mean_wall_time_ms": {
+        "total": 1583102,
+        "count": 3
+      },
+      "mean_churn_count": {
+        "total": 25,
+        "count": 3
+      },
+      "mean_conflict_count": {
+        "total": 6,
+        "count": 3
+      },
+      "mean_loc_added": {
+        "total": 859,
+        "count": 3
+      },
+      "mean_loc_deleted": {
+        "total": 164,
+        "count": 3
+      },
+      "mean_diff_bytes": {
+        "total": 39243,
+        "count": 3
+      },
+      "mean_quality": {
+        "held_out_basis_points": {
+          "total": 23877,
+          "count": 3
+        },
+        "breadth_basis_points": {
+          "total": 30000,
+          "count": 3
+        },
+        "anti_shortcut_basis_points": {
+          "total": 15000,
+          "count": 3
+        },
+        "overall_basis_points": {
+          "total": 23188,
+          "count": 3
+        }
+      },
+      "pareto_optimal": false
+    },
+    {
+      "profile_id": "balanced-all-v1",
+      "repetitions": 3,
+      "aggregate_role_usage": {
+        "supervisor": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 3902,
+            "output_tokens": 2438,
+            "total_tokens": 6340
+          },
+          "cost_usd": 0.06383254,
+          "observation": "synthetic_fake"
+        },
+        "child_orchestrator": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 4952,
+            "output_tokens": 1393,
+            "total_tokens": 6345
+          },
+          "cost_usd": 0.04940394,
+          "observation": "synthetic_fake"
+        },
+        "worker": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 3262,
+            "output_tokens": 1900,
+            "total_tokens": 5162
+          },
+          "cost_usd": 0.050796499999999994,
+          "observation": "synthetic_fake"
+        },
+        "auditor": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 4820,
+            "output_tokens": 2011,
+            "total_tokens": 6831
+          },
+          "cost_usd": 0.060259379999999994,
+          "observation": "synthetic_fake"
+        }
+      },
+      "aggregate_usage": {
+        "input_tokens": 16936,
+        "output_tokens": 7742,
+        "total_tokens": 24678
+      },
+      "aggregate_cost_usd": 0.22429235999999997,
+      "mean_cost_usd": 0.07476411999999999,
+      "mean_wall_time_ms": {
+        "total": 1515474,
+        "count": 3
+      },
+      "mean_churn_count": {
+        "total": 20,
+        "count": 3
+      },
+      "mean_conflict_count": {
+        "total": 9,
+        "count": 3
+      },
+      "mean_loc_added": {
+        "total": 544,
+        "count": 3
+      },
+      "mean_loc_deleted": {
+        "total": 303,
+        "count": 3
+      },
+      "mean_diff_bytes": {
+        "total": 33327,
+        "count": 3
+      },
+      "mean_quality": {
+        "held_out_basis_points": {
+          "total": 25695,
+          "count": 3
+        },
+        "breadth_basis_points": {
+          "total": 26250,
+          "count": 3
+        },
+        "anti_shortcut_basis_points": {
+          "total": 24999,
+          "count": 3
+        },
+        "overall_basis_points": {
+          "total": 25659,
+          "count": 3
+        }
+      },
+      "pareto_optimal": false
+    },
+    {
+      "profile_id": "economy-all-v1",
+      "repetitions": 3,
+      "aggregate_role_usage": {
+        "supervisor": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 4348,
+            "output_tokens": 1434,
+            "total_tokens": 5782
+          },
+          "cost_usd": 0.05297066,
+          "observation": "synthetic_fake"
+        },
+        "child_orchestrator": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 4220,
+            "output_tokens": 2458,
+            "total_tokens": 6678
+          },
+          "cost_usd": 0.06871594,
+          "observation": "synthetic_fake"
+        },
+        "worker": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 5177,
+            "output_tokens": 1332,
+            "total_tokens": 6509
+          },
+          "cost_usd": 0.056977269999999997,
+          "observation": "synthetic_fake"
+        },
+        "auditor": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 4031,
+            "output_tokens": 2136,
+            "total_tokens": 6167
+          },
+          "cost_usd": 0.062199010000000006,
+          "observation": "synthetic_fake"
+        }
+      },
+      "aggregate_usage": {
+        "input_tokens": 17776,
+        "output_tokens": 7360,
+        "total_tokens": 25136
+      },
+      "aggregate_cost_usd": 0.24086288000000003,
+      "mean_cost_usd": 0.08028762666666668,
+      "mean_wall_time_ms": {
+        "total": 2195314,
+        "count": 3
+      },
+      "mean_churn_count": {
+        "total": 15,
+        "count": 3
+      },
+      "mean_conflict_count": {
+        "total": 9,
+        "count": 3
+      },
+      "mean_loc_added": {
+        "total": 1257,
+        "count": 3
+      },
+      "mean_loc_deleted": {
+        "total": 427,
+        "count": 3
+      },
+      "mean_diff_bytes": {
+        "total": 63640,
+        "count": 3
+      },
+      "mean_quality": {
+        "held_out_basis_points": {
+          "total": 23271,
+          "count": 3
+        },
+        "breadth_basis_points": {
+          "total": 22500,
+          "count": 3
+        },
+        "anti_shortcut_basis_points": {
+          "total": 15000,
+          "count": 3
+        },
+        "overall_basis_points": {
+          "total": 21010,
+          "count": 3
+        }
+      },
+      "pareto_optimal": false
+    }
+  ],
+  "pareto_conclusion": {
+    "status": "refused_incomparable_dispatch_evidence",
+    "claim": {
+      "scope": "dispatch",
+      "provider_execution_difference_established": false,
+      "notice": "comparison is scoped to MACO-dispatched model selections; it does not establish that the provider executed profiles differently"
+    }
+  },
+  "pareto_frontier": []
+}

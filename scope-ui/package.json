@@ -1,0 +1,10 @@
+{
+  "name": "maco-scope-ui",
+  "private": true,
+  "type": "module",
+  "description": "Loopback web client for MACO Scope. No runtime dependencies.",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "build": "node scripts/build.mjs"
+  }
+}

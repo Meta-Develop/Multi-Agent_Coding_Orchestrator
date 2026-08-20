@@ -1,0 +1,19 @@
+{
+  "root": "/workspace/repository",
+  "entries": [
+    {
+      "path": "src",
+      "kind": "directory",
+      "size_bytes": null,
+      "category": "directory",
+      "git_status": "directory"
+    },
+    {
+      "path": "src/lib.rs",
+      "kind": "file",
+      "size_bytes": 128,
+      "category": "rust",
+      "git_status": "modified"
+    }
+  ]
+}

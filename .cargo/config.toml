@@ -1,0 +1,8 @@
+# Keep native code inside the checksum-verified Cargo closure. Both upstream
+# build scripts otherwise prefer compatible system libraries when present.
+[env]
+LIBGIT2_NO_VENDOR = { value = "0", force = true }
+LIBZ_SYS_STATIC = { value = "1", force = true }
+# Keep each libtest harness deterministic across hosts. Production binaries ignore this
+# standard test-harness variable and retain their measured process-capacity default.
+RUST_TEST_THREADS = { value = "3", force = true }

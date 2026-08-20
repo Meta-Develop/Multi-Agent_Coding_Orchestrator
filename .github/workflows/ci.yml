@@ -1,44 +1,55 @@
 name: Rust CI
 
-"on":
+on:
   pull_request:
   push:
-  schedule:
-    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: >-
-    rust-ci-${{ github.workflow }}-${{
-    github.event.pull_request.head.repo.full_name || github.repository }}-${{
-    github.head_ref || github.ref_name }}
+  group: rust-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
+  CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
-  # Match the flake.lock development shell used for local verification.
-  RUSTUP_TOOLCHAIN: "1.94.1"
 
 jobs:
+  repository-portability:
+    name: Repository portability
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run repository portability unit tests
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+      - name: Check tracked path portability
+        run: python3 scripts/check_repository_portability.py
+
   linux:
     name: Linux fmt, check, clippy, and test
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Select stable Rust with required components
+      - name: Install repository Rust toolchain
         run: |
-          rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+          rustup toolchain install
           rustc --version --verbose
           cargo --version --verbose
+          cargo clippy --version
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -50,10 +61,217 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run all tests
-        run: cargo test --locked --all-targets
+        shell: bash
+        run: |
+          current_cgroup="$(awk -F: '$1 == "0" && $2 == "" { print $3; exit }' /proc/self/cgroup)"
+          delegated_user_manager=false
+          while IFS= read -r component; do
+            if [[ "$component" == user@*.service ]]; then
+              delegated_user_manager=true
+              break
+            fi
+          done < <(tr '/' '\n' <<< "$current_cgroup")
+
+          test_harness_args=()
+          if [[ "$delegated_user_manager" == false ]]; then
+            reason="current cgroup ${current_cgroup:-<unified cgroup v2 entry absent>} is not inside a delegated systemd user manager"
+            test_harness_args+=(--exact --show-output)
+            while IFS= read -r test_name; do
+              [[ -z "$test_name" ]] && continue
+              printf 'SKIP %s: %s\n' "$test_name" "$reason"
+              printf '::notice title=Containment test skipped::%s: %s\n' "$test_name" "$reason"
+              test_harness_args+=(--skip "$test_name")
+            done <<'CONTAINMENT_DEPENDENT_TESTS'
+          agent::tests::allowed_provider_command_timeout_with_keep_claims_leaves_claim_active
+          agent::tests::fake_provider_agent_run_edits_only_agent_worktree_and_releases_claim
+          agent::tests::fake_provider_agent_run_reports_unclaimed_changes
+          agent::tests::fake_provider_patch_with_mismatched_diff_path_is_rejected_before_apply
+          agent::tests::provider_commands_are_disabled_by_default_and_not_executed
+          autopilot::tests::autopilot_authenticated_follow_up_dispatch_sets_boolean_after_real_gates
+          autopilot::tests::autopilot_cancellation_after_source_gate_refuses_dispatch_and_finalizes_cancelled
+          autopilot::tests::autopilot_cascade_error_after_authenticated_follow_up_start_never_reports_false
+          autopilot::tests::autopilot_generated_plan_refusal_keeps_dispatch_boolean_false
+          autopilot::tests::autopilot_marker_without_child_checkpoint_refuses_a_false_final_report
+          autopilot::tests::autopilot_max_child_dispatches_refuses_first_follow_up_before_dispatch_and_releases_claim
+          autopilot::tests::autopilot_max_zero_refuses_source_before_any_dispatch_and_leaves_no_state
+          autopilot::tests::autopilot_rechecks_dirty_primary_immediately_before_supervisor_dispatch
+          autopilot::tests::autopilot_reloads_effective_profile_at_call_site_before_starting_supervisor
+          autopilot::tests::autopilot_source_child_cancellation_propagates_and_cleanly_unwinds
+          autopilot::tests::bounded_repository_status_detects_present_deleted_and_untracked_paths
+          autopilot::tests::empty_validation_refuses_real_publication_before_review_or_publish
+          autopilot::tests::fake_forge_with_fake_reviewer_is_local_and_non_authoritative
+          autopilot::tests::interrupted_autopilot_queue_resumes_through_supervise_without_duplicate_identity
+          autopilot::tests::review_mutation_changes_binding_and_prevents_publication
+          autopilot::tests::unsupported_depth_shapes_are_typed_preflight_permission_expansions
+          autopilot::tests::validate_autopilot_plan_refuses_empty_path_proposal
+          autopilot::tests::write_lease_excludes_competing_access_through_review_and_releases_on_error
+          cli::tests::merge_apply_auto_reap_waits_for_trunk_then_reaps_on_finalization_rerun
+          cli::tests::merge_apply_json_delivers_unclaimed_edits_denial_to_integration_controller
+          external_agent::tests::verified_contained_fake_app_server_proves_duplex_ordering_and_confinement
+          merge::tests::authenticated_megafile_failure_refuses_merge_before_primary_mutation
+          merge::tests::candidate_collection_holds_read_lease_until_snapshot_finishes
+          merge::tests::candidate_validation_clears_shell_startup_and_private_network_environment
+          merge::tests::candidate_validation_total_deadline_returns_failed_report
+          merge::tests::collision_decision_is_persisted_without_weakening_merge_blockers
+          merge::tests::decomposition_bypass_requires_finalized_evidence_and_diff_backed_structure
+          merge::tests::decomposition_completion_is_persisted_only_after_successful_merge
+          merge::tests::decomposition_rejects_same_path_content_substitution_after_finalized_review
+          merge::tests::initialized_repository_fingerprint_ignores_ignored_output
+          merge::tests::megafile_policy_is_warn_only_by_default_and_reuses_typed_blocker_detail
+          merge::tests::semantic_conflicts_classify_import_only_as_low_risk
+          merge::tests::semantic_conflicts_mark_unresolved_paths_as_degraded
+          merge::tests::semantic_conflicts_report_same_function_and_dependent_files
+          merge::tests::semantic_conflicts_report_signature_and_impl_overlap
+          planning::tests::collect_repo_files_excludes_git_ignored_directory
+          planning::tests::collect_repo_files_excludes_local_agent_runtime_state
+          planning::tests::collect_repo_files_never_follows_links_or_accepts_unsafe_files
+          planning::tests::exact_symbol_scope_avoids_a_shared_megafile_module_attractor
+          planning::tests::fake_provider_proposes_a_validated_disjoint_plan
+          planning::tests::fake_provider_replans_from_feedback_with_a_hard_attempt_limit
+          planning::tests::optional_provider_uses_heuristic_fallback_when_unconfigured
+          planning::tests::propose_task_decomposition_coalesces_transitive_scope_overlap
+          planning::tests::propose_task_decomposition_is_deterministic_and_exposes_coverage_and_intents
+          planning::tests::propose_task_path_proposal_keeps_empty_result_without_readme
+          planning::tests::propose_task_path_proposal_reports_filename_only_degradation
+          planning::tests::propose_task_paths_does_not_match_common_symbol_words
+          planning::tests::propose_task_paths_matches_real_symbol_mentions
+          planning::tests::propose_task_paths_requires_standalone_short_identifier_tokens
+          planning::tests::propose_task_paths_routes_docs_and_rust_tasks_separately
+          planning::tests::provider_plan_rejects_overlapping_assignments
+          process_runner::tests::agent_lifecycle_metadata_stamps_environment_and_registers_running_process
+          process_runner::tests::external_codex_outer_sandbox_enforces_control_and_report_write_boundaries
+          process_runner::tests::required_containment_kills_setsid_delayed_mutation_with_closed_stdio
+          process_runner::tests::required_containment_kills_setsid_pipe_and_stdin_holders
+          process_runner::tests::strict_runtime_files_ignore_ambient_tmpdir
+          process_runner::tests::strict_target_cannot_create_hardlinks_or_fifos_after_start_gate
+          process_runner::tests::strict_target_cannot_launch_sibling_user_unit
+          process_runner::tests::target_environment_cannot_overwrite_guardian_gate_state
+          process_runner::tests::unsupported_path_masking_refuses_before_target_and_leaves_no_residue
+          publication::tests::borrowed_write_lease_publishes_without_nested_read_lease
+          publication::tests::prepare_already_clean_candidate_preserves_existing_commit
+          publication::tests::prepare_dirty_candidate_commits_exact_content_without_external_effects
+          publication::tests::prepare_holds_and_releases_worktree_and_repository_locks
+          publication::tests::prepare_refuses_drift_before_creating_local_commit
+          publication::tests::standalone_preview_coexists_with_reader_and_does_not_commit
+          publication::tests::standalone_publish_excludes_same_worktree_for_full_lifecycle
+          publication::tests::strict_prepared_publish_accepts_matching_bound_evidence
+          publication::tests::strict_prepared_publish_blocks_candidate_drift_before_effects
+          repo_map::tests::explicit_file_sampling_is_language_agnostic_and_does_not_create_state
+          repo_map::tests::scan_excludes_generated_and_local_state_paths
+          repo_map::tests::scan_reports_but_never_follows_links_or_special_files
+          repo_map::tests::scan_returns_stable_sorted_entries_and_categories
+          supervise::assignment_execution::decomposition_tests::review_lens_execution_boundary_hides_primary_and_child_roots_from_hostile_process
+          supervise::tests::acceptance_integrity::finalized_decomposition_evidence_binds_exact_candidate_and_exposes_chain_ids
+          supervise::tests::acceptance_integrity::supervisor_injects_binding_from_stable_candidate_and_detects_later_bytes
+          supervise::tests::budget::budget_integration_serial_scheduler_accounts_exact_hard_boundary_by_process_role
+          supervise::tests::licensed_breakage::declared_scoped_breakage_passes_and_journals_dispatchable_follow_up_plan
+          supervise::tests::licensed_breakage::generated_follow_up_deleted_retention_is_journaled_probe_failed_and_retryable
+          supervise::tests::licensed_breakage::generated_follow_up_exact_loaded_plan_drift_refuses_before_child_dispatch
+          supervise::tests::licensed_breakage::generated_follow_up_initial_deleted_retention_is_typed_without_queue
+          supervise::tests::licensed_breakage::generated_follow_up_real_loader_rejects_stripped_required_section
+          supervise::tests::licensed_breakage::generated_follow_up_rechecks_machine_global_after_profile_before_dispatch
+          supervise::tests::licensed_breakage::generated_follow_up_rechecks_primary_after_profile_before_dispatch
+          supervise::tests::licensed_breakage::held_ambiguous_finalized_round_two_tasks_refuse_maximum_round
+          supervise::tests::licensed_breakage::held_ambiguous_reconciles_newly_finalized_exact_subordinate
+          supervise::tests::licensed_breakage::held_ambiguous_refuses_finalized_subordinate_plan_drift_without_counting
+          supervise::tests::licensed_breakage::immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan
+          supervise::tests::licensed_breakage::licensed_follow_up_cascade_dispatches_one_authenticated_round_and_keeps_primary_untouched
+          supervise::tests::licensed_breakage::licensed_follow_up_enqueue_interruption_resumes_without_rerunning_source
+          supervise::tests::licensed_breakage::licensed_follow_up_survives_authenticated_final_report_resume_without_redispatch
+          supervise::tests::licensed_breakage::licensed_worker_failure_remains_subject_to_child_and_parent_auditor_gates
+          supervise::tests::plan_runtime::configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor
+          supervise::tests::plan_runtime::goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps
+          supervise::tests::plan_runtime::known_unavailable_child_runtime_default_reaches_production_app_server_argv_before_dispatch
+          supervise::tests::plan_runtime::local_deterministic_fake_fallback_reaches_shared_supervisor_core_without_external_dispatch
+          supervise::tests::plan_runtime::plain_text_task_without_actionable_scope_returns_guidance
+          supervise::tests::plan_runtime::stacked_review_lenses_execute_every_configured_boundary_and_aggregate
+          supervise::tests::plan_runtime::supervisor_input_loader_accepts_direct_regular_files_and_refuses_unsafe_inputs
+          supervise::tests::primary_worktree::bounded_primary_command_run_mutates_scope_holds_and_releases_claim_and_marks_reports
+          supervise::tests::primary_worktree::dirty_primary_scope_refuses_before_dispatch_and_releases_claim
+          supervise::tests::primary_worktree::primary_worktree_outside_scope_mutation_fails_integrity_and_releases_claim
+          supervise::tests::prompts_gates::auditor_rejection_reenters_child_and_parent_auditor
+          supervise::tests::prompts_gates::repeated_auditor_denial_uses_one_correlation_across_prompts_and_journal
+          supervise::tests::prompts_gates::repeated_validation_denial_uses_one_correlation_across_prompts_and_journal
+          supervise::tests::prompts_gates::safe_claim_conflict_narrows_scope_before_child_launch
+          supervise::tests::prompts_gates::validation_gate_reenters_child_with_injection_safe_prompt_and_journal
+          supervise::tests::reaudit::evidence_only_dispatch_physically_denies_mutate_validate_restore
+          supervise::tests::reaudit::evidence_only_reaudit_refuses_modified_preserved_tree_before_dispatch
+          supervise::tests::reaudit::evidence_rejection_reaudits_preserved_diff_without_worker_rerun_and_can_accept
+          supervise::tests::reaudit::ordinary_report_refuses_candidate_mismatch_across_parent_audit
+          supervise::tests::run_artifacts::authenticated_resume_finalizes_without_reexecuting_completed_work_and_preserves_budget
+          supervise::tests::run_artifacts::fake_supervise_run_finalizes_manifested_report_tree_events
+          supervise::tests::run_artifacts::injected_runner_retries_structural_report_once_then_runs_parent_auditor
+          supervise::tests::run_artifacts::narrowed_assignment_crash_after_final_report_plan_resumes_against_actual_claim_scope
+          supervise::tests::run_artifacts::scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch
+          supervise::tests::run_artifacts::verified_run_entry_creates_and_materializes_assignment_worktree
+          supervise::tests::run_artifacts::verified_run_entry_refuses_dirty_repository_before_assignment_creation
+          supervise::tests::scheduler::concurrent_disjoint_assignments_make_progress_and_finalize_in_plan_order
+          supervise::tests::scheduler::concurrent_failure_isolated_and_retry_retains_assignment_slot
+          supervise::tests::scheduler::external_termination_named_conflict_release_and_reacquisition_form_one_recovery_sequence
+          supervise::tests::scheduler::nonaccepted_run_releases_claim_and_followup_reacquires_same_path
+          supervise::tests::scheduler::semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead
+          supervise::tests::scheduler::semantic_warn_previews_are_plan_ordered_once_at_serial_and_concurrent_bounds
+          supervise::tests::scheduler::serial_overlapping_assignments_release_between_slots_with_legacy_scratch_names
+          supervise::tests::scheduler::supervise_holds_exclusive_worktree_lease_through_child_and_parent_auditor
+          worktree::tests::bounded_status_concurrent_lifecycles_serialize_without_cross_deletion
+          worktree::tests::bounded_status_ignores_ambient_and_repository_process_helpers
+          worktree::tests::bounded_status_refuses_entry_output_and_time_budget_exhaustion
+          worktree::tests::bounded_status_scavenges_prior_crash_index_and_symlink_tree
+          worktree::tests::create_retention_applies_after_new_worktree_creation
+          worktree::tests::create_size_retention_reserves_the_new_lane_before_reclaiming_older_lanes
+          worktree::tests::gc_boundary_protection_does_not_consume_count_or_size_retention
+          worktree::tests::gc_classifies_untracked_only_and_requires_exact_allowlist_for_lane_removal
+          worktree::tests::gc_dirtiness_snapshot_preserves_non_utf8_paths_and_detects_exact_change
+          worktree::tests::gc_dry_run_reports_without_removing_worktree_or_target
+          worktree::tests::gc_full_removal_reports_final_approved_untracked_paths
+          worktree::tests::gc_ignored_inventory_excludes_large_runtime_categories_before_bounds
+          worktree::tests::gc_late_protection_does_not_consume_count_or_size_retention
+          worktree::tests::gc_protects_dirty_worktree
+          worktree::tests::gc_protects_ignored_only_output_until_its_exact_path_is_allowed
+          worktree::tests::gc_refuses_late_ignored_output_after_reviewed_snapshot
+          worktree::tests::gc_refuses_live_nested_cargo_target_for_full_and_target_only_reclaim
+          worktree::tests::gc_refuses_target_replacement_between_probe_and_removal
+          worktree::tests::gc_removes_finished_clean_worktree_and_keeps_branch
+          worktree::tests::gc_report_serializes_non_utf8_untracked_paths_losslessly_and_escapes_human_text
+          worktree::tests::gc_retention_keeps_newest_and_removes_retained_target
+          worktree::tests::gc_revalidates_tracked_and_unapproved_output_after_liveness
+          worktree::tests::gc_scopes_managed_bindings_to_the_exact_requested_root
+          worktree::tests::gc_size_retention_keeps_the_newest_prefix_and_counts_lane_bytes_once
+          worktree::tests::gc_target_cleanup_rechecks_dirtiness_after_boundary_liveness
+          worktree::tests::gc_targets_only_reclaims_untracked_lane_target_and_keeps_lane_branch_and_orphan
+          worktree::tests::gc_unknown_and_live_evidence_protects_every_target_reclaim_path
+          worktree::tests::gc_without_requested_root_preserves_all_authenticated_root_scope
+          worktree::tests::lifecycle_dry_run_aggregates_worktree_and_explicit_o2_artifact_policy
+          worktree::tests::lifecycle_requires_explicit_trunk_containment_without_changing_manual_gc
+          worktree::tests::lifecycle_retry_supersedes_exact_authenticated_predecessor_despite_retention
+          worktree::tests::neutral_worktree_production_cleanliness_seam_uses_exact_base_without_claim
+          worktree::tests::remove_prepared_gc_recovery_refuses_changed_dirtiness_snapshot
+          worktree::tests::repository_cleanliness_capability_creates_clean_managed_worktree
+          worktree::tests::repository_cleanliness_capability_refuses_dirty_primary_before_create
+          worktree::tests::repository_cleanliness_capability_rejects_binding_drift
+          worktree::tests::repository_cleanliness_capability_rejects_cross_repository_use
+          worktree::tests::repository_local_sweep_uses_primary_hint_despite_stale_lane_metadata
+          worktree::tests::workspace_sweep_continues_after_typed_repository_open_failure
+          worktree::tests::workspace_sweep_defaults_to_dry_run_and_requires_apply_for_removal
+          worktree::tests::workspace_sweep_discovers_direct_child_repo_local_and_managed_roots_once_each
+          worktree::tests::workspace_sweep_discovers_repository_local_worktree_root
+          worktree::tests::workspace_sweep_inspects_repository_and_group_with_maco_prefix
+          worktree::tests::workspace_sweep_passes_retention_and_keep_target_options_to_gc
+          worktree::tests::workspace_sweep_reports_symlinked_group_and_continues_valid_group
+          CONTAINMENT_DEPENDENT_TESTS
+          fi
+
+          if ((${#test_harness_args[@]})); then
+            cargo test --locked --lib -- "${test_harness_args[@]}"
+            cargo test --locked --bins --test '*' -- --show-output
+            cargo test --locked --bench '*' --examples
+          else
+            cargo test --locked --all-targets
+          fi
 
   portable-build:
     name: ${{ matrix.os }} compile and test build
+    needs: repository-portability
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -64,15 +282,16 @@ jobs:
           - windows-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Select stable Rust
+      - name: Install repository Rust toolchain
         run: |
-          rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+          rustup toolchain install
           rustc --version --verbose
           cargo --version --verbose
+          cargo clippy --version
 
       - name: Check all targets against Cargo.lock
         run: cargo check --locked --all-targets

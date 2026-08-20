@@ -1,24 +1,73 @@
 [package]
 name = "multi-agent-coding-orchestrator"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
+rust-version = "1.89"
 description = "Local-first multi-agent coding orchestrator"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-or-later"
+readme = "README.md"
+documentation = "https://docs.rs/multi-agent-coding-orchestrator"
+repository = "https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator"
+keywords = ["orchestration", "agents", "git", "worktree", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    ".agent/**",
+    ".agents/**",
+    ".github/**",
+    ".maco/**",
+    ".maco-cache/**",
+    "AGENTS.md",
+]
+default-run = "maco"
+
+[[bin]]
+name = "multi-agent-coding-orchestrator"
+path = "src/main.rs"
+
+[[bin]]
+name = "maco"
+path = "src/bin/maco.rs"
+
+[[bench]]
+name = "coordination"
+harness = false
 
 [dependencies]
 anyhow = "1.0.103"
 clap = { version = "4", features = ["derive", "env"] }
 dashmap = "6"
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+libc = "0.2"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 syn = { version = "2", features = ["full", "extra-traits"] }
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
-tempfile = "3"
+criterion = "0.8.2"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"

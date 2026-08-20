@@ -1,0 +1,9 @@
+{
+  "role_economics_profile": {
+    "role_models": {
+      "supervisor": {
+        "unavailable_model_fallback": "not_a_runtime_variant"
+      }
+    }
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "run_id": "fixture-run-v2",
+  "role_economics_profile": {
+    "schema_version": 2,
+    "name": "provisional-phase-a-hybrid-effort-v1",
+    "evidence": "fixture process-observed execution evidence",
+    "evidence_notice": "fixture only",
+    "production_eligible": false,
+    "model_availability": "available",
+    "overridden_roles": [],
+    "role_models": {
+      "supervisor": { "model": "gpt-fixture", "reasoning_effort": "xhigh", "unavailable_model_fallback": "runtime_default" },
+      "child_orchestrator": { "model": "gpt-fixture", "reasoning_effort": "xhigh", "unavailable_model_fallback": "runtime_default" },
+      "worker": { "model": "gpt-fixture", "reasoning_effort": "medium", "unavailable_model_fallback": "runtime_default" },
+      "gate_classifier": { "model": "gpt-fixture", "reasoning_effort": "high", "unavailable_model_fallback": "local_deterministic_fake" },
+      "auditor": { "model": "gpt-fixture", "reasoning_effort": "xhigh", "unavailable_model_fallback": "runtime_default" }
+    },
+    "model_catalog_observation": "consulted",
+    "execution": {
+      "assignment_count": 2,
+      "started_assignment_count": 2,
+      "completed_assignment_count": 2,
+      "concurrency": {
+        "configured_max_concurrent_children": 2,
+        "policy_input_observation": "not_retained",
+        "policy_input": null,
+        "policy_input_unavailable_reason": "the scheduler receives only the resolved concurrency bound; the originating policy input is not retained at the scheduler reporting boundary",
+        "achieved_max_concurrent_children": 2,
+        "achieved_mean_concurrent_children": 1.75,
+        "achieved_mean_observation": "scheduler_observed",
+        "achieved_mean_unavailable_reason": null
+      },
+      "role_bindings": {
+        "supervisor": { "configured_model": "gpt-fixture", "configured_reasoning_effort": "xhigh", "resolved_model": "gpt-fixture", "resolved_reasoning_effort": "xhigh", "observation": "runtime_catalog_resolved" },
+        "child_orchestrator": { "configured_model": "gpt-fixture", "configured_reasoning_effort": "xhigh", "resolved_model": "gpt-fixture", "resolved_reasoning_effort": "xhigh", "observation": "runtime_catalog_resolved" },
+        "worker": { "configured_model": "gpt-fixture", "configured_reasoning_effort": "medium", "resolved_model": "gpt-fixture", "resolved_reasoning_effort": "medium", "observation": "runtime_catalog_resolved" },
+        "gate_classifier": { "configured_model": "gpt-fixture", "configured_reasoning_effort": "high", "resolved_model": "gpt-fixture", "resolved_reasoning_effort": "high", "observation": "runtime_catalog_resolved" },
+        "auditor": { "configured_model": "gpt-fixture", "configured_reasoning_effort": "xhigh", "resolved_model": "gpt-fixture", "resolved_reasoning_effort": "xhigh", "observation": "runtime_catalog_resolved" }
+      },
+      "usage": {
+        "total_usage": { "input_tokens": 1200, "output_tokens": 300, "total_tokens": 1500 },
+        "total_cost_usd": 0.0125,
+        "usage_complete": true,
+        "observation": "supervisor_aggregate"
+      }
+    }
+  }
+}

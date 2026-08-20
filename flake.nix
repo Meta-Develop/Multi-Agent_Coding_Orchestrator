@@ -1,9 +1,15 @@
 {
   description = "Development shell for the Multi-Agent Coding Orchestrator";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
-  outputs = { nixpkgs, ... }:
+  outputs = { nixpkgs, rust-overlay, ... }:
     let
       systems = [
         "x86_64-linux"
@@ -17,21 +23,19 @@
     {
       devShells = forEachSystem (system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ rust-overlay.overlays.default ];
+          };
+          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         in
         {
           default = pkgs.mkShell {
-            packages = with pkgs; [
-              cargo
-              rustc
-              rustfmt
-              clippy
-              pkg-config
-              openssl
-              zlib
-              libssh2
-              libgit2
-              cmake
+            packages = [
+              rustToolchain
+              pkgs.python3
+              pkgs.cargo-audit
+              pkgs.cargo-deny
             ];
 
             RUST_BACKTRACE = "1";
