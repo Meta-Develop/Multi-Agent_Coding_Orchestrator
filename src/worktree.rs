@@ -187,7 +187,11 @@ pub struct PendingWorktreeOperation {
 pub struct WorktreeRetentionPolicy {
     pub max_age: Option<Duration>,
     pub max_count: Option<usize>,
-    /// Maximum apparent bytes retained across newest age/count survivors.
+    /// Maximum apparent bytes retained across value-density survivors.
+    ///
+    /// Ranking is GreedyDual-Size / Landlord: rebuild cost per retained byte,
+    /// with recency as the tie-breaker when cost is unknown or equal. This
+    /// field remains a hard size bound on top of that ranking.
     pub max_total_bytes: Option<u64>,
 }
 
@@ -1728,6 +1732,7 @@ impl WorktreeManager {
                 .join(requested_root)
         };
         let root = SafeRoot::open_or_create_managed(&requested_root)?;
+        crate::lane_build::ensure_lane_build_configuration(root.path())?;
         let worktree_path = root.direct_child(&name)?;
 
         if find_worktree(&repo, &name)?.is_some() {
@@ -2372,6 +2377,9 @@ impl WorktreeManager {
             .transpose()?;
         let restrict_to_requested_root = options.worktree_root.is_some();
         let worktree_root = resolve_worktree_root(&repo, options.worktree_root.clone())?;
+        if !options.dry_run {
+            crate::lane_build::ensure_lane_build_configuration(&worktree_root)?;
+        }
         let allowed_untracked_paths =
             normalize_gc_allowed_untracked_paths(&options.allowed_untracked_paths)?;
         let active_claims = active_claim_agent_ids(&repo)?;
@@ -2655,14 +2663,26 @@ impl WorktreeManager {
                 untracked_paths,
                 apparent_worktree_bytes: size.worktree_bytes,
                 apparent_target_bytes: size.target_bytes,
+                rebuild_cost_ms: load_lane_rebuild_cost(&verified.path),
             });
         }
 
         let now = unix_now_nanos()?;
         candidates.sort_by(|left, right| {
-            gc_created_at(&right.binding)
-                .cmp(&gc_created_at(&left.binding))
-                .then_with(|| left.binding.name.cmp(&right.binding.name))
+            cmp_retention_keep_order(
+                &RetentionKeepKey {
+                    rebuild_cost_ms: left.rebuild_cost_ms,
+                    apparent_bytes: left.apparent_worktree_bytes,
+                    created_at_unix_nanos: gc_created_at(&left.binding),
+                    name: &left.binding.name,
+                },
+                &RetentionKeepKey {
+                    rebuild_cost_ms: right.rebuild_cost_ms,
+                    apparent_bytes: right.apparent_worktree_bytes,
+                    created_at_unix_nanos: gc_created_at(&right.binding),
+                    name: &right.binding.name,
+                },
+            )
         });
         // Retention is committed only on remove / retain / dry-run exits.
         // Protection continues deliberately drop `decision.committed_state` so

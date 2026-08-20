@@ -13,6 +13,7 @@ pub mod external_agent;
 pub mod field_guide;
 pub mod gate_denial;
 pub mod inbox;
+pub mod lane_build;
 pub mod live_claim;
 pub mod llm;
 pub mod machine_global;

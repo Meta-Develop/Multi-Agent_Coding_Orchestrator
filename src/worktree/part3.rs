@@ -92,7 +92,7 @@ fn prune_unregistered_worktree_directories(
     let git_registered = git_registered_worktree_names(repo, root.path())?;
     let mut orphans = Vec::new();
     for child_name in root.direct_child_names_bounded(MAX_MANAGED_RECORDS)? {
-        if child_name.to_string_lossy().starts_with(".maco-") {
+        if is_reserved_worktree_root_child(&child_name) {
             continue;
         }
         let Some(name) = child_name.to_str() else {
@@ -2977,6 +2977,12 @@ fn validate_branch_name(branch_name: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn is_reserved_worktree_root_child(name: impl AsRef<OsStr>) -> bool {
+    let name = name.as_ref();
+    name.to_string_lossy().starts_with(".maco-")
+        || crate::lane_build::is_lane_build_config_directory(name)
 }
 
 fn default_worktree_root(repo: &Repository) -> PathBuf {

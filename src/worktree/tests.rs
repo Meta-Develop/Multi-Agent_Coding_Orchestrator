@@ -20,6 +20,198 @@ fn bounded_status_parsers_are_lossless_and_fail_closed() {
     assert!(parse_nul_paths(b"../escape\0", 2).is_err());
 }
 
+#[cfg(target_os = "linux")]
+fn init_bounded_status_runtime_root_repo(temp: &TempDir) -> PathBuf {
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    commit_readme(&repo).expect("initial commit");
+    repo_path
+}
+
+#[cfg(target_os = "linux")]
+fn canonical_target_dir() -> Option<PathBuf> {
+    fs::canonicalize(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target")).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn path_on_other_filesystem(reference: &Path) -> Option<PathBuf> {
+    let mut candidates = vec![PathBuf::from("/tmp")];
+    if let Some(target) = canonical_target_dir() {
+        candidates.push(target);
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_dir() && !existing_paths_share_device(reference, candidate))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_status_runtime_root_uses_an_explicit_override() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = init_bounded_status_runtime_root_repo(&temp);
+    let override_root = temp.path().join("override-status-root");
+    let config = BoundedStatusRuntimeRootConfig {
+        explicit_root: Some(override_root.clone()),
+        tmpdir: Some(temp.path().join("ignored-tmpdir")),
+        prefer_shared_tmp: true,
+    };
+    let root = open_bounded_status_runtime_root(&repo_path, &config).expect("open override");
+    assert_eq!(root.path(), override_root.as_path());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_status_runtime_root_honors_tmpdir_when_shared_tmp_is_enabled() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = init_bounded_status_runtime_root_repo(&temp);
+    let tmpdir = temp.path().join("status-tmp");
+    fs::create_dir(&tmpdir).expect("tmpdir");
+    let config = BoundedStatusRuntimeRootConfig {
+        explicit_root: None,
+        tmpdir: Some(tmpdir.clone()),
+        prefer_shared_tmp: true,
+    };
+    let root = open_bounded_status_runtime_root(&repo_path, &config).expect("open tmpdir root");
+    assert_eq!(
+        root.path(),
+        tmpdir
+            .join(shared_bounded_status_runtime_root_name())
+            .as_path()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_status_runtime_root_fails_closed_when_the_explicit_root_is_empty() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = init_bounded_status_runtime_root_repo(&temp);
+    let config = BoundedStatusRuntimeRootConfig {
+        explicit_root: Some(PathBuf::new()),
+        tmpdir: None,
+        prefer_shared_tmp: true,
+    };
+    let error = open_bounded_status_runtime_root(&repo_path, &config)
+        .expect_err("empty explicit root must fail closed");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(BOUNDED_STATUS_RUNTIME_ROOT_ENV),
+        "unexpected empty-root error: {message}"
+    );
+    assert!(
+        message.contains("empty"),
+        "unexpected empty-root error: {message}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_status_runtime_root_fails_closed_when_the_explicit_root_is_a_file() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = init_bounded_status_runtime_root_repo(&temp);
+    let file_root = temp.path().join("not-a-directory");
+    fs::write(&file_root, b"nope").expect("write file root");
+    let config = BoundedStatusRuntimeRootConfig {
+        explicit_root: Some(file_root),
+        tmpdir: None,
+        prefer_shared_tmp: true,
+    };
+    let error = open_bounded_status_runtime_root(&repo_path, &config)
+        .expect_err("file explicit root must fail closed");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(BOUNDED_STATUS_RUNTIME_ROOT_ENV),
+        "unexpected file-root error: {message}"
+    );
+    assert!(
+        message.contains("unusable"),
+        "unexpected file-root error: {message}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_status_runtime_root_fails_closed_when_the_explicit_root_crosses_filesystems() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = init_bounded_status_runtime_root_repo(&temp);
+    let Some(foreign_parent) = path_on_other_filesystem(temp.path()) else {
+        return;
+    };
+    let foreign_root = foreign_parent.join(format!(
+        "maco-test-bounded-status-crossfs-{}",
+        std::process::id()
+    ));
+    let config = BoundedStatusRuntimeRootConfig {
+        explicit_root: Some(foreign_root.clone()),
+        tmpdir: None,
+        prefer_shared_tmp: true,
+    };
+    let error = open_bounded_status_runtime_root(&repo_path, &config)
+        .expect_err("cross-filesystem explicit root must fail closed");
+    let _ = fs::remove_dir_all(&foreign_root);
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("different filesystem"),
+        "unexpected cross-filesystem error: {message}"
+    );
+    assert!(
+        message.contains(BOUNDED_STATUS_RUNTIME_ROOT_ENV),
+        "cross-filesystem error must name the override: {message}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_status_runtime_root_skips_an_unusable_tmpdir_and_uses_a_worktree_local_root() {
+    let Some(host) = canonical_target_dir() else {
+        return;
+    };
+    if existing_paths_share_device(&host, Path::new("/tmp")) {
+        return;
+    }
+    let temp = TempDir::new_in(&host).expect("tempdir on target filesystem");
+    let repo_path = init_bounded_status_runtime_root_repo(&temp);
+    let foreign_parent = PathBuf::from("/tmp");
+    let config = BoundedStatusRuntimeRootConfig {
+        explicit_root: None,
+        tmpdir: Some(foreign_parent.clone()),
+        prefer_shared_tmp: true,
+    };
+    let root = open_bounded_status_runtime_root(&repo_path, &config)
+        .expect("unusable TMPDIR must fall back to a same-filesystem root");
+    assert_eq!(
+        existing_path_device(root.path()),
+        existing_path_device(&repo_path),
+        "fallback root {} is not on the worktree filesystem",
+        root.path().display()
+    );
+    assert!(
+        !root.path().starts_with(&foreign_parent),
+        "fallback still used the unusable TMPDIR {}",
+        root.path().display()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_status_runtime_root_test_default_stays_isolated_from_shared_tmp() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = init_bounded_status_runtime_root_repo(&temp);
+    let root = bounded_status_runtime_root(&repo_path).expect("test default root");
+    assert!(
+        !root
+            .path()
+            .ends_with(shared_bounded_status_runtime_root_name()),
+        "test default used the shared per-user tmp root {}",
+        root.path().display()
+    );
+    assert!(
+        root.path().starts_with(temp.path()),
+        "test default root {} was not isolated next to the fixture",
+        root.path().display()
+    );
+}
+
 #[test]
 fn bounded_index_accepts_only_plain_sha1_entries_and_tree_cache() {
     fn empty_index(extension: Option<(&[u8; 4], &[u8])>) -> Vec<u8> {
@@ -2136,6 +2328,115 @@ fn gc_retention_keeps_newest_and_removes_retained_target() {
     assert!(report.entries.iter().any(
         |entry| entry.name == "agent-new-gc" && entry.reason == WorktreeGcReason::TargetRemoved
     ));
+}
+
+#[test]
+fn retention_keep_order_prefers_higher_rebuild_cost_per_byte() {
+    use std::cmp::Ordering;
+    let expensive = RetentionKeepKey {
+        rebuild_cost_ms: Some(35 * 60 * 1000),
+        apparent_bytes: 6_900,
+        created_at_unix_nanos: 1,
+        name: "expensive-old",
+    };
+    let cheap = RetentionKeepKey {
+        rebuild_cost_ms: Some(2 * 60 * 1000),
+        apparent_bytes: 6_900,
+        created_at_unix_nanos: 2,
+        name: "cheap-new",
+    };
+    assert_eq!(
+        cmp_retention_keep_order(&expensive, &cheap),
+        Ordering::Less,
+        "expensive-to-rebuild lane must sort ahead of a same-sized cheap lane"
+    );
+    let old = RetentionKeepKey {
+        rebuild_cost_ms: None,
+        apparent_bytes: 100,
+        created_at_unix_nanos: 1,
+        name: "old",
+    };
+    let new = RetentionKeepKey {
+        rebuild_cost_ms: None,
+        apparent_bytes: 100,
+        created_at_unix_nanos: 2,
+        name: "new",
+    };
+    assert_eq!(
+        cmp_retention_keep_order(&old, &new),
+        Ordering::Greater,
+        "unknown cost must keep recency (newest first)"
+    );
+    let old_known = RetentionKeepKey {
+        rebuild_cost_ms: Some(1),
+        ..old
+    };
+    assert_eq!(
+        cmp_retention_keep_order(&old_known, &new),
+        Ordering::Greater,
+        "mixed known/unknown cost must not invert recency"
+    );
+}
+
+#[test]
+fn lane_rebuild_cost_sidecar_round_trips_and_ignores_garbage() {
+    let temp = TempDir::new().expect("tempdir");
+    let lane = temp.path().join("lane");
+    fs::create_dir(&lane).expect("lane");
+    assert_eq!(load_lane_rebuild_cost(&lane), None);
+    record_lane_rebuild_cost(&lane, 2_100_000).expect("record");
+    assert_eq!(load_lane_rebuild_cost(&lane), Some(2_100_000));
+    fs::write(lane.join(LANE_REBUILD_COST_RELATIVE), "{not-json").expect("corrupt");
+    assert_eq!(load_lane_rebuild_cost(&lane), None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gc_size_retention_keeps_expensive_rebuild_ahead_of_newer_cheap_lane() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let worktree_root = temp.path().join("worktrees");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    commit_readme(&repo).expect("initial commit");
+    let manager = WorktreeManager::new(&repo_path);
+    let expensive = create_gc_worktree(&manager, "cost-expensive", &worktree_root);
+    fs::create_dir_all(expensive.path.join("target/debug")).expect("expensive target");
+    fs::write(
+        expensive.path.join("target/debug/artifact"),
+        vec![b'e'; 32 * 1024],
+    )
+    .expect("expensive artifact");
+    record_lane_rebuild_cost(&expensive.path, 35 * 60 * 1000).expect("expensive cost");
+    let cheap = create_gc_worktree(&manager, "cost-cheap", &worktree_root);
+    fs::create_dir_all(cheap.path.join("target/debug")).expect("cheap target");
+    fs::write(
+        cheap.path.join("target/debug/artifact"),
+        vec![b'c'; 32 * 1024],
+    )
+    .expect("cheap artifact");
+    record_lane_rebuild_cost(&cheap.path, 2 * 60 * 1000).expect("cheap cost");
+    let expensive_size = gc_worktree_size_estimate(&expensive.path).expect("expensive size");
+    let cheap_size = gc_worktree_size_estimate(&cheap.path).expect("cheap size");
+    let budget = expensive_size.worktree_bytes.max(cheap_size.worktree_bytes);
+
+    let mut options = gc_options(Some(worktree_root), false);
+    options.remove_targets = false;
+    options.retention.max_total_bytes = Some(budget);
+    let report = manager
+        .gc_with_target_liveness(options, |_| WorktreeTargetLiveness::Clear)
+        .expect("cost-aware GC");
+
+    assert_eq!(report.removed_count, 1, "{report:#?}");
+    assert_eq!(report.retained_count, 1, "{report:#?}");
+    let removed = report
+        .entries
+        .iter()
+        .find(|entry| entry.status == WorktreeGcStatus::Removed)
+        .expect("removed entry");
+    assert_eq!(removed.name, cheap.name);
+    assert!(expensive.path.exists());
+    assert!(!cheap.path.exists());
 }
 
 #[cfg(target_os = "linux")]

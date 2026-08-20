@@ -18,12 +18,23 @@
 //!
 //! Provider adapters stay outside this module (`src/runtime_adapter.rs` /
 //! the #146 boundary). The core depends on capabilities, not CLI assumptions.
+//!
+//! Trust-lane siblings (`blinding`, `evidence_pool`, `merge_authority`,
+//! `escaped_defect`) plug in beside this foundation. They do not edit the
+//! action/policy/state IDs, trait signatures, the append-only
+//! [`QualityContract`] API, or the keyed [`ResourceVector`] core.
 
 pub mod action;
+pub mod blinding;
+pub mod calibration;
 pub mod catalog;
 pub mod certification;
+pub mod difficulty;
+mod digest;
 pub mod drift;
 pub mod error;
+pub mod escaped_defect;
+pub mod evidence_pool;
 pub mod explanation;
 pub mod failure_classifier;
 pub mod feasibility;
@@ -31,8 +42,10 @@ pub mod features;
 pub mod global_search;
 pub mod hedge;
 pub mod ids;
+pub mod merge_authority;
 pub mod objective;
 pub mod online_router;
+pub mod operator_labels;
 pub mod policy;
 pub mod predictor;
 pub mod quality;
@@ -41,6 +54,8 @@ pub mod resources;
 pub mod safe_set;
 pub mod shadow;
 pub mod state;
+pub mod switch_cost;
+pub mod taxonomy;
 pub mod telemetry;
 pub mod trajectory;
 pub mod value_of_information;
