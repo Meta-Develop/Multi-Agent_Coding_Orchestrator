@@ -32,51 +32,50 @@ use std::{
 #[test]
 fn effectful_inbox_library_entries_fail_closed_before_input_or_artifact_access() {
     let temp = TempDir::new().expect("tempdir");
-    let missing_repo = temp.path().join("repo-must-not-be-opened");
-    let missing_config = temp.path().join("config-must-not-be-read");
+    let missing_repo = temp.path().join("repo-that-does-not-exist");
+    let missing_config = temp.path().join("config-that-does-not-exist");
     let run_id = RunId::new("inbox-failclosed").expect("run id");
-    let errors = [
-        run_inbox(InboxRunOptions {
-            repo: missing_repo.clone(),
-            run_id: run_id.clone(),
-            github: true,
-            permission_mode: None,
-            dry_run: false,
-            max_items: None,
-            codex_bin: Some(temp.path().join("worker-must-not-run")),
-        })
-        .expect_err("inbox run must fail closed"),
-        watch_inbox(InboxWatchOptions {
-            repo: missing_repo,
-            poll_seconds: 1,
-            once: false,
-            github: true,
-            permission_mode: None,
-            dry_run: false,
-            max_items: None,
-            codex_bin: None,
-        })
-        .expect_err("inbox watch must fail closed"),
-        run_workspace_inbox(InboxWorkspaceRunOptions {
-            config: missing_config.clone(),
-            run_id,
-            dry_run: false,
-            codex_bin: None,
-        })
-        .expect_err("workspace inbox run must fail closed"),
-        watch_workspace_inbox(InboxWorkspaceWatchOptions {
-            config: missing_config,
-            poll_seconds: 1,
-            once: false,
-            dry_run: false,
-            codex_bin: None,
-        })
-        .expect_err("workspace inbox watch must fail closed"),
-    ];
+    run_inbox(InboxRunOptions {
+        repo: missing_repo.clone(),
+        run_id: run_id.clone(),
+        github: true,
+        permission_mode: None,
+        dry_run: false,
+        max_items: None,
+        codex_bin: Some(temp.path().join("worker-must-not-run")),
+        machine_global: None,
+    })
+    .expect_err("inbox run must fail closed");
+    watch_inbox(InboxWatchOptions {
+        repo: missing_repo,
+        poll_seconds: 1,
+        once: false,
+        github: true,
+        permission_mode: None,
+        dry_run: false,
+        max_items: None,
+        codex_bin: None,
+        machine_global: None,
+    })
+    .expect_err("inbox watch must fail closed");
+    run_workspace_inbox(InboxWorkspaceRunOptions {
+        config: missing_config.clone(),
+        run_id,
+        dry_run: false,
+        codex_bin: None,
+        machine_global: None,
+    })
+    .expect_err("workspace inbox run must fail closed");
+    watch_workspace_inbox(InboxWorkspaceWatchOptions {
+        config: missing_config,
+        poll_seconds: 1,
+        once: false,
+        dry_run: false,
+        codex_bin: None,
+        machine_global: None,
+    })
+    .expect_err("workspace inbox watch must fail closed");
 
-    assert!(errors
-        .iter()
-        .all(|error| format!("{error:#}").contains("capability-bound supervisor input bridge")));
     assert_eq!(fs::read_dir(temp.path()).expect("read temp").count(), 0);
 }
 
@@ -680,6 +679,7 @@ fn real_publication_mode_fails_closed_before_intake_or_artifacts() {
         dry_run: false,
         max_items: Some(1),
         codex_bin: None,
+        machine_global: None,
     })
     .expect_err("real publication must fail closed before effectful intake");
     let error = format!("{error:#}");

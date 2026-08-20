@@ -24,28 +24,6 @@ fn orchestrate_resume_uses_checkpoint_defaults_and_reports_json() -> Result<()> 
     )
     .context("write plan")?;
 
-    let unsupported = Command::new(BIN)
-        .args([
-            "orchestrate",
-            "run",
-            plan_path.to_str().context("plan path utf8")?,
-            "--repo",
-            repo,
-            "--checkpoint-dir",
-            checkpoint_dir.to_str().context("checkpoint dir utf8")?,
-            "--run-id",
-            run_id,
-            "--json",
-        ])
-        .output()
-        .context("run unsupported orchestration")?;
-    if !unsupported.status.success() {
-        assert!(String::from_utf8_lossy(&unsupported.stderr)
-            .contains("orchestration assignment creation is temporarily unsupported"));
-        assert!(!checkpoint_dir.exists());
-        return Ok(());
-    }
-
     let (run_summary, verified_backend_available) = run_json_regardless(&[
         "orchestrate",
         "run",

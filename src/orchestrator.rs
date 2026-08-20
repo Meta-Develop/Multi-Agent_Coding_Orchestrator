@@ -943,11 +943,6 @@ fn run_plan_with_controls_runtime(
     controls: OrchestrationRunControls,
     runtime: OrchestrationExecutionRuntime,
 ) -> Result<OrchestrationSummary> {
-    if runtime == OrchestrationExecutionRuntime::Verified {
-        bail!(
-            "orchestration assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
-        );
-    }
     if options.jobs == 0 {
         bail!("orchestration jobs must be at least 1");
     }
@@ -2756,7 +2751,14 @@ fn select_worktrees(
         #[cfg(test)]
         manager.create_for_test(create_options)?;
         #[cfg(not(test))]
-        manager.create(create_options)?;
+        {
+            let cleanliness = manager.acquire_repository_cleanliness().context(
+                "orchestration assignment creation requires a capability-bound \
+                 repository cleanliness input; commit, stash, or remove pending \
+                 changes in the primary repository, then rerun the orchestration",
+            )?;
+            manager.create_with_repository_cleanliness(create_options, &cleanliness)?;
+        }
         let lease = manager
             .acquire_write_execution_lease(&agent.id)
             .with_context(|| {

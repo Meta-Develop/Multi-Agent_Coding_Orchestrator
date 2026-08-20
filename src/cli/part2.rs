@@ -1693,14 +1693,7 @@ fn build_prompt_preview(args: LlmPromptPreviewArgs) -> Result<LlmPromptPreviewRe
     })
 }
 
-fn run_agent_from_args(_args: RunAgentArgs) -> Result<AgentRunReport> {
-    bail!(
-        "agent assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
-    )
-}
-
-#[allow(dead_code)]
-fn run_agent_from_args_disabled_legacy(args: RunAgentArgs) -> Result<AgentRunReport> {
+fn run_agent_from_args(args: RunAgentArgs) -> Result<AgentRunReport> {
     if args.provider != "fake" {
         bail!(
             "provider '{}' is not configured for agent run; only local fake is available",
