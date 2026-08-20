@@ -105,6 +105,7 @@ jobs:
           autopilot::tests::unsupported_depth_shapes_are_typed_preflight_permission_expansions
           autopilot::tests::validate_autopilot_plan_refuses_empty_path_proposal
           autopilot::tests::write_lease_excludes_competing_access_through_review_and_releases_on_error
+          cli::tests::completion_reap_removes_merged_and_preserves_unmerged_and_dirty_worktrees
           cli::tests::merge_apply_auto_reap_waits_for_trunk_then_reaps_on_finalization_rerun
           cli::tests::merge_apply_json_delivers_unclaimed_edits_denial_to_integration_controller
           external_agent::tests::verified_contained_fake_app_server_proves_duplex_ordering_and_confinement

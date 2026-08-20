@@ -298,6 +298,7 @@ impl RelativeWorktreeFixture {
             fs::canonicalize(&linked).context("canonicalize linked worktree")?
         );
 
+        let metadata_dir = primary.join(".git/worktrees/linked");
         let linked_git_file =
             fs::read_to_string(linked.join(".git")).context("read linked worktree .git file")?;
         let linked_git_dir = linked_git_file
@@ -305,9 +306,20 @@ impl RelativeWorktreeFixture {
             .strip_prefix("gitdir: ")
             .context("linked worktree .git file has gitdir prefix")?;
         assert!(Path::new(linked_git_dir).is_relative());
-        let metadata_gitdir = fs::read_to_string(primary.join(".git/worktrees/linked/gitdir"))
+        assert_eq!(
+            fs::canonicalize(linked.join(linked_git_dir))
+                .context("resolve linked worktree gitdir")?,
+            fs::canonicalize(&metadata_dir).context("canonicalize linked metadata directory")?
+        );
+
+        let metadata_gitdir = fs::read_to_string(metadata_dir.join("gitdir"))
             .context("read common worktree gitdir backlink")?;
         assert!(Path::new(metadata_gitdir.trim()).is_relative());
+        assert_eq!(
+            fs::canonicalize(metadata_dir.join(metadata_gitdir.trim()))
+                .context("resolve common worktree gitdir backlink")?,
+            fs::canonicalize(linked.join(".git")).context("canonicalize linked .git file")?
+        );
 
         fs::write(primary.join("primary-only.txt"), "primary\n")
             .context("write primary-only map sentinel")?;

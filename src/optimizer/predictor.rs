@@ -375,6 +375,34 @@ impl HierarchicalPolicyPredictor {
             .observe(amount);
     }
 
+    /// Widen every certification cell toward a Jeffreys prior. Used by #205
+    /// when the predictor is overconfident; this never grants certification.
+    pub fn widen_posteriors(&mut self, extra_milli: u64) {
+        let extra = extra_milli.max(1);
+        for cell in self.certification.values_mut() {
+            cell.alpha_milli = cell.alpha_milli.saturating_add(extra / 2);
+            cell.beta_milli = cell.beta_milli.saturating_add(extra / 2);
+        }
+        for cell in self.first_pass.values_mut() {
+            cell.alpha_milli = cell.alpha_milli.saturating_add(extra / 2);
+            cell.beta_milli = cell.beta_milli.saturating_add(extra / 2);
+        }
+        for cell in self.human.values_mut() {
+            cell.alpha_milli = cell.alpha_milli.saturating_add(extra / 2);
+            cell.beta_milli = cell.beta_milli.saturating_add(extra / 2);
+        }
+    }
+
+    /// Raise the Wilson z used for quality LCBs. Softens overconfident means
+    /// without changing any certification result.
+    pub fn raise_lcb_margin(&mut self, extra_z_hundredths: u32) {
+        self.lcb_z_hundredths = self.lcb_z_hundredths.saturating_add(extra_z_hundredths);
+    }
+
+    pub fn lcb_z_hundredths(&self) -> u32 {
+        self.lcb_z_hundredths
+    }
+
     pub fn hierarchy_for(state: &OptimizerState, policy: &PolicyGraph) -> HierarchyKey {
         let mut key = HierarchyKey::global();
         if let Some(action) = primary_action(policy) {

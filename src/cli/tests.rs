@@ -1038,6 +1038,182 @@ fn merge_apply_auto_reap_waits_for_trunk_then_reaps_on_finalization_rerun() {
     assert!(!worktree.path.exists());
 }
 
+fn init_committed_repo(repo_path: &Path) -> git2::Signature<'static> {
+    WorktreeManager::init_repository(repo_path, "main").expect("init repository");
+    fs::write(repo_path.join("README.md"), "# Before\n").expect("write README");
+    let repo = crate::git_repository::open(repo_path).expect("open repository");
+    let mut index = repo.index().expect("open index");
+    index
+        .add_path(Path::new("README.md"))
+        .expect("stage README");
+    index.write().expect("write index");
+    let tree_id = index.write_tree().expect("write tree");
+    let tree = repo.find_tree(tree_id).expect("find tree");
+    let signature = Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+    repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+        .expect("commit fixture");
+    signature
+}
+
+fn commit_worktree_file(
+    worktree: &Path,
+    relative: &str,
+    contents: &str,
+    message: &str,
+    signature: &Signature<'_>,
+) {
+    fs::write(worktree.join(relative), contents).expect("write worktree file");
+    let repo = crate::git_repository::open(worktree).expect("open worktree");
+    let mut index = repo.index().expect("open worktree index");
+    index
+        .add_path(Path::new(relative))
+        .expect("stage worktree file");
+    index.write().expect("write worktree index");
+    let tree_id = index.write_tree().expect("write worktree tree");
+    let tree = repo.find_tree(tree_id).expect("find worktree tree");
+    let parent = repo
+        .head()
+        .expect("worktree HEAD")
+        .peel_to_commit()
+        .expect("worktree parent");
+    repo.commit(
+        Some("HEAD"),
+        signature,
+        signature,
+        message,
+        &tree,
+        &[&parent],
+    )
+    .expect("commit worktree file");
+}
+
+fn create_test_lane(repo_path: &Path, agent_id: &str) -> WorktreeRecord {
+    WorktreeManager::new(repo_path)
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: agent_id.to_string(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })
+        .expect("create test worktree")
+}
+
+#[test]
+fn completion_reap_skips_when_no_managed_worktrees_exist() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    init_committed_repo(&repo_path);
+    assert!(reap_merged_managed_worktrees(&repo_path)
+        .expect("reap should succeed")
+        .is_none());
+    assert!(
+        !repo_path.join(".git/maco").exists(),
+        "completion reap must not create MACO state in a repository that never used managed worktrees"
+    );
+}
+
+#[test]
+fn completion_reap_removes_merged_and_preserves_unmerged_and_dirty_worktrees() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let signature = init_committed_repo(&repo_path);
+    let merged = create_test_lane(&repo_path, "agent-merged");
+    let unmerged = create_test_lane(&repo_path, "agent-unmerged");
+    let dirty = create_test_lane(&repo_path, "agent-dirty");
+
+    commit_worktree_file(
+        &merged.path,
+        "merged.txt",
+        "merged\n",
+        "merged work",
+        &signature,
+    );
+    commit_worktree_file(
+        &unmerged.path,
+        "unmerged.txt",
+        "unmerged\n",
+        "unmerged work",
+        &signature,
+    );
+    fs::write(dirty.path.join("README.md"), "# dirty local work\n").expect("dirty worktree");
+
+    let primary = crate::git_repository::open(&repo_path).expect("reopen primary");
+    let lane_oid = primary
+        .find_branch("maco/agent-merged", git2::BranchType::Local)
+        .expect("merged lane branch")
+        .get()
+        .target()
+        .expect("merged lane target");
+    primary
+        .reference("refs/heads/main", lane_oid, true, "absorb merged lane")
+        .expect("advance trunk to merged lane");
+    let lane_commit = primary.find_commit(lane_oid).expect("merged lane commit");
+    primary
+        .reset(lane_commit.as_object(), git2::ResetType::Hard, None)
+        .expect("refresh primary after absorbing merged lane");
+    drop(lane_commit);
+    drop(primary);
+
+    let report = reap_merged_managed_worktrees(&repo_path)
+        .expect("reap leak scenarios")
+        .expect("managed lanes should enable lifecycle");
+    let gc = report
+        .worktree_gc
+        .as_ref()
+        .expect("merged auto-reap should run GC");
+    assert_eq!(gc.considered_count, 3, "{gc:#?}");
+    assert_eq!(gc.removed_count, 1, "{gc:#?}");
+    assert_eq!(gc.protected_count, 1, "{gc:#?}");
+    assert_eq!(gc.retained_count, 1, "{gc:#?}");
+
+    let merged_entry = gc
+        .entries
+        .iter()
+        .find(|entry| entry.name == "agent-merged")
+        .expect("merged entry");
+    assert_eq!(merged_entry.status, WorktreeGcStatus::Removed);
+    assert_eq!(merged_entry.reason, WorktreeGcReason::FinishedBranch);
+    assert!(!merged.path.exists(), "merged worktree must be reclaimed");
+
+    let unmerged_entry = gc
+        .entries
+        .iter()
+        .find(|entry| entry.name == "agent-unmerged")
+        .expect("unmerged entry");
+    assert_eq!(unmerged_entry.status, WorktreeGcStatus::Retained);
+    assert_eq!(unmerged_entry.reason, WorktreeGcReason::UnmergedBranch);
+    assert!(
+        unmerged.path.exists(),
+        "unmerged work must not be destroyed without opt-in"
+    );
+
+    let dirty_entry = gc
+        .entries
+        .iter()
+        .find(|entry| entry.name == "agent-dirty")
+        .expect("dirty entry");
+    assert_eq!(dirty_entry.status, WorktreeGcStatus::Protected);
+    assert_eq!(dirty_entry.reason, WorktreeGcReason::Dirty);
+    assert!(
+        dirty.path.exists(),
+        "dirty worktree must remain until cleaned or explicitly forced"
+    );
+
+    let primary = crate::git_repository::open(&repo_path).expect("reopen after reap");
+    assert!(
+        primary
+            .find_branch("maco/agent-merged", git2::BranchType::Local)
+            .is_ok(),
+        "GC retains merged branch refs; unpinning the worktree is what makes later deletion possible"
+    );
+    assert!(primary
+        .find_branch("maco/agent-unmerged", git2::BranchType::Local)
+        .is_ok());
+    assert!(primary
+        .find_branch("maco/agent-dirty", git2::BranchType::Local)
+        .is_ok());
+}
+
 #[test]
 fn primary_arbitration_side_rejects_agent_claims_before_execution() {
     let error = arbitration_side_from_cli(
