@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     env,
+    ffi::OsString,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -353,12 +354,10 @@ impl RuntimeAdapterConfig {
             config.argument_template = args.split_whitespace().map(str::to_string).collect();
         }
         if let Ok(names) = env::var(format!("{prefix}_ENV")) {
-            config.env_passthrough = names
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect();
+            // Drop denied names here so the live insert in external_agent.rs
+            // cannot reinstate them. Remaining names are still refused at
+            // render if a caller constructs the config directly.
+            config.env_passthrough = env_passthrough_names_from_operator_list(&names);
         }
         if let Ok(flag) = env::var(format!("{prefix}_CWD_FLAG")) {
             config.working_dir_flag = Some(flag);
@@ -390,16 +389,11 @@ impl RuntimeAdapterConfig {
             .iter()
             .any(|token| token == "{prompt_text}")
         {
-            std::fs::read_to_string(context.prompt).with_context(|| {
-                format!(
-                    "failed to read prompt file {} for {{prompt_text}}",
-                    context.prompt.display()
-                )
-            })?
+            read_prompt_text_for_argv(context.prompt)?
         } else {
             String::new()
         };
-        let mut values = BTreeMap::from([
+        let values = BTreeMap::from([
             ("prompt", context.prompt.display().to_string()),
             ("prompt_text", prompt_text),
             ("model", context.model.unwrap_or_default().to_string()),
@@ -414,20 +408,19 @@ impl RuntimeAdapterConfig {
                 continue;
             };
             let value = values
-                .remove(name)
+                .get(name)
+                .cloned()
                 .with_context(|| format!("unknown runtime adapter placeholder '{{{name}}}'"))?;
-            if !value.is_empty() {
-                argv.push(value);
+            if value.is_empty() {
+                drop_empty_placeholder_pair(&mut argv);
+                continue;
             }
+            argv.push(value);
         }
         if let Some(flag) = &self.working_dir_flag {
             argv.extend([flag.clone(), context.cwd.display().to_string()]);
         }
-        let env = self
-            .env_passthrough
-            .iter()
-            .filter_map(|name| env::var(name).ok().map(|value| (name.clone(), value)))
-            .collect();
+        let env = collect_screened_passthrough_env(&self.env_passthrough)?;
         Ok(LaunchSpec {
             program: binary.to_path_buf(),
             argv,
@@ -435,6 +428,18 @@ impl RuntimeAdapterConfig {
             env,
             output_capture: self.output_capture,
         })
+    }
+
+    /// Fail-closed argv for a subprocess runtime. Callers must propagate the
+    /// error: an empty vector is a successful Codex/empty-template render, not a
+    /// substitute for a configuration failure.
+    pub fn render_os_argv(&self, context: &LaunchContext<'_>) -> Result<Vec<OsString>> {
+        Ok(self
+            .render(context)?
+            .argv
+            .into_iter()
+            .map(OsString::from)
+            .collect())
     }
 
     /// Small scripted-transport seam used by adapter conformance tests and diagnostics.
@@ -523,6 +528,142 @@ pub struct AdapterRun {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub captured: Vec<u8>,
+}
+
+/// Linux `MAX_ARG_STRLEN` is 32 pages (131072). Stay one byte under so a
+/// `{prompt_text}` argv element cannot hit `E2BIG` on that cap.
+const MAX_PROMPT_TEXT_ARGV_BYTES: u64 = 131_072 - 1;
+
+fn read_prompt_text_for_argv(path: &Path) -> Result<String> {
+    let text = crate::safe_state::BoundedRegularReader::read_utf8(path, MAX_PROMPT_TEXT_ARGV_BYTES)
+        .with_context(|| {
+            format!(
+                "failed to read prompt file {} for {{prompt_text}}",
+                path.display()
+            )
+        })?;
+    if text.contains('\0') {
+        bail!(
+            "prompt file {} for {{prompt_text}} contains a NUL byte and cannot be passed as argv",
+            path.display()
+        );
+    }
+    Ok(text)
+}
+
+fn drop_empty_placeholder_pair(argv: &mut Vec<String>) {
+    if argv
+        .last()
+        .is_some_and(|token| is_paired_option_flag(token))
+    {
+        argv.pop();
+    }
+}
+
+fn is_paired_option_flag(token: &str) -> bool {
+    token.starts_with('-') && token != "-" && token != "--" && !token.contains('=')
+}
+
+/// Operator `MACO_<RUNTIME>_ENV` lists are comma-separated. Empty names are
+/// dropped; denied names are omitted so a live insert after `allowed_env`
+/// cannot reinstate them.
+fn env_passthrough_names_from_operator_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .filter(|name| denied_passthrough_env_reason(name).is_none())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Parse a comma-separated passthrough list and refuse any denied name.
+pub fn parse_env_passthrough_list(raw: &str) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for name in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        screen_env_passthrough_name(name)?;
+        if !names.iter().any(|existing| existing == name) {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+/// Refuse a passthrough name that would undo worker environment hardening.
+pub fn screen_env_passthrough_name(name: &str) -> Result<()> {
+    if let Some(reason) = denied_passthrough_env_reason(name) {
+        bail!("refused runtime adapter env passthrough '{name}': {reason}");
+    }
+    Ok(())
+}
+
+fn collect_screened_passthrough_env(names: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut environment = BTreeMap::new();
+    for name in names {
+        screen_env_passthrough_name(name)?;
+        if let Ok(value) = env::var(name) {
+            environment.insert(name.clone(), value);
+        }
+    }
+    Ok(environment)
+}
+
+fn denied_passthrough_env_reason(name: &str) -> Option<&'static str> {
+    if name.is_empty()
+        || name.len() > 256
+        || name.contains('=')
+        || name.contains('\0')
+        || name.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Some("malformed environment variable name");
+    }
+    let bytes = name.as_bytes();
+    if bytes.starts_with(b"LD_") || bytes.starts_with(b"DYLD_") || bytes.starts_with(b"MALLOC_") {
+        return Some("dynamic-loader or allocator hook");
+    }
+    match name {
+        "BASH_ENV"
+        | "ENV"
+        | "SHELLOPTS"
+        | "BASHOPTS"
+        | "KSH_ENV"
+        | "ZDOTDIR"
+        | "PYTHONPATH"
+        | "PYTHONHOME"
+        | "PYTHONSTARTUP"
+        | "PYTHONINSPECT"
+        | "PYTHONUSERBASE"
+        | "PERL5OPT"
+        | "PERL5LIB"
+        | "PERLLIB"
+        | "PERL5DB"
+        | "RUBYOPT"
+        | "RUBYLIB"
+        | "NODE_OPTIONS"
+        | "NODE_PATH"
+        | "GCONV_PATH"
+        | "LOCPATH"
+        | "JAVA_TOOL_OPTIONS"
+        | "_JAVA_OPTIONS"
+        | "JDK_JAVA_OPTIONS"
+        | "CLASSPATH"
+        | "LUA_PATH"
+        | "LUA_CPATH"
+        | "LUA_INIT"
+        | "PHPRC"
+        | "PHP_INI_SCAN_DIR"
+        | "RUSTC_WRAPPER"
+        | "RUSTC_WORKSPACE_WRAPPER"
+        | "GIT_EXEC_PATH"
+        | "GIT_TEMPLATE_DIR" => Some("shell-startup or interpreter code-loading hook"),
+        "OPENAI_API_KEY" | "CODEX_API_KEY" | "CODEX_ACCESS_TOKEN" => {
+            Some("credential name tracked by the redactor")
+        }
+        _ => None,
+    }
 }
 
 fn resolve_binary(binary: &Path) -> Result<PathBuf> {
@@ -621,6 +762,128 @@ mod tests {
         );
         assert_eq!(spec.output_capture, OutputCaptureMode::Stdout);
         assert!(!spec.argv.iter().any(|arg| arg == "--output"));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_model_drops_the_preceding_flag_instead_of_shifting_argv() -> Result<()> {
+        let spec = RuntimeAdapterConfig::defaults(RuntimeId::Grok).render(&launch_context(
+            Path::new("prompt.txt"),
+            None,
+            Some("high"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert_eq!(
+            spec.argv,
+            [
+                "--prompt-file",
+                "prompt.txt",
+                "--effort",
+                "high",
+                "--cwd",
+                "/tmp/work",
+                "--output-format",
+                "plain",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_model_and_effort_drop_both_flag_pairs() -> Result<()> {
+        let spec = RuntimeAdapterConfig::defaults(RuntimeId::Grok).render(&launch_context(
+            Path::new("prompt.txt"),
+            None,
+            None,
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert_eq!(
+            spec.argv,
+            [
+                "--prompt-file",
+                "prompt.txt",
+                "--cwd",
+                "/tmp/work",
+                "--output-format",
+                "plain",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_cursor_model_drops_the_preceding_flag() -> Result<()> {
+        let spec = RuntimeAdapterConfig::defaults(RuntimeId::Cursor).render(&launch_context(
+            Path::new("prompt.txt"),
+            None,
+            Some("high"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert_eq!(
+            spec.argv,
+            [
+                "-p",
+                "--trust",
+                "--workspace",
+                "/tmp/work",
+                "--output-format",
+                "text",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_placeholders_render_the_same_value() -> Result<()> {
+        let config = RuntimeAdapterConfig {
+            argument_template: vec![
+                "--model".into(),
+                "{model}".into(),
+                "--fallback-model".into(),
+                "{model}".into(),
+            ],
+            ..RuntimeAdapterConfig::defaults(RuntimeId::Grok)
+        };
+        let spec = config.render(&launch_context(
+            Path::new("prompt.txt"),
+            Some("grok-4.6"),
+            Some("high"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert_eq!(
+            spec.argv,
+            ["--model", "grok-4.6", "--fallback-model", "grok-4.6"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_text_refuses_an_argv_oversized_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let prompt = dir.path().join("prompt.txt");
+        fs::write(
+            &prompt,
+            vec![b'a'; (MAX_PROMPT_TEXT_ARGV_BYTES as usize) + 1],
+        )?;
+        let config = RuntimeAdapterConfig::defaults_for(AdapterId::GeminiCli);
+        let error = config
+            .render(&launch_context(
+                &prompt,
+                Some("gemini-2.5-pro"),
+                None,
+                Path::new("/tmp/work"),
+                Path::new("out.txt"),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("bounded read limit") || error.contains("{prompt_text}"),
+            "unexpected render error: {error}"
+        );
         Ok(())
     }
 
@@ -840,6 +1103,65 @@ mod tests {
     }
 
     #[test]
+    fn operator_env_list_drops_shell_startup_and_loader_hooks() {
+        assert_eq!(
+            env_passthrough_names_from_operator_list(
+                "PATH,BASH_ENV, ENV, LD_PRELOAD,,DYLD_INSERT_LIBRARIES"
+            ),
+            vec!["PATH".to_string()]
+        );
+        assert!(env_passthrough_names_from_operator_list("BASH_ENV,LD_LIBRARY_PATH").is_empty());
+    }
+
+    #[test]
+    fn parse_env_passthrough_list_refuses_denied_names() {
+        assert_eq!(parse_env_passthrough_list("PATH").unwrap(), vec!["PATH"]);
+        let error = parse_env_passthrough_list("PATH,BASH_ENV")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("BASH_ENV"), "{error}");
+        assert!(
+            error.contains("refused runtime adapter env passthrough"),
+            "{error}"
+        );
+        let preload = parse_env_passthrough_list("LD_PRELOAD")
+            .unwrap_err()
+            .to_string();
+        assert!(preload.contains("LD_PRELOAD"), "{preload}");
+        let dyld = parse_env_passthrough_list("DYLD_LIBRARY_PATH")
+            .unwrap_err()
+            .to_string();
+        assert!(dyld.contains("DYLD_LIBRARY_PATH"), "{dyld}");
+        let credential = parse_env_passthrough_list("OPENAI_API_KEY")
+            .unwrap_err()
+            .to_string();
+        assert!(credential.contains("OPENAI_API_KEY"), "{credential}");
+    }
+
+    #[test]
+    fn render_refuses_unscreened_passthrough_environment() {
+        let config = RuntimeAdapterConfig {
+            env_passthrough: vec!["BASH_ENV".into()],
+            ..RuntimeAdapterConfig::defaults(RuntimeId::Grok)
+        };
+        let error = config
+            .render(&launch_context(
+                Path::new("prompt.txt"),
+                Some("grok-4.6"),
+                Some("high"),
+                Path::new("/tmp/work"),
+                Path::new("out.txt"),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("BASH_ENV"), "{error}");
+        assert!(
+            error.contains("refused runtime adapter env passthrough"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn missing_binary_is_fail_closed() {
         let config = RuntimeAdapterConfig {
             binary: Some("maco-definitely-missing-runtime".into()),
@@ -857,6 +1179,100 @@ mod tests {
         assert!(error
             .to_string()
             .contains("maco-definitely-missing-runtime"));
+    }
+
+    #[test]
+    fn unconfigured_binary_render_is_an_error_not_an_empty_argv() {
+        let config = RuntimeAdapterConfig {
+            binary: Some(PathBuf::new()),
+            ..RuntimeAdapterConfig::defaults(RuntimeId::Grok)
+        };
+        let error = config
+            .render_os_argv(&launch_context(
+                Path::new("prompt.txt"),
+                Some("grok-4.6"),
+                Some("high"),
+                Path::new("/tmp/work"),
+                Path::new("out.txt"),
+            ))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("runtime adapter binary is not configured"));
+    }
+
+    #[test]
+    fn unknown_placeholder_render_is_an_error_not_an_empty_argv() {
+        let config = RuntimeAdapterConfig {
+            argument_template: vec!["--flag".into(), "{unknown}".into()],
+            ..RuntimeAdapterConfig::defaults(RuntimeId::Grok)
+        };
+        let error = config
+            .render_os_argv(&launch_context(
+                Path::new("prompt.txt"),
+                Some("grok-4.6"),
+                Some("high"),
+                Path::new("/tmp/work"),
+                Path::new("out.txt"),
+            ))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unknown runtime adapter placeholder '{unknown}'"));
+    }
+
+    #[test]
+    fn missing_prompt_text_file_render_is_an_error_not_an_empty_argv() {
+        let config = RuntimeAdapterConfig {
+            argument_template: vec!["--prompt".into(), "{prompt_text}".into()],
+            ..RuntimeAdapterConfig::defaults(RuntimeId::Grok)
+        };
+        let error = config
+            .render_os_argv(&launch_context(
+                Path::new("maco-missing-adapter-prompt.txt"),
+                Some("grok-4.6"),
+                Some("high"),
+                Path::new("/tmp/work"),
+                Path::new("out.txt"),
+            ))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("maco-missing-adapter-prompt.txt"),
+            "unexpected render error: {message}"
+        );
+        assert!(
+            message.contains("{prompt_text}") || message.contains("prompt"),
+            "unexpected render error: {message}"
+        );
+    }
+
+    #[test]
+    fn successful_render_os_argv_preserves_the_template() -> Result<()> {
+        let argv =
+            RuntimeAdapterConfig::defaults(RuntimeId::Grok).render_os_argv(&launch_context(
+                Path::new("prompt.txt"),
+                Some("grok-4.6"),
+                Some("high"),
+                Path::new("/tmp/work"),
+                Path::new("out.txt"),
+            ))?;
+        assert_eq!(
+            argv,
+            [
+                OsString::from("--prompt-file"),
+                OsString::from("prompt.txt"),
+                OsString::from("--model"),
+                OsString::from("grok-4.6"),
+                OsString::from("--effort"),
+                OsString::from("high"),
+                OsString::from("--cwd"),
+                OsString::from("/tmp/work"),
+                OsString::from("--output-format"),
+                OsString::from("plain"),
+            ]
+        );
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -995,6 +1411,15 @@ mod tests {
         Ok(())
     }
 
+    const VERIFY_INSTALLED_CLIS_ENV: &str = "MACO_VERIFY_INSTALLED_CLIS";
+
+    fn installed_cli_verification_enabled() -> bool {
+        matches!(
+            env::var(VERIFY_INSTALLED_CLIS_ENV).as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        )
+    }
+
     fn installed_cli_help(binary: &str) -> Option<String> {
         let output = Command::new(binary).arg("--help").output().ok()?;
         let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -1006,76 +1431,144 @@ mod tests {
         }
     }
 
-    #[test]
-    fn grok_template_flags_are_present_on_the_installed_cli() {
-        let Some(help) = installed_cli_help("grok") else {
-            return;
-        };
-        for flag in ["--prompt-file", "--model", "--cwd", "--output-format"] {
-            assert!(help.contains(flag), "installed grok help missing {flag}");
+    fn require_installed_cli_help(binary: &str) -> String {
+        installed_cli_help(binary)
+            .unwrap_or_else(|| panic!("{VERIFY_INSTALLED_CLIS_ENV}=1 requires `{binary}` on PATH"))
+    }
+
+    fn assert_help_contains(help: &str, flags: &[&str], label: &str) {
+        for flag in flags {
+            assert!(help.contains(flag), "{label} missing {flag}");
         }
+    }
+
+    fn assert_grok_help_contract(help: &str, label: &str) {
+        assert_help_contains(
+            help,
+            &["--prompt-file", "--model", "--cwd", "--output-format"],
+            label,
+        );
         assert!(
             help.contains("--effort") || help.contains("--reasoning-effort"),
-            "installed grok help missing effort flag"
+            "{label} missing effort flag"
         );
         assert!(
             help.contains("models"),
-            "installed grok help missing models catalog command"
+            "{label} missing models catalog command"
+        );
+    }
+
+    fn assert_cursor_help_contract(help: &str, label: &str) {
+        assert_help_contains(
+            help,
+            &[
+                "--print",
+                "--model",
+                "--workspace",
+                "--output-format",
+                "--trust",
+            ],
+            label,
+        );
+        assert!(
+            !help.contains("--effort <"),
+            "{label} grew a standalone --effort flag; revisit the adapter template"
+        );
+    }
+
+    fn assert_claude_help_contract(help: &str, label: &str) {
+        assert_help_contains(
+            help,
+            &[
+                "--print",
+                "--output-format",
+                "--model",
+                "--effort",
+                "--resume",
+                "--permission-mode",
+            ],
+            label,
+        );
+    }
+
+    fn assert_gemini_help_contract(help: &str, label: &str) {
+        assert_help_contains(
+            help,
+            &["--prompt", "--model", "--output-format", "--resume"],
+            label,
         );
     }
 
     #[test]
-    fn cursor_template_flags_are_present_on_the_installed_cli() {
-        let Some(help) = installed_cli_help("cursor-agent") else {
+    fn grok_template_flags_are_present_in_the_pinned_help_fixture() {
+        assert_grok_help_contract(
+            include_str!("fixtures/grok-help.txt"),
+            "pinned grok help fixture",
+        );
+    }
+
+    #[test]
+    fn cursor_template_flags_are_present_in_the_pinned_help_fixture() {
+        assert_cursor_help_contract(
+            include_str!("fixtures/cursor-agent-help.txt"),
+            "pinned cursor-agent help fixture",
+        );
+    }
+
+    #[test]
+    fn claude_template_flags_are_present_in_the_pinned_help_fixture() {
+        assert_claude_help_contract(
+            include_str!("fixtures/claude-help.txt"),
+            "pinned claude help fixture",
+        );
+    }
+
+    #[test]
+    fn gemini_template_flags_are_present_in_the_pinned_help_fixture() {
+        assert_gemini_help_contract(
+            include_str!("fixtures/gemini-help.txt"),
+            "pinned gemini help fixture",
+        );
+    }
+
+    #[test]
+    fn grok_template_flags_are_present_on_the_installed_cli() {
+        if !installed_cli_verification_enabled() {
             return;
-        };
-        for flag in [
-            "--print",
-            "--model",
-            "--workspace",
-            "--output-format",
-            "--trust",
-        ] {
-            assert!(
-                help.contains(flag),
-                "installed cursor-agent help missing {flag}"
-            );
         }
-        assert!(
-            !help.contains("--effort <"),
-            "cursor-agent grew a standalone --effort flag; revisit the adapter template"
+        assert_grok_help_contract(&require_installed_cli_help("grok"), "installed grok help");
+    }
+
+    #[test]
+    fn cursor_template_flags_are_present_on_the_installed_cli() {
+        if !installed_cli_verification_enabled() {
+            return;
+        }
+        assert_cursor_help_contract(
+            &require_installed_cli_help("cursor-agent"),
+            "installed cursor-agent help",
         );
     }
 
     #[test]
     fn claude_template_flags_are_present_on_the_installed_cli() {
-        let Some(help) = installed_cli_help("claude") else {
+        if !installed_cli_verification_enabled() {
             return;
-        };
-        for flag in ["--print", "--output-format", "--model", "--effort"] {
-            assert!(help.contains(flag), "installed claude help missing {flag}");
         }
-        assert!(
-            help.contains("--resume"),
-            "installed claude help missing session resume"
-        );
-        assert!(
-            help.contains("--permission-mode"),
-            "installed claude help missing permission-mode"
+        assert_claude_help_contract(
+            &require_installed_cli_help("claude"),
+            "installed claude help",
         );
     }
 
     #[test]
     fn gemini_template_flags_are_present_on_the_installed_cli() {
-        let Some(help) = installed_cli_help("gemini") else {
+        if !installed_cli_verification_enabled() {
             return;
-        };
-        for flag in ["--prompt", "--model", "--output-format"] {
-            assert!(help.contains(flag), "installed gemini help missing {flag}");
         }
-        assert!(
-            help.contains("--resume"),
-            "installed gemini help missing session resume"
+        assert_gemini_help_contract(
+            &require_installed_cli_help("gemini"),
+            "installed gemini help",
         );
     }
 }

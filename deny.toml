@@ -57,9 +57,12 @@ allow = []
 allow-workspace = true
 deny = []
 skip = []
-skip-tree = []
+skip-tree = [
+    { crate = "syn:>=2,<3", depth = 0, reason = "Newer serde_derive and clap_derive require syn 3 while the workspace and remaining proc-macro graph still require syn 2." },
+]
 
-# Keep the duplicate allowlists empty. The dev path
+# The depth-zero syn 2 entry above is the sole scoped duplicate bridge; keep
+# `skip` empty and do not extend the exception beyond that major series. The dev path
 # `workspace -> tempfile -> getrandom` overlaps the native build path
 # `workspace -> git2 -> libgit2-sys -> cc -> jobserver -> getrandom`, so both
 # resolve to getrandom 0.3.4. That also removes the duplicate dev/target-only

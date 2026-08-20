@@ -73,6 +73,40 @@ pub struct DecisionDiagnostics {
     pub candidate_predictions: Vec<CandidatePrediction>,
     pub continuation: Option<String>,
     pub escalation_comparison: Option<EscalationComparison>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taxonomy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taxonomy_cell: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taxonomy_confidence_bp: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_observations: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_cost_micros: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_observation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oscillation_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty_score_bp: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty_lower_bp: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty_upper_bp: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_overhead_micros: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overhead_degraded: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_metric: Option<String>,
 }
 
 impl DecisionDiagnostics {
@@ -91,6 +125,23 @@ impl DecisionDiagnostics {
             candidate_predictions: Vec::new(),
             continuation: None,
             escalation_comparison: None,
+            taxonomy_version: None,
+            taxonomy_cell: None,
+            taxonomy_confidence_bp: None,
+            recommendation_source: None,
+            evidence_observations: None,
+            switch_cost_micros: None,
+            switch_class: None,
+            switch_observation: None,
+            oscillation_count: None,
+            stage_path: None,
+            difficulty_score_bp: None,
+            difficulty_lower_bp: None,
+            difficulty_upper_bp: None,
+            decision_overhead_micros: None,
+            overhead_degraded: None,
+            calibration_step: None,
+            calibration_metric: None,
         }
     }
 
@@ -177,6 +228,8 @@ pub struct ComparedPolicy {
     pub effort: String,
     pub objective_value_micros: i64,
     pub quality_lcb_bp: u16,
+    #[serde(default)]
+    pub switch_cost_micros: i64,
 }
 
 pub(crate) fn role_label(role: &AgentRole) -> String {

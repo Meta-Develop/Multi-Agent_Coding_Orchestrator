@@ -1,0 +1,9 @@
+Usage: claude [options] [command] [prompt]
+
+Options:
+  --effort <level>                      Effort level for the current session
+  --model <model>                       Model for the current session
+  --output-format <format>              Output format (only works with --print)
+  --permission-mode <mode>              Permission mode to use for the session
+  -p, --print                           Print response and exit
+  -r, --resume [value]                  Resume a conversation by session ID
