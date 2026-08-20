@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "dataset_id": "maco-runtime-model-effort-priors",
+  "revision": "2026-08-21.1",
+  "published_on": "2026-08-21",
+  "objective_profiles": [
+    {
+      "name": "accepted-task-total-cost",
+      "version": 1,
+      "effective_date": "2026-08-21",
+      "minimum_quality_basis_points": 8000,
+      "minimum_class_fit_samples": 1,
+      "minimum_authority_samples": 1,
+      "pool_pressure_full_cost_microunits": 200000,
+      "observed_consumption_unit_cost_microunits": 50,
+      "entitlement_scarcity_full_cost_microunits": 50000,
+      "retry_penalty_microunits": 100000,
+      "degrade_effort_rank_penalty_microunits": 30000
+    }
+  ],
+  "models": [
+    {
+      "runtime": "codex",
+      "model": "gpt-5.6-sol",
+      "observed_on": "2026-08-07",
+      "source_id": "owner-policy-sol-baseline-2026-08-07",
+      "prior_scope": "dated capability and benchmark prior plus strongest approved no-evidence gate fallback",
+      "limitations": ["not comparable local accepted-task gate evidence", "outcome ledger remains authoritative for local cost and acceptance"],
+      "prohibited": false,
+      "prohibition_reason": null,
+      "prohibited_authority_roles": [],
+      "long_context_eligible": true,
+      "strong_gate_fallback_efforts": ["xhigh"],
+      "strength_rank": 100,
+      "class_fit": [
+        {"task_class":"localized_code_change","effort":"high","quality_basis_points":9000,"sample_size":10,"execution_cost_microunits":90000,"review_cost_microunits":20000,"rework_cost_microunits":10000,"rereview_cost_microunits":5000},
+        {"task_class":"localized_code_change","effort":"xhigh","quality_basis_points":9600,"sample_size":10,"execution_cost_microunits":110000,"review_cost_microunits":15000,"rework_cost_microunits":5000,"rereview_cost_microunits":3000},
+        {"task_class":"review_gate","effort":"xhigh","quality_basis_points":9600,"sample_size":1,"execution_cost_microunits":120000,"review_cost_microunits":20000,"rework_cost_microunits":5000,"rereview_cost_microunits":3000}
+      ],
+      "authority_evidence": [],
+      "one_shot_environment_fallbacks": []
+    },
+    {
+      "runtime": "codex",
+      "model": "gpt-5.6-luna",
+      "observed_on": "2026-08-07",
+      "source_id": "dated-luna-bounded-leaf-prior-2026-08-07",
+      "prior_scope": "ten-task bounded-leaf pilot used only as a static prior",
+      "limitations": ["single task shape", "single run", "no delegating, review, audit, gate, long-context, or publication authority"],
+      "prohibited": false,
+      "prohibition_reason": null,
+      "prohibited_authority_roles": ["delegating","acceptance_gate","review_auditor","audit","conflict_resolution","failure_classification","git_publication","unknown_judgment"],
+      "long_context_eligible": false,
+      "strong_gate_fallback_efforts": [],
+      "strength_rank": 20,
+      "class_fit": [
+        {"task_class":"localized_code_change","effort":"high","quality_basis_points":9000,"sample_size":10,"execution_cost_microunits":50000,"review_cost_microunits":30000,"rework_cost_microunits":10000,"rereview_cost_microunits":5000}
+      ],
+      "authority_evidence": [],
+      "one_shot_environment_fallbacks": [
+        {"rejection_code":"native_multiagent_v2_model_rejected","target_runtime":"codex","target_model":"gpt-5.6-sol","target_effort":"high"}
+      ]
+    },
+    {
+      "runtime": "codex",
+      "model": "gpt-5.6-terra",
+      "observed_on": "2026-08-07",
+      "source_id": "owner-terra-accepted-task-evidence-2026-08-07",
+      "prior_scope": "dated repository-task comparison retained solely as prohibition evidence",
+      "limitations": ["not an eligibility path"],
+      "prohibited": true,
+      "prohibition_reason": "project policy prohibits this model for every role",
+      "prohibited_authority_roles": ["terminal_leaf","delegating","acceptance_gate","review_auditor","audit","conflict_resolution","failure_classification","git_publication","unknown_judgment"],
+      "long_context_eligible": false,
+      "strong_gate_fallback_efforts": [],
+      "strength_rank": 0,
+      "class_fit": [
+        {"task_class":"localized_code_change","effort":"high","quality_basis_points":4070,"sample_size":10,"execution_cost_microunits":40000,"review_cost_microunits":40000,"rework_cost_microunits":40000,"rereview_cost_microunits":20000}
+      ],
+      "authority_evidence": [],
+      "one_shot_environment_fallbacks": []
+    },
+    {
+      "runtime": "grok",
+      "model": "grok-code-fast-1",
+      "observed_on": "2026-08-07",
+      "source_id": "dated-provisional-grok-benchmark-prior-2026-08-07",
+      "prior_scope": "provisional benchmark class-fit prior",
+      "limitations": ["not local accepted-task outcome evidence", "bounded leaf class only"],
+      "prohibited": false,
+      "prohibition_reason": null,
+      "prohibited_authority_roles": ["delegating","acceptance_gate","review_auditor","audit","conflict_resolution","failure_classification","git_publication","unknown_judgment"],
+      "long_context_eligible": false,
+      "strong_gate_fallback_efforts": [],
+      "strength_rank": 30,
+      "class_fit": [
+        {"task_class":"localized_code_change","effort":"high","quality_basis_points":8800,"sample_size":3,"execution_cost_microunits":100000,"review_cost_microunits":30000,"rework_cost_microunits":15000,"rereview_cost_microunits":5000}
+      ],
+      "authority_evidence": [],
+      "one_shot_environment_fallbacks": []
+    },
+    {
+      "runtime": "cursor",
+      "model": "cursor-composer-1",
+      "observed_on": "2026-08-07",
+      "source_id": "dated-provisional-cursor-benchmark-prior-2026-08-07",
+      "prior_scope": "provisional benchmark class-fit prior",
+      "limitations": ["not local accepted-task outcome evidence", "bounded leaf class only"],
+      "prohibited": false,
+      "prohibition_reason": null,
+      "prohibited_authority_roles": ["delegating","acceptance_gate","review_auditor","audit","conflict_resolution","failure_classification","git_publication","unknown_judgment"],
+      "long_context_eligible": false,
+      "strong_gate_fallback_efforts": [],
+      "strength_rank": 25,
+      "class_fit": [
+        {"task_class":"localized_code_change","effort":"high","quality_basis_points":8600,"sample_size":3,"execution_cost_microunits":105000,"review_cost_microunits":30000,"rework_cost_microunits":15000,"rereview_cost_microunits":5000}
+      ],
+      "authority_evidence": [],
+      "one_shot_environment_fallbacks": []
+    }
+  ]
+}

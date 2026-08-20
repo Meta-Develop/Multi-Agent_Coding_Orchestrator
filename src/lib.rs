@@ -44,6 +44,7 @@ pub mod runtime_adapter;
 pub mod safe_state;
 pub mod scope;
 pub(crate) mod secure_output;
+pub mod selection;
 pub mod semantic_coord;
 pub(crate) mod state_journal;
 pub(crate) mod state_migration;
