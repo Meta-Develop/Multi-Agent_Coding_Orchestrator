@@ -8,6 +8,10 @@ permissions:
   contents: read
   issues: write
 
+concurrency:
+  group: issue-intake-${{ github.event.issue.user.login }}
+  cancel-in-progress: true
+
 jobs:
   mark-inbox:
     name: Mark issue for agent triage
@@ -43,16 +47,17 @@ jobs:
 
       - name: Check out repository for read-only analysis
         if: ${{ steps.triage_gate.outputs.enabled == 'true' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Triage issue
         if: ${{ steps.triage_gate.outputs.enabled == 'true' }}
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@d40ddef4c030e508327d6e35a9c45f3368482c50 # v1.0.195
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
-          allowed_non_write_users: "*"
           prompt: |
             Perform triage only for issue #${{ github.event.issue.number }} in ${{ github.repository }}.
 
