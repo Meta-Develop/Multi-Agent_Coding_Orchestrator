@@ -41,7 +41,7 @@ fn run_ready_agents(
         return Ok(vec![(index, run_agent_command(spec))]);
     }
 
-    let mut handles = Vec::with_capacity(ready.len());
+    let mut prepared = Vec::with_capacity(ready.len());
     for index in ready {
         verify_selected_worktree_binding(
             manager,
@@ -57,13 +57,32 @@ fn run_ready_agents(
             &worktrees[*index],
             runtime,
         )?;
-        let index = *index;
+        prepared.push((*index, spec));
+    }
+
+    let mut handles = Vec::with_capacity(prepared.len());
+    for (index, spec) in prepared {
         handles.push((
             index,
             thread::spawn(move || (index, run_agent_command(spec))),
         ));
+        #[cfg(test)]
+        if let Err(error) = fail_after_ready_agent_spawn(&plan.agents[index].id) {
+            let _ = join_ready_agent_handles(handles);
+            return Err(error);
+        }
     }
+    Ok(join_ready_agent_handles(handles))
+}
 
+type ReadyAgentHandle = (
+    usize,
+    std::thread::JoinHandle<(usize, Result<CommandRunResult, ProcessRunError>)>,
+);
+
+fn join_ready_agent_handles(
+    handles: Vec<ReadyAgentHandle>,
+) -> Vec<(usize, Result<CommandRunResult, ProcessRunError>)> {
     let mut outcomes = Vec::with_capacity(handles.len());
     for (index, handle) in handles {
         let outcome = handle.join().unwrap_or_else(|_| {
@@ -83,7 +102,7 @@ fn run_ready_agents(
     }
 
     outcomes.sort_by_key(|(index, _)| *index);
-    Ok(outcomes)
+    outcomes
 }
 
 fn inspect_captured_agent_changes(
@@ -996,6 +1015,10 @@ fn command_spec(
     worktree: &SelectedWorktree,
     runtime: OrchestrationExecutionRuntime,
 ) -> Result<CommandRunSpec> {
+    #[cfg(test)]
+    if take_ready_agent_setup_fault(&agent.id) {
+        bail!("injected ready-agent setup failure for '{}'", agent.id);
+    }
     let recorded = summary
         .worktree
         .as_ref()

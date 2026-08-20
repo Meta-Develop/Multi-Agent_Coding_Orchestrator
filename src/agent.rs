@@ -340,6 +340,7 @@ where
             &run.selected.record.path,
             patch,
             &run.claimed_paths,
+            run.command_timeout,
             run.runtime,
         );
         if !result.success && execution_error.is_none() {
@@ -630,6 +631,7 @@ fn apply_proposed_patch(
     worktree_path: &Path,
     patch: &ProposedPatch,
     claimed_paths: &[PathBuf],
+    timeout: Duration,
     runtime: AgentExecutionRuntime,
 ) -> PatchApplicationReport {
     let normalized_path = match normalize_repo_relative_path(&patch.path) {
@@ -680,7 +682,7 @@ fn apply_proposed_patch(
         };
     }
 
-    match run_git_apply(worktree_path, &patch.unified_diff, runtime) {
+    match run_git_apply(worktree_path, &patch.unified_diff, timeout, runtime) {
         Ok(result) => PatchApplicationReport {
             path: normalized_path,
             success: result.status.is_some_and(|status| status.success()),
@@ -1010,6 +1012,7 @@ fn validation_report_for_command(result: &CommandExecutionReport) -> ValidationR
 fn run_git_apply(
     worktree_path: &Path,
     patch: &str,
+    timeout: Duration,
     runtime: AgentExecutionRuntime,
 ) -> Result<ProcessOutput> {
     let process_spec = ProcessSpec::direct(
@@ -1020,7 +1023,8 @@ fn run_git_apply(
         OUTPUT_CAPTURE_LIMIT_BYTES,
     )
     .with_environment(EnvironmentMode::ClearAndSet(sandbox_environment()))
-    .with_stdin(StdinMode::Bytes(patch.as_bytes().to_vec()));
+    .with_stdin(StdinMode::Bytes(patch.as_bytes().to_vec()))
+    .with_timeout(Some(timeout));
     let output = run_process(match runtime {
         AgentExecutionRuntime::Verified => process_spec
             .with_private_runtime_home(true)
@@ -1032,6 +1036,9 @@ fn run_git_apply(
             .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
     })
     .with_context(|| format!("failed to run git apply in {}", worktree_path.display()))?;
+    if output.timed_out {
+        bail!("git apply timed out after {} seconds", timeout.as_secs());
+    }
     let succeeded = match runtime {
         AgentExecutionRuntime::Verified => output.safety_sensitive_succeeded(),
         #[cfg(test)]
@@ -1375,6 +1382,50 @@ diff --git a/src/lib.rs b/src/lib.rs
         );
         assert!(report.candidate.changed_paths.is_empty());
         assert!(SyncStore::open(&repo_path)?.snapshot()?.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn git_apply_uses_the_agent_command_timeout() -> Result<()> {
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let patch = "\
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1 @@
+-# Test
++# Changed
+";
+
+        let applied = run_git_apply(
+            &repo_path,
+            patch,
+            Duration::from_secs(5),
+            AgentExecutionRuntime::NonpublishableSimulation,
+        )
+        .context("bounded git apply should succeed")?;
+        assert!(applied.status.is_some_and(|status| status.success()));
+        assert_eq!(
+            fs::read_to_string(repo_path.join("README.md"))?,
+            "# Changed\n"
+        );
+
+        let started = Instant::now();
+        let error = run_git_apply(
+            &repo_path,
+            patch,
+            Duration::ZERO,
+            AgentExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect_err("zero apply budget must expire");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("timed out") || message.contains("timeout"),
+            "git apply must report a timeout, got: {message}"
+        );
 
         Ok(())
     }

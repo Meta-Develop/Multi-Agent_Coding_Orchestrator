@@ -114,6 +114,52 @@ static CHECKPOINT_EVENT_FAILURE_HOOK: std::sync::OnceLock<
     std::sync::Mutex<Vec<CheckpointEventFailureHook>>,
 > = std::sync::OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    static READY_AGENT_SETUP_FAULT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    static READY_AGENT_POST_SPAWN_FAULT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_ready_agent_setup_fault(agent_id: impl Into<String>) {
+    READY_AGENT_SETUP_FAULT.with(|slot| *slot.borrow_mut() = Some(agent_id.into()));
+}
+
+#[cfg(test)]
+fn take_ready_agent_setup_fault(agent_id: &str) -> bool {
+    READY_AGENT_SETUP_FAULT.with(|slot| {
+        if slot.borrow().as_deref() == Some(agent_id) {
+            slot.borrow_mut().take();
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+fn set_ready_agent_post_spawn_fault(agent_id: impl Into<String>) {
+    READY_AGENT_POST_SPAWN_FAULT.with(|slot| *slot.borrow_mut() = Some(agent_id.into()));
+}
+
+#[cfg(test)]
+fn fail_after_ready_agent_spawn(agent_id: &str) -> Result<()> {
+    let triggered = READY_AGENT_POST_SPAWN_FAULT.with(|slot| {
+        if slot.borrow().as_deref() == Some(agent_id) {
+            slot.borrow_mut().take();
+            true
+        } else {
+            false
+        }
+    });
+    if triggered {
+        bail!("injected ready-agent post-spawn setup failure for '{agent_id}'");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OrchestrationExecutionRuntime {
     Verified,

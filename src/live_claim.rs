@@ -2953,7 +2953,6 @@ fn ensure_field(lines: &mut Vec<String>, key: &str, value: &str) {
     let insert_at = lines
         .iter()
         .position(|line| line.starts_with("- Owner:"))
-        .map(|index| index.saturating_add(1))
         .or_else(|| lines.iter().position(|line| line.starts_with("- Date:")))
         .map(|index| index.saturating_add(1))
         .unwrap_or_else(|| {
@@ -2962,7 +2961,8 @@ fn ensure_field(lines: &mut Vec<String>, key: &str, value: &str) {
                 .position(|line| line.starts_with("# Claim:"))
                 .map(|index| index.saturating_add(1))
                 .unwrap_or(0)
-        });
+        })
+        .min(lines.len());
     lines.insert(insert_at, new_line);
 }
 

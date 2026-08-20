@@ -36,6 +36,14 @@ fn injected_codex_runtime_catalog(slugs: &[&str]) -> RuntimeModelCatalog {
     )
 }
 
+fn install_named_test_models(models: &[&str]) -> InstalledModelCapabilityPolicy {
+    let entries = models
+        .iter()
+        .map(|model| (*model, ModelCapabilityClass::CriticalJudgment))
+        .collect::<Vec<_>>();
+    install_test_fixture_models(&entries).expect("test fixture capability policy")
+}
+
 #[cfg(unix)]
 fn mandatory_control_test_workspace() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("temporary mandatory-control workspace");
@@ -1021,6 +1029,9 @@ fn assert_parseable_partial_usage_is_conservative(
     run_id: &str,
     partial_outcome: ParseablePartialRunOutcome,
 ) {
+    let _capability =
+        install_test_fixture_models(&[("priced-model", ModelCapabilityClass::CriticalJudgment)])
+            .expect("partial-usage fixture capability policy");
     let (temp, repo_path) = injected_repository();
     let child_a = injected_named_assignment("child-a", "README.md");
     let child_b = injected_named_assignment("child-b", "src/lib.rs");

@@ -2,7 +2,7 @@ name: Public Repository CI Failure Intake
 
 "on":
   workflow_run:
-    workflows: ["Rust CI", "Supply-chain policy"]
+    workflows: ["Rust CI", "Supply-chain policy", "Minimum supported Rust version"]
     types: [completed]
 
 permissions:
@@ -37,6 +37,7 @@ jobs:
             const expectedWorkflows = new Set([
               "Rust CI",
               "Supply-chain policy",
+              "Minimum supported Rust version",
             ]);
             const failureLikeConclusions = new Set([
               "failure",

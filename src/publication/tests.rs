@@ -866,8 +866,40 @@ fn legacy_plaintext_publication_journal_requires_explicit_migration_without_muta
     let error = refuse_legacy_publication_journals(&repository)
         .expect_err("legacy journal must require migration");
     assert!(error.to_string().contains("explicit signed migration"));
+    assert!(error.to_string().contains("maco state migrate"));
     assert_eq!(
         fs::read(&legacy_record).expect("legacy record remains"),
+        b"legacy plaintext must remain untouched\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn signed_state_migration_unblocks_legacy_publication_journals_without_deleting_them() {
+    let repo = fake_effect_repo();
+    let repository = crate::git_repository::open(repo.path()).expect("open legacy test repo");
+    let legacy_root = repository
+        .commondir()
+        .join("maco/state/publication-transactions/legacy");
+    fs::create_dir_all(&legacy_root).expect("create legacy journal directory");
+    let legacy_record = legacy_root.join("00000000000000000001.json");
+    fs::write(&legacy_record, b"legacy plaintext must remain untouched\n")
+        .expect("write legacy record");
+
+    refuse_legacy_publication_journals(&repository)
+        .expect_err("unsigned leftover journals must still refuse");
+
+    let applied = crate::state_migration::migrate_repository_state(repo.path(), true)
+        .expect("signed migration of leftover publication journals");
+    assert_eq!(
+        applied.status,
+        crate::state_migration::StateMigrationStatus::Applied
+    );
+
+    refuse_legacy_publication_journals(&repository)
+        .expect("signed migration must unblock authenticated external effects");
+    assert_eq!(
+        fs::read(&legacy_record).expect("legacy record remains after retirement"),
         b"legacy plaintext must remain untouched\n"
     );
 }

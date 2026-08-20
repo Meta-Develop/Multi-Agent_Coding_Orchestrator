@@ -146,6 +146,75 @@ fn heartbeat_updates_timestamp_and_audit_log() -> Result<()> {
 }
 
 #[test]
+fn heartbeat_accepts_owner_last_and_owner_before_owned_files_layouts() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo = temp.path();
+    write_claim(
+        repo,
+        "owner-last",
+        r#"# Claim: owner-last
+
+- Claim ID: `owner-last`
+- Date: `2026-05-19`
+- Status: `active`
+- Owned files, regions, devices, or services:
+  - `src/cli.rs`: last-line owner layout
+- Owner: `worker-a`
+"#,
+    )?;
+    write_claim(
+        repo,
+        "owner-before-files",
+        r#"# Claim: owner-before-files
+
+- Claim ID: `owner-before-files`
+- Date: `2026-05-19`
+- Status: `active`
+- Owner: `worker-a`
+- Owned files, regions, devices, or services:
+  - `src/lib.rs`: owner immediately before owned files
+"#,
+    )?;
+
+    let last = run_success_json(&[
+        "live",
+        "heartbeat",
+        "owner-last",
+        "--repo",
+        repo_str(repo)?,
+        "--by",
+        "worker-a",
+        "--json",
+    ])?;
+    assert_eq!(last["status"], "active");
+    let last_text =
+        fs::read_to_string(claim_path(repo, "owner-last")).context("read owner-last")?;
+    assert!(last_text.contains("  - `src/cli.rs`: last-line owner layout"));
+
+    let before = run_success_json(&[
+        "live",
+        "heartbeat",
+        "owner-before-files",
+        "--repo",
+        repo_str(repo)?,
+        "--by",
+        "worker-a",
+        "--json",
+    ])?;
+    assert_eq!(before["status"], "active");
+    let before_text = fs::read_to_string(claim_path(repo, "owner-before-files"))
+        .context("read owner-before-files")?;
+    assert!(
+        before_text.contains(
+            "- Owned files, regions, devices, or services:\n  - `src/lib.rs`: owner immediately before owned files"
+        ),
+        "inserted field must not split the owned-files heading from its entries: {before_text}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn heartbeat_rejects_blank_actor_without_touching_claim() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo = temp.path();

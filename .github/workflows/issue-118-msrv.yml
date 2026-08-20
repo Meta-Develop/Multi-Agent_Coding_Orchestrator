@@ -1,0 +1,78 @@
+name: Minimum supported Rust version
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: msrv-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  msrv:
+    name: Cargo.toml rust-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Resolve declared MSRV
+        id: msrv
+        shell: bash
+        run: |
+          msrv="$(python3 - <<'PY'
+          import pathlib
+          import re
+          import tomllib
+
+          with pathlib.Path("Cargo.toml").open("rb") as manifest_file:
+              manifest = tomllib.load(manifest_file)
+          value = manifest["package"].get("rust-version")
+          if not isinstance(value, str) or not re.fullmatch(
+              r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", value
+          ):
+              raise SystemExit(
+                  "Cargo.toml package.rust-version must be an explicit Rust release"
+              )
+          print(value)
+          PY
+          )"
+          echo "version=${msrv}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check all targets at the declared MSRV
+        shell: bash
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: |
+          rustup toolchain install "${MSRV}" --profile minimal
+
+          # Capture rustc output fully before parsing. Piping a still-writing
+          # rustc into `awk ... exit` (or head/grep -m) raises SIGPIPE under
+          # Actions' `set -o pipefail` and fails the step with exit 141.
+          rustc_verbose="$(rustc +"${MSRV}" --version --verbose)"
+          actual_release="$(
+            awk '$1 == "release:" { print $2; exit }' <<< "${rustc_verbose}"
+          )"
+          expected_release="${MSRV}"
+          if [[ "${expected_release}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            expected_release="${expected_release}.0"
+          fi
+          if [[ "${actual_release}" != "${expected_release}" ]]; then
+            echo "expected rustc ${expected_release}, got ${actual_release}" >&2
+            exit 1
+          fi
+
+          printf '%s\n' "${rustc_verbose}"
+          cargo +"${MSRV}" --version --verbose
+          cargo +"${MSRV}" check --locked --all-targets

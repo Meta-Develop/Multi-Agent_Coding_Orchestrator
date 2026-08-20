@@ -3252,6 +3252,9 @@ mod decomposition_tests {
         let field_guide = SupervisorFieldGuidePrompt::empty().expect("empty fixture field guide");
         let budget_ledger =
             RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
+        // Fake catalog hides the slug; the provisional default (sol) is still
+        // configured capability evidence. Runtime-default with no configured
+        // model would be refused.
         let runtime_model_catalog = RuntimeModelCatalog::LocalDeterministicFake;
         let cancellation = ProcessCancellation::new();
         let mut journal = initialize_orchestration_event_journal(

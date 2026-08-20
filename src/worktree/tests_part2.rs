@@ -201,6 +201,45 @@
         assert!(!orphan.exists());
     }
 
+    #[test]
+    fn gc_full_apply_reports_removal_despite_stale_git_registration() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        let oid = commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let removable = create_gc_worktree(&manager, "removable-lane", &worktree_root);
+        let commit = repo.find_commit(oid).expect("commit");
+        let branch = repo
+            .branch("topic/stale-registration", &commit, false)
+            .expect("stale registration branch");
+        let reference = branch.into_reference();
+        let mut add = WorktreeAddOptions::new();
+        add.reference(Some(&reference));
+        let stale_path = worktree_root.join("stale-registration");
+        repo.worktree("stale-registration", &stale_path, Some(&add))
+            .expect("registered worktree");
+        fs::remove_dir_all(&stale_path).expect("delete registered worktree out of band");
+
+        let report = manager
+            .gc(gc_options(Some(worktree_root), false))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "full GC discarded its report after durable removal (removable_exists={}): {error:#}",
+                    removable.path.exists()
+                )
+            });
+
+        assert_eq!(report.removed_count, 1, "{report:#?}");
+        assert!(report.entries.iter().any(|entry| {
+            entry.name == removable.name && entry.status == WorktreeGcStatus::Removed
+        }));
+        assert!(!removable.path.exists());
+        assert!(repo.find_worktree("stale-registration").is_ok());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn machine_global_claim_refuses_unregistered_worktree_gc_before_any_orphan_moves() {
@@ -3514,6 +3553,10 @@
             .iter()
             .find(|entry| entry.name == lane.name)
             .expect("claimed entry");
+        assert_eq!(
+            entry.state,
+            WorktreeReconciliationState::AuthenticatedMissingBoth
+        );
         assert_eq!(entry.action, WorktreeReconciliationAction::Protected);
         assert!(entry.detail.contains("active durable claim"));
         let lock = store.lock().expect("lock");

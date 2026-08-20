@@ -28,12 +28,15 @@ exceptions = [
     # arbitrary AGPL dependencies.
     { allow = ["AGPL-3.0-or-later"], crate = "multi-agent-coding-orchestrator@0.3.0" },
     # libz-sys embeds stock zlib when the static vendored build is selected.
-    # Keep Zlib scoped to that exact crate release.
-    { allow = ["Zlib"], crate = "libz-sys@1.1.28" },
+    # Keep Zlib scoped to that crate; the clarification below verifies the
+    # exact expression and license-file hashes for every resolved release.
+    { allow = ["Zlib"], crate = "libz-sys" },
 ]
 
 [[licenses.clarify]]
-crate = "libz-sys@1.1.28"
+# If an upgrade changes this evidence, review the upstream license files and
+# update the expression and hashes together; never bypass a hash mismatch.
+crate = "libz-sys"
 expression = "(MIT OR Apache-2.0) AND Zlib"
 license-files = [
     { path = "LICENSE-APACHE", hash = 0x24b54f4b },

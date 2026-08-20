@@ -431,8 +431,12 @@ fn refuse_legacy_publication_journals(repository: &Repository) -> Result<()> {
     let mut entries = fs::read_dir(&legacy_root)
         .context("failed to enumerate legacy publication journal root")?;
     if entries.next().transpose()?.is_some() {
+        let repo_path = repository.workdir().unwrap_or_else(|| repository.path());
+        if crate::state_migration::legacy_publication_journals_are_retired(repo_path)? {
+            return Ok(());
+        }
         bail!(
-            "legacy publication journals require explicit signed migration before authenticated external effects can run"
+            "legacy publication journals require explicit signed migration before authenticated external effects can run; run `maco state migrate --repo <repo> --apply`"
         );
     }
     Ok(())

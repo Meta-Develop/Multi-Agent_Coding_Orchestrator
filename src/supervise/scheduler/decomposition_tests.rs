@@ -159,7 +159,7 @@ fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
         model_policy.apply(&plan).role_models[&AgentRole::ChildOrchestrator]
             .model
             .as_deref(),
-        Some(BALANCED_PROFILE_MODEL)
+        Some(ECONOMY_PROFILE_MODEL)
     );
     controller
         .assignment_policy(
@@ -209,7 +209,7 @@ fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
             after,
             resolved_candidate_index: 0,
             ..
-        } if before == FRONTIER_PROFILE_MODEL && after == BALANCED_PROFILE_MODEL
+        } if before == FRONTIER_PROFILE_MODEL && after == ECONOMY_PROFILE_MODEL
     ));
     assert_eq!(
         controller.records[2].change,
@@ -244,8 +244,8 @@ fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
                 "assignment_id": "model-assignment",
                 "budget_action": "degrade",
                 "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
-                "change": {"kind": "model_tier", "role": "child_orchestrator", "before": FRONTIER_PROFILE_MODEL, "after": BALANCED_PROFILE_MODEL, "resolved_candidate_index": 0},
-                "effective_child_model": BALANCED_PROFILE_MODEL,
+                "change": {"kind": "model_tier", "role": "child_orchestrator", "before": FRONTIER_PROFILE_MODEL, "after": ECONOMY_PROFILE_MODEL, "resolved_candidate_index": 0},
+                "effective_child_model": ECONOMY_PROFILE_MODEL,
                 "effective_child_reasoning_effort": "high",
                 "effective_fan_out": 8,
                 "observation": "admission_policy_resolved"
@@ -256,7 +256,7 @@ fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
                 "budget_action": "degrade",
                 "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
                 "change": {"kind": "fan_out", "before": 8, "after": 4},
-                "effective_child_model": BALANCED_PROFILE_MODEL,
+                "effective_child_model": ECONOMY_PROFILE_MODEL,
                 "effective_child_reasoning_effort": "high",
                 "effective_fan_out": 4,
                 "observation": "admission_policy_resolved"
@@ -267,7 +267,7 @@ fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
                 "budget_action": "owner_escalation",
                 "budget_reasons": ["soft_token_ceiling_reached", "hard_token_ceiling_reached", "missing_pricing"],
                 "change": {"kind": "halt", "before_new_dispatch_allowed": true, "after_new_dispatch_allowed": false},
-                "effective_child_model": BALANCED_PROFILE_MODEL,
+                "effective_child_model": ECONOMY_PROFILE_MODEL,
                 "effective_child_reasoning_effort": "high",
                 "effective_fan_out": 4,
                 "observation": "admission_policy_resolved"
@@ -802,6 +802,9 @@ fn concurrent_scheduler_preserves_schedule_error_context_before_spawning() {
 
 #[test]
 fn serial_scheduler_directly_dispatches_and_completes_fake_assignment() {
+    // Fake dispatch keeps the provisional default model's configured
+    // capability evidence; it does not treat an empty resolved slug as
+    // authority by itself.
     with_valid_schedule_context!(
         context,
         vec![test_assignment("serial-child", "README.md")],
@@ -1518,5 +1521,40 @@ fn persistence_records_gate_before_status_and_finalizes_report() {
     assert_eq!(
         kinds,
         vec![OrchestrationEventKind::Gate, OrchestrationEventKind::Status]
+    );
+}
+
+#[test]
+fn persist_releases_terminal_claims_without_checkpoint_writer() {
+    let (_temp, repo) = test_repository();
+    let run_id = RunId::new("degraded-terminal-release").expect("valid degraded persist run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "scheduler-degraded-persist-test",
+    )
+    .expect("reserve degraded persist artifacts");
+    write_supervisor_final_schema(
+        &mut writer,
+        Path::new("schemas/supervisor-final-report.schema.json"),
+    )
+    .expect("write degraded persist schema fixture");
+    let _field_guide_store = FieldGuideStore::open(&repo, FieldGuideLimits::default())
+        .expect("initialize authenticated degraded persist fixture");
+    let mut journal = initialize_orchestration_event_journal(&repo, &run_id, None);
+    let plan = test_plan(Vec::new());
+    let report = build_supervisor_final_report(test_report_construction(&plan, run_id.clone()));
+    let released = std::sync::atomic::AtomicBool::new(false);
+
+    persist_supervisor_final_report(report, &mut journal, writer, None, || {
+        released.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    })
+    .expect("persist without a checkpoint writer");
+
+    assert!(
+        released.load(std::sync::atomic::Ordering::SeqCst),
+        "terminal release must run even when checkpoint finalization is unavailable"
     );
 }
