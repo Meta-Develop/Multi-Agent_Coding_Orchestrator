@@ -1,3 +1,5 @@
+mod support;
+
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 use serde_json::{json, Value};
@@ -157,6 +159,7 @@ fn scan_emits_public_safe_fake_schema() -> Result<()> {
 
 #[test]
 fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()> {
+    support::require_containment!("run_processes_default_fake_items_and_writes_expected_artifacts");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let machine_global_config = write_test_machine_global_config(temp.path())?;
@@ -1086,6 +1089,7 @@ fn github_full_workspace_refuses_without_bound_external_reviewer() -> Result<()>
 
 #[test]
 fn run_with_custom_codex_bin_fails_closed_without_executing_it() -> Result<()> {
+    support::require_containment!("run_with_custom_codex_bin_fails_closed_without_executing_it");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let machine_global_config = write_test_machine_global_config(temp.path())?;
@@ -2025,6 +2029,9 @@ fn workspace_scan_error_redacts_generic_temp_absolute_paths() -> Result<()> {
 
 #[test]
 fn repeated_workspace_run_suppresses_duplicate_items_for_same_repo() -> Result<()> {
+    support::require_containment!(
+        "repeated_workspace_run_suppresses_duplicate_items_for_same_repo"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_named_committed_repo(temp.path(), "duplicate-repo")?;
     let machine_global_config = write_test_machine_global_config(temp.path())?;
@@ -2273,6 +2280,7 @@ fn active_semantic_intent_refuses_run() -> Result<()> {
 
 #[test]
 fn non_overlapping_locks_do_not_refuse_inbox_run() -> Result<()> {
+    support::require_containment!("non_overlapping_locks_do_not_refuse_inbox_run");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let machine_global_config = write_test_machine_global_config(temp.path())?;
@@ -2396,6 +2404,9 @@ fn maco_runtime_paths_do_not_self_block() -> Result<()> {
 
 #[test]
 fn fake_mode_inbox_skips_configured_validation_commands_without_executing_them() -> Result<()> {
+    support::require_containment!(
+        "fake_mode_inbox_skips_configured_validation_commands_without_executing_them"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let machine_global_config = write_test_machine_global_config(temp.path())?;
@@ -2452,6 +2463,7 @@ fn fake_mode_inbox_skips_configured_validation_commands_without_executing_them()
 
 #[test]
 fn auto_merge_is_never_performed() -> Result<()> {
+    support::require_containment!("auto_merge_is_never_performed");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let machine_global_config = write_test_machine_global_config(temp.path())?;
