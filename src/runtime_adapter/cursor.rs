@@ -4,8 +4,12 @@
 //! observation. Policy code may classify the returned slugs, but this adapter
 //! does not embed a live model list or infer authority from a model name.
 
-use crate::process_runner::{
-    run_process, ContainmentPolicy, EnvironmentMode, ProcessSpec, StdinMode,
+use super::AdapterId;
+use crate::{
+    artifacts::state_auth::sha256_hex,
+    process_runner::{
+        ProcessTreeEvidence, SideEffectConfinementEvidence, SideEffectConfinementProfileKind,
+    },
 };
 use anyhow::{bail, Context, Result};
 use std::{
@@ -23,7 +27,7 @@ const CURSOR_MODEL_DISPLAY_NAME_MAX_BYTES: usize = 768;
 const CURSOR_CATALOG_TIP_MAX_BYTES: usize = 4 * 1024;
 const CURSOR_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Exact bounded command needed to obtain Cursor's account-visible catalog.
+/// Exact bounded command request for Cursor's account-visible catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorCatalogCommandSpec {
     program: PathBuf,
@@ -35,15 +39,10 @@ pub struct CursorCatalogCommandSpec {
 }
 
 impl CursorCatalogCommandSpec {
-    /// Construct the stable production command `cursor-agent models`.
+    /// Construct the stable catalog request `cursor-agent models`.
     pub fn new(current_dir: impl Into<PathBuf>) -> Self {
-        Self::with_program("cursor-agent", current_dir)
-    }
-
-    /// Construct the same command with an explicitly selected executable.
-    pub fn with_program(program: impl Into<PathBuf>, current_dir: impl Into<PathBuf>) -> Self {
         Self {
-            program: program.into(),
+            program: PathBuf::from("cursor-agent"),
             args: vec![OsString::from("models")],
             current_dir: current_dir.into(),
             environment: BTreeMap::from([
@@ -89,49 +88,19 @@ pub struct CursorCatalogCommandOutput {
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     pub timed_out: bool,
+    pub process_tree: ProcessTreeEvidence,
+    pub side_effects: SideEffectConfinementEvidence,
 }
 
-/// Injectable command boundary. Unit tests implement this trait without
-/// resolving or starting `cursor-agent`.
+/// Injectable command boundary.
+///
+/// This module intentionally supplies no process implementation. A future
+/// screened runtime layer must resolve and bind the executable, screen the
+/// environment, apply an honest side-effect profile, capture bounded output,
+/// and return verified process evidence. Unit tests inject hermetic evidence
+/// without resolving or starting `cursor-agent`.
 pub trait CursorCatalogCommandRunner {
     fn run(&self, spec: &CursorCatalogCommandSpec) -> Result<CursorCatalogCommandOutput>;
-}
-
-/// Production runner backed by MACO's bounded subprocess capture.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ProcessCursorCatalogCommandRunner;
-
-impl CursorCatalogCommandRunner for ProcessCursorCatalogCommandRunner {
-    fn run(&self, spec: &CursorCatalogCommandSpec) -> Result<CursorCatalogCommandOutput> {
-        let output = run_process(
-            ProcessSpec::direct(
-                "Cursor runtime model catalog",
-                spec.program(),
-                spec.args().iter().cloned(),
-                spec.current_dir(),
-                spec.capture_limit_bytes(),
-            )
-            .with_environment(EnvironmentMode::InheritAndSet(spec.environment().clone()))
-            .with_stdin(StdinMode::Null)
-            .with_timeout(Some(spec.timeout()))
-            .with_containment(ContainmentPolicy::TrustedBestEffort),
-        )
-        .context("Cursor runtime model catalog command failed before evidence was available")?;
-        if let Some(error) = output.process_error {
-            bail!("Cursor runtime model catalog process cleanup failed: {error}");
-        }
-        if let Some(error) = output.stdin_error {
-            bail!("Cursor runtime model catalog stdin handling failed: {error}");
-        }
-        Ok(CursorCatalogCommandOutput {
-            status: output.status.and_then(|status| status.code()),
-            stdout: output.stdout.as_bytes().to_vec(),
-            stderr: output.stderr.as_bytes().to_vec(),
-            stdout_truncated: output.stdout.is_truncated(),
-            stderr_truncated: output.stderr.is_truncated(),
-            timed_out: output.timed_out,
-        })
-    }
 }
 
 /// One runtime-advertised model and its human-facing label.
@@ -171,11 +140,46 @@ impl CursorModelCatalog {
     }
 }
 
+/// One content-bound runtime-advertised catalog observation.
+///
+/// Runtime identity is fixed to this adapter's typed identity. Observation
+/// time is supplied by the screened caller. Neither field confers capability
+/// or authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorAdvertisedCatalogObservation {
+    catalog: CursorModelCatalog,
+    runtime: AdapterId,
+    observed_at_unix_millis: u64,
+    source_sha256: String,
+}
+
+impl CursorAdvertisedCatalogObservation {
+    pub fn catalog(&self) -> &CursorModelCatalog {
+        &self.catalog
+    }
+
+    pub const fn runtime(&self) -> AdapterId {
+        self.runtime
+    }
+
+    pub const fn observed_at_unix_millis(&self) -> u64 {
+        self.observed_at_unix_millis
+    }
+
+    pub fn source_sha256(&self) -> &str {
+        &self.source_sha256
+    }
+}
+
 /// Run the supplied command seam and accept only complete successful evidence.
 pub fn discover_cursor_model_catalog(
     runner: &dyn CursorCatalogCommandRunner,
     spec: &CursorCatalogCommandSpec,
-) -> Result<CursorModelCatalog> {
+    observed_at_unix_millis: Option<u64>,
+) -> Result<CursorAdvertisedCatalogObservation> {
+    let observed_at_unix_millis = observed_at_unix_millis
+        .filter(|observed_at| *observed_at != 0)
+        .context("Cursor runtime model catalog observation time is missing or zero")?;
     let output = runner.run(spec)?;
     if output.timed_out {
         bail!("Cursor runtime model catalog command timed out");
@@ -200,7 +204,30 @@ pub fn discover_cursor_model_catalog(
             output.status
         );
     }
-    parse_cursor_model_catalog(&output.stdout)
+    if !output.process_tree.is_verified_empty() {
+        bail!("Cursor runtime model catalog process ownership was not verified empty");
+    }
+    if !matches!(
+        output.side_effects,
+        SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::StrictOfflineWorkspace
+                | SideEffectConfinementProfileKind::TrustedFixedNetwork
+        )
+    ) {
+        bail!(
+            "Cursor runtime model catalog side-effect confinement was not verified with a Cursor-compatible profile"
+        );
+    }
+    if !output.stderr.is_empty() {
+        bail!("Cursor runtime model catalog command emitted unexpected stderr");
+    }
+    let catalog = parse_cursor_model_catalog(&output.stdout)?;
+    Ok(CursorAdvertisedCatalogObservation {
+        catalog,
+        runtime: AdapterId::Cursor,
+        observed_at_unix_millis,
+        source_sha256: sha256_hex(&output.stdout),
+    })
 }
 
 /// Parse the strict plain-text grammar emitted by `cursor-agent models`.
@@ -326,6 +353,7 @@ fn validate_cursor_model_display_name(display_name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process_runner::ContainmentBackend;
     use std::cell::RefCell;
 
     const CAPTURED_CATALOG: &[u8] = include_bytes!(concat!(
@@ -352,6 +380,11 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/runtime_adapter/cursor/hand-authored-withdrawn.txt"
     ));
+    const CAPTURED_PROVENANCE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/runtime_adapter/cursor/captured-minimal-20260820.provenance.json"
+    ));
+    const CAPTURED_AT_UNIX_MILLIS: u64 = 1_787_240_463_000;
 
     #[derive(Debug)]
     struct FakeRunner {
@@ -369,6 +402,12 @@ mod tests {
                     stdout_truncated: false,
                     stderr_truncated: false,
                     timed_out: false,
+                    process_tree: ProcessTreeEvidence::VerifiedEmpty(
+                        ContainmentBackend::DirectChild,
+                    ),
+                    side_effects: SideEffectConfinementEvidence::Verified(
+                        SideEffectConfinementProfileKind::TrustedFixedNetwork,
+                    ),
                 },
                 observed_specs: RefCell::new(Vec::new()),
             }
@@ -399,11 +438,22 @@ mod tests {
         assert_eq!(spec.timeout(), CURSOR_CATALOG_TIMEOUT);
 
         let runner = FakeRunner::successful(CAPTURED_CATALOG);
-        let catalog = discover_cursor_model_catalog(&runner, &spec)?;
+        let observation =
+            discover_cursor_model_catalog(&runner, &spec, Some(CAPTURED_AT_UNIX_MILLIS))?;
         assert_eq!(runner.observed_specs.into_inner(), [spec]);
+        let catalog = observation.catalog();
         assert_eq!(catalog.models().len(), 9);
         assert!(catalog.contains("composer-2.5"));
         assert!(catalog.contains("composer-2.5-fast"));
+        assert_eq!(observation.runtime(), AdapterId::Cursor);
+        assert_eq!(
+            observation.observed_at_unix_millis(),
+            CAPTURED_AT_UNIX_MILLIS
+        );
+        assert_eq!(
+            observation.source_sha256(),
+            "af088f298dd5b96cd0703887635cab1ea198047f5558f5ff128d02195ece83c1"
+        );
         Ok(())
     }
 
@@ -420,6 +470,31 @@ mod tests {
                 .last()
                 .map(CursorModelCatalogEntry::display_name),
             Some("Claude Opus 5 1M Low")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn captured_fixture_provenance_is_adjacent_exact_and_content_bound() -> Result<()> {
+        let provenance: serde_json::Value = serde_json::from_str(CAPTURED_PROVENANCE)?;
+        assert_eq!(provenance["schema_version"], 1);
+        assert_eq!(provenance["fixture"], "captured-minimal-20260820.txt");
+        assert_eq!(provenance["classification"], "capture-derived-minimal");
+        assert_eq!(provenance["captured_at_utc"], "2026-08-20T15:41:03Z");
+        assert_eq!(provenance["cli"], "cursor-agent");
+        assert_eq!(provenance["cli_version"], "2026.06.26-7079533");
+        assert_eq!(
+            provenance["argv"],
+            serde_json::json!(["cursor-agent", "models"])
+        );
+        assert_eq!(provenance["environment"]["NO_COLOR"], "1");
+        assert_eq!(provenance["environment"]["TERM"], "dumb");
+        assert_eq!(provenance["exit_status"], 0);
+        assert_eq!(provenance["redactions"], "none");
+        assert_eq!(provenance["fixture_sha256"], sha256_hex(CAPTURED_CATALOG));
+        assert_eq!(
+            provenance["scope_note"],
+            "This capture-derived minimal fixture is not a full unabridged archive."
         );
         Ok(())
     }
@@ -454,10 +529,88 @@ mod tests {
     }
 
     #[test]
+    fn parser_limits_and_structural_edges_fail_closed_table() {
+        fn fixture(model_lines: &[String], tip: &str) -> Vec<u8> {
+            format!(
+                "Available models\n\n{}\n\nTip: {tip}\n",
+                model_lines.join("\n")
+            )
+            .into_bytes()
+        }
+
+        let too_many_models = (0..=CURSOR_CATALOG_MAX_MODELS)
+            .map(|index| format!("worker-{index} - Worker {index}"))
+            .collect::<Vec<_>>();
+        let cases = vec![
+            (
+                "over catalog byte limit",
+                vec![b'x'; CURSOR_CATALOG_MAX_BYTES.saturating_add(1)],
+                "exceeds the 262144 byte limit",
+            ),
+            (
+                "over model count limit",
+                fixture(&too_many_models, "hand-authored test case"),
+                "513 models",
+            ),
+            (
+                "overlong slug",
+                fixture(
+                    &[format!(
+                        "{} - Worker",
+                        "a".repeat(CURSOR_MODEL_SLUG_MAX_BYTES.saturating_add(1))
+                    )],
+                    "hand-authored test case",
+                ),
+                "model slug exceeds",
+            ),
+            (
+                "overlong display name",
+                fixture(
+                    &[format!(
+                        "worker - {}",
+                        "D".repeat(CURSOR_MODEL_DISPLAY_NAME_MAX_BYTES.saturating_add(1))
+                    )],
+                    "hand-authored test case",
+                ),
+                "invalid model display name",
+            ),
+            (
+                "overlong tip",
+                fixture(
+                    &["worker - Worker".to_string()],
+                    &"t".repeat(CURSOR_CATALOG_TIP_MAX_BYTES),
+                ),
+                "invalid tip footer",
+            ),
+            (
+                "invalid utf8",
+                [b"Available models\n\nworker - ".as_slice(), &[0xff], b"\n"].concat(),
+                "not valid UTF-8",
+            ),
+            (
+                "bare carriage return",
+                b"Available models\n\nworker - Worker\rName\n\nTip: test\n".to_vec(),
+                "bare carriage return",
+            ),
+            (
+                "trailing footer content",
+                b"Available models\n\nworker - Worker\n\nTip: test\ntrailing\n".to_vec(),
+                "invalid footer shape",
+            ),
+        ];
+
+        for (label, bytes, expected) in cases {
+            let error = parse_cursor_model_catalog(&bytes).expect_err(label);
+            let error = format!("{error:#}");
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+    }
+
+    #[test]
     fn nonzero_timeout_and_truncation_command_evidence_fail_closed() {
         let spec = CursorCatalogCommandSpec::new("/workspace");
         type EvidenceMutation = fn(&mut CursorCatalogCommandOutput);
-        let cases: [(&str, EvidenceMutation, &str); 4] = [
+        let cases: [(&str, EvidenceMutation, &str); 5] = [
             (
                 "nonzero",
                 |output: &mut CursorCatalogCommandOutput| output.status = Some(7),
@@ -478,14 +631,101 @@ mod tests {
                 |output: &mut CursorCatalogCommandOutput| output.stderr_truncated = true,
                 "exceeded",
             ),
+            (
+                "successful command emitted stderr",
+                |output: &mut CursorCatalogCommandOutput| {
+                    output.stderr = b"unexpected warning".to_vec()
+                },
+                "unexpected stderr",
+            ),
         ];
         for (label, mutate, expected) in cases {
             let mut runner = FakeRunner::successful(CAPTURED_CATALOG);
             mutate(&mut runner.output);
-            let error = discover_cursor_model_catalog(&runner, &spec)
-                .expect_err(label)
-                .to_string();
+            let error =
+                discover_cursor_model_catalog(&runner, &spec, Some(CAPTURED_AT_UNIX_MILLIS))
+                    .expect_err(label)
+                    .to_string();
             assert!(error.contains(expected), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn unverified_process_and_side_effect_evidence_fail_closed_table() {
+        let spec = CursorCatalogCommandSpec::new("/workspace");
+        let cases = [
+            (
+                "best-effort process ownership",
+                ProcessTreeEvidence::TrustedBestEffort(ContainmentBackend::DirectChild),
+                SideEffectConfinementEvidence::Verified(
+                    SideEffectConfinementProfileKind::TrustedFixedNetwork,
+                ),
+                "process ownership was not verified empty",
+            ),
+            (
+                "unverified process ownership",
+                ProcessTreeEvidence::Unverified(ContainmentBackend::DirectChild),
+                SideEffectConfinementEvidence::Verified(
+                    SideEffectConfinementProfileKind::TrustedFixedNetwork,
+                ),
+                "process ownership was not verified empty",
+            ),
+            (
+                "best-effort side effects",
+                ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::DirectChild),
+                SideEffectConfinementEvidence::TrustedBestEffort(
+                    SideEffectConfinementProfileKind::TrustedFixedNetwork,
+                ),
+                "side-effect confinement was not verified",
+            ),
+            (
+                "unverified side effects",
+                ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::DirectChild),
+                SideEffectConfinementEvidence::Unverified(
+                    SideEffectConfinementProfileKind::TrustedFixedNetwork,
+                ),
+                "side-effect confinement was not verified",
+            ),
+            (
+                "compatibility profile cannot be promoted by a runner",
+                ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::DirectChild),
+                SideEffectConfinementEvidence::Verified(
+                    SideEffectConfinementProfileKind::TrustedCompatibility,
+                ),
+                "side-effect confinement was not verified",
+            ),
+            (
+                "Codex-specific profile is not Cursor evidence",
+                ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::DirectChild),
+                SideEffectConfinementEvidence::Verified(
+                    SideEffectConfinementProfileKind::ExternalCodex,
+                ),
+                "side-effect confinement was not verified",
+            ),
+        ];
+
+        for (label, process_tree, side_effects, expected) in cases {
+            let mut runner = FakeRunner::successful(CAPTURED_CATALOG);
+            runner.output.process_tree = process_tree;
+            runner.output.side_effects = side_effects;
+            let error =
+                discover_cursor_model_catalog(&runner, &spec, Some(CAPTURED_AT_UNIX_MILLIS))
+                    .expect_err(label)
+                    .to_string();
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn missing_or_zero_observation_time_fails_before_runner_dispatch() {
+        let spec = CursorCatalogCommandSpec::new("/workspace");
+        for observed_at in [None, Some(0)] {
+            let runner = FakeRunner::successful(CAPTURED_CATALOG);
+            let error = discover_cursor_model_catalog(&runner, &spec, observed_at)
+                .expect_err("missing observation time must fail closed")
+                .to_string();
+            assert!(error.contains("missing or zero"), "{error}");
+            assert!(runner.observed_specs.into_inner().is_empty());
         }
     }
 
@@ -495,7 +735,7 @@ mod tests {
         let mut runner = FakeRunner::successful(CAPTURED_CATALOG);
         runner.output.stderr = vec![b'x'; spec.capture_limit_bytes().saturating_add(1)];
 
-        let error = discover_cursor_model_catalog(&runner, &spec)
+        let error = discover_cursor_model_catalog(&runner, &spec, Some(CAPTURED_AT_UNIX_MILLIS))
             .expect_err("oversized runner evidence must fail closed")
             .to_string();
         assert!(error.contains("larger than"), "{error}");
