@@ -1314,6 +1314,9 @@ fn merge_apply_rejects_successful_validation_that_mutates_initialized_submodule(
 #[cfg(unix)]
 #[test]
 fn merge_preview_preserves_non_utf8_claimed_path_and_emits_ascii_json() -> Result<()> {
+    support::require_containment!(
+        "merge_preview_preserves_non_utf8_claimed_path_and_emits_ascii_json"
+    );
     use std::os::unix::ffi::OsStringExt;
 
     let temp = TempDir::new().context("tempdir")?;
