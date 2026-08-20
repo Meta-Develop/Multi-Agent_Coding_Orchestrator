@@ -6,6 +6,7 @@
 //! runtime selection a vendor enum again.
 
 mod capabilities;
+pub mod cursor;
 
 pub use capabilities::{
     parse_adapter_allowlist, registered_adapter_ids, AdapterId, AdapterTrustClass,
