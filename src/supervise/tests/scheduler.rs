@@ -1254,7 +1254,7 @@ fn admission_commit_recv_failure_cancels_and_drains_active_assignments() {
             injected_verified_run(command)
         }
     };
-    set_abort_admission_commit_on_spawn(2);
+    set_abort_admission_commit_on_spawn(&options.run_id, 2);
 
     let report = run_supervisor_plan_with_concurrent_cancellable_runner(
         plan,

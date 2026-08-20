@@ -98,29 +98,42 @@ fn take_force_degraded_checkpoint_finalization() -> bool {
 }
 
 #[cfg(test)]
-static ABORT_ADMISSION_COMMIT_ON_SPAWN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-pub(crate) fn set_abort_admission_commit_on_spawn(remaining: usize) {
-    ABORT_ADMISSION_COMMIT_ON_SPAWN.store(remaining, std::sync::atomic::Ordering::SeqCst);
+fn admission_commit_abort_injections(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<String, usize>> {
+    static INJECTIONS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
+    > = std::sync::OnceLock::new();
+    INJECTIONS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
 }
 
 #[cfg(test)]
-fn take_abort_admission_commit_on_spawn() -> bool {
-    use std::sync::atomic::Ordering::SeqCst;
-    loop {
-        let remaining = ABORT_ADMISSION_COMMIT_ON_SPAWN.load(SeqCst);
-        if remaining == 0 {
-            return false;
-        }
-        if ABORT_ADMISSION_COMMIT_ON_SPAWN
-            .compare_exchange(remaining, remaining - 1, SeqCst, SeqCst)
-            .is_ok()
-        {
-            return remaining == 1;
-        }
+pub(crate) fn set_abort_admission_commit_on_spawn(run_id: &RunId, remaining: usize) {
+    let mut injections = admission_commit_abort_injections()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if remaining == 0 {
+        injections.remove(run_id.as_str());
+    } else {
+        injections.insert(run_id.as_str().to_string(), remaining);
     }
+}
+
+#[cfg(test)]
+fn take_abort_admission_commit_on_spawn(run_id: &RunId) -> bool {
+    let mut injections = admission_commit_abort_injections()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let should_abort = match injections.get_mut(run_id.as_str()) {
+        Some(remaining) => {
+            *remaining = remaining.saturating_sub(1);
+            *remaining == 0
+        }
+        None => false,
+    };
+    if should_abort {
+        injections.remove(run_id.as_str());
+    }
+    should_abort
 }
 
 fn assignments_overlap(left: &OrchestratorAssignment, right: &OrchestratorAssignment) -> bool {
@@ -1174,7 +1187,7 @@ fn run_concurrent_assignment_schedule(
                         };
                         let _concurrency_guard = concurrency.assignment_started();
                         #[cfg(test)]
-                        if take_abort_admission_commit_on_spawn() {
+                        if take_abort_admission_commit_on_spawn(&context.options.run_id) {
                             panic!("injected admission-commit abort before notify");
                         }
                         execute_supervisor_assignment(AssignmentExecutionContext {
