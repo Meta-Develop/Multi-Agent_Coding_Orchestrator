@@ -982,9 +982,6 @@ fn cli_worktree_diff_uses_active_claims_for_json() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nchanged\n").context("edit worktree")?;
@@ -1046,6 +1043,60 @@ fn cli_worktree_pending_on_fresh_repo_creates_no_maco_state() -> Result<()> {
     assert!(String::from_utf8_lossy(&remove.stderr)
         .contains("non-force managed worktree removal is unsupported"));
     assert!(!maco_root.exists());
+    Ok(())
+}
+
+#[test]
+fn cli_worktree_create_derives_cleanliness_capability_on_clean_repo() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+
+    let record = run_success_json([
+        "worktree",
+        "create",
+        "agent-clean",
+        "--repo",
+        repo,
+        "--json",
+    ])?;
+
+    assert_eq!(record["name"], "agent-clean");
+    let worktree_path = Path::new(record["path"].as_str().context("worktree path string")?);
+    assert!(worktree_path.is_dir());
+    Ok(())
+}
+
+#[test]
+fn cli_worktree_create_refuses_dirty_primary_with_actionable_error() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    fs::write(repo_path.join("dirty.txt"), "pending\n").context("write dirty file")?;
+
+    let output = Command::new(BIN)
+        .args([
+            "worktree",
+            "create",
+            "agent-dirty",
+            "--repo",
+            repo,
+            "--json",
+        ])
+        .output()
+        .context("run dirty worktree create")?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("capability-bound repository cleanliness input"),
+        "expected capability-bound cleanliness context: {stderr}"
+    );
+    assert!(
+        stderr.contains("primary repository is dirty"),
+        "expected dirty-primary cause: {stderr}"
+    );
+    assert!(!repo_path.join(".git/maco").exists());
     Ok(())
 }
 
@@ -1197,9 +1248,6 @@ fn cli_merge_preview_blocks_unclaimed_edits_json() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nchanged\n").context("edit worktree")?;
@@ -1562,21 +1610,6 @@ fn cli_prompt_preview_refuses_symlinked_repository_excerpts() -> Result<()> {
 
 fn run_success_json<const N: usize>(args: [&str; N]) -> Result<Value> {
     run_success_json_args(&args)
-}
-
-fn assert_worktree_creation_unsupported(repo: &str) -> Result<bool> {
-    let output = Command::new(BIN)
-        .args(["worktree", "create", "agent-a", "--repo", repo, "--json"])
-        .output()
-        .context("run unsupported worktree create")?;
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("managed worktree creation is unsupported")
-            && stderr.contains("capability-bound"),
-        "unexpected worktree-create refusal: {stderr}"
-    );
-    Ok(true)
 }
 
 fn assert_orchestrate_run_unsupported(plan: &Path, repo: &Path) -> Result<bool> {
