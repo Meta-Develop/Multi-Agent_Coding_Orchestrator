@@ -20,8 +20,10 @@
 //! the #146 boundary). The core depends on capabilities, not CLI assumptions.
 
 pub mod action;
+pub mod calibration;
 pub mod catalog;
 pub mod certification;
+pub mod difficulty;
 pub mod drift;
 pub mod error;
 pub mod explanation;
@@ -33,6 +35,7 @@ pub mod hedge;
 pub mod ids;
 pub mod objective;
 pub mod online_router;
+pub mod operator_labels;
 pub mod policy;
 pub mod predictor;
 pub mod quality;
@@ -41,6 +44,8 @@ pub mod resources;
 pub mod safe_set;
 pub mod shadow;
 pub mod state;
+pub mod switch_cost;
+pub mod taxonomy;
 pub mod telemetry;
 pub mod trajectory;
 pub mod value_of_information;
