@@ -39,12 +39,10 @@ fn pr_publish_help_describes_bound_two_stage_validation() -> Result<()> {
 
 #[test]
 fn pr_preview_reports_safe_fake_preview_for_claimed_worktree_edit() -> Result<()> {
+    support::require_containment!("pr_preview_reports_safe_fake_preview_for_claimed_worktree_edit");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\npreview\n").context("edit worktree")?;
@@ -80,6 +78,7 @@ fn pr_preview_reports_safe_fake_preview_for_claimed_worktree_edit() -> Result<()
 
 #[test]
 fn pr_preview_redacts_remote_url_userinfo_query_and_fragment() -> Result<()> {
+    support::require_containment!("pr_preview_redacts_remote_url_userinfo_query_and_fragment");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     run_git(&[
@@ -91,9 +90,6 @@ fn pr_preview_redacts_remote_url_userinfo_query_and_fragment() -> Result<()> {
         "https://user:super-secret@example.invalid/repo.git?token=query-secret#fragment-secret",
     ])?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(
@@ -128,12 +124,12 @@ fn pr_preview_redacts_remote_url_userinfo_query_and_fragment() -> Result<()> {
 
 #[test]
 fn pr_publish_fake_commits_uncommitted_worktree_changes_without_pushing() -> Result<()> {
+    support::require_containment!(
+        "pr_publish_fake_commits_uncommitted_worktree_changes_without_pushing"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\npublish\n").context("edit worktree")?;
@@ -175,12 +171,12 @@ fn pr_publish_fake_commits_uncommitted_worktree_changes_without_pushing() -> Res
 
 #[test]
 fn pr_publish_fake_ignores_untrusted_git_path_shadow_during_internal_commit() -> Result<()> {
+    support::require_containment!(
+        "pr_publish_fake_ignores_untrusted_git_path_shadow_during_internal_commit"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(
@@ -235,6 +231,7 @@ fn pr_publish_fake_ignores_untrusted_git_path_shadow_during_internal_commit() ->
 
 #[test]
 fn pr_publish_git_refuses_local_origin_without_calling_gh() -> Result<()> {
+    support::require_containment!("pr_publish_git_refuses_local_origin_without_calling_gh");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path())?;
@@ -247,9 +244,6 @@ fn pr_publish_git_refuses_local_origin_without_calling_gh() -> Result<()> {
         path_str(&origin_path)?,
     ])?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\ngit push\n").context("edit worktree")?;
@@ -301,6 +295,9 @@ fn pr_publish_git_refuses_local_origin_without_calling_gh() -> Result<()> {
 
 #[test]
 fn pr_publish_git_refuses_local_origin_before_config_url_redirects_can_run() -> Result<()> {
+    support::require_containment!(
+        "pr_publish_git_refuses_local_origin_before_config_url_redirects_can_run"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path())?;
@@ -333,9 +330,6 @@ fn pr_publish_git_refuses_local_origin_before_config_url_redirects_can_run() -> 
         "true",
     ])?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     let redirect_key = format!("url.{}.insteadOf", path_str(&attack_path)?);
@@ -388,6 +382,9 @@ fn pr_publish_git_refuses_local_origin_before_config_url_redirects_can_run() -> 
 
 #[test]
 fn pr_publish_fake_does_not_execute_repository_filter_or_diff_driver() -> Result<()> {
+    support::require_containment!(
+        "pr_publish_fake_does_not_execute_repository_filter_or_diff_driver"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let filter_marker = temp.path().join("filter-marker");
@@ -434,9 +431,6 @@ fn pr_publish_fake_does_not_execute_repository_filter_or_diff_driver() -> Result
         path_str(&diff)?,
     ])?;
     let repo = path_str(&repo_path)?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     let _ = fs::remove_file(&filter_marker);
@@ -467,6 +461,9 @@ fn pr_publish_fake_does_not_execute_repository_filter_or_diff_driver() -> Result
 
 #[test]
 fn pr_publish_git_refuses_ssh_without_running_home_repo_or_env_commands() -> Result<()> {
+    support::require_containment!(
+        "pr_publish_git_refuses_ssh_without_running_home_repo_or_env_commands"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     run_git(&[
@@ -478,9 +475,6 @@ fn pr_publish_git_refuses_ssh_without_running_home_repo_or_env_commands() -> Res
         "ssh://localhost:1/owner/repo.git",
     ])?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(
@@ -546,6 +540,7 @@ fn pr_publish_git_refuses_ssh_without_running_home_repo_or_env_commands() -> Res
 
 #[test]
 fn pr_publish_github_rejects_local_origin_and_untrusted_gh_shadow() -> Result<()> {
+    support::require_containment!("pr_publish_github_rejects_local_origin_and_untrusted_gh_shadow");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path())?;
@@ -558,9 +553,6 @@ fn pr_publish_github_rejects_local_origin_and_untrusted_gh_shadow() -> Result<()
         path_str(&origin_path)?,
     ])?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\ngithub pr\n")
@@ -650,6 +642,9 @@ fi
 
 #[test]
 fn pr_publish_github_refuses_local_origin_before_untrusted_gh_can_move_remote_ref() -> Result<()> {
+    support::require_containment!(
+        "pr_publish_github_refuses_local_origin_before_untrusted_gh_can_move_remote_ref"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path())?;
@@ -662,9 +657,6 @@ fn pr_publish_github_refuses_local_origin_before_untrusted_gh_can_move_remote_re
         path_str(&origin_path)?,
     ])?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(
@@ -765,6 +757,9 @@ fi
 
 #[test]
 fn pr_publish_github_refuses_local_origin_before_untrusted_lost_response_shim() -> Result<()> {
+    support::require_containment!(
+        "pr_publish_github_refuses_local_origin_before_untrusted_lost_response_shim"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path())?;
@@ -777,9 +772,6 @@ fn pr_publish_github_refuses_local_origin_before_untrusted_lost_response_shim() 
         path_str(&origin_path)?,
     ])?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nreconcile pr\n")
@@ -869,6 +861,9 @@ fi
 
 #[test]
 fn pr_publish_git_refuses_local_origin_before_untrusted_path_shadow_can_push() -> Result<()> {
+    support::require_containment!(
+        "pr_publish_git_refuses_local_origin_before_untrusted_path_shadow_can_push"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path())?;
@@ -892,9 +887,6 @@ fn pr_publish_git_refuses_local_origin_before_untrusted_path_shadow_can_push() -
         path_str(&origin_path)?,
     ])?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\npublish lock\n")
@@ -950,12 +942,12 @@ fn pr_publish_git_refuses_local_origin_before_untrusted_path_shadow_can_push() -
 
 #[test]
 fn pr_publish_fake_blocks_unclaimed_worktree_edits_with_json_report() -> Result<()> {
+    support::require_containment!(
+        "pr_publish_fake_blocks_unclaimed_worktree_edits_with_json_report"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nblocked\n").context("edit worktree")?;
@@ -988,12 +980,10 @@ fn pr_publish_fake_blocks_unclaimed_worktree_edits_with_json_report() -> Result<
 
 #[test]
 fn pr_publish_required_validation_blocks_missing_evidence() -> Result<()> {
+    support::require_containment!("pr_publish_required_validation_blocks_missing_evidence");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\npublish\n").context("edit worktree")?;
@@ -1031,12 +1021,10 @@ fn pr_publish_required_validation_blocks_missing_evidence() -> Result<()> {
 
 #[test]
 fn pr_publish_required_validation_accepts_exact_candidate_binding() -> Result<()> {
+    support::require_containment!("pr_publish_required_validation_accepts_exact_candidate_binding");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nbound pr\n").context("edit worktree")?;
@@ -1086,12 +1074,12 @@ fn pr_publish_required_validation_accepts_exact_candidate_binding() -> Result<()
 
 #[test]
 fn pr_publish_required_validation_refuses_dirty_bound_candidate_before_commit() -> Result<()> {
+    support::require_containment!(
+        "pr_publish_required_validation_refuses_dirty_bound_candidate_before_commit"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\ndirty bound\n")
@@ -1141,12 +1129,10 @@ fn pr_publish_required_validation_refuses_dirty_bound_candidate_before_commit() 
 
 #[test]
 fn pr_publish_required_validation_rejects_legacy_unbound_pass() -> Result<()> {
+    support::require_containment!("pr_publish_required_validation_rejects_legacy_unbound_pass");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nlegacy pr\n")
@@ -1186,12 +1172,12 @@ fn pr_publish_required_validation_rejects_legacy_unbound_pass() -> Result<()> {
 
 #[test]
 fn pr_preview_required_validation_rejects_mismatched_candidate_binding() -> Result<()> {
+    support::require_containment!(
+        "pr_preview_required_validation_rejects_mismatched_candidate_binding"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nfirst pr\n")
@@ -1240,12 +1226,10 @@ fn pr_preview_required_validation_rejects_mismatched_candidate_binding() -> Resu
 #[cfg(target_os = "linux")]
 #[test]
 fn pr_publish_refuses_live_repo_common_publication_lock() -> Result<()> {
+    support::require_containment!("pr_publish_refuses_live_repo_common_publication_lock");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(
@@ -1300,6 +1284,9 @@ fn pr_publish_refuses_live_repo_common_publication_lock() -> Result<()> {
 
 #[test]
 fn pr_publish_bound_evidence_rejects_later_same_path_commit_without_push() -> Result<()> {
+    support::require_containment!(
+        "pr_publish_bound_evidence_rejects_later_same_path_commit_without_push"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path())?;
@@ -1312,9 +1299,6 @@ fn pr_publish_bound_evidence_rejects_later_same_path_commit_without_push() -> Re
         path_str(&origin_path)?,
     ])?;
     let repo = repo_path.to_str().context("repo path utf8")?;
-    if assert_worktree_creation_unsupported(repo)? {
-        return Ok(());
-    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     let agent_repo = Repository::open(worktree_path).context("open agent repo")?;
@@ -1820,21 +1804,6 @@ fn write_bound_validation(path: &Path, binding: &Value) -> Result<()> {
         serde_json::to_vec_pretty(&evidence).context("serialize evidence")?,
     )
     .context("write bound validation")
-}
-
-fn assert_worktree_creation_unsupported(repo: &str) -> Result<bool> {
-    let output = Command::new(BIN)
-        .args(["worktree", "create", "agent-a", "--repo", repo, "--json"])
-        .output()
-        .context("run unsupported worktree create")?;
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("managed worktree creation is unsupported")
-            && stderr.contains("capability-bound"),
-        "unexpected worktree-create refusal: {stderr}"
-    );
-    Ok(true)
 }
 
 fn run_success_json(args: &[&str]) -> Result<Value> {
