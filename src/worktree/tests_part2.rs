@@ -2982,6 +2982,52 @@
         assert!(!registry.operations.contains_key(&binding.name));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_writes_lane_build_config_outside_the_lane_and_gc_does_not_prune_it() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = create_gc_worktree(&manager, "lane-build-config", &worktree_root);
+
+        let config_path = crate::lane_build::lane_build_config_path(&worktree_root);
+        let contents = fs::read_to_string(&config_path).expect("lane cargo config");
+        assert_eq!(contents, crate::lane_build::lane_cargo_config_contents());
+        assert!(
+            !created.path.join(".cargo/config.toml").exists()
+                || fs::read_to_string(created.path.join(".cargo/config.toml"))
+                    .expect("lane checkout cargo config")
+                    == fs::read_to_string(
+                        Path::new(env!("CARGO_MANIFEST_DIR")).join(".cargo/config.toml")
+                    )
+                    .expect("primary cargo config"),
+            "lane checkout must keep the tracked primary Cargo config"
+        );
+        assert!(
+            !config_path.starts_with(&created.path),
+            "lane build config must not live inside the disposable checkout"
+        );
+
+        let report = manager
+            .gc(gc_options(Some(worktree_root.clone()), false))
+            .expect("gc after lane create");
+        assert!(
+            config_path.exists(),
+            "reserved .cargo sibling must survive orphan prune"
+        );
+        assert!(
+            !report
+                .entries
+                .iter()
+                .any(|entry| entry.name == crate::lane_build::LANE_BUILD_CONFIG_DIR),
+            "lane Cargo config must not be classified as a worktree: {report:#?}"
+        );
+    }
+
     fn create_gc_worktree(
         manager: &WorktreeManager,
         agent_id: &str,

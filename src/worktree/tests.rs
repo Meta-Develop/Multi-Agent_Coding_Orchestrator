@@ -2296,6 +2296,115 @@ fn gc_retention_keeps_newest_and_removes_retained_target() {
     ));
 }
 
+#[test]
+fn retention_keep_order_prefers_higher_rebuild_cost_per_byte() {
+    use std::cmp::Ordering;
+    let expensive = RetentionKeepKey {
+        rebuild_cost_ms: Some(35 * 60 * 1000),
+        apparent_bytes: 6_900,
+        created_at_unix_nanos: 1,
+        name: "expensive-old",
+    };
+    let cheap = RetentionKeepKey {
+        rebuild_cost_ms: Some(2 * 60 * 1000),
+        apparent_bytes: 6_900,
+        created_at_unix_nanos: 2,
+        name: "cheap-new",
+    };
+    assert_eq!(
+        cmp_retention_keep_order(&expensive, &cheap),
+        Ordering::Less,
+        "expensive-to-rebuild lane must sort ahead of a same-sized cheap lane"
+    );
+    let old = RetentionKeepKey {
+        rebuild_cost_ms: None,
+        apparent_bytes: 100,
+        created_at_unix_nanos: 1,
+        name: "old",
+    };
+    let new = RetentionKeepKey {
+        rebuild_cost_ms: None,
+        apparent_bytes: 100,
+        created_at_unix_nanos: 2,
+        name: "new",
+    };
+    assert_eq!(
+        cmp_retention_keep_order(&old, &new),
+        Ordering::Greater,
+        "unknown cost must keep recency (newest first)"
+    );
+    let old_known = RetentionKeepKey {
+        rebuild_cost_ms: Some(1),
+        ..old
+    };
+    assert_eq!(
+        cmp_retention_keep_order(&old_known, &new),
+        Ordering::Greater,
+        "mixed known/unknown cost must not invert recency"
+    );
+}
+
+#[test]
+fn lane_rebuild_cost_sidecar_round_trips_and_ignores_garbage() {
+    let temp = TempDir::new().expect("tempdir");
+    let lane = temp.path().join("lane");
+    fs::create_dir(&lane).expect("lane");
+    assert_eq!(load_lane_rebuild_cost(&lane), None);
+    record_lane_rebuild_cost(&lane, 2_100_000).expect("record");
+    assert_eq!(load_lane_rebuild_cost(&lane), Some(2_100_000));
+    fs::write(lane.join(LANE_REBUILD_COST_RELATIVE), "{not-json").expect("corrupt");
+    assert_eq!(load_lane_rebuild_cost(&lane), None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gc_size_retention_keeps_expensive_rebuild_ahead_of_newer_cheap_lane() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let worktree_root = temp.path().join("worktrees");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    commit_readme(&repo).expect("initial commit");
+    let manager = WorktreeManager::new(&repo_path);
+    let expensive = create_gc_worktree(&manager, "cost-expensive", &worktree_root);
+    fs::create_dir_all(expensive.path.join("target/debug")).expect("expensive target");
+    fs::write(
+        expensive.path.join("target/debug/artifact"),
+        vec![b'e'; 32 * 1024],
+    )
+    .expect("expensive artifact");
+    record_lane_rebuild_cost(&expensive.path, 35 * 60 * 1000).expect("expensive cost");
+    let cheap = create_gc_worktree(&manager, "cost-cheap", &worktree_root);
+    fs::create_dir_all(cheap.path.join("target/debug")).expect("cheap target");
+    fs::write(
+        cheap.path.join("target/debug/artifact"),
+        vec![b'c'; 32 * 1024],
+    )
+    .expect("cheap artifact");
+    record_lane_rebuild_cost(&cheap.path, 2 * 60 * 1000).expect("cheap cost");
+    let expensive_size = gc_worktree_size_estimate(&expensive.path).expect("expensive size");
+    let cheap_size = gc_worktree_size_estimate(&cheap.path).expect("cheap size");
+    let budget = expensive_size.worktree_bytes.max(cheap_size.worktree_bytes);
+
+    let mut options = gc_options(Some(worktree_root), false);
+    options.remove_targets = false;
+    options.retention.max_total_bytes = Some(budget);
+    let report = manager
+        .gc_with_target_liveness(options, |_| WorktreeTargetLiveness::Clear)
+        .expect("cost-aware GC");
+
+    assert_eq!(report.removed_count, 1, "{report:#?}");
+    assert_eq!(report.retained_count, 1, "{report:#?}");
+    let removed = report
+        .entries
+        .iter()
+        .find(|entry| entry.status == WorktreeGcStatus::Removed)
+        .expect("removed entry");
+    assert_eq!(removed.name, cheap.name);
+    assert!(expensive.path.exists());
+    assert!(!cheap.path.exists());
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_size_retention_keeps_the_newest_prefix_and_counts_lane_bytes_once() {

@@ -20,6 +20,7 @@ pub(crate) mod follow_up_queue;
 pub mod gate_denial;
 mod git_repository;
 pub mod inbox;
+pub mod lane_build;
 pub mod live_claim;
 pub mod llm;
 pub mod machine_global;

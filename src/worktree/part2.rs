@@ -136,7 +136,7 @@ fn reconcile_managed_worktree_lifecycle(
         let root = SafeRoot::open_existing(&root_path)?;
         let git_registered = git_registered_worktree_names_for_reconciliation(repo, root.path())?;
         for child_name in root.direct_child_names_bounded(MAX_MANAGED_RECORDS)? {
-            if child_name.to_string_lossy().starts_with(".maco-") {
+            if is_reserved_worktree_root_child(&child_name) {
                 continue;
             }
             let Some(name) = child_name.to_str() else {
@@ -962,6 +962,7 @@ struct RegisteredWorktreePreviewCandidate {
     created_at_unix_nanos: i64,
     untracked_paths: Vec<PathBuf>,
     size: WorktreeGcSizeEstimate,
+    rebuild_cost_ms: Option<u64>,
 }
 
 /// Classifies Git-registered repository-local lanes that predate the
@@ -1158,18 +1159,29 @@ fn preview_registered_repository_local_worktrees(
             name: name.to_string(),
             branch,
             branch_merged,
-            path,
+            path: path.clone(),
             created_at_unix_nanos,
             untracked_paths,
             size,
+            rebuild_cost_ms: load_lane_rebuild_cost(&path),
         });
     }
 
     candidates.sort_by(|left, right| {
-        right
-            .created_at_unix_nanos
-            .cmp(&left.created_at_unix_nanos)
-            .then_with(|| left.name.cmp(&right.name))
+        cmp_retention_keep_order(
+            &RetentionKeepKey {
+                rebuild_cost_ms: left.rebuild_cost_ms,
+                apparent_bytes: left.size.worktree_bytes,
+                created_at_unix_nanos: left.created_at_unix_nanos,
+                name: &left.name,
+            },
+            &RetentionKeepKey {
+                rebuild_cost_ms: right.rebuild_cost_ms,
+                apparent_bytes: right.size.worktree_bytes,
+                created_at_unix_nanos: right.created_at_unix_nanos,
+                name: &right.name,
+            },
+        )
     });
     let mut retention_state = WorktreeGcRetentionState::default();
     for candidate in candidates {
@@ -1329,7 +1341,7 @@ fn resolve_sweep_repository(
     .map_err(|error| sweep_failure(WorktreeSweepFailureKind::RepositoryAssociation, error))?;
     let mut lane_associations = BTreeMap::new();
     for lane_name in lane_names {
-        if lane_name.to_string_lossy().starts_with(".maco-") {
+        if is_reserved_worktree_root_child(&lane_name) {
             continue;
         }
         let lane_path = group_root.join(&lane_name);
@@ -1756,6 +1768,7 @@ struct WorktreeGcCandidate {
     untracked_paths: Vec<PathBuf>,
     apparent_worktree_bytes: u64,
     apparent_target_bytes: Option<u64>,
+    rebuild_cost_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2146,6 +2159,88 @@ fn worktree_path_native_bytes(path: &Path) -> usize {
 
 fn gc_created_at(binding: &ManagedWorktreeBinding) -> i64 {
     binding.created_at_unix_nanos.unwrap_or(0)
+}
+
+const LANE_REBUILD_COST_RELATIVE: &str = ".maco/lane-rebuild-cost.json";
+const MAX_LANE_REBUILD_COST_BYTES: u64 = 4096;
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LaneRebuildCostRecord {
+    rebuild_cost_ms: u64,
+}
+
+/// Records the measured wall-clock of the build that produced a lane `target/`.
+///
+/// The sidecar lives under `.maco/`, which worktree status already excludes, so
+/// recording cost does not dirty the lane against GC.
+pub fn record_lane_rebuild_cost(worktree_path: &Path, rebuild_cost_ms: u64) -> Result<()> {
+    let path = worktree_path.join(LANE_REBUILD_COST_RELATIVE);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create lane rebuild-cost directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let encoded = serde_json::to_vec(&LaneRebuildCostRecord { rebuild_cost_ms })
+        .context("failed to encode lane rebuild cost")?;
+    fs::write(&path, encoded)
+        .with_context(|| format!("failed to write lane rebuild cost {}", path.display()))?;
+    Ok(())
+}
+
+/// Loads a recorded rebuild cost, or `None` when the lane has no usable record.
+pub fn load_lane_rebuild_cost(worktree_path: &Path) -> Option<u64> {
+    let path = worktree_path.join(LANE_REBUILD_COST_RELATIVE);
+    let metadata = fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_LANE_REBUILD_COST_BYTES {
+        return None;
+    }
+    let bytes = fs::read(&path).ok()?;
+    serde_json::from_slice::<LaneRebuildCostRecord>(&bytes)
+        .ok()
+        .map(|record| record.rebuild_cost_ms)
+}
+
+/// Landlord / GreedyDual-Size keep order: higher rebuild-cost per byte first.
+///
+/// Unknown cost falls back to recency so existing age/count/size tests keep
+/// their newest-prefix behavior until a lane records a rebuild cost.
+#[derive(Clone, Copy)]
+struct RetentionKeepKey<'a> {
+    rebuild_cost_ms: Option<u64>,
+    apparent_bytes: u64,
+    created_at_unix_nanos: i64,
+    name: &'a str,
+}
+
+fn cmp_retention_keep_order(
+    left: &RetentionKeepKey<'_>,
+    right: &RetentionKeepKey<'_>,
+) -> std::cmp::Ordering {
+    match (left.rebuild_cost_ms, right.rebuild_cost_ms) {
+        (Some(left_cost), Some(right_cost)) => {
+            let left_density =
+                u128::from(left_cost).saturating_mul(u128::from(right.apparent_bytes.max(1)));
+            let right_density =
+                u128::from(right_cost).saturating_mul(u128::from(left.apparent_bytes.max(1)));
+            right_density
+                .cmp(&left_density)
+                .then_with(|| {
+                    left.created_at_unix_nanos
+                        .cmp(&right.created_at_unix_nanos)
+                        .reverse()
+                })
+                .then_with(|| left.name.cmp(right.name))
+        }
+        _ => left
+            .created_at_unix_nanos
+            .cmp(&right.created_at_unix_nanos)
+            .reverse()
+            .then_with(|| left.name.cmp(right.name)),
+    }
 }
 
 fn worktree_retention_is_configured(retention: WorktreeRetentionPolicy) -> bool {
