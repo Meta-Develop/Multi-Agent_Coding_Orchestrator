@@ -1,0 +1,16 @@
+Usage: grok [OPTIONS] [PROMPT] [COMMAND]
+
+Options:
+      --cwd <CWD>
+          Working directory
+      --model <MODEL>
+          Model ID to use
+      --output-format <OUTPUT_FORMAT>
+          Output format for headless mode [default: plain]
+      --prompt-file <PATH>
+          Single-turn prompt from a file
+      --reasoning-effort <EFFORT>
+          Reasoning effort for reasoning models [aliases: --effort]
+
+Commands:
+  models       List available models and exit
