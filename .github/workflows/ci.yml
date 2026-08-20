@@ -235,7 +235,9 @@ jobs:
           worktree::tests::gc_report_serializes_non_utf8_untracked_paths_losslessly_and_escapes_human_text
           worktree::tests::gc_retention_keeps_newest_and_removes_retained_target
           worktree::tests::gc_revalidates_tracked_and_unapproved_output_after_liveness
+          worktree::tests::create_writes_lane_build_config_outside_the_lane_and_gc_does_not_prune_it
           worktree::tests::gc_scopes_managed_bindings_to_the_exact_requested_root
+          worktree::tests::gc_size_retention_keeps_expensive_rebuild_ahead_of_newer_cheap_lane
           worktree::tests::gc_size_retention_keeps_the_newest_prefix_and_counts_lane_bytes_once
           worktree::tests::gc_target_cleanup_rechecks_dirtiness_after_boundary_liveness
           worktree::tests::gc_targets_only_reclaims_untracked_lane_target_and_keeps_lane_branch_and_orphan
