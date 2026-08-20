@@ -795,6 +795,102 @@ fn run_merge_apply_controller(
     deliver_report(&report, json)
 }
 
+/// Reap authenticated managed worktrees whose branches are fully contained in
+/// the current local HEAD branch. Dirty, claimed, leased, and unmerged lanes
+/// stay in place. Candidate selectors disable pathname-only orphan pruning so
+/// this completion hook cannot demand a machine-global binding.
+fn reap_merged_managed_worktrees(repo: &Path) -> Result<Option<WorktreeLifecycleReport>> {
+    let git = crate::git_repository::open(repo).with_context(|| {
+        format!(
+            "failed to open repository {} for merged worktree reaping",
+            repo.display()
+        )
+    })?;
+    let head = match git.head() {
+        Ok(head) => head,
+        Err(_) => return Ok(None),
+    };
+    if !head.is_branch() {
+        return Ok(None);
+    }
+    let Ok(trunk_ref) = head.name().map(str::to_owned) else {
+        return Ok(None);
+    };
+    if !trunk_ref.starts_with("refs/heads/") {
+        return Ok(None);
+    }
+
+    let state_path = git.commondir().join("maco").join("state");
+    match std::fs::symlink_metadata(&state_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect managed worktree state at {}",
+                    state_path.display()
+                )
+            })
+        }
+    }
+
+    let manager = WorktreeManager::new(repo);
+    let candidate_agent_ids = manager
+        .list()
+        .context("failed to list managed worktrees for merged reaping")?
+        .into_iter()
+        .map(|record| record.name)
+        .collect::<BTreeSet<_>>();
+    if candidate_agent_ids.is_empty() {
+        return Ok(None);
+    }
+
+    manager
+        .lifecycle(WorktreeLifecycleOptions {
+            apply: true,
+            auto_reap_merged: true,
+            candidate_agent_ids: Some(candidate_agent_ids),
+            merged_into_reference: Some(trunk_ref),
+            ..WorktreeLifecycleOptions::default()
+        })
+        .map(Some)
+        .context("merged-lane worktree reaping failed")
+}
+
+fn print_merged_worktree_reap_summary(report: &WorktreeLifecycleReport, json: bool) {
+    if json {
+        return;
+    }
+    let Some(gc) = report.worktree_gc.as_ref() else {
+        return;
+    };
+    println!(
+        "Merged worktree reap: considered={} removed={} protected={} retained={}",
+        gc.considered_count, gc.removed_count, gc.protected_count, gc.retained_count
+    );
+}
+
+fn finish_with_merged_worktree_reap(repo: &Path, json: bool, outcome: Result<()>) -> Result<()> {
+    let reap = match reap_merged_managed_worktrees(repo) {
+        Ok(Some(report)) => {
+            print_merged_worktree_reap_summary(&report, json);
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(error) => Err(error),
+    };
+    match (outcome, reap) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(error).context(
+            "command succeeded, but merged worktree reaping failed; do not blindly retry the command",
+        ),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(reap_error)) => Err(primary).context(format!(
+            "merged worktree reaping also failed: {reap_error:#}"
+        )),
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum MergeSubcommand {
     /// Preview whether an agent worktree diff can be applied to the primary worktree.

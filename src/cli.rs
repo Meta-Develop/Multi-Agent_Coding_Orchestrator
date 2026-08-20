@@ -617,46 +617,56 @@ impl OrchestrateCommand {
     fn run(self) -> Result<()> {
         match self.command {
             OrchestrateSubcommand::Run(args) => {
-                let summary = orchestrator::run_plan_file_with_controls(
-                    OrchestrationRunOptions {
-                        repo: args.repo,
-                        plan_file: args.plan_file,
-                        keep_claims: args.keep_claims,
-                        jobs: args.jobs,
-                        patch_dir: args.patch_dir,
-                    },
-                    OrchestrationRunControls {
-                        run_id: args.run_id.map(RunId::new).transpose()?,
-                        checkpoint_dir: args.checkpoint_dir,
-                        worktree_reuse_policy: args.reuse,
-                        semantic_coordination: args.semantic_coordination,
-                    },
-                )?;
-                print_orchestration_summary(&summary, args.json)?;
-                if !summary.success {
-                    if let Some(agent_id) = summary.first_failed_agent() {
-                        bail!("orchestration failed for agent '{agent_id}'");
+                let json = args.json;
+                let reap_repo = args.repo.clone();
+                let outcome = (|| {
+                    let summary = orchestrator::run_plan_file_with_controls(
+                        OrchestrationRunOptions {
+                            repo: args.repo,
+                            plan_file: args.plan_file,
+                            keep_claims: args.keep_claims,
+                            jobs: args.jobs,
+                            patch_dir: args.patch_dir,
+                        },
+                        OrchestrationRunControls {
+                            run_id: args.run_id.map(RunId::new).transpose()?,
+                            checkpoint_dir: args.checkpoint_dir,
+                            worktree_reuse_policy: args.reuse,
+                            semantic_coordination: args.semantic_coordination,
+                        },
+                    )?;
+                    print_orchestration_summary(&summary, json)?;
+                    if !summary.success {
+                        if let Some(agent_id) = summary.first_failed_agent() {
+                            bail!("orchestration failed for agent '{agent_id}'");
+                        }
+                        bail!("orchestration failed");
                     }
-                    bail!("orchestration failed");
-                }
-                Ok(())
+                    Ok(())
+                })();
+                finish_with_merged_worktree_reap(&reap_repo, json, outcome)
             }
             OrchestrateSubcommand::Resume(args) => {
-                let summary = orchestrator::resume_plan_file(OrchestrationResumeOptions {
-                    checkpoint_file: args.checkpoint_file,
-                    repo: args.repo,
-                    plan_file: args.plan_file,
-                    jobs: args.jobs,
-                    patch_dir: args.patch_dir,
-                })?;
-                print_orchestration_summary(&summary, args.json)?;
-                if !summary.success {
-                    if let Some(agent_id) = summary.first_failed_agent() {
-                        bail!("orchestration failed for agent '{agent_id}'");
+                let json = args.json;
+                let reap_repo = args.repo.clone().unwrap_or_else(|| PathBuf::from("."));
+                let outcome = (|| {
+                    let summary = orchestrator::resume_plan_file(OrchestrationResumeOptions {
+                        checkpoint_file: args.checkpoint_file,
+                        repo: args.repo,
+                        plan_file: args.plan_file,
+                        jobs: args.jobs,
+                        patch_dir: args.patch_dir,
+                    })?;
+                    print_orchestration_summary(&summary, json)?;
+                    if !summary.success {
+                        if let Some(agent_id) = summary.first_failed_agent() {
+                            bail!("orchestration failed for agent '{agent_id}'");
+                        }
+                        bail!("orchestration failed");
                     }
-                    bail!("orchestration failed");
-                }
-                Ok(())
+                    Ok(())
+                })();
+                finish_with_merged_worktree_reap(&reap_repo, json, outcome)
             }
             OrchestrateSubcommand::Collect(args) => {
                 let report = collect_orchestration_results(
@@ -875,6 +885,8 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     .and_then(|plan| plan.assignments.first().and_then(|a| a.runtime))
                     .unwrap_or(supervise::SupervisorRuntime::Codex)
             });
+            let json = args.json;
+            let reap_repo = resolved_repo.clone();
             let options = SupervisorRunOptions {
                 repo: resolved_repo,
                 plan_file,
@@ -897,43 +909,46 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     correction_correlation_id: resolved_run_id.as_str().to_string(),
                 }),
             };
-            let report = match (goal_spec, resume_existing) {
-                (Some(goal_spec), true) => {
-                    supervise::resume_supervisor_goal_spec_cascade_with_concurrency_policy(
-                        options,
-                        "",
-                        &goal_spec,
-                        args.max_concurrent_children,
-                    )?
+            let outcome = (|| {
+                let report = match (goal_spec, resume_existing) {
+                    (Some(goal_spec), true) => {
+                        supervise::resume_supervisor_goal_spec_cascade_with_concurrency_policy(
+                            options,
+                            "",
+                            &goal_spec,
+                            args.max_concurrent_children,
+                        )?
+                    }
+                    (Some(goal_spec), false) => {
+                        supervise::run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_worktree_opt_in(
+                            options,
+                            "",
+                            &goal_spec,
+                            args.max_concurrent_children,
+                            args.allow_primary_worktree,
+                        )?
+                    }
+                    (None, true) => {
+                        supervise::resume_supervisor_plan_file_cascade_with_concurrency_policy(
+                            options,
+                            args.max_concurrent_children,
+                        )?
+                    }
+                    (None, false) => {
+                        supervise::run_supervisor_plan_file_cascade_with_concurrency_policy_and_primary_worktree_opt_in(
+                            options,
+                            args.max_concurrent_children,
+                            args.allow_primary_worktree,
+                        )?
+                    }
+                };
+                print_query_report(&report, json)?;
+                if !report.follow_up_cascade_success {
+                    bail!("supervise run failed");
                 }
-                (Some(goal_spec), false) => {
-                    supervise::run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_worktree_opt_in(
-                        options,
-                        "",
-                        &goal_spec,
-                        args.max_concurrent_children,
-                        args.allow_primary_worktree,
-                    )?
-                }
-                (None, true) => {
-                    supervise::resume_supervisor_plan_file_cascade_with_concurrency_policy(
-                        options,
-                        args.max_concurrent_children,
-                    )?
-                }
-                (None, false) => {
-                    supervise::run_supervisor_plan_file_cascade_with_concurrency_policy_and_primary_worktree_opt_in(
-                        options,
-                        args.max_concurrent_children,
-                        args.allow_primary_worktree,
-                    )?
-                }
-            };
-            print_query_report(&report, args.json)?;
-            if !report.follow_up_cascade_success {
-                bail!("supervise run failed");
-            }
-            Ok(())
+                Ok(())
+            })();
+            finish_with_merged_worktree_reap(&reap_repo, json, outcome)
         }
         SuperviseSubcommand::Reaudit(args) => {
             let resolved = resolve_run_id_for_run(
@@ -1721,6 +1736,7 @@ impl AutopilotCommand {
                 print_query_report(&plan, args.json)
             }
             AutopilotSubcommand::Run(args) => {
+                let json = args.json;
                 let budget_overrides = args.budget.limits();
                 let budget_max_duration_seconds = args.budget.max_duration_seconds();
                 let (plan_file, goal_spec) = match (args.task_file, args.from_goal) {
@@ -1745,6 +1761,7 @@ impl AutopilotCommand {
                     args.json,
                 )?;
                 let parent_node = args.parent_node.map(Into::into);
+                let reap_repo = resolved.repo.clone();
                 let options = AutopilotRunOptions {
                     repo: resolved.repo,
                     plan_file,
@@ -1763,29 +1780,34 @@ impl AutopilotCommand {
                     owner: "maco-autopilot".to_string(),
                     correction_correlation_id: resolved.run_id.as_str().to_string(),
                 });
-                let report = match goal_spec {
-                    Some(goal_spec) => {
-                        autopilot::run_autopilot_goal_spec_with_profile_retention_and_parent(
-                            options,
-                            "",
-                            &goal_spec,
-                            profile,
-                            retention,
-                            parent_node,
-                        )?
+                let outcome = (|| {
+                    let report = match goal_spec {
+                        Some(goal_spec) => {
+                            autopilot::run_autopilot_goal_spec_with_profile_retention_and_parent(
+                                options,
+                                "",
+                                &goal_spec,
+                                profile,
+                                retention,
+                                parent_node,
+                            )?
+                        }
+                        None => {
+                            autopilot::run_autopilot_plan_file_with_profile_retention_and_parent(
+                                options,
+                                profile,
+                                retention,
+                                parent_node,
+                            )?
+                        }
+                    };
+                    print_query_report(&report, json)?;
+                    if !report.success {
+                        bail!("autopilot run failed");
                     }
-                    None => autopilot::run_autopilot_plan_file_with_profile_retention_and_parent(
-                        options,
-                        profile,
-                        retention,
-                        parent_node,
-                    )?,
-                };
-                print_query_report(&report, args.json)?;
-                if !report.success {
-                    bail!("autopilot run failed");
-                }
-                Ok(())
+                    Ok(())
+                })();
+                finish_with_merged_worktree_reap(&reap_repo, json, outcome)
             }
             AutopilotSubcommand::Status(args) => {
                 let report = autopilot::autopilot_status(args.repo, RunId::new(&args.run_id)?)?;
@@ -2153,29 +2175,36 @@ impl AgentCommand {
         match self.command {
             AgentSubcommand::Run(args) => {
                 let json = args.json;
-                if json {
-                    let failure_context = AgentRunFailureContext::from_args(&args);
-                    match run_agent_from_args(args) {
-                        Ok(report) => {
-                            print_agent_run_report(&report, true)?;
-                            if !report.success {
-                                bail!("{}", report.error.as_deref().unwrap_or("agent run failed"));
+                let reap_repo = args.repo.clone();
+                let outcome = (|| {
+                    if json {
+                        let failure_context = AgentRunFailureContext::from_args(&args);
+                        match run_agent_from_args(args) {
+                            Ok(report) => {
+                                print_agent_run_report(&report, true)?;
+                                if !report.success {
+                                    bail!(
+                                        "{}",
+                                        report.error.as_deref().unwrap_or("agent run failed")
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                let report = failure_context.into_report(error.to_string());
+                                print_agent_run_failure_report(&report)?;
+                                bail!("{}", report.error);
                             }
                         }
-                        Err(error) => {
-                            let report = failure_context.into_report(error.to_string());
-                            print_agent_run_failure_report(&report)?;
-                            bail!("{}", report.error);
+                    } else {
+                        let report = run_agent_from_args(args)?;
+                        print_agent_run_report(&report, false)?;
+                        if !report.success {
+                            bail!("{}", report.error.as_deref().unwrap_or("agent run failed"));
                         }
                     }
-                } else {
-                    let report = run_agent_from_args(args)?;
-                    print_agent_run_report(&report, false)?;
-                    if !report.success {
-                        bail!("{}", report.error.as_deref().unwrap_or("agent run failed"));
-                    }
-                }
-                Ok(())
+                    Ok(())
+                })();
+                finish_with_merged_worktree_reap(&reap_repo, json, outcome)
             }
         }
     }
