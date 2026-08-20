@@ -1068,7 +1068,11 @@ fn pr_publish_required_validation_accepts_exact_candidate_binding() -> Result<()
         report["preview"]["safety"]["validation_evidence"]["binding_status"],
         "bound"
     );
-    assert_eq!(report["commit_id"], Value::Null);
+    assert_eq!(
+        report["commit_id"],
+        preview["preview"]["candidate"]["validation_binding"]["agent_head"]
+    );
+    assert_eq!(report["head_id"], report["commit_id"]);
     Ok(())
 }
 
