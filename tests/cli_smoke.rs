@@ -819,6 +819,7 @@ fn cli_repo_map_orchestrate_and_sync_status_json() -> Result<()> {
 
 #[test]
 fn cli_orchestrate_failure_still_emits_json_summary() -> Result<()> {
+    support::require_containment!("cli_orchestrate_failure_still_emits_json_summary");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("plan.json");
@@ -861,6 +862,7 @@ fn cli_orchestrate_failure_still_emits_json_summary() -> Result<()> {
 
 #[test]
 fn cli_orchestrate_reports_committed_agent_change_and_patch() -> Result<()> {
+    support::require_containment!("cli_orchestrate_reports_committed_agent_change_and_patch");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("plan.json");
@@ -914,6 +916,7 @@ fn cli_orchestrate_reports_committed_agent_change_and_patch() -> Result<()> {
 
 #[test]
 fn cli_claim_conflict_still_emits_json_summary() -> Result<()> {
+    support::require_containment!("cli_claim_conflict_still_emits_json_summary");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("plan.json");
@@ -1597,6 +1600,9 @@ fn run_success_json<const N: usize>(args: [&str; N]) -> Result<Value> {
 
 #[test]
 fn cli_orchestrate_run_refuses_dirty_primary_with_actionable_error() -> Result<()> {
+    support::require_containment!(
+        "cli_orchestrate_run_refuses_dirty_primary_with_actionable_error"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("plan.json");

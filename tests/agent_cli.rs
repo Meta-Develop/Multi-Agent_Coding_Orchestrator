@@ -1,3 +1,5 @@
+mod support;
+
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 use serde_json::Value;
@@ -8,6 +10,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 
 #[test]
 fn cli_agent_run_uses_fake_proposal_in_isolated_worktree() -> Result<()> {
+    support::require_containment!("cli_agent_run_uses_fake_proposal_in_isolated_worktree");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -159,6 +162,7 @@ fn cli_agent_run_missing_fake_proposal_emits_json_failure() -> Result<()> {
 
 #[test]
 fn cli_agent_run_disables_provider_commands_by_default_json() -> Result<()> {
+    support::require_containment!("cli_agent_run_disables_provider_commands_by_default_json");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -226,6 +230,7 @@ fn cli_agent_run_disables_provider_commands_by_default_json() -> Result<()> {
 
 #[test]
 fn cli_agent_run_failed_json_keep_claims_leaves_claim_active() -> Result<()> {
+    support::require_containment!("cli_agent_run_failed_json_keep_claims_leaves_claim_active");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -301,6 +306,7 @@ fn cli_agent_run_failed_json_keep_claims_leaves_claim_active() -> Result<()> {
 
 #[test]
 fn cli_agent_run_allows_provider_command_to_edit_claimed_path() -> Result<()> {
+    support::require_containment!("cli_agent_run_allows_provider_command_to_edit_claimed_path");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -412,6 +418,7 @@ fn run_success_json<const N: usize>(args: [&str; N]) -> Result<Value> {
 
 #[test]
 fn cli_agent_run_refuses_dirty_primary_with_actionable_error() -> Result<()> {
+    support::require_containment!("cli_agent_run_refuses_dirty_primary_with_actionable_error");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     fs::write(repo_path.join("dirty.txt"), "pending\n").context("write dirty file")?;

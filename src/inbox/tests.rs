@@ -683,7 +683,10 @@ fn real_publication_mode_fails_closed_before_intake_or_artifacts() {
     })
     .expect_err("real publication must fail closed before effectful intake");
     let error = format!("{error:#}");
-    assert!(error.contains("capability-bound supervisor input bridge"));
+    assert!(
+        error.contains("explicitly bound external reviewer"),
+        "expected external-reviewer refusal: {error}"
+    );
     assert!(!repo.join(".maco/inbox/runs/reviewer-refusal").exists());
 }
 

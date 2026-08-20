@@ -1,3 +1,5 @@
+mod support;
+
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 use serde_json::Value;
@@ -8,6 +10,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 
 #[test]
 fn orchestrate_resume_uses_checkpoint_defaults_and_reports_json() -> Result<()> {
+    support::require_containment!("orchestrate_resume_uses_checkpoint_defaults_and_reports_json");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
