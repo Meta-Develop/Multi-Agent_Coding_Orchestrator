@@ -1,3 +1,5 @@
+mod support;
+
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 use serde_json::Value;
@@ -8,11 +10,9 @@ const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 
 #[test]
 fn cli_agent_run_uses_fake_proposal_in_isolated_worktree() -> Result<()> {
+    support::require_containment!("cli_agent_run_uses_fake_proposal_in_isolated_worktree");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
-    if assert_agent_entry_unsupported(&repo_path)? {
-        return Ok(());
-    }
     let repo = repo_path.to_str().context("repo path utf8")?;
     let task_path = temp.path().join("task.md");
     let proposal_path = temp.path().join("proposal.json");
@@ -91,9 +91,6 @@ fn cli_agent_run_uses_fake_proposal_in_isolated_worktree() -> Result<()> {
 fn cli_agent_run_rejects_unconfigured_real_provider_without_network() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
-    if assert_agent_entry_unsupported(&repo_path)? {
-        return Ok(());
-    }
     let task_path = temp.path().join("task.md");
     fs::write(&task_path, "Try a real provider.\n").context("write task")?;
 
@@ -132,9 +129,6 @@ fn cli_agent_run_rejects_unconfigured_real_provider_without_network() -> Result<
 fn cli_agent_run_missing_fake_proposal_emits_json_failure() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
-    if assert_agent_entry_unsupported(&repo_path)? {
-        return Ok(());
-    }
     let task_path = temp.path().join("task.md");
     fs::write(&task_path, "No proposal.\n").context("write task")?;
 
@@ -168,11 +162,9 @@ fn cli_agent_run_missing_fake_proposal_emits_json_failure() -> Result<()> {
 
 #[test]
 fn cli_agent_run_disables_provider_commands_by_default_json() -> Result<()> {
+    support::require_containment!("cli_agent_run_disables_provider_commands_by_default_json");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
-    if assert_agent_entry_unsupported(&repo_path)? {
-        return Ok(());
-    }
     let repo = repo_path.to_str().context("repo path utf8")?;
     let task_path = temp.path().join("task.md");
     let proposal_path = temp.path().join("proposal.json");
@@ -238,11 +230,9 @@ fn cli_agent_run_disables_provider_commands_by_default_json() -> Result<()> {
 
 #[test]
 fn cli_agent_run_failed_json_keep_claims_leaves_claim_active() -> Result<()> {
+    support::require_containment!("cli_agent_run_failed_json_keep_claims_leaves_claim_active");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
-    if assert_agent_entry_unsupported(&repo_path)? {
-        return Ok(());
-    }
     let repo = repo_path.to_str().context("repo path utf8")?;
     let task_path = temp.path().join("task.md");
     let proposal_path = temp.path().join("proposal.json");
@@ -316,11 +306,9 @@ fn cli_agent_run_failed_json_keep_claims_leaves_claim_active() -> Result<()> {
 
 #[test]
 fn cli_agent_run_allows_provider_command_to_edit_claimed_path() -> Result<()> {
+    support::require_containment!("cli_agent_run_allows_provider_command_to_edit_claimed_path");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
-    if assert_agent_entry_unsupported(&repo_path)? {
-        return Ok(());
-    }
     let repo = repo_path.to_str().context("repo path utf8")?;
     let task_path = temp.path().join("task.md");
     let proposal_path = temp.path().join("proposal.json");
@@ -428,32 +416,48 @@ fn run_success_json<const N: usize>(args: [&str; N]) -> Result<Value> {
     serde_json::from_slice(&output.stdout).context("parse json")
 }
 
-fn assert_agent_entry_unsupported(repo_path: &Path) -> Result<bool> {
-    let output = Command::new(BIN)
-        .args([
-            "agent",
-            "run",
-            "must-not-be-read-task.md",
-            "--agent-id",
-            "unsupported-agent",
-            "--path",
-            "README.md",
-            "--fake-proposal",
-            "must-not-be-read-proposal.json",
-            "--repo",
-            repo_path.to_str().context("repo path utf8")?,
-            "--json",
-        ])
-        .output()
-        .context("run unsupported agent entry")?;
-    assert!(!output.status.success());
-    let report: Value = serde_json::from_slice(&output.stdout).context("agent failure json")?;
-    assert!(report["error"]
-        .as_str()
-        .context("agent error")?
-        .contains("agent assignment creation is temporarily unsupported"));
-    assert!(!repo_path.join(".git/maco").exists());
-    Ok(true)
+#[test]
+fn cli_agent_run_refuses_dirty_primary_with_actionable_error() -> Result<()> {
+    support::require_containment!("cli_agent_run_refuses_dirty_primary_with_actionable_error");
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    fs::write(repo_path.join("dirty.txt"), "pending\n").context("write dirty file")?;
+    let task_path = temp.path().join("task.md");
+    let proposal_path = temp.path().join("proposal.json");
+    fs::write(&task_path, "Attempt work on a dirty primary.\n").context("write task")?;
+    fs::write(
+        &proposal_path,
+        r#"{ "summary": "noop", "commands": [], "patches": [], "notes": [] }"#,
+    )
+    .context("write proposal")?;
+
+    let (report, succeeded) = run_agent_json([
+        "agent",
+        "run",
+        task_path.to_str().context("task path utf8")?,
+        "--agent-id",
+        "agent-dirty",
+        "--path",
+        "README.md",
+        "--fake-proposal",
+        proposal_path.to_str().context("proposal path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--json",
+    ])?;
+
+    assert!(!succeeded);
+    assert_eq!(report["success"], false);
+    let error = report["error"].as_str().context("agent error string")?;
+    assert!(
+        error.contains("capability-bound repository cleanliness input"),
+        "expected capability-bound cleanliness context: {error}"
+    );
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md"))?,
+        "# Smoke\n"
+    );
+    Ok(())
 }
 
 fn run_agent_json<const N: usize>(args: [&str; N]) -> Result<(Value, bool)> {
@@ -471,14 +475,6 @@ fn run_agent_json<const N: usize>(args: [&str; N]) -> Result<(Value, bool)> {
 fn assert_agent_run_failed_closed(report: &Value, repo_path: &Path) -> Result<()> {
     assert_eq!(report["success"], false);
     let error = report["error"].as_str().context("agent error string")?;
-    if error.contains("agent assignment creation is temporarily unsupported") {
-        assert_eq!(
-            fs::read_to_string(repo_path.join("README.md"))?,
-            "# Smoke\n"
-        );
-        assert!(!repo_path.join(".git/maco").exists());
-        return Ok(());
-    }
     assert!(
         error.contains("containment")
             || error.contains("failed to establish process-tree ownership")

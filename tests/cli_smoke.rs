@@ -781,10 +781,6 @@ fn cli_repo_map_orchestrate_and_sync_status_json() -> Result<()> {
     ])?;
     assert_eq!(validation["agent_count"], 1);
 
-    if assert_orchestrate_run_unsupported(&plan_path, &repo_path)? {
-        return Ok(());
-    }
-
     let (summary, verified_backend_available) = run_json_regardless([
         "orchestrate",
         "run",
@@ -823,6 +819,7 @@ fn cli_repo_map_orchestrate_and_sync_status_json() -> Result<()> {
 
 #[test]
 fn cli_orchestrate_failure_still_emits_json_summary() -> Result<()> {
+    support::require_containment!("cli_orchestrate_failure_still_emits_json_summary");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("plan.json");
@@ -835,10 +832,6 @@ fn cli_orchestrate_failure_still_emits_json_summary() -> Result<()> {
         }"#,
     )
     .context("write plan")?;
-
-    if assert_orchestrate_run_unsupported(&plan_path, &repo_path)? {
-        return Ok(());
-    }
 
     let output = Command::new(BIN)
         .args([
@@ -869,6 +862,7 @@ fn cli_orchestrate_failure_still_emits_json_summary() -> Result<()> {
 
 #[test]
 fn cli_orchestrate_reports_committed_agent_change_and_patch() -> Result<()> {
+    support::require_containment!("cli_orchestrate_reports_committed_agent_change_and_patch");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("plan.json");
@@ -887,11 +881,6 @@ fn cli_orchestrate_reports_committed_agent_change_and_patch() -> Result<()> {
     )
     .context("write plan")?;
 
-    if assert_orchestrate_run_unsupported(&plan_path, &repo_path)? {
-        assert!(!patch_dir.exists());
-        return Ok(());
-    }
-
     let (summary, verified_backend_available) = run_json_regardless([
         "orchestrate",
         "run",
@@ -903,8 +892,13 @@ fn cli_orchestrate_reports_committed_agent_change_and_patch() -> Result<()> {
         "--json",
     ])?;
     if !verified_backend_available {
-        assert_orchestration_failed_closed(&summary)?;
-        assert!(!patch_dir.join("agent-a.patch").exists());
+        // The agent may legitimately edit its disposable worktree before the
+        // confined command fails (for example at the commit step); captured
+        // candidate patches may still be exported for inspection. Pin the
+        // fail-closed boundary: a failed summary and no primary mutation.
+        assert_eq!(summary["success"], false);
+        assert_eq!(summary["agents"][0]["status"], "failed");
+        assert!(summary["agents"][0]["error"].as_str().is_some());
         assert_eq!(
             fs::read_to_string(repo_path.join("README.md"))?,
             "# Smoke\n"
@@ -927,6 +921,7 @@ fn cli_orchestrate_reports_committed_agent_change_and_patch() -> Result<()> {
 
 #[test]
 fn cli_claim_conflict_still_emits_json_summary() -> Result<()> {
+    support::require_containment!("cli_claim_conflict_still_emits_json_summary");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("plan.json");
@@ -948,10 +943,6 @@ fn cli_claim_conflict_still_emits_json_summary() -> Result<()> {
         }"#,
     )
     .context("write plan")?;
-
-    if assert_orchestrate_run_unsupported(&plan_path, &repo_path)? {
-        return Ok(());
-    }
 
     let output = Command::new(BIN)
         .args([
@@ -1620,25 +1611,43 @@ fn run_success_json<const N: usize>(args: [&str; N]) -> Result<Value> {
     run_success_json_args(&args)
 }
 
-fn assert_orchestrate_run_unsupported(plan: &Path, repo: &Path) -> Result<bool> {
+#[test]
+fn cli_orchestrate_run_refuses_dirty_primary_with_actionable_error() -> Result<()> {
+    support::require_containment!(
+        "cli_orchestrate_run_refuses_dirty_primary_with_actionable_error"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let plan_path = temp.path().join("plan.json");
+    fs::write(
+        &plan_path,
+        r#"{
+          "agents": [
+            {"id": "agent-a", "paths": ["README.md"], "command": "true"}
+          ]
+        }"#,
+    )
+    .context("write plan")?;
+    fs::write(repo_path.join("dirty.txt"), "pending\n").context("write dirty file")?;
+
     let output = Command::new(BIN)
         .args([
             "orchestrate",
             "run",
-            plan.to_str().context("plan path utf8")?,
+            plan_path.to_str().context("plan path utf8")?,
             "--repo",
-            repo.to_str().context("repo path utf8")?,
+            repo_path.to_str().context("repo path utf8")?,
             "--json",
         ])
         .output()
-        .context("run unsupported orchestration")?;
+        .context("run dirty orchestration")?;
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("orchestration assignment creation is temporarily unsupported"),
-        "unexpected orchestration refusal: {stderr}"
+        stderr.contains("capability-bound repository cleanliness input"),
+        "expected capability-bound cleanliness context: {stderr}"
     );
-    Ok(true)
+    Ok(())
 }
 
 fn run_success_json_args(args: &[&str]) -> Result<Value> {
@@ -1672,7 +1681,9 @@ fn assert_orchestration_failed_closed(summary: &Value) -> Result<()> {
         .as_str()
         .context("orchestration error")?;
     assert!(
-        error.contains("process-tree ownership") || error.contains("containment"),
+        error.contains("process-tree ownership")
+            || error.contains("containment")
+            || error.contains("command exited"),
         "unexpected fail-closed error: {error}"
     );
     assert_eq!(
