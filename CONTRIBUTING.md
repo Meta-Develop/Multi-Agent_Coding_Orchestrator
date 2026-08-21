@@ -27,12 +27,17 @@ nix develop path:$PWD -c cargo fmt --all -- --check
 nix develop path:$PWD -c cargo check --locked --all-targets
 nix develop path:$PWD -c cargo clippy --locked --all-targets -- -D warnings
 nix develop path:$PWD -c cargo test --locked --all-targets
+nix develop path:$PWD -c cargo audit --deny warnings
+nix develop path:$PWD -c cargo deny --locked check -D warnings advisories bans licenses sources
 ```
 
-These commands reproduce the Linux CI toolchain and tracked-path portability
-gate. They cannot compile or link target-specific code on actual macOS or
-Windows runners. Before treating a branch as fully CI-green, push it or open a
-draft pull request and wait for both the `macos-latest` and `windows-latest`
+These commands reproduce the Linux CI toolchain, the tracked-path portability
+gate, and the supply-chain job. The development shell pins `cargo-audit` and
+`cargo-deny` to the same releases CI installs.
+
+They cannot compile or link target-specific code on actual macOS or Windows
+runners. Before treating a branch as fully CI-green, push it or open a draft
+pull request and wait for both the `macos-latest` and `windows-latest`
 `portable-build` jobs; a draft pull request is the cheapest honest way to close
 that residual gap.
 

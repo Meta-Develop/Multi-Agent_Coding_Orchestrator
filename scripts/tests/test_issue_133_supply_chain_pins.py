@@ -8,6 +8,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 PINS = ROOT / "scripts" / "supply_chain_pins.toml"
 WORKFLOW = ROOT / ".github" / "workflows" / "supply-chain.yml"
 FLAKE = ROOT / "flake.nix"
+CONTRIBUTING = ROOT / "CONTRIBUTING.md"
 
 
 class SupplyChainPinContractTests(unittest.TestCase):
@@ -72,6 +73,19 @@ class SupplyChainPinContractTests(unittest.TestCase):
                 rf'(?<![0-9]){re.escape(value)}(?![0-9])',
                 "flake.nix must not duplicate pin versions",
             )
+
+    def test_contributing_lists_the_pinned_supply_chain_commands(self) -> None:
+        source = CONTRIBUTING.read_text(encoding="utf-8")
+        active = self._active_text(source)
+        self.assertIn(
+            "nix develop path:$PWD -c cargo audit --deny warnings",
+            active,
+        )
+        self.assertIn(
+            "nix develop path:$PWD -c cargo deny --locked check -D warnings "
+            "advisories bans licenses sources",
+            active,
+        )
 
     def test_commented_pin_reads_are_rejected(self) -> None:
         source = WORKFLOW.read_text(encoding="utf-8")
