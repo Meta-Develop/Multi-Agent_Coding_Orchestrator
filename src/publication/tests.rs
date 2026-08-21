@@ -3035,6 +3035,182 @@ fn github_expected_author_is_explicit_exact_and_bot_compatible() {
 }
 
 #[test]
+fn approved_github_actor_guard_blocks_missing_or_wrong_actor_before_mutation() {
+    use std::cell::Cell;
+
+    let pinned = tempfile::tempdir().expect("pinned actor repo");
+    let repository = Repository::init(pinned.path()).expect("init pinned actor repo");
+    repository
+        .config()
+        .expect("open pinned actor config")
+        .set_str(APPROVED_GITHUB_LOGIN_CONFIG_KEY, "Meta-Develop")
+        .expect("set approved actor pin");
+    let config_path = repository.path().join("config");
+
+    let actor_calls = Cell::new(0_u32);
+    let mutation_calls = Cell::new(0_u32);
+    let result = execute_with_approved_github_actor(
+        capture_approved_github_actor_binding(&config_path),
+        || {
+            actor_calls.set(actor_calls.get() + 1);
+            Ok("diverxgeneral".to_string())
+        },
+        || {
+            mutation_calls.set(mutation_calls.get() + 1);
+            Ok(())
+        },
+    );
+    assert!(result
+        .expect_err("wrong actor must fail")
+        .to_string()
+        .contains("does not exactly match"));
+    assert_eq!(actor_calls.get(), 1);
+    assert_eq!(mutation_calls.get(), 0);
+
+    let missing = tempfile::tempdir().expect("missing actor repo");
+    let missing_repository = Repository::init(missing.path()).expect("init missing actor repo");
+    let missing_actor_calls = Cell::new(0_u32);
+    let missing_mutation_calls = Cell::new(0_u32);
+    let result = execute_with_approved_github_actor(
+        capture_approved_github_actor_binding(&missing_repository.path().join("config")),
+        || {
+            missing_actor_calls.set(missing_actor_calls.get() + 1);
+            Ok("Meta-Develop".to_string())
+        },
+        || {
+            missing_mutation_calls.set(missing_mutation_calls.get() + 1);
+            Ok(())
+        },
+    );
+    assert!(result
+        .expect_err("missing pin must fail")
+        .to_string()
+        .contains("must contain exactly one non-empty value"));
+    assert_eq!(missing_actor_calls.get(), 0);
+    assert_eq!(missing_mutation_calls.get(), 0);
+}
+
+#[test]
+fn approved_github_actor_guard_runs_only_after_an_exact_actor_check() {
+    use std::cell::RefCell;
+
+    let temp = tempfile::tempdir().expect("approved actor repo");
+    let repository = Repository::init(temp.path()).expect("init approved actor repo");
+    repository
+        .config()
+        .expect("open approved actor config")
+        .set_str(APPROVED_GITHUB_LOGIN_CONFIG_KEY, "Meta-Develop")
+        .expect("set approved actor pin");
+    let events = RefCell::new(Vec::new());
+    execute_with_approved_github_actor(
+        capture_approved_github_actor_binding(&repository.path().join("config")),
+        || {
+            events.borrow_mut().push("actor");
+            Ok("Meta-Develop".to_string())
+        },
+        || {
+            events.borrow_mut().push("mutation");
+            Ok(())
+        },
+    )
+    .expect("exact actor runs mutation");
+    assert_eq!(*events.borrow(), ["actor", "mutation"]);
+}
+
+#[test]
+fn every_allowlisted_human_gh_mutation_uses_the_actor_guard() {
+    let repository = GithubRepositoryIdentity {
+        host: "github.example".to_string(),
+        owner: "owner".to_string(),
+        name: "repo".to_string(),
+    };
+    let selector = repository.selector();
+    for args in [
+        vec![
+            "pr",
+            "create",
+            "--repo",
+            &selector,
+            "--base",
+            "main",
+            "--head",
+            "topic",
+            "--title",
+            "title",
+            "--body-file",
+            "-",
+        ],
+        vec![
+            "issue",
+            "create",
+            "--repo",
+            &selector,
+            "--title",
+            "title",
+            "--body-file",
+            "-",
+        ],
+        vec![
+            "pr",
+            "comment",
+            "7",
+            "--repo",
+            &selector,
+            "--body-file",
+            "-",
+        ],
+        vec![
+            "issue",
+            "comment",
+            "8",
+            "--repo",
+            &selector,
+            "--body-file",
+            "-",
+        ],
+    ] {
+        let args = args.into_iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            classify_gh_operation(&args, &StdinMode::Bytes(Vec::new()), &repository)
+                .expect("allowlisted human mutation"),
+            GhOperationClass::HumanMutation
+        );
+    }
+
+    let source =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/publication/part3.rs"))
+            .expect("read publication transport source");
+    assert_eq!(source.matches(".run_human_mutation(").count(), 3);
+    for label in ["gh pr create", "gh issue create", "gh source comment"] {
+        let label_offset = source.find(label).expect("human mutation label");
+        let prefix = &source[label_offset.saturating_sub(160)..label_offset];
+        assert!(
+            prefix.contains("run_human_mutation"),
+            "{label} bypassed the actor guard"
+        );
+    }
+}
+
+#[test]
+fn github_actor_lookup_is_exact_and_case_sensitive() {
+    let parsed = github_actor_login_from_output(merge::RequiredCommandOutput {
+        success: true,
+        stdout: b"Meta-Develop\n".to_vec(),
+        stderr: Vec::new(),
+    })
+    .expect("canonical actor lookup output");
+    assert_eq!(parsed, "Meta-Develop");
+    assert!(
+        github_actor_login_from_output(merge::RequiredCommandOutput {
+            success: true,
+            stdout: b"Meta-Develop\nextra\n".to_vec(),
+            stderr: Vec::new(),
+        })
+        .is_err()
+    );
+}
+
+#[test]
 fn publication_pr_markers_are_canonical_unpredictable_and_exactly_embedded() {
     let first = generate_publication_pr_marker_nonce().expect("first marker");
     let second = generate_publication_pr_marker_nonce().expect("second marker");

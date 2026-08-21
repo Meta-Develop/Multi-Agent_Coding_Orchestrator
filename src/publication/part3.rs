@@ -252,16 +252,23 @@ impl GhCommandContext {
                 .with_hidden_root(&primary_worktree)
                 .with_hidden_root(&source_worktree)
                 .with_hidden_root(&common_state);
-            Ok((environment, profile, config_files, token))
+            Ok((
+                environment,
+                profile,
+                config_files,
+                token,
+                source.commondir().join("config"),
+            ))
         })();
         match result {
-            Ok((environment, profile, config_files, token)) => Ok(Self {
+            Ok((environment, profile, config_files, token, source_config_path)) => Ok(Self {
                 runtime_directory,
                 environment,
                 profile,
                 config_files,
                 repository: repository.clone(),
                 token,
+                source_config_path,
             }),
             Err(error) => {
                 let erase = erase_private_config_paths_if_present(&[directory.join("hosts.yml")]);
@@ -284,7 +291,55 @@ impl GhCommandContext {
         args: Vec<OsString>,
         stdin: StdinMode,
     ) -> Result<merge::RequiredCommandOutput> {
-        let execution = self.run_inner(label, args, stdin);
+        let execution = (|| {
+            if classify_gh_operation(&args, &stdin, &self.repository)?
+                == GhOperationClass::HumanMutation
+            {
+                bail!("human-authored gh mutations require the approved GitHub actor guard");
+            }
+            self.run_inner(label, args, stdin)
+        })();
+        self.finish(execution)
+    }
+
+    fn run_human_mutation(
+        mut self,
+        label: &str,
+        args: Vec<OsString>,
+        stdin: StdinMode,
+    ) -> Result<merge::RequiredCommandOutput> {
+        let execution = (|| {
+            if classify_gh_operation(&args, &stdin, &self.repository)?
+                != GhOperationClass::HumanMutation
+            {
+                bail!("approved GitHub actor guard accepts only human-authored gh mutations");
+            }
+            let binding = capture_approved_github_actor_binding(&self.source_config_path);
+            execute_with_approved_github_actor(
+                binding,
+                || self.authenticated_github_actor(),
+                || self.run_inner(label, args, stdin),
+            )
+        })();
+        self.finish(execution)
+    }
+
+    fn authenticated_github_actor(&self) -> Result<String> {
+        let output = self.run_inner(
+            "gh authenticated actor",
+            ["api", "user", "--jq", ".login"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            StdinMode::Null,
+        )?;
+        github_actor_login_from_output(output)
+    }
+
+    fn finish(
+        &mut self,
+        execution: Result<merge::RequiredCommandOutput>,
+    ) -> Result<merge::RequiredCommandOutput> {
         let cleanup = self.close();
         match (execution, cleanup) {
             (Ok(output), Ok(())) => Ok(output),
@@ -389,6 +444,21 @@ fn validate_gh_operation(
     stdin: &StdinMode,
     repository: &GithubRepositoryIdentity,
 ) -> Result<()> {
+    classify_gh_operation(args, stdin, repository).map(|_| ())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhOperationClass {
+    ActorLookup,
+    Observation,
+    HumanMutation,
+}
+
+fn classify_gh_operation(
+    args: &[OsString],
+    stdin: &StdinMode,
+    repository: &GithubRepositoryIdentity,
+) -> Result<GhOperationClass> {
     let args = args
         .iter()
         .map(|argument| {
@@ -400,26 +470,32 @@ fn validate_gh_operation(
     let selector = repository.selector();
     let receipt_fields = GITHUB_PR_RECEIPT_FIELDS;
     match args.as_slice() {
+        ["api", "user", "--jq", ".login"] if matches!(stdin, StdinMode::Null) => {
+            Ok(GhOperationClass::ActorLookup)
+        }
         ["issue", "view", number, "--repo", bound, "--json", fields]
             if *bound == selector
                 && *fields == GITHUB_ISSUE_SOURCE_FIELDS
                 && matches!(stdin, StdinMode::Null) =>
         {
-            validate_gh_positive_number(number, "issue source number")
+            validate_gh_positive_number(number, "issue source number")?;
+            Ok(GhOperationClass::Observation)
         }
         ["issue", "view", number, "--repo", bound, "--json", fields]
             if *bound == selector
                 && *fields == GITHUB_ISSUE_EFFECT_FIELDS
                 && matches!(stdin, StdinMode::Null) =>
         {
-            validate_gh_positive_number(number, "issue effect number")
+            validate_gh_positive_number(number, "issue effect number")?;
+            Ok(GhOperationClass::Observation)
         }
         ["issue", "list", "--repo", bound, "--state", "open", "--json", fields, "--limit", limit, labels @ ..]
             if *bound == selector
                 && *fields == GITHUB_ISSUE_SOURCE_FIELDS
                 && matches!(stdin, StdinMode::Null) =>
         {
-            validate_github_source_list_tail(limit, labels)
+            validate_github_source_list_tail(limit, labels)?;
+            Ok(GhOperationClass::Observation)
         }
         ["issue", "list", "--repo", bound, "--state", "all", "--search", marker, "--limit", limit, "--json", fields]
             if *bound == selector
@@ -427,21 +503,24 @@ fn validate_gh_operation(
                 && *fields == GITHUB_ISSUE_EFFECT_FIELDS
                 && matches!(stdin, StdinMode::Null) =>
         {
-            validate_external_effect_marker_argument(marker)
+            validate_external_effect_marker_argument(marker)?;
+            Ok(GhOperationClass::Observation)
         }
         ["pr", "view", number, "--repo", bound, "--json", fields]
             if *bound == selector
                 && *fields == GITHUB_PR_SOURCE_FIELDS
                 && matches!(stdin, StdinMode::Null) =>
         {
-            validate_gh_positive_number(number, "pull-request source number")
+            validate_gh_positive_number(number, "pull-request source number")?;
+            Ok(GhOperationClass::Observation)
         }
         ["pr", "list", "--repo", bound, "--state", "open", "--json", fields, "--limit", limit, labels @ ..]
             if *bound == selector
                 && *fields == GITHUB_PR_SOURCE_FIELDS
                 && matches!(stdin, StdinMode::Null) =>
         {
-            validate_github_source_list_tail(limit, labels)
+            validate_github_source_list_tail(limit, labels)?;
+            Ok(GhOperationClass::Observation)
         }
         ["pr", "list", "--repo", bound, "--head", branch, "--state", "all", "--limit", limit, "--json", fields]
             if *bound == selector
@@ -449,14 +528,16 @@ fn validate_gh_operation(
                 && *fields == receipt_fields
                 && matches!(stdin, StdinMode::Null) =>
         {
-            validate_gh_argument_value(branch, "PR branch")
+            validate_gh_argument_value(branch, "PR branch")?;
+            Ok(GhOperationClass::Observation)
         }
         ["pr", "view", view, "--repo", bound, "--json", fields]
             if *bound == selector
                 && *fields == receipt_fields
                 && matches!(stdin, StdinMode::Null) =>
         {
-            validate_gh_argument_value(view, "PR selector")
+            validate_gh_argument_value(view, "PR selector")?;
+            Ok(GhOperationClass::Observation)
         }
         ["pr", "create", "--repo", bound, "--base", base, "--head", branch, "--title", title, "--body-file", "-"]
         | ["pr", "create", "--repo", bound, "--base", base, "--head", branch, "--title", title, "--body-file", "-", "--draft"]
@@ -464,7 +545,8 @@ fn validate_gh_operation(
         {
             validate_gh_argument_value(base, "PR base")?;
             validate_gh_argument_value(branch, "PR branch")?;
-            validate_gh_argument_value(title, "PR title")
+            validate_gh_argument_value(title, "PR title")?;
+            Ok(GhOperationClass::HumanMutation)
         }
         ["issue", "create", "--repo", bound, "--title", title, "--body-file", "-", labels @ ..]
             if *bound == selector && matches!(stdin, StdinMode::Bytes(_)) =>
@@ -479,24 +561,97 @@ fn validate_gh_operation(
                 }
                 validate_gh_argument_value(pair[1], "issue label")?;
             }
-            Ok(())
+            Ok(GhOperationClass::HumanMutation)
         }
         [subcommand @ ("issue" | "pr"), "comment", number, "--repo", bound, "--body-file", "-"]
             if *bound == selector && matches!(stdin, StdinMode::Bytes(_)) =>
         {
             let _ = subcommand;
-            validate_gh_positive_number(number, "comment source number")
+            validate_gh_positive_number(number, "comment source number")?;
+            Ok(GhOperationClass::HumanMutation)
         }
         ["api", "--method", "GET", endpoint] if matches!(stdin, StdinMode::Null) => {
-            validate_github_comment_api_endpoint(endpoint, repository)
+            validate_github_comment_api_endpoint(endpoint, repository)?;
+            Ok(GhOperationClass::Observation)
         }
         ["api", "--method", "GET", "--paginate", "--slurp", endpoint]
             if matches!(stdin, StdinMode::Null) =>
         {
-            validate_github_comment_list_api_endpoint(endpoint, repository)
+            validate_github_comment_list_api_endpoint(endpoint, repository)?;
+            Ok(GhOperationClass::Observation)
         }
         _ => bail!("gh command is outside the fixed PR/issue allowlist"),
     }
+}
+
+fn capture_approved_github_actor_binding(
+    source_config_path: &Path,
+) -> Result<ApprovedGithubActorBinding> {
+    let source_config = capture_bound_config_file(source_config_path, false).with_context(|| {
+        format!(
+            "failed to bind repository-local {APPROVED_GITHUB_LOGIN_CONFIG_KEY} configuration"
+        )
+    })?;
+    let config = git2::Config::open(source_config_path).with_context(|| {
+        format!(
+            "failed to read repository-local {APPROVED_GITHUB_LOGIN_CONFIG_KEY} configuration"
+        )
+    })?;
+    let mut values = Vec::new();
+    match config.multivar(APPROVED_GITHUB_LOGIN_CONFIG_KEY, None) {
+        Ok(mut entries) => {
+            while let Some(entry) = entries.next() {
+                let entry = entry.context("failed to iterate approved GitHub login pins")?;
+                if entry.include_depth() != 0 {
+                    continue;
+                }
+                let value = std::str::from_utf8(entry.value_bytes())
+                    .context("repository-local approved GitHub login was not UTF-8")?;
+                values.push(value.to_string());
+            }
+        }
+        Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+        Err(error) => {
+            return Err(error).context("failed to enumerate approved GitHub login pins")
+        }
+    }
+    if values.len() != 1 || values[0].is_empty() {
+        bail!(
+            "repository-local {APPROVED_GITHUB_LOGIN_CONFIG_KEY} must contain exactly one non-empty value"
+        );
+    }
+    validate_github_slug(&values[0], "repository-local approved GitHub login")?;
+    verify_private_config_files(std::slice::from_ref(&source_config))
+        .context("repository-local approved GitHub login configuration changed while binding")?;
+    Ok(ApprovedGithubActorBinding {
+        login: values.remove(0),
+        source_config,
+    })
+}
+
+fn execute_with_approved_github_actor<T>(
+    binding: Result<ApprovedGithubActorBinding>,
+    actor_lookup: impl FnOnce() -> Result<String>,
+    mutation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let binding = binding?;
+    let actual = actor_lookup()?;
+    if actual != binding.login {
+        bail!("authenticated GitHub actor does not exactly match the approved repository login");
+    }
+    verify_private_config_files(std::slice::from_ref(&binding.source_config))
+        .context("repository-local approved GitHub login changed after actor verification")?;
+    mutation()
+}
+
+fn github_actor_login_from_output(output: merge::RequiredCommandOutput) -> Result<String> {
+    let stdout = required_command_stdout(output, "gh authenticated actor")?;
+    let login = stdout.strip_suffix('\n').unwrap_or(&stdout);
+    if login.is_empty() || login.contains(['\r', '\n']) {
+        bail!("authenticated GitHub actor response was empty or malformed");
+    }
+    validate_github_slug(login, "authenticated GitHub actor")?;
+    Ok(login.to_string())
 }
 
 fn validate_github_source_list_tail(limit: &str, labels: &[&str]) -> Result<()> {
@@ -921,7 +1076,7 @@ fn cli_github_pr_create(
     if draft {
         args.push(OsString::from("--draft"));
     }
-    let output = context.run(
+    let output = context.run_human_mutation(
         "gh pr create",
         args,
         StdinMode::Bytes(body.as_bytes().to_vec()),
@@ -1044,7 +1199,7 @@ impl ExternalEffectProvider for GithubIssueExternalEffectProvider<'_> {
             args.push(OsString::from("--label"));
             args.push(OsString::from(label));
         }
-        context.run(
+        context.run_human_mutation(
             "gh issue create",
             args,
             StdinMode::Bytes(self.marked_body.as_bytes().to_vec()),
@@ -1331,7 +1486,7 @@ impl ExternalEffectProvider for GithubCommentExternalEffectProvider<'_> {
             ExternalSourceObjectKind::PullRequest => "pr",
         };
         let context = GhCommandContext::create(self.worktree_path, self.repository)?;
-        context.run(
+        context.run_human_mutation(
             "gh source comment",
             [
                 subcommand,
