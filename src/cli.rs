@@ -2411,7 +2411,15 @@ impl WorktreeCommand {
                         .or(o2_default.and_then(|policy| policy.max_count)),
                     max_total_bytes: args.gc_max_total_bytes,
                 };
-                let record = manager.create_with_retention(
+                // The cleanliness capability cannot cross a process boundary, so the
+                // CLI derives it here: acquisition succeeds only when the primary
+                // repository is observed clean through the bounded status boundary.
+                let cleanliness = manager.acquire_repository_cleanliness().context(
+                    "managed worktree creation requires a capability-bound repository \
+                     cleanliness input; commit, stash, or remove pending changes in the \
+                     primary repository, then rerun `maco worktree create`",
+                )?;
+                let record = manager.create_with_repository_cleanliness_and_retention(
                     WorktreeCreateOptions {
                         agent_id: args.agent_id.clone(),
                         branch: args.branch,
@@ -2419,6 +2427,7 @@ impl WorktreeCommand {
                         worktree_root: args.worktree_root.clone(),
                     },
                     retention,
+                    &cleanliness,
                 )?;
                 if args.supersede_retry_predecessor {
                     let lifecycle = manager

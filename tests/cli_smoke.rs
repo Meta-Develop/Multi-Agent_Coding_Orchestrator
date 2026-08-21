@@ -1048,6 +1048,66 @@ fn cli_worktree_pending_on_fresh_repo_creates_no_maco_state() -> Result<()> {
 }
 
 #[test]
+fn cli_worktree_create_derives_cleanliness_capability_on_clean_repo() -> Result<()> {
+    support::require_containment!(
+        "cli_worktree_create_derives_cleanliness_capability_on_clean_repo"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+
+    let record = run_success_json([
+        "worktree",
+        "create",
+        "agent-clean",
+        "--repo",
+        repo,
+        "--json",
+    ])?;
+
+    assert_eq!(record["name"], "agent-clean");
+    let worktree_path = Path::new(record["path"].as_str().context("worktree path string")?);
+    assert!(worktree_path.is_dir());
+    Ok(())
+}
+
+#[test]
+fn cli_worktree_create_refuses_dirty_primary_with_actionable_error() -> Result<()> {
+    support::require_containment!(
+        "cli_worktree_create_refuses_dirty_primary_with_actionable_error"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    fs::write(repo_path.join("dirty.txt"), "pending\n").context("write dirty file")?;
+
+    let output = Command::new(BIN)
+        .args([
+            "worktree",
+            "create",
+            "agent-dirty",
+            "--repo",
+            repo,
+            "--json",
+        ])
+        .output()
+        .context("run dirty worktree create")?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("capability-bound repository cleanliness input"),
+        "expected capability-bound cleanliness context: {stderr}"
+    );
+    assert!(
+        stderr.contains("primary repository is dirty"),
+        "expected dirty-primary cause: {stderr}"
+    );
+    assert!(!repo_path.join(".git/maco").exists());
+    Ok(())
+}
+
+#[test]
 fn cli_semantic_map_and_queries_emit_json() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
