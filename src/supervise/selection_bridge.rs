@@ -15,6 +15,21 @@ use crate::selection::{
 const AUTOMATIC_SELECTION_TASK_CLASS: &str = "localized_code_change";
 const JUDGMENT_SELECTION_TASK_CLASS: &str = "review_gate";
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct AdvertisedCatalogSet {
+    pub cursor: Option<crate::runtime_adapter::cursor::CursorAdvertisedCatalogObservation>,
+    pub grok: Option<crate::runtime_adapter::grok::GrokAdvertisedCatalogObservation>,
+}
+
+impl AdvertisedCatalogSet {
+    pub(super) fn empty() -> Self {
+        Self {
+            cursor: None,
+            grok: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SupervisorSelectionMode {
     Automatic,
@@ -54,6 +69,7 @@ pub(super) struct SupervisorSelectionPreflightFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SupervisorAutomaticSelectionState {
     decisions: BTreeMap<AgentRole, SelectionProvenance>,
+    advertised: AdvertisedCatalogSet,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +89,7 @@ pub(super) fn initialize_supervisor_selection(
     runtime: SupervisorRuntime,
     catalog: &RuntimeModelCatalog,
     admission: &SupervisorAdmissionPolicyInput,
+    advertised: &AdvertisedCatalogSet,
 ) -> Result<SupervisorSelectionResolution> {
     if runtime == SupervisorRuntime::Fake {
         return Ok(SupervisorSelectionResolution {
@@ -100,6 +117,7 @@ pub(super) fn initialize_supervisor_selection(
             role,
             runtime,
             catalog,
+            advertised,
             admission,
             DynamicSignals {
                 retry_count: 0,
@@ -183,7 +201,12 @@ pub(super) fn initialize_supervisor_selection(
     }
 
     let automatic_state = automatic
-        .then(|| SupervisorAutomaticSelectionState::from_initial_decisions(&decisions))
+        .then(|| {
+            SupervisorAutomaticSelectionState::from_initial_decisions(
+                &decisions,
+                advertised.clone(),
+            )
+        })
         .transpose()?;
     Ok(SupervisorSelectionResolution {
         mode: if automatic {
@@ -198,7 +221,10 @@ pub(super) fn initialize_supervisor_selection(
 }
 
 impl SupervisorAutomaticSelectionState {
-    fn from_initial_decisions(decisions: &[SupervisorSelectionEvent]) -> Result<Self> {
+    fn from_initial_decisions(
+        decisions: &[SupervisorSelectionEvent],
+        advertised: AdvertisedCatalogSet,
+    ) -> Result<Self> {
         let mut by_role = BTreeMap::new();
         for decision in decisions {
             let normalized_role = role_for_task_profile(&decision.provenance.normalized_task)?;
@@ -227,7 +253,10 @@ impl SupervisorAutomaticSelectionState {
                 );
             }
         }
-        Ok(Self { decisions: by_role })
+        Ok(Self {
+            decisions: by_role,
+            advertised,
+        })
     }
 }
 
@@ -240,6 +269,7 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
     budget_signal: BudgetSignal,
     environment_rejections: &[TypedSelectorEnvironmentRejection],
 ) -> Result<SupervisorReselection> {
+    let advertised = state.advertised.clone();
     let mut ordered_roles = roles.to_vec();
     ordered_roles.sort();
     ordered_roles.dedup();
@@ -253,14 +283,18 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
             )
         })?;
         let mut input = previous.normalized_input.clone();
-        let runtime_name = runtime_name(runtime);
-        input.catalogs = vec![runtime_catalog_from_priors(
-            runtime_name,
+        let constructed = constructed_selection_catalogs(
+            runtime,
             catalog,
+            &advertised,
             &input.task,
             &input.priors,
-        )?];
-        input.constraints.allowed_runtimes = [runtime_name.to_string()].into_iter().collect();
+        )?;
+        input.constraints.allowed_runtimes = constructed
+            .iter()
+            .map(|runtime_catalog| runtime_catalog.runtime.clone())
+            .collect();
+        input.catalogs = constructed;
         input.constraints.allow_debug_override = false;
         input.debug_override = None;
         input.signals.retry_count = retry_count;
@@ -430,6 +464,7 @@ fn selection_input_for_role(
     role: AgentRole,
     runtime: SupervisorRuntime,
     catalog: &RuntimeModelCatalog,
+    advertised: &AdvertisedCatalogSet,
     admission: &SupervisorAdmissionPolicyInput,
     signals: DynamicSignals,
     debug_override: Option<DebugOverride>,
@@ -437,7 +472,7 @@ fn selection_input_for_role(
     let priors = selection::built_in_prior_dataset()?;
     let task = task_profile_for_role(role);
     let runtime_name = runtime_name(runtime);
-    let runtime_catalog = runtime_catalog_from_priors(runtime_name, catalog, &task, &priors)?;
+    let catalogs = constructed_selection_catalogs(runtime, catalog, advertised, &task, &priors)?;
     let profile = priors
         .objective_profiles
         .first()
@@ -448,7 +483,7 @@ fn selection_input_for_role(
         .context("provider inflight bound does not fit selector pool units")?;
     let admission_bytes = serde_json::to_vec(admission)
         .context("failed to normalize supervisor admission input for selection")?;
-    let pool = RuntimePoolState {
+    let primary_pool = RuntimePoolState {
         runtime: runtime_name.to_string(),
         admission_open: admission.resolved_bound > 0,
         entitlement_capacity_units: capacity,
@@ -463,16 +498,21 @@ fn selection_input_for_role(
         admission_provenance: "supervisor admission supplies a bounded active-runtime inflight pool; external account quota and marginal-price observations were unavailable"
             .to_string(),
         failover_provenance: Some(
-            "run-global runtime execution constrains automatic dispatch to the active runtime"
+            "advertised runtime catalogs participate in selection; launch uses the selected pair"
                 .to_string(),
         ),
     };
+    let pools = pools_for_constructed_catalogs(&catalogs, runtime_name, primary_pool);
+    let allowed_runtimes = catalogs
+        .iter()
+        .map(|runtime_catalog| runtime_catalog.runtime.clone())
+        .collect();
     Ok(SelectionInput {
         task,
-        catalogs: vec![runtime_catalog],
-        pools: vec![pool],
+        catalogs,
+        pools,
         constraints: OperatorConstraints {
-            allowed_runtimes: [runtime_name.to_string()].into_iter().collect(),
+            allowed_runtimes,
             allowed_models: BTreeSet::new(),
             forbidden_runtimes: BTreeSet::new(),
             forbidden_models: BTreeSet::new(),
@@ -488,6 +528,176 @@ fn selection_input_for_role(
         outcomes: Vec::new(),
         signals,
         debug_override,
+    })
+}
+
+fn constructed_selection_catalogs(
+    runtime: SupervisorRuntime,
+    catalog: &RuntimeModelCatalog,
+    advertised: &AdvertisedCatalogSet,
+    task: &TaskProfile,
+    priors: &selection::PriorDataset,
+) -> Result<Vec<RuntimeCatalog>> {
+    let mut catalogs = vec![runtime_catalog_from_priors(
+        runtime_name(runtime),
+        catalog,
+        task,
+        priors,
+    )?];
+    if let Some(observation) = &advertised.cursor {
+        catalogs.push(runtime_catalog_from_advertised_slugs(
+            "cursor",
+            observation.catalog().slugs(),
+            format!("cursor-advertised-sha256:{}", observation.source_sha256()),
+            observation.observed_at_unix_millis().to_string(),
+            task,
+            priors,
+        )?);
+    }
+    if let Some(observation) = &advertised.grok {
+        catalogs.push(runtime_catalog_from_advertised_slugs(
+            "grok",
+            observation.catalog().slugs(),
+            format!("grok-injected-sha256:{}", observation.source_sha256()),
+            observation.observed_at_unix_millis().to_string(),
+            task,
+            priors,
+        )?);
+    }
+    Ok(catalogs)
+}
+
+fn pools_for_constructed_catalogs(
+    catalogs: &[RuntimeCatalog],
+    primary_runtime: &str,
+    primary_pool: RuntimePoolState,
+) -> Vec<RuntimePoolState> {
+    catalogs
+        .iter()
+        .map(|runtime_catalog| {
+            if runtime_catalog.runtime == primary_runtime {
+                RuntimePoolState {
+                    runtime: runtime_catalog.runtime.clone(),
+                    ..primary_pool.clone()
+                }
+            } else {
+                RuntimePoolState {
+                    runtime: runtime_catalog.runtime.clone(),
+                    observation_revision: format!(
+                        "{}:{}",
+                        primary_pool.observation_revision, runtime_catalog.runtime
+                    ),
+                    pool_pressure_basis_points: 0,
+                    failover_provenance: Some(
+                        "advertised runtime catalogs participate in selection; launch uses the selected pair"
+                            .to_string(),
+                    ),
+                    ..primary_pool.clone()
+                }
+            }
+        })
+        .collect()
+}
+
+fn runtime_catalog_from_advertised_slugs<'a>(
+    runtime_name: &str,
+    advertised_slugs: impl IntoIterator<Item = &'a str>,
+    revision: String,
+    advertised_at: String,
+    task: &TaskProfile,
+    priors: &selection::PriorDataset,
+) -> Result<RuntimeCatalog> {
+    let advertised = advertised_slugs
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let mut models = Vec::new();
+    for prior in priors
+        .models
+        .iter()
+        .filter(|prior| prior.runtime == runtime_name)
+    {
+        if !advertised.contains(&prior.model) {
+            continue;
+        }
+        if let Some(model) = catalog_model_from_prior(prior, task, true) {
+            models.push(model);
+        }
+    }
+    models.sort_by(|left, right| left.model.cmp(&right.model));
+    Ok(RuntimeCatalog {
+        runtime: runtime_name.to_string(),
+        revision,
+        advertised_at,
+        models,
+    })
+}
+
+fn catalog_model_from_prior(
+    prior: &selection::ModelPrior,
+    task: &TaskProfile,
+    available: bool,
+) -> Option<CatalogModel> {
+    let mut supported_efforts = prior
+        .class_fit
+        .iter()
+        .filter(|class_fit| class_fit.task_class == task.task_class)
+        .map(|class_fit| class_fit.effort)
+        .chain(
+            prior
+                .authority_evidence
+                .iter()
+                .filter(|evidence| {
+                    evidence.task_class == task.task_class && evidence.role == task.authority_role
+                })
+                .map(|evidence| evidence.effort),
+        )
+        .chain(prior.strong_gate_fallback_efforts.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    supported_efforts.sort();
+    if supported_efforts.is_empty() {
+        return None;
+    }
+    let mut authority_roles = prior
+        .authority_evidence
+        .iter()
+        .map(|evidence| evidence.role)
+        .collect::<BTreeSet<_>>();
+    if !prior.class_fit.is_empty() {
+        authority_roles.insert(AuthorityRole::TerminalLeaf);
+    }
+    if !prior.strong_gate_fallback_efforts.is_empty()
+        && !prior
+            .prohibited_authority_roles
+            .contains(&task.authority_role)
+    {
+        authority_roles.insert(task.authority_role);
+    }
+    Some(CatalogModel {
+        model: prior.model.clone(),
+        available,
+        supported_efforts,
+        capabilities: CandidateCapabilities {
+            task_classes: prior
+                .class_fit
+                .iter()
+                .map(|class_fit| class_fit.task_class.clone())
+                .collect(),
+            authority_roles,
+            boundedness: [
+                Boundedness::TightlyBounded,
+                Boundedness::Bounded,
+                Boundedness::CrossCutting,
+            ]
+            .into_iter()
+            .collect(),
+            maximum_risk: RiskLevel::Critical,
+            maximum_context: ContextSize::Long,
+            maximum_horizon: TaskHorizon::Long,
+            long_context: prior.long_context_eligible,
+        },
     })
 }
 
@@ -647,13 +857,13 @@ fn executable_choice<'a>(
             role.as_str()
         )
     })?;
-    if choice.candidate.runtime != runtime_name(runtime) {
+    if runtime_from_name(&choice.candidate.runtime).is_err() {
         return Ok(ExecutableChoiceResolution::PreflightFailure(
             SupervisorSelectionPreflightFailure {
                 role,
                 kind: SupervisorSelectionPreflightFailureKind::ActiveRuntimeMismatch,
                 message: format!(
-                    "selector chose runtime '{}' for role '{}', but supervisor execution is constrained to run-global runtime '{}'; cross-runtime dispatch is unsupported",
+                    "selector chose unexecutable runtime '{}' for role '{}' while constructing the assignment-launch binding; run-global runtime was '{}'",
                     choice.candidate.runtime,
                     role.as_str(),
                     runtime_name(runtime)
@@ -662,6 +872,47 @@ fn executable_choice<'a>(
         ));
     }
     Ok(ExecutableChoiceResolution::Executable(choice))
+}
+
+pub(super) fn bind_selected_assignment_runtimes(
+    plan: &mut SupervisorPlan,
+    decisions: &[SupervisorSelectionEvent],
+) -> Result<()> {
+    let mut selected = BTreeMap::new();
+    for decision in decisions {
+        let Some(choice) = &decision.provenance.choice else {
+            continue;
+        };
+        selected.insert(
+            decision.role,
+            runtime_from_name(&choice.candidate.runtime).with_context(|| {
+                format!(
+                    "selector choice for role '{}' used unexecutable runtime '{}'",
+                    decision.role.as_str(),
+                    choice.candidate.runtime
+                )
+            })?,
+        );
+    }
+    for assignment in &mut plan.assignments {
+        let Some(selected_runtime) = selected.get(&assignment.role).copied() else {
+            continue;
+        };
+        match assignment.runtime {
+            Some(existing) if existing != selected_runtime => {
+                bail!(
+                    "assignment '{}' runtime '{}' contradicts selected runtime '{}' for role '{}'",
+                    assignment.id,
+                    runtime_name(existing),
+                    runtime_name(selected_runtime),
+                    assignment.role.as_str()
+                );
+            }
+            Some(_) => {}
+            None => assignment.runtime = Some(selected_runtime),
+        }
+    }
+    Ok(())
 }
 
 fn role_selection_from_choice(choice: &selection::SelectedChoice) -> RoleModelSelection {
@@ -806,6 +1057,7 @@ mod tests {
             SupervisorRuntime::Codex,
             &catalog,
             &test_admission(),
+            &AdvertisedCatalogSet::empty(),
         )?;
         Ok((
             catalog,
@@ -826,6 +1078,7 @@ mod tests {
             SupervisorRuntime::Codex,
             &catalog,
             &admission,
+            &AdvertisedCatalogSet::empty(),
         )?;
 
         assert_eq!(resolution.mode, SupervisorSelectionMode::Automatic);
@@ -863,6 +1116,7 @@ mod tests {
             SupervisorRuntime::Codex,
             &catalog,
             &admission,
+            &AdvertisedCatalogSet::empty(),
         )
         .expect_err("missing debug effort must fail closed");
         assert!(error
@@ -879,6 +1133,7 @@ mod tests {
             SupervisorRuntime::Codex,
             &catalog,
             &admission,
+            &AdvertisedCatalogSet::empty(),
         )
         .expect_err("unparseable debug effort must fail closed");
         assert!(error.to_string().contains("unsupported reasoning_effort"));
@@ -908,6 +1163,7 @@ mod tests {
             SupervisorRuntime::Codex,
             &catalog,
             &test_admission(),
+            &AdvertisedCatalogSet::empty(),
         )?;
 
         assert_eq!(resolution.mode, SupervisorSelectionMode::DebugOverride);
@@ -966,6 +1222,7 @@ mod tests {
             SupervisorRuntime::Codex,
             &catalog,
             &test_admission(),
+            &AdvertisedCatalogSet::empty(),
         )
         .expect_err("mismatched custom review lens must fail closed");
         assert!(error
@@ -1205,6 +1462,315 @@ mod tests {
         assert_eq!(transition.target.effort, fallback.target_effort);
         assert_eq!(transition.transition_ordinal, 1);
         assert_eq!(transition.maximum_transitions, 1);
+        Ok(())
+    }
+
+    const CAPTURED_CURSOR_CATALOG: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/runtime_adapter/cursor/captured-minimal-20260820.txt"
+    ));
+    const WITHDRAWN_CURSOR_CATALOG: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/runtime_adapter/cursor/hand-authored-withdrawn.txt"
+    ));
+    const CAPTURED_CURSOR_AT_UNIX_MILLIS: u64 = 1_787_240_463_000;
+
+    struct FakeCursorRunner {
+        output: crate::runtime_adapter::cursor::CursorCatalogCommandOutput,
+    }
+
+    impl FakeCursorRunner {
+        fn successful(stdout: &[u8]) -> Self {
+            Self {
+                output: crate::runtime_adapter::cursor::CursorCatalogCommandOutput {
+                    status: Some(0),
+                    stdout: stdout.to_vec(),
+                    stderr: Vec::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    timed_out: false,
+                    process_tree: crate::process_runner::ProcessTreeEvidence::VerifiedEmpty(
+                        crate::process_runner::ContainmentBackend::DirectChild,
+                    ),
+                    side_effects: crate::process_runner::SideEffectConfinementEvidence::Verified(
+                        crate::process_runner::SideEffectConfinementProfileKind::TrustedFixedNetwork,
+                    ),
+                },
+            }
+        }
+    }
+
+    impl crate::runtime_adapter::cursor::CursorCatalogCommandRunner for FakeCursorRunner {
+        fn run(
+            &self,
+            _spec: &crate::runtime_adapter::cursor::CursorCatalogCommandSpec,
+        ) -> Result<crate::runtime_adapter::cursor::CursorCatalogCommandOutput> {
+            Ok(self.output.clone())
+        }
+    }
+
+    fn captured_cursor_observation(
+    ) -> Result<crate::runtime_adapter::cursor::CursorAdvertisedCatalogObservation> {
+        crate::runtime_adapter::cursor::discover_cursor_model_catalog(
+            &FakeCursorRunner::successful(CAPTURED_CURSOR_CATALOG),
+            &crate::runtime_adapter::cursor::CursorCatalogCommandSpec::new("/workspace"),
+            Some(CAPTURED_CURSOR_AT_UNIX_MILLIS),
+        )
+    }
+
+    fn withdrawn_cursor_observation(
+    ) -> Result<crate::runtime_adapter::cursor::CursorAdvertisedCatalogObservation> {
+        crate::runtime_adapter::cursor::discover_cursor_model_catalog(
+            &FakeCursorRunner::successful(WITHDRAWN_CURSOR_CATALOG),
+            &crate::runtime_adapter::cursor::CursorCatalogCommandSpec::new("/workspace"),
+            Some(CAPTURED_CURSOR_AT_UNIX_MILLIS),
+        )
+    }
+
+    fn advertised_with_cursor(
+        observation: crate::runtime_adapter::cursor::CursorAdvertisedCatalogObservation,
+    ) -> AdvertisedCatalogSet {
+        AdvertisedCatalogSet {
+            cursor: Some(observation),
+            grok: None,
+        }
+    }
+
+    fn worker_assignment() -> OrchestratorAssignment {
+        OrchestratorAssignment {
+            id: "worker-a".to_string(),
+            runtime: None,
+            role: AgentRole::Worker,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn captured_cursor_catalog_makes_composer_slugs_selectable_without_operator_lists() -> Result<()>
+    {
+        let observation = captured_cursor_observation()?;
+        assert!(observation.catalog().contains("composer-2.5"));
+        assert!(observation.catalog().contains("composer-2.5-fast"));
+
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised_with_cursor(observation),
+        )?;
+        let worker = resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Worker)
+            .context("worker decision")?;
+        for slug in ["composer-2.5", "composer-2.5-fast"] {
+            assert!(
+                worker
+                    .provenance
+                    .candidate_set
+                    .iter()
+                    .any(|evaluation| evaluation.candidate.runtime == "cursor"
+                        && evaluation.candidate.model == slug
+                        && evaluation.eligible),
+                "{slug} must be an eligible advertised Worker candidate"
+            );
+        }
+        let fresh = worker
+            .provenance
+            .choice
+            .as_ref()
+            .context("fresh worker choice")?;
+        assert_eq!(fresh.candidate.runtime, "codex");
+
+        let mut pressured = worker.provenance.normalized_input.clone();
+        pressured
+            .pools
+            .iter_mut()
+            .find(|pool| pool.runtime == "codex")
+            .context("Codex pool")?
+            .pool_pressure_basis_points = 10_000;
+        let pressured = selection::select(&pressured)?;
+        let choice = pressured.choice.as_ref().context("pressured choice")?;
+        assert_eq!(choice.candidate.runtime, "cursor");
+        assert!(
+            choice.candidate.model == "composer-2.5"
+                || choice.candidate.model == "composer-2.5-fast"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn withdrawn_cursor_catalog_removes_composer_candidates() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised_with_cursor(withdrawn_cursor_observation()?),
+        )?;
+        let worker = resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Worker)
+            .context("worker decision")?;
+        assert!(worker.provenance.candidate_set.iter().all(|evaluation| {
+            evaluation.candidate.runtime != "cursor"
+                || !evaluation.candidate.model.starts_with("composer-2.5")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn composer_stays_fail_closed_for_judgment_roles_under_codex_pressure() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised_with_cursor(captured_cursor_observation()?),
+        )?;
+        for role in [
+            AgentRole::Supervisor,
+            AgentRole::Auditor,
+            AgentRole::GateClassifier,
+            AgentRole::ChildOrchestrator,
+        ] {
+            let decision = resolution
+                .decisions
+                .iter()
+                .find(|decision| decision.role == role)
+                .with_context(|| format!("{} decision", role.as_str()))?;
+            let mut pressured = decision.provenance.normalized_input.clone();
+            if let Some(pool) = pressured
+                .pools
+                .iter_mut()
+                .find(|pool| pool.runtime == "codex")
+            {
+                pool.pool_pressure_basis_points = 10_000;
+            }
+            let pressured = selection::select(&pressured)?;
+            if let Some(choice) = &pressured.choice {
+                assert_ne!(choice.candidate.runtime, "cursor", "{}", role.as_str());
+                assert!(!choice.candidate.model.starts_with("composer-2.5"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn injected_grok_catalog_joins_without_hardcoded_slug_lists() -> Result<()> {
+        use crate::runtime_adapter::grok::{
+            inject_grok_advertised_catalog, GrokModelCatalog, GrokModelCatalogEntry,
+        };
+        let catalog = codex_catalog()?;
+        let priors = selection::built_in_prior_dataset()?;
+        let grok_prior = priors
+            .models
+            .iter()
+            .find(|prior| prior.runtime == "grok")
+            .context("built-in Grok prior")?;
+        let observation = inject_grok_advertised_catalog(
+            GrokModelCatalog::from_injected_entries([GrokModelCatalogEntry::new(
+                grok_prior.model.clone(),
+                "Injected Grok Worker",
+            )?])?,
+            Some(CAPTURED_CURSOR_AT_UNIX_MILLIS),
+            b"opaque-injected-grok-payload",
+        )?;
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet {
+                cursor: None,
+                grok: Some(observation),
+            },
+        )?;
+        let worker = resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Worker)
+            .context("worker decision")?;
+        assert!(worker.provenance.candidate_set.iter().any(|evaluation| {
+            evaluation.candidate.runtime == "grok"
+                && evaluation.candidate.model == grok_prior.model
+                && evaluation.eligible
+        }));
+
+        let withdrawn = inject_grok_advertised_catalog(
+            GrokModelCatalog::from_injected_entries([GrokModelCatalogEntry::new(
+                "worker-stable",
+                "Worker Stable",
+            )?])?,
+            Some(CAPTURED_CURSOR_AT_UNIX_MILLIS + 1),
+            b"withdrawn-injected-grok-payload",
+        )?;
+        let mut withdrawn_plan = test_plan();
+        let withdrawn_resolution = initialize_supervisor_selection(
+            &mut withdrawn_plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet {
+                cursor: None,
+                grok: Some(withdrawn),
+            },
+        )?;
+        let withdrawn_worker = withdrawn_resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Worker)
+            .context("withdrawn worker decision")?;
+        assert!(withdrawn_worker
+            .provenance
+            .candidate_set
+            .iter()
+            .all(|evaluation| evaluation.candidate.model != grok_prior.model));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_runtime_is_stamped_onto_the_assignment() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        plan.assignments = vec![worker_assignment()];
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised_with_cursor(captured_cursor_observation()?),
+        )?;
+        bind_selected_assignment_runtimes(&mut plan, &resolution.decisions)?;
+        assert_eq!(
+            plan.assignments[0].runtime,
+            Some(runtime_from_name(
+                &resolution
+                    .decisions
+                    .iter()
+                    .find(|decision| decision.role == AgentRole::Worker)
+                    .and_then(|decision| decision.provenance.choice.as_ref())
+                    .context("worker choice")?
+                    .candidate
+                    .runtime
+            )?)
+        );
         Ok(())
     }
 }

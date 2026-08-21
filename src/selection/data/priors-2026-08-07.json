@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "dataset_id": "maco-runtime-model-effort-priors",
-  "revision": "2026-08-21.1",
+  "revision": "2026-08-21.2",
   "published_on": "2026-08-21",
   "objective_profiles": [
     {
@@ -104,6 +104,44 @@
       "model": "cursor-composer-1",
       "observed_on": "2026-08-07",
       "source_id": "dated-provisional-cursor-benchmark-prior-2026-08-07",
+      "prior_scope": "provisional benchmark class-fit prior",
+      "limitations": ["not local accepted-task outcome evidence", "bounded leaf class only"],
+      "prohibited": false,
+      "prohibition_reason": null,
+      "prohibited_authority_roles": ["delegating","acceptance_gate","review_auditor","audit","conflict_resolution","failure_classification","git_publication","unknown_judgment"],
+      "long_context_eligible": false,
+      "strong_gate_fallback_efforts": [],
+      "strength_rank": 25,
+      "class_fit": [
+        {"task_class":"localized_code_change","effort":"high","quality_basis_points":8600,"sample_size":3,"execution_cost_microunits":105000,"review_cost_microunits":30000,"rework_cost_microunits":15000,"rereview_cost_microunits":5000}
+      ],
+      "authority_evidence": [],
+      "one_shot_environment_fallbacks": []
+    },
+    {
+      "runtime": "cursor",
+      "model": "composer-2.5",
+      "observed_on": "2026-08-07",
+      "source_id": "dated-provisional-cursor-composer-2-5-prior-2026-08-21",
+      "prior_scope": "provisional benchmark class-fit prior",
+      "limitations": ["not local accepted-task outcome evidence", "bounded leaf class only"],
+      "prohibited": false,
+      "prohibition_reason": null,
+      "prohibited_authority_roles": ["delegating","acceptance_gate","review_auditor","audit","conflict_resolution","failure_classification","git_publication","unknown_judgment"],
+      "long_context_eligible": false,
+      "strong_gate_fallback_efforts": [],
+      "strength_rank": 25,
+      "class_fit": [
+        {"task_class":"localized_code_change","effort":"high","quality_basis_points":8600,"sample_size":3,"execution_cost_microunits":105000,"review_cost_microunits":30000,"rework_cost_microunits":15000,"rereview_cost_microunits":5000}
+      ],
+      "authority_evidence": [],
+      "one_shot_environment_fallbacks": []
+    },
+    {
+      "runtime": "cursor",
+      "model": "composer-2.5-fast",
+      "observed_on": "2026-08-07",
+      "source_id": "dated-provisional-cursor-composer-2-5-fast-prior-2026-08-21",
       "prior_scope": "provisional benchmark class-fit prior",
       "limitations": ["not local accepted-task outcome evidence", "bounded leaf class only"],
       "prohibited": false,
