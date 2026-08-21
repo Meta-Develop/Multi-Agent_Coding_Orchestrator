@@ -1,0 +1,13 @@
+Available models
+
+auto - Auto (default)
+gpt-5.2 - GPT-5.2
+cursor-grok-4.6-high-fast - Cursor Grok 4.6 Fast
+composer-2.5 - Composer 2.5
+claude-opus-5-thinking-high - Claude Opus 5 1M Thinking
+cursor-grok-4.6-xhigh - Cursor Grok 4.6 Extra High
+cursor-grok-4.6-xhigh-fast - Cursor Grok 4.6 Extra High Fast
+composer-2.5-fast - Composer 2.5 Fast
+claude-opus-5-low - Claude Opus 5 1M Low
+
+Tip: use --model <id> (or /model <id> in interactive mode) to switch. Parameterized models also accept quoted overrides, e.g. --model 'claude-opus-4-8[context=1m,effort=high,fast=false]'.

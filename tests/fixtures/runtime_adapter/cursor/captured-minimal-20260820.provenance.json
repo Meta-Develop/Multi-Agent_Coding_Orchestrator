@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "fixture": "captured-minimal-20260820.txt",
+  "classification": "capture-derived-minimal",
+  "captured_at_utc": "2026-08-20T15:41:03Z",
+  "cli": "cursor-agent",
+  "cli_version": "2026.06.26-7079533",
+  "argv": ["cursor-agent", "models"],
+  "environment": {
+    "NO_COLOR": "1",
+    "TERM": "dumb"
+  },
+  "exit_status": 0,
+  "redactions": "none",
+  "fixture_sha256": "af088f298dd5b96cd0703887635cab1ea198047f5558f5ff128d02195ece83c1",
+  "scope_note": "This capture-derived minimal fixture is not a full unabridged archive."
+}
