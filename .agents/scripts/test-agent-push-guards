@@ -529,6 +529,23 @@ case_missing_origin_main_still_scans_full_update_range() {
     fail_test "fail-closed update omitted the bot commit: $captured_output"
 }
 
+case_new_branch_push_excludes_inherited_main_for_url_remote() {
+  local repo="$scratch_root/new-branch-url"
+  local record
+
+  setup_pr_merge_with_inherited_main_bot "$repo"
+  record="$(pre_push_record_new refs/heads/feature "$merge_oid")"
+
+  capture run_with_input "$repo" "$record" "$authorship_guard" pre-push \
+    'git@github.com:example/repo.git'
+  [[ "$captured_status" -eq 0 && -z "$captured_output" ]] ||
+    fail_test "new-branch URL remote scanned inherited main: $captured_output"
+
+  capture run_with_input "$repo" "$record" "$authorship_guard" pre-push-approved origin
+  [[ "$captured_status" -eq 0 && -z "$captured_output" ]] ||
+    fail_test "new-branch named remote scanned inherited main: $captured_output"
+}
+
 case_installed_hook_accepts_inherited_main_and_rejects_lane_bot() {
   local repo="$scratch_root/installed-merge-push"
   local hooks_dir
@@ -607,10 +624,12 @@ run_case 'missing origin/main still scans the full update range' \
   case_missing_origin_main_still_scans_full_update_range
 run_case 'installed hook ignores inherited main and rejects lane-unique bots' \
   case_installed_hook_accepts_inherited_main_and_rejects_lane_bot
+run_case 'new-branch pushes exclude inherited main for URL and named remotes' \
+  case_new_branch_push_excludes_inherited_main_for_url_remote
 
 if [[ "$failures" -ne 0 ]]; then
   printf '%s test case(s) failed\n' "$failures" >&2
   exit 1
 fi
 
-printf 'All %s test cases passed\n' 13
+printf 'All %s test cases passed\n' 14

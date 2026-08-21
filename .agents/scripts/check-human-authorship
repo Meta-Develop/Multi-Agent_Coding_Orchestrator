@@ -487,26 +487,33 @@ resolve_remote_primary_ref() {
   return 1
 }
 
+is_simple_remote_name() {
+  [[ -n "$1" && "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+
 enumerate_pre_push_commits() {
   local local_oid="$1"
   local remote_oid="$2"
   local remote_name="${3:-}"
   local primary_ref
+  local -a rev_list_args=()
 
   if is_zero_oid "$remote_oid"; then
-    if [[ -n "$remote_name" ]]; then
-      GIT_NO_REPLACE_OBJECTS=1 git rev-list "$local_oid" --not --remotes="$remote_name"
+    rev_list_args+=("$local_oid")
+    if is_simple_remote_name "$remote_name"; then
+      rev_list_args+=(--not --remotes="$remote_name")
     else
-      GIT_NO_REPLACE_OBJECTS=1 git rev-list "$local_oid" --not --remotes
+      rev_list_args+=(--not --remotes)
     fi
-    return $?
+  else
+    rev_list_args+=("$remote_oid..$local_oid")
   fi
 
   if primary_ref="$(resolve_remote_primary_ref "$remote_name")"; then
-    GIT_NO_REPLACE_OBJECTS=1 git rev-list "$remote_oid..$local_oid" --not "$primary_ref"
-  else
-    GIT_NO_REPLACE_OBJECTS=1 git rev-list "$remote_oid..$local_oid"
+    rev_list_args+=(--not "$primary_ref")
   fi
+
+  GIT_NO_REPLACE_OBJECTS=1 git rev-list "${rev_list_args[@]}"
 }
 
 scan_pre_push() {
