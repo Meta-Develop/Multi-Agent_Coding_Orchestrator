@@ -3020,7 +3020,7 @@ fn verified_run_fails_closed_before_child_can_read_repository_authentication_key
             .expect("encode plan"),
         )
         .expect("write plan");
-    let error = super::run_plan_file_with_controls(
+    let summary = super::run_plan_file_with_controls(
         OrchestrationRunOptions {
             repo: repo_path,
             plan_file,
@@ -3035,10 +3035,26 @@ fn verified_run_fails_closed_before_child_can_read_repository_authentication_key
             semantic_coordination: SemanticCoordinationMode::Off,
         },
     )
-    .expect_err("verified assignment creation must fail closed");
-    assert!(error
-        .to_string()
-        .contains("orchestration assignment creation is temporarily unsupported"));
+    .expect("verified run must report a per-agent outcome");
+    let agent = &summary.agents[0];
+    assert_ne!(
+        agent.exit_code,
+        Some(91),
+        "verified child observed the repository authentication key"
+    );
+    match agent.status {
+        AgentRunStatus::Succeeded => {
+            assert!(
+                agent.stdout.text.contains("state-hidden"),
+                "verified child must observe the key as hidden: {}",
+                agent.stdout.text
+            );
+        }
+        // Hosts without the strict containment backend fail closed before the
+        // child command runs; the key stays unread either way.
+        AgentRunStatus::Failed => {}
+        other => panic!("unexpected verified agent status {other:?}"),
+    }
 }
 
 #[cfg(unix)]

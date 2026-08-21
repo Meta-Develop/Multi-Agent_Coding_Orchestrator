@@ -9,7 +9,11 @@ use crate::{
     },
     autopilot::{self, AutopilotRunOptions},
     consult::{self, ConsultAskOptions, ConsultantRuntime, DEFAULT_CONSULT_TIMEOUT_SECONDS},
-    inbox::{self, InboxPermissionMode, InboxScanOptions, InboxWorkspaceScanOptions},
+    inbox::{
+        self, InboxMachineGlobalInput, InboxPermissionMode, InboxRunOptions, InboxScanOptions,
+        InboxWatchOptions, InboxWorkspaceRunOptions, InboxWorkspaceScanOptions,
+        InboxWorkspaceWatchOptions,
+    },
     live_claim::{self, LiveClock},
     llm::{FakeProvider, PromptContext, ProviderCapabilities, Redactor, RepoExcerpt, WorkProposal},
     machine_global::{
@@ -1334,7 +1338,33 @@ impl InboxCommand {
                 }
                 Ok(())
             }
-            InboxSubcommand::Run(_) => Err(autopilot::effectful_autopilot_unavailable_error()),
+            InboxSubcommand::Run(args) => {
+                let repo = args.repo.clone();
+                let resolved = resolve_run_id_for_run(
+                    &repo,
+                    RunArtifactFamily::Inbox,
+                    args.run_id.as_deref(),
+                    args.json,
+                )?;
+                let report = inbox::run_inbox(InboxRunOptions {
+                    repo: args.repo,
+                    run_id: resolved.run_id,
+                    github: args.github,
+                    permission_mode: args.permission,
+                    dry_run: args.dry_run,
+                    max_items: args.max_items,
+                    codex_bin: args.codex_bin,
+                    machine_global: inbox_machine_global_input(
+                        args.machine_global_config,
+                        args.machine_global_runtime_root_id,
+                    ),
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("inbox run failed");
+                }
+                Ok(())
+            }
             InboxSubcommand::Status(args) => {
                 let report = inbox::inbox_status(args.repo, RunId::new(&args.run_id)?)?;
                 print_query_report(&report, args.json)
@@ -1351,10 +1381,43 @@ impl InboxCommand {
                 }
                 Ok(())
             }
-            InboxSubcommand::Watch(_) => Err(autopilot::effectful_autopilot_unavailable_error()),
+            InboxSubcommand::Watch(args) => {
+                let report = inbox::watch_inbox(InboxWatchOptions {
+                    repo: args.repo,
+                    poll_seconds: args.poll_seconds,
+                    once: args.once,
+                    github: args.github,
+                    permission_mode: args.permission,
+                    dry_run: args.dry_run,
+                    max_items: args.max_items,
+                    codex_bin: args.codex_bin,
+                    machine_global: inbox_machine_global_input(
+                        args.machine_global_config,
+                        args.machine_global_runtime_root_id,
+                    ),
+                })?;
+                print_query_report(&report, args.json)?;
+                if report.runs.iter().any(|run| !run.success) {
+                    bail!("inbox watch observed a failed run");
+                }
+                Ok(())
+            }
             InboxSubcommand::Workspace(command) => command.run(),
             InboxSubcommand::Artifacts(command) => command.run(RunArtifactFamily::Inbox),
         }
+    }
+}
+
+fn inbox_machine_global_input(
+    config: Option<PathBuf>,
+    runtime_root_id: Option<String>,
+) -> Option<InboxMachineGlobalInput> {
+    match (config, runtime_root_id) {
+        (Some(config), Some(runtime_root_id)) => Some(InboxMachineGlobalInput {
+            config,
+            runtime_root_id,
+        }),
+        _ => None,
     }
 }
 
@@ -1395,11 +1458,40 @@ impl WorkspaceInboxCommand {
                 }
                 Ok(())
             }
-            WorkspaceInboxSubcommand::Run(_) => {
-                Err(autopilot::effectful_autopilot_unavailable_error())
+            WorkspaceInboxSubcommand::Run(args) => {
+                let report = inbox::run_workspace_inbox(InboxWorkspaceRunOptions {
+                    config: args.config,
+                    run_id: RunId::new(&args.run_id)?,
+                    dry_run: args.dry_run,
+                    codex_bin: args.codex_bin,
+                    machine_global: inbox_machine_global_input(
+                        args.machine_global_config,
+                        args.machine_global_runtime_root_id,
+                    ),
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("inbox workspace run failed");
+                }
+                Ok(())
             }
-            WorkspaceInboxSubcommand::Watch(_) => {
-                Err(autopilot::effectful_autopilot_unavailable_error())
+            WorkspaceInboxSubcommand::Watch(args) => {
+                let report = inbox::watch_workspace_inbox(InboxWorkspaceWatchOptions {
+                    config: args.config,
+                    poll_seconds: args.poll_seconds,
+                    once: args.once,
+                    dry_run: args.dry_run,
+                    codex_bin: args.codex_bin,
+                    machine_global: inbox_machine_global_input(
+                        args.machine_global_config,
+                        args.machine_global_runtime_root_id,
+                    ),
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("inbox workspace watch failed");
+                }
+                Ok(())
             }
         }
     }
@@ -1575,6 +1667,12 @@ struct RunWorkspaceInboxArgs {
     /// Codex-compatible executable to pass through to per-repository inbox runs.
     #[arg(long)]
     codex_bin: Option<PathBuf>,
+    /// Exact reviewed config used to gate private runtime output-staging cleanup for item autopilot dispatch.
+    #[arg(long, requires = "machine_global_runtime_root_id")]
+    machine_global_config: Option<PathBuf>,
+    /// Reviewed root id whose canonical root must contain `/run/user/<uid>`.
+    #[arg(long, requires = "machine_global_config")]
+    machine_global_runtime_root_id: Option<String>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -1597,6 +1695,12 @@ struct WatchWorkspaceInboxArgs {
     /// Codex-compatible executable to pass through to per-repository inbox runs.
     #[arg(long)]
     codex_bin: Option<PathBuf>,
+    /// Exact reviewed config used to gate private runtime output-staging cleanup for item autopilot dispatch.
+    #[arg(long, requires = "machine_global_runtime_root_id")]
+    machine_global_config: Option<PathBuf>,
+    /// Reviewed root id whose canonical root must contain `/run/user/<uid>`.
+    #[arg(long, requires = "machine_global_config")]
+    machine_global_runtime_root_id: Option<String>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -1644,6 +1748,12 @@ struct RunInboxArgs {
     /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
     #[arg(long)]
     codex_bin: Option<PathBuf>,
+    /// Exact reviewed config used to gate private runtime output-staging cleanup for item autopilot dispatch.
+    #[arg(long, requires = "machine_global_runtime_root_id")]
+    machine_global_config: Option<PathBuf>,
+    /// Reviewed root id whose canonical root must contain `/run/user/<uid>`.
+    #[arg(long, requires = "machine_global_config")]
+    machine_global_runtime_root_id: Option<String>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -1699,6 +1809,12 @@ struct WatchInboxArgs {
     /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
     #[arg(long)]
     codex_bin: Option<PathBuf>,
+    /// Exact reviewed config used to gate private runtime output-staging cleanup for item autopilot dispatch.
+    #[arg(long, requires = "machine_global_runtime_root_id")]
+    machine_global_config: Option<PathBuf>,
+    /// Reviewed root id whose canonical root must contain `/run/user/<uid>`.
+    #[arg(long, requires = "machine_global_config")]
+    machine_global_runtime_root_id: Option<String>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
