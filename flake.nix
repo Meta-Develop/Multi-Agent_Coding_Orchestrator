@@ -1,5 +1,5 @@
 {
-  description = "Development shell for the Multi-Agent Coding Orchestrator";
+  description = "Installable maco package and development shell for the Multi-Agent Coding Orchestrator";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -9,8 +9,10 @@
     };
   };
 
-  outputs = { nixpkgs, rust-overlay, ... }:
+  outputs = { self, nixpkgs, rust-overlay, ... }:
     let
+      inherit (nixpkgs) lib;
+
       systems = [
         "x86_64-linux"
         "aarch64-linux"
@@ -18,18 +20,111 @@
         "aarch64-darwin"
       ];
 
-      forEachSystem = nixpkgs.lib.genAttrs systems;
+      forEachSystem = lib.genAttrs systems;
       supplyChainPins =
         builtins.fromTOML (builtins.readFile ./scripts/supply_chain_pins.toml);
+      cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+
+      pkgsFor = system:
+        import nixpkgs {
+          inherit system;
+          overlays = [ rust-overlay.overlays.default ];
+        };
+
+      rustToolchainFor = pkgs:
+        pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+
+      macoSrc = lib.fileset.toSource {
+        root = ./.;
+        fileset = lib.fileset.unions [
+          ./.cargo
+          ./benches
+          ./Cargo.lock
+          ./Cargo.toml
+          ./src
+        ];
+      };
+
+      macoPackageFor = system:
+        let
+          pkgs = pkgsFor system;
+          rustToolchain = rustToolchainFor pkgs;
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = rustToolchain;
+            rustc = rustToolchain;
+          };
+        in
+        rustPlatform.buildRustPackage {
+          pname = "maco";
+          version = cargoToml.package.version;
+          src = macoSrc;
+
+          cargoLock.lockFile = ./Cargo.lock;
+
+          # The crate also ships a long-name alias binary. The installable
+          # package is the `maco` PATH entry required by the global-install
+          # contract.
+          cargoBuildFlags = [ "--bin" "maco" ];
+
+          nativeBuildInputs = [
+            pkgs.cmake
+            pkgs.pkg-config
+          ];
+
+          buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+            pkgs.libiconv
+          ];
+
+          # Packaging builds the release binary only. The repository Cargo
+          # gates remain the correctness suite; they need Git, fixtures, and
+          # sometimes a delegated user manager that this derivation does not
+          # provide.
+          doCheck = false;
+          doInstallCheck = true;
+          installCheckPhase = ''
+            runHook preInstallCheck
+            version_output="$("$out/bin/maco" --version)"
+            echo "$version_output"
+            echo "$version_output" | grep -F "${cargoToml.package.version}"
+            test ! -e "$out/bin/multi-agent-coding-orchestrator"
+            runHook postInstallCheck
+          '';
+
+          postInstall = ''
+            rm -f "$out/bin/multi-agent-coding-orchestrator"
+          '';
+
+          meta = {
+            description = cargoToml.package.description;
+            homepage = cargoToml.package.repository;
+            license = lib.licenses.agpl3Plus;
+            mainProgram = "maco";
+            platforms = systems;
+          };
+        };
     in
     {
+      packages = forEachSystem (system: rec {
+        maco = macoPackageFor system;
+        default = maco;
+      });
+
+      apps = forEachSystem (system: rec {
+        maco = {
+          type = "app";
+          program = "${self.packages.${system}.maco}/bin/maco";
+        };
+        default = maco;
+      });
+
+      overlays.default = final: prev: {
+        maco = self.packages.${prev.stdenv.hostPlatform.system}.maco;
+      };
+
       devShells = forEachSystem (system:
         let
-          pkgs = import nixpkgs {
-            inherit system;
-            overlays = [ rust-overlay.overlays.default ];
-          };
-          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          pkgs = pkgsFor system;
+          rustToolchain = rustToolchainFor pkgs;
 
           # Hashes are for the pin versions in scripts/supply_chain_pins.toml.
           # Refresh both hashes when those versions change.
