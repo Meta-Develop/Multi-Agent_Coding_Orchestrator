@@ -25,7 +25,7 @@ reviewable and recoverable:
 The current implementation covers a local-first command-line slice:
 
 - `maco init` initializes a Git repository.
-- `maco worktree create <agent-id>` is temporarily disabled at its public entry point pending capability-bound repository cleanliness input.
+- `maco worktree create <agent-id>` derives the capability-bound repository cleanliness input at command start: creation proceeds only when the primary repository is observed clean, and a dirty primary fails with the required remedy.
 - `maco worktree list` lists verified registered agent worktrees. `maco worktree pending` is a strict existing-only authenticated reader: absent state returns an empty list, while transitional or invalid state is refused without creating locks, migrating, scavenging, recovering, or writing.
 - `maco worktree remove <agent-id> --force` performs explicitly authorized cleanup of authenticated managed state; non-force removal is temporarily disabled.
 - `maco worktree gc` removes clean, inactive managed worktrees while retaining branch refs, protects tracked changes and unapproved untracked-only lanes plus active leases/claims, supports an exact repeatable untracked-path allowlist for reviewed full-lane cleanup, offers a liveness-checked target-only mode that retains lanes and branches, removes retained `target/` build artifacts by default, supports dry-run and max-age/max-count/apparent-byte retention filters, reports estimated reclaimable and reclaimed bytes, and routes unregistered leftover directories through recoverable machine-global quarantine.
@@ -46,7 +46,7 @@ The current implementation covers a local-first command-line slice:
   repo-local semantic intent coordination for paths, modules, and symbols
   without automatic task planning.
 - `maco orchestrate validate <plan-file>` validates a local JSON orchestration plan.
-- `maco orchestrate run <plan-file>` is temporarily unsupported because verified assignment creation depends on the disabled managed-worktree creation boundary. Validation and existing read-only/status/collection surfaces remain available.
+- `maco orchestrate run <plan-file>` runs a local JSON orchestration plan. Verified assignment creation derives the capability-bound repository cleanliness input before creating managed worktrees; a dirty primary repository fails with the required remedy.
 - `maco orchestrate resume <checkpoint-file>` authenticates the repository-bound v3 journal, validates repository HEAD, plan snapshot, worktree metadata, path boundaries, and claims, then reruns validation/capture for completed commands without rerunning those commands.
 - `maco worktree diff` collects a registered agent worktree diff and uses active sync claims when `--claim` is omitted.
 - `maco orchestrate collect` reads a prior JSON run summary and builds merge candidates with validation reports from agent summaries.
@@ -64,7 +64,7 @@ The current implementation covers a local-first command-line slice:
   expose and safely mutate repo-local Markdown claim liveness for active,
   blocked, ready-for-review, handoff, and done work.
 - `maco llm providers` and `maco llm prompt-preview` expose the provider-neutral prompt boundary without network calls.
-- `maco agent run` is temporarily unsupported because verified agent assignment creation depends on the disabled managed-worktree creation boundary.
+- `maco agent run` executes one agent assignment in an isolated managed worktree. Verified assignment creation derives the capability-bound repository cleanliness input before creating the worktree; a dirty primary repository fails with the required remedy.
 - `maco supervise plan <task-or-plan-file>` normalizes the existing plain-text
   task or JSON plan form, while `maco supervise plan --from-goal <file>`
   explicitly decomposes a high-level goal/spec into a validated full supervisor
@@ -1803,9 +1803,9 @@ cargo run -- orchestrate resume .maco/checkpoints/demo.json --repo . --plan-file
 
 The orchestrator validator checks that plan paths do not overlap, dependencies
 are known and acyclic, commands are non-empty, and timeouts are positive.
-Verified `orchestrate run` currently returns `Unsupported` before claims,
-artifacts, commands, or assignment worktrees are created. Once the
-capability-bound creation boundary is restored, the retained execution design
+Verified `orchestrate run` derives the capability-bound repository cleanliness
+input before assignment worktrees are created; a dirty primary repository is
+refused with the required remedy. Execution
 creates or reuses a linked worktree for each agent id according to
 `worktree_reuse_policy` or CLI `--reuse`, claims all requested paths before
 running commands, runs dependency-ready agents up to `--jobs`, and releases
@@ -3195,11 +3195,13 @@ item is used. Duplicate detection remains stable by repository, kind, and number
 while the snapshot digest separately identifies the observed source revision.
 Fake fixtures use fixed timestamps and canonical fake OIDs for reproducibility.
 
-`maco inbox run` and `maco inbox watch` currently return `Unsupported` before
-repository config, artifacts, claims, supervisors, or worktrees are opened or
-created. `scan`, `status`, `collect`, and read-only artifact inspection remain
-available. The fake-first reaction flow described below is retained design, not
-currently executable behavior.
+`maco inbox run` and `maco inbox watch` execute effectfully again: item work
+dispatches through autopilot, whose supervisor cascade derives the
+capability-bound repository cleanliness input before creating managed
+worktrees. `scan`, `status`, `collect`, and read-only artifact inspection
+remain available. The fake-first reaction flow described below is the
+executable behavior; the unbound Fake reviewer still stops as nonpublishable
+before real publication effects.
 
 Inbox runs write public-safe artifacts under `.maco/inbox/runs/<run-id>/`,
 including `scan-report.json`, `selected-items.json`, `item-<n>-plan.json`,

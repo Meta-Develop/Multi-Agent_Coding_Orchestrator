@@ -1227,9 +1227,14 @@ impl<'a> DisposableValidationWorktree<'a> {
             .create_for_test(create_options)
             .context("combined candidate managed worktree creation failed")?;
         #[cfg(not(test))]
-        manager
-            .create(create_options)
-            .context("combined candidate managed worktree creation failed")?;
+        {
+            let cleanliness = manager
+                .acquire_repository_cleanliness()
+                .context("combined candidate repository cleanliness acquisition failed")?;
+            manager
+                .create_with_repository_cleanliness(create_options, &cleanliness)
+                .context("combined candidate managed worktree creation failed")?;
+        }
         let lease = match manager.acquire_write_execution_lease(&name) {
             Ok(lease) => lease,
             Err(error) => {

@@ -40,6 +40,7 @@ const REMOTE_BINDING_SECRET_FILE: &str = "publication-remote-binding.key";
 const REMOTE_BINDING_SECRET_BYTES: usize = 32;
 const GH_CAPTURE_LIMIT_BYTES: usize = 1024 * 1024;
 const GH_STDIN_LIMIT_BYTES: usize = 1024 * 1024;
+const APPROVED_GITHUB_LOGIN_CONFIG_KEY: &str = "agentFiles.approvedGitHubLogin";
 const PUBLICATION_JOURNAL_MAX_DIRECTORY_ENTRIES: usize = 96;
 const PUBLICATION_JOURNAL_MAX_RECORDS: usize = 64;
 const PUBLICATION_JOURNAL_MAX_RECORD_BYTES: u64 = 2 * 1024 * 1024;
@@ -1368,6 +1369,7 @@ struct GhCommandContext {
     config_files: Vec<PrivateConfigFileIdentity>,
     repository: GithubRepositoryIdentity,
     token: PrivateNetworkToken,
+    source_config_path: PathBuf,
 }
 
 type PublicationGitContextSetup = (
@@ -1383,7 +1385,13 @@ type GhCommandContextSetup = (
     TrustedFixedNetworkProfile,
     Vec<PrivateConfigFileIdentity>,
     PrivateNetworkToken,
+    PathBuf,
 );
+
+struct ApprovedGithubActorBinding {
+    login: String,
+    source_config: PrivateConfigFileIdentity,
+}
 
 #[derive(Clone)]
 enum PublicationGitBoundary {

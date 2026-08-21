@@ -25,6 +25,7 @@ struct AssignmentExecutionContext<'a, 'writer> {
     index: usize,
     concurrent_mode: bool,
     plan: &'a SupervisorPlan,
+    requested_plan: &'a SupervisorPlan,
     budget_config: &'a SupervisorBudgetConfig,
     consultant: &'a SupervisorConsultantPlan,
     assignment_metadata: &'a AssignmentMetadata,
@@ -317,33 +318,42 @@ fn test_runtime_model_catalog(
     runtime: SupervisorRuntime,
 ) -> Result<RuntimeModelCatalog> {
     match runtime {
-        SupervisorRuntime::Codex => CodexRuntimeModelCatalog::from_slugs(
-            [
-                AgentRole::Supervisor,
-                AgentRole::ChildOrchestrator,
-                AgentRole::Worker,
-                AgentRole::GateClassifier,
-                AgentRole::Auditor,
-            ]
-            .into_iter()
-            .flat_map(|role| {
-                let selection = effective_role_model_selection(plan, role);
-                let mut models = selection.configured_model_chain();
-                if let UnavailableModelFallback::OrderedCatalogChain(chain) =
-                    selection.unavailable_model_fallback
-                {
-                    models.extend(chain.budget_degrade_models);
-                }
-                models
-            })
-            .chain(
+        SupervisorRuntime::Codex => {
+            let mut models = if plan.role_models.is_empty() {
+                crate::selection::built_in_prior_dataset()?
+                    .models
+                    .into_iter()
+                    .filter(|prior| prior.runtime == "codex")
+                    .map(|prior| prior.model)
+                    .collect::<BTreeSet<_>>()
+            } else {
+                [
+                    AgentRole::Supervisor,
+                    AgentRole::ChildOrchestrator,
+                    AgentRole::Worker,
+                    AgentRole::GateClassifier,
+                    AgentRole::Auditor,
+                ]
+                .into_iter()
+                .flat_map(|role| {
+                    let selection = effective_role_model_selection(plan, role);
+                    let mut models = selection.configured_model_chain();
+                    if let UnavailableModelFallback::OrderedCatalogChain(chain) =
+                        selection.unavailable_model_fallback
+                    {
+                        models.extend(chain.budget_degrade_models);
+                    }
+                    models
+                })
+                .collect::<BTreeSet<_>>()
+            };
+            models.extend(
                 plan.review_lenses
                     .iter()
                     .map(|lens| lens.backend.model().to_string()),
-            )
-            .collect::<BTreeSet<_>>(),
-        )
-        .map(RuntimeModelCatalog::Codex),
+            );
+            CodexRuntimeModelCatalog::from_slugs(models).map(RuntimeModelCatalog::Codex)
+        }
         SupervisorRuntime::Fake => Ok(RuntimeModelCatalog::LocalDeterministicFake),
         SupervisorRuntime::Grok | SupervisorRuntime::Cursor => {
             Ok(RuntimeModelCatalog::OperatorDeclared)
