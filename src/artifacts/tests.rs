@@ -426,6 +426,56 @@ fn json_line_appends_remain_manifested_and_finalize() {
 
 #[cfg(unix)]
 #[test]
+fn write_bytes_rejects_disposition_change_without_mutation() {
+    let (_temp, repo) = committed_repo();
+    let run_id = RunId::new("write-disposition").expect("run id");
+    let mut writer =
+        ArtifactRunWriter::reserve(&repo, RunArtifactFamily::Supervise, run_id, "supervise")
+            .expect("reserve writer");
+    let path = Path::new("notes/private.txt");
+    let first = writer
+        .write_bytes(
+            path,
+            b"private evidence\n",
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .expect("write private evidence");
+    let before = fs::read(writer.run_dir().join(path)).expect("read before mismatch");
+
+    let error = writer
+        .write_bytes(
+            path,
+            b"now publishable\n",
+            ArtifactFileDisposition::Publishable,
+        )
+        .expect_err("disposition change must fail");
+    assert!(error.to_string().contains("cannot change file disposition"));
+    assert_eq!(
+        fs::read(writer.run_dir().join(path)).expect("read after mismatch"),
+        before
+    );
+    assert_eq!(writer.files.get(path), Some(&first));
+    assert_eq!(writer.total_bytes, first.bytes);
+
+    let rewritten = writer
+        .write_bytes(
+            path,
+            b"still private\n",
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .expect("same-disposition overwrite");
+    assert_eq!(
+        rewritten.disposition,
+        ArtifactFileDisposition::PrivateEvidence
+    );
+    assert_eq!(
+        fs::read(writer.run_dir().join(path)).expect("read same-disposition overwrite"),
+        b"still private\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn json_line_append_rejects_disposition_change_without_mutation() {
     let (_temp, repo) = committed_repo();
     let run_id = RunId::new("append-disposition").expect("run id");

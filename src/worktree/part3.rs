@@ -214,12 +214,18 @@ fn git_registered_worktree_names(
         let worktree = repo
             .find_worktree(name)
             .with_context(|| format!("failed to inspect Git worktree '{name}'"))?;
-        let path = fs::canonicalize(worktree.path()).with_context(|| {
-            format!(
-                "failed to resolve Git worktree path {}",
-                worktree.path().display()
-            )
-        })?;
+        let path = match fs::canonicalize(worktree.path()) {
+            Ok(path) => path,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to resolve Git worktree path {}",
+                        worktree.path().display()
+                    )
+                })
+            }
+        };
         if path.parent() == Some(worktree_root) {
             names.insert(name.to_string());
         }

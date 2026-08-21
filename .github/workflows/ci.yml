@@ -108,6 +108,9 @@ jobs:
           cli::tests::completion_reap_removes_merged_and_preserves_unmerged_and_dirty_worktrees
           cli::tests::merge_apply_auto_reap_waits_for_trunk_then_reaps_on_finalization_rerun
           cli::tests::merge_apply_json_delivers_unclaimed_edits_denial_to_integration_controller
+          execution_capability::tests::acquire_fails_closed_when_the_primary_repository_is_dirty
+          execution_capability::tests::capability_bound_create_succeeds_on_a_clean_repository
+          execution_capability::tests::public_create_without_the_capability_still_fails_closed
           external_agent::tests::verified_contained_fake_app_server_proves_duplex_ordering_and_confinement
           merge::tests::authenticated_megafile_failure_refuses_merge_before_primary_mutation
           merge::tests::candidate_collection_holds_read_lease_until_snapshot_finishes
@@ -127,6 +130,7 @@ jobs:
           planning::tests::collect_repo_files_excludes_local_agent_runtime_state
           planning::tests::collect_repo_files_never_follows_links_or_accepts_unsafe_files
           planning::tests::exact_symbol_scope_avoids_a_shared_megafile_module_attractor
+          planning::tests::fake_provider_proposes_a_recursive_tree_and_flattens_executable_leaves
           planning::tests::fake_provider_proposes_a_validated_disjoint_plan
           planning::tests::fake_provider_replans_from_feedback_with_a_hard_attempt_limit
           planning::tests::optional_provider_uses_heuristic_fallback_when_unconfigured
@@ -139,6 +143,8 @@ jobs:
           planning::tests::propose_task_paths_requires_standalone_short_identifier_tokens
           planning::tests::propose_task_paths_routes_docs_and_rust_tasks_separately
           planning::tests::provider_plan_rejects_overlapping_assignments
+          planning::tests::recursive_provider_plan_rejects_depth_and_reclaimed_completed_scope
+          planning::tests::recursive_provider_plan_rejects_internal_fragment_union_mismatch
           process_runner::tests::agent_lifecycle_metadata_stamps_environment_and_registers_running_process
           process_runner::tests::external_codex_outer_sandbox_enforces_control_and_report_write_boundaries
           process_runner::tests::required_containment_kills_setsid_delayed_mutation_with_closed_stdio
@@ -185,6 +191,7 @@ jobs:
           supervise::tests::plan_runtime::known_unavailable_child_runtime_default_reaches_production_app_server_argv_before_dispatch
           supervise::tests::plan_runtime::local_deterministic_fake_fallback_reaches_shared_supervisor_core_without_external_dispatch
           supervise::tests::plan_runtime::plain_text_task_without_actionable_scope_returns_guidance
+          supervise::tests::plan_runtime::provider_planning_session_lowers_recursive_tree_and_binds_run_identity
           supervise::tests::plan_runtime::stacked_review_lenses_execute_every_configured_boundary_and_aggregate
           supervise::tests::plan_runtime::supervisor_input_loader_accepts_direct_regular_files_and_refuses_unsafe_inputs
           supervise::tests::primary_worktree::bounded_primary_command_run_mutates_scope_holds_and_releases_claim_and_marks_reports
@@ -208,6 +215,7 @@ jobs:
           supervise::tests::run_artifacts::verified_run_entry_refuses_dirty_repository_before_assignment_creation
           supervise::tests::scheduler::concurrent_disjoint_assignments_make_progress_and_finalize_in_plan_order
           supervise::tests::scheduler::concurrent_failure_isolated_and_retry_retains_assignment_slot
+          supervise::tests::scheduler::degraded_manifest_boundary_finalization_still_releases_serial_claims
           supervise::tests::scheduler::external_termination_named_conflict_release_and_reacquisition_form_one_recovery_sequence
           supervise::tests::scheduler::nonaccepted_run_releases_claim_and_followup_reacquires_same_path
           supervise::tests::scheduler::semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead
@@ -224,6 +232,7 @@ jobs:
           worktree::tests::gc_classifies_untracked_only_and_requires_exact_allowlist_for_lane_removal
           worktree::tests::gc_dirtiness_snapshot_preserves_non_utf8_paths_and_detects_exact_change
           worktree::tests::gc_dry_run_reports_without_removing_worktree_or_target
+          worktree::tests::gc_full_apply_reports_removal_despite_stale_git_registration
           worktree::tests::gc_full_removal_reports_final_approved_untracked_paths
           worktree::tests::gc_ignored_inventory_excludes_large_runtime_categories_before_bounds
           worktree::tests::gc_late_protection_does_not_consume_count_or_size_retention
@@ -248,6 +257,7 @@ jobs:
           worktree::tests::lifecycle_requires_explicit_trunk_containment_without_changing_manual_gc
           worktree::tests::lifecycle_retry_supersedes_exact_authenticated_predecessor_despite_retention
           worktree::tests::neutral_worktree_production_cleanliness_seam_uses_exact_base_without_claim
+          worktree::tests::public_create_derives_cleanliness_from_a_clean_repository
           worktree::tests::remove_prepared_gc_recovery_refuses_changed_dirtiness_snapshot
           worktree::tests::repository_cleanliness_capability_creates_clean_managed_worktree
           worktree::tests::repository_cleanliness_capability_refuses_dirty_primary_before_create

@@ -93,6 +93,88 @@ fn write_claim(
 }
 
 #[test]
+fn ensure_field_inserts_after_owner_when_owner_is_last_line() {
+    let mut lines = vec![
+        "# Claim: owner-last".to_string(),
+        String::new(),
+        "- Claim ID: `owner-last`".to_string(),
+        "- Date: `2026-05-19`".to_string(),
+        "- Status: `active`".to_string(),
+        "- Owned files, regions, devices, or services:".to_string(),
+        "  - `src/cli.rs`: test".to_string(),
+        "- Owner: `worker-a`".to_string(),
+    ];
+    let owner_idx = lines
+        .iter()
+        .position(|line| line.starts_with("- Owner:"))
+        .expect("owner line");
+    ensure_field(&mut lines, "Updated", "2026-05-20T00:30:00Z");
+    assert_eq!(lines[owner_idx], "- Owner: `worker-a`");
+    assert_eq!(lines[owner_idx + 1], "- Updated: `2026-05-20T00:30:00Z`");
+    assert_eq!(lines.len(), owner_idx + 2);
+}
+
+#[test]
+fn ensure_field_inserts_before_owned_files_when_owner_precedes_heading() {
+    let mut lines = vec![
+        "# Claim: owner-before-files".to_string(),
+        String::new(),
+        "- Claim ID: `owner-before-files`".to_string(),
+        "- Date: `2026-05-19`".to_string(),
+        "- Status: `active`".to_string(),
+        "- Owner: `worker-a`".to_string(),
+        "- Owned files, regions, devices, or services:".to_string(),
+        "  - `src/cli.rs`: test".to_string(),
+    ];
+    let owner_idx = lines
+        .iter()
+        .position(|line| line.starts_with("- Owner:"))
+        .expect("owner line");
+    ensure_field(&mut lines, "Updated", "2026-05-20T00:30:00Z");
+    assert_eq!(lines[owner_idx], "- Owner: `worker-a`");
+    assert_eq!(lines[owner_idx + 1], "- Updated: `2026-05-20T00:30:00Z`");
+    assert!(lines[owner_idx + 2].starts_with("- Owned files"));
+    assert_eq!(lines[owner_idx + 3], "  - `src/cli.rs`: test");
+}
+
+#[test]
+fn heartbeat_accepts_owner_last_and_owner_before_owned_files_layouts() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
+    let directory = temp.path().join(CLAIMS_DIR);
+    std::fs::create_dir_all(&directory)?;
+
+    let owner_last = directory.join("owner-last.md");
+    std::fs::write(
+        &owner_last,
+        "# Claim: owner-last\n\n- Claim ID: `owner-last`\n- Date: `2026-05-19`\n- Status: `active`\n- Owned files, regions, devices, or services:\n  - `src/cli.rs`: test\n- Owner: `worker-a`\n",
+    )?;
+    let owner_last_report = heartbeat_with_clock(temp.path(), "owner-last", "worker-a", &now)?;
+    assert_eq!(owner_last_report.status.as_deref(), Some("active"));
+    let owner_last_text = std::fs::read_to_string(&owner_last)?;
+    assert!(owner_last_text.contains("- Heartbeat: `2026-05-20T00:30:00Z`"));
+    assert!(owner_last_text.contains("  - `src/cli.rs`: test"));
+
+    let owner_before = directory.join("owner-before-files.md");
+    std::fs::write(
+        &owner_before,
+        "# Claim: owner-before-files\n\n- Claim ID: `owner-before-files`\n- Date: `2026-05-19`\n- Status: `active`\n- Owner: `worker-a`\n- Owned files, regions, devices, or services:\n  - `src/lib.rs`: test\n",
+    )?;
+    let owner_before_report =
+        heartbeat_with_clock(temp.path(), "owner-before-files", "worker-a", &now)?;
+    assert_eq!(owner_before_report.status.as_deref(), Some("active"));
+    let owner_before_text = std::fs::read_to_string(&owner_before)?;
+    assert!(owner_before_text.contains("- Heartbeat: `2026-05-20T00:30:00Z`"));
+    assert!(
+        owner_before_text.contains(
+            "- Owned files, regions, devices, or services:\n  - `src/lib.rs`: test"
+        ),
+        "inserted field must not split the owned-files heading from its entries: {owner_before_text}"
+    );
+    Ok(())
+}
+
+#[test]
 fn parser_accepts_legacy_and_nonfilesystem_surfaces_but_rejects_strict_grammar_errors() {
     let legacy = parse_claim_file(
             PathBuf::from(CLAIMS_DIR).join("legacy.md"),

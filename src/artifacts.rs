@@ -1017,7 +1017,14 @@ impl ArtifactRunWriter {
                     MAX_ARTIFACT_TOTAL_BYTES
                 );
             }
-            if !self.files.contains_key(&relative) && self.files.len() >= MAX_ARTIFACT_FILES {
+            if let Some(previous) = self.files.get(&relative) {
+                if previous.disposition != disposition {
+                    bail!(
+                        "artifact overwrite cannot change file disposition: {}",
+                        relative.display()
+                    );
+                }
+            } else if self.files.len() >= MAX_ARTIFACT_FILES {
                 bail!(
                     "artifact run exceeds its {} file manifest limit",
                     MAX_ARTIFACT_FILES

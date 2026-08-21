@@ -621,7 +621,6 @@ fn mark_reconciliation_index_protected(
     detail: &str,
 ) {
     if let Some(entry) = entries.get_mut(entry_index) {
-        entry.state = WorktreeReconciliationState::Ambiguous;
         entry.action = WorktreeReconciliationAction::Protected;
         entry.detail = detail.to_string();
     }
@@ -1771,6 +1770,10 @@ struct WorktreeGcCandidate {
     rebuild_cost_ms: Option<u64>,
 }
 
+/// Running retention budget for candidates that take a keep/remove exit.
+/// Protected candidates do not update this state: a safety hold must not evict
+/// an older finished lane, so `max_count` / `max_total_bytes` can under-count
+/// on-disk usage.
 #[derive(Clone, Copy, Default)]
 struct WorktreeGcRetentionState {
     eligible_count: usize,

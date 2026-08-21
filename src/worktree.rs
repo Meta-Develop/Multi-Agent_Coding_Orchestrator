@@ -1476,12 +1476,13 @@ impl WorktreeManager {
 
     pub fn create_with_retention(
         &self,
-        _options: WorktreeCreateOptions,
-        _retention: WorktreeRetentionPolicy,
+        options: WorktreeCreateOptions,
+        retention: WorktreeRetentionPolicy,
     ) -> Result<WorktreeRecord> {
-        bail!(
-            "managed worktree creation is unsupported without a capability-bound repository cleanliness input"
-        );
+        let cleanliness = self.acquire_repository_cleanliness().with_context(|| {
+            "managed worktree creation requires a clean repository; `maco worktree create` derives the cleanliness capability automatically when the target repository is already clean"
+        })?;
+        self.create_with_repository_cleanliness_and_retention(options, retention, &cleanliness)
     }
 
     /// Captures repository-bound cleanliness evidence for effectful managed
@@ -2683,6 +2684,11 @@ impl WorktreeManager {
                 },
             )
         });
+        // Retention is committed only on remove / retain / dry-run exits.
+        // Protection continues deliberately drop `decision.committed_state` so
+        // a live, dirty, or identity-changed lane cannot evict an older
+        // finished candidate. `max_count` / `max_total_bytes` therefore
+        // under-count on-disk usage (conservative: never unsafe removal).
         let mut retention_state = WorktreeGcRetentionState::default();
         for mut candidate in candidates {
             let decision = worktree_gc_retention_decision(

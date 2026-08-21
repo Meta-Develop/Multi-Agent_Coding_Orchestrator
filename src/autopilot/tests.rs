@@ -2327,6 +2327,33 @@ fn autopilot_plan_bounds_attempts_and_defaults_validation_timeout() {
     assert!(!repo.join(".maco/autopilot").exists());
 }
 
+#[test]
+fn validation_commands_honor_caller_cancellation_between_commands() {
+    let cancellation = ProcessCancellation::new();
+    cancellation.cancel();
+    let mut plan = supervisor_profile_test_plan();
+    plan.validation_commands = vec![
+        AutopilotValidationCommand {
+            name: Some("first".to_string()),
+            command: "true".to_string(),
+            timeout_seconds: Some(600),
+        },
+        AutopilotValidationCommand {
+            name: Some("second".to_string()),
+            command: "true".to_string(),
+            timeout_seconds: Some(600),
+        },
+    ];
+
+    let error = run_validation_commands(Path::new("."), &plan, &cancellation)
+        .expect_err("cancelled validation must not start commands");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("cancelled before command 1"),
+        "remaining commands must be skipped without waiting on timeouts: {message}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn autopilot_plan_input_refuses_symlink_leaf_and_ancestor() {

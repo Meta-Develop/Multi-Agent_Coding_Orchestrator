@@ -958,6 +958,120 @@ fn run_plan_creates_worktree_runs_command_and_releases_claims() {
 
 #[cfg(unix)]
 #[test]
+fn mid_batch_setup_failure_does_not_spawn_earlier_agents() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+    fs::write(repo_path.join("b.txt"), "b\n").expect("write b");
+    commit_all(&repo, "initial commit").expect("commit");
+    let marker = temp.path().join("agent-a-ran");
+    let plan_file = temp.path().join("plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "agents": [
+                {
+                    "id": "agent-a",
+                    "paths": ["a.txt"],
+                    "command": format!("printf ran > '{}'; sleep 30", marker.display())
+                },
+                {
+                    "id": "agent-b",
+                    "paths": ["b.txt"],
+                    "command": "true"
+                }
+            ]
+        }))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+
+    set_ready_agent_setup_fault("agent-b");
+    let error = run_plan_file(OrchestrationRunOptions {
+        repo: repo_path.clone(),
+        plan_file,
+        keep_claims: false,
+        jobs: 2,
+        patch_dir: None,
+    })
+    .expect_err("later setup failure must abort the batch");
+    assert!(error
+        .to_string()
+        .contains("injected ready-agent setup failure"));
+    assert!(
+        !marker.exists(),
+        "pre-validation must stop earlier agents from spawning"
+    );
+    assert_eq!(
+        SyncStore::open(&repo_path)
+            .expect("open store")
+            .snapshot()
+            .expect("snapshot"),
+        Vec::<PathClaim>::new()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mid_batch_post_spawn_failure_joins_already_spawned_agents_before_return() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+    fs::write(repo_path.join("b.txt"), "b\n").expect("write b");
+    commit_all(&repo, "initial commit").expect("commit");
+    let marker = temp.path().join("agent-a-ran");
+    let plan_file = temp.path().join("plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "agents": [
+                {
+                    "id": "agent-a",
+                    "paths": ["a.txt"],
+                    "command": format!("printf ran > '{}'", marker.display())
+                },
+                {
+                    "id": "agent-b",
+                    "paths": ["b.txt"],
+                    "command": "true"
+                }
+            ]
+        }))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+
+    set_ready_agent_post_spawn_fault("agent-a");
+    let error = run_plan_file(OrchestrationRunOptions {
+        repo: repo_path.clone(),
+        plan_file,
+        keep_claims: false,
+        jobs: 2,
+        patch_dir: None,
+    })
+    .expect_err("post-spawn setup failure must abort after joining");
+    assert!(error
+        .to_string()
+        .contains("injected ready-agent post-spawn setup failure"));
+    assert!(
+        marker.exists(),
+        "already-spawned agent must run to completion while its claims are still held"
+    );
+    assert_eq!(
+        SyncStore::open(&repo_path)
+            .expect("open store")
+            .snapshot()
+            .expect("snapshot"),
+        Vec::<PathClaim>::new()
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn orchestration_holds_write_lease_through_child_validation_and_finalization() {
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");

@@ -414,6 +414,154 @@ fn dry_run_is_non_mutating_and_apply_is_signed_and_idempotent() {
 
 #[cfg(unix)]
 #[test]
+fn registered_authenticated_consumer_roots_and_state_locks_migrate_across_all_modes() {
+    let (_temp, path, state) = empty_repository_state();
+    let writer = repository_auth_writer(&path).expect("bootstrap repository authentication");
+    drop(writer);
+
+    let binding = expected_bindings_for(&path).repository_state;
+    let mut claims = LegacyClaimsState {
+        version: 2,
+        checksum: String::new(),
+        repository: binding,
+        next_token: 2,
+        claims: vec![PathClaim {
+            token: ClaimToken::from_u64(1),
+            agent_id: "registered-consumer-migration-test".to_string(),
+            paths: vec![PathBuf::from("src")],
+        }],
+    };
+    claims.checksum = stable_checksum(
+        &serde_json::to_vec(&(
+            claims.version,
+            &claims.repository,
+            claims.next_token,
+            &claims.claims,
+        ))
+        .expect("claims checksum payload"),
+    );
+    AtomicStateWriter::write_direct(
+        &state,
+        "claims.json",
+        &serde_json::to_vec_pretty(&claims).expect("claims JSON"),
+    )
+    .expect("claims state");
+    KernelStateLock::acquire_direct(&state, "claims.lock").expect("claims lock");
+
+    let sources = crate::artifacts::state_auth::authenticated_state_consumers();
+    assert_eq!(sources.len(), 9, "all authenticated consumer sources");
+    let registered_roots = sources
+        .iter()
+        .map(|source| source.root_name)
+        .collect::<BTreeSet<_>>();
+    for required in [
+        "authenticated-field-guide-state-v1",
+        "authenticated-megafile-history-v1",
+        "authenticated-generated-follow-up-queues-v1",
+    ] {
+        assert!(
+            registered_roots.contains(required),
+            "missing authenticated consumer root {required}"
+        );
+    }
+    let registered_state_root_locks = sources
+        .iter()
+        .flat_map(|source| source.state_root_lock_names.iter().copied())
+        .collect::<BTreeSet<_>>();
+    for required in [
+        ".authenticated-field-guide.lock",
+        "field-guide-operation-v1.lock",
+        ".authenticated-megafile-history.lock",
+        "megafile-history-operation-v1.lock",
+        ".generated-follow-up-queues.lock",
+    ] {
+        assert!(
+            registered_state_root_locks.contains(required),
+            "missing authenticated consumer state-root lock {required}"
+        );
+    }
+
+    for source in sources {
+        SafeRoot::open_or_create(state.path().join(source.root_name))
+            .expect("registered authenticated consumer root");
+        for lock_name in source.state_root_lock_names {
+            KernelStateLock::acquire_direct(&state, lock_name)
+                .expect("registered authenticated consumer state-root lock");
+        }
+    }
+    make_legacy_permissions(state.path());
+
+    let dry = migrate_repository_state(&path, false).expect("registered-source dry run");
+    assert_eq!(dry.status, StateMigrationStatus::Ready);
+    assert_eq!(dry.mode, StateMigrationMode::DryRun);
+
+    let applied = migrate_repository_state(&path, true).expect("registered-source apply");
+    assert_eq!(applied.status, StateMigrationStatus::Applied);
+    assert_eq!(applied.mode, StateMigrationMode::Apply);
+
+    let repeated_dry =
+        migrate_repository_state(&path, false).expect("registered-source repeated dry run");
+    assert_eq!(repeated_dry.status, StateMigrationStatus::AlreadyApplied);
+    assert_eq!(repeated_dry.mode, StateMigrationMode::DryRun);
+
+    let repeated_apply =
+        migrate_repository_state(&path, true).expect("registered-source repeated apply");
+    assert_eq!(repeated_apply.status, StateMigrationStatus::AlreadyApplied);
+    assert_eq!(repeated_apply.mode, StateMigrationMode::Apply);
+}
+
+#[cfg(unix)]
+#[test]
+fn publication_transaction_journals_are_inventoried_and_retired_across_all_modes() {
+    let (_temp, path, state) = repository_with_claims();
+    let journals = state
+        .join(LEGACY_PUBLICATION_TRANSACTIONS_DIR)
+        .join("legacy");
+    fs::create_dir_all(&journals).expect("legacy publication journals");
+    let record = journals.join("00000000000000000001.json");
+    fs::write(&record, b"legacy plaintext must remain untouched\n").expect("legacy record");
+    make_legacy_permissions(&state);
+
+    assert!(
+        !legacy_publication_journals_are_retired(&path).expect("pre-migration retirement query"),
+        "unsigned leftover journals are not retired"
+    );
+
+    let dry = migrate_repository_state(&path, false).expect("publication-journal dry run");
+    assert_eq!(dry.status, StateMigrationStatus::Ready);
+    assert_eq!(dry.mode, StateMigrationMode::DryRun);
+    assert!(
+        !legacy_publication_journals_are_retired(&path).expect("dry-run retirement query"),
+        "dry-run must not retire leftover journals"
+    );
+
+    let applied = migrate_repository_state(&path, true).expect("publication-journal apply");
+    assert_eq!(applied.status, StateMigrationStatus::Applied);
+    assert_eq!(applied.mode, StateMigrationMode::Apply);
+    assert!(
+        legacy_publication_journals_are_retired(&path).expect("applied retirement query"),
+        "signed migration must retire leftover publication journals"
+    );
+    assert_eq!(
+        fs::read(&record).expect("legacy record remains after apply"),
+        b"legacy plaintext must remain untouched\n"
+    );
+
+    let repeated_dry =
+        migrate_repository_state(&path, false).expect("publication-journal repeated dry run");
+    assert_eq!(repeated_dry.status, StateMigrationStatus::AlreadyApplied);
+    let repeated_apply =
+        migrate_repository_state(&path, true).expect("publication-journal repeated apply");
+    assert_eq!(repeated_apply.status, StateMigrationStatus::AlreadyApplied);
+    assert!(legacy_publication_journals_are_retired(&path).expect("repeated retirement query"));
+    assert_eq!(
+        fs::read(&record).expect("legacy record remains after re-verify"),
+        b"legacy plaintext must remain untouched\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn checksumless_semantic_requires_offline_manifest_then_adopts_authenticated_snapshot() {
     let (_temp, path, state, expected_intent) = repository_with_checksumless_semantic();
     let repository = crate::git_repository::open(&path).expect("repository");

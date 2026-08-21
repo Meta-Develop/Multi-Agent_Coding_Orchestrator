@@ -344,7 +344,12 @@ fn effectful_worktree_cleanliness_entries_fail_closed_before_repository_access()
         .remove("worker", false, true)
         .expect_err("non-force removal must fail closed");
 
-    assert!(create_error.to_string().contains("capability-bound"));
+    let create_message = format!("{create_error:#}");
+    assert!(
+        create_message.contains("failed to open repository")
+            && create_message.contains("cleanliness capability"),
+        "{create_message}"
+    );
     assert!(remove_error.to_string().contains("capability-bound"));
     assert_eq!(fs::read_dir(temp.path()).expect("read temp").count(), 0);
 }
@@ -626,6 +631,35 @@ fn repository_cleanliness_capability_creates_clean_managed_worktree() {
     )
     .expect("inspect created worktree")
     .is_empty());
+    assert_eq!(
+        manager.list_managed_verified().expect("list worktrees"),
+        vec![record]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn public_create_derives_cleanliness_from_a_clean_repository() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let worktree_root = temp.path().join("worktrees");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    commit_readme(&repo).expect("initial commit");
+    let manager = WorktreeManager::new(&repo_path);
+
+    let record = manager
+        .create(WorktreeCreateOptions {
+            agent_id: "public-create-worker".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: Some(worktree_root),
+        })
+        .expect("public create derives cleanliness from a clean repository");
+
+    assert_eq!(record.name, "public-create-worker");
+    assert_eq!(record.branch, "maco/public-create-worker");
+    assert!(record.path.join("README.md").is_file());
     assert_eq!(
         manager.list_managed_verified().expect("list worktrees"),
         vec![record]
@@ -2491,6 +2525,8 @@ fn gc_size_retention_keeps_the_newest_prefix_and_counts_lane_bytes_once() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_late_protection_does_not_consume_count_or_size_retention() {
+    // Conservative retention bias: a live/dirty hold must not evict an older
+    // finished lane. Protected candidates stay off the max_count / size budget.
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -3226,6 +3262,8 @@ fn gc_full_removal_reports_final_approved_untracked_paths() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_boundary_protection_does_not_consume_count_or_size_retention() {
+    // Conservative retention bias: apply-time dirtiness must not spend the
+    // budget that would otherwise keep the older finished lane.
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
