@@ -7,6 +7,7 @@
 
 mod capabilities;
 pub mod cursor;
+pub mod grok;
 
 pub use capabilities::{
     parse_adapter_allowlist, registered_adapter_ids, AdapterId, AdapterTrustClass,

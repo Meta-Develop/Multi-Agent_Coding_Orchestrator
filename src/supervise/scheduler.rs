@@ -2464,7 +2464,17 @@ fn prepare_supervisor_run(
             selection_preflight_failure: None,
         },
         Ok(catalog) => {
-            initialize_supervisor_selection(&mut plan, runtime, catalog, &admission_policy_input)?
+            let resolution = initialize_supervisor_selection(
+                &mut plan,
+                runtime,
+                catalog,
+                &admission_policy_input,
+                &AdvertisedCatalogSet::empty(),
+            )?;
+            if resolution.selection_preflight_failure.is_none() {
+                bind_selected_assignment_runtimes(&mut plan, &resolution.decisions)?;
+            }
+            resolution
         }
         Err(_) => SupervisorSelectionResolution {
             mode: SupervisorSelectionMode::LegacyFake,
@@ -3303,12 +3313,18 @@ mod selection_policy_tests {
             resolved_bound: 1,
         };
         let mut plan = test_plan();
-        initialize_supervisor_selection(&mut plan, SupervisorRuntime::Codex, &catalog, &admission)?
-            .decisions
-            .into_iter()
-            .next()
-            .map(|event| event.provenance)
-            .context("initial selector provenance")
+        initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &admission,
+            &AdvertisedCatalogSet::empty(),
+        )?
+        .decisions
+        .into_iter()
+        .next()
+        .map(|event| event.provenance)
+        .context("initial selector provenance")
     }
 
     fn initialized_repository() -> (tempfile::TempDir, PathBuf) {
@@ -3543,6 +3559,7 @@ mod selection_policy_tests {
             SupervisorRuntime::Codex,
             &catalog,
             &admission,
+            &AdvertisedCatalogSet::empty(),
         )?;
 
         assert_eq!(resolution.mode, SupervisorSelectionMode::Automatic);
@@ -3652,6 +3669,7 @@ mod selection_policy_tests {
             SupervisorRuntime::Codex,
             &catalog,
             &admission,
+            &AdvertisedCatalogSet::empty(),
         )?;
         assert_eq!(bridge_plan.role_models, original_role_models);
         assert!(bridge_resolution.selection_preflight_failure.is_some());

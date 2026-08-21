@@ -1,5 +1,122 @@
 use super::*;
 
+fn assignment_launch_runtime(
+    assignment: &OrchestratorAssignment,
+    options: &SupervisorRunOptions,
+) -> SupervisorRuntime {
+    assignment.runtime.unwrap_or(options.runtime)
+}
+
+fn selected_runtime_program(
+    launch_runtime: SupervisorRuntime,
+    options: &SupervisorRunOptions,
+) -> PathBuf {
+    match launch_runtime {
+        SupervisorRuntime::Codex if options.runtime == SupervisorRuntime::Codex => {
+            options.codex_bin.clone()
+        }
+        SupervisorRuntime::Grok | SupervisorRuntime::Cursor => {
+            crate::runtime_adapter::RuntimeAdapterConfig::from_environment(launch_runtime)
+                .binary
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| PathBuf::from(launch_runtime.default_binary()))
+        }
+        SupervisorRuntime::Codex | SupervisorRuntime::Fake => {
+            PathBuf::from(launch_runtime.default_binary())
+        }
+    }
+}
+
+fn bind_selected_runtime_launch(
+    mut command: ExternalAgentCommand,
+    assignment: &OrchestratorAssignment,
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    launch_runtime: SupervisorRuntime,
+    catalog: &RuntimeModelCatalog,
+) -> Result<ExternalAgentCommand> {
+    if matches!(
+        launch_runtime,
+        SupervisorRuntime::Grok | SupervisorRuntime::Cursor
+    ) {
+        if assignment.role != AgentRole::Worker {
+            bail!(
+                "selected runtime '{}' cannot launch judgment or delegating role '{}'",
+                crate::runtime_adapter::AdapterId::from_runtime(launch_runtime),
+                assignment.role.as_str()
+            );
+        }
+        command.program = selected_runtime_program(launch_runtime, options);
+        command = command.with_runtime_adapter(
+            launch_runtime,
+            crate::runtime_adapter::RuntimeAdapterConfig::from_environment(launch_runtime),
+        );
+        if command.runtime_adapter.is_none() {
+            bail!(
+                "selected runtime '{}' could not be translated into a supported executable command",
+                crate::runtime_adapter::AdapterId::from_runtime(launch_runtime)
+            );
+        }
+        let selection = effective_role_model_selection(plan, assignment.role);
+        let model = selection.model.clone().with_context(|| {
+            format!(
+                "selected runtime '{}' assignment '{}' has no model",
+                crate::runtime_adapter::AdapterId::from_runtime(launch_runtime),
+                assignment.id
+            )
+        })?;
+        command = command.with_model_selection(Some(model), selection.reasoning_effort.clone());
+        prerender_selected_runtime_adapter_command(&command, launch_runtime)?;
+        return Ok(command);
+    }
+    apply_role_model_selection(command, plan, assignment.role, launch_runtime, catalog)
+}
+
+pub(super) fn prerender_selected_runtime_adapter_command(
+    command: &ExternalAgentCommand,
+    launch_runtime: SupervisorRuntime,
+) -> Result<()> {
+    if !matches!(
+        launch_runtime,
+        SupervisorRuntime::Grok | SupervisorRuntime::Cursor
+    ) {
+        return Ok(());
+    }
+    let config = command.runtime_adapter.as_ref().with_context(|| {
+        format!(
+            "selected runtime '{}' is missing its adapter command configuration",
+            crate::runtime_adapter::AdapterId::from_runtime(launch_runtime)
+        )
+    })?;
+    let launch = config
+        .render(&crate::runtime_adapter::LaunchContext {
+            prompt: &command.prompt,
+            model: command.model.as_deref(),
+            effort: command.reasoning_effort.as_deref(),
+            cwd: &command.cwd,
+            output: &command.output_last_message,
+        })
+        .with_context(|| {
+            format!(
+                "selected runtime '{}' adapter command could not be rendered; refusing to launch",
+                crate::runtime_adapter::AdapterId::from_runtime(launch_runtime)
+            )
+        })?;
+    if launch.program.as_os_str().is_empty() {
+        bail!(
+            "selected runtime '{}' adapter binary is not configured; refusing to launch",
+            crate::runtime_adapter::AdapterId::from_runtime(launch_runtime)
+        );
+    }
+    if launch.argv.is_empty() {
+        bail!(
+            "selected runtime '{}' produced an empty adapter command; refusing to launch",
+            crate::runtime_adapter::AdapterId::from_runtime(launch_runtime)
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn execute_supervisor_assignment(
     context: AssignmentExecutionContext<'_, '_>,
 ) -> AssignmentExecutionOutcome {
@@ -740,6 +857,7 @@ fn prepare_child_attempt<'a>(
         )
     })?;
 
+    let launch_runtime = assignment_launch_runtime(assignment, options);
     let mut command = ExternalAgentCommand::codex(
         &options.codex_bin,
         &worktree.path,
@@ -748,20 +866,12 @@ fn prepare_child_attempt<'a>(
         &attempt_artifacts.report_path,
         Duration::from_secs(budget_plan.child_timeout_seconds),
     );
-    if matches!(
-        options.runtime,
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor
-    ) {
-        command = command.with_runtime_adapter(
-            options.runtime,
-            crate::runtime_adapter::RuntimeAdapterConfig::from_environment(options.runtime),
-        );
-    }
-    command = apply_role_model_selection(
+    command = bind_selected_runtime_launch(
         command,
+        assignment,
         &budget_plan,
-        assignment.role,
-        options.runtime,
+        options,
+        launch_runtime,
         runtime_model_catalog,
     )?;
     command.output_schema = Some(schema_path.to_path_buf());
@@ -3847,5 +3957,128 @@ done
                 worker_failed: false,
             }
         );
+    }
+
+    fn launch_fixture_command() -> ExternalAgentCommand {
+        ExternalAgentCommand::codex(
+            Path::new("unused-codex"),
+            Path::new("/tmp/work"),
+            Path::new("prompt.txt"),
+            Path::new("log.jsonl"),
+            Path::new("out.txt"),
+            Duration::from_secs(1),
+        )
+    }
+
+    fn launch_fixture_options(runtime: SupervisorRuntime) -> SupervisorRunOptions {
+        SupervisorRunOptions {
+            repo: PathBuf::from("."),
+            plan_file: PathBuf::from("plan.json"),
+            run_id: RunId::new("selected-runtime-launch").expect("valid run id"),
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-codex"),
+            runtime,
+            allow_dirty_primary: false,
+            admission_overrides: SupervisorAdmissionConfig::default(),
+            budget_overrides: RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: None,
+        }
+    }
+
+    fn worker_plan(model: &str) -> SupervisorPlan {
+        let mut plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "selected runtime launch".to_string(),
+            task_file: None,
+            max_depth: MIN_SUPERVISOR_DEPTH,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: Vec::new(),
+        };
+        plan.role_models.insert(
+            AgentRole::Worker,
+            RoleModelSelection {
+                model: Some(model.to_string()),
+                reasoning_effort: Some("high".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        plan
+    }
+
+    #[test]
+    fn assignment_launch_uses_selected_runtime_pair_not_run_global() -> Result<()> {
+        let mut assignment = OrchestratorAssignment {
+            id: "worker-a".to_string(),
+            runtime: Some(SupervisorRuntime::Cursor),
+            role: AgentRole::Worker,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let options = launch_fixture_options(SupervisorRuntime::Codex);
+        assert_eq!(
+            assignment_launch_runtime(&assignment, &options),
+            SupervisorRuntime::Cursor
+        );
+        let command = bind_selected_runtime_launch(
+            launch_fixture_command(),
+            &assignment,
+            &worker_plan("composer-2.5"),
+            &options,
+            SupervisorRuntime::Cursor,
+            &RuntimeModelCatalog::LocalDeterministicFake,
+        )?;
+        assert!(command.runtime_adapter.is_some());
+        assert_eq!(command.model.as_deref(), Some("composer-2.5"));
+        assert_eq!(command.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            command.program,
+            PathBuf::from(SupervisorRuntime::Cursor.default_binary())
+        );
+
+        assignment.role = AgentRole::ChildOrchestrator;
+        let error = bind_selected_runtime_launch(
+            launch_fixture_command(),
+            &assignment,
+            &worker_plan("composer-2.5"),
+            &options,
+            SupervisorRuntime::Cursor,
+            &RuntimeModelCatalog::LocalDeterministicFake,
+        )
+        .expect_err("delegating Cursor launch must fail closed");
+        assert!(error
+            .to_string()
+            .contains("cannot launch judgment or delegating role"));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_runtime_prerender_fails_closed_on_empty_adapter_command() {
+        let mut command = launch_fixture_command();
+        command.runtime_adapter = Some(crate::runtime_adapter::RuntimeAdapterConfig {
+            binary: Some(PathBuf::from("cursor-agent")),
+            argument_template: Vec::new(),
+            env_passthrough: Vec::new(),
+            working_dir_flag: None,
+            output_capture: crate::runtime_adapter::OutputCaptureMode::Stdout,
+            feed_prompt_on_stdin: true,
+        });
+        let error = prerender_selected_runtime_adapter_command(&command, SupervisorRuntime::Cursor)
+            .expect_err("empty adapter argv must fail closed");
+        assert!(error.to_string().contains("empty adapter command"));
     }
 }
