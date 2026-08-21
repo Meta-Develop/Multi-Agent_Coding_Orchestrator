@@ -224,10 +224,18 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                     "role_bindings": role_map_schema_value(role_binding),
                     "assignment_effort_bindings": assignment_effort_bindings_schema_value(),
                     "budget_degradations": budget_degradation_records_schema_value(),
+                    "selection_decisions": selection_decisions_schema_value(),
                     "usage": execution_usage_schema_value()
                 }
             }
         }
+    })
+}
+
+fn selection_decisions_schema_value() -> serde_json::Value {
+    json!({
+        "type": "array",
+        "items": crate::selection::selection_event_schema_value(),
     })
 }
 
@@ -1776,4 +1784,57 @@ pub(super) fn write_private_prompt(
         ArtifactFileDisposition::PrivateEvidence,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod selection_schema_tests {
+    use super::*;
+
+    fn required_contains(schema: &serde_json::Value, field: &str) -> bool {
+        schema["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|value| value == field))
+    }
+
+    #[test]
+    fn selection_event_schema_is_authoritative_for_dynamic_and_tracked_artifacts() -> Result<()> {
+        let dynamic = selection_decisions_schema_value();
+        let event = &dynamic["items"];
+        assert_eq!(event["additionalProperties"], false);
+        assert!(required_contains(event, "assignment_id"));
+        assert!(required_contains(event, "primary_cause"));
+        let decision = &event["properties"]["provenance"];
+        assert_eq!(decision["additionalProperties"], false);
+        assert!(required_contains(decision, "normalized_input"));
+        let normalized_input = &decision["properties"]["normalized_input"];
+        assert_eq!(normalized_input["additionalProperties"], false);
+        assert!(required_contains(normalized_input, "catalogs"));
+        assert_eq!(
+            normalized_input["properties"]["catalogs"]["items"]["additionalProperties"],
+            false
+        );
+
+        let digests = &decision["properties"]["input_digests"];
+        assert_eq!(digests["additionalProperties"], false);
+        assert!(required_contains(digests, "normalized_input"));
+        let digest = &digests["properties"]["normalized_input"];
+        assert_eq!(digest["additionalProperties"], false);
+        assert!(required_contains(digest, "algorithm"));
+        assert!(required_contains(digest, "value"));
+
+        let candidate = &decision["properties"]["candidate_set"]["items"];
+        assert_eq!(candidate["additionalProperties"], false);
+        assert!(required_contains(candidate, "score"));
+        let score = &candidate["properties"]["score"]["oneOf"][0];
+        assert_eq!(score["additionalProperties"], false);
+        assert!(required_contains(score, "total_score_microunits"));
+
+        let tracked: serde_json::Value = serde_json::from_str(include_str!(
+            "../../schemas/supervisor-final-report-v1.schema.json"
+        ))?;
+        let tracked_event =
+            &tracked["$defs"]["execution"]["properties"]["selection_decisions"]["items"];
+        assert_eq!(tracked_event, event);
+        Ok(())
+    }
 }

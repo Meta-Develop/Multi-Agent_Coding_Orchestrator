@@ -543,6 +543,7 @@ macro_rules! with_invalid_schedule_context {
         };
         let $context = AssignmentSchedulerContext {
             plan: &plan,
+            requested_plan: &plan,
             execution_target: None,
             budget_config: &budget_config,
             consultant: &consultant,
@@ -622,6 +623,7 @@ macro_rules! with_valid_schedule_context {
         };
         let $context = AssignmentSchedulerContext {
             plan: &plan,
+            requested_plan: &plan,
             execution_target: None,
             budget_config: &budget_config,
             consultant: &consultant,

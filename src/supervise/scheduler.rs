@@ -277,7 +277,10 @@ fn prepare_semantic_warn_assignments(
 }
 
 struct AssignmentSchedulerContext<'context, 'writer> {
+    /// Selector-resolved execution plan used for every dispatched duty.
     plan: &'context SupervisorPlan,
+    /// Caller-authenticated plan retained for generated follow-up intent.
+    requested_plan: &'context SupervisorPlan,
     budget_config: &'context SupervisorBudgetConfig,
     consultant: &'context SupervisorConsultantPlan,
     assignment_metadata: &'context AssignmentMetadata,
@@ -314,7 +317,16 @@ struct SchedulerProgress {
 }
 
 impl SchedulerProgress {
+    #[cfg(test)]
     fn new(assignment_count: usize, max_concurrent_children: usize) -> Self {
+        Self::new_with_selection_state(assignment_count, max_concurrent_children, None)
+    }
+
+    fn new_with_selection_state(
+        assignment_count: usize,
+        max_concurrent_children: usize,
+        automatic_selection_state: Option<SupervisorAutomaticSelectionState>,
+    ) -> Self {
         Self {
             indexed_outcomes: (0..assignment_count).map(|_| None).collect(),
             health_breaker: SwarmHealthCircuitBreaker::default(),
@@ -322,7 +334,10 @@ impl SchedulerProgress {
             budget_denied_assignment_indices: BTreeSet::new(),
             circuit_breaker_trip: None,
             concurrency: SchedulerConcurrencyTracker::new(),
-            budget_degradation: BudgetDegradationController::new(max_concurrent_children),
+            budget_degradation: BudgetDegradationController::new_with_selection_state(
+                max_concurrent_children,
+                automatic_selection_state,
+            ),
         }
     }
 }
@@ -332,6 +347,9 @@ pub(super) struct AssignmentBudgetPolicy {
     model_overrides: BTreeMap<AgentRole, RoleModelSelection>,
     child_effort_degradation_steps: usize,
     assignment_reasoning_effort: Option<ReasoningEffort>,
+    selector_state: Option<SupervisorAutomaticSelectionState>,
+    selector_overrides: BTreeMap<AgentRole, RoleModelSelection>,
+    pub(super) selector_decisions: Vec<SupervisorSelectionEvent>,
 }
 
 impl AssignmentBudgetPolicy {
@@ -362,8 +380,85 @@ impl AssignmentBudgetPolicy {
             selection.reasoning_effort = Some(resolved.resolved);
             effective.role_models.insert(role, selection);
         }
+        let initial_auditor = effective_role_model_selection(plan, AgentRole::Auditor);
+        for (role, selection) in &self.selector_overrides {
+            effective.role_models.insert(*role, selection.clone());
+        }
+        if let Some(auditor) = self.selector_overrides.get(&AgentRole::Auditor) {
+            for lens in &mut effective.review_lenses {
+                if let ReviewLensBackendConfig::Model {
+                    model,
+                    reasoning_effort,
+                    ..
+                } = &mut lens.backend
+                {
+                    if initial_auditor.model.as_deref() == Some(model.as_str())
+                        && initial_auditor.reasoning_effort.as_deref()
+                            == reasoning_effort.as_deref()
+                    {
+                        if let (Some(selected_model), Some(selected_effort)) =
+                            (&auditor.model, &auditor.reasoning_effort)
+                        {
+                            *model = selected_model.clone();
+                            *reasoning_effort = Some(selected_effort.clone());
+                        }
+                    }
+                }
+            }
+        }
         effective
     }
+
+    pub(super) fn reselect(
+        &mut self,
+        runtime: SupervisorRuntime,
+        catalog: &RuntimeModelCatalog,
+        request: SelectorReselectionRequest<'_>,
+    ) -> Result<Vec<SupervisorSelectionEvent>> {
+        let SelectorReselectionRequest {
+            roles,
+            assignment_id,
+            attempt,
+            primary_cause,
+            retry_count,
+            budget_signal,
+            environment_rejections,
+        } = request;
+        let Some(state) = self.selector_state.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let reselection = reselect_roles_from_supplied_catalog_snapshot(
+            state,
+            runtime,
+            catalog,
+            roles,
+            retry_count,
+            budget_signal,
+            environment_rejections,
+        )?;
+        self.selector_overrides.extend(reselection.overrides);
+        Ok(reselection
+            .decisions
+            .into_iter()
+            .map(|(role, provenance)| SupervisorSelectionEvent {
+                assignment_id: assignment_id.map(str::to_string),
+                attempt,
+                role,
+                primary_cause,
+                provenance,
+            })
+            .collect())
+    }
+}
+
+pub(super) struct SelectorReselectionRequest<'a> {
+    pub(super) roles: &'a [AgentRole],
+    pub(super) assignment_id: Option<&'a str>,
+    pub(super) attempt: usize,
+    pub(super) primary_cause: SupervisorSelectionEventCause,
+    pub(super) retry_count: u32,
+    pub(super) budget_signal: crate::selection::BudgetSignal,
+    pub(super) environment_rejections: &'a [TypedSelectorEnvironmentRejection],
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -386,10 +481,21 @@ struct BudgetDegradationController {
 }
 
 impl BudgetDegradationController {
+    #[cfg(test)]
     fn new(max_concurrent_children: usize) -> Self {
+        Self::new_with_selection_state(max_concurrent_children, None)
+    }
+
+    fn new_with_selection_state(
+        max_concurrent_children: usize,
+        automatic_selection_state: Option<SupervisorAutomaticSelectionState>,
+    ) -> Self {
         Self {
             rung: BudgetDegradationRung::Effort,
-            policy: AssignmentBudgetPolicy::default(),
+            policy: AssignmentBudgetPolicy {
+                selector_state: automatic_selection_state,
+                ..AssignmentBudgetPolicy::default()
+            },
             effective_fan_out: max_concurrent_children.max(1),
             records: Vec::new(),
             assignment_effort_bindings: Vec::new(),
@@ -427,9 +533,31 @@ impl BudgetDegradationController {
                 runtime,
             )?;
         }
+        let selector_decisions = if report.action == BudgetAction::Degrade {
+            self.policy.reselect(
+                runtime,
+                catalog,
+                SelectorReselectionRequest {
+                    roles: &[
+                        AgentRole::ChildOrchestrator,
+                        AgentRole::Worker,
+                        AgentRole::Auditor,
+                    ],
+                    assignment_id: Some(&assignment.id),
+                    attempt: 0,
+                    primary_cause: SupervisorSelectionEventCause::BudgetDegrade,
+                    retry_count: 0,
+                    budget_signal: crate::selection::BudgetSignal::Degrade,
+                    environment_rejections: &[],
+                },
+            )?
+        } else {
+            Vec::new()
+        };
         self.last_new_dispatch_allowed = report.new_dispatch_allowed;
         let mut policy = self.policy.clone();
         policy.assignment_reasoning_effort = requested_reasoning_effort;
+        policy.selector_decisions = selector_decisions;
         self.record_assignment_effort_bindings(
             assignment,
             requested_reasoning_effort,
@@ -827,6 +955,7 @@ struct CollectedAssignmentOutcomes {
     gate_denials: Vec<GateDenial>,
     pre_action_review_metrics: Vec<ReviewMetricSnapshot>,
     gate_correction_outcomes: Vec<GateCorrectionOutcomeRecord>,
+    selection_decisions: Vec<SupervisorSelectionEvent>,
     candidate_inspections: BTreeMap<String, SupervisorCandidateInspection>,
     findings: Vec<Finding>,
     assignment_execution_failed: bool,
@@ -851,6 +980,10 @@ fn collect_indexed_assignment_outcomes(
         collected
             .gate_correction_outcomes
             .extend(outcome.gate_correction_outcomes);
+        let mut selection_decisions = outcome.selection_decisions;
+        selection_decisions
+            .sort_by(|left, right| (left.attempt, left.role).cmp(&(right.attempt, right.role)));
+        collected.selection_decisions.extend(selection_decisions);
         collected.assignment_execution_failed |= outcome.assignment_failed;
         collected.external_containment_failed |= outcome.external_containment_failed;
         if !release_per_assignment {
@@ -999,6 +1132,7 @@ fn run_serial_assignment_schedule(
             index,
             concurrent_mode: false,
             plan: context.plan,
+            requested_plan: context.requested_plan,
             budget_config: context.budget_config,
             consultant: context.consultant,
             assignment_metadata: context.assignment_metadata,
@@ -1194,6 +1328,7 @@ fn run_concurrent_assignment_schedule(
                             index,
                             concurrent_mode: true,
                             plan: context.plan,
+                            requested_plan: context.requested_plan,
                             budget_config: context.budget_config,
                             consultant: context.consultant,
                             assignment_metadata: context.assignment_metadata,
@@ -1686,6 +1821,7 @@ fn build_supervisor_final_report(
         breaker_tripped,
         field_guide_mutation_failed,
     } = construction;
+    let selection_decisions = collected.selection_decisions.clone();
     let generated_follow_up_tasks = collected
         .orchestrator_reports
         .iter()
@@ -1752,6 +1888,7 @@ fn build_supervisor_final_report(
         role_bindings,
         assignment_effort_bindings,
         budget_degradations,
+        selection_decisions,
         usage: supervisor_execution_usage_report(total_usage, total_cost_usd, usage_complete),
     });
     SupervisorFinalReport {
@@ -2214,13 +2351,20 @@ fn initialize_scheduler_evidence(
 }
 
 struct PreparedSupervisorRun {
+    /// Selector-resolved execution plan.
     plan: SupervisorPlan,
+    /// Original caller plan used for artifact identity and follow-up inheritance.
+    requested_plan: SupervisorPlan,
     consultant: SupervisorConsultantPlan,
     assignment_metadata: AssignmentMetadata,
     plan_metadata: SupervisorPlanMetadata,
     max_concurrent_children: usize,
     admission_policy_input: SupervisorAdmissionPolicyInput,
     runtime_model_catalog: RuntimeModelCatalogAcquisition,
+    selection_mode: SupervisorSelectionMode,
+    selection_decisions: Vec<SupervisorSelectionEvent>,
+    selection_preflight_failure: Option<SupervisorSelectionPreflightFailure>,
+    automatic_selection_state: Option<SupervisorAutomaticSelectionState>,
     budget_ledger: RunBudgetLedger,
     runtime: SupervisorRuntime,
     repo: PathBuf,
@@ -2242,7 +2386,7 @@ fn prepare_supervisor_run(
     runtime_model_catalog: RuntimeModelCatalogAcquisition,
 ) -> Result<PreparedSupervisorRun> {
     let LoadedSupervisorPlan {
-        plan,
+        mut plan,
         consultant,
         assignment_metadata,
         mut plan_metadata,
@@ -2309,6 +2453,26 @@ fn prepare_supervisor_run(
         options.admission_overrides,
     )?;
     let max_concurrent_children = admission_policy_input.resolved_bound;
+    let requested_plan = plan.clone();
+    let legacy_nonpublishable_explicit_selection =
+        uses_legacy_nonpublishable_explicit_selection(execution_runtime, &plan);
+    let selection = match runtime_model_catalog.as_ref() {
+        Ok(_) if legacy_nonpublishable_explicit_selection => SupervisorSelectionResolution {
+            mode: SupervisorSelectionMode::LegacyNonpublishableSimulation,
+            decisions: Vec::new(),
+            automatic_state: None,
+            selection_preflight_failure: None,
+        },
+        Ok(catalog) => {
+            initialize_supervisor_selection(&mut plan, runtime, catalog, &admission_policy_input)?
+        }
+        Err(_) => SupervisorSelectionResolution {
+            mode: SupervisorSelectionMode::LegacyFake,
+            decisions: Vec::new(),
+            automatic_state: None,
+            selection_preflight_failure: None,
+        },
+    };
     let evidence_only_reaudit = plan_metadata
         .evidence_only_reaudit
         .as_ref()
@@ -2329,7 +2493,7 @@ fn prepare_supervisor_run(
     )?;
     let primary_base = current_head_oid(&repo)?;
     let normalized_plan_sha256 = normalized_supervisor_plan_sha256(
-        &plan,
+        &requested_plan,
         &consultant,
         &assignment_metadata,
         &plan_metadata,
@@ -2341,7 +2505,7 @@ fn prepare_supervisor_run(
             &primary_base,
             normalized_plan_sha256,
             max_concurrent_children,
-            &plan,
+            &requested_plan,
             artifact_writer.resume_binding()?,
             budget_ledger.report()?,
         ),
@@ -2351,12 +2515,17 @@ fn prepare_supervisor_run(
     let manager = WorktreeManager::new(&repo);
     Ok(PreparedSupervisorRun {
         plan,
+        requested_plan,
         consultant,
         assignment_metadata,
         plan_metadata,
         max_concurrent_children,
         admission_policy_input,
         runtime_model_catalog,
+        selection_mode: selection.mode,
+        selection_decisions: selection.decisions,
+        selection_preflight_failure: selection.selection_preflight_failure,
+        automatic_selection_state: selection.automatic_state,
         budget_ledger,
         runtime,
         repo,
@@ -2370,7 +2539,7 @@ fn prepare_supervisor_run(
     })
 }
 
-struct RuntimeModelCatalogFailureFinalization<'context, 'checkpoint> {
+struct PredispatchFailureFinalization<'context, 'checkpoint> {
     plan: &'context SupervisorPlan,
     plan_metadata: &'context SupervisorPlanMetadata,
     options: &'context SupervisorRunOptions,
@@ -2382,13 +2551,20 @@ struct RuntimeModelCatalogFailureFinalization<'context, 'checkpoint> {
     max_concurrent_children: usize,
     admission_policy_input: SupervisorAdmissionPolicyInput,
     has_multiple_independent_assignment_scopes: bool,
+    runtime_model_catalog: Option<&'context RuntimeModelCatalog>,
+    selection_decisions: Vec<SupervisorSelectionEvent>,
 }
 
-fn persist_runtime_model_catalog_environment_failure(
-    finalization: RuntimeModelCatalogFailureFinalization<'_, '_>,
-    failure: EnvironmentFailure,
+enum SupervisorPredispatchFailure {
+    RuntimeModelCatalog(EnvironmentFailure),
+    Selection(SupervisorSelectionPreflightFailure),
+}
+
+fn persist_supervisor_predispatch_failure(
+    finalization: PredispatchFailureFinalization<'_, '_>,
+    failure: SupervisorPredispatchFailure,
 ) -> Result<SupervisorFinalReport> {
-    let RuntimeModelCatalogFailureFinalization {
+    let PredispatchFailureFinalization {
         plan,
         plan_metadata,
         options,
@@ -2400,20 +2576,38 @@ fn persist_runtime_model_catalog_environment_failure(
         max_concurrent_children,
         admission_policy_input,
         has_multiple_independent_assignment_scopes,
+        runtime_model_catalog,
+        selection_decisions,
     } = finalization;
     let run_budget_report = budget_ledger.report()?;
     let (report_plan_file, report_run_dir) =
         supervisor_report_paths(repo, &options.plan_file, run_dir, &options.run_id);
-    let mut collected = CollectedAssignmentOutcomes::default();
+    let mut collected = CollectedAssignmentOutcomes {
+        selection_decisions,
+        ..CollectedAssignmentOutcomes::default()
+    };
+    let (finding_message, environment_failures) = match failure {
+        SupervisorPredispatchFailure::RuntimeModelCatalog(failure) => (
+            "runtime model catalog preflight blocked supervisor dispatch; inspect the typed environment_failures entry"
+                .to_string(),
+            vec![failure],
+        ),
+        SupervisorPredispatchFailure::Selection(failure) => (
+            format!(
+                "selection preflight failed for role '{}' with typed state '{:?}': {}",
+                failure.role.as_str(), failure.kind, failure.message
+            ),
+            Vec::new(),
+        ),
+    };
     collected.findings.push(Finding {
         severity: FindingSeverity::Error,
-        message: "runtime model catalog preflight blocked supervisor dispatch; inspect the typed environment_failures entry"
-            .to_string(),
+        message: finding_message,
         paths: Vec::new(),
     });
     let mut final_report = build_supervisor_final_report(SupervisorFinalReportConstruction {
         plan,
-        runtime_model_catalog: None,
+        runtime_model_catalog,
         max_concurrent_children,
         admission_policy_input,
         achieved_concurrency: AchievedConcurrency::default(),
@@ -2435,7 +2629,7 @@ fn persist_runtime_model_catalog_environment_failure(
         total_usage: None,
         total_cost_usd: None,
         usage_complete: true,
-        environment_failures: vec![failure],
+        environment_failures,
         sandbox_denials: Vec::new(),
         collected,
         bloated_file_flags: Vec::new(),
@@ -2458,7 +2652,7 @@ fn persist_runtime_model_catalog_environment_failure(
     apply_execution_target_reporting(&mut final_report, plan_metadata.execution_target.as_ref());
     let binding = artifact_writer
         .resume_binding()
-        .context("failed to establish runtime-catalog preflight report boundary")?;
+        .context("failed to establish predispatch failure report boundary")?;
     checkpoint_writer.scheduler_closed(binding, run_budget_report)?;
     let mut orchestration_journal = None;
     persist_supervisor_final_report(
@@ -2481,12 +2675,17 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
 ) -> Result<SupervisorFinalReport> {
     let PreparedSupervisorRun {
         plan,
+        requested_plan,
         consultant,
         assignment_metadata,
         plan_metadata,
         max_concurrent_children,
         admission_policy_input,
         runtime_model_catalog,
+        selection_mode: _selection_mode,
+        mut selection_decisions,
+        selection_preflight_failure,
+        automatic_selection_state,
         budget_ledger,
         runtime,
         repo,
@@ -2511,8 +2710,8 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     let runtime_model_catalog = match runtime_model_catalog {
         Ok(catalog) => catalog,
         Err(failure) => {
-            return persist_runtime_model_catalog_environment_failure(
-                RuntimeModelCatalogFailureFinalization {
+            return persist_supervisor_predispatch_failure(
+                PredispatchFailureFinalization {
                     plan: &plan,
                     plan_metadata: &plan_metadata,
                     options: &options,
@@ -2528,11 +2727,34 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                             &assignment_schedule,
                             &plan_metadata,
                         ),
+                    runtime_model_catalog: None,
+                    selection_decisions,
                 },
-                *failure,
+                SupervisorPredispatchFailure::RuntimeModelCatalog(*failure),
             );
         }
     };
+    if let Some(failure) = selection_preflight_failure {
+        return persist_supervisor_predispatch_failure(
+            PredispatchFailureFinalization {
+                plan: &plan,
+                plan_metadata: &plan_metadata,
+                options: &options,
+                repo: &repo,
+                budget_ledger: &budget_ledger,
+                artifact_writer,
+                checkpoint_writer: &mut checkpoint_writer,
+                run_dir: &run_dir,
+                max_concurrent_children,
+                admission_policy_input,
+                has_multiple_independent_assignment_scopes:
+                    has_multiple_independent_assignment_scopes(&assignment_schedule, &plan_metadata),
+                runtime_model_catalog: Some(&runtime_model_catalog),
+                selection_decisions,
+            },
+            SupervisorPredispatchFailure::Selection(failure),
+        );
+    }
     let budget_config = &plan_metadata.run_budget;
     let mut sync_store_slot = None;
     let mut semantic_store_slot = None;
@@ -2541,6 +2763,9 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     let mut orchestration_journal = None;
     let mut autonomy_kpi_collector = AutonomyKpiCollector::default();
     let mut collected = CollectedAssignmentOutcomes::default();
+    collected
+        .selection_decisions
+        .append(&mut selection_decisions);
     if runtime == SupervisorRuntime::Fake {
         collected.findings.push(Finding {
             severity: FindingSeverity::Warning,
@@ -2559,7 +2784,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     let mut achieved_concurrency = AchievedConcurrency::default();
     let run_result = (|| -> Result<()> {
         initialize_scheduler_evidence(&mut SchedulerEvidenceInitialization {
-            plan: &plan,
+            plan: &requested_plan,
             consultant: &consultant,
             assignment_metadata: &assignment_metadata,
             plan_metadata: &plan_metadata,
@@ -2613,10 +2838,14 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
             });
             let semantic_block_gate = SemanticBlockGate::default();
             let serial_semantic_warn_intents = Mutex::new(Vec::<(usize, SemanticIntent)>::new());
-            let mut progress =
-                SchedulerProgress::new(plan.assignments.len(), max_concurrent_children);
+            let mut progress = SchedulerProgress::new_with_selection_state(
+                plan.assignments.len(),
+                max_concurrent_children,
+                automatic_selection_state,
+            );
             let scheduler_context = AssignmentSchedulerContext {
                 plan: &plan,
+                requested_plan: &requested_plan,
                 budget_config,
                 consultant: &consultant,
                 assignment_metadata: &assignment_metadata,
@@ -3005,6 +3234,506 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
             Ok(())
         },
     )
+}
+
+#[cfg(test)]
+mod selection_policy_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn test_plan() -> SupervisorPlan {
+        SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "selector scheduler policy fixture".to_string(),
+            task_file: None,
+            max_depth: MIN_SUPERVISOR_DEPTH,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: Vec::new(),
+        }
+    }
+
+    fn role_selection(model: &str, effort: &str) -> RoleModelSelection {
+        RoleModelSelection {
+            model: Some(model.to_string()),
+            reasoning_effort: Some(effort.to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+        }
+    }
+
+    fn automatic_provenance() -> Result<crate::selection::SelectionProvenance> {
+        let priors = crate::selection::built_in_prior_dataset()?;
+        let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(
+            priors
+                .models
+                .iter()
+                .filter(|prior| prior.runtime == "codex")
+                .map(|prior| prior.model.clone()),
+        )?);
+        let admission = SupervisorAdmissionPolicyInput {
+            entrypoint_bound: 1,
+            plan: SupervisorAdmissionConfig::default(),
+            cli: SupervisorAdmissionConfig::default(),
+            effective: SupervisorAdmissionConfig::default(),
+            provider_inflight_bound: 1,
+            provider_inflight_source: AdmissionInputSource::ConservativeDefault,
+            host: SupervisorHostResourcePolicyInput {
+                memory_available_mib: None,
+                memory_available_source: AdmissionInputSource::ConservativeDefault,
+                memory_per_child_mib: DEFAULT_HOST_MEMORY_PER_CHILD_MIB,
+                memory_bound: None,
+                fd_available: None,
+                fd_available_source: AdmissionInputSource::ConservativeDefault,
+                fds_per_child: DEFAULT_HOST_FDS_PER_CHILD,
+                fd_bound: None,
+                disk_available_mib: None,
+                disk_available_source: AdmissionInputSource::ConservativeDefault,
+                disk_per_child_mib: DEFAULT_HOST_DISK_PER_CHILD_MIB,
+                disk_bound: None,
+                fallback_children: DEFAULT_HOST_FALLBACK_CHILDREN,
+                resolved_bound: 1,
+            },
+            resolved_bound: 1,
+        };
+        let mut plan = test_plan();
+        initialize_supervisor_selection(&mut plan, SupervisorRuntime::Codex, &catalog, &admission)?
+            .decisions
+            .into_iter()
+            .next()
+            .map(|event| event.provenance)
+            .context("initial selector provenance")
+    }
+
+    fn initialized_repository() -> (tempfile::TempDir, PathBuf) {
+        let temporary = tempfile::tempdir().expect("temporary selector repository");
+        let repo_path = temporary.path().join("repo");
+        let repository = git2::Repository::init(&repo_path).expect("initialize repository");
+        fs::write(repo_path.join("README.md"), "baseline\n").expect("write baseline");
+        let mut index = repository.index().expect("repository index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("stage baseline");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repository.find_tree(tree_id).expect("find tree");
+        let signature =
+            git2::Signature::now("maco test", "maco-test@example.invalid").expect("test signature");
+        repository
+            .commit(Some("HEAD"), &signature, &signature, "baseline", &tree, &[])
+            .expect("commit baseline");
+        drop(tree);
+        drop(repository);
+        (temporary, repo_path)
+    }
+
+    fn predispatch_options(repo: &Path, root: &Path, run_id: &str) -> SupervisorRunOptions {
+        SupervisorRunOptions {
+            repo: repo.to_path_buf(),
+            plan_file: root.join(format!("{run_id}.json")),
+            run_id: RunId::new(run_id).expect("valid run id"),
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-selector-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: true,
+            admission_overrides: SupervisorAdmissionConfig::default(),
+            budget_overrides: RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: None,
+        }
+    }
+
+    #[test]
+    fn selector_override_is_applied_after_legacy_budget_mutations() {
+        let mut plan = test_plan();
+        plan.role_models.insert(
+            AgentRole::ChildOrchestrator,
+            role_selection("plan-child", "xhigh"),
+        );
+        let (initial_auditor_model, initial_auditor_effort) = match &plan.review_lenses[0].backend {
+            ReviewLensBackendConfig::Model {
+                model,
+                reasoning_effort,
+                ..
+            } => (
+                model.clone(),
+                reasoning_effort.clone().expect("default effort"),
+            ),
+            ReviewLensBackendConfig::Precomputed { .. } => panic!("default lens must be a model"),
+        };
+        plan.role_models.insert(
+            AgentRole::Auditor,
+            role_selection(&initial_auditor_model, &initial_auditor_effort),
+        );
+        let mut policy = AssignmentBudgetPolicy {
+            child_effort_degradation_steps: 1,
+            assignment_reasoning_effort: Some(ReasoningEffort::Low),
+            ..AssignmentBudgetPolicy::default()
+        };
+        policy.model_overrides.insert(
+            AgentRole::ChildOrchestrator,
+            role_selection("legacy-degraded-child", "low"),
+        );
+        policy.selector_overrides.insert(
+            AgentRole::ChildOrchestrator,
+            role_selection("selector-child", "high"),
+        );
+        policy.selector_overrides.insert(
+            AgentRole::Auditor,
+            role_selection("selector-auditor", "xhigh"),
+        );
+
+        let effective = policy.apply(&plan);
+
+        assert_eq!(
+            effective.role_models[&AgentRole::ChildOrchestrator],
+            role_selection("selector-child", "high")
+        );
+        assert_eq!(
+            effective.role_models[&AgentRole::Auditor],
+            role_selection("selector-auditor", "xhigh")
+        );
+        match &effective.review_lenses[0].backend {
+            ReviewLensBackendConfig::Model {
+                model,
+                reasoning_effort,
+                ..
+            } => {
+                assert_eq!(model, "selector-auditor");
+                assert_eq!(reasoning_effort.as_deref(), Some("xhigh"));
+            }
+            ReviewLensBackendConfig::Precomputed { .. } => {
+                panic!("selector-bound lens changed backend")
+            }
+        }
+    }
+
+    #[test]
+    fn selection_decision_collection_is_schedule_attempt_role_deterministic() -> Result<()> {
+        fn tagged(
+            mut provenance: crate::selection::SelectionProvenance,
+            tag: &str,
+        ) -> crate::selection::SelectionProvenance {
+            provenance.decision_reason = tag.to_string();
+            provenance
+        }
+
+        let provenance = automatic_provenance()?;
+        let schedule_zero = AssignmentExecutionOutcome {
+            selection_decisions: vec![
+                SupervisorSelectionEvent {
+                    assignment_id: Some("schedule-0".to_string()),
+                    attempt: 2,
+                    role: AgentRole::Worker,
+                    primary_cause: SupervisorSelectionEventCause::Retry,
+                    provenance: tagged(provenance.clone(), "schedule-0-attempt-2-worker"),
+                },
+                SupervisorSelectionEvent {
+                    assignment_id: Some("schedule-0".to_string()),
+                    attempt: 1,
+                    role: AgentRole::Worker,
+                    primary_cause: SupervisorSelectionEventCause::Retry,
+                    provenance: tagged(provenance.clone(), "schedule-0-attempt-1-worker"),
+                },
+                SupervisorSelectionEvent {
+                    assignment_id: Some("schedule-0".to_string()),
+                    attempt: 1,
+                    role: AgentRole::ChildOrchestrator,
+                    primary_cause: SupervisorSelectionEventCause::Retry,
+                    provenance: tagged(provenance.clone(), "schedule-0-attempt-1-child"),
+                },
+            ],
+            ..AssignmentExecutionOutcome::default()
+        };
+        let schedule_one = AssignmentExecutionOutcome {
+            selection_decisions: vec![SupervisorSelectionEvent {
+                assignment_id: Some("schedule-1".to_string()),
+                attempt: 1,
+                role: AgentRole::Auditor,
+                primary_cause: SupervisorSelectionEventCause::Retry,
+                provenance: tagged(provenance, "schedule-1-attempt-1-auditor"),
+            }],
+            ..AssignmentExecutionOutcome::default()
+        };
+        let mut collected = CollectedAssignmentOutcomes::default();
+
+        let fatal_errors = collect_indexed_assignment_outcomes(
+            vec![Some(schedule_zero), Some(schedule_one)],
+            false,
+            &mut collected,
+        );
+
+        assert!(fatal_errors.is_empty());
+        assert_eq!(
+            collected
+                .selection_decisions
+                .iter()
+                .map(|event| event.provenance.decision_reason.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "schedule-0-attempt-1-child",
+                "schedule-0-attempt-1-worker",
+                "schedule-0-attempt-2-worker",
+                "schedule-1-attempt-1-auditor",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selection_event_serialization_is_strict_and_retains_execution_context() -> Result<()> {
+        let event = SupervisorSelectionEvent {
+            assignment_id: Some("assignment-a".to_string()),
+            attempt: 2,
+            role: AgentRole::Worker,
+            primary_cause: SupervisorSelectionEventCause::Retry,
+            provenance: automatic_provenance()?,
+        };
+
+        let value = serde_json::to_value(&event)?;
+        assert_eq!(value["assignment_id"], "assignment-a");
+        assert_eq!(value["attempt"], 2);
+        assert_eq!(value["role"], "worker");
+        assert_eq!(value["primary_cause"], "retry");
+        assert_eq!(
+            serde_json::from_value::<SupervisorSelectionEvent>(value.clone())?,
+            event
+        );
+
+        let mut unexpected = value;
+        unexpected
+            .as_object_mut()
+            .context("serialized event object")?
+            .insert("unexpected".to_string(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<SupervisorSelectionEvent>(unexpected).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn empty_role_model_test_catalog_supports_verified_automatic_selection() -> Result<()> {
+        let (temporary, repo) = initialized_repository();
+        let mut plan = test_plan();
+        let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)?;
+        let priors = crate::selection::built_in_prior_dataset()?;
+        let RuntimeModelCatalog::Codex(codex_catalog) = &catalog else {
+            bail!("Codex test runtime did not produce a Codex catalog")
+        };
+        for prior in priors
+            .models
+            .iter()
+            .filter(|prior| prior.runtime == "codex")
+        {
+            assert!(codex_catalog.contains(&prior.model));
+        }
+        let admission = SupervisorAdmissionPolicyInput::resolve(
+            &repo,
+            1,
+            SupervisorAdmissionConfig::default(),
+            SupervisorAdmissionConfig::default(),
+        )?;
+
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &admission,
+        )?;
+
+        assert_eq!(resolution.mode, SupervisorSelectionMode::Automatic);
+        assert_eq!(resolution.decisions.len(), 5);
+        assert!(resolution.selection_preflight_failure.is_none());
+        assert_eq!(plan.role_models.len(), 5);
+        drop(temporary);
+        Ok(())
+    }
+
+    #[test]
+    fn verified_automatic_preparation_separates_requested_and_effective_plans() -> Result<()> {
+        let (temporary, repo) = initialized_repository();
+        let mut plan = test_plan();
+        plan.assignments = vec![OrchestratorAssignment {
+            id: "assignment-a".to_string(),
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        }];
+        let requested_plan = plan.clone();
+        let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)?;
+        let options =
+            predispatch_options(&repo, temporary.path(), "automatic-requested-plan-identity");
+
+        let prepared = prepare_supervisor_run(
+            LoadedSupervisorPlan {
+                plan,
+                consultant: SupervisorConsultantPlan::default(),
+                assignment_metadata: AssignmentMetadata::new(),
+                plan_metadata: SupervisorPlanMetadata::default(),
+            },
+            &options,
+            1,
+            SupervisorExecutionRuntime::Verified,
+            SupervisorWorktreeCreation::ExistingOnly,
+            Ok(catalog),
+        )?;
+
+        assert_eq!(prepared.requested_plan, requested_plan);
+        assert!(prepared.requested_plan.role_models.is_empty());
+        assert_eq!(
+            prepared.requested_plan.review_lenses,
+            requested_plan.review_lenses
+        );
+        assert_eq!(prepared.plan.role_models.len(), 5);
+        assert_ne!(prepared.plan, prepared.requested_plan);
+        Ok(())
+    }
+
+    #[test]
+    fn fail_closed_debug_selection_is_persisted_before_any_external_dispatch() -> Result<()> {
+        let (temporary, repo) = initialized_repository();
+        let mut plan = test_plan();
+        plan.assignments = vec![OrchestratorAssignment {
+            id: "assignment-a".to_string(),
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        }];
+        let priors = crate::selection::built_in_prior_dataset()?;
+        let ineligible = priors
+            .models
+            .iter()
+            .find(|prior| {
+                prior.runtime == "codex"
+                    && prior
+                        .prohibited_authority_roles
+                        .contains(&crate::selection::AuthorityRole::ReviewAuditor)
+            })
+            .context("ineligible auditor prior")?;
+        plan.role_models.insert(
+            AgentRole::Auditor,
+            role_selection(&ineligible.model, "high"),
+        );
+        let original_role_models = plan.role_models.clone();
+        let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(
+            priors
+                .models
+                .iter()
+                .filter(|prior| prior.runtime == "codex")
+                .map(|prior| prior.model.clone()),
+        )?);
+        let admission = SupervisorAdmissionPolicyInput::resolve(
+            &repo,
+            1,
+            SupervisorAdmissionConfig::default(),
+            SupervisorAdmissionConfig::default(),
+        )?;
+        let mut bridge_plan = plan.clone();
+        let bridge_resolution = initialize_supervisor_selection(
+            &mut bridge_plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &admission,
+        )?;
+        assert_eq!(bridge_plan.role_models, original_role_models);
+        assert!(bridge_resolution.selection_preflight_failure.is_some());
+        let options = predispatch_options(
+            &repo,
+            temporary.path(),
+            "selection-fail-closed-before-dispatch",
+        );
+        let run_id = options.run_id.clone();
+        let calls = AtomicUsize::new(0);
+        let runner =
+            |_command: &ExternalAgentCommand,
+             _cancellation: &ProcessCancellation,
+             _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                panic!("selection preflight failure must prevent external dispatch")
+            };
+
+        let report = run_supervisor_plan_with_runner_and_creation(
+            LoadedSupervisorPlan {
+                plan,
+                consultant: SupervisorConsultantPlan::default(),
+                assignment_metadata: AssignmentMetadata::new(),
+                plan_metadata: SupervisorPlanMetadata::default(),
+            },
+            options,
+            1,
+            SupervisorExecutionRuntime::Verified,
+            SupervisorWorktreeCreation::ExistingOnly,
+            Ok(catalog),
+            &runner,
+        )?;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!report.success);
+        assert!(!report.publishable);
+        assert!(report.environment_failures.is_empty());
+        assert!(report.findings.iter().any(|finding| {
+            finding.severity == FindingSeverity::Error
+                && finding.message.contains("selection preflight failed")
+        }));
+        let profile = report
+            .role_economics_profile
+            .as_ref()
+            .context("selection failure economics profile")?;
+        assert_eq!(profile.overridden_roles, vec![AgentRole::Auditor]);
+        assert_eq!(
+            profile.role_models.len(),
+            provisional_default_role_models().len()
+        );
+        let normalized_auditor = &profile.role_models[&AgentRole::Auditor];
+        assert_eq!(
+            normalized_auditor.model,
+            original_role_models[&AgentRole::Auditor].model
+        );
+        assert_eq!(
+            normalized_auditor.reasoning_effort.as_deref(),
+            Some("xhigh")
+        );
+        let events = &profile
+            .execution
+            .as_ref()
+            .context("selection failure execution metadata")?
+            .selection_decisions;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].role, AgentRole::Auditor);
+        assert_eq!(
+            events[0].primary_cause,
+            SupervisorSelectionEventCause::DebugOverride
+        );
+        assert_eq!(
+            events[0].provenance.status,
+            crate::selection::DecisionStatus::FailClosed
+        );
+        assert!(events[0].provenance.choice.is_none());
+        assert!(!events[0].provenance.candidate_set.is_empty());
+
+        let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)?;
+        let persisted = read_supervisor_final_report(&reader)?;
+        assert_eq!(persisted, report);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

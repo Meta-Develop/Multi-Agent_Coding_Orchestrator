@@ -130,6 +130,9 @@ use repository::*;
 mod scheduler;
 pub use scheduler::*;
 
+mod selection_bridge;
+use selection_bridge::*;
+
 mod assignment_execution;
 use assignment_execution::*;
 
@@ -421,7 +424,6 @@ pub enum SupervisorExecutionTargetOptInError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SupervisorExecutionRuntime {
     Verified,
-    #[cfg(test)]
     NonpublishableSimulation,
 }
 
@@ -1038,7 +1040,31 @@ pub struct SupervisorExecutionMetadata {
     pub assignment_effort_bindings: Vec<AssignmentEffortBinding>,
     #[serde(default)]
     pub budget_degradations: Vec<BudgetDegradationRecord>,
+    /// Replayable runtime/model/effort selector decisions. Older reports omit
+    /// this field and deserialize to an empty decision history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selection_decisions: Vec<SupervisorSelectionEvent>,
     pub usage: SupervisorExecutionUsageReport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorSelectionEventCause {
+    Initial,
+    DebugOverride,
+    BudgetDegrade,
+    Retry,
+}
+
+/// Ordered supervisor context for one replayable selector decision.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorSelectionEvent {
+    pub assignment_id: Option<String>,
+    pub attempt: usize,
+    pub role: AgentRole,
+    pub primary_cause: SupervisorSelectionEventCause,
+    pub provenance: crate::selection::SelectionProvenance,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -3413,6 +3439,7 @@ struct AssignmentExecutionOutcome {
     pre_action_review_metrics: Vec<ReviewMetricSnapshot>,
     gate_denials: Vec<GateDenial>,
     gate_correction_outcomes: Vec<GateCorrectionOutcomeRecord>,
+    selection_decisions: Vec<SupervisorSelectionEvent>,
     assignment_failed: bool,
     budget_dispatch_stopped: bool,
     external_containment_failed: bool,

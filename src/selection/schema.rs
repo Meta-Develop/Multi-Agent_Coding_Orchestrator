@@ -1,0 +1,554 @@
+//! Authoritative strict JSON Schema fragments for published selector events.
+
+use serde_json::{json, Value};
+
+macro_rules! strict_object {
+    ($($name:literal => $schema:expr),+ $(,)?) => {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": [$($name),+],
+            "properties": {$($name: $schema),+}
+        })
+    };
+}
+
+fn string() -> Value {
+    json!({"type": "string"})
+}
+
+fn nonempty_string() -> Value {
+    json!({"type": "string", "minLength": 1})
+}
+
+fn nonnegative_integer() -> Value {
+    json!({"type": "integer", "minimum": 0})
+}
+
+fn positive_integer() -> Value {
+    json!({"type": "integer", "minimum": 1})
+}
+
+fn basis_points() -> Value {
+    json!({"type": "integer", "minimum": 0, "maximum": 10_000})
+}
+
+fn nullable(schema: Value) -> Value {
+    json!({"oneOf": [schema, {"type": "null"}]})
+}
+
+fn array(items: Value) -> Value {
+    json!({"type": "array", "items": items})
+}
+
+fn set(items: Value) -> Value {
+    json!({"type": "array", "items": items, "uniqueItems": true})
+}
+
+fn enum_schema(values: &[&str]) -> Value {
+    json!({"type": "string", "enum": values})
+}
+
+fn date() -> Value {
+    json!({"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"})
+}
+
+fn reasoning_effort() -> Value {
+    enum_schema(&["low", "medium", "high", "xhigh", "max", "ultra"])
+}
+
+fn risk(include_unknown: bool) -> Value {
+    if include_unknown {
+        enum_schema(&["low", "medium", "high", "critical", "unknown"])
+    } else {
+        enum_schema(&["low", "medium", "high", "critical"])
+    }
+}
+
+fn boundedness(include_unknown: bool) -> Value {
+    if include_unknown {
+        enum_schema(&["tightly_bounded", "bounded", "cross_cutting", "unknown"])
+    } else {
+        enum_schema(&["tightly_bounded", "bounded", "cross_cutting"])
+    }
+}
+
+fn context_size(include_unknown: bool) -> Value {
+    if include_unknown {
+        enum_schema(&["small", "medium", "large", "long", "unknown"])
+    } else {
+        enum_schema(&["small", "medium", "large", "long"])
+    }
+}
+
+fn task_horizon(include_unknown: bool) -> Value {
+    if include_unknown {
+        enum_schema(&["short", "medium", "long", "unknown"])
+    } else {
+        enum_schema(&["short", "medium", "long"])
+    }
+}
+
+fn authority_role() -> Value {
+    enum_schema(&[
+        "terminal_leaf",
+        "delegating",
+        "acceptance_gate",
+        "review_auditor",
+        "audit",
+        "conflict_resolution",
+        "failure_classification",
+        "git_publication",
+        "unknown_judgment",
+    ])
+}
+
+fn task_profile(include_unknown_shape: bool) -> Value {
+    strict_object!(
+        "task_class" => nonempty_string(),
+        "risk" => risk(include_unknown_shape),
+        "boundedness" => boundedness(include_unknown_shape),
+        "context" => context_size(include_unknown_shape),
+        "horizon" => task_horizon(include_unknown_shape),
+        "authority_role" => authority_role(),
+    )
+}
+
+fn candidate_key() -> Value {
+    strict_object!(
+        "runtime" => nonempty_string(),
+        "model" => nonempty_string(),
+        "effort" => reasoning_effort(),
+    )
+}
+
+fn candidate_capabilities() -> Value {
+    strict_object!(
+        "task_classes" => set(nonempty_string()),
+        "authority_roles" => set(authority_role()),
+        "boundedness" => set(boundedness(true)),
+        "maximum_risk" => risk(true),
+        "maximum_context" => context_size(true),
+        "maximum_horizon" => task_horizon(true),
+        "long_context" => json!({"type": "boolean"}),
+    )
+}
+
+fn catalog_model() -> Value {
+    strict_object!(
+        "model" => nonempty_string(),
+        "available" => json!({"type": "boolean"}),
+        "supported_efforts" => set(reasoning_effort()),
+        "capabilities" => candidate_capabilities(),
+    )
+}
+
+fn runtime_catalog() -> Value {
+    strict_object!(
+        "runtime" => nonempty_string(),
+        "revision" => nonempty_string(),
+        "advertised_at" => nonempty_string(),
+        "models" => array(catalog_model()),
+    )
+}
+
+fn runtime_pool_state() -> Value {
+    strict_object!(
+        "runtime" => nonempty_string(),
+        "admission_open" => json!({"type": "boolean"}),
+        "entitlement_capacity_units" => nonnegative_integer(),
+        "entitlement_remaining_units" => nonnegative_integer(),
+        "pool_pressure_basis_points" => basis_points(),
+        "observed_consumption_units" => nonnegative_integer(),
+        "marginal_cost_microunits" => nonnegative_integer(),
+        "observation_revision" => nonempty_string(),
+        "admission_provenance" => nonempty_string(),
+        "failover_provenance" => nullable(nonempty_string()),
+    )
+}
+
+fn operator_constraints() -> Value {
+    strict_object!(
+        "allowed_runtimes" => set(string()),
+        "allowed_models" => set(string()),
+        "forbidden_runtimes" => set(string()),
+        "forbidden_models" => set(string()),
+        "forbidden_candidates" => set(candidate_key()),
+        "allow_debug_override" => json!({"type": "boolean"}),
+    )
+}
+
+fn objective_profile_ref() -> Value {
+    strict_object!(
+        "name" => nonempty_string(),
+        "version" => positive_integer(),
+        "expected_digest" => nullable(json!({"type": "string", "pattern": "^[0-9a-f]{64}$"})),
+    )
+}
+
+fn objective_profile() -> Value {
+    strict_object!(
+        "name" => nonempty_string(),
+        "version" => positive_integer(),
+        "effective_date" => date(),
+        "minimum_quality_basis_points" => basis_points(),
+        "minimum_class_fit_samples" => positive_integer(),
+        "minimum_authority_samples" => positive_integer(),
+        "pool_pressure_full_cost_microunits" => nonnegative_integer(),
+        "observed_consumption_unit_cost_microunits" => nonnegative_integer(),
+        "entitlement_scarcity_full_cost_microunits" => nonnegative_integer(),
+        "retry_penalty_microunits" => nonnegative_integer(),
+        "degrade_effort_rank_penalty_microunits" => nonnegative_integer(),
+    )
+}
+
+fn class_fit_prior() -> Value {
+    strict_object!(
+        "task_class" => nonempty_string(),
+        "effort" => reasoning_effort(),
+        "quality_basis_points" => basis_points(),
+        "sample_size" => nonnegative_integer(),
+        "execution_cost_microunits" => nonnegative_integer(),
+        "review_cost_microunits" => nonnegative_integer(),
+        "rework_cost_microunits" => nonnegative_integer(),
+        "rereview_cost_microunits" => nonnegative_integer(),
+    )
+}
+
+fn authority_evidence_prior() -> Value {
+    strict_object!(
+        "task_class" => nonempty_string(),
+        "role" => authority_role(),
+        "effort" => reasoning_effort(),
+        "quality_basis_points" => basis_points(),
+        "sample_size" => nonnegative_integer(),
+    )
+}
+
+fn one_shot_environment_fallback() -> Value {
+    strict_object!(
+        "rejection_code" => nonempty_string(),
+        "target_runtime" => nonempty_string(),
+        "target_model" => nonempty_string(),
+        "target_effort" => reasoning_effort(),
+    )
+}
+
+fn model_prior() -> Value {
+    strict_object!(
+        "runtime" => nonempty_string(),
+        "model" => nonempty_string(),
+        "observed_on" => date(),
+        "source_id" => nonempty_string(),
+        "prior_scope" => nonempty_string(),
+        "limitations" => array(string()),
+        "prohibited" => json!({"type": "boolean"}),
+        "prohibition_reason" => nullable(nonempty_string()),
+        "prohibited_authority_roles" => set(authority_role()),
+        "long_context_eligible" => json!({"type": "boolean"}),
+        "strong_gate_fallback_efforts" => set(reasoning_effort()),
+        "strength_rank" => nonnegative_integer(),
+        "class_fit" => array(class_fit_prior()),
+        "authority_evidence" => array(authority_evidence_prior()),
+        "one_shot_environment_fallbacks" => array(one_shot_environment_fallback()),
+    )
+}
+
+fn prior_dataset() -> Value {
+    strict_object!(
+        "schema_version" => positive_integer(),
+        "dataset_id" => nonempty_string(),
+        "revision" => nonempty_string(),
+        "published_on" => date(),
+        "objective_profiles" => array(objective_profile()),
+        "models" => array(model_prior()),
+    )
+}
+
+fn environment_failure() -> Value {
+    strict_object!(
+        "code" => nonempty_string(),
+        "evidence_id" => nonempty_string(),
+        "detail" => string(),
+    )
+}
+
+fn fixed_cause_relaunch() -> Value {
+    strict_object!(
+        "proven_failure_cause" => nonempty_string(),
+        "exact_corrective_change" => nonempty_string(),
+        "same_cause_fix_verification" => nonempty_string(),
+    )
+}
+
+fn outcome_record() -> Value {
+    strict_object!(
+        "attempt_id" => nonempty_string(),
+        "task" => task_profile(true),
+        "candidate" => candidate_key(),
+        "result" => enum_schema(&["accepted", "rejected", "blocked"]),
+        "failure_class" => nullable(enum_schema(&["model_quality", "environment", "operator", "unknown"])),
+        "execution_cost_microunits" => nonnegative_integer(),
+        "review_cost_microunits" => nonnegative_integer(),
+        "rework_cost_microunits" => nonnegative_integer(),
+        "rereview_cost_microunits" => nonnegative_integer(),
+        "environment_cost_microunits" => nonnegative_integer(),
+        "environment_failures" => array(environment_failure()),
+        "fixed_cause_relaunch" => nullable(fixed_cause_relaunch()),
+    )
+}
+
+fn debug_override() -> Value {
+    strict_object!(
+        "candidate" => candidate_key(),
+        "requested_by" => nonempty_string(),
+        "reason" => nonempty_string(),
+    )
+}
+
+fn environment_rejection_state() -> Value {
+    strict_object!(
+        "candidate" => candidate_key(),
+        "rejection_code" => nonempty_string(),
+        "evidence_id" => nonempty_string(),
+        "fallback_transition_used" => json!({"type": "boolean"}),
+    )
+}
+
+fn dynamic_signals() -> Value {
+    strict_object!(
+        "retry_count" => nonnegative_integer(),
+        "budget_signal" => enum_schema(&["continue", "degrade", "owner_escalation"]),
+        "previous_choice" => nullable(candidate_key()),
+        "previous_catalog_digest" => nullable(json!({"type": "string", "pattern": "^[0-9a-f]{64}$"})),
+        "environment_rejections" => array(environment_rejection_state()),
+    )
+}
+
+fn selection_input() -> Value {
+    strict_object!(
+        "task" => task_profile(false),
+        "catalogs" => array(runtime_catalog()),
+        "pools" => array(runtime_pool_state()),
+        "constraints" => operator_constraints(),
+        "priors" => prior_dataset(),
+        "objective_profile" => objective_profile_ref(),
+        "outcomes" => array(outcome_record()),
+        "signals" => dynamic_signals(),
+        "debug_override" => nullable(debug_override()),
+    )
+}
+
+fn digest_record() -> Value {
+    strict_object!(
+        "algorithm" => json!({"const": "sha256"}),
+        "value" => json!({"type": "string", "pattern": "^[0-9a-f]{64}$"}),
+    )
+}
+
+fn input_digests() -> Value {
+    strict_object!(
+        "normalized_input" => digest_record(),
+        "task" => digest_record(),
+        "catalogs" => digest_record(),
+        "pools" => digest_record(),
+        "constraints" => digest_record(),
+        "priors" => digest_record(),
+        "outcomes" => digest_record(),
+        "signals" => digest_record(),
+    )
+}
+
+fn objective_profile_provenance() -> Value {
+    strict_object!(
+        "dataset_id" => nonempty_string(),
+        "dataset_revision" => nonempty_string(),
+        "dataset_published_on" => date(),
+        "profile_name" => nonempty_string(),
+        "profile_version" => positive_integer(),
+        "profile_effective_date" => date(),
+        "profile_digest" => digest_record(),
+    )
+}
+
+fn ledger_summary() -> Value {
+    strict_object!(
+        "matching_attempts" => nonnegative_integer(),
+        "accepted" => nonnegative_integer(),
+        "rejected" => nonnegative_integer(),
+        "blocked" => nonnegative_integer(),
+        "quality_attempts" => nonnegative_integer(),
+        "environment_failure_count" => nonnegative_integer(),
+        "execution_cost_microunits" => nonnegative_integer(),
+        "review_cost_microunits" => nonnegative_integer(),
+        "rework_cost_microunits" => nonnegative_integer(),
+        "rereview_cost_microunits" => nonnegative_integer(),
+        "environment_cost_microunits" => nonnegative_integer(),
+        "total_cycle_cost_microunits" => nonnegative_integer(),
+    )
+}
+
+fn ineligibility_reason() -> Value {
+    strict_object!(
+        "code" => enum_schema(&[
+            "catalog_unavailable", "operator_constraint", "runtime_admission_closed",
+            "entitlement_exhausted", "task_class_not_advertised", "task_shape_not_advertised",
+            "authority_not_advertised", "policy_prohibited", "long_context_prohibited",
+            "missing_dated_prior", "missing_class_fit_evidence", "class_fit_evidence_insufficient",
+            "quality_bar_not_met", "missing_authority_evidence", "authority_evidence_insufficient",
+            "authority_quality_bar_not_met", "unknown_judgment_authority", "environment_rejected"
+        ]),
+        "detail" => nonempty_string(),
+    )
+}
+
+fn score_breakdown() -> Value {
+    strict_object!(
+        "posterior_quality_basis_points" => basis_points(),
+        "authority_quality_basis_points" => nullable(basis_points()),
+        "expected_total_cost_per_accepted_task_microunits" => nonnegative_integer(),
+        "pool_pressure_cost_microunits" => nonnegative_integer(),
+        "entitlement_scarcity_cost_microunits" => nonnegative_integer(),
+        "observed_consumption_cost_microunits" => nonnegative_integer(),
+        "marginal_cost_microunits" => nonnegative_integer(),
+        "retry_cost_microunits" => nonnegative_integer(),
+        "degrade_cost_microunits" => nonnegative_integer(),
+        "total_score_microunits" => nonnegative_integer(),
+    )
+}
+
+fn candidate_evaluation() -> Value {
+    strict_object!(
+        "candidate" => candidate_key(),
+        "prior_source_id" => nullable(nonempty_string()),
+        "prior_observed_on" => nullable(date()),
+        "prior_scope" => nullable(nonempty_string()),
+        "prior_limitations" => array(string()),
+        "strong_gate_fallback" => json!({"type": "boolean"}),
+        "eligible" => json!({"type": "boolean"}),
+        "ineligibility_reasons" => array(ineligibility_reason()),
+        "ledger" => ledger_summary(),
+        "score" => nullable(score_breakdown()),
+    )
+}
+
+fn selected_choice() -> Value {
+    strict_object!(
+        "candidate" => candidate_key(),
+        "total_score_microunits" => nonnegative_integer(),
+        "reason" => enum_schema(&[
+            "lowest_expected_total_cost_per_accepted_task",
+            "strongest_no_evidence_judgment_fallback",
+            "debug_override",
+            "one_shot_environment_fallback"
+        ]),
+    )
+}
+
+fn debug_override_provenance() -> Value {
+    strict_object!(
+        "request" => debug_override(),
+        "disposition" => enum_schema(&["applied", "rejected"]),
+        "reason" => nonempty_string(),
+    )
+}
+
+fn environment_fallback_transition() -> Value {
+    strict_object!(
+        "source" => candidate_key(),
+        "target" => candidate_key(),
+        "rejection_code" => nonempty_string(),
+        "evidence_id" => nonempty_string(),
+        "transition_ordinal" => json!({"type": "integer", "minimum": 1, "maximum": 255}),
+        "maximum_transitions" => json!({"type": "integer", "minimum": 1, "maximum": 255}),
+    )
+}
+
+fn catalog_revision_provenance() -> Value {
+    strict_object!(
+        "runtime" => nonempty_string(),
+        "revision" => nonempty_string(),
+        "advertised_at" => nonempty_string(),
+    )
+}
+
+fn ranked_score() -> Value {
+    strict_object!(
+        "rank" => json!({"type": "integer", "minimum": 2}),
+        "candidate" => candidate_key(),
+        "total_score_microunits" => nonnegative_integer(),
+    )
+}
+
+pub(crate) fn selection_provenance_schema_value() -> Value {
+    strict_object!(
+        "schema_version" => json!({"type": "integer", "const": 1}),
+        "status" => enum_schema(&["selected", "fail_closed"]),
+        "normalized_input" => selection_input(),
+        "normalized_task" => task_profile(false),
+        "input_digests" => input_digests(),
+        "objective_profile" => objective_profile_provenance(),
+        "catalog_revisions" => array(catalog_revision_provenance()),
+        "runtime_operations" => array(runtime_pool_state()),
+        "triggers" => set(enum_schema(&[
+            "initial", "retry", "budget_degrade", "catalog_change", "environment_fallback",
+            "debug_override"
+        ])),
+        "candidate_set" => array(candidate_evaluation()),
+        "choice" => nullable(selected_choice()),
+        "runner_up_scores" => array(ranked_score()),
+        "decision_reason" => nonempty_string(),
+        "debug_override" => nullable(debug_override_provenance()),
+        "environment_fallback" => nullable(environment_fallback_transition()),
+    )
+}
+
+pub(crate) fn selection_event_schema_value() -> Value {
+    strict_object!(
+        "assignment_id" => nullable(nonempty_string()),
+        "attempt" => nonnegative_integer(),
+        "role" => enum_schema(&[
+            "supervisor", "child_orchestrator", "worker", "gate_classifier", "auditor"
+        ]),
+        "primary_cause" => enum_schema(&["initial", "debug_override", "budget_degrade", "retry"]),
+        "provenance" => selection_provenance_schema_value(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_every_object_is_closed(schema: &Value) {
+        match schema {
+            Value::Object(object) => {
+                if object.get("type") == Some(&Value::String("object".to_string())) {
+                    assert_eq!(
+                        object.get("additionalProperties"),
+                        Some(&Value::Bool(false))
+                    );
+                    let properties = object["properties"].as_object().expect("object properties");
+                    let required = object["required"].as_array().expect("object required");
+                    assert_eq!(required.len(), properties.len());
+                    for field in properties.keys() {
+                        assert!(required.iter().any(|required| required == field));
+                    }
+                }
+                for value in object.values() {
+                    assert_every_object_is_closed(value);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    assert_every_object_is_closed(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn event_and_every_nested_selector_object_are_closed_and_exhaustively_required() {
+        assert_every_object_is_closed(&selection_event_schema_value());
+    }
+}

@@ -623,7 +623,6 @@ fn sanitized_git_output(
             .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
                 StrictOfflineWorkspaceProfile::read_only(workdir),
             )),
-        #[cfg(test)]
         SupervisorExecutionRuntime::NonpublishableSimulation => process_spec
             .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
     })?;

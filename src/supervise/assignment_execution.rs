@@ -7,6 +7,7 @@ pub(super) fn execute_supervisor_assignment(
         gate_tracker: Some(GateCorrectionTracker::new(
             context.plan.max_gate_corrections,
         )),
+        selection_decisions: context.budget_policy.selector_decisions.clone(),
         ..AssignmentExecutionOutcome::default()
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -577,6 +578,7 @@ struct PreparedChildAttempt<'a> {
 fn prepare_child_attempt<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
     outcome: &mut AssignmentExecutionOutcome,
+    budget_policy: &AssignmentBudgetPolicy,
     preflight: &AssignmentExecutionPreflight<'_>,
     journal_parent_id: &str,
     attempt: usize,
@@ -602,7 +604,6 @@ fn prepare_child_attempt<'a>(
         field_guide,
         artifacts,
         budget_ledger,
-        budget_policy,
         runtime_model_catalog,
         ..
     } = context;
@@ -2509,7 +2510,7 @@ fn decide_parent_auditor_gate(
             "accepted licensed breakage has no supervisor-inspected breaking-change identity",
         )?;
         let tasks = generated_licensed_follow_up_tasks(
-            context.plan,
+            context.requested_plan,
             context.consultant,
             context.budget_config,
             assignment,
@@ -2649,6 +2650,7 @@ fn execute_supervisor_assignment_inner(
     let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
 
     let mut retry_feedback: Option<ChildAttemptCorrection> = None;
+    let mut active_budget_policy = context.budget_policy.clone();
     let mut attempt_history = Vec::new();
     let mut structural_attempt = 1usize;
     let max_attempts = usize::from(plan.max_child_retries)
@@ -2663,9 +2665,32 @@ fn execute_supervisor_assignment_inner(
         let first_attempt = next_attempt;
         for attempt in first_attempt..=max_attempts {
             next_attempt = attempt.saturating_add(1);
+            if attempt > 1 {
+                let retry_count = u32::try_from(attempt.saturating_sub(1))
+                    .context("assignment retry count does not fit selector input")?;
+                let decisions = active_budget_policy.reselect(
+                    options.runtime,
+                    runtime_model_catalog,
+                    SelectorReselectionRequest {
+                        roles: &[
+                            AgentRole::ChildOrchestrator,
+                            AgentRole::Worker,
+                            AgentRole::Auditor,
+                        ],
+                        assignment_id: Some(&assignment.id),
+                        attempt,
+                        primary_cause: SupervisorSelectionEventCause::Retry,
+                        retry_count,
+                        budget_signal: crate::selection::BudgetSignal::Continue,
+                        environment_rejections: &[],
+                    },
+                )?;
+                outcome.selection_decisions.extend(decisions);
+            }
             let prepared = match prepare_child_attempt(
                 context,
                 outcome,
+                &active_budget_policy,
                 &preflight,
                 journal_parent_id,
                 attempt,
@@ -3274,6 +3299,7 @@ mod decomposition_tests {
             index: 0,
             concurrent_mode: false,
             plan: &plan,
+            requested_plan: &plan,
             execution_target: None,
             budget_config: &budget_config,
             consultant: &consultant,
@@ -3326,6 +3352,7 @@ mod decomposition_tests {
         let prepared = match prepare_child_attempt(
             &context,
             &mut outcome,
+            &context.budget_policy,
             &preflight,
             options.run_id.as_str(),
             1,
