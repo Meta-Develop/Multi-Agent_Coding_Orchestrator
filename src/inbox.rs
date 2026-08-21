@@ -10,6 +10,7 @@ use crate::{
     },
     live_claim::{self, LiveClock},
     llm::{RedactionSummary, Redactor},
+    machine_global::MachineGlobalRetentionBinding,
     orchestrator::RunId,
     planning,
     publication::{self, ExternalSourceGuard, ExternalSourceObjectKind},
@@ -85,6 +86,25 @@ pub struct InboxScanOptions {
     pub action_policy_override: Option<InboxActionPolicy>,
 }
 
+/// Operator-reviewed machine-global cleanup authority forwarded to each
+/// per-item autopilot dispatch. Effectful item work is refused without it.
+#[derive(Debug, Clone)]
+pub struct InboxMachineGlobalInput {
+    pub config: PathBuf,
+    pub runtime_root_id: String,
+}
+
+impl InboxMachineGlobalInput {
+    fn retention_binding_for_run(&self, autopilot_run_id: &RunId) -> MachineGlobalRetentionBinding {
+        MachineGlobalRetentionBinding {
+            config: self.config.clone(),
+            root_id: self.runtime_root_id.clone(),
+            owner: "maco-inbox".to_string(),
+            correction_correlation_id: autopilot_run_id.as_str().to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct InboxRunOptions {
     pub repo: PathBuf,
@@ -94,6 +114,7 @@ pub struct InboxRunOptions {
     pub dry_run: bool,
     pub max_items: Option<usize>,
     pub codex_bin: Option<PathBuf>,
+    pub machine_global: Option<InboxMachineGlobalInput>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +127,7 @@ pub struct InboxWatchOptions {
     pub dry_run: bool,
     pub max_items: Option<usize>,
     pub codex_bin: Option<PathBuf>,
+    pub machine_global: Option<InboxMachineGlobalInput>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +141,7 @@ pub struct InboxWorkspaceRunOptions {
     pub run_id: RunId,
     pub dry_run: bool,
     pub codex_bin: Option<PathBuf>,
+    pub machine_global: Option<InboxMachineGlobalInput>,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +151,7 @@ pub struct InboxWorkspaceWatchOptions {
     pub once: bool,
     pub dry_run: bool,
     pub codex_bin: Option<PathBuf>,
+    pub machine_global: Option<InboxMachineGlobalInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1372,19 +1396,11 @@ fn scan_inbox_with_overrides(
     })
 }
 
-pub fn run_inbox(_options: InboxRunOptions) -> Result<InboxRunReport> {
-    Err(autopilot::effectful_autopilot_unavailable_error())
+pub fn run_inbox(options: InboxRunOptions) -> Result<InboxRunReport> {
+    run_inbox_with_overrides(options, InboxConfigOverrides::default())
 }
 
 fn run_inbox_with_overrides(
-    _options: InboxRunOptions,
-    _overrides: InboxConfigOverrides,
-) -> Result<InboxRunReport> {
-    Err(autopilot::effectful_autopilot_unavailable_error())
-}
-
-#[allow(dead_code)]
-fn run_inbox_with_overrides_disabled_legacy(
     options: InboxRunOptions,
     mut overrides: InboxConfigOverrides,
 ) -> Result<InboxRunReport> {
@@ -1540,6 +1556,7 @@ fn run_inbox_with_overrides_disabled_legacy(
             .codex_bin
             .clone()
             .or_else(|| loaded.config.codex_bin.clone()),
+        machine_global: options.machine_global.clone(),
     };
     let mut item_reports = Vec::new();
     for (zero_index, item) in selected_items.iter().enumerate() {
@@ -1628,12 +1645,7 @@ pub fn collect_inbox_run(repo: impl AsRef<Path>, run_id: RunId) -> Result<Value>
     }
 }
 
-pub fn watch_inbox(_options: InboxWatchOptions) -> Result<InboxWatchReport> {
-    Err(autopilot::effectful_autopilot_unavailable_error())
-}
-
-#[allow(dead_code)]
-fn watch_inbox_disabled_legacy(options: InboxWatchOptions) -> Result<InboxWatchReport> {
+pub fn watch_inbox(options: InboxWatchOptions) -> Result<InboxWatchReport> {
     validate_poll_seconds(options.poll_seconds)?;
     validate_cli_source_options(
         options.github,
@@ -1658,6 +1670,7 @@ fn watch_inbox_disabled_legacy(options: InboxWatchOptions) -> Result<InboxWatchR
             dry_run: options.dry_run,
             max_items: options.max_items,
             codex_bin: options.codex_bin.clone(),
+            machine_global: options.machine_global.clone(),
         })?;
         runs.push(report);
         if options.once {
@@ -1682,14 +1695,7 @@ pub fn scan_workspace_inbox(
     Ok(scan_workspace_specs(&loaded, &specs))
 }
 
-pub fn run_workspace_inbox(_options: InboxWorkspaceRunOptions) -> Result<InboxWorkspaceRunReport> {
-    Err(autopilot::effectful_autopilot_unavailable_error())
-}
-
-#[allow(dead_code)]
-fn run_workspace_inbox_disabled_legacy(
-    options: InboxWorkspaceRunOptions,
-) -> Result<InboxWorkspaceRunReport> {
+pub fn run_workspace_inbox(options: InboxWorkspaceRunOptions) -> Result<InboxWorkspaceRunReport> {
     if let Some(codex_bin) = &options.codex_bin {
         validate_path_text(codex_bin, "workspace codex-bin", MAX_CODEX_PATH_BYTES)?;
     }
@@ -1755,6 +1761,7 @@ fn run_workspace_inbox_disabled_legacy(
                 dry_run,
                 max_items: None,
                 codex_bin: options.codex_bin.clone(),
+                machine_global: options.machine_global.clone(),
             },
             workspace_overrides_for_repo(&spec),
         );
@@ -1842,13 +1849,6 @@ fn run_workspace_inbox_disabled_legacy(
 }
 
 pub fn watch_workspace_inbox(
-    _options: InboxWorkspaceWatchOptions,
-) -> Result<InboxWorkspaceWatchReport> {
-    Err(autopilot::effectful_autopilot_unavailable_error())
-}
-
-#[allow(dead_code)]
-fn watch_workspace_inbox_disabled_legacy(
     options: InboxWorkspaceWatchOptions,
 ) -> Result<InboxWorkspaceWatchReport> {
     validate_poll_seconds(options.poll_seconds)?;
@@ -1864,6 +1864,7 @@ fn watch_workspace_inbox_disabled_legacy(
             run_id,
             dry_run: options.dry_run,
             codex_bin: options.codex_bin.clone(),
+            machine_global: options.machine_global.clone(),
         })?;
         runs.push(report);
         if options.once {
@@ -2371,6 +2372,7 @@ struct InboxItemRunContext<'a> {
     action_policy: InboxActionPolicy,
     permission_mode: InboxPermissionMode,
     codex_bin: Option<PathBuf>,
+    machine_global: Option<InboxMachineGlobalInput>,
 }
 
 struct InboxItemRunInput<'a> {
@@ -2464,18 +2466,25 @@ fn run_inbox_item(
 
     revalidate_inbox_item_source(repo, item)
         .context("inbox source changed immediately before local work started")?;
-    let autopilot_result = autopilot::run_autopilot_plan_file(AutopilotRunOptions {
-        repo: repo.to_path_buf(),
-        plan_file: plan_path.clone(),
-        run_id: autopilot_run_id.clone(),
-        codex_bin: context.codex_bin.clone(),
-        reviewer_command: None,
-        allow_dirty_primary: false,
-        max_child_dispatches: None,
-        budget_overrides: crate::supervise::RunBudgetLimits::default(),
-        budget_max_duration_seconds: None,
-        cancellation: None,
-    });
+    let machine_global_retention = context
+        .machine_global
+        .as_ref()
+        .map(|input| input.retention_binding_for_run(&autopilot_run_id));
+    let autopilot_result = autopilot::run_autopilot_plan_file_with_retention(
+        AutopilotRunOptions {
+            repo: repo.to_path_buf(),
+            plan_file: plan_path.clone(),
+            run_id: autopilot_run_id.clone(),
+            codex_bin: context.codex_bin.clone(),
+            reviewer_command: None,
+            allow_dirty_primary: false,
+            max_child_dispatches: None,
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            cancellation: None,
+        },
+        machine_global_retention,
+    );
     let (autopilot_success, autopilot_message) = match autopilot_result {
         Ok(report) => {
             let success = report.success;

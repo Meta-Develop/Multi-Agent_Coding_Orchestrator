@@ -92,8 +92,6 @@ const AUTOPILOT_ACTIVE_ARTIFACT_MAX_ENTRIES: usize = 256;
 const AUTOPILOT_ACTIVE_ARTIFACT_MAX_TOTAL_PATH_BYTES: usize = 1024 * 1024;
 const AUTOPILOT_ACTIVE_ARTIFACT_MAX_DURATION: Duration = Duration::from_secs(2);
 const AUTOPILOT_SPINE_MAX_DEPTH: &str = "2";
-const AUTOPILOT_EFFECTFUL_UNAVAILABLE_MESSAGE: &str =
-    "autopilot effectful execution is temporarily unsupported: the capability-bound supervisor input bridge is not implemented";
 
 #[derive(Debug, Clone)]
 pub struct AutopilotRunOptions {
@@ -1638,10 +1636,6 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     write_private_json(&mut artifact_writer, "final-report.json", &report)?;
     artifact_writer.finalize("final-report.json", false)?;
     Ok(report)
-}
-
-pub(crate) fn effectful_autopilot_unavailable_error() -> anyhow::Error {
-    anyhow::anyhow!(AUTOPILOT_EFFECTFUL_UNAVAILABLE_MESSAGE)
 }
 
 #[allow(dead_code)]

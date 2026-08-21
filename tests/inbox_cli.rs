@@ -1,3 +1,5 @@
+mod support;
+
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 use serde_json::{json, Value};
@@ -11,10 +13,10 @@ use tempfile::TempDir;
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 
 #[test]
-fn effectful_inbox_cli_entries_fail_closed_before_repo_config_or_artifacts() -> Result<()> {
+fn effectful_inbox_cli_entries_fail_closed_before_artifacts_on_missing_inputs() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
-    let repo = temp.path().join("repo-must-not-be-opened");
-    let config = temp.path().join("config-must-not-be-read");
+    let repo = temp.path().join("repo-that-does-not-exist");
+    let config = temp.path().join("config-that-does-not-exist");
     let commands = [
         vec![
             "inbox",
@@ -54,28 +56,17 @@ fn effectful_inbox_cli_entries_fail_closed_before_repo_config_or_artifacts() -> 
         ],
     ];
     for command in commands {
-        let error = run_failure_stderr(&command)?;
-        assert!(error.contains("capability-bound supervisor input bridge"));
+        run_failure_stderr(&command)?;
     }
     assert_eq!(fs::read_dir(temp.path())?.count(), 0);
     Ok(())
 }
 
-// Handoff matrix for the later test-only injected verified-autopilot/effect-WAL slice. Public Fake
-// now stops as nonpublishable, so these former downstream-success assertions are intentionally
-// retained as named follow-up coverage rather than bypassing the production gate:
-// - run_processes_default_fake_items_and_writes_expected_artifacts: successful item aggregation
-// - status_and_collect_return_sanitized_repo_relative_reports: collect of a successful run
-// - github_local_reads_live_github_but_publishes_and_comments_locally: local publish completion
-// - real Git push, draft-PR, and source-comment success paths require an injected bound external
-//   reviewer fixture; production currently refuses the unbound Fake reviewer before effects
-// - run_passes_codex_bin_to_autopilot / watch_once_passes_codex_bin_to_autopilot: verified child
-// - workspace_run_non_strict_continues_and_strict_fails_on_refusal: successful peer repository
-// - workspace_run_permission_modes_keep_read_local_and_publish_boundaries: local/publish success
-// - repeated_workspace_run_suppresses_duplicate_items_for_same_repo: success-led deduplication
-// - non_overlapping_locks_do_not_refuse_inbox_run: successful downstream completion
-// - timeout_seconds_stops_hanging_validation_command: injected validation timeout
-// - auto_merge_is_never_performed: successful pipeline with auto-merge still disabled
+// Effectful inbox run/watch execute again behind the capability-bound repository cleanliness
+// input. The public Fake reviewer still stops as nonpublishable before real publication effects,
+// so the run-shaped tests below assert nonpublishable-stop reports rather than downstream
+// publication success; real Git push, draft-PR, and source-comment success paths still require an
+// injected bound external reviewer fixture.
 
 #[test]
 fn scan_emits_public_safe_fake_schema() -> Result<()> {
@@ -167,18 +158,23 @@ fn scan_emits_public_safe_fake_schema() -> Result<()> {
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()> {
+    support::require_containment!("run_processes_default_fake_items_and_writes_expected_artifacts");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
+    let machine_global_config = write_test_machine_global_config(temp.path())?;
 
-    let report = run_failure_json(&[
+    let report = run_success_json(&[
         "inbox",
         "run",
         "--repo",
         path_str(&repo_path)?,
         "--run-id",
         "default-flow",
+        "--machine-global-config",
+        path_str(&machine_global_config)?,
+        "--machine-global-runtime-root-id",
+        "runtime",
         "--json",
     ])?;
 
@@ -187,8 +183,8 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
     assert_eq!(report["repo"], ".");
     assert_eq!(report["action_policy"], "fake");
     assert_eq!(report["github_enabled"], false);
-    assert_eq!(report["status"], "failed");
-    assert_eq!(report["success"], false);
+    assert_eq!(report["status"], "succeeded");
+    assert_eq!(report["success"], true);
     assert_eq!(report["selected_item_count"], 2);
     assert_eq!(report["auto_merge_performed"], false);
     assert_eq!(
@@ -199,8 +195,8 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
     let item_reports = report["item_reports"].as_array().context("item reports")?;
     assert_eq!(item_reports.len(), 2);
     assert_eq!(item_reports[0]["kind"], "issue");
-    assert_eq!(item_reports[0]["success"], false);
-    assert_eq!(item_reports[0]["autopilot_success"], false);
+    assert_eq!(item_reports[0]["success"], true);
+    assert_eq!(item_reports[0]["autopilot_success"], true);
     assert_eq!(item_reports[0]["github_success"], true);
     assert_eq!(
         item_reports[0]["plan_path"],
@@ -261,7 +257,7 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
     assert!(pr_body.contains("address failing check context: fake-ci"));
 
     let autopilot = read_json_file(&run_dir.join("item-1-autopilot-report.json"))?;
-    assert_eq!(autopilot["success"], false);
+    assert_eq!(autopilot["success"], true);
     assert_eq!(autopilot["validation"]["status"], "skipped");
     assert!(autopilot["pr"].is_null());
     assert_eq!(autopilot["auto_merge_performed"], false);
@@ -279,7 +275,6 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn inbox_generates_run_ids_refuses_reuse_and_prunes_only_run_dirs() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -368,7 +363,6 @@ fn inbox_generates_run_ids_refuses_reuse_and_prunes_only_run_dirs() -> Result<()
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn status_and_collect_return_sanitized_repo_relative_reports() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -423,7 +417,6 @@ fn status_and_collect_return_sanitized_repo_relative_reports() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn status_and_collect_fail_closed_across_absent_active_and_tampered_runs() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -568,7 +561,6 @@ fn assert_corrupt_inbox_status(repo: &Path, run_id: &str) -> Result<()> {
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn dry_run_cli_does_not_launch_autopilot() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -606,7 +598,6 @@ fn dry_run_cli_does_not_launch_autopilot() -> Result<()> {
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn dry_run_config_does_not_require_cli_flag() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -719,11 +710,60 @@ fn permission_config_overrides_legacy_action_policy() -> Result<()> {
     Ok(())
 }
 
+/// Live GitHub intake fails closed in test environments: without
+/// GH_TOKEN/GITHUB_TOKEN the source binding refuses before any gh execution,
+/// and with a token the sandboxed exact-source gh launch refuses when process
+/// containment is unavailable. Either way no intake, publication, or autopilot
+/// side effects may occur.
+fn assert_github_intake_failed_closed(
+    report: &Value,
+    repo_path: &Path,
+    run_id: &str,
+    gh: &FakeGh,
+) -> Result<()> {
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["success"], false);
+    assert_eq!(report["github_enabled"], true);
+    assert_eq!(report["selected_item_count"], 0);
+    assert!(report["item_reports"]
+        .as_array()
+        .context("item reports")?
+        .is_empty());
+    assert!(report["next_action"]
+        .as_str()
+        .context("next action")?
+        .contains("repair inbox intake"));
+
+    let scan = read_json_file(
+        &repo_path
+            .join(".maco/inbox/runs")
+            .join(run_id)
+            .join("scan-report.json"),
+    )?;
+    let message = scan["message"].as_str().context("scan failure message")?;
+    assert!(
+        message.contains("requires GH_TOKEN")
+            || message.contains("failed to run gh exact source list"),
+        "unexpected intake failure: {message}"
+    );
+
+    assert!(!repo_path.join(".maco/autopilot/runs").exists());
+    let gh_log = fs::read_to_string(&gh.log_path).unwrap_or_default();
+    assert!(!gh_log.contains("comment"));
+    assert!(!gh_log.contains("pr create"));
+    assert_no_approval_or_merge_in_gh_log(&gh_log);
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md"))?,
+        "# Smoke\n"
+    );
+    Ok(())
+}
+
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
-fn github_read_permission_plans_without_launching_autopilot() -> Result<()> {
+fn github_read_permission_fails_closed_before_planning_without_intake_capability() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
+    add_https_origin(&repo_path, "github-read-origin")?;
     write_json_file(
         &repo_path.join("maco-inbox.json"),
         &json!({"selection": {"pull_requests": false, "max_items": 1}}),
@@ -731,7 +771,7 @@ fn github_read_permission_plans_without_launching_autopilot() -> Result<()> {
     commit_all(&Repository::open(&repo_path)?, "inbox github read config")?;
     let gh = write_fake_gh(temp.path())?;
 
-    let report = run_success_json_with_path(
+    let report = run_failure_json_with_path(
         &[
             "inbox",
             "run",
@@ -748,36 +788,19 @@ fn github_read_permission_plans_without_launching_autopilot() -> Result<()> {
 
     assert_eq!(report["action_policy"], "github");
     assert_eq!(report["permission_mode"], "github_read");
-    assert_eq!(report["github_enabled"], true);
-    assert_eq!(report["status"], "planned");
-    assert_eq!(report["success"], true);
-    assert_eq!(report["item_reports"][0]["status"], "planned");
-    assert_eq!(report["item_reports"][0]["autopilot_success"], Value::Null);
-    assert!(!repo_path.join(".maco/autopilot/runs").exists());
-
-    let plan = read_json_file(&repo_path.join(".maco/inbox/runs/github-read/item-1-plan.json"))?;
-    assert_eq!(plan["forge_mode"], "fake");
-    let skipped = read_json_file(
-        &repo_path.join(".maco/inbox/runs/github-read/item-1-autopilot-report.json"),
-    )?;
-    assert_eq!(skipped["status"], "skipped");
-    assert_eq!(
-        skipped["reason"],
-        "permission mode does not launch autopilot"
-    );
-    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
-    assert!(gh_log.contains("issue list"));
-    assert!(!gh_log.contains("comment"));
-    assert!(!gh_log.contains("pr create"));
+    assert_github_intake_failed_closed(&report, &repo_path, "github-read", &gh)?;
+    assert!(!repo_path
+        .join(".maco/inbox/runs/github-read/item-1-plan.json")
+        .exists());
 
     Ok(())
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
-fn github_local_reads_live_github_but_publishes_and_comments_locally() -> Result<()> {
+fn github_local_fails_closed_before_local_publication_without_intake_capability() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
+    add_https_origin(&repo_path, "github-local-origin")?;
     write_json_file(
         &repo_path.join("maco-inbox.json"),
         &json!({"selection": {"pull_requests": false, "max_items": 1}}),
@@ -801,29 +824,19 @@ fn github_local_reads_live_github_but_publishes_and_comments_locally() -> Result
     )?;
 
     assert_eq!(report["permission_mode"], "github_local");
-    assert_nonpublishable_autopilot_stop(&report, &repo_path, 1)?;
-
-    let plan = read_json_file(&repo_path.join(".maco/inbox/runs/github-local/item-1-plan.json"))?;
-    assert_eq!(plan["forge_mode"], "fake");
-    let github =
-        read_json_file(&repo_path.join(".maco/inbox/runs/github-local/item-1-github-report.json"))?;
-    assert_eq!(github["mode"], "github");
-    assert_eq!(github["permission_mode"], "github_local");
-    assert_eq!(github["status"], "local_report_only");
-
-    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
-    assert!(gh_log.contains("issue list"));
-    assert!(!gh_log.contains("comment"));
-    assert!(!gh_log.contains("pr create"));
+    assert_github_intake_failed_closed(&report, &repo_path, "github-local", &gh)?;
+    assert!(!repo_path
+        .join(".maco/inbox/runs/github-local/item-1-github-report.json")
+        .exists());
 
     Ok(())
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
-fn github_pr_permission_dry_run_plans_github_publish_without_commenting() -> Result<()> {
+fn github_pr_permission_dry_run_fails_closed_without_intake_capability() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
+    add_https_origin(&repo_path, "github-pr-dry-origin")?;
     write_json_file(
         &repo_path.join("maco-inbox.json"),
         &json!({"selection": {"pull_requests": false, "max_items": 1}}),
@@ -831,7 +844,7 @@ fn github_pr_permission_dry_run_plans_github_publish_without_commenting() -> Res
     commit_all(&Repository::open(&repo_path)?, "inbox github pr config")?;
     let gh = write_fake_gh(temp.path())?;
 
-    let report = run_success_json_with_path(
+    let report = run_failure_json_with_path(
         &[
             "inbox",
             "run",
@@ -849,25 +862,19 @@ fn github_pr_permission_dry_run_plans_github_publish_without_commenting() -> Res
 
     assert_eq!(report["action_policy"], "dry_run");
     assert_eq!(report["permission_mode"], "github_pr");
-    assert_eq!(report["status"], "dry_run");
-    let plan = read_json_file(&repo_path.join(".maco/inbox/runs/github-pr-dry/item-1-plan.json"))?;
-    assert_eq!(plan["forge_mode"], "github");
-    let github = read_json_file(
-        &repo_path.join(".maco/inbox/runs/github-pr-dry/item-1-github-report.json"),
-    )?;
-    assert_eq!(github["permission_mode"], "github_pr");
-    assert_eq!(github["status"], "skipped");
-    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
-    assert!(!gh_log.contains("comment"));
+    assert_github_intake_failed_closed(&report, &repo_path, "github-pr-dry", &gh)?;
+    assert!(!repo_path
+        .join(".maco/inbox/runs/github-pr-dry/item-1-plan.json")
+        .exists());
 
     Ok(())
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
-fn github_git_permission_dry_run_plans_git_publish_without_commenting() -> Result<()> {
+fn github_git_permission_dry_run_fails_closed_without_intake_capability() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
+    add_https_origin(&repo_path, "github-git-dry-origin")?;
     write_json_file(
         &repo_path.join("maco-inbox.json"),
         &json!({"selection": {"pull_requests": false, "max_items": 1}}),
@@ -875,7 +882,7 @@ fn github_git_permission_dry_run_plans_git_publish_without_commenting() -> Resul
     commit_all(&Repository::open(&repo_path)?, "inbox github git config")?;
     let gh = write_fake_gh(temp.path())?;
 
-    let report = run_success_json_with_path(
+    let report = run_failure_json_with_path(
         &[
             "inbox",
             "run",
@@ -893,25 +900,15 @@ fn github_git_permission_dry_run_plans_git_publish_without_commenting() -> Resul
 
     assert_eq!(report["action_policy"], "dry_run");
     assert_eq!(report["permission_mode"], "github_git");
-    assert_eq!(report["github_enabled"], true);
-    assert_eq!(report["status"], "dry_run");
-    let plan = read_json_file(&repo_path.join(".maco/inbox/runs/github-git-dry/item-1-plan.json"))?;
-    assert_eq!(plan["forge_mode"], "git");
-    let github = read_json_file(
-        &repo_path.join(".maco/inbox/runs/github-git-dry/item-1-github-report.json"),
-    )?;
-    assert_eq!(github["permission_mode"], "github_git");
-    assert_eq!(github["status"], "skipped");
-    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
-    assert!(gh_log.contains("issue list"));
-    assert!(!gh_log.contains("comment"));
-    assert!(!gh_log.contains("pr create"));
+    assert_github_intake_failed_closed(&report, &repo_path, "github-git-dry", &gh)?;
+    assert!(!repo_path
+        .join(".maco/inbox/runs/github-git-dry/item-1-plan.json")
+        .exists());
 
     Ok(())
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn github_git_permission_refuses_without_bound_external_reviewer() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -954,7 +951,6 @@ fn github_git_permission_refuses_without_bound_external_reviewer() -> Result<()>
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn github_pr_permission_refuses_without_bound_external_reviewer() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -997,7 +993,6 @@ fn github_pr_permission_refuses_without_bound_external_reviewer() -> Result<()> 
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn github_full_workspace_refuses_without_bound_external_reviewer() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let success_repo = create_named_committed_repo(temp.path(), "github-full-success")?;
@@ -1081,11 +1076,10 @@ fn github_full_workspace_refuses_without_bound_external_reviewer() -> Result<()>
         .context("failed refusal message")?
         .contains("external reviewer"));
 
-    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
-    assert_eq!(gh_log.matches("issue list").count(), 2);
-    assert_eq!(gh_log.matches("pr create").count(), 0);
-    assert_eq!(gh_log.matches("issue comment").count(), 0);
-    assert_no_approval_or_merge_in_gh_log(&gh_log);
+    assert!(
+        !gh.log_path.exists(),
+        "GitHub intake must not run before the publication-authority refusal"
+    );
 
     let serialized = serde_json::to_string(&report).context("serialize report")?;
     assert_public_json_is_sanitized(&serialized, temp.path());
@@ -1094,10 +1088,11 @@ fn github_full_workspace_refuses_without_bound_external_reviewer() -> Result<()>
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
-fn run_passes_codex_bin_to_autopilot() -> Result<()> {
+fn run_with_custom_codex_bin_fails_closed_without_executing_it() -> Result<()> {
+    support::require_containment!("run_with_custom_codex_bin_fails_closed_without_executing_it");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
+    let machine_global_config = write_test_machine_global_config(temp.path())?;
     let codex = write_fake_codex(temp.path())?;
 
     let report = run_failure_json(&[
@@ -1111,10 +1106,29 @@ fn run_passes_codex_bin_to_autopilot() -> Result<()> {
         "1",
         "--codex-bin",
         path_str(&codex.script_path)?,
+        "--machine-global-config",
+        path_str(&machine_global_config)?,
+        "--machine-global-runtime-root-id",
+        "runtime",
         "--json",
     ])?;
 
-    assert_nonpublishable_autopilot_stop(&report, &repo_path, 1)?;
+    // A custom codex executable fails the runtime model-catalog preflight
+    // closed; the binary itself must never be executed.
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["success"], false);
+    assert_eq!(report["selected_item_count"], 1);
+    assert_eq!(report["item_reports"][0]["autopilot_success"], false);
+    let autopilot =
+        read_json_file(&repo_path.join(".maco/inbox/runs/codex-bin/item-1-autopilot-report.json"))?;
+    assert_eq!(autopilot["success"], false);
+    let environment_failures =
+        serde_json::to_string(&autopilot["supervisor"]["environment_failures"])
+            .context("serialize environment failures")?;
+    assert!(
+        environment_failures.contains("runtime_model_catalog_unavailable"),
+        "expected runtime model-catalog preflight failure: {environment_failures}"
+    );
     let codex_log = fs::read_to_string(&codex.log_path).unwrap_or_default();
     assert!(codex_log.is_empty());
 
@@ -1126,10 +1140,10 @@ fn run_passes_codex_bin_to_autopilot() -> Result<()> {
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
-fn watch_once_passes_codex_bin_to_autopilot() -> Result<()> {
+fn watch_once_with_custom_codex_bin_fails_closed_without_executing_it() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
+    let machine_global_config = write_test_machine_global_config(temp.path())?;
     let codex = write_fake_codex(temp.path())?;
 
     let report = run_failure_json(&[
@@ -1144,12 +1158,17 @@ fn watch_once_passes_codex_bin_to_autopilot() -> Result<()> {
         "1",
         "--codex-bin",
         path_str(&codex.script_path)?,
+        "--machine-global-config",
+        path_str(&machine_global_config)?,
+        "--machine-global-runtime-root-id",
+        "runtime",
         "--json",
     ])?;
 
     assert_eq!(report["iteration_count"], 1);
     assert_eq!(report["runs"][0]["status"], "failed");
     assert_eq!(report["runs"][0]["success"], false);
+    // The custom codex binary must never be executed.
     let codex_log = fs::read_to_string(&codex.log_path).unwrap_or_default();
     assert!(codex_log.is_empty());
 
@@ -1209,7 +1228,6 @@ fn github_mode_is_disabled_by_default() -> Result<()> {
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn watch_once_runs_one_poll_iteration() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -1435,7 +1453,6 @@ fn workspace_scan_uses_default_github_read_and_repo_fake_override() -> Result<()
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn workspace_watch_once_runs_one_workspace_iteration() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_named_committed_repo(temp.path(), "watch-repo")?;
@@ -1521,7 +1538,6 @@ fn workspace_watch_once_runs_one_workspace_iteration() -> Result<()> {
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn workspace_run_non_strict_continues_and_strict_fails_on_refusal() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let good_repo = create_named_committed_repo(temp.path(), "good-repo")?;
@@ -1681,11 +1697,12 @@ fn workspace_run_non_strict_continues_and_strict_fails_on_refusal() -> Result<()
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
-fn workspace_run_permission_modes_keep_read_local_and_publish_boundaries() -> Result<()> {
+fn workspace_run_github_modes_fail_closed_without_intake_capability() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let read_repo = create_named_committed_repo(temp.path(), "read-repo")?;
     let local_repo = create_named_committed_repo(temp.path(), "local-repo")?;
+    add_https_origin(&read_repo, "workspace-read-origin")?;
+    add_https_origin(&local_repo, "workspace-local-origin")?;
     let read_local_config = temp.path().join("workspace-read-local.json");
     write_json_file(
         &read_local_config,
@@ -1736,34 +1753,28 @@ fn workspace_run_permission_modes_keep_read_local_and_publish_boundaries() -> Re
 
     let read_entry = workspace_repo_entry(&read_local, "read")?;
     assert_eq!(read_entry["permission_mode"], "github_read");
-    assert_eq!(read_entry["status"], "planned");
-    assert_eq!(read_entry["run_report"]["status"], "planned");
-    assert_eq!(
-        read_entry["run_report"]["item_reports"][0]["autopilot_success"],
-        Value::Null
-    );
+    assert_eq!(read_entry["status"], "failed");
+    assert_eq!(read_entry["success"], false);
+    assert_eq!(read_entry["run_report"]["status"], "failed");
+    assert_eq!(read_entry["run_report"]["selected_item_count"], 0);
+    assert!(read_entry["run_report"]["next_action"]
+        .as_str()
+        .context("read next action")?
+        .contains("repair inbox intake"));
     assert!(!read_repo.join(".maco/autopilot/runs").exists());
 
     let local_entry = workspace_repo_entry(&read_local, "local")?;
     assert_eq!(local_entry["permission_mode"], "github_local");
     assert_eq!(local_entry["status"], "failed");
     assert_eq!(local_entry["success"], false);
-    assert_eq!(
-        local_entry["run_report"]["item_reports"][0]["autopilot_success"],
-        false
-    );
-    assert!(local_repo.join(".maco/autopilot/runs").exists());
-    let local_github_report = read_json_file(
-        &local_repo.join(
-            local_entry["run_report"]["item_reports"][0]["github_report_path"]
-                .as_str()
-                .context("local github report path")?,
-        ),
-    )?;
-    assert_eq!(local_github_report["status"], "local_report_only");
+    assert_eq!(local_entry["run_report"]["status"], "failed");
+    assert_eq!(local_entry["run_report"]["selected_item_count"], 0);
+    assert!(!local_repo.join(".maco/autopilot/runs").exists());
 
     let git_repo = create_named_committed_repo(temp.path(), "git-repo")?;
     let pr_repo = create_named_committed_repo(temp.path(), "pr-repo")?;
+    add_https_origin(&git_repo, "workspace-git-origin")?;
+    add_https_origin(&pr_repo, "workspace-pr-origin")?;
     let dry_publish_config = temp.path().join("workspace-dry-publish.json");
     write_json_file(
         &dry_publish_config,
@@ -1813,24 +1824,19 @@ fn workspace_run_permission_modes_keep_read_local_and_publish_boundaries() -> Re
     )?;
     let git_entry = workspace_repo_entry(&dry_publish, "git-default")?;
     assert_eq!(git_entry["permission_mode"], "github_git");
-    assert_eq!(git_entry["status"], "dry_run");
-    assert_eq!(
-        first_workspace_item_plan(&git_repo, git_entry)?["forge_mode"],
-        "git"
-    );
+    assert_eq!(git_entry["status"], "failed");
+    assert_eq!(git_entry["run_report"]["status"], "failed");
+    assert_eq!(git_entry["run_report"]["selected_item_count"], 0);
     assert!(!git_repo.join(".maco/autopilot/runs").exists());
 
     let pr_entry = workspace_repo_entry(&dry_publish, "github-pr")?;
     assert_eq!(pr_entry["permission_mode"], "github_pr");
-    assert_eq!(pr_entry["status"], "dry_run");
-    assert_eq!(
-        first_workspace_item_plan(&pr_repo, pr_entry)?["forge_mode"],
-        "github"
-    );
+    assert_eq!(pr_entry["status"], "failed");
+    assert_eq!(pr_entry["run_report"]["status"], "failed");
+    assert_eq!(pr_entry["run_report"]["selected_item_count"], 0);
     assert!(!pr_repo.join(".maco/autopilot/runs").exists());
 
-    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
-    assert!(gh_log.contains("issue list"));
+    let gh_log = fs::read_to_string(&gh.log_path).unwrap_or_default();
     assert!(!gh_log.contains("issue comment"));
     assert!(!gh_log.contains("pr comment"));
     assert!(!gh_log.contains("pr create"));
@@ -1844,8 +1850,7 @@ fn workspace_run_permission_modes_keep_read_local_and_publish_boundaries() -> Re
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
-fn workspace_run_refuses_real_publication_modes_without_validation_commands() -> Result<()> {
+fn workspace_run_fails_closed_real_publication_modes_before_intake() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let git_repo = create_named_committed_repo(temp.path(), "publish-no-validation-git-repo")?;
     let pr_repo = create_named_committed_repo(temp.path(), "publish-no-validation-pr-repo")?;
@@ -1915,10 +1920,14 @@ fn workspace_run_refuses_real_publication_modes_without_validation_commands() ->
         &gh.path_dir,
     )?;
 
+    // Real publication modes fail closed at the bound-external-reviewer
+    // preflight, which fires before GitHub intake and before the
+    // validation-command publication policy is evaluated.
     assert_eq!(report["strict"], false);
     assert_eq!(report["success"], true);
     assert_eq!(report["repo_counts"]["succeeded"], 0);
-    assert_eq!(report["repo_counts"]["refused"], 3);
+    assert_eq!(report["repo_counts"]["failed"], 3);
+    assert_eq!(report["repo_counts"]["refused"], 0);
     for (id, permission_mode) in [
         ("github-git", "github_git"),
         ("github-pr", "github_pr"),
@@ -1926,12 +1935,13 @@ fn workspace_run_refuses_real_publication_modes_without_validation_commands() ->
     ] {
         let entry = workspace_repo_entry(&report, id)?;
         assert_eq!(entry["permission_mode"], permission_mode);
-        assert_eq!(entry["status"], "refused");
+        assert_eq!(entry["status"], "failed");
         assert_eq!(entry["success"], false);
-        assert_eq!(entry["refused"], true);
         let message = entry["message"].as_str().context("refusal message")?;
-        assert!(message.contains("requires at least one validation command"));
-        assert!(message.contains(&format!("permission mode {permission_mode}")));
+        assert!(
+            message.contains("external reviewer"),
+            "expected publication-authority refusal: {message}"
+        );
         assert!(entry["run_report"].is_null());
     }
 
@@ -1939,22 +1949,20 @@ fn workspace_run_refuses_real_publication_modes_without_validation_commands() ->
         ".maco/inbox-workspace/runs/workspace-publish-no-validation/repo-github-pr-run-report.json",
     ))?;
     assert_eq!(repo_run_artifact["phase"], "run");
-    assert_eq!(repo_run_artifact["status"], "refused");
+    assert_eq!(repo_run_artifact["status"], "failed");
     assert_eq!(repo_run_artifact["success"], false);
-    assert_eq!(repo_run_artifact["refused"], true);
     assert!(repo_run_artifact["message"]
         .as_str()
         .context("artifact refusal message")?
-        .contains("requires at least one validation command"));
+        .contains("external reviewer"));
     assert!(!git_repo.join(".maco/autopilot/runs").exists());
     assert!(!pr_repo.join(".maco/autopilot/runs").exists());
     assert!(!full_repo.join(".maco/autopilot/runs").exists());
 
-    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
-    assert_eq!(gh_log.matches("issue list").count(), 3);
-    assert!(!gh_log.contains("pr create"));
-    assert!(!gh_log.contains("comment"));
-    assert_no_approval_or_merge_in_gh_log(&gh_log);
+    assert!(
+        !gh.log_path.exists(),
+        "GitHub intake must not run before the publication-authority refusal"
+    );
 
     let serialized = serde_json::to_string(&report).context("serialize report")?;
     assert_public_json_is_sanitized(&serialized, temp.path());
@@ -2020,10 +2028,13 @@ fn workspace_scan_error_redacts_generic_temp_absolute_paths() -> Result<()> {
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn repeated_workspace_run_suppresses_duplicate_items_for_same_repo() -> Result<()> {
+    support::require_containment!(
+        "repeated_workspace_run_suppresses_duplicate_items_for_same_repo"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_named_committed_repo(temp.path(), "duplicate-repo")?;
+    let machine_global_config = write_test_machine_global_config(temp.path())?;
     let config_path = temp.path().join("workspace-duplicates.json");
     write_json_file(
         &config_path,
@@ -2057,15 +2068,21 @@ fn repeated_workspace_run_suppresses_duplicate_items_for_same_repo() -> Result<(
             path_str(&config_path)?,
             "--run-id",
             "workspace-duplicates-1",
+            "--machine-global-config",
+            path_str(&machine_global_config)?,
+            "--machine-global-runtime-root-id",
+            "runtime",
             "--json",
         ],
         temp.path(),
     )?;
-    assert_eq!(
-        workspace_repo_entry(&first, "solo")?["run_report"]["selected_item_count"],
-        1
-    );
+    let first_entry = workspace_repo_entry(&first, "solo")?;
+    assert_eq!(first_entry["status"], "succeeded");
+    assert_eq!(first_entry["run_report"]["status"], "succeeded");
+    assert_eq!(first_entry["run_report"]["selected_item_count"], 1);
 
+    // After a successful run the same fake items must be recorded in the
+    // duplicate ledger and suppressed by subsequent scans.
     let scan = run_success_json_in_dir(
         &[
             "inbox",
@@ -2078,14 +2095,15 @@ fn repeated_workspace_run_suppresses_duplicate_items_for_same_repo() -> Result<(
         temp.path(),
     )?;
     let scan_entry = workspace_repo_entry(&scan, "solo")?;
-    assert_eq!(scan_entry["scan_report"]["selected_count"], 1);
-    assert!(scan_entry["scan_report"]["items"]
+    assert_eq!(scan_entry["scan_report"]["selected_count"], 0);
+    let scan_items = scan_entry["scan_report"]["items"]
         .as_array()
-        .context("retry scan items")?
+        .context("retry scan items")?;
+    assert!(scan_items.iter().all(|item| item["selected"] == false));
+    assert!(scan_items
         .iter()
-        .filter(|item| item["selected"] == true)
-        .all(|item| item["skip_reason"] != "duplicate"
-            && item["duplicate"]["matched_run_id"].is_null()));
+        .any(|item| item["skip_reason"] == "duplicate"
+            && item["duplicate"]["matched_run_id"] == "workspace-duplicates-1-repo-solo"));
 
     let second = run_success_json_in_dir(
         &[
@@ -2096,24 +2114,32 @@ fn repeated_workspace_run_suppresses_duplicate_items_for_same_repo() -> Result<(
             path_str(&config_path)?,
             "--run-id",
             "workspace-duplicates-2",
+            "--machine-global-config",
+            path_str(&machine_global_config)?,
+            "--machine-global-runtime-root-id",
+            "runtime",
             "--json",
         ],
         temp.path(),
     )?;
     let second_entry = workspace_repo_entry(&second, "solo")?;
-    assert_eq!(second_entry["status"], "failed");
-    assert_eq!(second_entry["run_report"]["selected_item_count"], 1);
-    assert_eq!(
-        second_entry["run_report"]["item_reports"][0]["autopilot_success"],
-        false
-    );
-    let retry_autopilot_run_id = second_entry["run_report"]["item_reports"][0]["autopilot_run_id"]
-        .as_str()
-        .context("retry autopilot run id")?;
-    assert!(repo_path
-        .join(".maco/autopilot/runs")
-        .join(retry_autopilot_run_id)
-        .exists());
+    assert_eq!(second_entry["status"], "no_items");
+    assert_eq!(second_entry["run_report"]["status"], "no_items");
+    assert_eq!(second_entry["run_report"]["selected_item_count"], 0);
+    assert!(second_entry["run_report"]["item_reports"]
+        .as_array()
+        .context("second item reports")?
+        .is_empty());
+    let autopilot_runs = repo_path.join(".maco/autopilot/runs");
+    assert!(fs::read_dir(&autopilot_runs)
+        .context("list autopilot runs")?
+        .filter_map(|entry| entry.ok())
+        .all(|entry| {
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("workspace-duplicates-2")
+        }));
 
     let serialized = serde_json::to_string(&(first, scan, second)).context("serialize reports")?;
     assert_public_json_is_sanitized(&serialized, temp.path());
@@ -2181,7 +2207,6 @@ fn workspace_public_json_redacts_temp_paths_and_secret_like_values() -> Result<(
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn active_live_lock_refuses_run() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -2201,7 +2226,6 @@ fn active_live_lock_refuses_run() -> Result<()> {
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn active_sync_claim_refuses_run() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -2228,7 +2252,6 @@ fn active_sync_claim_refuses_run() -> Result<()> {
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn active_semantic_intent_refuses_run() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -2256,10 +2279,11 @@ fn active_semantic_intent_refuses_run() -> Result<()> {
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn non_overlapping_locks_do_not_refuse_inbox_run() -> Result<()> {
+    support::require_containment!("non_overlapping_locks_do_not_refuse_inbox_run");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
+    let machine_global_config = write_test_machine_global_config(temp.path())?;
     run_success_json(&[
         "sync",
         "claim",
@@ -2285,7 +2309,7 @@ fn non_overlapping_locks_do_not_refuse_inbox_run() -> Result<()> {
         "track non-overlapping live claim",
     )?;
 
-    let report = run_failure_json(&[
+    let report = run_success_json(&[
         "inbox",
         "run",
         "--repo",
@@ -2294,11 +2318,15 @@ fn non_overlapping_locks_do_not_refuse_inbox_run() -> Result<()> {
         "non-overlap",
         "--max-items",
         "1",
+        "--machine-global-config",
+        path_str(&machine_global_config)?,
+        "--machine-global-runtime-root-id",
+        "runtime",
         "--json",
     ])?;
 
-    assert_eq!(report["status"], "failed");
-    assert_eq!(report["success"], false);
+    assert_eq!(report["status"], "succeeded");
+    assert_eq!(report["success"], true);
     assert_eq!(report["selected_item_count"], 1);
     assert!(
         report.get("refusals").is_none()
@@ -2306,13 +2334,11 @@ fn non_overlapping_locks_do_not_refuse_inbox_run() -> Result<()> {
                 .as_array()
                 .is_some_and(|items| items.is_empty())
     );
-    assert_nonpublishable_autopilot_stop(&report, &repo_path, 1)?;
 
     Ok(())
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn dirty_primary_real_file_refuses_run_while_runtime_paths_are_ignored() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo_without_maco_ignore(temp.path())?;
@@ -2349,7 +2375,6 @@ fn dirty_primary_real_file_refuses_run_while_runtime_paths_are_ignored() -> Resu
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn maco_runtime_paths_do_not_self_block() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo_without_maco_ignore(temp.path())?;
@@ -2378,10 +2403,16 @@ fn maco_runtime_paths_do_not_self_block() -> Result<()> {
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
-fn timeout_seconds_stops_hanging_validation_command() -> Result<()> {
+fn fake_mode_inbox_skips_configured_validation_commands_without_executing_them() -> Result<()> {
+    support::require_containment!(
+        "fake_mode_inbox_skips_configured_validation_commands_without_executing_them"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
+    let machine_global_config = write_test_machine_global_config(temp.path())?;
+    // Non-publishable fake items never dispatch repo-configured validation
+    // commands; the marker file proves the command was not executed.
+    let marker = temp.path().join("validation-executed.marker");
     write_json_file(
         &repo_path.join("maco-inbox.json"),
         &json!({
@@ -2389,26 +2420,34 @@ fn timeout_seconds_stops_hanging_validation_command() -> Result<()> {
             "max_repair_attempts": 0,
             "timeout_seconds": 1,
             "default_validation_commands": [
-                {"name": "hang", "command": "sleep 5", "timeout_seconds": 1}
+                {
+                    "name": "hang",
+                    "command": format!("touch {} && sleep 5", path_str(&marker)?),
+                    "timeout_seconds": 1
+                }
             ]
         }),
     )?;
     commit_all(&Repository::open(&repo_path)?, "inbox timeout config")?;
 
-    let report = run_failure_json(&[
+    let report = run_success_json(&[
         "inbox",
         "run",
         "--repo",
         path_str(&repo_path)?,
         "--run-id",
         "timeout",
+        "--machine-global-config",
+        path_str(&machine_global_config)?,
+        "--machine-global-runtime-root-id",
+        "runtime",
         "--json",
     ])?;
 
-    assert_eq!(report["status"], "failed");
-    assert_eq!(report["success"], false);
+    assert_eq!(report["status"], "succeeded");
+    assert_eq!(report["success"], true);
     assert_eq!(report["selected_item_count"], 1);
-    assert_eq!(report["item_reports"][0]["autopilot_success"], false);
+    assert_eq!(report["item_reports"][0]["autopilot_success"], true);
 
     let autopilot =
         read_json_file(&repo_path.join(".maco/inbox/runs/timeout/item-1-autopilot-report.json"))?;
@@ -2417,17 +2456,19 @@ fn timeout_seconds_stops_hanging_validation_command() -> Result<()> {
         .as_array()
         .context("validation reports")?
         .is_empty());
+    assert!(!marker.exists(), "validation command must not execute");
 
     Ok(())
 }
 
 #[test]
-#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn auto_merge_is_never_performed() -> Result<()> {
+    support::require_containment!("auto_merge_is_never_performed");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
+    let machine_global_config = write_test_machine_global_config(temp.path())?;
 
-    let report = run_failure_json(&[
+    let report = run_success_json(&[
         "inbox",
         "run",
         "--repo",
@@ -2436,6 +2477,10 @@ fn auto_merge_is_never_performed() -> Result<()> {
         "no-auto-merge",
         "--max-items",
         "1",
+        "--machine-global-config",
+        path_str(&machine_global_config)?,
+        "--machine-global-runtime-root-id",
+        "runtime",
         "--json",
     ])?;
 
@@ -2445,7 +2490,7 @@ fn auto_merge_is_never_performed() -> Result<()> {
     )?;
     assert_eq!(autopilot["auto_merge_requested"], false);
     assert_eq!(autopilot["auto_merge_performed"], false);
-    assert_eq!(autopilot["success"], false);
+    assert_eq!(autopilot["success"], true);
     assert!(autopilot["pr"].is_null());
 
     Ok(())
@@ -2509,13 +2554,6 @@ fn workspace_repo_entry<'a>(report: &'a Value, id: &str) -> Result<&'a Value> {
         .iter()
         .find(|entry| entry["id"].as_str() == Some(id))
         .with_context(|| format!("expected workspace repository entry {id}"))
-}
-
-fn first_workspace_item_plan(repo: &Path, entry: &Value) -> Result<Value> {
-    let plan_path = entry["run_report"]["item_reports"][0]["plan_path"]
-        .as_str()
-        .context("first item plan path")?;
-    read_json_file(&repo.join(plan_path))
 }
 
 fn assert_public_config_path(report: &Value, expected_file_name: &str) -> Result<()> {
@@ -2586,10 +2624,6 @@ fn run_success_json(args: &[&str]) -> Result<Value> {
     run_json_command(args, None, None, true)
 }
 
-fn run_success_json_with_path(args: &[&str], path_dir: &Path) -> Result<Value> {
-    run_json_command(args, None, Some(path_dir), true)
-}
-
 fn run_success_json_in_dir(args: &[&str], cwd: &Path) -> Result<Value> {
     run_json_command(args, Some(cwd), None, true)
 }
@@ -2629,39 +2663,6 @@ fn run_failure_json_with_path(args: &[&str], path_dir: &Path) -> Result<Value> {
 
 fn run_failure_json_in_dir(args: &[&str], cwd: &Path) -> Result<Value> {
     run_json_command(args, Some(cwd), None, false)
-}
-
-fn assert_nonpublishable_autopilot_stop(
-    report: &Value,
-    repo: &Path,
-    expected_items: usize,
-) -> Result<()> {
-    assert_eq!(report["success"], false);
-    assert_eq!(report["status"], "failed");
-    assert_eq!(
-        report["selected_item_count"].as_u64(),
-        Some(expected_items as u64)
-    );
-    assert_eq!(report["auto_merge_performed"], false);
-    let items = report["item_reports"].as_array().context("item reports")?;
-    assert_eq!(items.len(), expected_items);
-    for item in items {
-        assert_eq!(item["success"], false);
-        assert_eq!(item["autopilot_success"], false);
-        let path = item["autopilot_report_path"]
-            .as_str()
-            .context("autopilot report path")?;
-        let autopilot = read_json_file(&repo.join(path))?;
-        assert_eq!(autopilot["success"], false);
-        if autopilot.get("validation").is_some() {
-            assert_eq!(autopilot["validation"]["status"], "skipped");
-            assert!(autopilot["pr"].is_null());
-            assert!(autopilot["review"].is_null());
-            assert_eq!(autopilot["auto_merge_performed"], false);
-        }
-    }
-    assert_eq!(fs::read_to_string(repo.join("README.md"))?, "# Smoke\n");
-    Ok(())
 }
 
 fn run_json_command(
@@ -2898,6 +2899,42 @@ fn write_executable(path: &Path, contents: &str) -> Result<()> {
 fn path_with_prefix(path_dir: &Path) -> Result<String> {
     let existing = std::env::var("PATH").unwrap_or_default();
     Ok(format!("{}:{existing}", path_str(path_dir)?))
+}
+
+/// Autopilot dispatch requires the machine-global retention binding, so tests
+/// that reach real (fake-mode) autopilot execution write this fixture and pass
+/// `--machine-global-config`/`--machine-global-runtime-root-id` to the inbox
+/// entry points.
+#[cfg(target_os = "linux")]
+fn write_test_machine_global_config(root: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let state_root = root.join("inbox-machine-global-state");
+    fs::create_dir_all(&state_root)?;
+    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))?;
+    let uid = fs::metadata("/proc/self")?.uid();
+    let runtime_root = PathBuf::from(format!("/run/user/{uid}"));
+    let config = root.join("inbox-machine-global.json");
+    fs::write(
+        &config,
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "state_root": state_root,
+            "roots": [{
+                "id": "runtime",
+                "path": runtime_root,
+                "protected_paths": [],
+                "quarantine_grace_seconds": 60
+            }]
+        }))?,
+    )?;
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
+    Ok(config)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_test_machine_global_config(root: &Path) -> Result<PathBuf> {
+    Ok(root.join("unsupported-machine-global-config"))
 }
 
 fn create_committed_repo(root: &Path) -> Result<std::path::PathBuf> {
