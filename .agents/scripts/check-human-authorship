@@ -1,0 +1,646 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  check-human-authorship identity LABEL VALUE
+  check-human-authorship message FILE
+  check-human-authorship commit COMMIT
+  check-human-authorship range REVISION_RANGE
+  check-human-authorship all-history [REPOSITORY]
+  check-human-authorship approved-current
+  check-human-authorship pre-push [REMOTE_NAME]
+  check-human-authorship pre-push-approved [REMOTE_NAME]
+  check-human-authorship metadata FILE [FILE...]
+  check-human-authorship metadata-tree [REPOSITORY]
+
+Reject machine, model, vendor, or agent self-attribution while allowing normal
+technical references and real human or organization credits. The pre-push
+modes read standard Git pre-push records from stdin. Update ranges scan only
+lane-unique commits (remote-head..HEAD --not origin/main or the remote primary
+equivalent). New branches still use --not --remotes. pre-push-approved also
+requires every outgoing lane-unique commit author and committer to match the
+approved repository identity exactly.
+EOF
+}
+
+approved_name_key=agentFiles.approvedGitAuthorName
+approved_email_key=agentFiles.approvedGitAuthorEmail
+approved_login_key=agentFiles.approvedGitHubLogin
+approved_import_remote_key=agentFiles.approvedGitImportRemote
+
+ai_identity_re='(^|[^[:alnum:]])(ai|artificial[ -]+intelligence|ai[ -]+assistant|ai[ -]+agent|llm|claude|anthropic|chatgpt|openai|codex|github[ -]?(copilot|actions)|copilot|gemini|gpt([- ]?[0-9])?|llama|mistral|deepseek|grok|perplexity|cursor|windsurf|aider|devin|qwen|kimi|xai|coding[ -]+agent|software[ -]+agent|automation[ -]+agent|autonomous[ -]+agent|dependabot|renovate[ -]+bot|bot)([^[:alnum:]]|$)'
+constructed_agent_role_re='(^|[^[:alnum:]])(([[:alnum:]][[:alnum:]_.-]*[ -]+)?clean[ -]+worker|coding[ -]+worker|automation[ -]+worker|delegated[ -]+worker)([^[:alnum:]]|$)'
+placeholder_name_re='(^|[^[:alnum:]])(your[ ._-]*name|あなたの名前)([^[:alnum:]]|$)'
+placeholder_email_re='(^|[^[:alnum:]@._+-])((you|your[._+-]*(name|email|address)|user(name)?|name|author|developer|test|example)@(example[.][[:alnum:].-]+|[^@[:space:]]+[.](invalid|test)))([^[:alnum:]@._+-]|$)'
+prohibited_identity_re="(($ai_identity_re)|($constructed_agent_role_re)|($placeholder_name_re)|($placeholder_email_re))"
+credit_key_re='(co-authored-by|signed-off-by|reviewed-by|acked-by|tested-by|reported-by|suggested-by|mentored-by|helped-by|developed-by|implemented-by|generated-by|authored-by|contributed-by)'
+credit_field_re='(authors?|contributors?|credits?|copyright|implementation|implemented[ -]by|generated[ -]by|created[ -]by|developed[ -]by|written[ -]by|reviewed[ -]by)'
+disclosure_action_re='(implemented|authored|written|generated|created|developed|built|produced|reviewed|tested|assisted|contributed)'
+
+failed=0
+
+report() {
+  printf 'human-authorship: %s\n' "$*" >&2
+  failed=1
+}
+
+contains_ai_identity() {
+  LC_ALL=C grep -Eiq -- "$prohibited_identity_re"
+}
+
+read_local_config_values() {
+  local key="$1"
+  local output
+  local status
+
+  config_values=()
+  config_read_error=0
+  output="$(mktemp)"
+  if git config --local --no-includes --null --get-all "$key" > "$output" 2>/dev/null; then
+    status=0
+  else
+    status=$?
+  fi
+
+  if [[ "$status" -eq 0 ]]; then
+    mapfile -d '' -t config_values < "$output"
+  elif [[ "$status" -ne 1 ]]; then
+    report "cannot read repository-local Git config key $key"
+    config_read_error=1
+  fi
+  rm -f "$output"
+}
+
+load_approved_identity_config() {
+  local -a name_values=()
+  local -a email_values=()
+  local -a login_values=()
+  local read_error=0
+  local configured_count
+
+  approved_config_state=invalid
+  approved_name=''
+  approved_email=''
+  approved_login=''
+
+  read_local_config_values "$approved_name_key"
+  name_values=("${config_values[@]}")
+  read_error=$((read_error + config_read_error))
+  read_local_config_values "$approved_email_key"
+  email_values=("${config_values[@]}")
+  read_error=$((read_error + config_read_error))
+  read_local_config_values "$approved_login_key"
+  login_values=("${config_values[@]}")
+  read_error=$((read_error + config_read_error))
+
+  [[ "$read_error" -eq 0 ]] || return 0
+
+  configured_count=$((${#name_values[@]} + ${#email_values[@]} + ${#login_values[@]}))
+  if [[ "$configured_count" -eq 0 ]]; then
+    report "approved identity config must contain exactly one repository-local value for each of $approved_name_key, $approved_email_key, and $approved_login_key"
+    return 0
+  fi
+
+  if [[ "${#name_values[@]}" -ne 1 || "${#email_values[@]}" -ne 1 || "${#login_values[@]}" -ne 1 ]]; then
+    report "approved identity config must contain exactly one repository-local value for each of $approved_name_key, $approved_email_key, and $approved_login_key"
+    return 0
+  fi
+  if [[ -z "${name_values[0]}" || -z "${email_values[0]}" || -z "${login_values[0]}" ]]; then
+    report "approved identity config values must be non-empty"
+    return 0
+  fi
+
+  approved_name="${name_values[0]}"
+  approved_email="${email_values[0]}"
+  approved_login="${login_values[0]}"
+  approved_config_state=configured
+}
+
+check_exact_local_value() {
+  local key="$1"
+  local expected="$2"
+  local label="$3"
+
+  read_local_config_values "$key"
+  [[ "$config_read_error" -eq 0 ]] || return 0
+  if [[ "${#config_values[@]}" -ne 1 || -z "${config_values[0]}" ]]; then
+    report "$label must contain exactly one non-empty repository-local value"
+  elif [[ "${config_values[0]}" != "$expected" ]]; then
+    report "$label does not exactly match the approved repository identity"
+  fi
+}
+
+check_resolved_git_identity() {
+  local variable="$1"
+  local label="$2"
+  local identity
+  local identity_without_zone
+  local identity_without_time
+  local expected="$approved_name <$approved_email>"
+
+  if ! identity="$(git var "$variable" 2>/dev/null)"; then
+    report "cannot resolve $label"
+    return 0
+  fi
+  identity_without_zone="${identity% *}"
+  identity_without_time="${identity_without_zone% *}"
+  if [[ "$identity_without_time" != "$expected" ]]; then
+    report "$label does not exactly match the approved repository identity"
+  fi
+}
+
+check_approved_current() {
+  load_approved_identity_config
+  [[ "$approved_config_state" == configured ]] || return 0
+
+  if printf '%s\n' "$approved_name" | contains_ai_identity; then
+    report "approved Git author name uses a prohibited machine, model, vendor, or agent identity"
+  fi
+  if printf '%s\n' "$approved_email" | contains_ai_identity; then
+    report "approved Git author email uses a prohibited machine, model, vendor, or agent identity"
+  fi
+  if printf '%s\n' "$approved_login" | contains_ai_identity; then
+    report "approved GitHub login uses a prohibited machine, model, vendor, or agent identity"
+  fi
+  check_exact_local_value user.name "$approved_name" "local user.name"
+  check_exact_local_value user.email "$approved_email" "local user.email"
+  check_resolved_git_identity GIT_AUTHOR_IDENT "resolved Git author identity"
+  check_resolved_git_identity GIT_COMMITTER_IDENT "resolved Git committer identity"
+}
+
+load_approved_import_config() {
+  local remote_name
+  local seen_remote
+  local -a remote_url_values=()
+  local invalid=0
+  local has_commit_ref
+  local ref
+
+  approved_import_remotes=()
+  approved_import_config_state=none
+
+  read_local_config_values "$approved_import_remote_key"
+  if [[ "$config_read_error" -ne 0 ]]; then
+    approved_import_config_state=invalid
+    return 0
+  fi
+  [[ "${#config_values[@]}" -gt 0 ]] || return 0
+
+  for remote_name in "${config_values[@]}"; do
+    if [[ -z "$remote_name" || ! "$remote_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+      report "$approved_import_remote_key values must be non-empty simple Git remote names"
+      invalid=1
+      continue
+    fi
+    for seen_remote in "${approved_import_remotes[@]}"; do
+      if [[ "$seen_remote" == "$remote_name" ]]; then
+        report "$approved_import_remote_key contains a duplicate remote: $remote_name"
+        invalid=1
+        continue 2
+      fi
+    done
+
+    read_local_config_values "remote.$remote_name.url"
+    remote_url_values=("${config_values[@]}")
+    if [[ "$config_read_error" -ne 0 || "${#remote_url_values[@]}" -ne 1 || -z "${remote_url_values[0]}" ]]; then
+      report "approved import remote $remote_name must have exactly one non-empty repository-local URL"
+      invalid=1
+      continue
+    fi
+
+    has_commit_ref=0
+    while IFS= read -r ref; do
+      [[ -n "$ref" ]] || continue
+      if GIT_NO_REPLACE_OBJECTS=1 git cat-file -e "$ref^{commit}" 2>/dev/null; then
+        has_commit_ref=1
+        break
+      fi
+    done < <(git for-each-ref --format='%(refname)' "refs/remotes/$remote_name/")
+    if [[ "$has_commit_ref" -ne 1 ]]; then
+      report "approved import remote $remote_name has no fetched remote-tracking commit ref"
+      invalid=1
+      continue
+    fi
+
+    approved_import_remotes+=("$remote_name")
+  done
+
+  if [[ "$invalid" -ne 0 ]]; then
+    approved_import_config_state=invalid
+  else
+    approved_import_config_state=configured
+  fi
+}
+
+commit_is_approved_import() {
+  local commit="$1"
+  local remote_name
+  local ref
+
+  [[ "$approved_import_config_state" == configured ]] || return 1
+  for remote_name in "${approved_import_remotes[@]}"; do
+    while IFS= read -r ref; do
+      [[ -n "$ref" ]] || continue
+      GIT_NO_REPLACE_OBJECTS=1 git cat-file -e "$ref^{commit}" 2>/dev/null || continue
+      if GIT_NO_REPLACE_OBJECTS=1 git merge-base --is-ancestor "$commit" "$ref" 2>/dev/null; then
+        return 0
+      fi
+    done < <(git for-each-ref --format='%(refname)' "refs/remotes/$remote_name/")
+  done
+  return 1
+}
+
+is_approved_import_bot_identity() {
+  local name
+  local email
+
+  name="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  email="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$name" == github && "$email" == noreply@github.com ]]; then
+    return 0
+  fi
+  if [[ "$name" =~ ^(github-actions|dependabot|renovate)(\[bot\])?$ ]] &&
+    [[ "$email" =~ ^[0-9]+\+(github-actions|dependabot|renovate)\[bot\]@users[.]noreply[.]github[.]com$ ]]; then
+    return 0
+  fi
+  return 1
+}
+
+scan_import_identity_pair() {
+  local label="$1"
+  local name="$2"
+  local email="$3"
+
+  if is_approved_import_bot_identity "$name" "$email"; then
+    return 0
+  fi
+  scan_identity "$label name" "$name"
+  scan_identity "$label email" "$email"
+}
+
+scan_identity() {
+  local label="$1"
+  local value="$2"
+
+  if printf '%s\n' "$value" | contains_ai_identity; then
+    report "$label uses a prohibited machine, model, vendor, or agent identity: $value"
+  fi
+}
+
+scan_text_file() {
+  local file="$1"
+  local label="${2:-$file}"
+
+  [[ -f "$file" ]] || {
+    report "missing input file: $file"
+    return
+  }
+
+  if ! LC_ALL=C awk \
+    -v label="$label" \
+    -v ai="$prohibited_identity_re" \
+    -v credit_key="$credit_key_re" \
+    -v credit_field="$credit_field_re" \
+    -v action="$disclosure_action_re" '
+      BEGIN {
+        trailer = "^[[:space:]]*" credit_key "[[:space:]]*:"
+        field_start = "^[[:space:]\"\047]*" credit_field "[[:space:]\"\047]*[:=]"
+        field_embedded = "[,{.][[:space:]\"\047]*" credit_field "[[:space:]\"\047]*:[^,}]*"
+        disclosure = "(^|[^[:alnum:]])" action "[[:space:][:punct:]]{0,20}(by|with|using)[[:space:][:punct:]]{0,20}" ai
+        agent_disclosure = "(^|[^[:alnum:]])ai[- ]+(assisted|authored|generated|implemented|written|reviewed|developed)([^[:alnum:]]|$)"
+        credit_block = 0
+      }
+      {
+        lower = tolower($0)
+        violation = ""
+        if (lower ~ trailer && lower ~ ai) {
+          violation = "contains a prohibited credit trailer"
+        } else if (lower ~ field_start && lower ~ ai) {
+          violation = "contains a prohibited authorship or implementation credit"
+        } else {
+          rest = lower
+          while (match(rest, field_embedded)) {
+            segment = substr(rest, RSTART, RLENGTH)
+            if (segment ~ ai) {
+              violation = "contains a prohibited authorship or implementation credit"
+              break
+            }
+            rest = substr(rest, RSTART + RLENGTH)
+          }
+        }
+        if (violation == "" && credit_block && lower ~ ai) {
+          violation = "contains a prohibited authorship or implementation credit"
+        }
+        if (violation == "" && lower ~ disclosure) {
+          violation = "contains a prohibited generated-by or implementation disclosure"
+        }
+        if (violation == "" && lower ~ agent_disclosure) {
+          violation = "contains a prohibited agent-implementation disclosure"
+        }
+        if (violation != "") {
+          print "human-authorship: " label ":" NR " " violation > "/dev/stderr"
+          found = 1
+        }
+
+        if (lower ~ field_start) {
+          if (lower ~ /[:=][[:space:]]*[\[{][[:space:]]*$/) {
+            credit_block = 2
+          } else if (lower ~ /[:=][[:space:]]*$/) {
+            credit_block = 1
+          } else {
+            credit_block = 0
+          }
+        } else if (credit_block == 1 && lower ~ /^[[:space:]]*$/) {
+          credit_block = 0
+        } else if (credit_block == 2 && lower ~ /^[[:space:]]*[\]}][,[:space:]]*$/) {
+          credit_block = 0
+        }
+      }
+      END { exit(found ? 1 : 0) }
+    ' "$file"; then
+    failed=1
+  fi
+}
+
+scan_commit() {
+  local commit="$1"
+  local require_approved="${2:-0}"
+  local approved_import=0
+  local -a fields=()
+  local message_file
+
+  if ! GIT_NO_REPLACE_OBJECTS=1 git cat-file -e "$commit^{commit}" 2>/dev/null; then
+    report "cannot inspect commit: $commit"
+    return
+  fi
+
+  mapfile -d '' -t fields < <(
+    GIT_NO_REPLACE_OBJECTS=1 git show -s --format='%an%x00%ae%x00%cn%x00%ce%x00%B%x00' "$commit"
+  )
+  if [[ "${#fields[@]}" -lt 5 ]]; then
+    report "cannot read commit metadata: $commit"
+    return
+  fi
+
+  if [[ "$require_approved" -eq 1 ]]; then
+    if [[ "${fields[0]}" != "$approved_name" || "${fields[1]}" != "$approved_email" ||
+      "${fields[2]}" != "$approved_name" || "${fields[3]}" != "$approved_email" ]]; then
+      if commit_is_approved_import "$commit"; then
+        approved_import=1
+      else
+        if [[ "${fields[0]}" != "$approved_name" || "${fields[1]}" != "$approved_email" ]]; then
+          report "commit $commit author does not exactly match the approved repository identity and is not an approved fetched import"
+        fi
+        if [[ "${fields[2]}" != "$approved_name" || "${fields[3]}" != "$approved_email" ]]; then
+          report "commit $commit committer does not exactly match the approved repository identity and is not an approved fetched import"
+        fi
+      fi
+    fi
+  fi
+
+  if [[ "$approved_import" -eq 1 ]]; then
+    scan_import_identity_pair "commit $commit imported author" "${fields[0]}" "${fields[1]}"
+    scan_import_identity_pair "commit $commit imported committer" "${fields[2]}" "${fields[3]}"
+  else
+    scan_identity "commit $commit author name" "${fields[0]}"
+    scan_identity "commit $commit author email" "${fields[1]}"
+    scan_identity "commit $commit committer name" "${fields[2]}"
+    scan_identity "commit $commit committer email" "${fields[3]}"
+  fi
+
+  message_file="$(mktemp)"
+  printf '%s' "${fields[4]}" > "$message_file"
+  scan_text_file "$message_file" "commit $commit message"
+  rm -f "$message_file"
+}
+
+scan_range() {
+  local revision_range="$1"
+  local commits
+  local commit
+
+  if ! commits="$(GIT_NO_REPLACE_OBJECTS=1 git rev-list "$revision_range")"; then
+    report "invalid revision range: $revision_range"
+    return
+  fi
+
+  [[ -n "$commits" ]] || return 0
+  while IFS= read -r commit; do
+    [[ -n "$commit" ]] || continue
+    scan_commit "$commit"
+  done <<< "$commits"
+}
+
+scan_all_history() {
+  local repository="${1:-.}"
+  local top
+  local commits_file
+  local commit
+
+  if ! top="$(git -C "$repository" rev-parse --show-toplevel 2>/dev/null)"; then
+    report "cannot resolve repository: $repository"
+    return
+  fi
+
+  commits_file="$(mktemp)"
+  if ! GIT_NO_REPLACE_OBJECTS=1 git -C "$top" rev-list --all > "$commits_file"; then
+    report "cannot enumerate all history in: $repository"
+    rm -f "$commits_file"
+    return
+  fi
+
+  while IFS= read -r commit; do
+    [[ -n "$commit" ]] || continue
+    (
+      cd "$top"
+      scan_commit "$commit"
+      [[ "$failed" -eq 0 ]]
+    ) || failed=1
+  done < "$commits_file"
+  rm -f "$commits_file"
+}
+
+is_zero_oid() {
+  [[ "$1" =~ ^0{40,64}$ ]]
+}
+
+resolve_remote_primary_ref() {
+  local remote_name="${1:-}"
+  local candidate
+  local -a candidates=()
+
+  if [[ -n "$remote_name" ]]; then
+    candidates+=("${remote_name}/HEAD" "${remote_name}/main" "${remote_name}/master")
+  fi
+  if [[ "$remote_name" != origin ]]; then
+    candidates+=("origin/HEAD" "origin/main" "origin/master")
+  fi
+
+  for candidate in "${candidates[@]}"; do
+    if GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+enumerate_pre_push_commits() {
+  local local_oid="$1"
+  local remote_oid="$2"
+  local remote_name="${3:-}"
+  local primary_ref
+
+  if is_zero_oid "$remote_oid"; then
+    if [[ -n "$remote_name" ]]; then
+      GIT_NO_REPLACE_OBJECTS=1 git rev-list "$local_oid" --not --remotes="$remote_name"
+    else
+      GIT_NO_REPLACE_OBJECTS=1 git rev-list "$local_oid" --not --remotes
+    fi
+    return $?
+  fi
+
+  if primary_ref="$(resolve_remote_primary_ref "$remote_name")"; then
+    GIT_NO_REPLACE_OBJECTS=1 git rev-list "$remote_oid..$local_oid" --not "$primary_ref"
+  else
+    GIT_NO_REPLACE_OBJECTS=1 git rev-list "$remote_oid..$local_oid"
+  fi
+}
+
+scan_pre_push() {
+  local remote_name="${1:-}"
+  local require_approved="${2:-0}"
+  local local_ref
+  local local_oid
+  local remote_ref
+  local remote_oid
+  local commit
+  local commits
+
+  if [[ "$require_approved" -eq 1 ]]; then
+    load_approved_identity_config
+    [[ "$approved_config_state" == configured ]] || return 0
+    load_approved_import_config
+    [[ "$approved_import_config_state" != invalid ]] || return 0
+  fi
+
+  while read -r local_ref local_oid remote_ref remote_oid; do
+    [[ -n "${local_oid:-}" ]] || continue
+    is_zero_oid "$local_oid" && continue
+
+    if ! commits="$(enumerate_pre_push_commits "$local_oid" "$remote_oid" "$remote_name")"; then
+      if is_zero_oid "$remote_oid"; then
+        report "cannot enumerate commits for new remote branch: $local_ref"
+      else
+        report "cannot enumerate commits for update: $local_ref -> $remote_ref"
+      fi
+      continue
+    fi
+
+    [[ -n "$commits" ]] || continue
+    while IFS= read -r commit; do
+      [[ -n "$commit" ]] || continue
+      scan_commit "$commit" "$require_approved"
+    done <<< "$commits"
+  done
+}
+
+is_metadata_path() {
+  local path="$1"
+  local base="${path##*/}"
+  local lower
+
+  case "$path" in
+    .agents/*|.agent/*|.git/*|*/.git/*|*/node_modules/*|*/vendor/*|*/external/*|*/storage/*|*/build/*|*/target/*|*/dist/*)
+      return 1
+      ;;
+  esac
+
+  lower="$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')"
+  case "$lower" in
+    authors|authors.*|contributors|contributors.*|credits|credits.*|acknowledgements|acknowledgements.*|acknowledgments|acknowledgments.*|citation.cff|package.json|pyproject.toml|setup.cfg|setup.py|cargo.toml|composer.json|*.gemspec|changelog*|history*|release_notes*|release-notes*|news*|copyright*)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+scan_metadata_tree() {
+  local repository="${1:-.}"
+  local top
+  local path
+
+  top="$(git -C "$repository" rev-parse --show-toplevel)"
+  while IFS= read -r -d '' path; do
+    is_metadata_path "$path" || continue
+    scan_text_file "$top/$path" "$path"
+  done < <(git -C "$top" ls-files -z)
+}
+
+[[ $# -ge 1 ]] || {
+  usage
+  exit 2
+}
+
+command="$1"
+shift
+
+case "$command" in
+  identity)
+    [[ $# -eq 2 ]] || { usage; exit 2; }
+    scan_identity "$1" "$2"
+    ;;
+  message)
+    [[ $# -eq 1 ]] || { usage; exit 2; }
+    scan_text_file "$1" "$1"
+    ;;
+  commit)
+    [[ $# -eq 1 ]] || { usage; exit 2; }
+    scan_commit "$1"
+    ;;
+  range)
+    [[ $# -eq 1 ]] || { usage; exit 2; }
+    scan_range "$1"
+    ;;
+  all-history)
+    [[ $# -le 1 ]] || { usage; exit 2; }
+    scan_all_history "${1:-.}"
+    ;;
+  approved-current)
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+    check_approved_current
+    ;;
+  pre-push)
+    [[ $# -le 1 ]] || { usage; exit 2; }
+    scan_pre_push "${1:-}"
+    ;;
+  pre-push-approved)
+    [[ $# -le 1 ]] || { usage; exit 2; }
+    scan_pre_push "${1:-}" 1
+    ;;
+  metadata)
+    [[ $# -ge 1 ]] || { usage; exit 2; }
+    for file in "$@"; do
+      scan_text_file "$file" "$file"
+    done
+    ;;
+  metadata-tree)
+    [[ $# -le 1 ]] || { usage; exit 2; }
+    scan_metadata_tree "${1:-.}"
+    ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
+
+if [[ "$failed" -ne 0 ]]; then
+  exit 1
+fi

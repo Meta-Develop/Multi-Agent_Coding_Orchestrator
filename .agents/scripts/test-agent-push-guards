@@ -1,0 +1,616 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "$0")" && pwd -P)"
+authorship_guard="$script_dir/check-human-authorship"
+github_actor_guard="$script_dir/check-approved-github-actor"
+private_guard="$script_dir/check-private-agent-paths"
+installer="$script_dir/install-human-authorship-guard"
+scratch_root="$(mktemp -d)"
+zero_oid=0000000000000000000000000000000000000000
+publish_config_key=agentFiles.publishAgentContent
+failures=0
+captured_status=0
+captured_output=
+
+trap 'rm -rf "$scratch_root"' EXIT
+
+fake_bin="$scratch_root/fake-bin"
+mkdir -p "$fake_bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  '[[ "$#" -eq 4 && "$1" == api && "$2" == user && "$3" == --jq && "$4" == .login ]] || exit 64' \
+  'printf "%s\\n" "${FAKE_GH_LOGIN:?}"' \
+  > "$fake_bin/gh"
+chmod 0755 "$fake_bin/gh"
+export PATH="$fake_bin:$PATH"
+export FAKE_GH_LOGIN=GuardTester
+
+capture() {
+  set +e
+  captured_output="$("$@" 2>&1)"
+  captured_status=$?
+  set -e
+}
+
+fail_test() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+run_case() {
+  local name="$1"
+  local function_name="$2"
+  local detail
+  local case_status
+
+  set +e
+  detail="$(
+    set -e
+    "$function_name" 2>&1
+  )"
+  case_status=$?
+  set -e
+
+  if [[ "$case_status" -eq 0 ]]; then
+    printf 'PASS %s\n' "$name"
+  else
+    printf 'FAIL %s\n' "$name"
+    if [[ -n "$detail" ]]; then
+      while IFS= read -r line; do
+        printf '  %s\n' "$line"
+      done <<< "$detail"
+    fi
+    failures=$((failures + 1))
+  fi
+}
+
+init_repo() {
+  local repo="$1"
+
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  git -C "$repo" config user.name 'Guard Tester'
+  git -C "$repo" config user.email 'guard-tester@example.invalid'
+  git -C "$repo" config agentFiles.approvedGitAuthorName 'Guard Tester'
+  git -C "$repo" config agentFiles.approvedGitAuthorEmail 'guard-tester@example.invalid'
+  git -C "$repo" config agentFiles.approvedGitHubLogin 'GuardTester'
+}
+
+commit_file() {
+  local repo="$1"
+  local path="$2"
+  local content="$3"
+  local message="$4"
+
+  mkdir -p "$(dirname "$repo/$path")"
+  printf '%s\n' "$content" > "$repo/$path"
+  git -C "$repo" add -f -- "$path"
+  git -C "$repo" commit -q -m "$message"
+}
+
+commit_file_as() {
+  local repo="$1"
+  local path="$2"
+  local content="$3"
+  local message="$4"
+  local name="$5"
+  local email="$6"
+
+  mkdir -p "$(dirname "$repo/$path")"
+  printf '%s\n' "$content" > "$repo/$path"
+  git -C "$repo" add -f -- "$path"
+  GIT_AUTHOR_NAME="$name" GIT_AUTHOR_EMAIL="$email" \
+    GIT_COMMITTER_NAME="$name" GIT_COMMITTER_EMAIL="$email" \
+    git -C "$repo" -c commit.gpgsign=false commit -q --no-verify -m "$message"
+}
+
+setup_pr_merge_with_inherited_main_bot() {
+  local repo="$1"
+  local feature_name="${2:-feature}"
+
+  init_repo "$repo"
+  commit_file "$repo" shared.txt shared 'Initial shared commit'
+  git -C "$repo" branch -M main
+  git -C "$repo" switch -q -c "$feature_name"
+  commit_file "$repo" feature.txt feature 'Add lane-unique feature change'
+  feature_base_oid="$(git -C "$repo" rev-parse HEAD)"
+  git -C "$repo" switch -q main
+  commit_file_as "$repo" bot.txt bot 'Bump dependency' \
+    'dependabot[bot]' '49699333+dependabot[bot]@users.noreply.github.com'
+  inherited_bot_oid="$(git -C "$repo" rev-parse HEAD)"
+  git -C "$repo" update-ref refs/remotes/origin/main "$inherited_bot_oid"
+  git -C "$repo" switch -q "$feature_name"
+  git -C "$repo" merge -q --no-ff --no-edit main
+  merge_oid="$(git -C "$repo" rev-parse HEAD)"
+}
+
+copy_guard_bundle() {
+  local repo="$1"
+
+  mkdir -p "$repo/.agents/scripts"
+  cp "$authorship_guard" "$github_actor_guard" "$private_guard" "$installer" \
+    "$repo/.agents/scripts/"
+  chmod 0755 "$repo/.agents/scripts/"*
+}
+
+run_in_repo() {
+  local repo="$1"
+  shift
+  (
+    cd "$repo"
+    "$@"
+  )
+}
+
+run_with_input() {
+  local repo="$1"
+  local input="$2"
+  shift 2
+  printf '%s\n' "$input" | (
+    cd "$repo"
+    "$@"
+  )
+}
+
+pre_push_record_new() {
+  printf '%s %s %s %s\n' "$1" "$2" "$1" "$zero_oid"
+}
+
+pre_push_record_update() {
+  printf '%s %s %s %s\n' "$1" "$2" "$1" "$3"
+}
+
+case_private_history_is_rejected() {
+  local repo="$scratch_root/private-history"
+  local remote_oid
+  local private_oid
+  local local_oid
+  local record
+
+  init_repo "$repo"
+  commit_file "$repo" clean.txt clean 'Initial clean commit'
+  remote_oid="$(git -C "$repo" rev-parse HEAD)"
+  commit_file "$repo" .agents/context.md private 'Add local context'
+  private_oid="$(git -C "$repo" rev-parse HEAD)"
+  git -C "$repo" rm -q -- .agents/context.md
+  git -C "$repo" commit -q -m 'Remove local context'
+  local_oid="$(git -C "$repo" rev-parse HEAD)"
+  record="$(pre_push_record_update refs/heads/private-history "$local_oid" "$remote_oid")"
+
+  capture run_with_input "$repo" "$record" "$private_guard" pre-push origin
+  [[ "$captured_status" -eq 1 ]] ||
+    fail_test "expected rejection, got $captured_status: $captured_output"
+  [[ "$captured_output" == *'refs/heads/private-history'* ]] ||
+    fail_test "missing ref diagnostic: $captured_output"
+  [[ "$captured_output" == *"$private_oid"* ]] ||
+    fail_test "missing private commit diagnostic: $captured_output"
+  [[ "$captured_output" == *'.agents/context.md'* ]] ||
+    fail_test "missing blocked path diagnostic: $captured_output"
+}
+
+case_all_blocked_paths_are_reported() {
+  local repo="$scratch_root/all-paths"
+  local remote_oid
+  local local_oid
+  local record
+  local path
+  local -a blocked_paths=(
+    .agents/context.md
+    .agent/context.md
+    .codex/context.md
+    AGENTS.md
+    .github/agents/context.md
+    .github/hooks/context
+    .github/copilot-instructions.md
+    .vscode/settings.json
+  )
+
+  init_repo "$repo"
+  commit_file "$repo" clean.txt clean 'Initial clean commit'
+  remote_oid="$(git -C "$repo" rev-parse HEAD)"
+  for path in "${blocked_paths[@]}"; do
+    mkdir -p "$(dirname "$repo/$path")"
+    printf 'private\n' > "$repo/$path"
+  done
+  git -C "$repo" add -f -- "${blocked_paths[@]}"
+  git -C "$repo" commit -q -m 'Add protected paths'
+  local_oid="$(git -C "$repo" rev-parse HEAD)"
+  record="$(pre_push_record_update refs/heads/all-paths "$local_oid" "$remote_oid")"
+
+  capture run_with_input "$repo" "$record" "$private_guard" pre-push origin
+  [[ "$captured_status" -eq 1 ]] ||
+    fail_test "expected rejection, got $captured_status: $captured_output"
+  for path in "${blocked_paths[@]}"; do
+    [[ "$captured_output" == *"$path"* ]] ||
+      fail_test "missing blocked path $path: $captured_output"
+  done
+}
+
+case_clean_and_empty_ranges_pass() {
+  local repo="$scratch_root/clean-ranges"
+  local remote_oid
+  local local_oid
+  local record
+
+  init_repo "$repo"
+  commit_file "$repo" initial.txt initial 'Initial clean commit'
+  remote_oid="$(git -C "$repo" rev-parse HEAD)"
+  commit_file "$repo" clean.txt clean 'Add clean file'
+  local_oid="$(git -C "$repo" rev-parse HEAD)"
+  record="$(pre_push_record_update refs/heads/clean "$local_oid" "$remote_oid")"
+  capture run_with_input "$repo" "$record" "$private_guard" pre-push origin
+  [[ "$captured_status" -eq 0 && -z "$captured_output" ]] ||
+    fail_test "clean update failed: $captured_output"
+
+  record="$(pre_push_record_update refs/heads/unchanged "$local_oid" "$local_oid")"
+  capture run_with_input "$repo" "$record" "$private_guard" pre-push origin
+  [[ "$captured_status" -eq 0 && -z "$captured_output" ]] ||
+    fail_test "empty update failed: $captured_output"
+
+  record="$(pre_push_record_update refs/heads/deleted "$zero_oid" "$local_oid")"
+  capture run_with_input "$repo" "$record" "$private_guard" pre-push origin
+  [[ "$captured_status" -eq 0 && -z "$captured_output" ]] ||
+    fail_test "delete record failed: $captured_output"
+}
+
+case_replacement_objects_do_not_hide_paths() {
+  local repo="$scratch_root/replacements"
+  local remote_oid
+  local original_oid
+  local replacement_oid
+  local record
+
+  init_repo "$repo"
+  commit_file "$repo" clean.txt clean 'Initial clean commit'
+  remote_oid="$(git -C "$repo" rev-parse HEAD)"
+  commit_file "$repo" .agents/context.md private 'Add local context'
+  original_oid="$(git -C "$repo" rev-parse HEAD)"
+  replacement_oid="$(
+    printf 'Clean replacement view\n' |
+      git -C "$repo" commit-tree "$remote_oid^{tree}" -p "$remote_oid"
+  )"
+  git -C "$repo" replace "$original_oid" "$replacement_oid"
+  record="$(pre_push_record_update refs/heads/replaced "$original_oid" "$remote_oid")"
+
+  capture run_with_input "$repo" "$record" "$private_guard" pre-push origin
+  [[ "$captured_status" -eq 1 ]] ||
+    fail_test "replacement object hid protected path: $captured_output"
+  [[ "$captured_output" == *'.agents/context.md'* ]] ||
+    fail_test "missing original protected path: $captured_output"
+}
+
+case_publication_policy_is_local_and_exact() {
+  local publisher="$scratch_root/publisher"
+  local consumer="$scratch_root/consumer"
+  local publisher_oid
+  local consumer_oid
+  local publisher_record
+  local consumer_record
+
+  init_repo "$publisher"
+  commit_file "$publisher" .agents/context.md published 'Publish agent content'
+  publisher_oid="$(git -C "$publisher" rev-parse HEAD)"
+  publisher_record="$(pre_push_record_new refs/heads/publisher "$publisher_oid")"
+  git -C "$publisher" config --local "$publish_config_key" true
+  capture run_with_input "$publisher" "$publisher_record" "$private_guard" pre-push origin
+  [[ "$captured_status" -eq 0 && -z "$captured_output" ]] ||
+    fail_test "valid publisher configuration failed: $captured_output"
+
+  init_repo "$consumer"
+  commit_file "$consumer" .agents/context.md private 'Accidentally track agent content'
+  consumer_oid="$(git -C "$consumer" rev-parse HEAD)"
+  consumer_record="$(pre_push_record_new refs/heads/consumer "$consumer_oid")"
+  git -C "$consumer" config --local --add "$publish_config_key" true
+  git -C "$consumer" config --local --add "$publish_config_key" true
+  capture run_with_input "$consumer" "$consumer_record" "$private_guard" pre-push origin
+  [[ "$captured_status" -eq 1 ]] ||
+    fail_test "duplicate publication setting did not fail closed"
+  [[ "$captured_output" == *"invalid local Git config $publish_config_key"* ]] ||
+    fail_test "missing duplicate-setting diagnostic: $captured_output"
+
+  git -C "$consumer" config --local --unset-all "$publish_config_key"
+  git -C "$consumer" config --local --add "$publish_config_key" true
+  git -C "$consumer" config --local --add "$publish_config_key" ''
+  capture run_with_input "$consumer" "$consumer_record" "$private_guard" pre-push origin
+  [[ "$captured_status" -eq 1 ]] ||
+    fail_test "empty second setting did not fail closed"
+
+  git -C "$consumer" config --local --unset-all "$publish_config_key"
+  git -C "$consumer" config --local "$publish_config_key" yes
+  capture run_with_input "$consumer" "$consumer_record" "$private_guard" pre-push origin
+  [[ "$captured_status" -eq 1 ]] ||
+    fail_test "non-exact publication setting did not fail closed"
+
+  git -C "$consumer" config --local --unset-all "$publish_config_key"
+  git -C "$consumer" config --local --add "$publish_config_key" $'true\n'
+  capture run_with_input "$consumer" "$consumer_record" "$private_guard" pre-push origin
+  [[ "$captured_status" -eq 1 ]] ||
+    fail_test "newline-bearing publication setting did not fail closed"
+}
+
+case_installer_preflight_preserves_existing_hooks() {
+  local repo="$scratch_root/preflight"
+  local hooks_dir
+  local hook_hash
+  local backup_hash
+
+  init_repo "$repo"
+  commit_file "$repo" .agents/context.md private 'Accidentally track agent content'
+  copy_guard_bundle "$repo"
+  hooks_dir="$(git -C "$repo" rev-parse --path-format=absolute --git-path hooks)"
+  mkdir -p "$hooks_dir"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    '# human-authorship-guard dispatcher v2 standalone' 'exit 0' \
+    > "$hooks_dir/pre-push"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' \
+    > "$hooks_dir/pre-push.human-authorship-previous"
+  chmod 0755 "$hooks_dir/pre-push" \
+    "$hooks_dir/pre-push.human-authorship-previous"
+  hook_hash="$(sha256sum "$hooks_dir/pre-push")"
+  backup_hash="$(sha256sum "$hooks_dir/pre-push.human-authorship-previous")"
+
+  capture run_in_repo "$repo" "$repo/.agents/scripts/install-human-authorship-guard"
+  [[ "$captured_status" -eq 1 ]] ||
+    fail_test "installer accepted tracked protected paths"
+  [[ "$captured_output" == *'refusing hook installation'* ]] ||
+    fail_test "missing installer preflight diagnostic: $captured_output"
+  [[ "$hook_hash" == "$(sha256sum "$hooks_dir/pre-push")" ]] ||
+    fail_test 'preflight refusal changed existing hook'
+  [[ "$backup_hash" == "$(sha256sum "$hooks_dir/pre-push.human-authorship-previous")" ]] ||
+    fail_test 'preflight refusal changed existing backup'
+}
+
+case_v3_dispatcher_is_idempotent_and_composes() {
+  local repo="$scratch_root/dispatcher"
+  local hooks_dir
+  local oid
+  local record
+  local first_hash
+
+  init_repo "$repo"
+  commit_file "$repo" clean.txt clean 'Initial clean commit'
+  oid="$(git -C "$repo" rev-parse HEAD)"
+  git -C "$repo" update-ref refs/remotes/origin/main "$oid"
+  record="$(pre_push_record_new refs/heads/already-published "$oid")"
+  copy_guard_bundle "$repo"
+
+  capture run_in_repo "$repo" "$repo/.agents/scripts/install-human-authorship-guard"
+  [[ "$captured_status" -eq 0 ]] ||
+    fail_test "dispatcher installation failed: $captured_output"
+  hooks_dir="$(git -C "$repo" rev-parse --path-format=absolute --git-path hooks)"
+  first_hash="$(sha256sum "$hooks_dir/pre-push")"
+  capture run_in_repo "$repo" "$repo/.agents/scripts/install-human-authorship-guard"
+  [[ "$captured_status" -eq 0 ]] ||
+    fail_test "dispatcher reinstall failed: $captured_output"
+  [[ "$first_hash" == "$(sha256sum "$hooks_dir/pre-push")" ]] ||
+    fail_test 'dispatcher changed on reinstall'
+  capture run_in_repo "$repo" "$repo/.agents/scripts/install-human-authorship-guard" --check
+  [[ "$captured_status" -eq 0 ]] ||
+    fail_test "dispatcher --check failed: $captured_output"
+
+  printf '%s\n' '#!/usr/bin/env bash' \
+    '# human-authorship-guard dispatcher v5' 'exit 0' \
+    > "$hooks_dir/commit-msg"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    '# human-authorship-guard dispatcher v5' 'exit 0' \
+    > "$hooks_dir/pre-push"
+  chmod 0755 "$hooks_dir/commit-msg" "$hooks_dir/pre-push"
+  capture run_in_repo "$repo" "$repo/.agents/scripts/install-human-authorship-guard" --check
+  [[ "$captured_status" -eq 1 ]] ||
+    fail_test 'dispatcher --check accepted marker-only no-op hooks'
+  [[ "$captured_output" == *'missing or modified human-authorship dispatcher'* ]] ||
+    fail_test "tampered dispatcher diagnostic was not explicit: $captured_output"
+  capture run_in_repo "$repo" "$repo/.agents/scripts/install-human-authorship-guard"
+  [[ "$captured_status" -eq 0 ]] ||
+    fail_test "tampered dispatcher repair failed: $captured_output"
+  capture run_in_repo "$repo" "$repo/.agents/scripts/install-human-authorship-guard" --check
+  [[ "$captured_status" -eq 0 ]] ||
+    fail_test "repaired dispatcher --check failed: $captured_output"
+
+  capture run_with_input "$repo" "$record" "$hooks_dir/pre-push" origin unused-url
+  [[ "$captured_status" -eq 0 && -z "$captured_output" ]] ||
+    fail_test "dispatcher rejected clean empty publication: $captured_output"
+
+  rm -f "$repo/.agents/scripts/check-private-agent-paths"
+  capture run_with_input "$repo" "$record" "$hooks_dir/pre-push" origin unused-url
+  [[ "$captured_status" -eq 1 ]] ||
+    fail_test 'dispatcher did not fail when private guard was missing'
+  [[ "$captured_output" == *'missing executable guard check-private-agent-paths'* ]] ||
+    fail_test "missing guard diagnostic was not explicit: $captured_output"
+}
+
+case_v2_upgrade_preserves_backup_chain() {
+  local repo="$scratch_root/v2-upgrade"
+  local hooks_dir
+  local oid
+  local record
+  local previous_log="$scratch_root/v2-previous.log"
+  local backup_hash
+
+  init_repo "$repo"
+  commit_file "$repo" clean.txt clean 'Initial clean commit'
+  oid="$(git -C "$repo" rev-parse HEAD)"
+  git -C "$repo" update-ref refs/remotes/origin/main "$oid"
+  record="$(pre_push_record_new refs/heads/already-published "$oid")"
+  copy_guard_bundle "$repo"
+  hooks_dir="$(git -C "$repo" rev-parse --path-format=absolute --git-path hooks)"
+  mkdir -p "$hooks_dir"
+
+  printf '%s\n' '#!/usr/bin/env bash' \
+    '# human-authorship-guard dispatcher v2 standalone' 'exit 0' \
+    > "$hooks_dir/commit-msg"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    '# human-authorship-guard dispatcher v2 standalone' 'exit 0' \
+    > "$hooks_dir/pre-push"
+  cat > "$hooks_dir/pre-push.human-authorship-previous" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+input="$(cat)"
+printf '%s|%s|%s\n' "${1:-}" "${2:-}" "$input" >> "${PREVIOUS_HOOK_LOG:?}"
+EOF
+  chmod 0755 "$hooks_dir/commit-msg" "$hooks_dir/pre-push" \
+    "$hooks_dir/pre-push.human-authorship-previous"
+  backup_hash="$(sha256sum "$hooks_dir/pre-push.human-authorship-previous")"
+
+  capture run_in_repo "$repo" "$repo/.agents/scripts/install-human-authorship-guard"
+  [[ "$captured_status" -eq 0 ]] ||
+    fail_test "v2 upgrade failed: $captured_output"
+  grep -Fq '# human-authorship-guard dispatcher v5' "$hooks_dir/commit-msg" ||
+    fail_test 'standalone commit-msg was not upgraded to v5'
+  grep -Fq '# human-authorship-guard dispatcher v5' "$hooks_dir/pre-push" ||
+    fail_test 'standalone pre-push was not upgraded to v5'
+  [[ "$backup_hash" == "$(sha256sum "$hooks_dir/pre-push.human-authorship-previous")" ]] ||
+    fail_test 'v2 upgrade changed the existing backup'
+
+  export PREVIOUS_HOOK_LOG="$previous_log"
+  capture run_with_input "$repo" "$record" "$hooks_dir/pre-push" origin unused-url
+  unset PREVIOUS_HOOK_LOG
+  [[ "$captured_status" -eq 0 ]] ||
+    fail_test "upgraded dispatcher failed: $captured_output"
+  grep -Fq "origin|unused-url|$record" "$previous_log" ||
+    fail_test 'v2 backup did not remain in the dispatcher chain'
+}
+
+case_inherited_main_bot_commits_pass_on_pr_merge_push() {
+  local repo="$scratch_root/inherited-main-pass"
+  local record
+
+  setup_pr_merge_with_inherited_main_bot "$repo"
+  record="$(pre_push_record_update refs/heads/feature "$merge_oid" "$feature_base_oid")"
+
+  capture run_with_input "$repo" "$record" "$authorship_guard" pre-push origin
+  [[ "$captured_status" -eq 0 && -z "$captured_output" ]] ||
+    fail_test "inherited main bot commit blocked a lane-unique merge push: $captured_output"
+
+  capture run_with_input "$repo" "$record" "$authorship_guard" pre-push-approved origin
+  [[ "$captured_status" -eq 0 && -z "$captured_output" ]] ||
+    fail_test "pre-push-approved rejected inherited main commits: $captured_output"
+}
+
+case_lane_unique_bot_commit_still_rejected_after_main_merge() {
+  local repo="$scratch_root/lane-unique-bot"
+  local lane_bot_oid
+  local record
+
+  setup_pr_merge_with_inherited_main_bot "$repo"
+  commit_file_as "$repo" lane-bot.txt lane-bot 'Lane-only bot change' \
+    'dependabot[bot]' '49699333+dependabot[bot]@users.noreply.github.com'
+  lane_bot_oid="$(git -C "$repo" rev-parse HEAD)"
+  record="$(pre_push_record_update refs/heads/feature "$lane_bot_oid" "$feature_base_oid")"
+
+  capture run_with_input "$repo" "$record" "$authorship_guard" pre-push origin
+  [[ "$captured_status" -eq 1 ]] ||
+    fail_test "lane-unique bot commit was accepted: $captured_output"
+  [[ "$captured_output" == *"$lane_bot_oid"* ]] ||
+    fail_test "rejection omitted the lane-unique bot commit: $captured_output"
+  [[ "$captured_output" != *"$inherited_bot_oid"* ]] ||
+    fail_test "rejection still named the inherited main commit: $captured_output"
+}
+
+case_missing_origin_main_still_scans_full_update_range() {
+  local repo="$scratch_root/missing-primary"
+  local remote_oid
+  local bot_oid
+  local record
+
+  init_repo "$repo"
+  commit_file "$repo" clean.txt clean 'Initial clean commit'
+  remote_oid="$(git -C "$repo" rev-parse HEAD)"
+  commit_file_as "$repo" bot.txt bot 'Introduced bot commit' \
+    'dependabot[bot]' '49699333+dependabot[bot]@users.noreply.github.com'
+  bot_oid="$(git -C "$repo" rev-parse HEAD)"
+  record="$(pre_push_record_update refs/heads/feature "$bot_oid" "$remote_oid")"
+
+  capture run_with_input "$repo" "$record" "$authorship_guard" pre-push origin
+  [[ "$captured_status" -eq 1 ]] ||
+    fail_test "update without origin/main accepted a bot commit: $captured_output"
+  [[ "$captured_output" == *"$bot_oid"* ]] ||
+    fail_test "fail-closed update omitted the bot commit: $captured_output"
+}
+
+case_installed_hook_accepts_inherited_main_and_rejects_lane_bot() {
+  local repo="$scratch_root/installed-merge-push"
+  local hooks_dir
+  local lane_bot_oid
+  local record
+
+  setup_pr_merge_with_inherited_main_bot "$repo"
+  copy_guard_bundle "$repo"
+  capture run_in_repo "$repo" "$repo/.agents/scripts/install-human-authorship-guard"
+  [[ "$captured_status" -eq 0 ]] ||
+    fail_test "hook installation failed: $captured_output"
+  hooks_dir="$(git -C "$repo" rev-parse --path-format=absolute --git-path hooks)"
+  record="$(pre_push_record_update refs/heads/feature "$merge_oid" "$feature_base_oid")"
+  capture run_with_input "$repo" "$record" "$hooks_dir/pre-push" origin unused-url
+  [[ "$captured_status" -eq 0 && -z "$captured_output" ]] ||
+    fail_test "installed hook rejected inherited main merge push: $captured_output"
+
+  commit_file_as "$repo" lane-bot.txt lane-bot 'Lane-only bot change' \
+    'dependabot[bot]' '49699333+dependabot[bot]@users.noreply.github.com'
+  lane_bot_oid="$(git -C "$repo" rev-parse HEAD)"
+  record="$(pre_push_record_update refs/heads/feature "$lane_bot_oid" "$feature_base_oid")"
+  capture run_with_input "$repo" "$record" "$hooks_dir/pre-push" origin unused-url
+  [[ "$captured_status" -eq 1 ]] ||
+    fail_test "installed hook accepted a lane-unique bot commit: $captured_output"
+  [[ "$captured_output" == *"$lane_bot_oid"* ]] ||
+    fail_test "installed hook omitted the lane-unique bot commit: $captured_output"
+}
+
+case_linked_worktree_uses_common_checkout_guard() {
+  local main_repo="$scratch_root/common-main"
+  local linked_repo="$scratch_root/common-linked"
+  local hooks_dir
+  local oid
+  local record
+
+  init_repo "$main_repo"
+  commit_file "$main_repo" clean.txt clean 'Initial clean commit'
+  copy_guard_bundle "$main_repo"
+  git -C "$main_repo" worktree add -q -b linked "$linked_repo"
+  oid="$(git -C "$linked_repo" rev-parse HEAD)"
+  git -C "$linked_repo" update-ref refs/remotes/origin/main "$oid"
+  record="$(pre_push_record_new refs/heads/already-published "$oid")"
+
+  capture run_in_repo "$linked_repo" "$installer"
+  [[ "$captured_status" -eq 0 ]] ||
+    fail_test "linked-worktree installation failed: $captured_output"
+  hooks_dir="$(git -C "$linked_repo" rev-parse --path-format=absolute --git-path hooks)"
+  capture run_with_input "$linked_repo" "$record" "$hooks_dir/pre-push" origin unused-url
+  [[ "$captured_status" -eq 0 && -z "$captured_output" ]] ||
+    fail_test "linked-worktree dispatcher failed: $captured_output"
+}
+
+run_case 'private paths anywhere in published history are rejected' \
+  case_private_history_is_rejected
+run_case 'all Local Agent Files path variants are reported' \
+  case_all_blocked_paths_are_reported
+run_case 'clean, empty, and deletion ranges pass silently' \
+  case_clean_and_empty_ranges_pass
+run_case 'replacement objects cannot hide protected paths' \
+  case_replacement_objects_do_not_hide_paths
+run_case 'publisher opt-out is repository-local, singular, and exact' \
+  case_publication_policy_is_local_and_exact
+run_case 'installer preflight preserves existing hook state' \
+  case_installer_preflight_preserves_existing_hooks
+run_case 'dispatcher v5 is idempotent, composed, and fails loudly' \
+  case_v3_dispatcher_is_idempotent_and_composes
+run_case 'v2 dispatchers upgrade without changing the backup chain' \
+  case_v2_upgrade_preserves_backup_chain
+run_case 'linked worktrees resolve guards beside the common Git directory' \
+  case_linked_worktree_uses_common_checkout_guard
+run_case 'inherited main bot commits do not fail PR merge pushes' \
+  case_inherited_main_bot_commits_pass_on_pr_merge_push
+run_case 'lane-unique bot commits are still rejected after merging main' \
+  case_lane_unique_bot_commit_still_rejected_after_main_merge
+run_case 'missing origin/main still scans the full update range' \
+  case_missing_origin_main_still_scans_full_update_range
+run_case 'installed hook ignores inherited main and rejects lane-unique bots' \
+  case_installed_hook_accepts_inherited_main_and_rejects_lane_bot
+
+if [[ "$failures" -ne 0 ]]; then
+  printf '%s test case(s) failed\n' "$failures" >&2
+  exit 1
+fi
+
+printf 'All %s test cases passed\n' 13
