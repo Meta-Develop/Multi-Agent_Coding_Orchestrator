@@ -2,7 +2,10 @@
 //!
 //! First slice of issue #92: refuse durable path claims unless repository map,
 //! risk report, and runtime evidence are all present. Missing evidence is
-//! fail-closed. The decision is recorded before any claim token is issued.
+//! fail-closed on the Verified/production path. NonpublishableSimulation
+//! records a typed synthetic viability decision and proceeds without scanning
+//! map/risk evidence that Fake fixtures do not supply. The decision is
+//! recorded before any claim token is issued.
 
 use super::*;
 use crate::repo_map::RepoMap;
@@ -44,6 +47,14 @@ pub(super) enum PreclaimDisposition {
     Reject,
 }
 
+/// How the gate obtained the evidence it recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum PreclaimEvidenceSource {
+    Acquired,
+    SyntheticSimulation,
+}
+
 /// Auditable pre-claim viability decision for one assignment.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -54,6 +65,7 @@ pub(super) struct PreclaimDecision {
     pub map_present: bool,
     pub risk_present: bool,
     pub runtime_present: bool,
+    pub evidence_source: PreclaimEvidenceSource,
 }
 
 impl PreclaimDecision {
@@ -67,18 +79,35 @@ pub(super) struct PreclaimRunEvidence {
     pub(super) repo_map: Option<RepoMap>,
     semantic_map: Option<SemanticRepoMap>,
     pub(super) runtime: Option<SupervisorRuntime>,
+    execution_runtime: SupervisorExecutionRuntime,
 }
 
 impl PreclaimRunEvidence {
-    pub(super) fn acquire(repo: &Path, runtime: SupervisorRuntime) -> Self {
+    pub(super) fn acquire(
+        repo: &Path,
+        runtime: SupervisorRuntime,
+        execution_runtime: SupervisorExecutionRuntime,
+    ) -> Self {
         #[cfg(test)]
         if FORCE_MISSING_PRECLAIM_EVIDENCE.with(Cell::get) {
             return Self::missing();
+        }
+        if execution_runtime == SupervisorExecutionRuntime::NonpublishableSimulation {
+            // Fake/simulation fixtures do not carry map/risk artifacts. Do not
+            // scan here: discover+walk can escape a temp fixture and stall the
+            // scheduler for the repository-map deadline.
+            return Self {
+                repo_map: None,
+                semantic_map: None,
+                runtime: Some(runtime),
+                execution_runtime,
+            };
         }
         Self {
             repo_map: crate::repo_map::scan_repository(repo).ok(),
             semantic_map: crate::repo_semantic::scan_repository(repo).ok(),
             runtime: Some(runtime),
+            execution_runtime,
         }
     }
 
@@ -88,6 +117,7 @@ impl PreclaimRunEvidence {
             repo_map: None,
             semantic_map: None,
             runtime: None,
+            execution_runtime: SupervisorExecutionRuntime::Verified,
         }
     }
 
@@ -98,13 +128,28 @@ impl PreclaimRunEvidence {
     }
 }
 
-/// Fail-closed viability gate: every evidence handle must be present.
+/// Fail-closed viability gate on the Verified path: every evidence handle must
+/// be present. Simulation records a typed synthetic claim instead of parking.
 pub(super) fn evaluate_preclaim_viability(
     assignment_id: &str,
     repo_map: Option<&RepoMap>,
     risk_report: Option<&SemanticRiskReport>,
     runtime: Option<SupervisorRuntime>,
+    execution_runtime: SupervisorExecutionRuntime,
 ) -> PreclaimDecision {
+    if execution_runtime == SupervisorExecutionRuntime::NonpublishableSimulation {
+        return PreclaimDecision {
+            assignment_id: assignment_id.to_string(),
+            disposition: PreclaimDisposition::Claim,
+            reason: format!(
+                "assignment '{assignment_id}' recorded synthetic simulation pre-claim viability"
+            ),
+            map_present: repo_map.is_some(),
+            risk_present: risk_report.is_some(),
+            runtime_present: runtime.is_some(),
+            evidence_source: PreclaimEvidenceSource::SyntheticSimulation,
+        };
+    }
     let map_present = repo_map.is_some();
     let risk_present = risk_report.is_some();
     let runtime_present = runtime.is_some();
@@ -124,6 +169,7 @@ pub(super) fn evaluate_preclaim_viability(
             map_present,
             risk_present,
             runtime_present,
+            evidence_source: PreclaimEvidenceSource::Acquired,
         };
     }
     PreclaimDecision {
@@ -136,6 +182,7 @@ pub(super) fn evaluate_preclaim_viability(
         map_present,
         risk_present,
         runtime_present,
+        evidence_source: PreclaimEvidenceSource::Acquired,
     }
 }
 
@@ -150,6 +197,7 @@ pub(super) fn preclaim_assignment(
         evidence.repo_map.as_ref(),
         risk.as_ref(),
         evidence.runtime,
+        evidence.execution_runtime,
     );
     persist_preclaim_decision(artifacts, assignment, &decision)?;
     Ok(decision)
@@ -230,22 +278,26 @@ mod tests {
             Some(&present_map()),
             Some(&present_risk()),
             Some(SupervisorRuntime::Fake),
+            SupervisorExecutionRuntime::Verified,
         );
         assert_eq!(decision.disposition, PreclaimDisposition::Claim);
+        assert_eq!(decision.evidence_source, PreclaimEvidenceSource::Acquired);
         assert!(decision.allows_path_claim());
         assert!(decision.map_present && decision.risk_present && decision.runtime_present);
         assert!(decision.reason.contains("passed pre-claim viability"));
     }
 
     #[test]
-    fn missing_map_fails_closed() {
+    fn missing_map_fails_closed_on_verified_path() {
         let decision = evaluate_preclaim_viability(
             "child-a",
             None,
             Some(&present_risk()),
             Some(SupervisorRuntime::Fake),
+            SupervisorExecutionRuntime::Verified,
         );
         assert_eq!(decision.disposition, PreclaimDisposition::Reject);
+        assert_eq!(decision.evidence_source, PreclaimEvidenceSource::Acquired);
         assert!(!decision.allows_path_claim());
         assert!(!decision.map_present);
         assert!(decision.reason.contains("missing map"));
@@ -254,12 +306,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_risk_fails_closed() {
+    fn missing_risk_fails_closed_on_verified_path() {
         let decision = evaluate_preclaim_viability(
             "child-a",
             Some(&present_map()),
             None,
             Some(SupervisorRuntime::Fake),
+            SupervisorExecutionRuntime::Verified,
         );
         assert_eq!(decision.disposition, PreclaimDisposition::Reject);
         assert!(!decision.allows_path_claim());
@@ -268,12 +321,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_runtime_fails_closed() {
+    fn missing_runtime_fails_closed_on_verified_path() {
         let decision = evaluate_preclaim_viability(
             "child-a",
             Some(&present_map()),
             Some(&present_risk()),
             None,
+            SupervisorExecutionRuntime::Verified,
         );
         assert_eq!(decision.disposition, PreclaimDisposition::Reject);
         assert!(!decision.allows_path_claim());
@@ -282,8 +336,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_all_evidence_lists_every_gap() {
-        let decision = evaluate_preclaim_viability("child-a", None, None, None);
+    fn missing_all_evidence_lists_every_gap_on_verified_path() {
+        let decision = evaluate_preclaim_viability(
+            "child-a",
+            None,
+            None,
+            None,
+            SupervisorExecutionRuntime::Verified,
+        );
         assert_eq!(decision.disposition, PreclaimDisposition::Reject);
         assert!(!decision.allows_path_claim());
         assert!(decision.reason.contains("missing map, risk, runtime"));
@@ -298,8 +358,37 @@ mod tests {
     }
 
     #[test]
+    fn simulation_records_synthetic_claim_when_evidence_is_missing() {
+        let decision = evaluate_preclaim_viability(
+            "child-a",
+            None,
+            None,
+            None,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+        );
+        assert_eq!(decision.disposition, PreclaimDisposition::Claim);
+        assert_eq!(
+            decision.evidence_source,
+            PreclaimEvidenceSource::SyntheticSimulation
+        );
+        assert!(decision.allows_path_claim());
+        assert!(decision
+            .reason
+            .contains("synthetic simulation pre-claim viability"));
+        assert!(!decision.map_present);
+        assert!(!decision.risk_present);
+        assert!(!decision.runtime_present);
+    }
+
+    #[test]
     fn decision_round_trips_for_the_recorded_ledger() {
-        let decision = evaluate_preclaim_viability("child-a", None, None, None);
+        let decision = evaluate_preclaim_viability(
+            "child-a",
+            None,
+            None,
+            None,
+            SupervisorExecutionRuntime::Verified,
+        );
         let encoded = serde_json::to_string(&decision).expect("serialize decision");
         let decoded: PreclaimDecision =
             serde_json::from_str(&encoded).expect("deserialize decision");

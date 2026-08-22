@@ -832,6 +832,10 @@ fn serial_scheduler_directly_dispatches_and_completes_fake_assignment() {
                 decisions.contains("\"disposition\":\"claim\"")
                     || decisions.contains("\"disposition\": \"claim\"")
             );
+            assert!(
+                decisions.contains("\"evidence_source\":\"synthetic_simulation\"")
+                    || decisions.contains("\"evidence_source\": \"synthetic_simulation\"")
+            );
             assert!(decisions.contains("serial-child"));
         }
     );
@@ -920,24 +924,55 @@ fn missing_map_risk_runtime_parks_before_claiming_paths() {
 }
 
 #[test]
-fn acquired_map_risk_runtime_allows_claim_on_scheduler_fixture_repo() {
+fn simulation_acquire_records_synthetic_claim_without_map_risk_scan() {
     let (_temp, repo) = test_repository();
-    let evidence = PreclaimRunEvidence::acquire(&repo, SupervisorRuntime::Fake);
+    let evidence = PreclaimRunEvidence::acquire(
+        &repo,
+        SupervisorRuntime::Fake,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+    );
     let assignment = test_assignment("acquired-child", "README.md");
-    let risk = evidence
-        .risk_for(&assignment.assigned_paths)
-        .expect("fixture repo must produce a risk report");
+    assert!(
+        evidence.repo_map.is_none(),
+        "simulation must not require a scanned repository map"
+    );
+    assert!(
+        evidence.risk_for(&assignment.assigned_paths).is_none(),
+        "simulation must not require a scanned risk report"
+    );
     let decision = preclaim::evaluate_preclaim_viability(
         &assignment.id,
         evidence.repo_map.as_ref(),
-        Some(&risk),
+        None,
         evidence.runtime,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
     );
     assert!(
         decision.allows_path_claim(),
-        "fixture repo should supply map/risk/runtime: {}",
+        "simulation should record synthetic viability: {}",
         decision.reason
     );
+    assert_eq!(
+        decision.evidence_source,
+        preclaim::PreclaimEvidenceSource::SyntheticSimulation
+    );
+}
+
+#[test]
+fn verified_acquire_without_evidence_still_fails_closed() {
+    let decision = preclaim::evaluate_preclaim_viability(
+        "verified-child",
+        None,
+        None,
+        None,
+        SupervisorExecutionRuntime::Verified,
+    );
+    assert!(!decision.allows_path_claim());
+    assert_eq!(
+        decision.evidence_source,
+        preclaim::PreclaimEvidenceSource::Acquired
+    );
+    assert!(decision.reason.contains("missing map, risk, runtime"));
 }
 
 #[test]
