@@ -116,8 +116,8 @@ mod follow_up_cascade;
 use follow_up_cascade::*;
 #[cfg(test)]
 pub(crate) use follow_up_cascade::{
-    clear_generated_follow_up_queue_observer, set_before_generated_follow_up_plan_load_hook,
-    set_generated_follow_up_queue_observer,
+    clear_follow_up_cascade_test_isolation, clear_generated_follow_up_queue_observer,
+    set_before_generated_follow_up_plan_load_hook, set_generated_follow_up_queue_observer,
     set_interrupt_after_authenticated_follow_up_child_start,
     set_interrupt_after_follow_up_dispatch_started, set_interrupt_after_follow_up_enqueue,
 };
@@ -216,6 +216,7 @@ const GITLINK_MODE: u32 = 0o160000;
 const PRIMARY_INDEX_MAX_BYTES: usize = 64 * 1024 * 1024;
 const SNAPSHOT_GIT_CAPTURE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SNAPSHOT_GIT_TIMEOUT: Duration = Duration::from_secs(15);
+const SNAPSHOT_GIT_TRANSIENT_ATTEMPTS: u32 = 3;
 const MAX_SUPERVISOR_REPORT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SUPERVISOR_PROMPT_BYTES: usize = 1024 * 1024;
 const MAX_FIELD_GUIDE_ENTRIES_PER_REPORT: usize = 16;
