@@ -1468,6 +1468,10 @@ fn fake_supervise_run_finalizes_manifested_report_tree_events() {
             && event.payload[SUPERVISION_EDGE_FIELD]["legacy_role"] == "child_orchestrator"
             && event.payload[SUPERVISION_EDGE_FIELD]["scope_ref"]
                 == format!("assignment:{}", assignment.id)
+            && event.payload[ROLE_ASSIGNMENT_FIELD]["agent_id"] == assignment.id
+            && event.payload[ROLE_ASSIGNMENT_FIELD]["category"] == "delegating_coordinator"
+            && event.payload[ROLE_ASSIGNMENT_FIELD]["legacy_role"] == "child_orchestrator"
+            && event.payload[ROLE_ASSIGNMENT_FIELD]["source"] == "derived_from_plan_role"
     }));
     assert!(events.iter().any(|event| {
         event.kind == OrchestrationEventKind::Gate

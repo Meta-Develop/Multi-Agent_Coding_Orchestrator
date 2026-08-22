@@ -240,6 +240,32 @@ fn selection_decisions_schema_value() -> serde_json::Value {
     })
 }
 
+fn role_assignment_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["agent_id", "category", "legacy_role", "source", "reason"],
+        "properties": {
+            "agent_id": {"type": "string", "minLength": 1},
+            "category": {
+                "type": "string",
+                "enum": [
+                    "delegating_coordinator",
+                    "non_delegating_terminal_worker",
+                    "read_only_researcher",
+                    "read_only_review_auditor"
+                ]
+            },
+            "legacy_role": {"type": "string", "minLength": 1},
+            "source": {
+                "type": "string",
+                "enum": ["derived_from_plan_role", "operator_override"]
+            },
+            "reason": {"type": "string", "minLength": 1}
+        }
+    })
+}
+
 fn assignment_selection_ledger_schema_value() -> serde_json::Value {
     json!({
         "type": "array",
@@ -256,6 +282,7 @@ fn assignment_selection_ledger_schema_value() -> serde_json::Value {
                 "assignment_id": {"type": "string", "minLength": 1},
                 "attempt": {"type": "integer", "minimum": 0},
                 "role": agent_role_schema_value(),
+                "role_assignment": role_assignment_schema_value(),
                 "selection_source": {
                     "type": "string",
                     "enum": [

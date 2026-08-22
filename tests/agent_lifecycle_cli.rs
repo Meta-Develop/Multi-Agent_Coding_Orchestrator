@@ -70,11 +70,13 @@ fn agents_list_and_stop_json_surface_registered_process() -> Result<()> {
         String::from_utf8_lossy(&list.stderr)
     );
     let listed: Value = serde_json::from_slice(&list.stdout).context("parse agents list JSON")?;
-    assert_eq!(listed[0]["pid"], pid);
-    assert_eq!(listed[0]["role"], "worker");
-    assert_eq!(listed[0]["run_id"], "cli-run");
-    assert_eq!(listed[0]["task_id"], "cli-task");
-    assert!(listed[0].get("parent").is_none());
+    assert_eq!(listed["observed_coordination_depth"], 1);
+    assert_eq!(listed["agents"][0]["pid"], pid);
+    assert_eq!(listed["agents"][0]["role"], "worker");
+    assert_eq!(listed["agents"][0]["run_id"], "cli-run");
+    assert_eq!(listed["agents"][0]["task_id"], "cli-task");
+    assert_eq!(listed["agents"][0]["observed_depth"], 0);
+    assert!(listed["agents"][0].get("parent").is_none());
 
     let stop = Command::new(BIN)
         .args([
@@ -133,8 +135,10 @@ fn agents_list_json_exposes_parent_linkage() -> Result<()> {
         String::from_utf8_lossy(&list.stderr)
     );
     let listed: Value = serde_json::from_slice(&list.stdout).context("parse agents list JSON")?;
-    assert_eq!(listed[0]["pid"], pid);
-    assert_eq!(listed[0]["parent"], "cli-parent");
+    assert_eq!(listed["observed_coordination_depth"], 2);
+    assert_eq!(listed["agents"][0]["pid"], pid);
+    assert_eq!(listed["agents"][0]["parent"], "cli-parent");
+    assert_eq!(listed["agents"][0]["observed_depth"], 1);
     let _ = child.0.kill();
     Ok(())
 }

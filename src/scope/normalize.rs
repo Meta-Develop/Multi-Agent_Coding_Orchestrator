@@ -10,6 +10,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
+use crate::hierarchy_ledger::{
+    observe_hierarchy, orchestration_role_is_coordinator, ObservedHierarchyNode,
+};
 use crate::orchestration_event::{OrchestrationEvent, OrchestrationEventKind, OrchestrationRole};
 
 const RUN_FAMILIES: [(&str, &str); 5] = [
@@ -94,6 +97,9 @@ pub struct RunSummary {
     pub final_report_exists: bool,
     pub modified_unix_seconds: u64,
     pub event_count: usize,
+    /// Observed coordination-layer count derived from parent links.
+    /// This is an output of the recorded graph, not a launch-time tier input.
+    pub observed_coordination_depth: u32,
     #[serde(skip)]
     pub events: Vec<NormalizedEvent>,
     #[serde(skip)]
@@ -989,6 +995,7 @@ fn scan_repository(target: &RepositoryTarget) -> io::Result<ProjectSnapshot> {
                     final_report_exists,
                     modified_unix_seconds: unix_seconds(modified),
                     event_count: events.len(),
+                    observed_coordination_depth: observed_coordination_depth_from_events(&events),
                     events,
                     journal,
                 },
@@ -2021,6 +2028,26 @@ fn report_kind(report: &Value) -> OrchestrationEventKind {
     }
 }
 
+fn observed_coordination_depth_from_events(events: &[NormalizedEvent]) -> u32 {
+    let mut nodes = BTreeMap::new();
+    for event in events {
+        nodes.entry(event.node.as_str()).or_insert((
+            event.parent.as_deref(),
+            orchestration_role_is_coordinator(event.role),
+        ));
+    }
+    observe_hierarchy(
+        nodes
+            .iter()
+            .map(|(id, (parent, coordinator))| ObservedHierarchyNode {
+                id,
+                parent: *parent,
+                coordinator: *coordinator,
+            }),
+    )
+    .coordination_depth
+}
+
 fn infer_report_role(node: &str, fallback_node: &str, run_id: &str) -> OrchestrationRole {
     if node.ends_with("-review-auditor") || fallback_node.ends_with("-review-auditor") {
         OrchestrationRole::Auditor
@@ -2955,6 +2982,55 @@ mod tests {
         assert_eq!(escalation.parent.as_deref(), Some("o2-0001"));
         assert_eq!(escalation.payload["origin"], "finding-node");
         assert_eq!(escalation.payload["inferred"], true);
+        let fallback_run = snapshot.projects[0]
+            .runs
+            .iter()
+            .find(|run| run.run == "run-fallback")
+            .expect("fallback run summary");
+        assert_eq!(fallback_run.observed_coordination_depth, 2);
+    }
+
+    #[test]
+    fn scope_reports_observed_coordination_depth_for_flat_and_three_layer_graphs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write(
+            &temp
+                .path()
+                .join(".maco/o2/runs/flat-run/assignments/supervisor-plan.json"),
+            r#"{"assignments":[]}"#,
+        );
+        write(
+            &temp
+                .path()
+                .join(".maco/o2/runs/three-layer/assignments/supervisor-plan.json"),
+            r#"{
+                "assignments":[{
+                    "id":"o1-a","role":"child_orchestrator",
+                    "assignments":[{
+                        "id":"o1-b","role":"child_orchestrator",
+                        "worker_assignments":[{"id":"worker-a","role":"worker"}]
+                    }]
+                }]
+            }"#,
+        );
+
+        let snapshot = scan_repositories(&[target(temp.path())]).expect("scan depths");
+        let flat = snapshot.projects[0]
+            .runs
+            .iter()
+            .find(|run| run.run == "flat-run")
+            .expect("flat run");
+        let three = snapshot.projects[0]
+            .runs
+            .iter()
+            .find(|run| run.run == "three-layer")
+            .expect("three-layer run");
+        assert_eq!(flat.observed_coordination_depth, 1);
+        assert_eq!(three.observed_coordination_depth, 3);
+        assert_ne!(
+            three.observed_coordination_depth, 2,
+            "three coordination layers must not be reported as the fixed two-tier shape"
+        );
     }
 
     #[test]
