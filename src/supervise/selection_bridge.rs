@@ -45,7 +45,7 @@ pub(super) fn advertised_catalogs_for_launch(repo: &Path) -> Result<AdvertisedCa
     #[cfg(test)]
     {
         let _ = repo;
-        return advertised_catalogs_from_test_fixtures();
+        advertised_catalogs_from_test_fixtures()
     }
     #[cfg(not(test))]
     {
