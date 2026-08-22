@@ -1736,10 +1736,7 @@ fn external_side_effect_profile(
     protected_controls: &ProtectedWorktreeControls,
 ) -> Result<SideEffectConfinementProfile> {
     if program_trust != ExternalProgramTrust::TrustedSystemCodex
-        && !matches!(
-            spec.invocation,
-            ExternalAgentInvocation::Grok | ExternalAgentInvocation::Cursor
-        )
+        && !spec.invocation.is_adapter_subprocess()
     {
         bail!("provider-network confinement is reserved for the trusted system Codex executable");
     }
@@ -1757,7 +1754,9 @@ fn external_side_effect_profile(
         ExternalAgentInvocation::CodexSupervisor
         | ExternalAgentInvocation::CodexConsultant
         | ExternalAgentInvocation::Grok
-        | ExternalAgentInvocation::Cursor => {
+        | ExternalAgentInvocation::Cursor
+        | ExternalAgentInvocation::ClaudeCode
+        | ExternalAgentInvocation::GeminiCli => {
             let mut profile = match spec.workspace_access {
                 WorkspaceAccess::ReadOnly => ExternalCodexProfile::read_only(&spec.cwd),
                 WorkspaceAccess::ReadWrite => ExternalCodexProfile::read_write(&spec.cwd),
@@ -1820,7 +1819,13 @@ fn external_side_effect_profile(
             Ok(SideEffectConfinementProfile::ExternalCodex(profile))
         }
         ExternalAgentInvocation::ClaudeConsultant => {
-            bail!("Claude consultant has no enforceable fixed-network capability")
+            let capability = crate::runtime_adapter::AdapterId::ClaudeCode
+                .capabilities()
+                .read_only_inner_contract_refusal()
+                .unwrap_or("side_effect_confinement != verified");
+            bail!(
+                "Claude consultant has no enforceable fixed-network capability ({capability})"
+            )
         }
     }
 }
@@ -2280,9 +2285,10 @@ fn command_argv_with_controls(
         ExternalAgentInvocation::CodexSupervisor => Ok(codex_supervisor_argv(spec, controls)),
         ExternalAgentInvocation::CodexConsultant => Ok(codex_consultant_argv(spec, controls)),
         ExternalAgentInvocation::ClaudeConsultant => Ok(claude_consultant_argv()),
-        ExternalAgentInvocation::Grok | ExternalAgentInvocation::Cursor => {
-            runtime_adapter_argv(spec)
-        }
+        ExternalAgentInvocation::Grok
+        | ExternalAgentInvocation::Cursor
+        | ExternalAgentInvocation::ClaudeCode
+        | ExternalAgentInvocation::GeminiCli => runtime_adapter_argv(spec),
     }
 }
 
@@ -2291,6 +2297,8 @@ fn runtime_adapter_argv(spec: &ExternalAgentCommand) -> Result<Vec<OsString>> {
         RuntimeAdapterConfig::defaults(match spec.invocation {
             ExternalAgentInvocation::Grok => RuntimeId::Grok,
             ExternalAgentInvocation::Cursor => RuntimeId::Cursor,
+            ExternalAgentInvocation::ClaudeCode => RuntimeId::ClaudeCode,
+            ExternalAgentInvocation::GeminiCli => RuntimeId::GeminiCli,
             _ => RuntimeId::Codex,
         })
     });

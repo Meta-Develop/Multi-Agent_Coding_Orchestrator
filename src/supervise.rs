@@ -859,7 +859,10 @@ impl RuntimeModelCatalog {
             )
             .map(Self::Codex),
             SupervisorRuntime::Fake => Ok(Self::LocalDeterministicFake),
-            SupervisorRuntime::Grok | SupervisorRuntime::Cursor => Ok(Self::OperatorDeclared),
+            SupervisorRuntime::Grok
+            | SupervisorRuntime::Cursor
+            | SupervisorRuntime::ClaudeCode
+            | SupervisorRuntime::GeminiCli => Ok(Self::OperatorDeclared),
         }
     }
 
@@ -880,18 +883,21 @@ impl RuntimeModelCatalog {
             (Self::LocalDeterministicFake, SupervisorRuntime::Fake) => {
                 Ok(RoleModelAvailability::Unavailable)
             }
-            (Self::OperatorDeclared, SupervisorRuntime::Grok | SupervisorRuntime::Cursor) => {
+            (Self::OperatorDeclared, runtime) if runtime.is_adapter_subprocess() => {
                 Ok(RoleModelAvailability::Available)
             }
             (Self::Codex(_), SupervisorRuntime::Fake)
             | (Self::LocalDeterministicFake, SupervisorRuntime::Codex)
-            | (Self::Codex(_), SupervisorRuntime::Grok | SupervisorRuntime::Cursor)
             | (Self::OperatorDeclared, SupervisorRuntime::Codex)
-            | (Self::OperatorDeclared, SupervisorRuntime::Fake)
-            | (Self::LocalDeterministicFake, SupervisorRuntime::Grok | SupervisorRuntime::Cursor) =>
+            | (Self::OperatorDeclared, SupervisorRuntime::Fake) => {
+                bail!("runtime model catalog does not match the selected supervisor runtime")
+            }
+            (Self::Codex(_), runtime) | (Self::LocalDeterministicFake, runtime)
+                if runtime.is_adapter_subprocess() =>
             {
                 bail!("runtime model catalog does not match the selected supervisor runtime")
             }
+            _ => bail!("runtime model catalog does not match the selected supervisor runtime"),
         }
     }
 

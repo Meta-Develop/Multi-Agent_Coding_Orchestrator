@@ -298,13 +298,7 @@ fn sanitize_supervisor_report(
     SanitizedSupervisorReport {
         version: report.version,
         run_id: report.run_id.as_str().to_string(),
-        runtime: match report.runtime {
-            SupervisorRuntime::Codex => "codex",
-            SupervisorRuntime::Fake => "fake",
-            SupervisorRuntime::Grok => "grok",
-            SupervisorRuntime::Cursor => "cursor",
-        }
-        .to_string(),
+        runtime: report.runtime.as_str().to_string(),
         publishable: report.publishable,
         success: report.success,
         status: review_status_label(report.status).to_string(),

@@ -896,10 +896,12 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 plan_file,
                 run_id: resolved_run_id.clone(),
                 parent_node: args.parent_node.map(Into::into),
-                codex_bin: args.runtime_bin.unwrap_or_else(|| match runtime {
-                    supervise::SupervisorRuntime::Grok => PathBuf::from("grok"),
-                    supervise::SupervisorRuntime::Cursor => PathBuf::from("cursor-agent"),
-                    _ => args.codex_bin,
+                codex_bin: args.runtime_bin.unwrap_or_else(|| {
+                    if runtime.is_adapter_subprocess() {
+                        PathBuf::from(runtime.default_binary())
+                    } else {
+                        args.codex_bin
+                    }
                 }),
                 runtime,
                 allow_dirty_primary: args.allow_dirty_primary,
@@ -968,10 +970,11 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     assignment_id: args.assignment_id,
                     run_id: resolved.run_id.clone(),
                     codex_bin: args.runtime_bin.unwrap_or_else(|| {
-                        match args.runtime.unwrap_or(supervise::SupervisorRuntime::Codex) {
-                            supervise::SupervisorRuntime::Grok => PathBuf::from("grok"),
-                            supervise::SupervisorRuntime::Cursor => PathBuf::from("cursor-agent"),
-                            _ => args.codex_bin,
+                        let runtime = args.runtime.unwrap_or(supervise::SupervisorRuntime::Codex);
+                        if runtime.is_adapter_subprocess() {
+                            PathBuf::from(runtime.default_binary())
+                        } else {
+                            args.codex_bin
                         }
                     }),
                     runtime: args.runtime.unwrap_or(supervise::SupervisorRuntime::Codex),

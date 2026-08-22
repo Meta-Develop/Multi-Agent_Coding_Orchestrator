@@ -9,8 +9,7 @@ use std::fmt::{Display, Formatter};
 
 use super::RuntimeId;
 
-/// Stable adapter identity, including runtimes that are not yet selectable via
-/// [`RuntimeId`] because supervisor/execution match arms live outside this module.
+/// Stable adapter identity. Every registered adapter is selectable via [`RuntimeId`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AdapterId {
@@ -88,6 +87,8 @@ impl AdapterId {
             RuntimeId::Fake => Self::Fake,
             RuntimeId::Grok => Self::Grok,
             RuntimeId::Cursor => Self::Cursor,
+            RuntimeId::ClaudeCode => Self::ClaudeCode,
+            RuntimeId::GeminiCli => Self::GeminiCli,
         }
     }
 
@@ -97,7 +98,8 @@ impl AdapterId {
             Self::Fake => Some(RuntimeId::Fake),
             Self::Grok => Some(RuntimeId::Grok),
             Self::Cursor => Some(RuntimeId::Cursor),
-            Self::ClaudeCode | Self::GeminiCli => None,
+            Self::ClaudeCode => Some(RuntimeId::ClaudeCode),
+            Self::GeminiCli => Some(RuntimeId::GeminiCli),
         }
     }
 
@@ -400,6 +402,17 @@ impl RuntimeCapabilities {
         ]
     }
 
+    /// Read-only consultant admission requires verified side-effect confinement.
+    pub const fn read_only_inner_contract_refusal(self) -> Option<&'static str> {
+        if !matches!(
+            self.side_effect_confinement,
+            SideEffectConfinement::Verified
+        ) {
+            return Some("side_effect_confinement != verified");
+        }
+        None
+    }
+
     /// Writable release is refused unless every tool action can be blocked on a MACO callback.
     pub const fn writable_refusal(self) -> Option<&'static str> {
         if !matches!(
@@ -597,6 +610,41 @@ mod tests {
             serde_json::from_str::<AdapterId>(&json).unwrap(),
             AdapterId::GeminiCli
         );
+    }
+
+    #[test]
+    fn claude_and_gemini_are_first_class_runtime_ids() {
+        assert_eq!(
+            AdapterId::ClaudeCode.to_runtime_id(),
+            Some(RuntimeId::ClaudeCode)
+        );
+        assert_eq!(
+            AdapterId::GeminiCli.to_runtime_id(),
+            Some(RuntimeId::GeminiCli)
+        );
+        assert_eq!(
+            serde_json::to_string(&RuntimeId::ClaudeCode).unwrap(),
+            "\"claude-code\""
+        );
+        assert_eq!(
+            serde_json::from_str::<RuntimeId>("\"claude-code\"").unwrap(),
+            RuntimeId::ClaudeCode
+        );
+        assert_eq!(
+            serde_json::from_str::<RuntimeId>("\"gemini-cli\"").unwrap(),
+            RuntimeId::GeminiCli
+        );
+        assert!(RuntimeId::ClaudeCode.is_adapter_subprocess());
+        assert!(RuntimeId::GeminiCli.is_adapter_subprocess());
+        assert_eq!(
+            RuntimeCapabilities::CLAUDE_CODE.read_only_inner_contract_refusal(),
+            Some("side_effect_confinement != verified")
+        );
+        assert_eq!(
+            RuntimeCapabilities::CLAUDE_CODE.writable_refusal(),
+            Some("blocking_pre_action_callback != All")
+        );
+        assert!(!RuntimeCapabilities::CLAUDE_CODE.admits_writable_release());
     }
 
     #[test]

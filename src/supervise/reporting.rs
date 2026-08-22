@@ -350,7 +350,10 @@ fn external_process_quiescent_for_scratch(
         SupervisorRuntime::Codex => run.scratch_quiescence_verified(),
         // Fake mode is an in-process serializer and never launches a child.
         SupervisorRuntime::Fake => true,
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor => run.scratch_quiescence_verified(),
+        SupervisorRuntime::Grok
+        | SupervisorRuntime::Cursor
+        | SupervisorRuntime::ClaudeCode
+        | SupervisorRuntime::GeminiCli => run.scratch_quiescence_verified(),
     }
 }
 
@@ -1284,7 +1287,10 @@ pub(super) fn external_safety_verified(run: &ExternalAgentRun, runtime: Supervis
         SupervisorRuntime::Fake => {
             run.simulation_succeeded() && run.program_trust == ExternalProgramTrust::ExplicitCustom
         }
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor => {
+        SupervisorRuntime::Grok
+        | SupervisorRuntime::Cursor
+        | SupervisorRuntime::ClaudeCode
+        | SupervisorRuntime::GeminiCli => {
             run.process_tree
                 .is_some_and(ProcessTreeEvidence::is_verified_empty)
                 && run

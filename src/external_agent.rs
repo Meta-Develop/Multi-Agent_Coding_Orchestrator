@@ -20,7 +20,7 @@ use crate::process_runner::{
     WorkspaceAccess,
 };
 use crate::protected_path::{DeclaredPathCoordinate, ProtectedPathSpec};
-use crate::runtime_adapter::{LaunchContext, RuntimeAdapterConfig, RuntimeId};
+use crate::runtime_adapter::{AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId};
 use crate::safe_state::unsigned_to_u32;
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
 use anyhow::{bail, Context, Result};
@@ -231,6 +231,17 @@ pub enum ExternalAgentInvocation {
     ClaudeConsultant,
     Grok,
     Cursor,
+    ClaudeCode,
+    GeminiCli,
+}
+
+impl ExternalAgentInvocation {
+    pub const fn is_adapter_subprocess(self) -> bool {
+        matches!(
+            self,
+            Self::Grok | Self::Cursor | Self::ClaudeCode | Self::GeminiCli
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -692,12 +703,16 @@ impl ExternalAgentCommand {
         runtime: RuntimeId,
         mut config: RuntimeAdapterConfig,
     ) -> Self {
-        if matches!(runtime, RuntimeId::Grok | RuntimeId::Cursor) {
+        if runtime.is_adapter_subprocess() {
             config.binary = Some(self.program.clone());
             self.invocation = match runtime {
                 RuntimeId::Grok => ExternalAgentInvocation::Grok,
                 RuntimeId::Cursor => ExternalAgentInvocation::Cursor,
-                _ => unreachable!(),
+                RuntimeId::ClaudeCode => ExternalAgentInvocation::ClaudeCode,
+                RuntimeId::GeminiCli => ExternalAgentInvocation::GeminiCli,
+                RuntimeId::Codex | RuntimeId::Fake => {
+                    return self;
+                }
             };
             self.runtime_adapter = Some(config);
         }
@@ -1576,14 +1591,19 @@ fn run_external_agent_runtime(
 
     if spec.invocation == ExternalAgentInvocation::ClaudeConsultant {
         report.duration_ms = duration_millis(started.elapsed());
+        let capability = AdapterId::ClaudeCode
+            .capabilities()
+            .read_only_inner_contract_refusal()
+            .unwrap_or("read_only_inner_contract unmet");
         record_environment_failure(
             &mut report,
             EnvironmentFailureCategory::SandboxUnavailable,
             Some(EnvironmentRequirement::sandbox(
                 EnvironmentSandboxCapability::VerifiedExternalCodex,
             )),
-            "external Claude runtime is refused because no enforceable inner read-only permission contract is available"
-                .to_string(),
+            format!(
+                "external Claude runtime is refused because no enforceable inner read-only permission contract is available ({capability})"
+            ),
         );
         return report;
     }
@@ -1594,10 +1614,7 @@ fn run_external_agent_runtime(
     // side effect in the first place.
     if runtime == ExternalExecutionRuntime::Verified
         && program_trust == ExternalProgramTrust::ExplicitCustom
-        && !matches!(
-            spec.invocation,
-            ExternalAgentInvocation::Grok | ExternalAgentInvocation::Cursor
-        )
+        && !spec.invocation.is_adapter_subprocess()
     {
         report.duration_ms = duration_millis(started.elapsed());
         record_environment_failure(
@@ -1704,10 +1721,8 @@ fn run_external_agent_runtime(
 
     let side_effect_profile = if runtime == ExternalExecutionRuntime::Verified
         && (program_trust == ExternalProgramTrust::TrustedSystemCodex
-            || matches!(
-                spec.invocation,
-                ExternalAgentInvocation::Grok | ExternalAgentInvocation::Cursor
-            )) {
+            || spec.invocation.is_adapter_subprocess())
+    {
         match external_side_effect_profile(
             &target_spec,
             &resolved_program,
@@ -2775,10 +2790,7 @@ fn record_completed_target(
             );
         }
     }
-    let adapter_runtime = matches!(
-        context.spec.invocation,
-        ExternalAgentInvocation::Grok | ExternalAgentInvocation::Cursor
-    );
+    let adapter_runtime = context.spec.invocation.is_adapter_subprocess();
     report.publishable = context.runtime == ExternalExecutionRuntime::Verified
         && safety_verified
         && (adapter_runtime

@@ -15,7 +15,10 @@ fn selected_runtime_program(
         SupervisorRuntime::Codex if options.runtime == SupervisorRuntime::Codex => {
             options.codex_bin.clone()
         }
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor => {
+        SupervisorRuntime::Grok
+        | SupervisorRuntime::Cursor
+        | SupervisorRuntime::ClaudeCode
+        | SupervisorRuntime::GeminiCli => {
             crate::runtime_adapter::RuntimeAdapterConfig::from_environment(launch_runtime)
                 .binary
                 .filter(|path| !path.as_os_str().is_empty())
@@ -35,10 +38,7 @@ fn bind_selected_runtime_launch(
     launch_runtime: SupervisorRuntime,
     catalog: &RuntimeModelCatalog,
 ) -> Result<ExternalAgentCommand> {
-    if matches!(
-        launch_runtime,
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor
-    ) {
+    if launch_runtime.is_adapter_subprocess() {
         if assignment.role != AgentRole::Worker {
             bail!(
                 "selected runtime '{}' cannot launch judgment or delegating role '{}'",
@@ -76,10 +76,7 @@ pub(super) fn prerender_selected_runtime_adapter_command(
     command: &ExternalAgentCommand,
     launch_runtime: SupervisorRuntime,
 ) -> Result<()> {
-    if !matches!(
-        launch_runtime,
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor
-    ) {
+    if !launch_runtime.is_adapter_subprocess() {
         return Ok(());
     }
     let config = command.runtime_adapter.as_ref().with_context(|| {
@@ -1118,7 +1115,10 @@ fn dispatch_and_collect_child_attempt<'a>(
                 }
             }
         }
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor => {
+        SupervisorRuntime::Grok
+        | SupervisorRuntime::Cursor
+        | SupervisorRuntime::ClaudeCode
+        | SupervisorRuntime::GeminiCli => {
             if let Err(error) = budget_reservation.mark_invoked() {
                 drop(incoming_output_root);
                 drop(capture_output_root);
@@ -1928,10 +1928,7 @@ fn prepare_parent_auditor<'a>(
         &auditor_report_path,
         Duration::from_secs(plan.child_timeout_seconds),
     );
-    if matches!(
-        options.runtime,
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor
-    ) {
+    if options.runtime.is_adapter_subprocess() {
         auditor_command = auditor_command.with_runtime_adapter(
             options.runtime,
             crate::runtime_adapter::RuntimeAdapterConfig::from_environment(options.runtime),
@@ -2194,7 +2191,10 @@ fn dispatch_and_collect_parent_auditor(
                 }
             }
         }
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor => {
+        SupervisorRuntime::Grok
+        | SupervisorRuntime::Cursor
+        | SupervisorRuntime::ClaudeCode
+        | SupervisorRuntime::GeminiCli => {
             if let Err(error) = auditor_budget_reservation.mark_invoked() {
                 drop(auditor_incoming_root);
                 drop(auditor_capture_root);
@@ -4016,6 +4016,29 @@ done
     }
 
     #[test]
+    fn supervise_plan_accepts_claude_code_runtime_without_closing_writable_release() -> Result<()> {
+        let assignment: OrchestratorAssignment = serde_json::from_str(
+            r#"{
+                "id": "worker-claude",
+                "runtime": "claude-code",
+                "role": "worker",
+                "assigned_paths": ["README.md"]
+            }"#,
+        )?;
+        assert_eq!(assignment.runtime, Some(SupervisorRuntime::ClaudeCode));
+        assert_eq!(
+            SupervisorRuntime::ClaudeCode
+                .capabilities()
+                .writable_refusal(),
+            Some("blocking_pre_action_callback != All")
+        );
+        assert!(!SupervisorRuntime::ClaudeCode
+            .capabilities()
+            .admits_writable_release());
+        Ok(())
+    }
+
+    #[test]
     fn assignment_launch_uses_selected_runtime_pair_not_run_global() -> Result<()> {
         let mut assignment = OrchestratorAssignment {
             id: "worker-a".to_string(),
@@ -4049,6 +4072,33 @@ done
         assert_eq!(
             command.program,
             PathBuf::from(SupervisorRuntime::Cursor.default_binary())
+        );
+
+        assignment.runtime = Some(SupervisorRuntime::ClaudeCode);
+        assignment.role = AgentRole::Worker;
+        assert_eq!(
+            assignment_launch_runtime(&assignment, &options),
+            SupervisorRuntime::ClaudeCode
+        );
+        let command = bind_selected_runtime_launch(
+            launch_fixture_command(),
+            &assignment,
+            &worker_plan("claude-sonnet-4-5"),
+            &options,
+            SupervisorRuntime::ClaudeCode,
+            &RuntimeModelCatalog::OperatorDeclared,
+        )?;
+        assert!(command.runtime_adapter.is_some());
+        assert_eq!(command.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(
+            command.program,
+            PathBuf::from(SupervisorRuntime::ClaudeCode.default_binary())
+        );
+        assert_eq!(
+            SupervisorRuntime::ClaudeCode
+                .capabilities()
+                .writable_refusal(),
+            Some("blocking_pre_action_callback != All")
         );
 
         assignment.role = AgentRole::ChildOrchestrator;

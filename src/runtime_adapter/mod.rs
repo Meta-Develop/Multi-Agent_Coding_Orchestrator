@@ -36,6 +36,10 @@ pub enum RuntimeId {
     Fake,
     Grok,
     Cursor,
+    #[serde(rename = "claude-code")]
+    ClaudeCode,
+    #[serde(rename = "gemini-cli")]
+    GeminiCli,
 }
 
 /// Common launch boundary implemented by every subprocess runtime adapter.
@@ -204,6 +208,10 @@ pub fn adapter_for(id: AdapterId) -> Box<dyn AgentRuntimeAdapter> {
 }
 
 impl RuntimeId {
+    pub const fn as_str(self) -> &'static str {
+        AdapterId::from_runtime(self).as_str()
+    }
+
     pub const fn default_binary(self) -> &'static str {
         AdapterId::from_runtime(self).default_binary()
     }
@@ -214,6 +222,11 @@ impl RuntimeId {
 
     pub const fn capabilities(self) -> RuntimeCapabilities {
         AdapterId::from_runtime(self).capabilities()
+    }
+
+    /// Non-Codex, non-Fake subprocess CLIs launched through the adapter boundary.
+    pub const fn is_adapter_subprocess(self) -> bool {
+        !matches!(self, Self::Codex | Self::Fake)
     }
 }
 
