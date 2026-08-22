@@ -3286,7 +3286,8 @@ fn publication_network_capability_callsites_are_exactly_audited() {
             "process_runner.rs",
             "publication.rs",
             "publication.rs",
-            "runtime_adapter.rs"
+            "runtime_adapter.rs",
+            "supervise.rs",
         ]
     );
     assert_eq!(runners, ["publication.rs", "publication.rs"]);
