@@ -8,12 +8,19 @@
 mod capabilities;
 pub mod cursor;
 pub mod grok;
+pub mod hosted_callback;
 
 pub use capabilities::{
     parse_adapter_allowlist, registered_adapter_ids, AdapterId, AdapterTrustClass,
     BlockingPreActionCallback, CapabilityMatrix, CapabilityMatrixCell, CapabilityMatrixRow,
     MatrixStatus, ModelCatalogSource, PrivateRuntimeStateHome, RuntimeCapabilities, SessionResume,
     SideEffectConfinement, UsageReporting, WorkspaceWritability,
+};
+pub use hosted_callback::{
+    capabilities_with_hosted_callback, review_pretooluse, writable_leaf_launch_refusal_with_host,
+    ClaudePreToolUseHost, HostedActionKind, HostedCallbackAttachment, HostedCallbackDecision,
+    HostedCallbackFixtureRunner, HostedCallbackPolicy, HostedHookResult, HostedPreActionGate,
+    ProposedHostedAction,
 };
 
 use anyhow::{bail, Context, Result};
@@ -128,13 +135,37 @@ impl AgentRuntimeAdapter for GeminiAdapter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeCodeAdapter {
     config: RuntimeAdapterConfig,
+    hosted_callback: Option<HostedCallbackAttachment>,
 }
 
 impl ClaudeCodeAdapter {
     pub fn from_environment() -> Self {
         Self {
             config: RuntimeAdapterConfig::from_adapter_environment(AdapterId::ClaudeCode),
+            hosted_callback: None,
         }
+    }
+
+    pub fn attach_hosted_pretooluse(
+        &mut self,
+        root: impl AsRef<Path>,
+    ) -> Result<&HostedCallbackAttachment> {
+        let host = ClaudePreToolUseHost::attach(root.as_ref())?;
+        self.hosted_callback = Some(host.into_attachment());
+        self.hosted_callback
+            .as_ref()
+            .context("hosted PreToolUse attachment vanished after install")
+    }
+
+    pub fn hosted_callback(&self) -> Option<&HostedCallbackAttachment> {
+        self.hosted_callback.as_ref()
+    }
+
+    pub fn require_writable_release(&self) -> Result<()> {
+        if let Some(reason) = self.capabilities().writable_refusal() {
+            bail!("writable Claude Code launch failed closed: {reason}");
+        }
+        Ok(())
     }
 }
 
@@ -145,6 +176,34 @@ impl AgentRuntimeAdapter for ClaudeCodeAdapter {
 
     fn config(&self) -> &RuntimeAdapterConfig {
         &self.config
+    }
+
+    fn capabilities(&self) -> RuntimeCapabilities {
+        capabilities_with_hosted_callback(self.hosted_callback.as_ref())
+    }
+
+    fn launch(&self, context: &LaunchContext<'_>) -> Result<LaunchSpec> {
+        let mut spec = self.config().render(context)?;
+        if let Some(host) = &self.hosted_callback {
+            if !host.covers_all_actions() {
+                bail!(
+                    "Claude Code launch failed closed: hosted PreToolUse callback does not cover every action"
+                );
+            }
+            spec.env.insert(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                host.claude_config_dir().display().to_string(),
+            );
+            spec.env.insert(
+                "MACO_HOSTED_CALLBACK_DIR".to_string(),
+                host.callback_dir().display().to_string(),
+            );
+            if !spec.argv.iter().any(|arg| arg == "--permission-mode") {
+                spec.argv
+                    .extend(["--permission-mode".to_string(), "dontAsk".to_string()]);
+            }
+        }
+        Ok(spec)
     }
 }
 
@@ -1065,6 +1124,45 @@ mod tests {
             .argv
             .iter()
             .any(|arg| arg == "--output" || arg == "--cwd"));
+        Ok(())
+    }
+
+    #[test]
+    fn attached_claude_launch_injects_hosted_pretooluse_env() -> Result<()> {
+        let mut adapter = ClaudeCodeAdapter::from_environment();
+        let unattached = adapter.launch(&launch_context(
+            Path::new("prompt.txt"),
+            Some("sonnet"),
+            Some("high"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert!(!unattached.env.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!unattached.argv.iter().any(|arg| arg == "--permission-mode"));
+
+        let temp = tempfile::tempdir()?;
+        adapter.attach_hosted_pretooluse(temp.path())?;
+        let spec = adapter.launch(&launch_context(
+            Path::new("prompt.txt"),
+            Some("sonnet"),
+            Some("high"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        let host = adapter.hosted_callback().expect("attached host");
+        assert_eq!(
+            spec.env.get("CLAUDE_CONFIG_DIR"),
+            Some(&host.claude_config_dir().display().to_string())
+        );
+        assert_eq!(
+            spec.env.get("MACO_HOSTED_CALLBACK_DIR"),
+            Some(&host.callback_dir().display().to_string())
+        );
+        assert!(spec
+            .argv
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "dontAsk"]));
+        assert!(adapter.capabilities().admits_writable_release());
         Ok(())
     }
 

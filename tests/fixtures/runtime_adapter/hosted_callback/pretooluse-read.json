@@ -1,0 +1,1 @@
+{"hook_event_name":"PreToolUse","session_id":"sess-read","cwd":"/workspace","transcript_path":"/tmp/transcript.jsonl","tool_name":"Read","tool_input":{"file_path":"/workspace/README.md"},"tool_use_id":"toolu-read"}
