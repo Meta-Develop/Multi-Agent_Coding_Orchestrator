@@ -1,4 +1,5 @@
 pub mod review_loop;
+pub mod review_loop_entry;
 
 use crate::{
     artifacts::{
@@ -496,6 +497,8 @@ pub struct InboxScanReport {
     pub candidate_count: usize,
     pub selected_count: usize,
     pub items: Vec<InboxItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_loops: Vec<review_loop_entry::InboxReviewLoopReport>,
     pub next_action: String,
 }
 
@@ -1065,6 +1068,8 @@ pub struct InboxItemRunReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autopilot_success: Option<bool>,
     pub github_success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_loop: Option<review_loop_entry::InboxReviewLoopReport>,
     pub next_action: String,
 }
 
@@ -1353,6 +1358,7 @@ fn scan_inbox_with_overrides(
             .then_with(|| left.item_id.cmp(&right.item_id))
     });
     apply_scan_decisions(&mut items, loaded.config.selection.max_items);
+    let review_loops = review_loop_entry::evaluate_inbox_scan_review_loops(&items);
 
     let selected_count = items.iter().filter(|item| item.selected).count();
     let candidate_count = items.len();
@@ -1372,6 +1378,7 @@ fn scan_inbox_with_overrides(
             candidate_count,
             selected_count,
             items,
+            review_loops,
             next_action: "resolve inbox safety refusals, then scan again".to_string(),
         });
     }
@@ -1388,6 +1395,7 @@ fn scan_inbox_with_overrides(
         candidate_count,
         selected_count,
         items,
+        review_loops,
         next_action: if selected_count == 0 {
             "no safe non-duplicate inbox items selected".to_string()
         } else {
@@ -2395,6 +2403,14 @@ fn run_inbox_item(
     let config = context.config;
     revalidate_inbox_item_source(repo, item)
         .context("inbox source changed before item processing started")?;
+    let review_loop = review_loop_entry::evaluate_inbox_item_review_loop(item);
+    if let Some(report) = &review_loop {
+        write_private_artifact_json(
+            writer,
+            format!("item-{item_index}-review-loop.json"),
+            report,
+        )?;
+    }
     let plan = autopilot_plan_for_item(item, config, permission_mode)?;
     let plan_relative = PathBuf::from(format!("item-{item_index}-plan.json"));
     write_private_artifact_json(writer, &plan_relative, &plan)?;
@@ -2456,6 +2472,7 @@ fn run_inbox_item(
             ),
             autopilot_success: None,
             github_success: true,
+            review_loop,
             next_action: if planned_only {
                 "review the plan; this permission mode does not launch work".to_string()
             } else {
@@ -2544,6 +2561,7 @@ fn run_inbox_item(
         ),
         autopilot_success: Some(autopilot_success),
         github_success: github_report.success,
+        review_loop,
         next_action: if success {
             "review the generated autopilot and GitHub reports".to_string()
         } else {
