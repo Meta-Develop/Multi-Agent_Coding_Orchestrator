@@ -1438,6 +1438,7 @@ fn supervise_and_autopilot_budget_flags_parse_validate_and_bind_hard_limits() {
         assert_eq!(budget.limits().hard_tokens, Some(12_000));
         assert_eq!(budget.limits().hard_cost_usd, Some(1.25));
         assert_eq!(budget.max_duration_seconds(), Some(900));
+        assert!(budget.rolling_quota().is_none());
 
         for (flag, value) in [
             ("--max-tokens", "0"),
@@ -1469,6 +1470,53 @@ fn supervise_and_autopilot_budget_flags_parse_validate_and_bind_hard_limits() {
     ];
     aliases.extend(retention);
     assert!(Cli::try_parse_from(aliases).is_ok());
+
+    for command in ["supervise", "autopilot"] {
+        let mut argv = vec![
+            "maco",
+            command,
+            "run",
+            "plan.json",
+            "--max-rolling-tokens",
+            "50000",
+            "--max-rolling-cost-usd",
+            "12.5",
+            "--rolling-window-seconds",
+            "3600",
+        ];
+        argv.extend(retention);
+        let parsed = Cli::try_parse_from(argv)
+            .unwrap_or_else(|error| panic!("{command} rolling budget flags must parse: {error}"));
+        let budget = match parsed.command {
+            Command::Supervise(SuperviseCommand {
+                command: SuperviseSubcommand::Run(args),
+            }) => args.budget,
+            Command::Autopilot(AutopilotCommand {
+                command: AutopilotSubcommand::Run(args),
+            }) => args.budget,
+            _ => panic!("expected {command} run command"),
+        };
+        let rolling = budget
+            .rolling_quota()
+            .expect("rolling quota must bind from CLI flags");
+        assert_eq!(rolling.max_tokens, Some(50_000));
+        assert_eq!(rolling.max_cost_usd, Some(12.5));
+        assert_eq!(rolling.window_seconds, 3_600);
+
+        for (flag, value) in [
+            ("--max-rolling-tokens", "0"),
+            ("--max-rolling-cost-usd", "0"),
+            ("--max-rolling-cost-usd", "NaN"),
+            ("--rolling-window-seconds", "0"),
+        ] {
+            let mut invalid = vec!["maco", command, "run", "plan.json", flag, value];
+            invalid.extend(retention);
+            assert!(
+                Cli::try_parse_from(invalid).is_err(),
+                "{command} accepted nonsense {flag}={value}"
+            );
+        }
+    }
 }
 
 #[test]

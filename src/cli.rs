@@ -834,6 +834,7 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             print_query_report(&plan, json)
         }
         SuperviseSubcommand::Run(args) => {
+            let rolling_quota = args.budget.rolling_quota();
             let budget_overrides = args.budget.limits();
             let budget_max_duration_seconds = args.budget.max_duration_seconds();
             let (plan_file, goal_spec) = match (args.supervisor_plan, args.from_goal) {
@@ -895,6 +896,15 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             });
             let json = args.json;
             let reap_repo = resolved_repo.clone();
+            let _rolling_guard = rolling_quota
+                .map(|quota| {
+                    crate::budget_ledger::bind_rolling_budget(
+                        &resolved_repo,
+                        quota,
+                        resolved_run_id.as_str(),
+                    )
+                })
+                .transpose()?;
             let options = SupervisorRunOptions {
                 repo: resolved_repo,
                 plan_file,
@@ -1028,6 +1038,7 @@ fn read_supervise_goal_file(goal_file: &Path) -> Result<String> {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum SuperviseSubcommand {
     /// Build a validated plan from a goal/spec, task file, or JSON supervisor plan.
     Plan(PlanSuperviseArgs),
@@ -1098,6 +1109,27 @@ struct RunBudgetArgs {
         value_parser = parse_positive_seconds
     )]
     max_duration_seconds: Option<u64>,
+    /// Hard ceiling for provider tokens consumed across supervise/autopilot runs
+    /// in the workspace rolling window (default 24h).
+    #[arg(
+        long = "max-rolling-tokens",
+        value_parser = parse_positive_usize
+    )]
+    max_rolling_tokens: Option<usize>,
+    /// Hard ceiling for provider cost consumed across supervise/autopilot runs
+    /// in the workspace rolling window, in USD.
+    #[arg(
+        long = "max-rolling-cost-usd",
+        value_parser = parse_positive_finite_f64
+    )]
+    max_rolling_cost_usd: Option<f64>,
+    /// Rolling window used with `--max-rolling-tokens` / `--max-rolling-cost-usd`.
+    /// Defaults to 86400 seconds (24 hours) when a rolling ceiling is set.
+    #[arg(
+        long = "rolling-window-seconds",
+        value_parser = parse_positive_seconds
+    )]
+    rolling_window_seconds: Option<u64>,
 }
 
 impl RunBudgetArgs {
@@ -1112,6 +1144,19 @@ impl RunBudgetArgs {
 
     const fn max_duration_seconds(self) -> Option<u64> {
         self.max_duration_seconds
+    }
+
+    fn rolling_quota(self) -> Option<crate::budget_ledger::RollingBudgetQuota> {
+        if self.max_rolling_tokens.is_none() && self.max_rolling_cost_usd.is_none() {
+            return None;
+        }
+        Some(crate::budget_ledger::RollingBudgetQuota {
+            max_tokens: self.max_rolling_tokens,
+            max_cost_usd: self.max_rolling_cost_usd,
+            window_seconds: self
+                .rolling_window_seconds
+                .unwrap_or(crate::budget_ledger::DEFAULT_ROLLING_WINDOW_SECONDS),
+        })
     }
 }
 
@@ -1874,6 +1919,7 @@ impl AutopilotCommand {
             }
             AutopilotSubcommand::Run(args) => {
                 let json = args.json;
+                let rolling_quota = args.budget.rolling_quota();
                 let budget_overrides = args.budget.limits();
                 let budget_max_duration_seconds = args.budget.max_duration_seconds();
                 let (plan_file, goal_spec) = match (args.task_file, args.from_goal) {
@@ -1899,6 +1945,15 @@ impl AutopilotCommand {
                 )?;
                 let parent_node = args.parent_node.map(Into::into);
                 let reap_repo = resolved.repo.clone();
+                let _rolling_guard = rolling_quota
+                    .map(|quota| {
+                        crate::budget_ledger::bind_rolling_budget(
+                            &resolved.repo,
+                            quota,
+                            resolved.run_id.as_str(),
+                        )
+                    })
+                    .transpose()?;
                 let options = AutopilotRunOptions {
                     repo: resolved.repo,
                     plan_file,
