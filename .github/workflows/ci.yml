@@ -167,6 +167,7 @@ jobs:
           repo_map::tests::scan_excludes_generated_and_local_state_paths
           repo_map::tests::scan_reports_but_never_follows_links_or_special_files
           repo_map::tests::scan_returns_stable_sorted_entries_and_categories
+          repo_map::tests::scan_treats_worktree_stores_as_boundaries_and_ignores_nested_git_markers
           supervise::assignment_execution::decomposition_tests::review_lens_execution_boundary_hides_primary_and_child_roots_from_hostile_process
           supervise::tests::acceptance_integrity::finalized_decomposition_evidence_binds_exact_candidate_and_exposes_chain_ids
           supervise::tests::acceptance_integrity::supervisor_injects_binding_from_stable_candidate_and_detects_later_bytes
