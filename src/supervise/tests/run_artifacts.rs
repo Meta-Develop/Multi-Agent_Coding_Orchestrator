@@ -1325,7 +1325,8 @@ fn writable_fake_runtime_assignment_creation_is_reachable_without_network() {
     // Stay on Fake + NonpublishableSimulation/TestOnly. The verified
     // plan-file helper acquires Bound cleanliness and fails closed on hosts
     // without a delegated systemd user manager; that is not a Fake-runtime
-    // capability refusal.
+    // capability refusal. Candidate binding for this path uses git2 so it
+    // stays reachable without isolated git.
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let plan = injected_plan(assignment.clone(), 0);

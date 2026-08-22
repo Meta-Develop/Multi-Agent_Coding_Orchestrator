@@ -34,9 +34,9 @@ use crate::{
     },
     llm::provider::{ModelPricing, Usage},
     merge::{
-        collect_agent_result_with_evidence_and_write_lease, ApplyBlockerDetail,
-        CandidateValidationBinding, MergeCollectOptions, ValidationEvidenceBundle,
-        VALIDATION_BINDING_VERSION,
+        candidate_validation_binding, collect_agent_result_with_evidence_and_write_lease,
+        ApplyBlockerDetail, CandidateValidationBinding, MergeCollectOptions,
+        ValidationEvidenceBundle, WorktreeMergeMetadata, VALIDATION_BINDING_VERSION,
     },
     orchestration_event::{
         FieldGuideEventKind, OrchestrationEventJournal, OrchestrationEventKind, OrchestrationRole,
