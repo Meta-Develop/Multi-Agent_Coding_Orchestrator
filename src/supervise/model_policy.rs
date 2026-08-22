@@ -86,6 +86,39 @@ impl OrchestrationPhase {
     }
 }
 
+/// Tracked lite instruction profile for mechanical-terminal weak models.
+///
+/// Judgment phases never receive this profile. `BudgetAction::Degrade` to a
+/// weaker tier may attach it only when the degraded phase already permits
+/// [`ModelCapabilityClass::WeakMechanical`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackedLiteInstructionProfile {
+    pub id: &'static str,
+    pub version: u32,
+    pub applies_to_phase: OrchestrationPhase,
+}
+
+pub const WEAK_MECHANICAL_LITE_PROFILE_ID: &str = "maco-weak-mechanical-lite-v1";
+pub const WEAK_MECHANICAL_LITE_PROFILE_VERSION: u32 = 1;
+
+/// Shipped mechanical-only lite profile. Discovery, triage, merge, gate, audit,
+/// and review stay hard-excluded.
+pub const WEAK_MECHANICAL_LITE_PROFILE: TrackedLiteInstructionProfile =
+    TrackedLiteInstructionProfile {
+        id: WEAK_MECHANICAL_LITE_PROFILE_ID,
+        version: WEAK_MECHANICAL_LITE_PROFILE_VERSION,
+        applies_to_phase: OrchestrationPhase::MechanicalTerminal,
+    };
+
+const WEAK_MECHANICAL_LITE_PROFILE_BODY: &str = "\
+This session uses the weak-mechanical instruction profile.
+- Execute only the assigned mechanical steps. Do not invent scope, policy, or extra work.
+- Prefer the exact command, path, schema, or helper already named in this prompt.
+- One instruction at a time. Do not stack compound judgment.
+- If a required helper, schema, path, or command is missing or fails, stop and report the block. Do not fall back to open-ended judgment.
+- Discovery, triage, merge, and acceptance decisions are out of scope. Report them upward instead of taking them over.
+- Do not relax ownership, journaling, validation, or audit requirements.";
+
 /// Closed list of duties that a constrained weak-model profile may perform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -405,6 +438,67 @@ pub fn validate_budget_model_degradation(
     )
 }
 
+fn recorded_model_capability_class(model: &str) -> Option<ModelCapabilityClass> {
+    current_model_capability_policy()
+        .lookup(model)
+        .map(|entry| entry.capability)
+}
+
+/// Whether `phase` may ever receive the tracked lite instruction profile.
+pub const fn phase_permits_lite_instruction_profile(phase: OrchestrationPhase) -> bool {
+    !phase.hard_excludes_weak_models()
+        && matches!(
+            WEAK_MECHANICAL_LITE_PROFILE.applies_to_phase,
+            OrchestrationPhase::MechanicalTerminal
+        )
+        && matches!(phase, OrchestrationPhase::MechanicalTerminal)
+}
+
+/// Attach the tracked lite profile only for Worker + MechanicalTerminal when
+/// the selected model is recorded [`ModelCapabilityClass::WeakMechanical`].
+pub fn lite_instruction_profile_applies(
+    role: AgentRole,
+    phase: OrchestrationPhase,
+    model: Option<&str>,
+) -> bool {
+    role == AgentRole::Worker
+        && phase_permits_lite_instruction_profile(phase)
+        && matches!(
+            model.and_then(recorded_model_capability_class),
+            Some(ModelCapabilityClass::WeakMechanical)
+        )
+}
+
+/// `BudgetAction::Degrade` to a weaker tier may apply the lite profile only
+/// to phases that already allow `WeakMechanical`. Judgment phases stay
+/// hard-excluded even when the degrade target is a weaker capability.
+pub fn budget_degrade_attaches_lite_instruction_profile(
+    role: AgentRole,
+    phase: OrchestrationPhase,
+    mechanical_duty: Option<MechanicalTerminalDuty>,
+    target_capability: ModelCapabilityClass,
+) -> bool {
+    if !phase_permits_lite_instruction_profile(phase) {
+        return false;
+    }
+    match validate_budget_model_degradation(role, phase, mechanical_duty, target_capability) {
+        Ok(decision) => {
+            decision.weak_model_permitted
+                && target_capability == ModelCapabilityClass::WeakMechanical
+        }
+        Err(_) => false,
+    }
+}
+
+/// Render the tracked lite profile section. Callers must gate with
+/// [`lite_instruction_profile_applies`] so judgment phases never receive it.
+pub fn render_mechanical_lite_instruction_profile_section() -> String {
+    format!(
+        "\nINSTRUCTION_PROFILE: {}\nReason: low_tier_capability\n\n{}\n",
+        WEAK_MECHANICAL_LITE_PROFILE.id, WEAK_MECHANICAL_LITE_PROFILE_BODY
+    )
+}
+
 /// Authorize the model that a catalog resolution actually selected.
 ///
 /// A concrete resolved slug must have trusted capability evidence. Runtime-default
@@ -528,7 +622,7 @@ pub fn install_test_fixture_models(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supervise::{ModelResolutionObservation, SupervisorRuntime};
+    use crate::supervise::{ModelResolutionObservation, SupervisorRuntime, BALANCED_PROFILE_MODEL};
 
     #[test]
     fn default_policy_ranks_luna_above_ineligible_terra() {
@@ -659,6 +753,102 @@ mod tests {
             ModelCapabilityClass::GeneralJudgment,
         )
         .expect_err("auditor cannot degrade below critical");
+
+        for phase in [
+            OrchestrationPhase::Discovery,
+            OrchestrationPhase::Triage,
+            OrchestrationPhase::Planning,
+            OrchestrationPhase::Implementation,
+            OrchestrationPhase::ValidationInterpretation,
+            OrchestrationPhase::Merge,
+            OrchestrationPhase::GateClassification,
+            OrchestrationPhase::ReviewAcceptance,
+            OrchestrationPhase::Audit,
+        ] {
+            assert!(
+                phase.hard_excludes_weak_models(),
+                "{} must stay hard-excluded",
+                phase.as_str()
+            );
+            assert!(!phase_permits_lite_instruction_profile(phase));
+            assert!(!lite_instruction_profile_applies(
+                AgentRole::Worker,
+                phase,
+                Some(BALANCED_PROFILE_MODEL),
+            ));
+            assert!(!budget_degrade_attaches_lite_instruction_profile(
+                AgentRole::Worker,
+                phase,
+                Some(MechanicalTerminalDuty::RunPreselectedCommand),
+                ModelCapabilityClass::WeakMechanical,
+            ));
+            assert!(validate_phase_model_binding(
+                AgentRole::Worker,
+                phase,
+                None,
+                ModelCapabilityClass::WeakMechanical,
+            )
+            .is_err());
+            assert!(validate_known_judgment_role_model(
+                AgentRole::ChildOrchestrator,
+                Some("unknown-local-model"),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn lite_profile_is_mechanical_terminal_only_including_after_budget_degrade() {
+        assert_eq!(
+            WEAK_MECHANICAL_LITE_PROFILE.applies_to_phase,
+            OrchestrationPhase::MechanicalTerminal
+        );
+        assert_eq!(
+            WEAK_MECHANICAL_LITE_PROFILE.id,
+            "maco-weak-mechanical-lite-v1"
+        );
+        assert!(phase_permits_lite_instruction_profile(
+            OrchestrationPhase::MechanicalTerminal
+        ));
+        assert!(lite_instruction_profile_applies(
+            AgentRole::Worker,
+            OrchestrationPhase::MechanicalTerminal,
+            Some(BALANCED_PROFILE_MODEL),
+        ));
+        assert!(!lite_instruction_profile_applies(
+            AgentRole::Worker,
+            OrchestrationPhase::MechanicalTerminal,
+            Some("unknown-local-model"),
+        ));
+        assert!(!lite_instruction_profile_applies(
+            AgentRole::Auditor,
+            OrchestrationPhase::MechanicalTerminal,
+            Some(BALANCED_PROFILE_MODEL),
+        ));
+        assert!(budget_degrade_attaches_lite_instruction_profile(
+            AgentRole::Worker,
+            OrchestrationPhase::MechanicalTerminal,
+            Some(MechanicalTerminalDuty::ValidateAgainstFixedSchema),
+            ModelCapabilityClass::WeakMechanical,
+        ));
+        assert!(!budget_degrade_attaches_lite_instruction_profile(
+            AgentRole::Auditor,
+            OrchestrationPhase::Audit,
+            None,
+            ModelCapabilityClass::WeakMechanical,
+        ));
+        assert!(!budget_degrade_attaches_lite_instruction_profile(
+            AgentRole::ChildOrchestrator,
+            OrchestrationPhase::Implementation,
+            None,
+            ModelCapabilityClass::GeneralJudgment,
+        ));
+        let section = render_mechanical_lite_instruction_profile_section();
+        assert!(section.contains("INSTRUCTION_PROFILE: maco-weak-mechanical-lite-v1"));
+        assert!(section.contains("stop and report the block"));
+        assert!(
+            section.contains("Discovery, triage, merge, and acceptance decisions are out of scope")
+        );
     }
 
     #[test]

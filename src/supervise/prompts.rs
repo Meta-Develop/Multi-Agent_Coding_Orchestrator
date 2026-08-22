@@ -628,9 +628,10 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
     let (child_model, child_reasoning_effort) =
         role_model_selection(plan, AgentRole::ChildOrchestrator);
     let (worker_model, worker_reasoning_effort) = role_model_selection(plan, AgentRole::Worker);
-    let instruction_profile_section = instruction_profile_prompt_section(
+    let instruction_profile_section = phase_aware_instruction_profile_section(
+        AgentRole::ChildOrchestrator,
+        OrchestrationPhase::Implementation,
         child_model.as_deref(),
-        child_reasoning_effort.as_deref(),
     );
     let consultation_section = consultation_prompt_section(consultant);
     let cacheable_prefix = child_cacheable_prefix_for_target(execution_target);
@@ -826,9 +827,10 @@ pub(super) fn worker_prompt_with_field_guide(
     let task = worker_task(plan, orchestrator, worker);
     let journal_path = incoming_root.join(worker_execution_journal_incoming_relative(worker));
     let (worker_model, worker_reasoning_effort) = role_model_selection(plan, AgentRole::Worker);
-    let instruction_profile_section = instruction_profile_prompt_section(
+    let instruction_profile_section = phase_aware_instruction_profile_section(
+        AgentRole::Worker,
+        OrchestrationPhase::MechanicalTerminal,
         worker_model.as_deref(),
-        worker_reasoning_effort.as_deref(),
     );
     Ok(format!(
         r#"{cacheable_prefix}{role_prefix}{field_guide_section}{instruction_profile_section}
@@ -940,10 +942,11 @@ pub(super) fn review_auditor_prompt_with_metadata_and_field_guide(
     let auditor_id = format!("{}-review-auditor", orchestrator.id);
     let role_prefix = supervise_role_prefix(SupervisePromptRole::ReviewAuditor, &auditor_id, None);
     let task = assignment_task(plan, orchestrator);
-    let (auditor_model, auditor_reasoning_effort) = role_model_selection(plan, AgentRole::Auditor);
-    let instruction_profile_section = instruction_profile_prompt_section(
+    let (auditor_model, _) = role_model_selection(plan, AgentRole::Auditor);
+    let instruction_profile_section = phase_aware_instruction_profile_section(
+        AgentRole::Auditor,
+        OrchestrationPhase::Audit,
         auditor_model.as_deref(),
-        auditor_reasoning_effort.as_deref(),
     );
     Ok(format!(
         r#"{cacheable_prefix}{role_prefix}{field_guide_section}{instruction_profile_section}
@@ -1032,10 +1035,11 @@ pub(super) fn render_parent_review_auditor_prompt_with_field_guide(
     .context("failed to serialize redacted field-guide suggestion metadata")?;
     let task = assignment_task(plan, assignment);
     let cacheable_prefix = parent_review_auditor_cacheable_prefix();
-    let (auditor_model, auditor_reasoning_effort) = role_model_selection(plan, AgentRole::Auditor);
-    let instruction_profile_section = instruction_profile_prompt_section(
+    let (auditor_model, _) = role_model_selection(plan, AgentRole::Auditor);
+    let instruction_profile_section = phase_aware_instruction_profile_section(
+        AgentRole::Auditor,
+        OrchestrationPhase::ReviewAcceptance,
         auditor_model.as_deref(),
-        auditor_reasoning_effort.as_deref(),
     );
     let prompt = format!(
         r#"{cacheable_prefix}{role_prefix}{field_guide_section}{instruction_profile_section}
@@ -1112,8 +1116,11 @@ pub(super) fn render_review_lens_auditor_prompt(
     let reasoning_effort = resolved_reasoning_effort
         .or_else(|| lens.backend.reasoning_effort())
         .unwrap_or("<runtime-default>");
-    let instruction_profile_section =
-        instruction_profile_prompt_section(Some(lens.backend.model()), Some(reasoning_effort));
+    let instruction_profile_section = phase_aware_instruction_profile_section(
+        AgentRole::Auditor,
+        OrchestrationPhase::ReviewAcceptance,
+        Some(lens.backend.model()),
+    );
     let prompt = format!(
         r#"{cacheable_prefix}{role_prefix}{instruction_profile_section}
 
@@ -1181,6 +1188,21 @@ fn role_model_selection(
 ) -> (Option<String>, Option<String>) {
     let selection = effective_role_model_selection(plan, role);
     (selection.model, selection.reasoning_effort)
+}
+
+/// Mechanical-terminal Worker prompts may attach the tracked lite profile.
+/// Judgment phases stay hard-excluded, including after budget degrade to a
+/// weaker tier or high reasoning effort on a non-critical model.
+fn phase_aware_instruction_profile_section(
+    role: AgentRole,
+    phase: OrchestrationPhase,
+    model: Option<&str>,
+) -> String {
+    if lite_instruction_profile_applies(role, phase, model) {
+        render_mechanical_lite_instruction_profile_section()
+    } else {
+        String::new()
+    }
 }
 
 pub(super) fn provisional_default_role_model_selection(role: AgentRole) -> RoleModelSelection {
@@ -1667,6 +1689,10 @@ mod regression_tests {
         assert!(rendered.starts_with(&worker_cacheable_prefix()));
         assert!(rendered.contains("INSTRUCTION_PROFILE: maco-weak-mechanical-lite-v1"));
         assert!(rendered.contains("Reason: low_tier_capability"));
+        assert!(rendered.contains("Execute only the assigned mechanical steps"));
+        assert!(rendered.contains("stop and report the block"));
+        assert!(rendered
+            .contains("Discovery, triage, merge, and acceptance decisions are out of scope"));
         let profile_offset = rendered
             .find("INSTRUCTION_PROFILE: maco-weak-mechanical-lite-v1")
             .expect("named profile");
@@ -1681,6 +1707,172 @@ mod regression_tests {
             profile_offset < context_offset,
             "named profile must be attached before assignment-specific context"
         );
+    }
+
+    #[test]
+    fn judgment_and_auditor_prompts_never_receive_the_lite_profile() {
+        let assignment = OrchestratorAssignment {
+            id: "child-judgment".to_string(),
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: Some("complete the bounded prompt-chain assignment".to_string()),
+            worker_assignments: vec![WorkerAssignment {
+                id: "worker-judgment".to_string(),
+                role: AgentRole::Worker,
+                assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
+                semantic_symbols: Vec::new(),
+                semantic_modules: Vec::new(),
+                task: Some("implement the assigned change".to_string()),
+                environment_requirements: Vec::new(),
+                report_path: None,
+            }],
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let mut plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "lite-profile judgment exclusion fixture".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 60,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+        for role in [
+            AgentRole::ChildOrchestrator,
+            AgentRole::Auditor,
+            AgentRole::GateClassifier,
+        ] {
+            plan.role_models.insert(
+                role,
+                RoleModelSelection {
+                    model: Some(BALANCED_PROFILE_MODEL.to_string()),
+                    reasoning_effort: Some("xhigh".to_string()),
+                    unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+                },
+            );
+        }
+        let run_dir = Path::new("/tmp/maco-prompt-lite-judgment");
+        let incoming_root = run_dir.join("incoming");
+        let field_guide = SupervisorFieldGuidePrompt::empty().expect("empty field guide");
+        let assignment_metadata = AssignmentMetadata::new();
+        let auditor = review_auditor_prompt_with_metadata_and_field_guide(
+            &plan,
+            &assignment,
+            &assignment_metadata,
+            run_dir,
+            &run_dir.join("schemas/auditor-report.schema.json"),
+            &field_guide,
+        )
+        .expect("render judgment auditor prompt");
+        assert!(
+            !auditor.contains("INSTRUCTION_PROFILE:"),
+            "audit prompts must stay hard-excluded from the lite profile"
+        );
+
+        let worktree = WorktreeRecord {
+            name: assignment.id.clone(),
+            path: PathBuf::from("/tmp/maco-prompt-lite-judgment/worktree"),
+            branch: "maco/prompt-lite-judgment-child".to_string(),
+        };
+        let claim = PathClaim {
+            token: ClaimToken::from_u64(1),
+            agent_id: assignment.id.clone(),
+            paths: assignment.assigned_paths.clone(),
+        };
+        let child = child_orchestrator_prompt_with_incoming_root_and_field_guide(
+            ChildOrchestratorPromptContext {
+                plan: &plan,
+                execution_target: None,
+                assignment: &assignment,
+                run_dir,
+                worktree: &worktree,
+                report_path: &incoming_root.join("child-judgment.json"),
+                schema_path: &run_dir.join("schemas/orchestrator-review-report.schema.json"),
+                worker_schema_path: &run_dir.join("schemas/worker-report.schema.json"),
+                auditor_schema_path: &run_dir.join("schemas/auditor-report.schema.json"),
+                consultant: &SupervisorConsultantPlan::default(),
+                claim_context: ChildPromptClaimContext {
+                    claim: &claim,
+                    semantic_intent_token: None,
+                },
+            },
+            &incoming_root,
+            &assignment_metadata,
+            &field_guide,
+        )
+        .expect("render judgment child prompt");
+        let child_own_prefix = child
+            .split("Worker prompt templates:")
+            .next()
+            .expect("child prompt prefix");
+        assert!(
+            !child_own_prefix.contains("INSTRUCTION_PROFILE:"),
+            "implementation prompts must stay hard-excluded from the lite profile"
+        );
+        assert!(!budget_degrade_attaches_lite_instruction_profile(
+            AgentRole::Auditor,
+            OrchestrationPhase::Audit,
+            None,
+            ModelCapabilityClass::WeakMechanical,
+        ));
+        assert!(!budget_degrade_attaches_lite_instruction_profile(
+            AgentRole::ChildOrchestrator,
+            OrchestrationPhase::Implementation,
+            None,
+            ModelCapabilityClass::WeakMechanical,
+        ));
+    }
+
+    #[test]
+    fn unknown_and_weak_models_cannot_take_excluded_phases() {
+        for phase in [
+            OrchestrationPhase::Discovery,
+            OrchestrationPhase::Triage,
+            OrchestrationPhase::Merge,
+            OrchestrationPhase::GateClassification,
+            OrchestrationPhase::ReviewAcceptance,
+            OrchestrationPhase::Audit,
+        ] {
+            assert!(phase.hard_excludes_weak_models());
+            assert!(!lite_instruction_profile_applies(
+                AgentRole::Worker,
+                phase,
+                Some(BALANCED_PROFILE_MODEL),
+            ));
+            assert!(!lite_instruction_profile_applies(
+                AgentRole::Auditor,
+                phase,
+                Some("unknown-local-model"),
+            ));
+            let weak = validate_phase_model_binding(
+                AgentRole::ChildOrchestrator,
+                phase,
+                None,
+                ModelCapabilityClass::WeakMechanical,
+            )
+            .expect_err("weak model cannot take excluded phase");
+            assert!(weak.to_string().contains("weak-model binding is forbidden"));
+            let unknown = validate_known_judgment_role_model(
+                AgentRole::ChildOrchestrator,
+                Some("unknown-local-model"),
+            )
+            .expect_err("unknown model cannot take judgment");
+            assert!(unknown
+                .to_string()
+                .contains("has no trusted capability policy"));
+        }
     }
 
     #[test]
