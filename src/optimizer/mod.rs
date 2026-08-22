@@ -11,6 +11,7 @@
 //! | `failure_classifier`, `trajectory` | #164 |
 //! | `policy` candidate generation | #165 |
 //! | `replay` | #166 |
+//! | `evaluation_fn` | #157 first slice (quality-hard, min cost-to-certification) |
 //! | `predictor`, `feasibility`, `objective`, `online_router`, `explanation` | #167 |
 //! | `value_of_information`, `hedge` | #168 |
 //! | `global_search`, `safe_set`, `shadow` | #169 |
@@ -38,6 +39,7 @@ mod digest;
 pub mod drift;
 pub mod error;
 pub mod escaped_defect;
+pub mod evaluation_fn;
 pub mod evidence_pool;
 pub mod explanation;
 pub mod failure_classifier;
@@ -78,6 +80,9 @@ pub use certification::{
 };
 pub use drift::{AdaptationStore, DriftDetector, LedgerReserveRecalibrator, ReserveRecalibrator};
 pub use error::OptimizerError;
+pub use evaluation_fn::{
+    EvaluatedPolicy, EvaluationFunction, EvaluationOutcome, PolicyRejection, RejectionReason,
+};
 pub use global_search::{
     ConstrainedTpeOptimizer, GlobalPolicyOptimizer, OptimizationHistory, PolicySearchSpace,
 };
