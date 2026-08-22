@@ -1253,6 +1253,15 @@ pub(crate) fn clear_generated_follow_up_queue_observer() {
 }
 
 #[cfg(test)]
+pub(crate) fn clear_follow_up_cascade_test_isolation() {
+    BEFORE_GENERATED_FOLLOW_UP_PLAN_LOAD_HOOK.with(|slot| *slot.borrow_mut() = None);
+    INTERRUPT_AFTER_FOLLOW_UP_ENQUEUE.with(|slot| slot.set(false));
+    INTERRUPT_AFTER_FOLLOW_UP_DISPATCH_STARTED.with(|slot| slot.set(false));
+    INTERRUPT_AFTER_AUTHENTICATED_FOLLOW_UP_CHILD_START.with(|slot| slot.set(false));
+    clear_generated_follow_up_queue_observer();
+}
+
+#[cfg(test)]
 fn record_queue_test_observation(
     label: &'static str,
     queue: &GeneratedFollowUpQueue,
