@@ -112,6 +112,10 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
                 .iter()
                 .any(|reason| reason == "max_duration_reached"))
     );
+    assert_eq!(
+        schema["properties"]["run_budget"]["properties"]["sources"]["required"],
+        serde_json::json!(["plan", "cli"])
+    );
     let autonomy = &schema["properties"]["autonomy_kpis"];
     let required = autonomy["required"]
         .as_array()
@@ -565,7 +569,7 @@ fn budget_integration_scheduler_applies_and_persists_degrade_ladder_before_halt(
     );
     assert_eq!(
         child_bindings["degrade-child-2"],
-        (ECONOMY_PROFILE_MODEL.to_string(), "high".to_string())
+        (FRONTIER_PROFILE_MODEL.to_string(), "high".to_string())
     );
     assert!(!child_bindings.contains_key("degrade-child-6"));
 
@@ -574,24 +578,20 @@ fn budget_integration_scheduler_applies_and_persists_degrade_ladder_before_halt(
         .as_ref()
         .and_then(|profile| profile.execution.as_ref())
         .expect("execution telemetry");
-    assert_eq!(execution.budget_degradations.len(), 4);
+    assert_eq!(execution.budget_degradations.len(), 3);
     assert!(matches!(
         execution.budget_degradations[0].change,
         BudgetDegradationChange::ReasoningEffort { .. }
     ));
-    assert!(matches!(
-        execution.budget_degradations[1].change,
-        BudgetDegradationChange::ModelTier { .. }
-    ));
     assert_eq!(
-        execution.budget_degradations[2].change,
+        execution.budget_degradations[1].change,
         BudgetDegradationChange::FanOut {
             before: 8,
             after: 4
         }
     );
     assert!(matches!(
-        execution.budget_degradations[3].change,
+        execution.budget_degradations[2].change,
         BudgetDegradationChange::Halt { .. }
     ));
     assert_eq!(
@@ -632,7 +632,7 @@ fn budget_integration_scheduler_applies_and_persists_degrade_ladder_before_halt(
         persisted["role_economics_profile"]["execution"]["budget_degradations"]
             .as_array()
             .map(Vec::len),
-        Some(4)
+        Some(3)
     );
 }
 

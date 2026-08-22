@@ -11,6 +11,7 @@
 //! | `failure_classifier`, `trajectory` | #164 |
 //! | `policy` candidate generation | #165 |
 //! | `replay` | #166 |
+//! | `evaluation_fn` | #157 first slice (quality-hard, min cost-to-certification) |
 //! | `predictor`, `feasibility`, `objective`, `online_router`, `explanation` | #167 |
 //! | `value_of_information`, `hedge` | #168 |
 //! | `global_search`, `safe_set`, `shadow` | #169 |
@@ -23,6 +24,10 @@
 //! `escaped_defect`) plug in beside this foundation. They do not edit the
 //! action/policy/state IDs, trait signatures, the append-only
 //! [`QualityContract`] API, or the keyed [`ResourceVector`] core.
+//!
+//! Contract quota pools (`quota_pools`, issue #151) are the local-first cost
+//! input for later selector scoring. They do not edit operator labels,
+//! difficulty, or switch-cost types.
 
 pub mod action;
 pub mod blinding;
@@ -34,6 +39,7 @@ mod digest;
 pub mod drift;
 pub mod error;
 pub mod escaped_defect;
+pub mod evaluation_fn;
 pub mod evidence_pool;
 pub mod explanation;
 pub mod failure_classifier;
@@ -49,6 +55,7 @@ pub mod operator_labels;
 pub mod policy;
 pub mod predictor;
 pub mod quality;
+pub mod quota_pools;
 pub mod replay;
 pub mod resources;
 pub mod safe_set;
@@ -59,6 +66,7 @@ pub mod taxonomy;
 pub mod telemetry;
 pub mod trajectory;
 pub mod value_of_information;
+mod weight_profile;
 
 pub use action::{
     enumerate_compatible_actions, ActionTemplate, AgentRole, CanonicalEffort, EffortMapper,
@@ -72,6 +80,9 @@ pub use certification::{
 };
 pub use drift::{AdaptationStore, DriftDetector, LedgerReserveRecalibrator, ReserveRecalibrator};
 pub use error::OptimizerError;
+pub use evaluation_fn::{
+    EvaluatedPolicy, EvaluationFunction, EvaluationOutcome, PolicyRejection, RejectionReason,
+};
 pub use global_search::{
     ConstrainedTpeOptimizer, GlobalPolicyOptimizer, OptimizationHistory, PolicySearchSpace,
 };
@@ -79,6 +90,9 @@ pub use online_router::{OnlineRouter, RouterDecision};
 pub use policy::{PolicyEdge, PolicyGraph, PolicyNode, TransitionCondition, TransitionEvidence};
 pub use predictor::{PolicyOutcomeDistribution, PolicyPredictor};
 pub use quality::QualityContract;
+pub use quota_pools::{
+    build_quota_selector_input, ConsumptionLedger, EntitlementDescriptor, QuotaSelectorInput,
+};
 pub use resources::{
     DispatchClass, DispatchDecision, DispatchRequest, ResourceObserver, ResourceSnapshot,
     ResourceVector,

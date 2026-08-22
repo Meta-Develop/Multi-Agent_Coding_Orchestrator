@@ -189,10 +189,29 @@ pub struct RoleBudgetReport {
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct RunBudgetSource {
+    pub limits: RunBudgetLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunBudgetSources {
+    pub plan: RunBudgetSource,
+    pub cli: RunBudgetSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunBudgetReport {
     pub limits: RunBudgetLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_duration_seconds: Option<u64>,
+    /// Original plan and CLI ceilings before strictest-wins composition.
+    /// Present only when a CLI flag actually set a token, cost, or duration bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<RunBudgetSources>,
     pub consumed: BudgetAmount,
     pub reserved: BudgetAmount,
     pub committed: BudgetAmount,
@@ -322,6 +341,7 @@ pub(super) type Result<T> = std::result::Result<T, BudgetError>;
 pub(super) struct RunBudgetLedger {
     limits: RunBudgetLimits,
     max_duration_seconds: Option<u64>,
+    sources: Option<RunBudgetSources>,
     started_at: Instant,
     inner: Arc<Mutex<LedgerState>>,
 }
@@ -404,21 +424,56 @@ impl RunBudgetLedger {
         Self::new_with_duration(limits, None)
     }
 
+    #[cfg(test)]
     pub(super) fn new_with_duration(
         limits: RunBudgetLimits,
         max_duration_seconds: Option<u64>,
     ) -> Result<Self> {
-        if max_duration_seconds == Some(0) {
-            return Err(BudgetError::ZeroLimit {
-                name: "maximum duration",
-            });
-        }
-        Ok(Self {
-            limits: limits.validate()?,
+        Self::new_composed(
+            limits,
+            RunBudgetLimits::default(),
             max_duration_seconds,
+            None,
+        )
+    }
+
+    /// Compose plan and CLI ceilings by taking the strictest bound of each
+    /// resource, and retain both inputs on the ledger when the CLI set any.
+    pub(super) fn new_composed(
+        plan_limits: RunBudgetLimits,
+        cli_limits: RunBudgetLimits,
+        plan_max_duration_seconds: Option<u64>,
+        cli_max_duration_seconds: Option<u64>,
+    ) -> Result<Self> {
+        validate_duration(plan_max_duration_seconds)?;
+        validate_duration(cli_max_duration_seconds)?;
+        let limits = plan_limits.strictest(cli_limits)?;
+        let max_duration_seconds = match (plan_max_duration_seconds, cli_max_duration_seconds) {
+            (Some(plan), Some(cli)) => Some(plan.min(cli)),
+            (plan, cli) => plan.or(cli),
+        };
+        let sources = (cli_limits.has_any_ceiling() || cli_max_duration_seconds.is_some())
+            .then_some(RunBudgetSources {
+                plan: RunBudgetSource {
+                    limits: plan_limits,
+                    max_duration_seconds: plan_max_duration_seconds,
+                },
+                cli: RunBudgetSource {
+                    limits: cli_limits,
+                    max_duration_seconds: cli_max_duration_seconds,
+                },
+            });
+        Ok(Self {
+            limits,
+            max_duration_seconds,
+            sources,
             started_at: Instant::now(),
             inner: Arc::new(Mutex::new(LedgerState::default())),
         })
+    }
+
+    pub(super) fn effective_limits(&self) -> RunBudgetLimits {
+        self.limits
     }
 
     #[cfg(test)]
@@ -580,6 +635,7 @@ impl RunBudgetLedger {
         report_for(
             self.limits,
             self.max_duration_seconds,
+            self.sources.clone(),
             state,
             self.started_at.elapsed(),
         )
@@ -588,6 +644,15 @@ impl RunBudgetLedger {
     fn lock_state(&self) -> Result<MutexGuard<'_, LedgerState>> {
         self.inner.lock().map_err(|_| BudgetError::Poisoned)
     }
+}
+
+fn validate_duration(value: Option<u64>) -> Result<()> {
+    if value == Some(0) {
+        return Err(BudgetError::ZeroLimit {
+            name: "maximum duration",
+        });
+    }
+    Ok(())
 }
 
 fn validate_token_limit(value: Option<usize>, name: &'static str) -> Result<()> {
@@ -819,6 +884,7 @@ fn apply_charge(
 fn report_for(
     limits: RunBudgetLimits,
     max_duration_seconds: Option<u64>,
+    sources: Option<RunBudgetSources>,
     state: &LedgerState,
     elapsed: Duration,
 ) -> Result<RunBudgetReport> {
@@ -900,6 +966,7 @@ fn report_for(
     Ok(RunBudgetReport {
         limits,
         max_duration_seconds,
+        sources,
         consumed: BudgetAmount {
             tokens: state.consumed_tokens,
             cost_usd: state.cost_complete.then_some(state.consumed_cost_usd),
@@ -1078,6 +1145,55 @@ mod tests {
                 hard_cost_usd: Some(0.4),
             }
         );
+    }
+
+    #[test]
+    fn composed_cli_overrides_persist_plan_and_cli_sources_on_the_ledger() {
+        let plan = RunBudgetLimits {
+            soft_tokens: Some(100),
+            hard_tokens: Some(200),
+            soft_cost_usd: Some(0.5),
+            hard_cost_usd: Some(1.0),
+        };
+        let cli = RunBudgetLimits {
+            hard_tokens: Some(50),
+            hard_cost_usd: Some(0.4),
+            ..RunBudgetLimits::default()
+        };
+        let ledger = RunBudgetLedger::new_composed(plan, cli, Some(600), Some(300))
+            .expect("composed ledger");
+        let report = ledger.report().expect("composed report");
+
+        assert_eq!(
+            report.limits,
+            RunBudgetLimits {
+                soft_tokens: Some(50),
+                hard_tokens: Some(50),
+                soft_cost_usd: Some(0.4),
+                hard_cost_usd: Some(0.4),
+            }
+        );
+        assert_eq!(report.max_duration_seconds, Some(300));
+        assert_eq!(
+            report.sources,
+            Some(RunBudgetSources {
+                plan: RunBudgetSource {
+                    limits: plan,
+                    max_duration_seconds: Some(600),
+                },
+                cli: RunBudgetSource {
+                    limits: cli,
+                    max_duration_seconds: Some(300),
+                },
+            })
+        );
+
+        let plan_only = RunBudgetLedger::new_with_duration(plan, Some(600)).expect("plan ledger");
+        assert!(plan_only
+            .report()
+            .expect("plan-only report")
+            .sources
+            .is_none());
     }
 
     #[test]

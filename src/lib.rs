@@ -13,9 +13,11 @@ pub mod consult;
 #[doc(hidden)]
 pub mod containment_probe;
 pub mod decision_claim;
+pub mod eval_harness;
 pub mod evaluation;
 pub mod evaluation_gate_policy;
 pub mod execution_capability;
+pub mod executor;
 pub mod external_agent;
 pub mod field_guide;
 pub mod gate_denial;

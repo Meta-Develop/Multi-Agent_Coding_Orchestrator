@@ -147,6 +147,7 @@ impl Cli {
             Command::Agents(command) => command.run(),
             Command::Llm(command) => command.run(),
             Command::Evaluation(command) => command.run(),
+            Command::EvalHarness(command) => command.run(),
             Command::Optimizer(command) => command.run(),
         }
     }
@@ -200,6 +201,8 @@ enum Command {
     Llm(LlmCommand),
     /// Generate deterministic model-mix fixture results from a versioned manifest.
     Evaluation(EvaluationCommand),
+    /// Run a local fake-provider-backed model-mix harness and record mix plus outcomes.
+    EvalHarness(EvalHarnessCommand),
     /// Inspect the optimizer policy library, replay snapshots, and preference profiles.
     Optimizer(OptimizerCommand),
 }
@@ -1066,6 +1069,9 @@ struct PlanSuperviseArgs {
 #[derive(Debug, Clone, Copy, Default, Args)]
 struct RunBudgetArgs {
     /// Hard ceiling for total provider tokens committed by this supervise run.
+    ///
+    /// Tightens the plan `run_budget` by taking the minimum and is retained on
+    /// the run budget ledger as `sources.cli` alongside the original plan values.
     #[arg(
         long = "max-tokens",
         visible_alias = "max-total-tokens",
@@ -1073,6 +1079,9 @@ struct RunBudgetArgs {
     )]
     max_tokens: Option<usize>,
     /// Hard ceiling for total provider cost committed by this supervise run, in USD.
+    ///
+    /// Tightens the plan `run_budget` by taking the minimum and is retained on
+    /// the run budget ledger as `sources.cli` alongside the original plan values.
     #[arg(
         long = "max-cost-usd",
         visible_alias = "max-total-cost-usd",
@@ -1080,6 +1089,9 @@ struct RunBudgetArgs {
     )]
     max_cost_usd: Option<f64>,
     /// Maximum elapsed duration for admitting new supervise dispatches.
+    ///
+    /// Tightens `run_budget.max_duration_seconds` by taking the minimum and is
+    /// retained on the run budget ledger as `sources.cli`.
     #[arg(
         long = "max-duration-seconds",
         visible_alias = "max-total-duration-seconds",
@@ -3689,6 +3701,56 @@ struct RunEvaluationArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct EvalHarnessCommand {
+    #[command(subcommand)]
+    command: EvalHarnessSubcommand,
+}
+
+impl EvalHarnessCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            EvalHarnessSubcommand::Run(args) => run_eval_harness_command(args),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum EvalHarnessSubcommand {
+    /// Complete each role in a mix through the local fake provider and record outcomes.
+    Run(RunEvalHarnessArgs),
+}
+
+#[derive(Debug, Args)]
+struct RunEvalHarnessArgs {
+    /// Versioned eval-harness manifest JSON.
+    manifest: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+fn run_eval_harness_command(args: RunEvalHarnessArgs) -> Result<()> {
+    let manifest_bytes = BoundedRegularReader::read_tree_no_follow(
+        &args.manifest,
+        crate::eval_harness::MAX_MANIFEST_BYTES,
+    )
+    .with_context(|| {
+        format!(
+            "failed to read eval harness manifest {}",
+            args.manifest.display()
+        )
+    })?;
+    let manifest = crate::eval_harness::parse_manifest(&manifest_bytes).with_context(|| {
+        format!(
+            "failed to parse eval harness manifest {}",
+            args.manifest.display()
+        )
+    })?;
+    let results = crate::eval_harness::run_local_fake_harness(&manifest)?;
+    print_query_report(&results, args.json)
 }
 
 include!("cli/part2.rs");

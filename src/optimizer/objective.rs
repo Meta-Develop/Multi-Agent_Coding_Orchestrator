@@ -169,20 +169,10 @@ pub struct PreferenceProfile {
 
 impl PreferenceProfile {
     pub fn shipped_default() -> Self {
-        Self {
-            schema_version: PREFERENCE_SCHEMA_VERSION,
-            id: PreferenceProfileId::new("default").expect("default id"),
-            version: 1,
-            provider_weights: BTreeMap::new(),
-            reserve_margin_native: 0,
-            latency_weight_bp: 5_000,
-            cost_weight_bp: 5_000,
-            human_intervention_aversion_bp: 0,
-            uncertainty_aversion_bp: 0,
-            exploration: BTreeMap::new(),
-            hedge: HedgeAggressiveness::default(),
-            task_class_overrides: BTreeMap::new(),
-        }
+        parse_preference_profile(super::weight_profile::DEFAULT_PREFERENCE_PROFILE_JSON.as_bytes())
+            .unwrap_or_else(|error| {
+                panic!("tracked default preference profile failed validation: {error}")
+            })
     }
 
     pub fn attribution(&self) -> PreferenceAttribution {
@@ -297,6 +287,7 @@ pub fn parse_preference_profile(bytes: &[u8]) -> Result<PreferenceProfile, Optim
     let value: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| OptimizerError::invalid(format!("preference profile JSON: {error}")))?;
     reject_forbidden_preference_keys(&value, "")?;
+    super::weight_profile::validate_preference_profile_document(&value)?;
     let profile: PreferenceProfile = serde_json::from_value(value)
         .map_err(|error| OptimizerError::invalid(format!("preference profile schema: {error}")))?;
     profile.validate()?;
@@ -840,6 +831,32 @@ mod tests {
             human_minutes_micros: 0,
             uncertainty_bp: 0,
         }
+    }
+
+    #[test]
+    fn shipped_default_loads_tracked_profile_with_current_constants() {
+        let profile = PreferenceProfile::shipped_default();
+        assert_eq!(profile.schema_version, PREFERENCE_SCHEMA_VERSION);
+        assert_eq!(profile.id.as_str(), "default");
+        assert_eq!(profile.version, 1);
+        assert_eq!(profile.latency_weight_bp, 5_000);
+        assert_eq!(profile.cost_weight_bp, 5_000);
+        assert_eq!(profile.reserve_margin_native, 0);
+        assert_eq!(profile.human_intervention_aversion_bp, 0);
+        assert_eq!(profile.uncertainty_aversion_bp, 0);
+        assert!(profile.provider_weights.is_empty());
+        assert!(profile.exploration.is_empty());
+        assert!(profile.task_class_overrides.is_empty());
+        assert_eq!(profile.hedge, HedgeAggressiveness::default());
+    }
+
+    #[test]
+    fn operator_profile_missing_required_weight_fails_closed() {
+        let error = parse_preference_profile(
+            br#"{"schema_version":1,"id":"bad","version":1,"latency_weight_bp":1}"#,
+        )
+        .expect_err("missing cost weight");
+        assert!(error.to_string().contains("cost_weight_bp"), "{error}");
     }
 
     #[test]

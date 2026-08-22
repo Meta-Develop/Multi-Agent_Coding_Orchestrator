@@ -2467,21 +2467,14 @@ fn prepare_supervisor_run(
         mut plan_metadata,
     } = loaded;
     validate_max_concurrent_children(max_concurrent_children)?;
-    plan_metadata.run_budget.limits = plan_metadata
-        .run_budget
-        .limits
-        .strictest(options.budget_overrides)
-        .context("failed to compose plan and CLI run budgets")?;
-    let max_duration_seconds = match (
+    let budget_ledger = RunBudgetLedger::new_composed(
+        plan_metadata.run_budget.limits,
+        options.budget_overrides,
         plan_metadata.run_budget_max_duration_seconds,
         options.budget_max_duration_seconds,
-    ) {
-        (Some(plan), Some(cli)) => Some(plan.min(cli)),
-        (plan, cli) => plan.or(cli),
-    };
-    let budget_ledger =
-        RunBudgetLedger::new_with_duration(plan_metadata.run_budget.limits, max_duration_seconds)
-            .context("failed to initialize the supervise run budget ledger")?;
+    )
+    .context("failed to initialize the supervise run budget ledger")?;
+    plan_metadata.run_budget.limits = budget_ledger.effective_limits();
     match worktree_creation {
         SupervisorWorktreeCreation::Bound(_)
             if execution_runtime != SupervisorExecutionRuntime::Verified =>
