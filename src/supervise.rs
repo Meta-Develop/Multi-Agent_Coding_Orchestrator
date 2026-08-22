@@ -2,7 +2,7 @@
 use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
 pub use crate::supervise_budget::{
     BudgetAction, BudgetAmount, BudgetReason, BudgetRemaining, RoleBudgetReport, RunBudgetLimits,
-    RunBudgetReport,
+    RunBudgetReport, RunBudgetSource, RunBudgetSources,
 };
 use crate::{
     artifacts::{
@@ -170,6 +170,9 @@ use primary_integrity::*;
 
 mod worktree_controls;
 use worktree_controls::*;
+
+mod instruction_profile;
+pub use instruction_profile::*;
 
 mod prompts;
 pub use prompts::*;
@@ -1112,6 +1115,10 @@ pub struct AssignmentSelectionLedgerEntry {
     pub assignment_id: String,
     pub attempt: usize,
     pub role: AgentRole,
+    /// Auto-selected or operator-overridden authority category recorded with
+    /// the same provenance rule as #149 (why this role, not a launch tier).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_assignment: Option<RoleAssignmentRecord>,
     pub selection_source: AssignmentSelectionSource,
     pub selected_runtime: Option<String>,
     pub selected_model: Option<String>,

@@ -1214,6 +1214,10 @@ fn decision_for_assignment_role<'a>(
     })
 }
 
+fn recorded_role_assignment(assignment_id: &str, role: AgentRole) -> Option<RoleAssignmentRecord> {
+    assign_role_category(assignment_id, role, None).ok()
+}
+
 fn ledger_entry_for_assignment(
     assignment_id: &str,
     role: AgentRole,
@@ -1223,12 +1227,14 @@ fn ledger_entry_for_assignment(
 ) -> AssignmentSelectionLedgerEntry {
     let event = decision_for_assignment_role(decisions, assignment_id, role);
     let source = selection_source_for(event, runtime);
+    let role_assignment = recorded_role_assignment(assignment_id, role);
     if source == AssignmentSelectionSource::LegacyFake {
         let configured = plan.role_models.get(&role);
         return AssignmentSelectionLedgerEntry {
             assignment_id: assignment_id.to_string(),
             attempt: event.map(|event| event.attempt).unwrap_or(0),
             role,
+            role_assignment,
             selection_source: source,
             selected_runtime: Some(runtime_name(runtime).to_string()),
             selected_model: configured.and_then(|selection| selection.model.clone()),
@@ -1250,6 +1256,7 @@ fn ledger_entry_for_assignment(
             assignment_id: assignment_id.to_string(),
             attempt: 0,
             role,
+            role_assignment,
             selection_source: source,
             selected_runtime: Some(runtime_name(runtime).to_string()),
             selected_model: None,
@@ -1319,6 +1326,7 @@ fn ledger_entry_for_assignment(
         assignment_id: assignment_id.to_string(),
         attempt: event.attempt,
         role,
+        role_assignment,
         selection_source: source,
         selected_runtime: choice.map(|choice| choice.candidate.runtime.clone()),
         selected_model: choice.map(|choice| choice.candidate.model.clone()),
@@ -1647,6 +1655,20 @@ mod tests {
                         format!("missing {assignment_id} {} ledger row", role.as_str())
                     })?;
                 assert_eq!(entry.selection_source, AssignmentSelectionSource::Automatic);
+                let role_assignment = entry
+                    .role_assignment
+                    .as_ref()
+                    .with_context(|| format!("missing role assignment for {assignment_id}"))?;
+                assert_eq!(role_assignment.agent_id, assignment_id);
+                assert_eq!(role_assignment.legacy_role, role.as_str());
+                assert_eq!(role_assignment.category, role.authority_category());
+                assert_eq!(
+                    role_assignment.source,
+                    RoleAssignmentSource::DerivedFromPlanRole
+                );
+                assert!(role_assignment
+                    .reason
+                    .contains("without a launch-tier designation"));
                 assert_eq!(entry.selected_runtime.as_deref(), Some("codex"));
                 assert!(entry.selected_model.is_some());
                 assert!(entry.selected_reasoning_effort.is_some());

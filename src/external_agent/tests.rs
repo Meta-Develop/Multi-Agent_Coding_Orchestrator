@@ -436,6 +436,63 @@ fn production_writable_path_refuses_before_starting_any_child_process() -> Resul
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn writable_claude_and_gemini_fail_closed_before_starting_any_child() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for runtime in [RuntimeId::ClaudeCode, RuntimeId::GeminiCli] {
+        let temp = tempfile::tempdir()?;
+        let marker = temp.path().join("child-process-started");
+        let agent = temp.path().join("must-not-start.sh");
+        fs::write(&agent, format!("#!/bin/sh\ntouch '{}'\n", marker.display()))?;
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+        let prompt = temp.path().join("prompt.md");
+        fs::write(&prompt, "writable adapter child must remain disabled\n")?;
+        let incoming = temp.path().join("incoming");
+        fs::create_dir(&incoming)?;
+        let spec = ExternalAgentCommand::codex(
+            &agent,
+            temp.path(),
+            &prompt,
+            incoming.join("events.jsonl"),
+            incoming.join("last-message.txt"),
+            Duration::from_secs(5),
+        )
+        .with_runtime_adapter(runtime, RuntimeAdapterConfig::defaults(runtime))
+        .with_workspace_access(WorkspaceAccess::ReadWrite)
+        .with_model_selection(Some("test-model".to_string()), None);
+
+        let report = run_external_agent(&spec);
+
+        assert!(
+            !marker.exists(),
+            "{} child must not start",
+            runtime.as_str()
+        );
+        assert!(!report.stdout.target_launch_attempted);
+        assert_eq!(report.process_tree, None);
+        assert_eq!(report.side_effects, None);
+        assert!(report.environment_blocked());
+        let capability = runtime
+            .capabilities()
+            .writable_refusal()
+            .expect("claude/gemini writable release stays refused");
+        assert_eq!(capability, "blocking_pre_action_callback != All");
+        assert!(report.error.as_deref().is_some_and(|error| {
+            error.contains(&format!(
+                "writable {} failed closed before launch",
+                runtime.as_str()
+            )) && error.contains(capability)
+        }));
+        assert!(report.environment_failures().iter().any(|failure| {
+            failure.category == EnvironmentFailureCategory::SandboxUnavailable
+                && failure.summary.contains(capability)
+        }));
+    }
+    Ok(())
+}
+
 fn contained_fake_app_server(
     mode: &str,
     journal: &mut RecordingPreActionJournal,

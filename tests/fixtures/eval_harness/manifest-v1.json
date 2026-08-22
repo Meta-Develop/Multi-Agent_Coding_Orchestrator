@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "experiment_id": "local-fake-planner-worker-v1",
+  "task": "compare planner and worker proposals for a held-out fixture task",
+  "provider": "local_fake",
+  "profiles": [
+    {
+      "id": "frontier-planner-cheap-worker",
+      "mix": [
+        {
+          "role": "planner",
+          "model": "fake-frontier"
+        },
+        {
+          "role": "worker",
+          "model": "fake-fast"
+        }
+      ]
+    },
+    {
+      "id": "cheap-planner-cheap-worker",
+      "mix": [
+        {
+          "role": "planner",
+          "model": "fake-fast"
+        },
+        {
+          "role": "worker",
+          "model": "fake-fast"
+        }
+      ]
+    }
+  ]
+}

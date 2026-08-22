@@ -1051,7 +1051,7 @@ fn dispatch_and_collect_child_attempt<'a>(
             &assignment.id,
             journal_parent_id,
             OrchestrationRole::Orchestrator,
-            assignment.role.as_str(),
+            assignment.role,
             write_boundary_refs(&assignment.assigned_paths),
             &assignment_scope_ref(&assignment.id),
             json!({
@@ -2171,7 +2171,7 @@ fn dispatch_and_collect_parent_auditor(
             &auditor_id,
             &assignment.id,
             OrchestrationRole::Auditor,
-            AgentRole::Auditor.as_str(),
+            AgentRole::Auditor,
             Vec::new(),
             &assignment_scope_ref(&assignment.id),
             json!({
@@ -4077,6 +4077,39 @@ done
         assert!(!SupervisorRuntime::ClaudeCode
             .capabilities()
             .admits_writable_release());
+        assert_eq!(
+            crate::runtime_adapter::AdapterId::from_runtime(SupervisorRuntime::ClaudeCode)
+                .writable_leaf_launch_refusal(),
+            Some("blocking_pre_action_callback != All")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn supervise_plan_accepts_gemini_cli_runtime_without_closing_writable_release() -> Result<()> {
+        let assignment: OrchestratorAssignment = serde_json::from_str(
+            r#"{
+                "id": "worker-gemini",
+                "runtime": "gemini-cli",
+                "role": "worker",
+                "assigned_paths": ["README.md"]
+            }"#,
+        )?;
+        assert_eq!(assignment.runtime, Some(SupervisorRuntime::GeminiCli));
+        assert_eq!(
+            SupervisorRuntime::GeminiCli
+                .capabilities()
+                .writable_refusal(),
+            Some("blocking_pre_action_callback != All")
+        );
+        assert!(!SupervisorRuntime::GeminiCli
+            .capabilities()
+            .admits_writable_release());
+        assert_eq!(
+            crate::runtime_adapter::AdapterId::from_runtime(SupervisorRuntime::GeminiCli)
+                .writable_leaf_launch_refusal(),
+            Some("blocking_pre_action_callback != All")
+        );
         Ok(())
     }
 

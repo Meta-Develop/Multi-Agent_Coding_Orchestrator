@@ -1358,6 +1358,28 @@ fn preflight_composes_cli_budget_overrides_with_plan_by_strictest_limit() {
         }
     );
     assert_eq!(report.max_duration_seconds, Some(300));
+    assert_eq!(
+        report.sources,
+        Some(crate::supervise::RunBudgetSources {
+            plan: crate::supervise::RunBudgetSource {
+                limits: RunBudgetLimits {
+                    soft_tokens: Some(100),
+                    hard_tokens: Some(200),
+                    soft_cost_usd: Some(0.5),
+                    hard_cost_usd: Some(1.0),
+                },
+                max_duration_seconds: Some(600),
+            },
+            cli: crate::supervise::RunBudgetSource {
+                limits: RunBudgetLimits {
+                    hard_tokens: Some(50),
+                    hard_cost_usd: Some(0.4),
+                    ..RunBudgetLimits::default()
+                },
+                max_duration_seconds: Some(300),
+            },
+        })
+    );
 }
 
 #[test]

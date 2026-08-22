@@ -112,6 +112,10 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
                 .iter()
                 .any(|reason| reason == "max_duration_reached"))
     );
+    assert_eq!(
+        schema["properties"]["run_budget"]["properties"]["sources"]["required"],
+        serde_json::json!(["plan", "cli"])
+    );
     let autonomy = &schema["properties"]["autonomy_kpis"];
     let required = autonomy["required"]
         .as_array()

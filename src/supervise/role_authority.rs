@@ -1,13 +1,17 @@
-//! Role categories as authority boundaries (#221 first slice).
+//! Role categories as authority boundaries (#221).
 //!
 //! Delegation, write, and judgment attach to a category, not to a launch-time
-//! tier name. This module owns the fail-closed types and gates. It does not
-//! auto-select roles from a task, emit variable-depth plans, or drive the
-//! optimizer.
+//! tier name. This slice records auto-selected (or operator-overridden) role
+//! categories on assignment. It does not run the optimizer, emit variable-depth
+//! plans, or change weak-model capability floors.
 
 use super::{AgentRole, ModelCapabilityClass};
-use anyhow::{bail, Result};
+use crate::orchestration_event::OrchestrationEvent;
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub const ROLE_ASSIGNMENT_FIELD: &str = "role_assignment";
 
 /// Authority primitive. Launch-time tier names map onto these categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
@@ -209,6 +213,41 @@ pub fn assign_role_category(
     };
     record.validate()?;
     Ok(record)
+}
+
+pub fn insert_role_assignment(payload: &mut Value, record: &RoleAssignmentRecord) -> Result<()> {
+    record.validate()?;
+    let object = payload
+        .as_object_mut()
+        .context("orchestration payload must be an object to record a role assignment")?;
+    object.insert(
+        ROLE_ASSIGNMENT_FIELD.to_string(),
+        serde_json::to_value(record).context("failed to encode role assignment")?,
+    );
+    Ok(())
+}
+
+pub fn collect_role_assignments(
+    events: &[OrchestrationEvent],
+) -> Result<Vec<RoleAssignmentRecord>> {
+    let mut records = Vec::new();
+    for event in events {
+        let Some(value) = event.payload.get(ROLE_ASSIGNMENT_FIELD) else {
+            continue;
+        };
+        let record: RoleAssignmentRecord = serde_json::from_value(value.clone())
+            .context("role assignment payload is not a valid ledger record")?;
+        record.validate()?;
+        if record.agent_id != event.node {
+            bail!(
+                "role assignment agent_id '{}' does not match event node '{}'",
+                record.agent_id,
+                event.node
+            );
+        }
+        records.push(record);
+    }
+    Ok(records)
 }
 
 /// Adapter-launched runtimes may only host a non-delegating terminal worker.
@@ -460,6 +499,33 @@ mod tests {
         assert_eq!(record.source, RoleAssignmentSource::DerivedFromPlanRole);
         assert!(record.reason.contains("without a launch-tier designation"));
         assert_eq!(record.legacy_role, "child_orchestrator");
+        Ok(())
+    }
+
+    #[test]
+    fn role_assignment_round_trips_through_an_orchestration_payload() -> Result<()> {
+        let record = assign_role_category("child-1", AgentRole::ChildOrchestrator, None)?;
+        let mut payload = serde_json::json!({"attempt": 1});
+        insert_role_assignment(&mut payload, &record)?;
+        let event = crate::orchestration_event::OrchestrationEvent {
+            ts: "2026-08-22T00:00:00Z".into(),
+            repo: "repo".into(),
+            run: "run-1".into(),
+            node: "child-1".into(),
+            parent: Some("run-1".into()),
+            role: crate::orchestration_event::OrchestrationRole::Orchestrator,
+            kind: crate::orchestration_event::OrchestrationEventKind::Spawn,
+            payload,
+        };
+        let collected = collect_role_assignments(&[event])?;
+        assert_eq!(collected, vec![record]);
+        assert_eq!(
+            collected[0].source,
+            RoleAssignmentSource::DerivedFromPlanRole
+        );
+        assert!(collected[0]
+            .reason
+            .contains("without a launch-tier designation"));
         Ok(())
     }
 

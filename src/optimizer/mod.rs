@@ -23,6 +23,10 @@
 //! `escaped_defect`) plug in beside this foundation. They do not edit the
 //! action/policy/state IDs, trait signatures, the append-only
 //! [`QualityContract`] API, or the keyed [`ResourceVector`] core.
+//!
+//! Contract quota pools (`quota_pools`, issue #151) are the local-first cost
+//! input for later selector scoring. They do not edit operator labels,
+//! difficulty, or switch-cost types.
 
 pub mod action;
 pub mod blinding;
@@ -49,6 +53,7 @@ pub mod operator_labels;
 pub mod policy;
 pub mod predictor;
 pub mod quality;
+pub mod quota_pools;
 pub mod replay;
 pub mod resources;
 pub mod safe_set;
@@ -79,6 +84,9 @@ pub use online_router::{OnlineRouter, RouterDecision};
 pub use policy::{PolicyEdge, PolicyGraph, PolicyNode, TransitionCondition, TransitionEvidence};
 pub use predictor::{PolicyOutcomeDistribution, PolicyPredictor};
 pub use quality::QualityContract;
+pub use quota_pools::{
+    build_quota_selector_input, ConsumptionLedger, EntitlementDescriptor, QuotaSelectorInput,
+};
 pub use resources::{
     DispatchClass, DispatchDecision, DispatchRequest, ResourceObserver, ResourceSnapshot,
     ResourceVector,
