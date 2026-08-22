@@ -2520,12 +2520,13 @@ fn prepare_supervisor_run(
             selection_preflight_failure: None,
         },
         Ok(catalog) => {
+            let advertised = advertised_catalogs_for_launch(&repo)?;
             let resolution = initialize_supervisor_selection(
                 &mut plan,
                 runtime,
                 catalog,
                 &admission_policy_input,
-                &AdvertisedCatalogSet::empty(),
+                &advertised,
             )?;
             if resolution.selection_preflight_failure.is_none() {
                 bind_selected_assignment_runtimes(&mut plan, &resolution.decisions)?;

@@ -54,6 +54,11 @@ impl CursorCatalogCommandSpec {
         }
     }
 
+    pub fn with_program(mut self, program: impl Into<PathBuf>) -> Self {
+        self.program = program.into();
+        self
+    }
+
     pub fn program(&self) -> &Path {
         &self.program
     }
