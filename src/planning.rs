@@ -288,6 +288,14 @@ impl TaskPlanningSession {
     pub fn provider_assignment_tree(&self) -> &[ProviderTaskAssignmentTree] {
         &self.provider_assignment_tree
     }
+
+    pub fn completed_fragment_ids(&self) -> &BTreeSet<String> {
+        &self.completed_fragment_ids
+    }
+
+    pub fn completed_assignments(&self) -> &[TaskAssignmentProposal] {
+        &self.completed_assignments
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -587,6 +595,15 @@ pub fn propose_task_decomposition(
     body: &str,
 ) -> Result<TaskDecompositionProposal> {
     let fragments = task_spec_fragments(title, body)?;
+    propose_task_decomposition_from_fragments(repo, fragments, title, body)
+}
+
+fn propose_task_decomposition_from_fragments(
+    repo: &Path,
+    fragments: Vec<TaskSpecFragment>,
+    title: &str,
+    body: &str,
+) -> Result<TaskDecompositionProposal> {
     let mut diagnostics = TaskPathProposalDiagnostics::default();
     let files = collect_planning_files(repo, title, body, &mut diagnostics)?;
     let file_set = files.iter().cloned().collect::<BTreeSet<_>>();
@@ -913,6 +930,158 @@ pub fn replan_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
     session.provider_usage = session.provider_usage.saturating_add(response.usage);
     session.proposal = proposal;
     session.provider_assignment_tree = provider_assignment_tree;
+    session.completed_fragment_ids = next_completed_fragment_ids;
+    session.completed_assignments = next_completed_assignments;
+    Ok(())
+}
+
+/// Revises remaining heuristic work from execution feedback without invoking a planner model.
+///
+/// Completed assignments stay frozen. Remaining fragments are rematched through the
+/// existing deterministic decomposer, optionally steered by feedback notes, then
+/// checked against the same disjointness and completed-scope gates as provider replans.
+/// This is the first #80 slice: a bounded feedback hook, not model-driven recursive planning.
+pub fn replan_task_decomposition_from_feedback(
+    repo: &Path,
+    session: &mut TaskPlanningSession,
+    feedback: &TaskExecutionFeedback,
+) -> Result<()> {
+    if session.source != TaskPlanningSource::Heuristic {
+        anyhow::bail!(
+            "feedback re-planning without a provider requires a heuristic planning session"
+        );
+    }
+    if !session.provider_assignment_tree.is_empty() {
+        anyhow::bail!("heuristic planning session unexpectedly carries a provider assignment tree");
+    }
+    if session.replans_used >= MAX_PROVIDER_REPLANS {
+        anyhow::bail!("re-planning limit of {MAX_PROVIDER_REPLANS} attempt(s) has been exhausted");
+    }
+
+    let normalized_feedback =
+        normalize_execution_feedback(feedback, &session.proposal, &session.completed_fragment_ids)?;
+    let newly_completed_assignments = session
+        .proposal
+        .assignments
+        .iter()
+        .filter(|assignment| {
+            normalized_feedback
+                .completed_assignment_ids
+                .contains(&assignment.id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let newly_completed_fragment_ids = newly_completed_assignments
+        .iter()
+        .flat_map(|assignment| assignment.fragment_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if let Some(overlap) = newly_completed_fragment_ids
+        .intersection(&normalized_feedback.coverage_gap_fragment_ids)
+        .next()
+    {
+        anyhow::bail!(
+            "execution feedback marks newly completed fragment '{overlap}' as a coverage gap"
+        );
+    }
+
+    let mut next_completed_fragment_ids = session.completed_fragment_ids.clone();
+    next_completed_fragment_ids.extend(newly_completed_fragment_ids);
+    let mut next_completed_assignments = session.completed_assignments.clone();
+    next_completed_assignments.extend(newly_completed_assignments);
+
+    let remaining_fragments = session
+        .proposal
+        .fragments
+        .iter()
+        .filter(|fragment| !next_completed_fragment_ids.contains(&fragment.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if remaining_fragments.is_empty() {
+        anyhow::bail!("feedback re-planning has no remaining incomplete fragments");
+    }
+
+    let rematch_body = remaining_fragments
+        .iter()
+        .map(|fragment| format!("- {}", fragment.text))
+        .chain(
+            normalized_feedback
+                .notes
+                .iter()
+                .map(|note| format!("- {note}")),
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rematch_fragments = remaining_fragments
+        .iter()
+        .map(|fragment| {
+            let apply_notes = normalized_feedback
+                .coverage_gap_fragment_ids
+                .contains(&fragment.id)
+                || session.proposal.assignments.iter().any(|assignment| {
+                    normalized_feedback
+                        .failed_assignment_ids
+                        .contains(&assignment.id)
+                        && assignment.fragment_ids.contains(&fragment.id)
+                })
+                || (normalized_feedback.failed_assignment_ids.is_empty()
+                    && normalized_feedback.coverage_gap_fragment_ids.is_empty());
+            let text = if apply_notes && !normalized_feedback.notes.is_empty() {
+                let mut text = fragment.text.clone();
+                for note in &normalized_feedback.notes {
+                    text.push(' ');
+                    text.push_str(note);
+                }
+                text
+            } else {
+                fragment.text.clone()
+            };
+            TaskSpecFragment {
+                id: fragment.id.clone(),
+                text,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let next_attempt = session.replans_used.saturating_add(1);
+    let mut proposal =
+        propose_task_decomposition_from_fragments(repo, rematch_fragments, "", &rematch_body)?;
+    if proposal.assignments.is_empty() {
+        anyhow::bail!("feedback re-planning produced no remaining executable assignments");
+    }
+    for (index, assignment) in proposal.assignments.iter_mut().enumerate() {
+        assignment.id = format!("assignment-replan-{next_attempt:02}-{:03}", index + 1);
+        assignment.task = assignment
+            .fragment_ids
+            .iter()
+            .filter_map(|fragment_id| {
+                remaining_fragments
+                    .iter()
+                    .find(|fragment| &fragment.id == fragment_id)
+                    .map(|fragment| fragment.text.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    let scoped_nodes = proposal
+        .assignments
+        .iter()
+        .enumerate()
+        .map(|(index, assignment)| (vec![index], assignment.clone()))
+        .collect::<Vec<_>>();
+    validate_completed_scope_not_reclaimed(
+        &scoped_nodes,
+        &next_completed_assignments,
+        "feedback re-planning",
+    )?;
+    validate_task_assignment_disjointness(&proposal.assignments)
+        .context("feedback re-planning remaining assignments are not independently assignable")?;
+    proposal.fragments = session.proposal.fragments.clone();
+    proposal.diagnostics.notes.push(format!(
+        "heuristic re-plan attempt {next_attempt} used execution feedback without a planner model"
+    ));
+
+    session.replans_used = next_attempt;
+    session.proposal = proposal;
     session.completed_fragment_ids = next_completed_fragment_ids;
     session.completed_assignments = next_completed_assignments;
     Ok(())
@@ -1442,7 +1611,7 @@ fn normalize_execution_feedback(
         .and_then(|count| count.checked_add(feedback.notes.len()))
         .context("execution feedback item count overflowed")?;
     if item_count == 0 {
-        anyhow::bail!("provider re-planning requires at least one execution feedback item");
+        anyhow::bail!("re-planning requires at least one execution feedback item");
     }
     if item_count > PROVIDER_PLANNING_MAX_FEEDBACK_ITEMS {
         anyhow::bail!(
@@ -1524,7 +1693,7 @@ fn normalize_execution_feedback(
         && coverage_gap_fragment_ids.is_empty()
         && notes.is_empty()
     {
-        anyhow::bail!("provider re-planning requires non-empty normalized execution feedback");
+        anyhow::bail!("re-planning requires non-empty normalized execution feedback");
     }
     Ok(NormalizedTaskExecutionFeedback {
         completed_assignment_ids,
@@ -3789,6 +3958,172 @@ mod tests {
 
         let files = collect_repo_files(&repo).expect("collect files");
         assert_eq!(files, vec![PathBuf::from("README.md")]);
+    }
+
+    #[test]
+    fn heuristic_replans_from_feedback_without_a_planner_model() {
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "src/alpha.rs", "pub fn alpha_task() {}\n");
+            write_file(repo, "src/beta.rs", "pub fn beta_task() {}\n");
+            write_file(repo, "src/gamma.rs", "pub fn gamma_task() {}\n");
+            let config = ProviderPlanningConfig::new("feedback", "planner-model");
+            let mut session = propose_task_decomposition_with_optional_provider(
+                repo,
+                "",
+                "- Update alpha_task in src/alpha.rs.\n- Update beta_task in src/beta.rs.",
+                None,
+                &config,
+            )
+            .expect("heuristic session");
+            assert_eq!(session.source(), TaskPlanningSource::Heuristic);
+            assert_eq!(session.proposal().assignments.len(), 2);
+            assert_eq!(
+                session.proposal().assignments[0].assigned_paths,
+                vec![PathBuf::from("src/alpha.rs")]
+            );
+            assert_eq!(
+                session.proposal().assignments[1].assigned_paths,
+                vec![PathBuf::from("src/beta.rs")]
+            );
+
+            let first_feedback = TaskExecutionFeedback {
+                completed_assignment_ids: vec!["assignment-001".to_string()],
+                failed_assignment_ids: vec!["assignment-002".to_string()],
+                coverage_gap_fragment_ids: vec!["fragment-002".to_string()],
+                notes: vec!["execution found the implementation in src/gamma.rs".to_string()],
+            };
+            replan_task_decomposition_from_feedback(repo, &mut session, &first_feedback)
+                .expect("first feedback re-plan");
+            assert_eq!(session.replans_used(), 1);
+            assert_eq!(session.source(), TaskPlanningSource::Heuristic);
+            assert_eq!(session.completed_fragment_ids().len(), 1);
+            assert_eq!(session.completed_assignments().len(), 1);
+            assert_eq!(
+                session.completed_assignments()[0].assigned_paths,
+                vec![PathBuf::from("src/alpha.rs")]
+            );
+            assert_eq!(session.proposal().assignments.len(), 1);
+            assert_eq!(
+                session.proposal().assignments[0].id,
+                "assignment-replan-01-001"
+            );
+            assert!(
+                session.proposal().assignments[0]
+                    .assigned_paths
+                    .contains(&PathBuf::from("src/gamma.rs")),
+                "remaining work should pick up the feedback path: {:?}",
+                session.proposal().assignments[0].assigned_paths
+            );
+            assert!(
+                !session.proposal().assignments[0]
+                    .assigned_paths
+                    .contains(&PathBuf::from("src/alpha.rs")),
+                "remaining work must not reclaim completed alpha"
+            );
+            assert!(session
+                .proposal()
+                .diagnostics
+                .notes
+                .iter()
+                .any(|note| note.contains("without a planner model")));
+
+            let second_feedback = TaskExecutionFeedback {
+                failed_assignment_ids: vec!["assignment-replan-01-001".to_string()],
+                notes: vec!["retry remaining work in src/gamma.rs".to_string()],
+                ..TaskExecutionFeedback::default()
+            };
+            replan_task_decomposition_from_feedback(repo, &mut session, &second_feedback)
+                .expect("second feedback re-plan");
+            assert_eq!(session.replans_used(), MAX_PROVIDER_REPLANS);
+            assert_eq!(
+                session.proposal().assignments[0].id,
+                "assignment-replan-02-001"
+            );
+
+            let limit_error =
+                replan_task_decomposition_from_feedback(repo, &mut session, &second_feedback)
+                    .expect_err("third re-plan must be rejected");
+            assert!(limit_error.to_string().contains("limit of 2 attempt"));
+        });
+    }
+
+    #[test]
+    fn heuristic_replan_rejects_completed_scope_reclaim_and_provider_sessions() {
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "src/alpha.rs", "pub fn alpha_task() {}\n");
+            write_file(repo, "src/beta.rs", "pub fn beta_task() {}\n");
+            let config = ProviderPlanningConfig::new("reclaim", "planner-model");
+            let mut session = propose_task_decomposition_with_optional_provider(
+                repo,
+                "",
+                "- Update alpha_task in src/alpha.rs.\n- Update beta_task in src/beta.rs.",
+                None,
+                &config,
+            )
+            .expect("heuristic session");
+            let reclaim_error = replan_task_decomposition_from_feedback(
+                repo,
+                &mut session,
+                &TaskExecutionFeedback {
+                    completed_assignment_ids: vec!["assignment-001".to_string()],
+                    failed_assignment_ids: vec!["assignment-002".to_string()],
+                    coverage_gap_fragment_ids: vec!["fragment-002".to_string()],
+                    notes: vec!["keep using src/alpha.rs".to_string()],
+                },
+            )
+            .expect_err("reclaiming completed scope must fail");
+            assert!(reclaim_error
+                .to_string()
+                .contains("reclaims completed scope"));
+
+            let empty_error = replan_task_decomposition_from_feedback(
+                repo,
+                &mut session,
+                &TaskExecutionFeedback::default(),
+            )
+            .expect_err("empty feedback must fail");
+            assert!(empty_error
+                .to_string()
+                .contains("re-planning requires at least one execution feedback item"));
+
+            let provider_plan = ProviderTaskPlan {
+                assignments: vec![
+                    provider_assignment("alpha", "Update alpha", "fragment-001", "src/alpha.rs"),
+                    provider_assignment("beta", "Update beta", "fragment-002", "src/beta.rs"),
+                ],
+            };
+            let mut provider = FakeProvider::new("fake-planner", "planner-model");
+            provider
+                .push_json_response("reclaim-proposal", &provider_plan)
+                .expect("script provider plan");
+            let mut provider_session = propose_task_decomposition_with_provider(
+                repo,
+                "",
+                "- Update alpha behavior.\n- Update beta behavior.",
+                &mut provider,
+                &config,
+            )
+            .expect("provider session");
+            let provider_error = replan_task_decomposition_from_feedback(
+                repo,
+                &mut provider_session,
+                &TaskExecutionFeedback {
+                    failed_assignment_ids: vec!["beta".to_string()],
+                    notes: vec!["use heuristic rematch".to_string()],
+                    ..TaskExecutionFeedback::default()
+                },
+            )
+            .expect_err("provider sessions must use the provider re-plan path");
+            assert!(provider_error
+                .to_string()
+                .contains("requires a heuristic planning session"));
+        });
     }
 
     fn write_file(repo: &Path, relative: &str, contents: &str) {
