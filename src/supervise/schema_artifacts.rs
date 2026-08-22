@@ -811,6 +811,49 @@ fn run_budget_report_schema_value() -> serde_json::Value {
                 }
             },
             "max_duration_seconds": {"type": "integer", "minimum": 1},
+            "sources": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["plan", "cli"],
+                "properties": {
+                    "plan": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["limits"],
+                        "properties": {
+                            "limits": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "soft_tokens": {"type": "integer", "minimum": 1},
+                                    "hard_tokens": {"type": "integer", "minimum": 1},
+                                    "soft_cost_usd": {"type": "number", "exclusiveMinimum": 0},
+                                    "hard_cost_usd": {"type": "number", "exclusiveMinimum": 0}
+                                }
+                            },
+                            "max_duration_seconds": {"type": "integer", "minimum": 1}
+                        }
+                    },
+                    "cli": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["limits"],
+                        "properties": {
+                            "limits": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "soft_tokens": {"type": "integer", "minimum": 1},
+                                    "hard_tokens": {"type": "integer", "minimum": 1},
+                                    "soft_cost_usd": {"type": "number", "exclusiveMinimum": 0},
+                                    "hard_cost_usd": {"type": "number", "exclusiveMinimum": 0}
+                                }
+                            },
+                            "max_duration_seconds": {"type": "integer", "minimum": 1}
+                        }
+                    }
+                }
+            },
             "consumed": amount(),
             "reserved": amount(),
             "committed": amount(),

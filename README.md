@@ -1366,7 +1366,10 @@ the minimum. If the resulting hard ceiling is below a plan soft threshold, the
 soft threshold is clamped to the hard ceiling. Duration likewise composes with
 `run_budget.max_duration_seconds` by taking the minimum and stops new admission
 once elapsed time reaches the bound. The effective limits, elapsed seconds, and
-remaining duration are retained in `supervisor-final.json`.
+remaining duration are retained in `supervisor-final.json`. When any CLI ceiling
+is supplied, the run budget ledger also retains the original plan and CLI
+values under `run_budget.sources` so the override is visible independently of
+the composed `limits`.
 
 Autopilot propagates these limits to its source and generated follow-up
 supervise dispatches. Each supervise run still owns an independent in-memory

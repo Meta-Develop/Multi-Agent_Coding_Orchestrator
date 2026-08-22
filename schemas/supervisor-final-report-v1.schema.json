@@ -3695,6 +3695,38 @@
         }
       }
     },
+    "budgetSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "limits"
+      ],
+      "properties": {
+        "limits": {
+          "$ref": "#/$defs/budgetLimits"
+        },
+        "max_duration_seconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "budgetSources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "plan",
+        "cli"
+      ],
+      "properties": {
+        "plan": {
+          "$ref": "#/$defs/budgetSource"
+        },
+        "cli": {
+          "$ref": "#/$defs/budgetSource"
+        }
+      }
+    },
     "budgetRemaining": {
       "type": "object",
       "additionalProperties": false,
@@ -3772,6 +3804,9 @@
         "max_duration_seconds": {
           "type": "integer",
           "minimum": 1
+        },
+        "sources": {
+          "$ref": "#/$defs/budgetSources"
         },
         "consumed": {
           "$ref": "#/$defs/budgetAmount"
