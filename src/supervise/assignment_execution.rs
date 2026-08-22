@@ -715,6 +715,7 @@ fn prepare_child_attempt<'a>(
         run_dir,
         dirs,
         execution_runtime,
+        execution_target,
         field_guide,
         artifacts,
         budget_ledger,
@@ -887,6 +888,12 @@ fn prepare_child_attempt<'a>(
     } else {
         configure_writable_child_command(command, &assignment.assigned_paths)?
     };
+    command = command.with_writable_launch_target(match execution_target {
+        Some(SupervisorExecutionTarget::PrimaryWorktree { .. }) => {
+            crate::runtime_adapter::WritableLaunchTarget::PrimaryWorktree
+        }
+        None => crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree,
+    });
 
     let primary_before = primary_worktree_snapshot(repo, *execution_runtime)?;
     if let Some(error) = primary_before.inspection_problem() {
@@ -4066,6 +4073,40 @@ done
     }
 
     #[test]
+    fn worktree_writable_launch_is_admitted_while_primary_release_stays_refused() {
+        assert!(SupervisorRuntime::Codex
+            .capabilities()
+            .admits_worktree_writable());
+        assert!(SupervisorRuntime::Cursor
+            .capabilities()
+            .admits_worktree_writable());
+        assert!(!SupervisorRuntime::Codex
+            .capabilities()
+            .admits_writable_release());
+        assert!(!SupervisorRuntime::Fake
+            .capabilities()
+            .admits_worktree_writable());
+        let worktree = launch_fixture_command();
+        assert_eq!(
+            worktree.writable_launch_target,
+            crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree
+        );
+        assert_eq!(
+            crate::runtime_adapter::AdapterId::Codex
+                .writable_launch_refusal(worktree.writable_launch_target),
+            None
+        );
+        let primary = launch_fixture_command().with_writable_launch_target(
+            crate::runtime_adapter::WritableLaunchTarget::PrimaryWorktree,
+        );
+        assert_eq!(
+            crate::runtime_adapter::AdapterId::Codex
+                .writable_launch_refusal(primary.writable_launch_target),
+            Some("blocking_pre_action_callback != All")
+        );
+    }
+
+    #[test]
     fn supervise_plan_accepts_claude_code_runtime_without_closing_writable_release() -> Result<()> {
         let assignment: OrchestratorAssignment = serde_json::from_str(
             r#"{
@@ -4085,10 +4126,13 @@ done
         assert!(!SupervisorRuntime::ClaudeCode
             .capabilities()
             .admits_writable_release());
+        assert!(SupervisorRuntime::ClaudeCode
+            .capabilities()
+            .admits_worktree_writable());
         assert_eq!(
             crate::runtime_adapter::AdapterId::from_runtime(SupervisorRuntime::ClaudeCode)
                 .writable_leaf_launch_refusal(),
-            Some("blocking_pre_action_callback != All")
+            None
         );
         Ok(())
     }
@@ -4113,10 +4157,13 @@ done
         assert!(!SupervisorRuntime::GeminiCli
             .capabilities()
             .admits_writable_release());
+        assert!(SupervisorRuntime::GeminiCli
+            .capabilities()
+            .admits_worktree_writable());
         assert_eq!(
             crate::runtime_adapter::AdapterId::from_runtime(SupervisorRuntime::GeminiCli)
                 .writable_leaf_launch_refusal(),
-            Some("blocking_pre_action_callback != All")
+            None
         );
         Ok(())
     }

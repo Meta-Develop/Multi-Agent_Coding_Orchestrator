@@ -1,8 +1,10 @@
 //! Per-runtime capability descriptors and the generated conformance matrix.
 //!
-//! Gates must consult these declarations instead of vendor names. An under-declared
-//! or unmet capability fails closed: writable release requires
-//! `blocking_pre_action_callback == All`.
+//! Gates must consult these declarations instead of vendor names. Admission is
+//! split: isolated managed-child worktree writes are allowed when
+//! `writable_workspace` is Partial or Supported. Primary-writable release still
+//! requires `blocking_pre_action_callback == All` and is not granted by the
+//! descriptors in this module. The matrix reports callback coverage honestly.
 
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
@@ -103,18 +105,21 @@ impl AdapterId {
         }
     }
 
-    /// ReadWrite launch gate consulted before a child starts.
+    /// ReadWrite launch gate for an isolated managed child worktree.
     ///
-    /// Grok and Cursor already ship as unverified leaf workers. Claude and
-    /// Gemini stay refused so a selectable runtime does not become a fake
-    /// writable worker or supervisor. Once
-    /// [`RuntimeCapabilities::admits_writable_release`] is true, this returns
-    /// `None` and the existing adapter launch path can proceed.
+    /// This is the ordinary orchestrator posture: the child uses its native
+    /// permission/sandbox mode inside a disposable worktree. Primary-writable
+    /// / All-callback release stays on [`RuntimeCapabilities::writable_refusal`].
     pub const fn writable_leaf_launch_refusal(self) -> Option<&'static str> {
-        if matches!(self, Self::Grok | Self::Cursor) {
-            return None;
-        }
-        self.capabilities().writable_refusal()
+        self.writable_launch_refusal(WritableLaunchTarget::ManagedChildWorktree)
+    }
+
+    /// Launch-time writable admission for a concrete workspace target.
+    pub const fn writable_launch_refusal(
+        self,
+        target: WritableLaunchTarget,
+    ) -> Option<&'static str> {
+        self.capabilities().writable_launch_refusal(target)
     }
 
     pub const fn capabilities(self) -> RuntimeCapabilities {
@@ -300,6 +305,15 @@ impl SessionResume {
     }
 }
 
+/// Where a writable child would run. Parent merge/apply to the primary stays
+/// a separate fail-closed gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WritableLaunchTarget {
+    ManagedChildWorktree,
+    PrimaryWorktree,
+}
+
 /// Shared matrix cell used by the generated adapter × capability table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -378,8 +392,8 @@ impl RuntimeCapabilities {
     pub const CLAUDE_CODE: Self = Self {
         // `--permission-mode` and PreToolUse hooks exist on the CLI. The static
         // descriptor stays `None` until a MACO-owned host in `hosted_callback`
-        // is attached and covers every tool/fs/destructive action. Unattached
-        // supervise admission must not start a writable child.
+        // is attached. Hosted All-callback is optional defense-in-depth, not a
+        // worktree-launch requirement.
         blocking_pre_action_callback: BlockingPreActionCallback::None,
         writable_workspace: WorkspaceWritability::Partial,
         side_effect_confinement: SideEffectConfinement::Unverified,
@@ -429,7 +443,19 @@ impl RuntimeCapabilities {
         None
     }
 
-    /// Writable release is refused unless every tool action can be blocked on a MACO callback.
+    /// Isolated managed-child worktree writes. Does not require a hosted All-callback.
+    pub const fn worktree_writable_refusal(self) -> Option<&'static str> {
+        match self.writable_workspace {
+            WorkspaceWritability::Partial | WorkspaceWritability::Supported => None,
+            WorkspaceWritability::Unsupported => Some("writable_workspace == unsupported"),
+        }
+    }
+
+    pub const fn admits_worktree_writable(self) -> bool {
+        self.worktree_writable_refusal().is_none()
+    }
+
+    /// Primary-writable / publication release. Still requires a hosted All-callback.
     pub const fn writable_refusal(self) -> Option<&'static str> {
         if !matches!(
             self.blocking_pre_action_callback,
@@ -450,7 +476,8 @@ impl RuntimeCapabilities {
     /// Writable-release pair used only after a host covers every action.
     ///
     /// Do not map this from [`AdapterId::capabilities`]. The static Claude
-    /// descriptor stays fail-closed until a hosted PreToolUse attachment is real.
+    /// descriptor stays fail-closed for primary-writable until a hosted
+    /// PreToolUse attachment is real. Isolated worktree launch does not use this.
     pub const fn with_hosted_blocking_callback(self) -> Self {
         Self {
             blocking_pre_action_callback: BlockingPreActionCallback::All,
@@ -459,6 +486,16 @@ impl RuntimeCapabilities {
             model_catalog: self.model_catalog,
             usage_reporting: self.usage_reporting,
             session_resume: self.session_resume,
+        }
+    }
+
+    pub const fn writable_launch_refusal(
+        self,
+        target: WritableLaunchTarget,
+    ) -> Option<&'static str> {
+        match target {
+            WritableLaunchTarget::ManagedChildWorktree => self.worktree_writable_refusal(),
+            WritableLaunchTarget::PrimaryWorktree => self.writable_refusal(),
         }
     }
 }
@@ -479,6 +516,9 @@ pub struct CapabilityMatrixRow {
     pub admits_writable_release: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub writable_refusal: Option<String>,
+    pub admits_worktree_writable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_writable_refusal: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -507,6 +547,10 @@ impl CapabilityMatrix {
                         .collect(),
                     admits_writable_release: capabilities.admits_writable_release(),
                     writable_refusal: capabilities.writable_refusal().map(str::to_string),
+                    admits_worktree_writable: capabilities.admits_worktree_writable(),
+                    worktree_writable_refusal: capabilities
+                        .worktree_writable_refusal()
+                        .map(str::to_string),
                     capabilities,
                 }
             })
@@ -528,9 +572,9 @@ impl CapabilityMatrix {
 
     pub fn to_markdown(&self) -> String {
         let mut table = String::from(
-            "| adapter | blocking_pre_action_callback | writable_workspace | side_effect_confinement | model_catalog | usage_reporting | session_resume | writable_release |\n",
+            "| adapter | blocking_pre_action_callback | writable_workspace | side_effect_confinement | model_catalog | usage_reporting | session_resume | writable_release | worktree_writable |\n",
         );
-        table.push_str("| --- | --- | --- | --- | --- | --- | --- | --- |\n");
+        table.push_str("| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
         for row in &self.adapters {
             let mut cells = row
                 .cells
@@ -542,7 +586,13 @@ impl CapabilityMatrix {
             } else {
                 "refused"
             };
+            let worktree = if row.admits_worktree_writable {
+                "admitted"
+            } else {
+                "refused"
+            };
             cells.push(release);
+            cells.push(worktree);
             table.push_str(&format!(
                 "| {} | {} |\n",
                 row.adapter.as_str(),
@@ -588,9 +638,49 @@ mod tests {
                         capabilities.blocking_pre_action_callback,
                         BlockingPreActionCallback::All
                     ),
-                "{adapter} cannot admit writable release without a blocking callback"
+                "{adapter} cannot admit primary-writable release without a hosted All-callback"
+            );
+            assert!(
+                !capabilities.admits_worktree_writable()
+                    || matches!(
+                        capabilities.writable_workspace,
+                        WorkspaceWritability::Partial | WorkspaceWritability::Supported
+                    ),
+                "{adapter} worktree-writable admission must follow declared workspace writability"
             );
         }
+    }
+
+    #[test]
+    fn worktree_writable_is_admitted_without_all_callback() {
+        for capabilities in [
+            RuntimeCapabilities::CODEX,
+            RuntimeCapabilities::CURSOR,
+            RuntimeCapabilities::CLAUDE_CODE,
+            RuntimeCapabilities::GROK,
+            RuntimeCapabilities::GEMINI_CLI,
+        ] {
+            assert_ne!(
+                capabilities.blocking_pre_action_callback,
+                BlockingPreActionCallback::All
+            );
+            assert!(capabilities.admits_worktree_writable());
+            assert_eq!(
+                capabilities.writable_launch_refusal(WritableLaunchTarget::ManagedChildWorktree),
+                None
+            );
+            assert!(!capabilities.admits_writable_release());
+            assert_eq!(
+                capabilities.writable_launch_refusal(WritableLaunchTarget::PrimaryWorktree),
+                Some("blocking_pre_action_callback != All")
+            );
+        }
+        assert!(!RuntimeCapabilities::FAKE.admits_worktree_writable());
+        assert_eq!(
+            RuntimeCapabilities::FAKE.worktree_writable_refusal(),
+            Some("writable_workspace == unsupported")
+        );
+        assert!(!RuntimeCapabilities::FAKE.admits_writable_release());
     }
 
     #[test]
@@ -604,6 +694,18 @@ mod tests {
         assert_eq!(
             RuntimeCapabilities::GEMINI_CLI.writable_refusal(),
             Some("blocking_pre_action_callback != All")
+        );
+        assert_eq!(
+            RuntimeCapabilities::CODEX.blocking_pre_action_callback,
+            BlockingPreActionCallback::CommandsOnly
+        );
+        assert_eq!(
+            RuntimeCapabilities::CURSOR.blocking_pre_action_callback,
+            BlockingPreActionCallback::None
+        );
+        assert_eq!(
+            RuntimeCapabilities::CLAUDE_CODE.blocking_pre_action_callback,
+            BlockingPreActionCallback::None
         );
     }
 
@@ -628,7 +730,28 @@ mod tests {
             );
         }
         assert!(markdown.contains("refused"));
-        assert!(!markdown.contains("| admitted |"));
+        assert!(markdown.contains("worktree_writable"));
+        assert!(markdown.contains("| admitted |"));
+        let callback_status = |adapter: AdapterId| -> &str {
+            markdown
+                .lines()
+                .find(|line| line.starts_with(&format!("| {} |", adapter.as_str())))
+                .and_then(|line| line.split('|').nth(2))
+                .map(str::trim)
+                .unwrap_or_else(|| panic!("matrix missing callback cell for {adapter}"))
+        };
+        assert_eq!(callback_status(AdapterId::Codex), "partial");
+        assert_eq!(callback_status(AdapterId::Cursor), "unsupported");
+        assert_eq!(callback_status(AdapterId::ClaudeCode), "unsupported");
+        assert_eq!(callback_status(AdapterId::Grok), "unsupported");
+        assert_eq!(callback_status(AdapterId::GeminiCli), "unsupported");
+        assert_eq!(callback_status(AdapterId::Fake), "unsupported");
+        let fake = markdown
+            .lines()
+            .find(|line| line.starts_with("| fake |"))
+            .expect("matrix missing fake");
+        assert!(fake.contains("refused"));
+        assert!(!fake.contains("admitted"));
     }
 
     #[test]
@@ -676,20 +799,24 @@ mod tests {
             Some("blocking_pre_action_callback != All")
         );
         assert!(!RuntimeCapabilities::CLAUDE_CODE.admits_writable_release());
-        assert_eq!(
-            AdapterId::ClaudeCode.writable_leaf_launch_refusal(),
-            Some("blocking_pre_action_callback != All")
-        );
-        assert_eq!(
-            AdapterId::GeminiCli.writable_leaf_launch_refusal(),
-            Some("blocking_pre_action_callback != All")
-        );
+        assert!(RuntimeCapabilities::CLAUDE_CODE.admits_worktree_writable());
+        assert_eq!(AdapterId::ClaudeCode.writable_leaf_launch_refusal(), None);
+        assert_eq!(AdapterId::GeminiCli.writable_leaf_launch_refusal(), None);
         assert_eq!(AdapterId::Grok.writable_leaf_launch_refusal(), None);
         assert_eq!(AdapterId::Cursor.writable_leaf_launch_refusal(), None);
+        assert_eq!(AdapterId::Codex.writable_leaf_launch_refusal(), None);
+        assert_eq!(
+            AdapterId::Fake.writable_leaf_launch_refusal(),
+            Some("writable_workspace == unsupported")
+        );
+        assert_eq!(
+            AdapterId::ClaudeCode.writable_launch_refusal(WritableLaunchTarget::PrimaryWorktree),
+            Some("blocking_pre_action_callback != All")
+        );
     }
 
     #[test]
-    fn hosted_blocking_callback_is_the_only_writable_release_admission() {
+    fn hosted_blocking_callback_is_the_only_primary_writable_release_admission() {
         let admitted = RuntimeCapabilities {
             blocking_pre_action_callback: BlockingPreActionCallback::All,
             writable_workspace: WorkspaceWritability::Supported,

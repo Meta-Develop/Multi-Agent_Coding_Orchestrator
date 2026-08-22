@@ -14,7 +14,7 @@ pub use capabilities::{
     parse_adapter_allowlist, registered_adapter_ids, AdapterId, AdapterTrustClass,
     BlockingPreActionCallback, CapabilityMatrix, CapabilityMatrixCell, CapabilityMatrixRow,
     MatrixStatus, ModelCatalogSource, PrivateRuntimeStateHome, RuntimeCapabilities, SessionResume,
-    SideEffectConfinement, UsageReporting, WorkspaceWritability,
+    SideEffectConfinement, UsageReporting, WorkspaceWritability, WritableLaunchTarget,
 };
 pub use hosted_callback::{
     capabilities_with_hosted_callback, review_pretooluse, writable_leaf_launch_refusal_with_host,
@@ -1467,17 +1467,17 @@ mod tests {
                 Some("blocking_pre_action_callback != All"),
                 "{id} writable gate must be capability-derived, not vendor-named"
             );
-            if matches!(id, AdapterId::ClaudeCode | AdapterId::GeminiCli) {
+            if id == AdapterId::Fake {
                 assert_eq!(
                     id.writable_leaf_launch_refusal(),
-                    Some("blocking_pre_action_callback != All"),
-                    "{id} must refuse writable leaf launch until a blocking callback is hosted"
+                    Some("writable_workspace == unsupported"),
+                    "{id} must not become a real writable worktree lie"
                 );
-            } else if matches!(id, AdapterId::Grok | AdapterId::Cursor) {
+            } else {
                 assert_eq!(
                     id.writable_leaf_launch_refusal(),
                     None,
-                    "{id} already ships as an unverified leaf worker"
+                    "{id} worktree-writable launch must not require a hosted All-callback"
                 );
             }
         }
@@ -1514,8 +1514,19 @@ mod tests {
             assert_eq!(config.binary_path(), Path::new(adapter.default_binary()));
             assert!(
                 adapter.capabilities().writable_refusal().is_some(),
-                "{adapter} must refuse writable release until a blocking callback is hosted"
+                "{adapter} must refuse primary-writable release until a hosted All-callback exists"
             );
+            if adapter == AdapterId::Fake {
+                assert!(
+                    adapter.capabilities().worktree_writable_refusal().is_some(),
+                    "{adapter} must stay non-publishable and not claim worktree writability"
+                );
+            } else {
+                assert!(
+                    adapter.capabilities().admits_worktree_writable(),
+                    "{adapter} must admit isolated worktree writes from declared workspace writability"
+                );
+            }
             let capabilities = adapter.capabilities();
             assert_eq!(
                 capabilities,
