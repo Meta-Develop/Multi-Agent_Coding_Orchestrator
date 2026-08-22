@@ -2472,6 +2472,14 @@ fn inspect_assignment_candidate(
         .worktree_write_lease
         .as_ref()
         .context("managed child candidate inspection has no write lease")?;
+    // Fake + NonpublishableSimulation never launches a child and must not depend
+    // on isolated git / delegated systemd. Production Verified collect stays on
+    // the writable fail-closed snapshot path.
+    if context.options.runtime == SupervisorRuntime::Fake
+        && context.execution_runtime == SupervisorExecutionRuntime::NonpublishableSimulation
+    {
+        return inspect_fake_simulation_candidate(context.repo, &preflight.assignment, lease);
+    }
     inspect_supervisor_candidate(context.repo, &preflight.assignment, lease)
 }
 

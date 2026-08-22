@@ -12,10 +12,11 @@
 //! | `policy` candidate generation | #165 |
 //! | `replay` | #166 |
 //! | `evaluation_fn` | #157 first slice (quality-hard, min cost-to-certification) |
+//! | `seed_evidence` | #180 campaign observation re-home (evidence, not rules) |
 //! | `predictor`, `feasibility`, `objective`, `online_router`, `explanation` | #167 |
 //! | `value_of_information`, `hedge` | #168 |
 //! | `global_search`, `safe_set`, `shadow` | #169 |
-//! | `drift` | #170 |
+//! | `drift`, `adaptation` | #170 |
 //!
 //! Provider adapters stay outside this module (`src/runtime_adapter.rs` /
 //! the #146 boundary). The core depends on capabilities, not CLI assumptions.
@@ -30,6 +31,7 @@
 //! difficulty, or switch-cost types.
 
 pub mod action;
+pub mod adaptation;
 pub mod blinding;
 pub mod calibration;
 pub mod catalog;
@@ -59,6 +61,7 @@ pub mod quota_pools;
 pub mod replay;
 pub mod resources;
 pub mod safe_set;
+pub mod seed_evidence;
 pub mod shadow;
 pub mod state;
 pub mod switch_cost;
@@ -96,6 +99,9 @@ pub use quota_pools::{
 pub use resources::{
     DispatchClass, DispatchDecision, DispatchRequest, ResourceObserver, ResourceSnapshot,
     ResourceVector,
+};
+pub use seed_evidence::{
+    load_shipped_seed_evidence, SeedEvidenceDocument, SeedObservation, SEED_EVIDENCE_SCHEMA,
 };
 pub use state::OptimizerState;
 
