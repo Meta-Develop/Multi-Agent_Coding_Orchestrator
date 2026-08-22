@@ -1,0 +1,79 @@
+{
+  "schema": "maco.optimizer.seed-evidence.v0",
+  "note": "Measured observations to seed optimizer priors. Data, not policy. Every entry is an observation with a source; the evaluation function decides what to do with it.",
+  "observations": [
+    {
+      "model": "grok-4.6",
+      "axis": "output_tokens_per_task",
+      "value_relative_to": "grok-4.5",
+      "value": 1.47,
+      "range": [1.9, 2.0],
+      "unit": "ratio_median",
+      "source": "artificialanalysis.ai, techsy.io (2026-08)"
+    },
+    {
+      "model": "grok-4.6",
+      "axis": "measured_cost_per_task_usd",
+      "value": 0.837,
+      "source": "techsy.io (2026-08)"
+    },
+    {
+      "model": "grok-4.5",
+      "axis": "measured_cost_per_task_usd",
+      "value": 0.36,
+      "source": "techsy.io (2026-08)"
+    },
+    {
+      "model": "grok-4.6",
+      "axis": "cached_input_usd_per_mtok",
+      "value": 0.5,
+      "source": "xai pricing (2026-08)"
+    },
+    {
+      "model": "grok-4.5",
+      "axis": "cached_input_usd_per_mtok",
+      "value": 0.3,
+      "source": "xai pricing (2026-08)"
+    },
+    {
+      "model": "grok-4.6",
+      "axis": "rate_above_200k_prompt_tokens_usd_per_mtok",
+      "input": 4,
+      "output": 12,
+      "source": "xai pricing (2026-08)"
+    },
+    {
+      "model": "grok-4.6",
+      "axis": "swe_bench",
+      "value": 0.956,
+      "delta_vs": "grok-4.5",
+      "delta": 0.09,
+      "source": "vendor + artificialanalysis.ai (2026-08)"
+    },
+    {
+      "model": "grok-4.6",
+      "axis": "equal_answer_rate_vs_4_5",
+      "value": "same answers on 80 calls at 1.38x cost",
+      "source": "techsy.io (2026-08)"
+    },
+    {
+      "model": "gpt-5.6-terra",
+      "axis": "cost_per_solved_task_relative_to_sol",
+      "value": 1.33,
+      "note": "half token price but 2.65x output tokens per solved task; agentic rank 112/302; repo-task pass 40.7% vs sol 63.7%",
+      "source": "coderabbit, ofox (2026-08)"
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "axis": "spawn_agent_compatibility",
+      "value": "multi_agent_version=v1, rejected by V2 sessions",
+      "source": "codex debug models + openai/codex#35097"
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "axis": "effort_scaling",
+      "value": "flat: xhigh approximately equals high",
+      "source": "benchlm.ai (2026-08)"
+    }
+  ]
+}

@@ -981,6 +981,11 @@ fn automatic_policy_and_bridge_contain_no_model_slug_constants() {
     let automatic_sources = [
         include_str!("selector.rs"),
         include_str!("../supervise/selection_bridge.rs"),
+        include_str!("../optimizer/evaluation_fn.rs"),
+        include_str!("../optimizer/seed_evidence.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("seed evidence production source"),
     ]
     .join("\n");
     for slug in [
