@@ -147,6 +147,7 @@ impl Cli {
             Command::Agents(command) => command.run(),
             Command::Llm(command) => command.run(),
             Command::Evaluation(command) => command.run(),
+            Command::EvalHarness(command) => command.run(),
             Command::Optimizer(command) => command.run(),
         }
     }
@@ -200,6 +201,8 @@ enum Command {
     Llm(LlmCommand),
     /// Generate deterministic model-mix fixture results from a versioned manifest.
     Evaluation(EvaluationCommand),
+    /// Run a local fake-provider-backed model-mix harness and record mix plus outcomes.
+    EvalHarness(EvalHarnessCommand),
     /// Inspect the optimizer policy library, replay snapshots, and preference profiles.
     Optimizer(OptimizerCommand),
 }
@@ -3689,6 +3692,56 @@ struct RunEvaluationArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct EvalHarnessCommand {
+    #[command(subcommand)]
+    command: EvalHarnessSubcommand,
+}
+
+impl EvalHarnessCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            EvalHarnessSubcommand::Run(args) => run_eval_harness_command(args),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum EvalHarnessSubcommand {
+    /// Complete each role in a mix through the local fake provider and record outcomes.
+    Run(RunEvalHarnessArgs),
+}
+
+#[derive(Debug, Args)]
+struct RunEvalHarnessArgs {
+    /// Versioned eval-harness manifest JSON.
+    manifest: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+fn run_eval_harness_command(args: RunEvalHarnessArgs) -> Result<()> {
+    let manifest_bytes = BoundedRegularReader::read_tree_no_follow(
+        &args.manifest,
+        crate::eval_harness::MAX_MANIFEST_BYTES,
+    )
+    .with_context(|| {
+        format!(
+            "failed to read eval harness manifest {}",
+            args.manifest.display()
+        )
+    })?;
+    let manifest = crate::eval_harness::parse_manifest(&manifest_bytes).with_context(|| {
+        format!(
+            "failed to parse eval harness manifest {}",
+            args.manifest.display()
+        )
+    })?;
+    let results = crate::eval_harness::run_local_fake_harness(&manifest)?;
+    print_query_report(&results, args.json)
 }
 
 include!("cli/part2.rs");
