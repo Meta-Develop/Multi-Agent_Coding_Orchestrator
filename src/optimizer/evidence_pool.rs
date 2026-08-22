@@ -78,17 +78,40 @@ fn scrub_error(class: ScrubClass, detail: impl Into<String>) -> OptimizerError {
     OptimizerError::invalid(format!("scrub violation ({class:?}): {}", detail.into()))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct ContentHash(String);
 
 impl ContentHash {
-    pub fn from_hex(hex: impl Into<String>) -> Self {
-        Self(hex.into())
+    pub fn from_hex(hex: impl Into<String>) -> Result<Self, OptimizerError> {
+        let hex = hex.into();
+        if !is_sha256_hex(&hex) {
+            return Err(OptimizerError::invalid(
+                "content hash must be 64 lowercase hexadecimal characters",
+            ));
+        }
+        Ok(Self(hex))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+impl<'de> Deserialize<'de> for ContentHash {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let hex = String::deserialize(deserializer)?;
+        Self::from_hex(hex).map_err(serde::de::Error::custom)
+    }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -374,9 +397,12 @@ impl EvidencePool {
         let mut local_observations = 0u32;
         let mut pooled_observations = 0u32;
         for stored in self.observations() {
-            let record = &stored.record;
-            let count = record.body.observation_count.max(1);
-            if record.body.cell.hashed_repository == *local_repository {
+            let count = stored.record.body.observation_count.max(1);
+            // Source dominates the claimed repository hash: imported records
+            // never count as local measurement (#204 / #228).
+            if matches!(stored.source, ObservationSource::Local)
+                && stored.record.body.cell.hashed_repository == *local_repository
+            {
                 local_observations = local_observations.saturating_add(count);
             } else {
                 pooled_observations = pooled_observations.saturating_add(count);
@@ -416,13 +442,7 @@ impl EvidencePool {
     ) -> HierarchicalPolicyPredictor {
         let mut predictor = HierarchicalPolicyPredictor::new();
         for stored in self.observations() {
-            apply_observation(
-                &mut predictor,
-                &stored.record,
-                state,
-                policy,
-                local_repository,
-            );
+            apply_observation(&mut predictor, &stored, state, policy, local_repository);
         }
         predictor
     }
@@ -454,24 +474,59 @@ impl EvidencePool {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CompactKey {
+    hashed_repository: String,
+    task_class: String,
+    language: String,
+    policy_id: String,
+    certified: Option<bool>,
+    first_pass_success: Option<bool>,
+    human_intervention: bool,
+    latency_micros: Option<i64>,
+    cost_micros: Option<i64>,
+    failure_class: Option<String>,
+}
+
+fn compact_key(record: &PortableEvidenceRecord) -> CompactKey {
+    CompactKey {
+        hashed_repository: record.body.cell.hashed_repository.as_str().to_string(),
+        task_class: record.body.cell.task_class.as_str().to_string(),
+        language: record.body.cell.language.as_str().to_string(),
+        policy_id: record.body.policy_id.to_string(),
+        certified: record.body.outcome.certified,
+        first_pass_success: record.body.outcome.first_pass_success,
+        human_intervention: record.body.outcome.human_intervention,
+        latency_micros: record.body.outcome.latency_micros,
+        cost_micros: record.body.outcome.cost_micros,
+        failure_class: record
+            .body
+            .outcome
+            .failure_class
+            .as_ref()
+            .map(|token| token.as_str().to_string()),
+    }
+}
+
 fn compact_records(records: &mut Vec<PortableEvidenceRecord>, max_records: usize) {
-    let mut merged: BTreeMap<String, PortableEvidenceRecord> = BTreeMap::new();
+    let mut merged: BTreeMap<CompactKey, PortableEvidenceRecord> = BTreeMap::new();
     for record in records.drain(..) {
-        let key = format!(
-            "{}:{}:{}",
-            record.body.cell.hashed_repository.as_str(),
-            record.body.policy_id,
-            record.body.outcome.certified.unwrap_or(false)
-        );
+        let incoming_count = record.body.observation_count.max(1);
+        let key = compact_key(&record);
         merged
             .entry(key)
             .and_modify(|existing| {
                 existing.body.observation_count = existing
                     .body
                     .observation_count
-                    .saturating_add(record.body.observation_count.max(1));
+                    .max(1)
+                    .saturating_add(incoming_count);
             })
-            .or_insert(record);
+            .or_insert_with(|| {
+                let mut record = record;
+                record.body.observation_count = incoming_count;
+                record
+            });
     }
     let mut compacted = Vec::new();
     for mut record in merged.into_values() {
@@ -495,16 +550,19 @@ fn compact_records(records: &mut Vec<PortableEvidenceRecord>, max_records: usize
 
 fn apply_observation(
     predictor: &mut HierarchicalPolicyPredictor,
-    record: &PortableEvidenceRecord,
+    stored: &StoredObservation,
     state: &OptimizerState,
     policy: &PolicyGraph,
     local_repository: &ContentHash,
 ) {
+    let record = &stored.record;
     let count = record.body.observation_count.max(1);
-    let local = record.body.cell.hashed_repository == *local_repository;
-    // Foreign corpora update the global prior. Local records write the full
-    // #167 hierarchy cell so they dominate wherever they exist.
-    let key = if local {
+    // Source dominates claimed repository identity. Imported corpora only
+    // update the global prior; a foreign record cannot write the local
+    // hierarchy cell by claiming the local hash (#204 / #228).
+    let writes_local_cell = matches!(stored.source, ObservationSource::Local)
+        && record.body.cell.hashed_repository == *local_repository;
+    let key = if writes_local_cell {
         HierarchicalPolicyPredictor::hierarchy_for(state, policy)
     } else {
         HierarchyKey::global()
@@ -526,16 +584,27 @@ pub fn evidence_root(repo: impl AsRef<Path>) -> PathBuf {
     repo.as_ref().join(".maco").join(EVIDENCE_DIR_NAME)
 }
 
+/// Static invariant: evidence lives outside every #71 prune selector.
+/// Program prune collects only `.maco/program-*` children, so the evidence
+/// directory name must not use that prefix. This is not a prune-time hook.
 pub fn evidence_is_exempt_from_artifact_prune(repo: impl AsRef<Path>) -> bool {
     let evidence = evidence_root(repo);
-    ArtifactRetentionFamily::ALL.iter().all(|family| {
-        let run_root = family.run_root();
-        if *family == ArtifactRetentionFamily::Program {
-            return evidence.file_name().and_then(|name| name.to_str()) != Some("program-");
-        }
-        !run_root.ends_with(EVIDENCE_DIR_NAME)
-            && run_root.file_name().and_then(|name| name.to_str()) != Some(EVIDENCE_DIR_NAME)
-    })
+    let evidence_name = evidence
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    ArtifactRetentionFamily::ALL
+        .iter()
+        .all(|family| family_prune_skips_evidence(*family, evidence_name))
+}
+
+fn family_prune_skips_evidence(family: ArtifactRetentionFamily, evidence_dir_name: &str) -> bool {
+    let run_root = family.run_root();
+    if family == ArtifactRetentionFamily::Program {
+        return !evidence_dir_name.starts_with("program-");
+    }
+    !run_root.ends_with(evidence_dir_name)
+        && run_root.file_name().and_then(|name| name.to_str()) != Some(evidence_dir_name)
 }
 
 /// Persist a corpus under the evidence root. Run-artifact prune (#71) does not
@@ -579,7 +648,9 @@ mod tests {
         VerifierProfileId,
     };
     use crate::optimizer::policy::PolicyNode;
-    use crate::optimizer::predictor::{feature_keys, insert_text, PolicyPredictor};
+    use crate::optimizer::predictor::{
+        feature_keys, insert_text, PolicyOutcomeDistribution, PolicyPredictor,
+    };
     use crate::optimizer::state::DecisionHorizon;
     use tempfile::TempDir;
 
@@ -890,5 +961,207 @@ mod tests {
         );
         assert_eq!(kept.body.observation_count, 2);
         assert_eq!(kept.body.cell.hashed_repository, hash_identity("repo-a"));
+    }
+
+    fn rehash(mut record: PortableEvidenceRecord) -> PortableEvidenceRecord {
+        record.content_hash = record.body.content_hash().expect("rehash");
+        record
+    }
+
+    fn replay_eq(left: &PolicyOutcomeDistribution, right: &PolicyOutcomeDistribution) {
+        assert_eq!(
+            left.certified_probability_bp, right.certified_probability_bp,
+            "certified probability"
+        );
+        assert_eq!(
+            left.quality_lower_confidence_bp, right.quality_lower_confidence_bp,
+            "quality LCB"
+        );
+        assert_eq!(
+            left.expected_latency_micros, right.expected_latency_micros,
+            "expected latency"
+        );
+        assert_eq!(
+            left.expected_cost_micros, right.expected_cost_micros,
+            "expected cost"
+        );
+        assert_eq!(
+            left.details.time_to_cert_samples_micros, right.details.time_to_cert_samples_micros,
+            "latency samples"
+        );
+        assert_eq!(
+            left.details.monetary_cost_samples_micros, right.details.monetary_cost_samples_micros,
+            "cost samples"
+        );
+    }
+
+    #[test]
+    fn imported_corpus_claiming_local_hash_cannot_write_local_cells() {
+        let local_cell = TaxonomyCell::new("repair", "rust", "local-repo").expect("cell");
+        let policy = graph("p1");
+        let state = state(&local_cell.hashed_repository);
+
+        let mut local_failures = request("local-repo", false, "p1");
+        local_failures.cell = local_cell.clone();
+        let mut with_local = EvidencePool::new();
+        for _ in 0..12 {
+            with_local
+                .record_local(export_record(&local_failures).expect("local"))
+                .expect("record");
+        }
+        let after_local = with_local
+            .replay_predictor(&state, &policy, &local_cell.hashed_repository)
+            .predict(&state, &policy)
+            .expect("local");
+
+        let mut hostile = with_local;
+        hostile
+            .import(corpus("hostile", "local-repo", true, 40))
+            .expect("import hostile");
+        let after_hostile = hostile
+            .replay_predictor(&state, &policy, &local_cell.hashed_repository)
+            .predict(&state, &policy)
+            .expect("hostile");
+
+        let mut foreign = EvidencePool::new();
+        for _ in 0..12 {
+            foreign
+                .record_local(export_record(&local_failures).expect("local"))
+                .expect("record");
+        }
+        foreign
+            .import(corpus("foreign-c", "foreign-repo", true, 40))
+            .expect("import foreign");
+        let after_foreign = foreign
+            .replay_predictor(&state, &policy, &local_cell.hashed_repository)
+            .predict(&state, &policy)
+            .expect("foreign");
+
+        replay_eq(&after_hostile, &after_foreign);
+        assert!(
+            after_hostile.certified_probability_bp > after_local.certified_probability_bp,
+            "a pooled prior may raise the mean, but must stay source-equivalent to a foreign corpus"
+        );
+
+        let mut local_successes = request("local-repo", true, "p1");
+        local_successes.cell = local_cell.clone();
+        let mut poisoned = EvidencePool::new();
+        for _ in 0..12 {
+            poisoned
+                .record_local(export_record(&local_failures).expect("local"))
+                .expect("record");
+        }
+        for _ in 0..40 {
+            poisoned
+                .record_local(export_record(&local_successes).expect("local success"))
+                .expect("record");
+        }
+        let after_poisoned = poisoned
+            .replay_predictor(&state, &policy, &local_cell.hashed_repository)
+            .predict(&state, &policy)
+            .expect("poisoned");
+        assert!(
+            after_poisoned.certified_probability_bp > after_hostile.certified_probability_bp,
+            "true local successes must occupy the local cell; a hostile corpus must not (hostile {}, local-success {})",
+            after_hostile.certified_probability_bp,
+            after_poisoned.certified_probability_bp
+        );
+        assert_ne!(
+            after_poisoned.details.time_to_cert_samples_micros,
+            after_hostile.details.time_to_cert_samples_micros,
+            "hostile corpus must not occupy the local latency cell"
+        );
+
+        let health = hostile.health(&local_cell.hashed_repository);
+        assert_eq!(health.local_observations, 12);
+        assert_eq!(health.pooled_observations, 40);
+    }
+
+    #[test]
+    fn compact_merges_only_identical_outcomes_and_preserves_replay() {
+        let local_cell = TaxonomyCell::new("repair", "rust", "repo-a").expect("cell");
+        let policy = graph("p1");
+        let state = state(&local_cell.hashed_repository);
+        let mut pool = EvidencePool::new();
+
+        let mut fast = request("repo-a", true, "p1");
+        fast.outcome.latency_micros = Some(1_000_000);
+        fast.outcome.cost_micros = Some(50_000);
+        let mut slow = request("repo-a", true, "p1");
+        slow.outcome.latency_micros = Some(9_000_000);
+        slow.outcome.cost_micros = Some(400_000);
+        let mut unset = request("repo-a", false, "p1");
+        unset.outcome.certified = None;
+        unset.outcome.first_pass_success = None;
+        unset.outcome.latency_micros = None;
+        unset.outcome.cost_micros = None;
+
+        pool.record_local(export_record(&fast).expect("fast"))
+            .expect("record fast");
+        pool.record_local(export_record(&fast).expect("fast dup"))
+            .expect("record fast dup");
+        pool.record_local(export_record(&slow).expect("slow"))
+            .expect("record slow");
+        pool.record_local(rehash(export_record(&unset).expect("unset")))
+            .expect("record unset");
+
+        let before = pool
+            .replay_predictor(&state, &policy, &local_cell.hashed_repository)
+            .predict(&state, &policy)
+            .expect("before");
+        pool.compact(16);
+        let after = pool
+            .replay_predictor(&state, &policy, &local_cell.hashed_repository)
+            .predict(&state, &policy)
+            .expect("after");
+        replay_eq(&before, &after);
+
+        assert_eq!(pool.local.len(), 3);
+        let fast_kept = pool
+            .local
+            .iter()
+            .find(|record| record.body.outcome.latency_micros == Some(1_000_000))
+            .expect("fast kept");
+        assert_eq!(fast_kept.body.observation_count, 2);
+        assert!(pool
+            .local
+            .iter()
+            .any(|record| record.body.outcome.latency_micros == Some(9_000_000)));
+        assert!(pool
+            .local
+            .iter()
+            .any(|record| record.body.outcome.certified.is_none()));
+        for record in &pool.local {
+            assert_eq!(
+                record.content_hash,
+                record.body.content_hash().expect("rehashed")
+            );
+        }
+    }
+
+    #[test]
+    fn content_hash_from_hex_rejects_non_hex() {
+        assert!(ContentHash::from_hex("not-hex").is_err());
+        assert!(ContentHash::from_hex("A".repeat(64)).is_err());
+        assert!(ContentHash::from_hex("ab".repeat(32)).is_ok());
+        let record = export_record(&request("repo-a", true, "p1")).expect("export");
+        let mut json = serde_json::to_value(&record).expect("json");
+        json["content_hash"] = serde_json::Value::String("zzzz".to_string());
+        let error = serde_json::from_value::<PortableEvidenceRecord>(json)
+            .expect_err("invalid hash must fail closed");
+        assert!(error.to_string().contains("hexadecimal"));
+    }
+
+    #[test]
+    fn program_prune_selector_does_not_vacuously_exempt_evidence() {
+        assert!(family_prune_skips_evidence(
+            ArtifactRetentionFamily::Program,
+            EVIDENCE_DIR_NAME
+        ));
+        assert!(
+            !family_prune_skips_evidence(ArtifactRetentionFamily::Program, "program-evidence"),
+            "a program-* evidence directory would be collected by program prune"
+        );
+        assert!(evidence_is_exempt_from_artifact_prune(Path::new(".")));
     }
 }

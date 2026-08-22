@@ -248,7 +248,8 @@ impl LeakLexicon {
 
 fn insert_token(tokens: &mut BTreeSet<String>, raw: &str) {
     let token = raw.trim().to_ascii_lowercase();
-    if token.len() >= 4 {
+    // Keep short model slugs (o1, g4, ...) so they cannot evade the leak guard.
+    if !token.is_empty() {
         tokens.insert(token);
     }
 }
@@ -519,6 +520,17 @@ mod tests {
         )
         .expect_err("blank reason");
         assert!(error.to_string().contains("unblinding"));
+    }
+
+    #[test]
+    fn short_model_slugs_stay_in_the_leak_lexicon() {
+        let mut tokens = BTreeSet::new();
+        insert_token(&mut tokens, "o1");
+        insert_token(&mut tokens, "g4");
+        insert_token(&mut tokens, "  ");
+        assert!(tokens.contains("o1"));
+        assert!(tokens.contains("g4"));
+        assert!(!tokens.contains(""));
     }
 
     #[test]

@@ -84,7 +84,7 @@ pub fn contract_version(contract: &QualityContract) -> Result<ContentHash, Optim
     let encoded = serde_json::to_vec(contract).map_err(|error| {
         OptimizerError::invalid(format!("failed to fingerprint quality contract: {error}"))
     })?;
-    Ok(ContentHash::from_hex(sha256_hex(&encoded)))
+    ContentHash::from_hex(sha256_hex(&encoded))
 }
 
 /// Append-only amendment. There is no remove or weaken method.
@@ -425,11 +425,23 @@ pub fn schedule_reaudit(
     indexed.sort_by_key(|(rank, execution)| {
         (*rank, execution.policy_execution_id.as_str().to_string())
     });
-    indexed
-        .into_iter()
-        .take(budget.max_samples as usize)
-        .map(|(_, execution)| execution.clone())
-        .collect()
+    let mut selected = Vec::new();
+    let mut spent = 0i64;
+    for (_, execution) in indexed {
+        if selected.len() >= budget.max_samples as usize {
+            break;
+        }
+        // CertifiedExecution has no per-sample cost today. Each draw costs 1
+        // so max_cost_micros=0 returns empty and a positive budget caps the
+        // spread sample instead of taking a consecutive prefix.
+        let cost = 1;
+        if spent.saturating_add(cost) > budget.max_cost_micros {
+            continue;
+        }
+        spent = spent.saturating_add(cost);
+        selected.push(execution.clone());
+    }
+    selected
 }
 
 /// Type-level: this module cannot certify. The only write of certification
@@ -695,6 +707,15 @@ mod tests {
             7,
         );
         assert_eq!(sample.len(), 2);
+        let empty = schedule_reaudit(
+            &ledger.certified,
+            ReauditBudget {
+                max_samples: 2,
+                max_cost_micros: 0,
+            },
+            7,
+        );
+        assert!(empty.is_empty());
         let sampled = sample[0].clone();
         ledger
             .record_escape(
