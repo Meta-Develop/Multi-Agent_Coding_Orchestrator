@@ -355,9 +355,10 @@ fn test_runtime_model_catalog(
             CodexRuntimeModelCatalog::from_slugs(models).map(RuntimeModelCatalog::Codex)
         }
         SupervisorRuntime::Fake => Ok(RuntimeModelCatalog::LocalDeterministicFake),
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor => {
-            Ok(RuntimeModelCatalog::OperatorDeclared)
-        }
+        SupervisorRuntime::Grok
+        | SupervisorRuntime::Cursor
+        | SupervisorRuntime::ClaudeCode
+        | SupervisorRuntime::GeminiCli => Ok(RuntimeModelCatalog::OperatorDeclared),
     }
 }
 

@@ -1425,12 +1425,7 @@ impl IfEmptyThen for String {
 }
 
 fn runtime_name(runtime: SupervisorRuntime) -> &'static str {
-    match runtime {
-        SupervisorRuntime::Codex => "codex",
-        SupervisorRuntime::Fake => "fake",
-        SupervisorRuntime::Grok => "grok",
-        SupervisorRuntime::Cursor => "cursor",
-    }
+    runtime.as_str()
 }
 
 fn runtime_from_name(runtime: &str) -> Result<SupervisorRuntime> {
@@ -1439,6 +1434,8 @@ fn runtime_from_name(runtime: &str) -> Result<SupervisorRuntime> {
         "fake" => Ok(SupervisorRuntime::Fake),
         "grok" => Ok(SupervisorRuntime::Grok),
         "cursor" => Ok(SupervisorRuntime::Cursor),
+        "claude-code" | "claude" => Ok(SupervisorRuntime::ClaudeCode),
+        "gemini-cli" | "gemini" => Ok(SupervisorRuntime::GeminiCli),
         _ => bail!("selector runtime '{runtime}' is not executable by the supervisor"),
     }
 }
