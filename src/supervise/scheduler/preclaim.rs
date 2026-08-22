@@ -15,7 +15,7 @@ pub(super) const PRECLAIM_DECISIONS_RELATIVE: &str = "preclaim/decisions.jsonl";
 
 #[cfg(test)]
 thread_local! {
-    static FORCE_MISSING_PRECLAIM_EVIDENCE: Cell<bool> = Cell::new(false);
+    static FORCE_MISSING_PRECLAIM_EVIDENCE: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -42,15 +42,6 @@ impl Drop for ForceMissingPreclaimEvidence {
 pub(super) enum PreclaimDisposition {
     Claim,
     Reject,
-}
-
-impl PreclaimDisposition {
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Claim => "claim",
-            Self::Reject => "reject",
-        }
-    }
 }
 
 /// Auditable pre-claim viability decision for one assignment.
@@ -241,7 +232,6 @@ mod tests {
             Some(SupervisorRuntime::Fake),
         );
         assert_eq!(decision.disposition, PreclaimDisposition::Claim);
-        assert_eq!(decision.disposition.as_str(), "claim");
         assert!(decision.allows_path_claim());
         assert!(decision.map_present && decision.risk_present && decision.runtime_present);
         assert!(decision.reason.contains("passed pre-claim viability"));
