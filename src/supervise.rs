@@ -30,7 +30,8 @@ use crate::{
         ResumeCheckpointDenial, VerifiedGateContext,
     },
     hierarchy_ledger::{
-        gate_ownership_payload, insert_supervision_edge, GateOwnershipRecord, SupervisionEdgeRecord,
+        gate_ownership_payload, insert_supervision_edge, role_transition_payload,
+        GateOwnershipRecord, SupervisionEdgeRecord,
     },
     llm::provider::{ModelPricing, Usage},
     merge::{
@@ -113,6 +114,8 @@ mod model_policy;
 pub use model_policy::*;
 mod role_authority;
 pub use role_authority::*;
+mod role_transition;
+use role_transition::*;
 
 mod follow_up_cascade;
 use follow_up_cascade::*;
