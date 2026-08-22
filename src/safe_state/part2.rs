@@ -38,7 +38,11 @@ fn open_existing_stable_private_file_at(
 }
 
 #[cfg(not(unix))]
-fn open_stable_private_file_at(root: &SafeRoot, file_name: &OsStr) -> Result<File> {
+fn open_stable_private_file_at(
+    root: &SafeRoot,
+    file_name: &OsStr,
+    _policy: LockFilePolicy,
+) -> Result<File> {
     bail!(
         "handle-relative stable lock files are unsupported on this platform: {}",
         root.path().join(file_name).display()
