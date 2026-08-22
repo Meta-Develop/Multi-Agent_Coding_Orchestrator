@@ -743,6 +743,32 @@ fn resolve_external_program(program: &Path, cwd: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutableAncestorPermissionDecision {
+    Accept,
+    RejectWritable,
+    RejectOwnership,
+}
+
+#[cfg(unix)]
+fn executable_ancestor_permission_decision(
+    mode: u32,
+    uid: u32,
+    is_directory: bool,
+    require_root_owned: bool,
+) -> ExecutableAncestorPermissionDecision {
+    let root_sticky_directory =
+        uid == 0 && is_directory && mode & unsigned_to_u32(libc::S_ISVTX) != 0;
+    if mode & 0o022 != 0 && !root_sticky_directory {
+        ExecutableAncestorPermissionDecision::RejectWritable
+    } else if require_root_owned && uid != 0 {
+        ExecutableAncestorPermissionDecision::RejectOwnership
+    } else {
+        ExecutableAncestorPermissionDecision::Accept
+    }
+}
+
 fn validate_external_program_identity(path: &Path, require_root_owned: bool) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
@@ -781,21 +807,25 @@ fn validate_external_program_identity(path: &Path, require_root_owned: bool) -> 
                     ancestor.display()
                 );
             }
-            let mode = metadata.permissions().mode();
-            let root_sticky_directory = metadata.uid() == 0
-                && metadata.is_dir()
-                && mode & unsigned_to_u32(libc::S_ISVTX) != 0;
-            if (require_root_owned || !root_sticky_directory) && mode & 0o022 != 0 {
-                bail!(
-                    "external executable ancestor is group/world-writable: {}",
-                    ancestor.display()
-                );
-            }
-            if require_root_owned && metadata.uid() != 0 {
-                bail!(
-                    "default Codex executable ancestor is not root-owned: {}",
-                    ancestor.display()
-                );
+            match executable_ancestor_permission_decision(
+                metadata.permissions().mode(),
+                metadata.uid(),
+                metadata.is_dir(),
+                require_root_owned,
+            ) {
+                ExecutableAncestorPermissionDecision::Accept => {}
+                ExecutableAncestorPermissionDecision::RejectWritable => {
+                    bail!(
+                        "external executable ancestor is group/world-writable: {}",
+                        ancestor.display()
+                    );
+                }
+                ExecutableAncestorPermissionDecision::RejectOwnership => {
+                    bail!(
+                        "default Codex executable ancestor is not root-owned: {}",
+                        ancestor.display()
+                    );
+                }
             }
         }
     }
@@ -1823,9 +1853,7 @@ fn external_side_effect_profile(
                 .capabilities()
                 .read_only_inner_contract_refusal()
                 .unwrap_or("side_effect_confinement != verified");
-            bail!(
-                "Claude consultant has no enforceable fixed-network capability ({capability})"
-            )
+            bail!("Claude consultant has no enforceable fixed-network capability ({capability})")
         }
     }
 }
@@ -1975,7 +2003,16 @@ impl ValidatedCodexAuth {
         if !home.is_absolute() {
             bail!("Codex auth home must be absolute: {}", home.display());
         }
-        match fs::symlink_metadata(home) {
+        let home = match fs::canonicalize(home) {
+            Ok(home) => home,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to canonicalize Codex auth home {}", home.display())
+                });
+            }
+        };
+        match fs::symlink_metadata(&home) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 bail!(
                     "Codex auth home must be a non-symlink directory: {}",
@@ -1986,7 +2023,7 @@ impl ValidatedCodexAuth {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).context("failed to inspect Codex auth home"),
         }
-        ensure_existing_directory_without_symlinks(home)?;
+        ensure_existing_directory_without_symlinks(&home)?;
         let path = home.join("auth.json");
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -2368,11 +2405,11 @@ fn codex_hardened_argv(
         OsString::from("-c"),
         OsString::from(filesystem_permissions),
         OsString::from("-c"),
-        OsString::from("shell_environment_policy.inherit=\"none\""),
+        OsString::from("shell_environment_policy.inherit=\"core\""),
         OsString::from("-c"),
-        OsString::from(
-            "shell_environment_policy.set={PATH=\"/run/current-system/sw/bin:/usr/bin:/bin\"}",
-        ),
+        OsString::from("shell_environment_policy.ignore_default_excludes=false"),
+        OsString::from("-c"),
+        OsString::from("shell_environment_policy.include_only=[\"PATH\"]"),
         OsString::from("-c"),
         OsString::from("web_search=\"disabled\""),
     ];
@@ -2432,11 +2469,11 @@ fn codex_app_server_argv(
         OsString::from("-c"),
         OsString::from(filesystem_permissions),
         OsString::from("-c"),
-        OsString::from("shell_environment_policy.inherit=\"none\""),
+        OsString::from("shell_environment_policy.inherit=\"core\""),
         OsString::from("-c"),
-        OsString::from(
-            "shell_environment_policy.set={PATH=\"/run/current-system/sw/bin:/usr/bin:/bin\"}",
-        ),
+        OsString::from("shell_environment_policy.ignore_default_excludes=false"),
+        OsString::from("-c"),
+        OsString::from("shell_environment_policy.include_only=[\"PATH\"]"),
         OsString::from("-c"),
         OsString::from("web_search=\"disabled\""),
         // app-server has no --ignore-rules flag. A private CODEX_HOME prevents ambient user config,
@@ -2765,5 +2802,127 @@ fn duration_millis(duration: Duration) -> u64 {
         u64::MAX
     } else {
         millis as u64
+    }
+}
+
+#[cfg(test)]
+mod nixos_identity_regression_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_ancestor_permission_decision_allows_only_root_owned_sticky_writable_directories() {
+        use ExecutableAncestorPermissionDecision::{Accept, RejectOwnership, RejectWritable};
+
+        assert_eq!(
+            executable_ancestor_permission_decision(0o1775, 0, true, true),
+            Accept
+        );
+        assert_eq!(
+            executable_ancestor_permission_decision(0o0775, 0, true, true),
+            RejectWritable
+        );
+        assert_eq!(
+            executable_ancestor_permission_decision(0o0757, 0, true, true),
+            RejectWritable
+        );
+        assert_eq!(
+            executable_ancestor_permission_decision(0o1775, 1000, true, true),
+            RejectWritable
+        );
+        assert_eq!(
+            executable_ancestor_permission_decision(0o1775, 0, false, true),
+            RejectWritable
+        );
+        assert_eq!(
+            executable_ancestor_permission_decision(0o0755, 1000, true, true),
+            RejectOwnership
+        );
+        assert_eq!(
+            executable_ancestor_permission_decision(0o0755, 0, true, true),
+            Accept
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_auth_home_symlink_is_canonicalized_before_auth_validation() -> Result<()> {
+        use std::os::unix::{fs::symlink, fs::PermissionsExt};
+
+        let temp = tempfile::tempdir()?;
+        let target = temp.path().join("codex-home-target");
+        fs::create_dir(&target)?;
+        let auth_path = target.join("auth.json");
+        fs::write(&auth_path, br#"{"token":"redacted"}"#)?;
+        fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+        let selected = temp.path().join("selected-codex-home");
+        symlink(&target, &selected)?;
+
+        let validated = ValidatedCodexAuth::load_from_home(&selected)?
+            .context("canonical Codex auth source")?;
+        assert_eq!(validated.path, fs::canonicalize(&target)?.join("auth.json"));
+        assert_eq!(validated.bytes, br#"{"token":"redacted"}"#);
+
+        let replacement = temp.path().join("replacement-codex-home");
+        fs::create_dir(&replacement)?;
+        fs::remove_file(&selected)?;
+        symlink(&replacement, &selected)?;
+        validated.verify_source_unchanged()?;
+        Ok(())
+    }
+
+    #[test]
+    fn codex_exec_and_app_server_argv_use_exact_path_only_legacy_shell_policy() {
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            "/workspace",
+            "/run/prompt.md",
+            "/run/events.jsonl",
+            "/run/report.json",
+            Duration::from_secs(1),
+        );
+        let controls = ProtectedWorktreeControls::default();
+        let expected = vec![
+            OsString::from("-c"),
+            OsString::from("shell_environment_policy.inherit=\"core\""),
+            OsString::from("-c"),
+            OsString::from("shell_environment_policy.ignore_default_excludes=false"),
+            OsString::from("-c"),
+            OsString::from("shell_environment_policy.include_only=[\"PATH\"]"),
+        ];
+
+        for (label, argv) in [
+            ("exec", codex_hardened_argv(&command, &controls)),
+            ("app-server", codex_app_server_argv(&command, &controls)),
+        ] {
+            let inherit_index = argv
+                .iter()
+                .position(|argument| argument == "shell_environment_policy.inherit=\"core\"")
+                .expect("path-only shell policy inherit override");
+            let policy_start = inherit_index
+                .checked_sub(1)
+                .expect("shell policy inherit override must follow -c");
+            assert_eq!(
+                argv.get(policy_start..policy_start + expected.len()),
+                Some(expected.as_slice()),
+                "unexpected {label} shell policy argv"
+            );
+            assert_eq!(
+                argv.iter()
+                    .filter(|argument| {
+                        argument
+                            .to_string_lossy()
+                            .starts_with("shell_environment_policy.")
+                    })
+                    .count(),
+                3,
+                "unexpected additional {label} shell policy override"
+            );
+            assert!(!argv.iter().any(|argument| {
+                argument
+                    .to_string_lossy()
+                    .starts_with("shell_environment_policy.set=")
+            }));
+        }
     }
 }
