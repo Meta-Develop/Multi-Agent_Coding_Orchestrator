@@ -127,7 +127,7 @@ pub(super) fn record_supervision_spawn_payload(
     child_agent_id: &str,
     parent_agent_id: &str,
     role: OrchestrationRole,
-    legacy_role: &str,
+    plan_role: AgentRole,
     write_boundary: Vec<String>,
     scope_ref: &str,
     mut payload: Value,
@@ -136,11 +136,13 @@ pub(super) fn record_supervision_spawn_payload(
         child_agent_id,
         parent_agent_id,
         role,
-        legacy_role,
+        plan_role.as_str(),
         write_boundary,
         scope_ref,
     )?;
     insert_supervision_edge(&mut payload, &edge)?;
+    let assignment = assign_role_category(child_agent_id, plan_role, None)?;
+    insert_role_assignment(&mut payload, &assignment)?;
     Ok(payload)
 }
 
@@ -455,17 +457,21 @@ pub(super) fn record_worker_journal_events(
             WorkerExecutionJournalStatus::Missing => ("missing", None, None),
             WorkerExecutionJournalStatus::Invalid(error) => ("invalid", None, Some(error.as_str())),
         };
-        let write_boundary = assignment
+        let worker = assignment
             .worker_assignments
             .iter()
-            .find(|worker| worker.id == *worker_id)
+            .find(|worker| worker.id == *worker_id);
+        let write_boundary = worker
             .map(|worker| write_boundary_refs(&worker.assigned_paths))
             .unwrap_or_default();
+        let plan_role = worker
+            .map(|worker| worker.role)
+            .unwrap_or(AgentRole::Worker);
         match record_supervision_spawn_payload(
             worker_id,
             &assignment.id,
             OrchestrationRole::Worker,
-            "worker",
+            plan_role,
             write_boundary,
             &worker_scope_ref(worker_id),
             json!({}),

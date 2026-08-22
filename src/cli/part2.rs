@@ -2391,23 +2391,64 @@ fn print_agent_run_failure_report(report: &AgentRunFailureReport) -> Result<()> 
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AgentListReport {
+    observed_coordination_depth: u32,
+    agents: Vec<AgentListEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AgentListEntry {
+    #[serde(flatten)]
+    process: AgentProcessRecord,
+    observed_depth: u32,
+}
+
+fn agent_list_report(processes: &[AgentProcessRecord]) -> AgentListReport {
+    let observed = observe_hierarchy(processes.iter().map(|process| ObservedHierarchyNode {
+        id: process.task_id.as_str(),
+        parent: process.parent.as_deref(),
+        coordinator: is_coordinator_role_label(&process.role),
+    }));
+    AgentListReport {
+        observed_coordination_depth: observed.coordination_depth,
+        agents: processes
+            .iter()
+            .map(|process| AgentListEntry {
+                observed_depth: observed.depths.get(&process.task_id).copied().unwrap_or(0),
+                process: process.clone(),
+            })
+            .collect(),
+    }
+}
+
 fn print_agent_processes(processes: &[AgentProcessRecord], json: bool) -> Result<()> {
+    let report = agent_list_report(processes);
     if json {
-        println!("{}", serde_json::to_string_pretty(processes)?);
-    } else if processes.is_empty() {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.agents.is_empty() {
         println!("No live MACO agents registered.");
+        println!(
+            "observed_coordination_depth\t{}",
+            report.observed_coordination_depth
+        );
     } else {
-        for process in processes {
+        println!(
+            "observed_coordination_depth\t{}",
+            report.observed_coordination_depth
+        );
+        for agent in &report.agents {
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                process.pid,
-                process.role,
-                process.run_id,
-                process.task_id,
-                process.parent.as_deref().unwrap_or("-"),
-                process.repo.display(),
-                process.launch_timestamp_ms,
-                process.argv.join(" ")
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                agent.process.pid,
+                agent.process.role,
+                agent.process.run_id,
+                agent.process.task_id,
+                agent.process.parent.as_deref().unwrap_or("-"),
+                agent.observed_depth,
+                agent.process.repo.display(),
+                agent.process.launch_timestamp_ms,
+                agent.process.argv.join(" ")
             );
         }
     }

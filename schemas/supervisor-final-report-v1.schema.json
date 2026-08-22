@@ -823,6 +823,29 @@
               "role": {
                 "$ref": "#/$defs/agentRole"
               },
+              "role_assignment": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["agent_id", "category", "legacy_role", "source", "reason"],
+                "properties": {
+                  "agent_id": {"type": "string", "minLength": 1},
+                  "category": {
+                    "type": "string",
+                    "enum": [
+                      "delegating_coordinator",
+                      "non_delegating_terminal_worker",
+                      "read_only_researcher",
+                      "read_only_review_auditor"
+                    ]
+                  },
+                  "legacy_role": {"type": "string", "minLength": 1},
+                  "source": {
+                    "type": "string",
+                    "enum": ["derived_from_plan_role", "operator_override"]
+                  },
+                  "reason": {"type": "string", "minLength": 1}
+                }
+              },
               "selection_source": {
                 "type": "string",
                 "enum": [
