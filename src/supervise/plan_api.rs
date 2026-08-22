@@ -83,10 +83,10 @@ pub(super) fn supervisor_plan_and_consultant_from_task_file(
         Some(path_relative_to(&repo, task_file)),
     )
     .map_err(|error| {
-        anyhow!(
-            "failed to plan plain-text task specification {}: {error}",
+        error.context(format!(
+            "failed to plan plain-text task specification {}",
             task_file.display()
-        )
+        ))
     })
 }
 
@@ -98,135 +98,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
 ) -> Result<LoadedSupervisorPlan> {
     let proposal = planning::propose_task_decomposition(repo, goal, spec)
         .context("failed to decompose goal/spec into repository workstreams")?;
-    if proposal.assignments.is_empty() {
-        bail!(
-            "goal/spec produced no actionable workstreams; name at least one repository path, Rust module, or Rust symbol to change"
-        );
-    }
-    planning::validate_task_assignment_disjointness(&proposal.assignments)
-        .context("goal/spec workstreams are not independently assignable")?;
-
-    let spec_fragment_ids = proposal
-        .fragments
-        .iter()
-        .map(|fragment| fragment.id.clone())
-        .collect::<Vec<_>>();
-    let mut spec_fragment_ids_by_assignment = BTreeMap::new();
-    let mut assignment_metadata = AssignmentMetadata::new();
-    let workstream_count = proposal.assignments.len();
-    let assignment_capacity = workstream_count
-        .checked_mul(2)
-        .context("goal/spec workstream count overflowed the assignment capacity")?;
-    let mut assignments = Vec::with_capacity(assignment_capacity);
-    let mut assignment_schedule = Vec::with_capacity(assignment_capacity);
-    for assignment in proposal.assignments {
-        let planning_id = format!("{}-planning", assignment.id);
-        let planning_index = assignments.len();
-        assignments.push(OrchestratorAssignment {
-            id: planning_id.clone(),
-            runtime: None,
-            role: AgentRole::ChildOrchestrator,
-            assigned_paths: assignment.assigned_paths.clone(),
-            semantic_symbols: assignment.semantic_symbols.clone(),
-            semantic_modules: assignment.semantic_modules.clone(),
-            task: Some(format!(
-                "Read-only planning gate for workstream '{}'. Review the proposed scope and implementation task without editing files or delegating implementation. Confirm whether the execution child can proceed safely.\n\nExecution task:\n{}",
-                assignment.id, assignment.task
-            )),
-            worker_assignments: Vec::new(),
-            environment_requirements: Vec::new(),
-            licensed_breakage: None,
-            notes: Some(
-                "MACO-visible read-only planning root; its execution child is parent-gated"
-                    .to_string(),
-            ),
-        });
-        assignment_schedule.push(AssignmentScheduleEntry {
-            assignment_id: planning_id.clone(),
-            parent_assignment_id: None,
-            depth: MIN_SUPERVISOR_DEPTH,
-            flattened_index: planning_index,
-        });
-
-        spec_fragment_ids_by_assignment
-            .insert(assignment.id.clone(), assignment.fragment_ids.clone());
-        let worker = WorkerAssignment {
-            id: format!("{}-worker", assignment.id),
-            role: AgentRole::Worker,
-            assigned_paths: assignment.assigned_paths.clone(),
-            semantic_symbols: assignment.semantic_symbols.clone(),
-            semantic_modules: assignment.semantic_modules.clone(),
-            task: Some(assignment.task.clone()),
-            environment_requirements: Vec::new(),
-            report_path: None,
-        };
-        assignment_metadata.insert(
-            (assignment.id.clone(), worker.id.clone()),
-            WorkerAssignmentMetadata::default(),
-        );
-        let execution_index = assignments.len();
-        assignments.push(OrchestratorAssignment {
-            id: assignment.id.clone(),
-            runtime: None,
-            role: AgentRole::ChildOrchestrator,
-            assigned_paths: assignment.assigned_paths,
-            semantic_symbols: assignment.semantic_symbols,
-            semantic_modules: assignment.semantic_modules,
-            task: Some(assignment.task),
-            worker_assignments: vec![worker],
-            environment_requirements: Vec::new(),
-            licensed_breakage: None,
-            notes: Some(format!(
-                "Execution child admitted only after read-only planning root '{planning_id}' succeeds"
-            )),
-        });
-        assignment_schedule.push(AssignmentScheduleEntry {
-            assignment_id: assignment.id,
-            parent_assignment_id: Some(planning_id),
-            depth: MIN_SUPERVISOR_DEPTH.saturating_add(1),
-            flattened_index: execution_index,
-        });
-    }
-    let task = match (goal.is_empty(), spec.is_empty()) {
-        (false, false) => format!("{goal}\n\n{spec}"),
-        (false, true) => goal.to_string(),
-        (true, _) => spec.to_string(),
-    };
-    let plan = SupervisorPlan {
-        version: SUPERVISOR_SCHEMA_VERSION,
-        task,
-        task_file,
-        max_depth: MIN_SUPERVISOR_DEPTH.saturating_add(1),
-        max_child_assignments: assignment_capacity.max(DEFAULT_MAX_CHILD_ASSIGNMENTS),
-        max_child_retries: DEFAULT_MAX_CHILD_RETRIES,
-        max_gate_corrections: DEFAULT_MAX_GATE_CORRECTIONS,
-        child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
-        semantic_coordination: SemanticCoordinationMode::Off,
-        role_models: BTreeMap::new(),
-        model_pricing: BTreeMap::new(),
-        review_lenses: default_supervisor_review_lenses(),
-        review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
-        assignments,
-    };
-    let metadata = SupervisorPlanMetadata {
-        execution_target: None,
-        spec_fragment_ids,
-        spec_fragment_ids_by_assignment,
-        assignment_schedule,
-        coverage_gaps: Vec::new(),
-        run_budget: SupervisorBudgetConfig::default(),
-        run_budget_max_duration_seconds: None,
-        admission: SupervisorAdmissionConfig::default(),
-        evidence_only_reaudit: None,
-        generated_follow_up: None,
-    };
-    let (plan, plan_metadata) = validate_supervisor_plan(plan, metadata)?;
-    Ok(LoadedSupervisorPlan {
-        plan,
-        consultant: SupervisorConsultantPlan::default(),
-        assignment_metadata,
-        plan_metadata,
-    })
+    supervisor_plan_and_consultant_from_goal_spec_proposal(goal, spec, task_file, proposal)
 }
 
 /// Lowers an already validated planning session into the ordinary supervisor
@@ -291,9 +163,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
     proposal: planning::TaskDecompositionProposal,
 ) -> Result<LoadedSupervisorPlan> {
     if proposal.assignments.is_empty() {
-        bail!(
-            "goal/spec produced no actionable workstreams; name at least one repository path, Rust module, or Rust symbol to change"
-        );
+        bail!("{}", empty_goal_spec_workstream_message(&proposal));
     }
     planning::validate_task_assignment_disjointness(&proposal.assignments)
         .context("goal/spec workstreams are not independently assignable")?;
@@ -586,6 +456,21 @@ fn combined_goal_spec(goal: &str, spec: &str) -> String {
         (false, true) => goal.to_string(),
         (true, _) => spec.to_string(),
     }
+}
+
+fn empty_goal_spec_workstream_message(proposal: &planning::TaskDecompositionProposal) -> String {
+    let mut message = String::from(
+        "goal/spec produced no actionable workstreams; name at least one repository path, Rust module, or Rust symbol to change; documentation, policy, and script files are valid scopes",
+    );
+    if let Some(gap) = proposal.coverage_gaps.first() {
+        message.push_str("; ");
+        message.push_str(&gap.message);
+    }
+    if let Some(note) = proposal.diagnostics.notes.first() {
+        message.push_str("; ");
+        message.push_str(note);
+    }
+    message
 }
 
 /// Opaque authority tying one validated provider planning session and its
