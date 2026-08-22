@@ -145,6 +145,36 @@ fn built_in_data_is_dated_and_keeps_policy_in_data() {
 }
 
 #[test]
+fn measured_eligibility_keeps_static_table_from_overriding_dated_ineligibility() {
+    let priors = built_in_prior_dataset().expect("built-in priors");
+    assert!(matches!(
+        priors.measured_authority_eligibility("gpt-5.6-luna", AuthorityRole::TerminalLeaf),
+        MeasuredAuthorityEligibility::Eligible
+    ));
+    assert!(matches!(
+        priors.measured_authority_eligibility("gpt-5.6-luna", AuthorityRole::Delegating),
+        MeasuredAuthorityEligibility::Ineligible { .. }
+    ));
+    assert!(matches!(
+        priors.measured_authority_eligibility("gpt-5.6-terra", AuthorityRole::TerminalLeaf),
+        MeasuredAuthorityEligibility::Ineligible { .. }
+    ));
+    assert!(matches!(
+        priors.measured_authority_eligibility("gpt-5.6-sol", AuthorityRole::AcceptanceGate),
+        MeasuredAuthorityEligibility::Eligible
+    ));
+    assert_eq!(
+        priors.measured_authority_eligibility("unknown-model", AuthorityRole::Delegating),
+        MeasuredAuthorityEligibility::NoDatedEvidence
+    );
+    assert!(matches!(
+        measured_authority_eligibility("gpt-5.6-luna", AuthorityRole::Delegating)
+            .expect("built-in eligibility"),
+        MeasuredAuthorityEligibility::Ineligible { .. }
+    ));
+}
+
+#[test]
 fn owner_same_class_fixture_uses_codex_fresh_and_alternate_under_pressure() {
     let fresh = select(&base_input()).expect("fresh selection");
     assert_eq!(fresh.status, DecisionStatus::Selected);

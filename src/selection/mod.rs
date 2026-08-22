@@ -14,7 +14,9 @@ pub use quota_input::{
     apply_fail_closed_quota_pools, fail_closed_quota_selector_input, runtime_pool_states,
 };
 pub(crate) use schema::selection_event_schema_value;
-pub use selector::{built_in_prior_dataset, select, SelectionError};
+pub use selector::{
+    built_in_prior_dataset, measured_authority_eligibility, select, SelectionError,
+};
 pub use types::*;
 
 #[cfg(test)]

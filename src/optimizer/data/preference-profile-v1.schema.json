@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/src/optimizer/data/preference-profile-v1.schema.json",
+  "title": "MACO Optimizer Preference Profile v1",
+  "description": "Versioned operator-tunable soft-objective weights. Quality floors, validators, and fail-closed bypasses are not expressible.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "version",
+    "latency_weight_bp",
+    "cost_weight_bp"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "provider_weights": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/providerPreference"
+      }
+    },
+    "reserve_margin_native": {
+      "type": "integer"
+    },
+    "latency_weight_bp": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "cost_weight_bp": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "human_intervention_aversion_bp": {
+      "type": "integer"
+    },
+    "uncertainty_aversion_bp": {
+      "type": "integer"
+    },
+    "exploration": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/explorationBudget"
+      }
+    },
+    "hedge": {
+      "$ref": "#/$defs/hedgeAggressiveness"
+    },
+    "task_class_overrides": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/preferenceOverride"
+      }
+    }
+  },
+  "$defs": {
+    "providerPreference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "prior_weight_bp",
+        "target_usage_bp",
+        "interactive_reserve_bp",
+        "external_consumption_margin_bp"
+      ],
+      "properties": {
+        "prior_weight_bp": {
+          "type": "integer"
+        },
+        "target_usage_bp": {
+          "type": "integer"
+        },
+        "interactive_reserve_bp": {
+          "type": "integer"
+        },
+        "external_consumption_margin_bp": {
+          "type": "integer"
+        }
+      }
+    },
+    "explorationBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "probes_per_period",
+        "period_seconds"
+      ],
+      "properties": {
+        "probes_per_period": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "period_seconds": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "hedgeAggressiveness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_concurrent_hedges",
+        "min_delay_seconds",
+        "max_delay_seconds"
+      ],
+      "properties": {
+        "max_concurrent_hedges": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "min_delay_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_delay_seconds": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "preferenceOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "latency_weight_bp": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cost_weight_bp": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reserve_margin_native": {
+          "type": "integer"
+        },
+        "human_intervention_aversion_bp": {
+          "type": "integer"
+        },
+        "uncertainty_aversion_bp": {
+          "type": "integer"
+        },
+        "provider_weights": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/providerPreference"
+          }
+        }
+      }
+    }
+  }
+}
