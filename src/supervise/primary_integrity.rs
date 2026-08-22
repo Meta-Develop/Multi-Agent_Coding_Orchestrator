@@ -573,7 +573,34 @@ fn shared_index_path(
     }))
 }
 
+fn snapshot_git_error_is_transient(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}");
+    !text.contains("output exceeded the")
+}
+
 fn sanitized_git_output(
+    workdir: &Path,
+    args: &[&str],
+    runtime: SupervisorExecutionRuntime,
+) -> Result<std::process::Output> {
+    let mut last_error = None;
+    for attempt in 1..=SNAPSHOT_GIT_TRANSIENT_ATTEMPTS {
+        match sanitized_git_output_once(workdir, args, runtime) {
+            Ok(output) => return Ok(output),
+            Err(error)
+                if attempt < SNAPSHOT_GIT_TRANSIENT_ATTEMPTS
+                    && snapshot_git_error_is_transient(&error) =>
+            {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("supervisor Git snapshot retry exhausted")))
+        .context("supervisor Git snapshot failed after transient retries")
+}
+
+fn sanitized_git_output_once(
     workdir: &Path,
     args: &[&str],
     runtime: SupervisorExecutionRuntime,
@@ -1072,5 +1099,24 @@ pub(super) fn claim_conflict_details(
             })
             .collect(),
         Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod snapshot_git_retry_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_git_error_retries_load_failures_but_not_truncated_output() {
+        assert!(snapshot_git_error_is_transient(&anyhow::anyhow!(
+            "supervisor Git snapshot was not safely verified: process_tree=None; side_effects=None; process_error=None; stdin_error=None"
+        )));
+        assert!(snapshot_git_error_is_transient(&anyhow::anyhow!(
+            "strict containment slot acquisition timed out"
+        )));
+        assert!(!snapshot_git_error_is_transient(&anyhow::anyhow!(
+            "supervisor Git snapshot output exceeded the {} byte limit",
+            SNAPSHOT_GIT_CAPTURE_MAX_BYTES
+        )));
     }
 }

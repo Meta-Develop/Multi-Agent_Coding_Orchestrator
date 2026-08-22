@@ -32,6 +32,7 @@ pub struct AgentLaunchMetadata {
     pub run_id: String,
     pub task_id: String,
     pub repo: PathBuf,
+    pub parent: Option<String>,
 }
 
 impl AgentLaunchMetadata {
@@ -46,15 +47,25 @@ impl AgentLaunchMetadata {
             run_id: run_id.into(),
             task_id: task_id.into(),
             repo: discover_repo_root(repo)?,
+            parent: None,
         };
         metadata.validate()?;
         Ok(metadata)
+    }
+
+    pub fn with_parent(mut self, parent: impl Into<String>) -> Result<Self> {
+        self.parent = Some(parent.into());
+        self.validate()?;
+        Ok(self)
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
         validate_text_field("agent role", &self.role, MAX_ROLE_BYTES)?;
         validate_text_field("run id", &self.run_id, MAX_IDENTIFIER_BYTES)?;
         validate_text_field("task id", &self.task_id, MAX_IDENTIFIER_BYTES)?;
+        if let Some(parent) = &self.parent {
+            validate_text_field("parent agent id", parent, MAX_IDENTIFIER_BYTES)?;
+        }
         if !self.repo.is_absolute() {
             bail!("agent lifecycle repository path must be absolute");
         }
@@ -76,6 +87,10 @@ impl AgentLaunchMetadata {
     pub fn repo(&self) -> &Path {
         &self.repo
     }
+
+    pub fn parent(&self) -> Option<&str> {
+        self.parent.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -86,6 +101,8 @@ pub struct AgentProcessRecord {
     pub role: String,
     pub run_id: String,
     pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
     pub repo: PathBuf,
     pub argv: Vec<String>,
     pub launch_timestamp_ms: u64,
@@ -104,6 +121,9 @@ impl AgentProcessRecord {
         validate_text_field("agent role", &self.role, MAX_ROLE_BYTES)?;
         validate_text_field("run id", &self.run_id, MAX_IDENTIFIER_BYTES)?;
         validate_text_field("task id", &self.task_id, MAX_IDENTIFIER_BYTES)?;
+        if let Some(parent) = &self.parent {
+            validate_text_field("parent agent id", parent, MAX_IDENTIFIER_BYTES)?;
+        }
         if self.repo != expected_repo {
             bail!(
                 "agent registry record repository {} does not match {}",
@@ -124,10 +144,30 @@ impl AgentProcessRecord {
 
     fn summary(&self) -> String {
         format!(
-            "pid={} role={} run_id={} task_id={}",
-            self.pid, self.role, self.run_id, self.task_id
+            "pid={} role={} run_id={} task_id={} parent={}",
+            self.pid,
+            self.role,
+            self.run_id,
+            self.task_id,
+            self.parent.as_deref().unwrap_or("-")
         )
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentIdentityLiveness {
+    Live,
+    Stale,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentProcessInspection {
+    pub process: AgentProcessRecord,
+    pub identity: AgentIdentityLiveness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncertainty_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -240,6 +280,7 @@ impl AgentRegistry {
             role: metadata.role.clone(),
             run_id: metadata.run_id.clone(),
             task_id: metadata.task_id.clone(),
+            parent: metadata.parent.clone(),
             repo: self.repo.clone(),
             argv,
             launch_timestamp_ms: unix_timestamp_ms()?,
@@ -261,6 +302,36 @@ impl AgentRegistry {
             Ok(())
         })?;
         Ok(record)
+    }
+
+    /// Inspect every durable registry record without pruning.
+    ///
+    /// Each record is classified as live, stale (gone or PID reuse), or uncertain.
+    /// Process-enumeration failures are reported per record and never collapsed
+    /// into an empty list.
+    pub fn inspect(&self) -> Result<Vec<AgentProcessInspection>> {
+        let records = self.snapshot_records()?;
+        let mut inspections = Vec::with_capacity(records.len());
+        for process in records {
+            let (identity, uncertainty_reason) =
+                match process_state(process.pid, &process.process_start_time) {
+                    Ok(ProcessIdentityState::Live) => (AgentIdentityLiveness::Live, None),
+                    Ok(ProcessIdentityState::Gone | ProcessIdentityState::Reused) => {
+                        (AgentIdentityLiveness::Stale, None)
+                    }
+                    Err(error) => (AgentIdentityLiveness::Uncertain, Some(error.to_string())),
+                };
+            inspections.push(AgentProcessInspection {
+                process,
+                identity,
+                uncertainty_reason,
+            });
+        }
+        Ok(inspections)
+    }
+
+    pub fn unregister(&self, pid: u32, start_time: &str) -> Result<()> {
+        self.remove_identity(pid, start_time)
     }
 
     pub fn list(&self, filter: &AgentListFilter) -> Result<Vec<AgentProcessRecord>> {
@@ -388,11 +459,15 @@ impl AgentRegistry {
         })
     }
 
-    #[cfg(test)]
-    fn snapshot_all(&self) -> Result<Vec<AgentProcessRecord>> {
+    fn snapshot_records(&self) -> Result<Vec<AgentProcessRecord>> {
         let root = SafeRoot::open_or_create(self.repo.join(".maco").join("agents"))?;
         let _lock = KernelStateLock::acquire_direct(&root, REGISTRY_LOCK)?;
         Ok(read_state(&root, &self.repo)?.processes)
+    }
+
+    #[cfg(test)]
+    fn snapshot_all(&self) -> Result<Vec<AgentProcessRecord>> {
+        self.snapshot_records()
     }
 }
 
@@ -810,6 +885,7 @@ mod tests {
             role: "worker".to_string(),
             run_id: "run-stale".to_string(),
             task_id: "reused".to_string(),
+            parent: None,
             repo: registry.repo().to_path_buf(),
             argv: vec!["test".to_string()],
             launch_timestamp_ms: unix_timestamp_ms()?,
@@ -819,6 +895,40 @@ mod tests {
 
         assert!(registry.list(&AgentListFilter::default())?.is_empty());
         assert!(registry.snapshot_all()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_reports_live_and_stale_without_pruning() -> Result<()> {
+        let (_temp, registry) = registry()?;
+        let live = SleepChild::spawn()?;
+        let live_record = registry.register(
+            &metadata(&registry, "run-inspect", "live")?,
+            live.pid(),
+            vec!["sleep".to_string(), "60".to_string()],
+        )?;
+        let mut dead = SleepChild::spawn()?;
+        let dead_record = registry.register(
+            &metadata(&registry, "run-inspect", "dead")?,
+            dead.pid(),
+            vec!["sleep".to_string(), "60".to_string()],
+        )?;
+        dead.0.kill().context("kill inspect fixture")?;
+        dead.0.wait().context("wait inspect fixture")?;
+
+        let inspections = registry.inspect()?;
+        assert_eq!(inspections.len(), 2);
+        let live_inspection = inspections
+            .iter()
+            .find(|inspection| inspection.process.pid == live_record.pid)
+            .context("live inspection")?;
+        let stale_inspection = inspections
+            .iter()
+            .find(|inspection| inspection.process.pid == dead_record.pid)
+            .context("stale inspection")?;
+        assert_eq!(live_inspection.identity, AgentIdentityLiveness::Live);
+        assert_eq!(stale_inspection.identity, AgentIdentityLiveness::Stale);
+        assert_eq!(registry.snapshot_all()?.len(), 2);
         Ok(())
     }
 
@@ -855,6 +965,25 @@ mod tests {
         assert_eq!(
             registry.list(&AgentListFilter {
                 run_id: Some("run-two".to_string())
+            })?,
+            vec![expected]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn registry_preserves_parent_linkage() -> Result<()> {
+        let (_temp, registry) = registry()?;
+        let child = SleepChild::spawn()?;
+        let expected = registry.register(
+            &metadata(&registry, "run-parented", "task-child")?.with_parent("run-parented")?,
+            child.pid(),
+            vec!["sleep".to_string(), "60".to_string()],
+        )?;
+        assert_eq!(expected.parent.as_deref(), Some("run-parented"));
+        assert_eq!(
+            registry.list(&AgentListFilter {
+                run_id: Some("run-parented".to_string())
             })?,
             vec![expected]
         );
@@ -914,6 +1043,7 @@ mod tests {
             role: "worker".to_string(),
             run_id: "run-reused".to_string(),
             task_id: "reused".to_string(),
+            parent: None,
             repo: PathBuf::from("/tmp/maco-agent-lifecycle-reused"),
             argv: vec!["test".to_string()],
             launch_timestamp_ms: unix_timestamp_ms()?,
@@ -933,6 +1063,7 @@ mod tests {
             role: "worker".to_string(),
             run_id: "run-pidfd".to_string(),
             task_id: "pidfd".to_string(),
+            parent: None,
             repo: PathBuf::from("/tmp/maco-agent-lifecycle-pidfd"),
             argv: vec!["sleep".to_string()],
             launch_timestamp_ms: unix_timestamp_ms()?,

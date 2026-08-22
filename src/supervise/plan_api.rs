@@ -2011,6 +2011,7 @@ pub fn reaudit_supervisor_assignment(
         codex_bin: request.codex_bin,
         runtime: request.runtime,
         allow_dirty_primary: request.allow_dirty_primary,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -2586,6 +2587,7 @@ pub fn supervisor_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<Superv
             }
         }
     };
+    let heartbeats = crate::run_ops::read_heartbeat_ledger(&run_dir).unwrap_or_default();
     Ok(SupervisorStatusReport {
         run_id,
         repo: PathBuf::from("."),
@@ -2596,6 +2598,9 @@ pub fn supervisor_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<Superv
         final_report_exists: final_report.is_some(),
         lifecycle,
         resume_gate_denial,
+        last_heartbeat: heartbeats.last().cloned(),
+        heartbeat_count: heartbeats.len(),
+        operator_summary_exists: crate::run_ops::operator_summary_exists(&run_dir),
         final_report_path: final_report_path
             .strip_prefix(&repo)
             .map(Path::to_path_buf)

@@ -11,6 +11,7 @@ use crate::selection::{
     OperatorConstraints, ReasoningEffort as SelectorEffort, RiskLevel, RuntimeCatalog,
     RuntimePoolState, SelectionInput, SelectionProvenance, TaskHorizon, TaskProfile,
 };
+use std::path::Path;
 
 const AUTOMATIC_SELECTION_TASK_CLASS: &str = "localized_code_change";
 const JUDGMENT_SELECTION_TASK_CLASS: &str = "review_gate";
@@ -22,12 +23,231 @@ pub(super) struct AdvertisedCatalogSet {
 }
 
 impl AdvertisedCatalogSet {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn empty() -> Self {
         Self {
             cursor: None,
             grok: None,
         }
     }
+}
+
+#[cfg(test)]
+const TEST_CURSOR_CATALOG_FIXTURE_ENV: &str = "MACO_TEST_CURSOR_CATALOG_FIXTURE";
+#[cfg(test)]
+const TEST_CURSOR_CATALOG_OBSERVED_AT_ENV: &str = "MACO_TEST_CURSOR_CATALOG_OBSERVED_AT";
+
+/// Observe advertised runtime catalogs for supervisor launch.
+///
+/// Under `cargo test` this stays hermetic: it never resolves or starts a
+/// third-party CLI. Production binaries screen a live `cursor-agent models`
+/// observation and omit Cursor when the binary is unavailable.
+pub(super) fn advertised_catalogs_for_launch(repo: &Path) -> Result<AdvertisedCatalogSet> {
+    #[cfg(test)]
+    {
+        let _ = repo;
+        advertised_catalogs_from_test_fixtures()
+    }
+    #[cfg(not(test))]
+    {
+        advertised_catalogs_from_live_runtimes(repo)
+    }
+}
+
+#[cfg(test)]
+fn advertised_catalogs_from_test_fixtures() -> Result<AdvertisedCatalogSet> {
+    let Some(path) = std::env::var_os(TEST_CURSOR_CATALOG_FIXTURE_ENV) else {
+        return Ok(AdvertisedCatalogSet::empty());
+    };
+    observe_cursor_catalog_from_fixture(Path::new(&path))
+}
+
+#[cfg(test)]
+fn observe_cursor_catalog_from_fixture(path: &Path) -> Result<AdvertisedCatalogSet> {
+    let bytes = std::fs::read(path).with_context(|| {
+        format!(
+            "failed to read hermetic Cursor catalog fixture {}",
+            path.display()
+        )
+    })?;
+    if bytes.is_empty() {
+        bail!(
+            "hermetic Cursor catalog fixture {} is empty",
+            path.display()
+        );
+    }
+    let observed_at = std::env::var(TEST_CURSOR_CATALOG_OBSERVED_AT_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value != 0)
+        .unwrap_or(1_787_240_463_000);
+    let observation = crate::runtime_adapter::cursor::discover_cursor_model_catalog(
+        &HermeticCursorCatalogRunner::successful(&bytes),
+        &crate::runtime_adapter::cursor::CursorCatalogCommandSpec::new("/workspace"),
+        Some(observed_at),
+    )?;
+    Ok(AdvertisedCatalogSet {
+        cursor: Some(observation),
+        grok: None,
+    })
+}
+
+#[cfg(not(test))]
+fn advertised_catalogs_from_live_runtimes(repo: &Path) -> Result<AdvertisedCatalogSet> {
+    let cursor = match observe_live_cursor_catalog(repo) {
+        Ok(observation) => Some(observation),
+        Err(error) if cursor_catalog_unavailable(&error) => None,
+        Err(error) => {
+            return Err(error).context("live Cursor catalog observation failed closed");
+        }
+    };
+    Ok(AdvertisedCatalogSet { cursor, grok: None })
+}
+
+#[cfg(not(test))]
+fn observe_live_cursor_catalog(
+    repo: &Path,
+) -> Result<crate::runtime_adapter::cursor::CursorAdvertisedCatalogObservation> {
+    let mut spec = crate::runtime_adapter::cursor::CursorCatalogCommandSpec::new(repo);
+    if let Some(program) = std::env::var_os("MACO_CURSOR_BIN") {
+        spec = spec.with_program(program);
+    }
+    let observed_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("Cursor catalog observation time is before UNIX_EPOCH")?
+        .as_millis();
+    let observed_at = u64::try_from(observed_at)
+        .context("Cursor catalog observation time does not fit u64 millis")?;
+    crate::runtime_adapter::cursor::discover_cursor_model_catalog(
+        &ScreenedCursorCatalogRunner { repo },
+        &spec,
+        Some(observed_at.max(1)),
+    )
+}
+
+fn cursor_catalog_unavailable(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    text.contains("is missing")
+        || text.contains("not found")
+        || text.contains("no such file")
+        || text.contains("timed out")
+        || text.contains("cannot find")
+}
+
+#[cfg(test)]
+struct HermeticCursorCatalogRunner {
+    output: crate::runtime_adapter::cursor::CursorCatalogCommandOutput,
+}
+
+#[cfg(test)]
+impl HermeticCursorCatalogRunner {
+    fn successful(stdout: &[u8]) -> Self {
+        Self {
+            output: crate::runtime_adapter::cursor::CursorCatalogCommandOutput {
+                status: Some(0),
+                stdout: stdout.to_vec(),
+                stderr: Vec::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                timed_out: false,
+                process_tree: ProcessTreeEvidence::VerifiedEmpty(
+                    crate::process_runner::ContainmentBackend::DirectChild,
+                ),
+                side_effects: SideEffectConfinementEvidence::Verified(
+                    crate::process_runner::SideEffectConfinementProfileKind::TrustedFixedNetwork,
+                ),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+impl crate::runtime_adapter::cursor::CursorCatalogCommandRunner for HermeticCursorCatalogRunner {
+    fn run(
+        &self,
+        _spec: &crate::runtime_adapter::cursor::CursorCatalogCommandSpec,
+    ) -> Result<crate::runtime_adapter::cursor::CursorCatalogCommandOutput> {
+        Ok(self.output.clone())
+    }
+}
+
+#[cfg(not(test))]
+struct ScreenedCursorCatalogRunner<'a> {
+    repo: &'a Path,
+}
+
+#[cfg(not(test))]
+impl crate::runtime_adapter::cursor::CursorCatalogCommandRunner
+    for ScreenedCursorCatalogRunner<'_>
+{
+    fn run(
+        &self,
+        spec: &crate::runtime_adapter::cursor::CursorCatalogCommandSpec,
+    ) -> Result<crate::runtime_adapter::cursor::CursorCatalogCommandOutput> {
+        let program = resolve_cursor_catalog_program(spec.program())?;
+        let program_parent = program.parent().with_context(|| {
+            format!(
+                "Cursor catalog executable has no parent: {}",
+                program.display()
+            )
+        })?;
+        let environment = spec
+            .environment()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .chain([(
+                "PATH".to_string(),
+                "/run/current-system/sw/bin:/usr/bin:/bin".to_string(),
+            )])
+            .collect();
+        let process_spec = ProcessSpec::direct(
+            "Cursor runtime model catalog",
+            &program,
+            spec.args().iter().cloned(),
+            spec.current_dir(),
+            spec.capture_limit_bytes(),
+        )
+        .with_environment(EnvironmentMode::ClearAndSet(environment))
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(spec.timeout()))
+        .with_private_runtime_home(true)
+        .with_side_effect_confinement(SideEffectConfinementProfile::TrustedFixedNetwork(
+            crate::process_runner::TrustedFixedNetworkProfile::read_write(self.repo)
+                .with_visible_read_only_root(program_parent),
+        ));
+        let output = run_process(process_spec)
+            .context("Cursor runtime model catalog process failed before verified evidence")?;
+        Ok(crate::runtime_adapter::cursor::CursorCatalogCommandOutput {
+            status: output.status.and_then(|status| status.code()),
+            stdout: output.stdout.as_bytes().to_vec(),
+            stderr: output.stderr.as_bytes().to_vec(),
+            stdout_truncated: output.stdout.is_truncated(),
+            stderr_truncated: output.stderr.is_truncated(),
+            timed_out: output.timed_out,
+            process_tree: output.process_tree,
+            side_effects: output.side_effects,
+        })
+    }
+}
+
+#[cfg(not(test))]
+fn resolve_cursor_catalog_program(program: &Path) -> Result<PathBuf> {
+    if program.as_os_str().is_empty() {
+        bail!("Cursor catalog binary is missing");
+    }
+    if program.components().count() > 1 {
+        if program.is_file() {
+            return Ok(program.to_path_buf());
+        }
+        bail!("Cursor catalog binary '{}' is missing", program.display());
+    }
+    std::env::var_os("PATH")
+        .as_deref()
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+        .with_context(|| format!("Cursor catalog binary '{}' is missing", program.display()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -923,6 +1143,287 @@ fn role_selection_from_choice(choice: &selection::SelectedChoice) -> RoleModelSe
     }
 }
 
+pub(super) fn build_assignment_selection_ledger(
+    plan: &SupervisorPlan,
+    decisions: &[SupervisorSelectionEvent],
+    runtime: SupervisorRuntime,
+) -> Vec<AssignmentSelectionLedgerEntry> {
+    plan.assignments
+        .iter()
+        .flat_map(|assignment| {
+            assignment_ledger_roles(assignment).into_iter().map(|role| {
+                ledger_entry_for_assignment(assignment.id.as_str(), role, decisions, runtime, plan)
+            })
+        })
+        .collect()
+}
+
+pub(super) fn write_selection_ledger_from_report(
+    writer: &mut crate::artifacts::ArtifactRunWriter,
+    report: &SupervisorFinalReport,
+) -> Result<()> {
+    let Some(execution) = report
+        .role_economics_profile
+        .as_ref()
+        .and_then(|profile| profile.execution.as_ref())
+    else {
+        return Ok(());
+    };
+    let ledger = AssignmentSelectionLedger {
+        schema_version: ASSIGNMENT_SELECTION_LEDGER_SCHEMA_VERSION,
+        entries: execution.assignment_selection_ledger.clone(),
+    };
+    writer
+        .write_json(
+            Path::new(SELECTION_LEDGER_RELATIVE),
+            &ledger,
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .context("failed to persist assignment selection ledger")?;
+    Ok(())
+}
+
+fn assignment_ledger_roles(assignment: &OrchestratorAssignment) -> Vec<AgentRole> {
+    let mut roles = vec![
+        assignment.role,
+        AgentRole::GateClassifier,
+        AgentRole::Auditor,
+    ];
+    roles.extend(
+        assignment
+            .worker_assignments
+            .iter()
+            .map(|worker| worker.role),
+    );
+    let mut seen = BTreeSet::new();
+    roles.retain(|role| seen.insert(*role));
+    roles
+}
+
+fn decision_for_assignment_role<'a>(
+    decisions: &'a [SupervisorSelectionEvent],
+    assignment_id: &str,
+    role: AgentRole,
+) -> Option<&'a SupervisorSelectionEvent> {
+    decisions.iter().rev().find(|event| {
+        event.role == role
+            && event
+                .assignment_id
+                .as_deref()
+                .is_none_or(|id| id == assignment_id)
+    })
+}
+
+fn ledger_entry_for_assignment(
+    assignment_id: &str,
+    role: AgentRole,
+    decisions: &[SupervisorSelectionEvent],
+    runtime: SupervisorRuntime,
+    plan: &SupervisorPlan,
+) -> AssignmentSelectionLedgerEntry {
+    let event = decision_for_assignment_role(decisions, assignment_id, role);
+    let source = selection_source_for(event, runtime);
+    if source == AssignmentSelectionSource::LegacyFake {
+        let configured = plan.role_models.get(&role);
+        return AssignmentSelectionLedgerEntry {
+            assignment_id: assignment_id.to_string(),
+            attempt: event.map(|event| event.attempt).unwrap_or(0),
+            role,
+            selection_source: source,
+            selected_runtime: Some(runtime_name(runtime).to_string()),
+            selected_model: configured.and_then(|selection| selection.model.clone()),
+            selected_reasoning_effort: configured
+                .and_then(|selection| selection.reasoning_effort.clone()),
+            catalog_source: AssignmentCatalogSource::None,
+            catalog_snapshot_digest: None,
+            catalog_revisions: Vec::new(),
+            rejected_candidates: Vec::new(),
+            evidence_gap: Some(
+                "legacy fake runtime does not consult a catalog or record eligibility evidence"
+                    .to_string(),
+            ),
+        };
+    }
+
+    let Some(event) = event else {
+        return AssignmentSelectionLedgerEntry {
+            assignment_id: assignment_id.to_string(),
+            attempt: 0,
+            role,
+            selection_source: source,
+            selected_runtime: Some(runtime_name(runtime).to_string()),
+            selected_model: None,
+            selected_reasoning_effort: None,
+            catalog_source: AssignmentCatalogSource::None,
+            catalog_snapshot_digest: None,
+            catalog_revisions: Vec::new(),
+            rejected_candidates: Vec::new(),
+            evidence_gap: Some(
+                "no selector decision was recorded for this assignment role".to_string(),
+            ),
+        };
+    };
+
+    let choice = event.provenance.choice.as_ref();
+    let mut rejected_candidates: Vec<AssignmentRejectedCandidate> = event
+        .provenance
+        .candidate_set
+        .iter()
+        .filter(|candidate| choice.is_none_or(|choice| choice.candidate != candidate.candidate))
+        .map(rejected_candidate_from_evaluation)
+        .collect();
+    if rejected_candidates.is_empty() {
+        rejected_candidates.extend(event.provenance.runner_up_scores.iter().map(|ranked| {
+            AssignmentRejectedCandidate {
+                runtime: ranked.candidate.runtime.clone(),
+                model: ranked.candidate.model.clone(),
+                effort: selector_effort_as_str(ranked.candidate.effort).to_string(),
+                reasons: vec![AssignmentRejectionReason {
+                    code: "runner_up".to_string(),
+                    detail: format!(
+                        "candidate ranked {} with {} microunits and was not selected",
+                        ranked.rank, ranked.total_score_microunits
+                    ),
+                }],
+            }
+        }));
+    }
+    if rejected_candidates.is_empty() {
+        rejected_candidates.push(AssignmentRejectedCandidate {
+            runtime: choice
+                .map(|choice| choice.candidate.runtime.clone())
+                .unwrap_or_else(|| runtime_name(runtime).to_string()),
+            model: "unselected-alternate".to_string(),
+            effort: "high".to_string(),
+            reasons: vec![AssignmentRejectionReason {
+                code: "no_alternate_recorded".to_string(),
+                detail: "selector candidate set contained only the selected choice".to_string(),
+            }],
+        });
+    }
+    let evidence_gap = if event.provenance.status == DecisionStatus::FailClosed {
+        Some(
+            event
+                .provenance
+                .decision_reason
+                .clone()
+                .if_empty_then("selector failed closed without a recorded choice"),
+        )
+    } else if choice.is_none() {
+        Some("selector recorded no executable choice".to_string())
+    } else {
+        None
+    };
+
+    AssignmentSelectionLedgerEntry {
+        assignment_id: assignment_id.to_string(),
+        attempt: event.attempt,
+        role,
+        selection_source: source,
+        selected_runtime: choice.map(|choice| choice.candidate.runtime.clone()),
+        selected_model: choice.map(|choice| choice.candidate.model.clone()),
+        selected_reasoning_effort: choice
+            .map(|choice| selector_effort_as_str(choice.candidate.effort).to_string()),
+        catalog_source: if event.provenance.catalog_revisions.is_empty() {
+            AssignmentCatalogSource::None
+        } else {
+            AssignmentCatalogSource::RuntimeAdvertised
+        },
+        catalog_snapshot_digest: Some(event.provenance.input_digests.catalogs.value.clone())
+            .filter(|digest| !digest.is_empty()),
+        catalog_revisions: event.provenance.catalog_revisions.clone(),
+        rejected_candidates,
+        evidence_gap,
+    }
+}
+
+fn selection_source_for(
+    event: Option<&SupervisorSelectionEvent>,
+    runtime: SupervisorRuntime,
+) -> AssignmentSelectionSource {
+    if runtime == SupervisorRuntime::Fake {
+        return AssignmentSelectionSource::LegacyFake;
+    }
+    match event.map(|event| event.primary_cause) {
+        Some(SupervisorSelectionEventCause::Initial) => AssignmentSelectionSource::Automatic,
+        Some(SupervisorSelectionEventCause::DebugOverride) => {
+            AssignmentSelectionSource::PlanRoleModels
+        }
+        Some(SupervisorSelectionEventCause::BudgetDegrade) => {
+            AssignmentSelectionSource::BudgetDegrade
+        }
+        Some(SupervisorSelectionEventCause::Retry) => AssignmentSelectionSource::Retry,
+        None => AssignmentSelectionSource::Automatic,
+    }
+}
+
+fn rejected_candidate_from_evaluation(
+    candidate: &selection::CandidateEvaluation,
+) -> AssignmentRejectedCandidate {
+    let reasons = if candidate.ineligibility_reasons.is_empty() {
+        vec![AssignmentRejectionReason {
+            code: "not_selected".to_string(),
+            detail: "candidate remained eligible but was not the selected choice".to_string(),
+        }]
+    } else {
+        candidate
+            .ineligibility_reasons
+            .iter()
+            .map(|reason| AssignmentRejectionReason {
+                code: ineligibility_code_as_str(reason.code.clone()).to_string(),
+                detail: reason.detail.clone(),
+            })
+            .collect()
+    };
+    AssignmentRejectedCandidate {
+        runtime: candidate.candidate.runtime.clone(),
+        model: candidate.candidate.model.clone(),
+        effort: selector_effort_as_str(candidate.candidate.effort).to_string(),
+        reasons,
+    }
+}
+
+fn ineligibility_code_as_str(code: selection::IneligibilityCode) -> &'static str {
+    match code {
+        selection::IneligibilityCode::CatalogUnavailable => "catalog_unavailable",
+        selection::IneligibilityCode::OperatorConstraint => "operator_constraint",
+        selection::IneligibilityCode::RuntimeAdmissionClosed => "runtime_admission_closed",
+        selection::IneligibilityCode::EntitlementExhausted => "entitlement_exhausted",
+        selection::IneligibilityCode::TaskClassNotAdvertised => "task_class_not_advertised",
+        selection::IneligibilityCode::TaskShapeNotAdvertised => "task_shape_not_advertised",
+        selection::IneligibilityCode::AuthorityNotAdvertised => "authority_not_advertised",
+        selection::IneligibilityCode::PolicyProhibited => "policy_prohibited",
+        selection::IneligibilityCode::LongContextProhibited => "long_context_prohibited",
+        selection::IneligibilityCode::MissingDatedPrior => "missing_dated_prior",
+        selection::IneligibilityCode::MissingClassFitEvidence => "missing_class_fit_evidence",
+        selection::IneligibilityCode::ClassFitEvidenceInsufficient => {
+            "class_fit_evidence_insufficient"
+        }
+        selection::IneligibilityCode::QualityBarNotMet => "quality_bar_not_met",
+        selection::IneligibilityCode::MissingAuthorityEvidence => "missing_authority_evidence",
+        selection::IneligibilityCode::AuthorityEvidenceInsufficient => {
+            "authority_evidence_insufficient"
+        }
+        selection::IneligibilityCode::AuthorityQualityBarNotMet => "authority_quality_bar_not_met",
+        selection::IneligibilityCode::UnknownJudgmentAuthority => "unknown_judgment_authority",
+        selection::IneligibilityCode::EnvironmentRejected => "environment_rejected",
+    }
+}
+
+trait IfEmptyThen {
+    fn if_empty_then(self, fallback: &str) -> String;
+}
+
+impl IfEmptyThen for String {
+    fn if_empty_then(self, fallback: &str) -> String {
+        if self.trim().is_empty() {
+            fallback.to_string()
+        } else {
+            self
+        }
+    }
+}
+
 fn runtime_name(runtime: SupervisorRuntime) -> &'static str {
     runtime.as_str()
 }
@@ -1090,6 +1591,147 @@ mod tests {
                 && decision.primary_cause == SupervisorSelectionEventCause::Initial
                 && decision.provenance.status == DecisionStatus::Selected
                 && decision.provenance.choice.is_some()
+        }));
+        Ok(())
+    }
+
+    fn child_assignment(id: &str) -> OrchestratorAssignment {
+        OrchestratorAssignment {
+            id: id.to_string(),
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn assignment_selection_ledger_projects_role_decisions_onto_each_assignment() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        plan.assignments = vec![
+            child_assignment("assignment-a"),
+            child_assignment("assignment-b"),
+        ];
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+        )?;
+
+        let ledger = build_assignment_selection_ledger(
+            &plan,
+            &resolution.decisions,
+            SupervisorRuntime::Codex,
+        );
+
+        assert_eq!(ledger.len(), 6);
+        for assignment_id in ["assignment-a", "assignment-b"] {
+            for role in [
+                AgentRole::ChildOrchestrator,
+                AgentRole::GateClassifier,
+                AgentRole::Auditor,
+            ] {
+                let entry = ledger
+                    .iter()
+                    .find(|entry| entry.assignment_id == assignment_id && entry.role == role)
+                    .with_context(|| {
+                        format!("missing {assignment_id} {} ledger row", role.as_str())
+                    })?;
+                assert_eq!(entry.selection_source, AssignmentSelectionSource::Automatic);
+                assert_eq!(entry.selected_runtime.as_deref(), Some("codex"));
+                assert!(entry.selected_model.is_some());
+                assert!(entry.selected_reasoning_effort.is_some());
+                assert_eq!(
+                    entry.catalog_source,
+                    AssignmentCatalogSource::RuntimeAdvertised
+                );
+                assert!(entry
+                    .catalog_snapshot_digest
+                    .as_ref()
+                    .is_some_and(|digest| !digest.is_empty()));
+                assert!(!entry.catalog_revisions.is_empty());
+                assert!(!entry.rejected_candidates.is_empty());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn assignment_selection_ledger_records_plan_role_models_source() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let prior = codex_prior_for(|prior| {
+            prior.class_fit.iter().any(|class_fit| {
+                class_fit.task_class == AUTOMATIC_SELECTION_TASK_CLASS
+                    && class_fit.effort == SelectorEffort::High
+            })
+        })?;
+        let mut plan = test_plan();
+        plan.assignments = vec![child_assignment("assignment-a")];
+        plan.role_models
+            .insert(AgentRole::Worker, role_selection(prior.model, Some("high")));
+        plan.assignments[0].worker_assignments = vec![WorkerAssignment {
+            id: "worker-a".to_string(),
+            role: AgentRole::Worker,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            environment_requirements: Vec::new(),
+            report_path: None,
+        }];
+
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+        )?;
+        let ledger = build_assignment_selection_ledger(
+            &plan,
+            &resolution.decisions,
+            SupervisorRuntime::Codex,
+        );
+
+        let worker = ledger
+            .iter()
+            .find(|entry| entry.assignment_id == "assignment-a" && entry.role == AgentRole::Worker)
+            .context("worker ledger row")?;
+        assert_eq!(
+            worker.selection_source,
+            AssignmentSelectionSource::PlanRoleModels
+        );
+        assert_eq!(worker.selected_runtime.as_deref(), Some("codex"));
+        assert_eq!(worker.selected_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            worker.catalog_source,
+            AssignmentCatalogSource::RuntimeAdvertised
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn assignment_selection_ledger_synthesizes_legacy_fake_rows() -> Result<()> {
+        let mut plan = test_plan();
+        plan.assignments = vec![child_assignment("assignment-a")];
+        let ledger = build_assignment_selection_ledger(&plan, &[], SupervisorRuntime::Fake);
+
+        assert!(!ledger.is_empty());
+        assert!(ledger.iter().all(|entry| {
+            entry.assignment_id == "assignment-a"
+                && entry.selection_source == AssignmentSelectionSource::LegacyFake
+                && entry.catalog_source == AssignmentCatalogSource::None
+                && entry.catalog_snapshot_digest.is_none()
+                && entry.evidence_gap.is_some()
         }));
         Ok(())
     }
@@ -1729,6 +2371,38 @@ mod tests {
                 assert!(!choice.candidate.model.starts_with("composer-2.5"));
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_launch_catalogs_stay_empty_under_cargo_test() -> Result<()> {
+        let catalogs = advertised_catalogs_for_launch(Path::new("/workspace"))?;
+        assert_eq!(catalogs, AdvertisedCatalogSet::empty());
+        assert!(cursor_catalog_unavailable(&anyhow!(
+            "Cursor catalog binary 'cursor-agent' is missing"
+        )));
+        assert!(!cursor_catalog_unavailable(&anyhow!(
+            "Cursor runtime model catalog has an invalid header"
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn hermetic_cursor_fixture_path_advertises_composer_without_live_cli() -> Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/runtime_adapter/cursor/captured-minimal-20260820.txt");
+        let catalogs = observe_cursor_catalog_from_fixture(&fixture)?;
+        let observation = catalogs.cursor.context("fixture Cursor observation")?;
+        assert!(observation.catalog().contains("composer-2.5"));
+        assert!(observation.catalog().contains("composer-2.5-fast"));
+        let missing = observe_cursor_catalog_from_fixture(Path::new(
+            "/tmp/maco-missing-cursor-catalog-fixture.txt",
+        ))
+        .expect_err("missing fixture must fail closed");
+        assert!(
+            format!("{missing:#}").contains("failed to read hermetic Cursor catalog fixture"),
+            "{missing:#}"
+        );
         Ok(())
     }
 

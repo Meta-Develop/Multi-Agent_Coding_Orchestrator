@@ -456,6 +456,7 @@ fn test_options(repo: &Path, run_id: &str) -> SupervisorRunOptions {
         codex_bin: PathBuf::from("unused-test-codex"),
         runtime: SupervisorRuntime::Fake,
         allow_dirty_primary: true,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,

@@ -905,6 +905,7 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 }),
                 runtime,
                 allow_dirty_primary: args.allow_dirty_primary,
+                allow_live_run_collision: args.force_live_run,
                 admission_overrides,
                 budget_overrides,
                 budget_max_duration_seconds,
@@ -1134,6 +1135,10 @@ struct RunSuperviseArgs {
     /// Allow supervise to run when the primary worktree is dirty.
     #[arg(long)]
     allow_dirty_primary: bool,
+    /// Launch even when another live supervise or autopilot run still targets this repository.
+    /// Launch-only: grants no authority to kill, interrupt, revert, or discard another run.
+    #[arg(long)]
+    force_live_run: bool,
     /// Acknowledge an exact execution_target.kind=primary_worktree plan declaration.
     #[arg(long)]
     allow_primary_worktree: bool,
@@ -1888,6 +1893,7 @@ impl AutopilotCommand {
                     codex_bin: args.codex_bin,
                     reviewer_command: args.reviewer_command,
                     allow_dirty_primary: args.allow_dirty_primary,
+                    allow_live_run_collision: args.force_live_run,
                     max_child_dispatches: args.max_child_dispatches,
                     budget_overrides,
                     budget_max_duration_seconds,
@@ -2009,6 +2015,10 @@ struct RunAutopilotArgs {
     /// Allow autopilot to run when the primary worktree is dirty.
     #[arg(long)]
     allow_dirty_primary: bool,
+    /// Launch even when another live supervise or autopilot run still targets this repository.
+    /// Launch-only: grants no authority to kill, interrupt, revert, or discard another run.
+    #[arg(long)]
+    force_live_run: bool,
     /// Maximum source plus generated follow-up supervisor-plan dispatches admitted by this run.
     #[arg(long, value_name = "COUNT")]
     max_child_dispatches: Option<usize>,

@@ -719,6 +719,12 @@ fn set_after_autopilot_safety_hook(hook: impl FnMut() + 'static) {
 }
 
 #[cfg(test)]
+fn clear_autopilot_test_hooks() {
+    AUTOPILOT_PROFILE_CALLSITE_HOOK.with(|slot| *slot.borrow_mut() = None);
+    AFTER_AUTOPILOT_SAFETY_HOOK.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[cfg(test)]
 fn run_after_autopilot_safety_hook() {
     AFTER_AUTOPILOT_SAFETY_HOOK.with(|slot| {
         if let Some(mut hook) = slot.borrow_mut().take() {
