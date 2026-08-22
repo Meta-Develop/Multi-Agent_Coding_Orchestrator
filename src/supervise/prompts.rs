@@ -628,6 +628,10 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
     let (child_model, child_reasoning_effort) =
         role_model_selection(plan, AgentRole::ChildOrchestrator);
     let (worker_model, worker_reasoning_effort) = role_model_selection(plan, AgentRole::Worker);
+    let instruction_profile_section = instruction_profile_prompt_section(
+        child_model.as_deref(),
+        child_reasoning_effort.as_deref(),
+    );
     let consultation_section = consultation_prompt_section(consultant);
     let cacheable_prefix = child_cacheable_prefix_for_target(execution_target);
     let execution_target_context = execution_target
@@ -640,7 +644,7 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
         })
         .unwrap_or_default();
     let prompt = format!(
-        r#"{cacheable_prefix}{role_prefix}{field_guide_section}
+        r#"{cacheable_prefix}{role_prefix}{field_guide_section}{instruction_profile_section}
 
 Assignment-specific context:
 - Assigned child worktree: {worktree_path}
@@ -685,6 +689,7 @@ Review auditor prompt template:
         cacheable_prefix = cacheable_prefix,
         role_prefix = role_prefix,
         field_guide_section = field_guide.section,
+        instruction_profile_section = instruction_profile_section,
         worktree_path = worktree.path.display(),
         child_id = assignment.id,
         execution_target_context = execution_target_context,
@@ -821,8 +826,12 @@ pub(super) fn worker_prompt_with_field_guide(
     let task = worker_task(plan, orchestrator, worker);
     let journal_path = incoming_root.join(worker_execution_journal_incoming_relative(worker));
     let (worker_model, worker_reasoning_effort) = role_model_selection(plan, AgentRole::Worker);
+    let instruction_profile_section = instruction_profile_prompt_section(
+        worker_model.as_deref(),
+        worker_reasoning_effort.as_deref(),
+    );
     Ok(format!(
-        r#"{cacheable_prefix}{role_prefix}{field_guide_section}
+        r#"{cacheable_prefix}{role_prefix}{field_guide_section}{instruction_profile_section}
 
 Assignment-specific context:
 - Parent child orchestrator: {orchestrator_id}
@@ -852,6 +861,7 @@ Worker assignment JSON:
         cacheable_prefix = worker_cacheable_prefix_for_target(execution_target),
         role_prefix = role_prefix,
         field_guide_section = field_guide.section,
+        instruction_profile_section = instruction_profile_section,
         orchestrator_id = orchestrator.id,
         worker_id = worker.id,
         assignment_kind = metadata.kind.as_str(),
@@ -930,8 +940,13 @@ pub(super) fn review_auditor_prompt_with_metadata_and_field_guide(
     let auditor_id = format!("{}-review-auditor", orchestrator.id);
     let role_prefix = supervise_role_prefix(SupervisePromptRole::ReviewAuditor, &auditor_id, None);
     let task = assignment_task(plan, orchestrator);
+    let (auditor_model, auditor_reasoning_effort) = role_model_selection(plan, AgentRole::Auditor);
+    let instruction_profile_section = instruction_profile_prompt_section(
+        auditor_model.as_deref(),
+        auditor_reasoning_effort.as_deref(),
+    );
     Ok(format!(
-        r#"{cacheable_prefix}{role_prefix}{field_guide_section}
+        r#"{cacheable_prefix}{role_prefix}{field_guide_section}{instruction_profile_section}
 
 Assignment-specific context:
 - Parent child orchestrator: {orchestrator_id}
@@ -951,6 +966,7 @@ Supervisor task:
         cacheable_prefix = review_auditor_cacheable_prefix(),
         role_prefix = role_prefix,
         field_guide_section = field_guide.section,
+        instruction_profile_section = instruction_profile_section,
         orchestrator_id = orchestrator.id,
         auditor_id = auditor_id,
         worker_ids = if worker_ids.is_empty() {
@@ -1016,8 +1032,13 @@ pub(super) fn render_parent_review_auditor_prompt_with_field_guide(
     .context("failed to serialize redacted field-guide suggestion metadata")?;
     let task = assignment_task(plan, assignment);
     let cacheable_prefix = parent_review_auditor_cacheable_prefix();
+    let (auditor_model, auditor_reasoning_effort) = role_model_selection(plan, AgentRole::Auditor);
+    let instruction_profile_section = instruction_profile_prompt_section(
+        auditor_model.as_deref(),
+        auditor_reasoning_effort.as_deref(),
+    );
     let prompt = format!(
-        r#"{cacheable_prefix}{role_prefix}{field_guide_section}
+        r#"{cacheable_prefix}{role_prefix}{field_guide_section}{instruction_profile_section}
 
 Evidence to review:
 - Supervisor task: {task}
@@ -1039,6 +1060,7 @@ Child report JSON:
         cacheable_prefix = cacheable_prefix,
         role_prefix = role_prefix,
         field_guide_section = field_guide.section,
+        instruction_profile_section = instruction_profile_section,
         task = task,
         assignment_id = assignment.id,
         decomposition_targets = display_decomposition_targets(assignment, assignment_metadata),
@@ -1087,8 +1109,13 @@ pub(super) fn render_review_lens_auditor_prompt(
         .context("failed to serialize the parent-built review lens request")?;
     let coverage_json = serde_json::to_string(required_coverage)
         .context("failed to serialize supervisor-derived review coverage")?;
+    let reasoning_effort = resolved_reasoning_effort
+        .or_else(|| lens.backend.reasoning_effort())
+        .unwrap_or("<runtime-default>");
+    let instruction_profile_section =
+        instruction_profile_prompt_section(Some(lens.backend.model()), Some(reasoning_effort));
     let prompt = format!(
-        r#"{cacheable_prefix}{role_prefix}
+        r#"{cacheable_prefix}{role_prefix}{instruction_profile_section}
 
 Review-lens execution contract:
 - Lens id: {lens_id}
@@ -1109,9 +1136,7 @@ REVIEW_LENS_REQUEST_JSON:
         lens_id = lens.id,
         backend_id = lens.backend.backend_id(),
         model = lens.backend.model(),
-        reasoning_effort = resolved_reasoning_effort
-            .or_else(|| lens.backend.reasoning_effort())
-            .unwrap_or("<runtime-default>"),
+        reasoning_effort = reasoning_effort,
     );
     enforce_rendered_prompt_ceiling(
         "parent acceptance auditor review lens",
@@ -1558,6 +1583,104 @@ mod regression_tests {
         assert_eq!(multiplier.worker_roles_per_run, 3);
         assert_eq!(multiplier.levels_that_embed_template, 2);
         assert_eq!(multiplier.total_worker_template_embeddings, 6);
+    }
+
+    #[test]
+    fn default_rendered_prompts_do_not_attach_the_weak_mechanical_profile() {
+        let (worker, child, auditor, parent_auditor) =
+            fixed_prompt_fixture().expect("render the fixed prompt fixture");
+        for rendered in [&worker, &child, &auditor, &parent_auditor] {
+            assert!(
+                !rendered.contains("INSTRUCTION_PROFILE:"),
+                "frontier defaults must keep the standard prompt shape"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_prompt_attaches_named_lite_profile_for_low_tier_model() {
+        let worker = WorkerAssignment {
+            id: "worker-lite".to_string(),
+            role: AgentRole::Worker,
+            assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: Some("apply the assigned mechanical edit".to_string()),
+            environment_requirements: Vec::new(),
+            report_path: None,
+        };
+        let assignment = OrchestratorAssignment {
+            id: "child-lite".to_string(),
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: Some("complete the bounded prompt-chain assignment".to_string()),
+            worker_assignments: vec![worker],
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let mut plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "lite-profile attachment fixture".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 60,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+        plan.role_models.insert(
+            AgentRole::Worker,
+            RoleModelSelection {
+                model: Some(BALANCED_PROFILE_MODEL.to_string()),
+                reasoning_effort: Some("medium".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let run_dir = Path::new("/tmp/maco-prompt-lite");
+        let incoming_root = run_dir.join("incoming");
+        let field_guide = SupervisorFieldGuidePrompt::empty().expect("empty field guide");
+        let rendered = worker_prompt_with_field_guide(
+            WorkerPromptRenderContext {
+                plan: &plan,
+                execution_target: None,
+                orchestrator: &assignment,
+                worker: &assignment.worker_assignments[0],
+                metadata: &WorkerAssignmentMetadata::default(),
+                run_dir,
+                incoming_root: &incoming_root,
+                schema_path: &run_dir.join("schemas/worker-report.schema.json"),
+            },
+            &field_guide,
+        )
+        .expect("render low-tier worker prompt");
+
+        assert!(rendered.starts_with(&worker_cacheable_prefix()));
+        assert!(rendered.contains("INSTRUCTION_PROFILE: maco-weak-mechanical-lite-v1"));
+        assert!(rendered.contains("Reason: low_tier_capability"));
+        let profile_offset = rendered
+            .find("INSTRUCTION_PROFILE: maco-weak-mechanical-lite-v1")
+            .expect("named profile");
+        let context_offset = rendered
+            .find("Assignment-specific context:")
+            .expect("assignment context");
+        assert!(
+            profile_offset > worker_cacheable_prefix().len(),
+            "named profile must stay out of the cacheable prefix"
+        );
+        assert!(
+            profile_offset < context_offset,
+            "named profile must be attached before assignment-specific context"
+        );
     }
 
     #[test]

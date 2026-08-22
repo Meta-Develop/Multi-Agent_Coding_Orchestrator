@@ -171,6 +171,9 @@ use primary_integrity::*;
 mod worktree_controls;
 use worktree_controls::*;
 
+mod instruction_profile;
+pub use instruction_profile::*;
+
 mod prompts;
 pub use prompts::*;
 
