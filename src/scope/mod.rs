@@ -524,6 +524,7 @@ mod tests {
         assert_eq!(project["runs"][0]["family"], "o2");
         assert_eq!(project["runs"][0]["run"], "run-1");
         assert_eq!(project["runs"][0]["final_report_exists"], false);
+        assert_eq!(project["runs"][0]["observed_coordination_depth"], 2);
         assert!(project["runs"][0].get("events").is_none());
 
         let events_response = http_get(address, "/api/runs/fixture-repo/o2/run-1/events");

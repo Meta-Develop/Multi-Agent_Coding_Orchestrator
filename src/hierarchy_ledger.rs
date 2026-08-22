@@ -8,10 +8,12 @@
 //!
 //! #221 note: this module records the four authority *categories* as ledger
 //! labels mapped from the existing `AgentRole` / `OrchestrationRole` values.
-//! It does not redesign assignment, promotion/demotion, auto-selected roles,
-//! or variable-depth planning. Those remain #221.
+//! Observed coordination depth is derived from parent links (depth as output).
+//! Assignment-time role provenance and promotion/demotion stay in
+//! `supervise::role_authority`. This module does not select roles or drive
+//! the optimizer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -348,6 +350,105 @@ fn apply_gate_ownership(
     Ok(())
 }
 
+/// One node in an observed parent/child graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObservedHierarchyNode<'a> {
+    pub id: &'a str,
+    pub parent: Option<&'a str>,
+    pub coordinator: bool,
+}
+
+/// Depth derived from parent links. Coordination depth is a layer count.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ObservedHierarchy {
+    pub depths: BTreeMap<String, u32>,
+    pub coordination_depth: u32,
+}
+
+/// Labels that count as delegating coordinators when only a role string is known.
+pub fn is_coordinator_role_label(role: &str) -> bool {
+    matches!(
+        role,
+        "supervisor" | "child_orchestrator" | "orchestrator" | "root"
+    )
+}
+
+pub fn orchestration_role_is_coordinator(role: OrchestrationRole) -> bool {
+    matches!(
+        role,
+        OrchestrationRole::Root | OrchestrationRole::Supervisor | OrchestrationRole::Orchestrator
+    )
+}
+
+/// Compute per-node depth and the observed coordination-layer count.
+///
+/// Roots (no parent, or a parent outside the set) sit at depth 0. An unseen
+/// parent still counts as one ancestor, so a listed child of a missing parent
+/// is depth 1. Coordination depth is the number of coordinator layers
+/// (`max(coordinator depth) + 1`). If the graph has no coordinators, the same
+/// layer-count rule is applied to every node so a flat worker list still
+/// reports its observed shape instead of a fixed two-tier label.
+pub fn observe_hierarchy<'a, I>(nodes: I) -> ObservedHierarchy
+where
+    I: IntoIterator<Item = ObservedHierarchyNode<'a>>,
+{
+    let entries = nodes
+        .into_iter()
+        .map(|node| {
+            (
+                node.id.to_string(),
+                node.parent.map(str::to_string),
+                node.coordinator,
+            )
+        })
+        .collect::<Vec<_>>();
+    let parents = entries
+        .iter()
+        .map(|(id, parent, _)| (id.clone(), parent.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut depths = BTreeMap::new();
+    for id in parents.keys() {
+        let _ = depth_of(id, &parents, &mut depths, &mut BTreeSet::new());
+    }
+    let coordinator_ids = entries
+        .iter()
+        .filter(|(_, _, coordinator)| *coordinator)
+        .map(|(id, _, _)| id.as_str())
+        .collect::<BTreeSet<_>>();
+    let max = depths
+        .iter()
+        .filter(|(id, _)| coordinator_ids.is_empty() || coordinator_ids.contains(id.as_str()))
+        .map(|(_, depth)| *depth)
+        .max();
+    ObservedHierarchy {
+        depths,
+        coordination_depth: max.map(|depth| depth.saturating_add(1)).unwrap_or(0),
+    }
+}
+
+fn depth_of(
+    id: &str,
+    parents: &BTreeMap<String, Option<String>>,
+    depths: &mut BTreeMap<String, u32>,
+    visiting: &mut BTreeSet<String>,
+) -> u32 {
+    if let Some(depth) = depths.get(id) {
+        return *depth;
+    }
+    if !visiting.insert(id.to_string()) {
+        depths.insert(id.to_string(), 0);
+        return 0;
+    }
+    let depth = match parents.get(id).and_then(Option::as_deref) {
+        None => 0,
+        Some(parent) if !parents.contains_key(parent) => 1,
+        Some(parent) => depth_of(parent, parents, depths, visiting).saturating_add(1),
+    };
+    visiting.remove(id);
+    depths.insert(id.to_string(), depth);
+    depth
+}
+
 fn require_identifier(field: &str, value: &str) -> Result<()> {
     if value.is_empty() || value != value.trim() {
         bail!("{field} must be a non-empty canonical identifier");
@@ -547,5 +648,52 @@ mod tests {
         .expect_err("mismatched parent must fail");
         assert!(error.to_string().contains("does not match event parent"));
         Ok(())
+    }
+
+    #[test]
+    fn observed_hierarchy_reports_flat_and_three_layer_coordination_as_output() {
+        let flat = observe_hierarchy([ObservedHierarchyNode {
+            id: "run-1",
+            parent: None,
+            coordinator: true,
+        }]);
+        assert_eq!(flat.depths.get("run-1").copied(), Some(0));
+        assert_eq!(flat.coordination_depth, 1);
+
+        let three = observe_hierarchy([
+            ObservedHierarchyNode {
+                id: "o2",
+                parent: None,
+                coordinator: true,
+            },
+            ObservedHierarchyNode {
+                id: "o1-a",
+                parent: Some("o2"),
+                coordinator: true,
+            },
+            ObservedHierarchyNode {
+                id: "o1-b",
+                parent: Some("o1-a"),
+                coordinator: true,
+            },
+            ObservedHierarchyNode {
+                id: "worker-a",
+                parent: Some("o1-b"),
+                coordinator: false,
+            },
+        ]);
+        assert_eq!(three.depths.get("o2").copied(), Some(0));
+        assert_eq!(three.depths.get("o1-a").copied(), Some(1));
+        assert_eq!(three.depths.get("o1-b").copied(), Some(2));
+        assert_eq!(three.depths.get("worker-a").copied(), Some(3));
+        assert_eq!(three.coordination_depth, 3);
+
+        let orphan_worker = observe_hierarchy([ObservedHierarchyNode {
+            id: "worker-a",
+            parent: Some("missing-parent"),
+            coordinator: false,
+        }]);
+        assert_eq!(orphan_worker.depths.get("worker-a").copied(), Some(1));
+        assert_eq!(orphan_worker.coordination_depth, 2);
     }
 }

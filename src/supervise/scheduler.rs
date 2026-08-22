@@ -2372,7 +2372,7 @@ fn initialize_scheduler_evidence(
             run_id,
             parent,
             OrchestrationRole::Supervisor,
-            "supervisor",
+            AgentRole::Supervisor,
             Vec::new(),
             &run_scope_ref(run_id),
             json!({}),

@@ -9,6 +9,7 @@ use crate::{
     },
     autopilot::{self, AutopilotRunOptions},
     consult::{self, ConsultAskOptions, ConsultantRuntime, DEFAULT_CONSULT_TIMEOUT_SECONDS},
+    hierarchy_ledger::{is_coordinator_role_label, observe_hierarchy, ObservedHierarchyNode},
     inbox::{
         self, InboxMachineGlobalInput, InboxPermissionMode, InboxRunOptions, InboxScanOptions,
         InboxWatchOptions, InboxWorkspaceRunOptions, InboxWorkspaceScanOptions,

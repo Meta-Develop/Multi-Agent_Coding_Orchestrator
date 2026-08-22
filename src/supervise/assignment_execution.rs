@@ -1051,7 +1051,7 @@ fn dispatch_and_collect_child_attempt<'a>(
             &assignment.id,
             journal_parent_id,
             OrchestrationRole::Orchestrator,
-            assignment.role.as_str(),
+            assignment.role,
             write_boundary_refs(&assignment.assigned_paths),
             &assignment_scope_ref(&assignment.id),
             json!({
@@ -2171,7 +2171,7 @@ fn dispatch_and_collect_parent_auditor(
             &auditor_id,
             &assignment.id,
             OrchestrationRole::Auditor,
-            AgentRole::Auditor.as_str(),
+            AgentRole::Auditor,
             Vec::new(),
             &assignment_scope_ref(&assignment.id),
             json!({
