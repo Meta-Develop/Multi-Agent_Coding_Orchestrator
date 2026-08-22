@@ -3255,14 +3255,14 @@ fn open_relative_regular_unix_allow_mounts(root: &Path, relative: &Path) -> Resu
         let name = c_string(segment)?;
         let is_final = index + 1 == components.len();
         if !is_final {
+            let intent = DirectoryOpenIntent::Traverse;
             let opened =
-                open_directory_component_at(&directory, &name, DirectoryOpenIntent::Traverse)
-                    .with_context(|| {
-                        format!(
-                            "failed to open repository-relative component {} without following links",
-                            walked.display()
-                        )
-                    })?;
+                open_directory_component_at(&directory, &name, intent).with_context(|| {
+                    format!(
+                        "failed to open repository-relative component {} without following links",
+                        walked.display()
+                    )
+                })?;
             let metadata = opened.metadata().with_context(|| {
                 format!("failed to inspect directory component {}", walked.display())
             })?;
