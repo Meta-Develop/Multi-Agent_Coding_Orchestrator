@@ -15,7 +15,7 @@
 //! | `predictor`, `feasibility`, `objective`, `online_router`, `explanation` | #167 |
 //! | `value_of_information`, `hedge` | #168 |
 //! | `global_search`, `safe_set`, `shadow` | #169 |
-//! | `drift` | #170 |
+//! | `drift`, `adaptation` | #170 |
 //!
 //! Provider adapters stay outside this module (`src/runtime_adapter.rs` /
 //! the #146 boundary). The core depends on capabilities, not CLI assumptions.
@@ -30,6 +30,7 @@
 //! difficulty, or switch-cost types.
 
 pub mod action;
+pub mod adaptation;
 pub mod blinding;
 pub mod calibration;
 pub mod catalog;
