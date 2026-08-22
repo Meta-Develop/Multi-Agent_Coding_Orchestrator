@@ -33,6 +33,72 @@ pub(super) fn write_supervisor_final_schema(
     write_schema(writer, relative, supervisor_final_report_schema_value())
 }
 
+pub(super) fn write_worktree_writable_admission_schema(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+) -> Result<()> {
+    write_schema(writer, relative, worktree_writable_admission_schema_value())
+}
+
+pub(super) fn worktree_writable_admission_schema_value() -> serde_json::Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "WorktreeWritableAdmission",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "version", "assignment_id", "attempt", "target", "worktree", "claims",
+            "native_sandbox"
+        ],
+        "properties": {
+            "version": {
+                "type": "integer",
+                "const": crate::external_agent::WORKTREE_WRITABLE_ADMISSION_SCHEMA_VERSION
+            },
+            "assignment_id": {"type": "string", "minLength": 1},
+            "attempt": {"type": "integer", "minimum": 1},
+            "target": {"const": "managed_child_worktree"},
+            "worktree": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "worktree_id"],
+                "properties": {
+                    "kind": {"const": "managed_disposable"},
+                    "worktree_id": {"type": "string", "minLength": 1}
+                }
+            },
+            "claims": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["state", "token", "paths"],
+                "properties": {
+                    "state": {"const": "held"},
+                    "token": {"type": "integer", "minimum": 1},
+                    "paths": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": true,
+                        "items": {"type": "string", "minLength": 1}
+                    }
+                }
+            },
+            "native_sandbox": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["runtime", "workspace_access", "side_effect_confinement"],
+                "properties": {
+                    "runtime": {
+                        "type": "string",
+                        "enum": ["codex", "fake", "grok", "cursor", "claude-code", "gemini-cli"]
+                    },
+                    "workspace_access": {"const": "read_write"},
+                    "side_effect_confinement": {"const": "verified"}
+                }
+            }
+        }
+    })
+}
+
 pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",

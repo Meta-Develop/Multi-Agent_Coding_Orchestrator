@@ -73,12 +73,16 @@ The current implementation covers a local-first command-line slice:
   `maco supervise run --from-goal <file>` accept the same mutually exclusive
   positional-plan or high-level-goal inputs as `supervise plan`, then execute
   the resulting validated plan through the live supervisor gates. The command
-  selects the Codex runtime by default, but verified
-  writable child release currently fails closed before launch because the
-  Codex 0.144.4 app-server protocol cannot force a blocking client callback for
-  every in-sandbox action. It requires `--machine-global-config` and
+  selects the Codex runtime by default. Verified managed-worktree Codex
+  children launch through native workspace-write execution; the optional
+  app-server duplex reviewer is not their release path. Writable access to the
+  primary checkout remains fail-closed because Codex cannot force a blocking
+  client callback for every in-sandbox action. The command requires
+  `--machine-global-config` and
   `--machine-global-runtime-root-id` so private runtime output-staging cleanup
-  cannot silently take the unbound deletion bypass. It still acquires the repository-cleanliness
+  cannot silently take the unbound deletion bypass. The private staging
+  directory is created beneath that exact reviewed runtime root, not an
+  independently discovered per-user runtime directory. It still acquires the repository-cleanliness
   capability and creates capability-bound managed child worktrees before that
   safety gate. The in-process Fake runtime executes the same depth, claim,
   journal, review-lens, economics, KPI, and final primary-integrity gates
@@ -848,7 +852,7 @@ The current cleanup/retention audit is:
 | Unregistered direct-child directories found by `worktree gc` | Routed | These may be nonempty arbitrary external directories and therefore match the destructive incident shape; treating routing as optional would be unjustified. GC requires an explicit reviewed binding when such targets exist, preflights the complete orphan set, quarantines allowed targets, and reports a typed denial plus logical actor `maco-worktree-gc` when refused. |
 | Pre-worktree final reservation and staging setup rollback/recovery/finalization | Known transactional bypass, attributed | These paths exist before the child is a repository worktree, but they are not adopted retention targets: MACO creates the exclusive reservation and authenticated create intent, binds the exact inode, removes only a still-empty reservation/staging root, and preserves changed, nonempty, or unbound paths for manual recovery. Final replacement accepts only the verified clean staged worktree. Routing these transaction-internal names into retention quarantine would break the idempotent create protocol rather than protect pre-existing data. While retained, the authenticated operation records agent, phase, root/path identity, and branch; each direct mutation also emits its fixed operation label with `process_attribution=not_process_observable`. |
 | Machine-global state-root lock/state/temp maintenance | Known infrastructure bypass | The state root is deliberately disjoint from declared data roots: the gate must lock and replace its own bounded authenticated state before it can evaluate a claim, so recursively gating that state is ill-founded. State writes and temp cleanup are identity-bound, bounded, and lock-fenced. The fixed private state root and filenames identify the machine-global subsystem, but successful bootstrap/temp cleanup is not durably process-observable. Retention purge is not included in this bypass: it rechecks the gate and retains its owner, operation ID, coordinates, identities, and final `purged` phase. |
-| External-agent output staging used by `merge arbitrate` or `supervise run` | Routed | The exact existing staging directory is resolved beneath the explicitly declared root ID and revalidated. Supervise applies the binding to child-orchestrator and parent review-lens auditor launches; review-lens temporary Git workspaces therefore reach this same runtime-staging cleanup path. Refusals use `GateDenial`; allowed operations use the existing retention record. |
+| External-agent output staging used by `merge arbitrate` or `supervise run` | Routed | Creation resolves the explicitly declared root ID first and places the private staging directory beneath that exact reviewed machine-global runtime root. Cleanup revalidates the same directory/root binding. Supervise applies the binding to child-orchestrator and parent review-lens auditor launches; review-lens temporary Git workspaces therefore reach this same runtime-staging cleanup path. Refusals use `GateDenial`; allowed operations use the existing retention record. |
 | Parent review-lens isolated Git workspaces under `/tmp/maco-review-lens-*` | Known process-owned ephemeral bypass | `tempfile` creates an unpredictable, exclusively owned directory for one lens; no operator, sibling agent, or caller supplies or adopts its path. `TempDir::drop` recursively removes that leaf, so this is a distinct deletion from the routed `/run/user/<uid>` output staging. Its hazard is materially weaker than shared staging, while routing it through the runtime-root binding would misrepresent an independently created `/tmp` leaf as part of that reviewed root. The supervisor run and lens identity provide logical context while their artifacts remain, but successful `Drop` cleanup is not durably process-observable. Any change that accepts a caller path or permits adoption must route the cleanup instead of relying on this exception. |
 | External-agent output staging used without a machine-global binding by other entrypoints | Known bypass, attributed | `supervise run` and `merge arbitrate` do not take this path. For callers that genuinely lack a reviewed binding, completed cleanup records `actor=maco-external-agent`, `operation=delete_private_output_staging`, the reason, and `process_attribution=not_process_observable` in the serialized run; early `Drop` cleanup emits the same actor/operation marker before deletion. This identifies the cooperative bypass without claiming process-level observation. |
 | External-agent staging setup rollback | Known empty-directory bypass, attributed | If exclusive output reservation fails, setup emits `actor=maco-external-agent`, `operation=delete_empty_output_staging_setup_rollback`, and `process_attribution=not_process_observable` before removing only the newly created, still-empty staging directory. No external data was accepted into that directory. |
@@ -994,8 +998,10 @@ Claude consultant mode is currently refused before launch because MACO cannot
 enforce an equivalent inner read-only permission contract. Supplying an
 executable does not weaken that refusal. Selecting `runtime: claude-code` or
 `runtime: gemini-cli` on a supervise assignment is accepted, but writable
-worker or supervisor launch stays refused until the adapter hosts
-`blocking_pre_action_callback == All`. The command form below demonstrates
+managed-worktree launch stays refused under their current capability values
+because release requires verified native side-effect confinement. Writable
+primary-worktree release uses the separate
+`blocking_pre_action_callback == All` gate. The command form below demonstrates
 the expected fail-closed consultant response; it does not launch Claude.
 
 ```bash
@@ -2562,7 +2568,7 @@ Run an opt-in supervisor-of-orchestrators plan:
 cargo run -- supervise plan --from-goal goal.md --repo . --json
 # Preserve the positional form for either plain-text tasks or authored JSON plans:
 cargo run -- supervise plan supervisor-plan.json --repo . --json
-# Selects the default Codex runtime; writable child release currently fails closed:
+# Selects the default Codex runtime and uses native workspace-write in managed worktrees:
 cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-demo \
   --codex-bin codex \
   --machine-global-config /exact/path/to/machine-global.json \
@@ -2653,10 +2659,11 @@ declared scope, and accepted changes already reside in the primary checkout—no
 managed-worktree merge step exists.
 
 This opt-in does not relax the existing external-Codex containment,
-machine-global retention, pre-action review, or acceptance gates. In
-particular, if the current verified writable-Codex coverage gate refuses child
-release, this mode reports that refusal rather than bypassing it. The fake
-runtime does not execute a primary-worktree target.
+machine-global retention, primary-target pre-action review, or acceptance
+gates. In particular, the primary-writable coverage gate still refuses release
+when no universal blocking callback exists; managed-worktree native
+workspace-write admission does not authorize this mode. The fake runtime does
+not execute a primary-worktree target.
 
 Goal/spec planning fragments the source and emits one nested subtree per
 disjoint workstream: a depth-2 read-only planning root followed by a depth-3
@@ -2728,20 +2735,30 @@ surface: supervisor plan validation already rejected an empty `assignments`
 array. The run path continues to use that library validation and does not
 reimplement a second empty-plan check.
 
-`maco supervise run` has a default Codex runtime, but this release does not
-claim writable production child execution. Its file-entry path internally
-acquires the repository-cleanliness capability used to create managed child
-worktrees, claims each assignment's paths, records semantic coordination
-metadata when the plan requests it, and writes structured logs and reports
-under the run directory. Before releasing a writable Codex child it applies the
-Issue 28 universal-review coverage gate described below; with the current
-protocol that gate refuses launch. The in-process Fake file-entry simulation
-path instead returns `Unsupported` before repository access or artifact
-reservation.
+`maco supervise run` has a default Codex runtime and admits writable production
+execution only inside a verified managed child worktree. Its file-entry path
+acquires the repository-cleanliness capability used to create that worktree,
+claims each assignment's paths, records semantic coordination metadata when the
+plan requests it, and writes structured logs and reports under the run
+directory. Managed-worktree Codex uses native workspace-write execution under
+the outer confinement boundary; the Issue 28 universal-review coverage gate
+remains mandatory for a writable primary-checkout target. The in-process Fake
+file-entry simulation path instead returns `Unsupported` before repository
+access or artifact reservation.
 Child/model final-message bytes are confined to `incoming/`; normalized child
-reports and `supervisor-final.json` are parent-owned under `reports/`. Only the
-incoming root is granted writable to an external child. The parent retains file
-descriptors for bounded reads and atomic final writes.
+reports and `supervisor-final.json` are parent-owned under `reports/`. A live
+external child requires two distinct writable artifact capabilities in both the
+outer and native sandboxes: the descriptor-held incoming report/journal root,
+and the private final-message staging root beneath the reviewed machine-global
+runtime root. Neither is source-workspace authority. Release must fail closed
+unless both exact capabilities are verified; the parent retains descriptors
+for bounded reads and atomic final writes.
+The full local report schemas remain the authoritative acceptance gate. Current
+external providers, including Codex, reject their draft-2020-12 conditional
+forms, so child and parent-auditor launches omit the provider `--output-schema`
+hint instead of staging a hidden primary-artifact path or weakening the schema.
+The parent still parses and validates every collected final message before it
+can enter accepted evidence.
 Worker prompts also include a structured execution journal path under
 `incoming/worker-journals/<worker-id>.jsonl`. Terminal workers append JSONL
 records with `command`, `cwd`, `start_timestamp`, `end_timestamp`, and
@@ -2781,19 +2798,31 @@ fixed `maco_external_codex` inner permission profile. Goals and multi-agent
 features are enabled only for the supervisor role; inner model-generated
 network access remains disabled. Nested O2/O1 subprocess chains must go through
 the same validated MACO launch path instead of invoking a raw Codex process or
-selecting a broader sandbox mode. The ordinary workspace-write profile is not
-used for these chains because nested Codex state DB access can collide, corrupt,
-or fail under workspace-scoped restrictions.
+selecting a broader sandbox mode. Within that boundary, an O1 assigned a
+managed child worktree uses native workspace-write and launches supplied
+terminal worker templates through runtime-native SubAgent support; it does not
+switch to app-server merely because an optional duplex reviewer is present.
+Before each such writable launch, the parent revalidates the managed disposable
+worktree binding, the exact authenticated held-claim token and paths, and the
+runtime's verified native side-effect confinement together. A successful
+decision is persisted as strict, parent-owned private evidence at
+`assignments/<assignment>.attempt-<n>.worktree-writable-admission.json`, with
+its matching schema under `schemas/`; primary-worktree targets never receive
+this admission record and continue through the universal callback gate.
 
-### Duplex pre-action review boundary
+### Native managed-worktree execution and duplex primary review
 
-Issue 28 adds a crate-internal, line-oriented app-server transport over the
-ordinary contained process runner. The protocol handler receives only a
-bounded borrowed session after executable validation, containment attachment,
-lifecycle registration, tee setup, and the start gate. It cannot obtain or
-retain `Child`, raw stdio handles, or an uncontained `Command`. The writable
-app-server configuration selects `approvals_reviewer="user"`; the upstream
-`auto_review` mode remains experiment evidence only.
+Managed-worktree Codex runs through the native CLI workspace-write path under
+the ordinary contained process runner. It does not require the optional hosted
+duplex reviewer and therefore does not select app-server for normal isolated
+child execution. Issue 28's crate-internal, line-oriented app-server transport
+is retained for the stricter primary-writable review boundary. Its protocol
+handler receives only a bounded borrowed session after executable validation,
+containment attachment, lifecycle registration, tee setup, and the start gate;
+it cannot obtain or retain `Child`, raw stdio handles, or an uncontained
+`Command`. The writable app-server configuration selects
+`approvals_reviewer="user"`; the upstream `auto_review` mode remains experiment
+evidence only.
 
 The live Codex 0.144.4 schema exposes client callbacks for approval requests
 that Codex chooses to surface. `AskForApproval` has no mode that forces every
@@ -2801,10 +2830,13 @@ in-sandbox read, write, destructive operation, or tool action through the
 client. Consequently, approval callbacks alone cannot prove universal
 review-before-action, including for sensitive reads, and a static filesystem
 sandbox cannot distinguish an allowed claimed write from a forbidden delete
-of that same path. MACO therefore refuses verified writable production release
-before starting the child. Removing this gate requires a future protocol
-mechanism that blocks every relevant proposed action; the existing callback
-tests are not evidence that such coverage already exists.
+of that same path. MACO therefore refuses writable primary-checkout release
+before starting the child. This callback limitation is not a managed-worktree
+admission condition: that narrower target is disposable, claim-bound, and
+validated before any later publication. Removing the primary-target gate
+requires a future protocol mechanism that blocks every relevant proposed
+action; the existing callback tests are not evidence that such coverage
+already exists.
 
 For surfaced requests, the retained duplex implementation derives policy input
 from server lifecycle items, never treats best-effort or missing manifests as a
@@ -2827,15 +2859,15 @@ post-approval action marker on denial or journal failure, and protocol-loss
 evidence retention. It skips only when required containment itself is
 unavailable; ownership or protocol failures remain failures. Separate
 trusted-best-effort compatibility tests are explicitly nonpublishable and do
-not claim verified evidence. These tests validate the bounded duplex path; they
-do not claim that current Codex provides universal writable production
-interception.
+not claim verified evidence. These tests validate the bounded duplex
+primary-review path; managed-worktree coverage instead exercises native
+workspace-write launch and does not claim universal action interception.
 
-For worker assignments, child orchestrators should use Codex native
-SubAgent/delegated-worker mechanisms when available only for terminal worker or
-researcher execution so the project manager/worker boundary is preserved. If no
-delegated-worker mechanism is available, the child should stop before mutation
-and report the exact blocked worker task. For child assignments with workers,
+For worker assignments, child orchestrators launch the supplied terminal
+worker templates through Codex native SubAgent/delegated-worker mechanisms so
+the project manager/worker boundary is preserved. If no delegated-worker
+mechanism is available, the child stops before mutation and reports the exact
+blocked worker task. For child assignments with workers,
 the retained supervisor runner requires structured terminal audit evidence before
 accepting the child report: the parent launches a read-only `REVIEW_AUDITOR`
 subprocess and requires an accepted AuditorReport with `role=auditor`,
@@ -3164,7 +3196,7 @@ requested, but `auto_merge_performed` is always `false`.
 | Repository-cleanliness capability and primary isolation | Issue #11 (`42f51aa`) capability-binds managed worktree creation. Autopilot checks dirty primary and repository bindings twice; supervise compares its final primary snapshot and fails the run on drift. The E2E independently compares complete HEAD identity/tree, exact index storage/entries, every HEAD- or index-tracked worktree path's content or link target, mode, missing/type state, and raw porcelain-v2 status flags. No result is applied to primary. | `autopilot_rechecks_dirty_primary_immediately_before_supervisor_dispatch`, `dirty_primary_refusal_emits_public_json`, and `fake_autopilot_depth_two_e2e_is_gated_durable_and_primary_untouched` fail if the pre-dispatch guard, typed dirty denial, or complete before/after snapshot equality regresses. `primary_git_snapshot_detects_complete_state_drift` independently fails unless otherwise omitted tracked content, mode, index storage/entries, status flags, and HEAD/tree changes are observable. |
 | Typed path ownership | Issue #29 (`a38d6bc`) provides `GateDenial`. Overlapping durable sync claims, semantic intents, and live locks all become `claim_conflict`; the command finalizes a refusal without starting supervise. | `active_sync_claim_is_a_typed_preflight_refusal`, `active_semantic_intent_is_a_typed_preflight_refusal`, and `active_live_lock_is_a_typed_preflight_refusal` independently seed each store and fail if its guard is bypassed. |
 | Depth, scheduling, journal, and breaker gates | Issues #9 (`1a9642e`, `6bc7e44`), #10 (`9b87d2d` through `61d1179`), and #24 (`d5b46ee`) made these live supervise gates. Autopilot accepts only the fixed depth-2, non-recursive assignment spine and calls that public path; other integer depths and non-empty recursive assignments become a typed `approval_review`/`permission_expansion` refusal before supervise dispatch, while malformed depth is invalid. Goal decomposition now uses the same validated in-tool planner from both live run entrypoints. Accepted publishable licensed-breakage follow-ups may add one command-level generated batch; evidence for a further batch becomes a typed `permission_expansion` refusal. | `fake_autopilot_depth_two_e2e_is_gated_durable_and_primary_untouched` requires a terminal worker, read-only auditor, review-lens aggregate, and durable supervise report. `autopilot_run_refuses_max_depth_three_with_typed_permission_expansion` and `autopilot_run_refuses_recursive_assignments_with_typed_permission_expansion` require a nonzero CLI result, the exact typed denial, a null embedded supervisor result, and no `.maco/o2` dispatch artifacts. Existing supervise journal/scheduler/breaker tests remain unchanged. |
-| Writable-child containment ceiling | Issue #28 (`c5e086c`) permanently refuses verified-writable external Codex children when the protocol cannot enforce every action callback. Autopilot does not bypass that refusal. Fake executes in process and never invokes `codex_bin` or task text. | `codex_runtime_custom_bin_fails_closed_and_cannot_mutate_primary` still expects the containment refusal; `fake_runtime_never_executes_codex_bin_or_task_text_and_is_never_publishable` fails if Fake launches an executable or becomes publishable. |
+| Writable-child containment boundary | Managed-worktree Codex uses native workspace-write under the verified outer boundary and does not require an app-server `All` callback. The primary-writable target still fails closed when universal callback coverage is absent, and Autopilot does not bypass that refusal. Fake executes in process and never invokes `codex_bin` or task text. | Managed-worktree launch tests require native execution and retained child-worktree isolation; the primary-target coverage test retains the containment refusal; `fake_runtime_never_executes_codex_bin_or_task_text_and_is_never_publishable` fails if Fake launches an executable or becomes publishable. |
 | Acceptance lenses, megafile evidence, re-audit, claim lifecycle, and timing | Issues #16 (`9a88d44`), #19 (`098eb6a`), #30 (`80cce22`), structural extractions #45 (`bfb59ba`) and #49 (`8399ad8`, merged by `8bda772`), #50 (`f9b4b33`), #51 (`76bc21c`), and #53 (`469e3a6`) are consumed through the complete supervisor report rather than reimplemented. Their own failure paths continue to make the supervisor non-successful/non-publishable. | The depth-2 E2E requires worker, auditor, and `review_lens_aggregate` output. Existing focused supervise tests for each gate remain load-bearing and unchanged by the Autopilot wrapper. |
 | Typed environment failures | Issues #31 (`5655419`) and #47 (`74369ac`) provide `EnvironmentFailure`, including `runtime_model_catalog_unavailable`. Autopilot embeds the supervisor report unchanged and performs no dispatch/publication after catalog failure. | `runtime_catalog_failure_composes_typed_environment_failure_without_dispatch` uses a missing Codex runtime and fails unless the exact typed category is nested in the Autopilot report. |
 | Economics and KPI composition | Issues #34 (`285c517`) and #35 (`60ad4f9`) provide role economics, honest usage attribution including `not_process_observable`, and supervisor KPIs. Autopilot passes those fields through without inventing cost observations or recomputing rates. | `public_json_shape_is_stable_and_sanitized` requires the nested role-economics profile and `supervisor_aggregate` KPI observation. Existing supervisor economics/KPI gate tests retain their refusal assertions. |

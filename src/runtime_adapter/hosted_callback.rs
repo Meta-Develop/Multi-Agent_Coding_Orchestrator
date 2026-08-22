@@ -407,7 +407,7 @@ pub fn writable_leaf_launch_refusal_with_host(
     {
         return RuntimeCapabilities::CLAUDE_CODE
             .with_hosted_blocking_callback()
-            .writable_refusal();
+            .worktree_writable_refusal();
     }
     adapter.writable_leaf_launch_refusal()
 }
@@ -703,7 +703,7 @@ mod tests {
         adapter.require_writable_release().expect_err("unattached");
         assert_eq!(
             writable_leaf_launch_refusal_with_host(AdapterId::ClaudeCode, None),
-            None
+            Some("side_effect_confinement != verified")
         );
 
         let temp = tempfile::tempdir()?;
@@ -726,9 +726,12 @@ mod tests {
                 AdapterId::ClaudeCode,
                 adapter.hosted_callback()
             ),
-            None
+            Some("side_effect_confinement != verified")
         );
-        assert_eq!(AdapterId::ClaudeCode.writable_leaf_launch_refusal(), None);
+        assert_eq!(
+            AdapterId::ClaudeCode.writable_leaf_launch_refusal(),
+            Some("side_effect_confinement != verified")
+        );
         assert_eq!(
             AdapterId::ClaudeCode.writable_launch_refusal(
                 crate::runtime_adapter::WritableLaunchTarget::PrimaryWorktree
@@ -765,12 +768,12 @@ mod tests {
                 row.admits_writable_release,
                 row.capabilities.admits_writable_release()
             );
-            if row.adapter == AdapterId::Fake {
-                assert!(!row.admits_writable_release);
-                assert!(!row.admits_worktree_writable);
-            } else {
+            if row.adapter == AdapterId::Codex {
                 assert!(!row.admits_writable_release);
                 assert!(row.admits_worktree_writable);
+            } else {
+                assert!(!row.admits_writable_release);
+                assert!(!row.admits_worktree_writable);
             }
         }
         let markdown = matrix.to_markdown();

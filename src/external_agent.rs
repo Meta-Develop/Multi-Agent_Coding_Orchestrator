@@ -21,7 +21,8 @@ use crate::process_runner::{
 };
 use crate::protected_path::{DeclaredPathCoordinate, ProtectedPathSpec};
 use crate::runtime_adapter::{
-    AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId, WritableLaunchTarget,
+    AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId, SideEffectConfinement,
+    WritableLaunchTarget,
 };
 use crate::safe_state::unsigned_to_u32;
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
@@ -276,6 +277,58 @@ pub struct CodexPermissionEvidence {
     pub network_enabled: bool,
     pub argv_digest: String,
     pub executable_identity: String,
+}
+
+pub const WORKTREE_WRITABLE_ADMISSION_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedWorktreeAdmissionKind {
+    ManagedDisposable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedWorktreeAdmission {
+    pub kind: ManagedWorktreeAdmissionKind,
+    pub worktree_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldPathClaimsAdmissionState {
+    Held,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeldPathClaimsAdmission {
+    pub state: HeldPathClaimsAdmissionState,
+    pub token: u64,
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSandboxAdmission {
+    pub runtime: RuntimeId,
+    pub workspace_access: WorkspaceAccess,
+    pub side_effect_confinement: SideEffectConfinement,
+}
+
+/// Parent-derived evidence that all three managed-worktree writable conditions held together.
+/// Primary-worktree execution uses the separate universal callback gate and is never represented
+/// by this record.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeWritableAdmission {
+    pub version: u32,
+    pub assignment_id: String,
+    pub attempt: usize,
+    pub target: WritableLaunchTarget,
+    pub worktree: ManagedWorktreeAdmission,
+    pub claims: HeldPathClaimsAdmission,
+    pub native_sandbox: NativeSandboxAdmission,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -1338,10 +1391,7 @@ fn run_external_agent_runtime(
     // Hosted duplex review is optional defense-in-depth. Isolated worktree
     // children launch with native permission/sandbox mode; they are not
     // blocked on a parent All-callback or a missing reviewer.
-    let duplex_review_required = runtime == ExternalExecutionRuntime::Verified
-        && spec.invocation == ExternalAgentInvocation::CodexSupervisor
-        && spec.workspace_access == WorkspaceAccess::ReadWrite
-        && review_runtime.is_some();
+    let duplex_review_required = should_use_duplex_review(spec, runtime, review_runtime.is_some());
     if spec.workspace_access == WorkspaceAccess::ReadWrite
         && spec.writable_launch_target == WritableLaunchTarget::PrimaryWorktree
     {
@@ -1666,6 +1716,10 @@ fn run_external_agent_runtime(
         && !spec.invocation.is_adapter_subprocess()
     {
         report.duration_ms = duration_millis(started.elapsed());
+        // The retained probe metadata describes the version diagnostic, not a released target.
+        // Do not let a clean diagnostic process look like target containment evidence.
+        report.process_tree = None;
+        report.side_effects = None;
         record_environment_failure(
             &mut report,
             EnvironmentFailureCategory::SandboxUnavailable,
@@ -2271,6 +2325,20 @@ fn run_external_agent_runtime(
     report.stdout.run_metadata.pre_action_review_metrics = retained_review_metrics;
     report.duration_ms = duration_millis(started.elapsed());
     report
+}
+
+fn should_use_duplex_review(
+    spec: &ExternalAgentCommand,
+    runtime: ExternalExecutionRuntime,
+    hosted_reviewer_available: bool,
+) -> bool {
+    runtime == ExternalExecutionRuntime::Verified
+        && spec.invocation == ExternalAgentInvocation::CodexSupervisor
+        && spec.workspace_access == WorkspaceAccess::ReadWrite
+        // Managed worktree children always use Codex's native workspace-write sandbox. Merely
+        // receiving an optional hosted reviewer must not reroute them into app-server duplex.
+        && spec.writable_launch_target == WritableLaunchTarget::PrimaryWorktree
+        && hosted_reviewer_available
 }
 
 fn validate_universal_pre_action_coverage(target: WritableLaunchTarget) -> Result<()> {

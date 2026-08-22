@@ -2736,7 +2736,15 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
         "--property=LimitCORE=0",
         "--property=OOMPolicy=kill",
     ]);
-    command.arg("--property=RestrictNamespaces=yes");
+    command.arg(
+        if sandbox.kind == SideEffectConfinementProfileKind::ExternalCodex {
+            // Codex's native Linux sandbox establishes an inner bubblewrap namespace. The outer
+            // unit still verifies every other fixed confinement property and its exact path mounts.
+            "--property=RestrictNamespaces=no"
+        } else {
+            "--property=RestrictNamespaces=yes"
+        },
+    );
     if sandbox.isolated_host_view {
         command.arg("--property=TemporaryFileSystem=/:ro");
     }
@@ -2745,6 +2753,16 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
             "--property=PrivateNetwork=yes",
             "--property=RestrictAddressFamilies=AF_UNIX",
             "--property=SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat socket socketpair socketcall",
+        ]);
+    } else if sandbox.kind == SideEffectConfinementProfileKind::ExternalCodex {
+        command.args([
+            "--property=PrivateNetwork=no",
+            // Codex's inner bubblewrap sandbox needs AF_NETLINK while constructing its network
+            // namespace and configuring loopback. Keep this exception exclusive to ExternalCodex.
+            "--property=RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK",
+            // Bubblewrap must construct the inner mount tree. Keep the rest of the ordinary
+            // networked deny list intact and relax @mount only for ExternalCodex.
+            "--property=SystemCallFilter=~@clock @debug @module @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat",
         ]);
     } else {
         command.args([
@@ -2871,11 +2889,9 @@ fn verify_systemd_sandbox_properties(
         sandbox.kind,
         property_value(properties, "SystemCallFilter")?,
     )?;
-    require_effective_property(
-        properties,
-        "RestrictNamespaces",
-        |value| value == "yes",
-        "yes",
+    verify_effective_namespace_restriction(
+        sandbox.kind,
+        property_value(properties, "RestrictNamespaces")?,
     )?;
 
     verify_systemd_network_properties(sandbox.kind, properties)?;
@@ -3138,10 +3154,15 @@ fn verify_systemd_network_properties(
 ) -> std::io::Result<()> {
     let address_families = property_value(properties, "RestrictAddressFamilies")?;
     let actual_families = address_families.split_whitespace().collect::<BTreeSet<_>>();
-    let expected_families = if kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace {
-        BTreeSet::from(["AF_UNIX"])
-    } else {
-        BTreeSet::from(["AF_INET", "AF_INET6"])
+    let expected_families = match kind {
+        SideEffectConfinementProfileKind::StrictOfflineWorkspace => BTreeSet::from(["AF_UNIX"]),
+        SideEffectConfinementProfileKind::ExternalCodex => {
+            BTreeSet::from(["AF_INET", "AF_INET6", "AF_NETLINK"])
+        }
+        SideEffectConfinementProfileKind::TrustedFixedNetwork
+        | SideEffectConfinementProfileKind::TrustedCompatibility => {
+            BTreeSet::from(["AF_INET", "AF_INET6"])
+        }
     };
     if actual_families != expected_families {
         return Err(std::io::Error::new(

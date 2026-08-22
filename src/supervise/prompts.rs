@@ -662,7 +662,7 @@ Declared role selections:
 - Child orchestrator reasoning effort: {child_reasoning_effort}
 - Nested worker model: {worker_model}
 - Nested worker reasoning effort: {worker_reasoning_effort}
-- Worker values are declarative context for the generated worker prompts. MACO does not launch a separate worker process, so worker usage remains unavailable until runtime-side role-tagged usage reporting exists.
+- Launch each supplied terminal worker prompt through runtime-native SubAgent/delegated-worker support and preserve its declared role selection. MACO's parent scheduler does not launch those terminal sessions for you; runtime-side role-tagged usage reporting is required before worker usage or cost can be reported.
 {consultation_section}
 
 Collection targets:
@@ -850,7 +850,7 @@ Assignment-specific context:
 Declared role selection:
 - Worker model: {worker_model}
 - Worker reasoning effort: {worker_reasoning_effort}
-- These values are declarative nested-worker context. MACO does not launch a separate worker process, so worker usage remains unavailable until runtime-side role-tagged usage reporting exists.
+- The O1 must launch this supplied terminal worker template through runtime-native SubAgent. MACO's parent scheduler does not launch the worker automatically; runtime-side role-tagged usage reporting is required before worker usage or cost can be reported.
 
 - Use the worker report schema path: {schema_path}
 
@@ -1617,6 +1617,21 @@ mod regression_tests {
                 "frontier defaults must keep the standard prompt shape"
             );
         }
+    }
+
+    #[test]
+    fn supplied_worker_templates_require_runtime_native_subagent_launch() {
+        let (worker, child, _, _) =
+            fixed_prompt_fixture().expect("render the fixed prompt fixture");
+        let contradictory = "MACO does not launch a separate worker process";
+        assert!(!worker.contains(contradictory));
+        assert!(!child.contains(contradictory));
+        assert!(worker.contains(
+            "The O1 must launch this supplied terminal worker template through runtime-native SubAgent"
+        ));
+        assert!(child.contains(
+            "Launch each supplied terminal worker prompt through runtime-native SubAgent/delegated-worker support"
+        ));
     }
 
     #[test]

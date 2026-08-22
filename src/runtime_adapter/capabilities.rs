@@ -2,9 +2,10 @@
 //!
 //! Gates must consult these declarations instead of vendor names. Admission is
 //! split: isolated managed-child worktree writes are allowed when
-//! `writable_workspace` is Partial or Supported. Primary-writable release still
-//! requires `blocking_pre_action_callback == All` and is not granted by the
-//! descriptors in this module. The matrix reports callback coverage honestly.
+//! `writable_workspace` is Partial or Supported and
+//! `side_effect_confinement == Verified`. Primary-writable release uses the
+//! separate `blocking_pre_action_callback == All` gate and is not granted by
+//! the descriptors in this module. The matrix reports callback coverage honestly.
 
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
@@ -443,12 +444,20 @@ impl RuntimeCapabilities {
         None
     }
 
-    /// Isolated managed-child worktree writes. Does not require a hosted All-callback.
+    /// Isolated managed-child worktree writes. Does not require a hosted All-callback, but the
+    /// selected runtime must declare verified side-effect confinement rather than relying on the
+    /// outer launcher to turn an unverified native contract into a static capability claim.
     pub const fn worktree_writable_refusal(self) -> Option<&'static str> {
-        match self.writable_workspace {
-            WorkspaceWritability::Partial | WorkspaceWritability::Supported => None,
-            WorkspaceWritability::Unsupported => Some("writable_workspace == unsupported"),
+        if matches!(self.writable_workspace, WorkspaceWritability::Unsupported) {
+            return Some("writable_workspace == unsupported");
         }
+        if !matches!(
+            self.side_effect_confinement,
+            SideEffectConfinement::Verified
+        ) {
+            return Some("side_effect_confinement != verified");
+        }
+        None
     }
 
     pub const fn admits_worktree_writable(self) -> bool {
@@ -642,19 +651,37 @@ mod tests {
             );
             assert!(
                 !capabilities.admits_worktree_writable()
-                    || matches!(
+                    || (matches!(
                         capabilities.writable_workspace,
                         WorkspaceWritability::Partial | WorkspaceWritability::Supported
-                    ),
-                "{adapter} worktree-writable admission must follow declared workspace writability"
+                    ) && matches!(
+                        capabilities.side_effect_confinement,
+                        SideEffectConfinement::Verified
+                    )),
+                "{adapter} worktree-writable admission must require writability and verified confinement"
             );
         }
     }
 
     #[test]
-    fn worktree_writable_is_admitted_without_all_callback() {
+    fn worktree_writable_requires_verified_selected_runtime_confinement() {
+        let codex = RuntimeCapabilities::CODEX;
+        assert_ne!(
+            codex.blocking_pre_action_callback,
+            BlockingPreActionCallback::All
+        );
+        assert!(codex.admits_worktree_writable());
+        assert_eq!(
+            codex.writable_launch_refusal(WritableLaunchTarget::ManagedChildWorktree),
+            None
+        );
+        assert!(!codex.admits_writable_release());
+        assert_eq!(
+            codex.writable_launch_refusal(WritableLaunchTarget::PrimaryWorktree),
+            Some("blocking_pre_action_callback != All")
+        );
+
         for capabilities in [
-            RuntimeCapabilities::CODEX,
             RuntimeCapabilities::CURSOR,
             RuntimeCapabilities::CLAUDE_CODE,
             RuntimeCapabilities::GROK,
@@ -664,10 +691,10 @@ mod tests {
                 capabilities.blocking_pre_action_callback,
                 BlockingPreActionCallback::All
             );
-            assert!(capabilities.admits_worktree_writable());
+            assert!(!capabilities.admits_worktree_writable());
             assert_eq!(
                 capabilities.writable_launch_refusal(WritableLaunchTarget::ManagedChildWorktree),
-                None
+                Some("side_effect_confinement != verified")
             );
             assert!(!capabilities.admits_writable_release());
             assert_eq!(
@@ -799,11 +826,18 @@ mod tests {
             Some("blocking_pre_action_callback != All")
         );
         assert!(!RuntimeCapabilities::CLAUDE_CODE.admits_writable_release());
-        assert!(RuntimeCapabilities::CLAUDE_CODE.admits_worktree_writable());
-        assert_eq!(AdapterId::ClaudeCode.writable_leaf_launch_refusal(), None);
-        assert_eq!(AdapterId::GeminiCli.writable_leaf_launch_refusal(), None);
-        assert_eq!(AdapterId::Grok.writable_leaf_launch_refusal(), None);
-        assert_eq!(AdapterId::Cursor.writable_leaf_launch_refusal(), None);
+        assert!(!RuntimeCapabilities::CLAUDE_CODE.admits_worktree_writable());
+        for adapter in [
+            AdapterId::ClaudeCode,
+            AdapterId::GeminiCli,
+            AdapterId::Grok,
+            AdapterId::Cursor,
+        ] {
+            assert_eq!(
+                adapter.writable_leaf_launch_refusal(),
+                Some("side_effect_confinement != verified")
+            );
+        }
         assert_eq!(AdapterId::Codex.writable_leaf_launch_refusal(), None);
         assert_eq!(
             AdapterId::Fake.writable_leaf_launch_refusal(),

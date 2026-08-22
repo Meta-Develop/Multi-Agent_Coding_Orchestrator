@@ -215,6 +215,44 @@ fn validate_universal_pre_action_coverage_allows_worktree_and_refuses_primary() 
 }
 
 #[test]
+fn hosted_reviewer_does_not_reroute_managed_worktree_codex_into_duplex() {
+    let managed = ExternalAgentCommand::codex(
+        "codex",
+        "/worktree",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/last-message.txt",
+        Duration::from_secs(1),
+    )
+    .with_workspace_access(WorkspaceAccess::ReadWrite)
+    .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree);
+    assert!(!should_use_duplex_review(
+        &managed,
+        ExternalExecutionRuntime::Verified,
+        true,
+    ));
+
+    let primary = managed
+        .clone()
+        .with_writable_launch_target(WritableLaunchTarget::PrimaryWorktree);
+    assert!(should_use_duplex_review(
+        &primary,
+        ExternalExecutionRuntime::Verified,
+        true,
+    ));
+    assert!(!should_use_duplex_review(
+        &primary,
+        ExternalExecutionRuntime::Verified,
+        false,
+    ));
+    assert!(!should_use_duplex_review(
+        &primary,
+        ExternalExecutionRuntime::NonpublishableSimulation,
+        true,
+    ));
+}
+
+#[test]
 fn local_executor_forwards_the_concrete_reviewed_runner_once_without_changing_its_run() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -439,7 +477,7 @@ fn production_writable_path_refuses_before_starting_any_child_process() -> Resul
 }
 
 #[test]
-fn worktree_writable_codex_and_cursor_are_admitted_without_all_callback() {
+fn worktree_writable_requires_verified_selected_runtime_confinement() {
     assert_ne!(
         RuntimeId::Codex.capabilities().blocking_pre_action_callback,
         crate::runtime_adapter::BlockingPreActionCallback::All
@@ -451,7 +489,7 @@ fn worktree_writable_codex_and_cursor_are_admitted_without_all_callback() {
         crate::runtime_adapter::BlockingPreActionCallback::All
     );
     assert!(RuntimeId::Codex.capabilities().admits_worktree_writable());
-    assert!(RuntimeId::Cursor.capabilities().admits_worktree_writable());
+    assert!(!RuntimeId::Cursor.capabilities().admits_worktree_writable());
     assert_eq!(
         crate::runtime_adapter::AdapterId::from_runtime(RuntimeId::Codex)
             .writable_launch_refusal(WritableLaunchTarget::ManagedChildWorktree),
@@ -460,7 +498,7 @@ fn worktree_writable_codex_and_cursor_are_admitted_without_all_callback() {
     assert_eq!(
         crate::runtime_adapter::AdapterId::from_runtime(RuntimeId::Cursor)
             .writable_launch_refusal(WritableLaunchTarget::ManagedChildWorktree),
-        None
+        Some("side_effect_confinement != verified")
     );
     validate_universal_pre_action_coverage(WritableLaunchTarget::ManagedChildWorktree)
         .expect("worktree coverage must not fail a launch");
@@ -507,7 +545,7 @@ fn worktree_writable_codex_launch_is_not_blocked_by_coverage() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
-fn worktree_writable_claude_is_not_blocked_by_all_callback() -> Result<()> {
+fn worktree_writable_claude_refuses_unverified_selected_runtime_confinement() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir()?;
@@ -536,21 +574,18 @@ fn worktree_writable_claude_is_not_blocked_by_all_callback() -> Result<()> {
     .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree);
 
     let report = run_external_agent(&spec);
-    let error = report.error.clone().unwrap_or_default();
-    assert!(
-        !error.contains("blocking_pre_action_callback != All"),
-        "worktree Claude must not be blocked by the All-callback launch gate: {error}"
-    );
-    assert!(
-        !error.contains("writable claude-code failed closed before launch"),
-        "worktree Claude must be admitted: {error}"
-    );
+    assert!(!marker.exists());
+    assert!(!report.stdout.target_launch_attempted);
+    assert!(report.environment_blocked());
+    assert!(report.error.as_deref().is_some_and(|error| {
+        error.contains("writable claude-code failed closed before launch")
+            && error.contains("side_effect_confinement != verified")
+    }));
     assert_eq!(
         crate::runtime_adapter::AdapterId::ClaudeCode
             .writable_launch_refusal(WritableLaunchTarget::ManagedChildWorktree),
-        None
+        Some("side_effect_confinement != verified")
     );
-    let _ = marker;
     Ok(())
 }
 
@@ -3443,7 +3478,7 @@ fn codex_inner_permissions_keep_exact_reads_writes_and_toml_escaping() -> Result
     for root in [".maco", ".maco-cache", ".codex", ".agents"] {
         fs::create_dir(workspace.join(root))?;
     }
-    let exception = PathBuf::from(".agents/policy\"quoted.md");
+    let exception = PathBuf::from(".agents/policy-portable.md");
     fs::write(workspace.join(&exception), "policy\n")?;
     fs::write(workspace.join(".gitattributes"), "* text=auto\n")?;
     fs::write(workspace.join(".cursorignore"), "ignored\n")?;
@@ -3477,7 +3512,11 @@ fn codex_inner_permissions_keep_exact_reads_writes_and_toml_escaping() -> Result
             "missing exact read entry for {path}: {permissions}"
         );
     }
-    assert!(permissions.contains("\".agents/policy\\\"quoted.md\"=\"write\""));
+    assert!(permissions.contains("\".agents/policy-portable.md\"=\"write\""));
+    assert_eq!(
+        toml_basic_string(".agents/policy\"quoted.md"),
+        "\".agents/policy\\\"quoted.md\""
+    );
     assert!(!permissions.contains("\".agents\"=\"write\""));
     assert!(!permissions.contains("\".maco-cache\"=\"write\""));
     assert!(permissions.contains(&format!(

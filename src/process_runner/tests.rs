@@ -660,28 +660,90 @@ fn trusted_network_properties_require_exact_ip_families_without_private_network(
         ),
         ("PrivateNetwork".to_string(), "no".to_string()),
     ]);
-    verify_systemd_network_properties(
+    for kind in [
         SideEffectConfinementProfileKind::TrustedFixedNetwork,
-        &properties,
-    )
-    .expect("exact trusted network properties");
+        SideEffectConfinementProfileKind::TrustedCompatibility,
+    ] {
+        verify_systemd_network_properties(kind, &properties)
+            .unwrap_or_else(|error| panic!("exact {kind:?} network properties: {error}"));
+    }
 
     properties.insert(
         "RestrictAddressFamilies".to_string(),
-        "AF_UNIX AF_INET AF_INET6".to_string(),
+        "AF_INET AF_INET6 AF_NETLINK".to_string(),
     );
-    assert!(verify_systemd_network_properties(
+    for kind in [
         SideEffectConfinementProfileKind::TrustedFixedNetwork,
-        &properties,
-    )
-    .is_err());
+        SideEffectConfinementProfileKind::TrustedCompatibility,
+    ] {
+        assert!(verify_systemd_network_properties(kind, &properties).is_err());
+    }
     properties.insert(
         "RestrictAddressFamilies".to_string(),
         "AF_INET AF_INET6".to_string(),
     );
     properties.insert("PrivateNetwork".to_string(), "yes".to_string());
-    assert!(verify_systemd_network_properties(
+    for kind in [
         SideEffectConfinementProfileKind::TrustedFixedNetwork,
+        SideEffectConfinementProfileKind::TrustedCompatibility,
+    ] {
+        assert!(verify_systemd_network_properties(kind, &properties).is_err());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn strict_offline_network_properties_reject_external_codex_netlink() {
+    let mut properties = BTreeMap::from([
+        ("RestrictAddressFamilies".to_string(), "AF_UNIX".to_string()),
+        ("PrivateNetwork".to_string(), "yes".to_string()),
+    ]);
+    verify_systemd_network_properties(
+        SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+        &properties,
+    )
+    .expect("exact strict offline network properties");
+
+    properties.insert(
+        "RestrictAddressFamilies".to_string(),
+        "AF_UNIX AF_NETLINK".to_string(),
+    );
+    assert!(verify_systemd_network_properties(
+        SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+        &properties,
+    )
+    .is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn external_codex_network_properties_require_exact_netlink_family() {
+    let mut properties = BTreeMap::from([
+        (
+            "RestrictAddressFamilies".to_string(),
+            "AF_NETLINK AF_INET6 AF_INET".to_string(),
+        ),
+        ("PrivateNetwork".to_string(), "no".to_string()),
+    ]);
+    verify_systemd_network_properties(SideEffectConfinementProfileKind::ExternalCodex, &properties)
+        .expect("exact ExternalCodex network properties");
+
+    properties.insert(
+        "RestrictAddressFamilies".to_string(),
+        "AF_INET AF_INET6".to_string(),
+    );
+    assert!(verify_systemd_network_properties(
+        SideEffectConfinementProfileKind::ExternalCodex,
+        &properties,
+    )
+    .is_err());
+
+    properties.insert(
+        "RestrictAddressFamilies".to_string(),
+        "AF_UNIX AF_INET AF_INET6 AF_NETLINK".to_string(),
+    );
+    assert!(verify_systemd_network_properties(
+        SideEffectConfinementProfileKind::ExternalCodex,
         &properties,
     )
     .is_err());
@@ -1940,6 +2002,110 @@ fn system_call_filter_accepts_retained_and_complete_expanded_deny_forms() {
         &expanded.join(" "),
     )
     .expect("complete expanded deny groups");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
+    let mut external = program_visibility_sandbox(Path::new("/worktree"));
+    external.kind = SideEffectConfinementProfileKind::ExternalCodex;
+    let mut command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(&mut command, &external);
+    let arguments = command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(arguments
+        .iter()
+        .any(|argument| argument == "--property=RestrictNamespaces=no"));
+    assert!(arguments.iter().any(|argument| {
+        argument == "--property=RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK"
+    }));
+    let external_filter = arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--property=SystemCallFilter="))
+        .expect("ExternalCodex syscall filter");
+    verify_effective_system_call_filter(
+        SideEffectConfinementProfileKind::ExternalCodex,
+        external_filter,
+    )
+    .expect("ExternalCodex bubblewrap-compatible deny list");
+    verify_effective_namespace_restriction(SideEffectConfinementProfileKind::ExternalCodex, "no")
+        .expect("ExternalCodex namespaces are available to bubblewrap");
+    assert!(verify_effective_namespace_restriction(
+        SideEffectConfinementProfileKind::ExternalCodex,
+        "yes",
+    )
+    .is_err());
+
+    for kind in [
+        SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+        SideEffectConfinementProfileKind::TrustedFixedNetwork,
+        SideEffectConfinementProfileKind::TrustedCompatibility,
+    ] {
+        let mut ordinary = program_visibility_sandbox(Path::new("/worktree"));
+        ordinary.kind = kind;
+        let mut command = Command::new("systemd-run");
+        apply_systemd_sandbox_properties(&mut command, &ordinary);
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "--property=RestrictNamespaces=yes"),
+            "{kind:?} namespace confinement changed"
+        );
+        let expected_address_families = match kind {
+            SideEffectConfinementProfileKind::StrictOfflineWorkspace => {
+                "--property=RestrictAddressFamilies=AF_UNIX"
+            }
+            SideEffectConfinementProfileKind::TrustedFixedNetwork
+            | SideEffectConfinementProfileKind::TrustedCompatibility => {
+                "--property=RestrictAddressFamilies=AF_INET AF_INET6"
+            }
+            SideEffectConfinementProfileKind::ExternalCodex => {
+                unreachable!("ExternalCodex is checked separately")
+            }
+        };
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == expected_address_families),
+            "{kind:?} address-family confinement changed"
+        );
+        assert!(
+            arguments
+                .iter()
+                .all(|argument| !argument.contains("AF_NETLINK")),
+            "{kind:?} unexpectedly gained AF_NETLINK"
+        );
+        let filter = arguments
+            .iter()
+            .find_map(|argument| argument.strip_prefix("--property=SystemCallFilter="))
+            .unwrap_or_else(|| panic!("{kind:?} syscall filter"));
+        verify_effective_system_call_filter(kind, filter)
+            .unwrap_or_else(|error| panic!("{kind:?} syscall confinement changed: {error}"));
+        verify_effective_namespace_restriction(kind, "yes")
+            .unwrap_or_else(|error| panic!("{kind:?} namespace verification changed: {error}"));
+        assert!(verify_effective_namespace_restriction(kind, "no").is_err());
+        assert!(filter
+            .split_whitespace()
+            .any(|token| token.trim_start_matches('~') == "@mount"));
+    }
+
+    let ordinary_filter = retained_system_call_filter_fixture();
+    assert!(verify_effective_system_call_filter(
+        SideEffectConfinementProfileKind::ExternalCodex,
+        &ordinary_filter,
+    )
+    .is_err());
+    assert!(verify_effective_system_call_filter(
+        SideEffectConfinementProfileKind::TrustedFixedNetwork,
+        external_filter,
+    )
+    .is_err());
 }
 
 #[cfg(target_os = "linux")]

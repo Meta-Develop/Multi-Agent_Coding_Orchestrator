@@ -16,6 +16,26 @@ fn verify_effective_system_call_filter(
     // architecture-specific expansion. Require either the group token or every selected
     // architecture-common member from each requested group.
     for (group, representatives) in required_denied_group_representatives() {
+        if kind == SideEffectConfinementProfileKind::ExternalCodex && group == "@mount" {
+            let denied_group = tokens
+                .iter()
+                .any(|token| token.trim_start_matches('~') == group);
+            let denied_member = representatives.iter().find(|representative| {
+                tokens
+                    .iter()
+                    .any(|token| token.trim_start_matches('~') == **representative)
+            });
+            if denied_group || denied_member.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "effective SystemCallFilter denied ExternalCodex inner bubblewrap mount operations: {}",
+                        denied_member.copied().unwrap_or(group)
+                    ),
+                ));
+            }
+            continue;
+        }
         let retained_group = tokens
             .iter()
             .any(|token| token.trim_start_matches('~') == group);
@@ -60,6 +80,26 @@ fn verify_effective_system_call_filter(
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_effective_namespace_restriction(
+    kind: SideEffectConfinementProfileKind,
+    value: &str,
+) -> std::io::Result<()> {
+    let expected = if kind == SideEffectConfinementProfileKind::ExternalCodex {
+        "no"
+    } else {
+        "yes"
+    };
+    if value == expected {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("effective RestrictNamespaces={value:?}; required {expected:?} for {kind:?}"),
+        ))
+    }
 }
 
 #[cfg(target_os = "linux")]

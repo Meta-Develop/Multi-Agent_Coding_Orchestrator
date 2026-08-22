@@ -1467,19 +1467,16 @@ mod tests {
                 Some("blocking_pre_action_callback != All"),
                 "{id} writable gate must be capability-derived, not vendor-named"
             );
-            if id == AdapterId::Fake {
-                assert_eq!(
-                    id.writable_leaf_launch_refusal(),
-                    Some("writable_workspace == unsupported"),
-                    "{id} must not become a real writable worktree lie"
-                );
+            let expected = if id == AdapterId::Fake {
+                "writable_workspace == unsupported"
             } else {
-                assert_eq!(
-                    id.writable_leaf_launch_refusal(),
-                    None,
-                    "{id} worktree-writable launch must not require a hosted All-callback"
-                );
-            }
+                "side_effect_confinement != verified"
+            };
+            assert_eq!(
+                id.writable_leaf_launch_refusal(),
+                Some(expected),
+                "{id} must not advertise unverified worktree writability"
+            );
         }
         // Codex remains the unresolved default by operator policy.
         assert_eq!(resolve_runtime(None, None), RuntimeId::Codex);
@@ -1516,15 +1513,15 @@ mod tests {
                 adapter.capabilities().writable_refusal().is_some(),
                 "{adapter} must refuse primary-writable release until a hosted All-callback exists"
             );
-            if adapter == AdapterId::Fake {
+            if adapter == AdapterId::Codex {
                 assert!(
-                    adapter.capabilities().worktree_writable_refusal().is_some(),
-                    "{adapter} must stay non-publishable and not claim worktree writability"
+                    adapter.capabilities().admits_worktree_writable(),
+                    "Codex must retain verified managed-worktree admission"
                 );
             } else {
                 assert!(
-                    adapter.capabilities().admits_worktree_writable(),
-                    "{adapter} must admit isolated worktree writes from declared workspace writability"
+                    adapter.capabilities().worktree_writable_refusal().is_some(),
+                    "{adapter} must not claim managed-worktree writability without verified confinement"
                 );
             }
             let capabilities = adapter.capabilities();
