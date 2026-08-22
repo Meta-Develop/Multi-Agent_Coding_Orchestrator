@@ -1440,6 +1440,67 @@ diff --git a/src/lib.rs b/src/lib.rs
     }
 
     #[test]
+    fn writable_fake_provider_e2e_is_reachable_without_network() -> Result<()> {
+        // First #77 slice: FakeProvider writable execution must run in `cargo test`
+        // without live network and without the containment skip used by the
+        // existing command-backed fixtures. This is not a real-model e2e.
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
+        provider.push_response(
+            "agent-run-fake-e2e",
+            WorkProposal::summary("writable fake-provider e2e").with_patch(ProposedPatch::new(
+                "README.md",
+                "\
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1,3 @@
+ # Test
++
++fake-provider writable e2e
+",
+            )),
+        );
+
+        let report = run_agent_with_provider_simulation(
+            AgentRunOptions {
+                repo: repo_path.clone(),
+                agent_id: "fake-e2e".to_string(),
+                task: "Apply a canned fake-provider patch in an isolated worktree.".to_string(),
+                request_id: Some("agent-run-fake-e2e".to_string()),
+                model: None,
+                claimed_paths: vec![PathBuf::from("README.md")],
+                validation_commands: Vec::new(),
+                keep_claims: false,
+                worktree_reuse: AgentWorktreeReusePolicy::Clean,
+                provider_command_policy: ProviderCommandPolicy::Disabled,
+                command_timeout: DEFAULT_COMMAND_TIMEOUT,
+            },
+            &mut provider,
+        )?;
+
+        assert!(report.success, "unexpected failed report: {report:#?}");
+        assert_eq!(report.provider_id, "fake");
+        assert_eq!(report.model, DEFAULT_MODEL);
+        assert_eq!(
+            report.candidate.changed_paths,
+            vec![PathBuf::from("README.md")]
+        );
+        assert!(report.candidate.unclaimed_changed_paths.is_empty());
+        assert_eq!(provider.calls().len(), 1);
+        assert_eq!(fs::read_to_string(repo_path.join("README.md"))?, "# Test\n");
+        assert_eq!(
+            fs::read_to_string(report.worktree.path.join("README.md"))?,
+            "# Test\n\nfake-provider writable e2e\n"
+        );
+        assert_ne!(report.worktree.path, repo_path);
+        assert!(SyncStore::open(&repo_path)?.snapshot()?.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
     fn git_apply_uses_the_agent_command_timeout() -> Result<()> {
         let temp = TempDir::new().context("tempdir")?;
         let repo_path = create_committed_repo(temp.path())?;

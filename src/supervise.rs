@@ -2675,11 +2675,6 @@ fn run_supervisor_plan_file_with_runner(
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
 ) -> Result<SupervisorFinalReport> {
     validate_max_concurrent_children(1)?;
-    if options.runtime == SupervisorRuntime::Fake {
-        bail!(
-            "supervisor assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
-        );
-    }
     let repo = discover_repo_root(&options.repo)?;
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
