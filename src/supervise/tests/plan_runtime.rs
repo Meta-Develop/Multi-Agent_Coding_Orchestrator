@@ -2896,3 +2896,45 @@ fn provider_planning_session_lowers_recursive_tree_and_binds_run_identity() {
     assert_eq!(bound.plan.assignments.len(), 3);
     assert!(bound.document.get("assignments").is_some());
 }
+
+#[test]
+fn heuristic_feedback_replan_lowers_remaining_work_only() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    git2::Repository::init(repo).expect("init repo");
+    std::fs::create_dir_all(repo.join("src")).expect("src dir");
+    std::fs::write(repo.join("src/alpha.rs"), "pub fn alpha_task() {}\n").expect("alpha");
+    std::fs::write(repo.join("src/beta.rs"), "pub fn beta_task() {}\n").expect("beta");
+    std::fs::write(repo.join("src/gamma.rs"), "pub fn gamma_task() {}\n").expect("gamma");
+    let config = crate::planning::ProviderPlanningConfig::new("replan", "planner-model");
+    let spec = "- Update alpha_task in src/alpha.rs.\n- Update beta_task in src/beta.rs.";
+    let mut session = crate::planning::propose_task_decomposition_with_optional_provider(
+        repo, "", spec, None, &config,
+    )
+    .expect("heuristic session");
+    let feedback = crate::planning::TaskExecutionFeedback {
+        completed_assignment_ids: vec!["assignment-001".to_string()],
+        failed_assignment_ids: vec!["assignment-002".to_string()],
+        coverage_gap_fragment_ids: vec!["fragment-002".to_string()],
+        notes: vec!["execution found the implementation in src/gamma.rs".to_string()],
+    };
+
+    let plan = supervisor_plan_from_feedback_replan(repo, "", spec, &mut session, &feedback)
+        .expect("lower heuristic feedback re-plan");
+
+    assert_eq!(session.replans_used(), 1);
+    assert_eq!(plan.assignments.len(), 2);
+    assert_eq!(plan.assignments[0].id, "assignment-replan-01-001-planning");
+    assert_eq!(plan.assignments[1].id, "assignment-replan-01-001");
+    assert!(
+        plan.assignments[1]
+            .assigned_paths
+            .contains(&PathBuf::from("src/gamma.rs")),
+        "remaining work should pick up the feedback path: {:?}",
+        plan.assignments[1].assigned_paths
+    );
+    assert!(plan
+        .assignments
+        .iter()
+        .all(|assignment| assignment.id != "assignment-001"));
+}
