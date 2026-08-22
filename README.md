@@ -1014,6 +1014,30 @@ Durable project guidance under `.agents/docs`, `.agents/skills`, and
 state under `.agents/temp`, `.agents/storage`, and `.agents/live` is excluded
 from repository maps, semantic maps, and task-path proposal helpers.
 
+## Install
+
+Install `maco` once as a machine-global binary. Do not invoke it through a
+per-repository `cargo run` wrapper around a pinned checkout. See
+[`docs/PACKAGING.md`](docs/PACKAGING.md) for the install, update, and version
+contract.
+
+On Nix:
+
+```bash
+nix profile install path:$PWD#maco
+maco --version
+```
+
+On hosts without Nix:
+
+```bash
+cargo install --locked --path . --bin maco
+maco --version
+```
+
+`maco --version` prints the crate version from `Cargo.toml`. After install,
+`maco` runs from any working directory.
+
 ## Development
 
 The authoritative local environment for CI parity is the repository's Nix
@@ -1069,7 +1093,9 @@ nix develop path:$PWD -c cargo deny --locked check -D warnings advisories bans l
 ```
 
 The `path:$PWD` flake reference addresses the current worktree explicitly. The
-flake exports development shells only; release contents are selected
+flake exports the installable `maco` package and `apps` outputs documented in
+[`docs/PACKAGING.md`](docs/PACKAGING.md), plus the development shell used by
+these gates. Release contents of the Cargo package remain selected
 independently by Cargo, whose package manifest excludes `.agents`, `.github`,
 `.maco`, and `AGENTS.md`.
 
