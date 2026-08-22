@@ -1,5 +1,8 @@
 use super::*;
 
+mod preclaim;
+use preclaim::{parked_preclaim_outcome, preclaim_assignment, PreclaimRunEvidence};
+
 /// Admission policy for concurrently runnable supervisor children.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SupervisorConcurrencyPolicy {
@@ -1056,6 +1059,7 @@ fn run_serial_assignment_schedule(
     cancellation: &ProcessCancellation,
     serial_semantic_warn_intents: &Mutex<Vec<(usize, SemanticIntent)>>,
 ) -> Result<()> {
+    let preclaim_evidence = PreclaimRunEvidence::acquire(context.repo, context.options.runtime);
     let mut pending = (0..context.plan.assignments.len()).collect::<BTreeSet<_>>();
     while !pending.is_empty() {
         suppress_failed_descendants(
@@ -1119,8 +1123,14 @@ fn run_serial_assignment_schedule(
                 .extend(pending.iter().copied());
             break;
         };
-        pending.remove(&index);
         let assignment = &context.plan.assignments[index];
+        let preclaim = preclaim_assignment(context.artifacts, assignment, &preclaim_evidence)?;
+        if !preclaim.allows_path_claim() {
+            pending.remove(&index);
+            progress.indexed_outcomes[index] = Some(parked_preclaim_outcome(assignment, &preclaim));
+            continue;
+        }
+        pending.remove(&index);
         record_assignment_started_checkpoint(
             context.artifacts,
             assignment,
@@ -1226,6 +1236,7 @@ fn run_concurrent_assignment_schedule(
     cancellation: &ProcessCancellation,
     semantic_block_gate: &SemanticBlockGate,
 ) -> Result<()> {
+    let preclaim_evidence = PreclaimRunEvidence::acquire(context.repo, context.options.runtime);
     thread::scope(|scope| -> Result<()> {
         let (completion_sender, completion_receiver) = mpsc::channel::<usize>();
         let mut pending = (0..context.plan.assignments.len()).collect::<BTreeSet<_>>();
@@ -1295,8 +1306,16 @@ fn run_concurrent_assignment_schedule(
                     if active.len() >= progress.budget_degradation.effective_fan_out {
                         break;
                     }
-                    pending.remove(&index);
                     let assignment = &context.plan.assignments[index];
+                    let preclaim =
+                        preclaim_assignment(context.artifacts, assignment, &preclaim_evidence)?;
+                    if !preclaim.allows_path_claim() {
+                        pending.remove(&index);
+                        progress.indexed_outcomes[index] =
+                            Some(parked_preclaim_outcome(assignment, &preclaim));
+                        continue;
+                    }
+                    pending.remove(&index);
                     record_assignment_started_checkpoint(
                         context.artifacts,
                         assignment,

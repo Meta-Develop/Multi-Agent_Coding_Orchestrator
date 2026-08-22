@@ -839,7 +839,119 @@ fn serial_scheduler_directly_dispatches_and_completes_fake_assignment() {
             assert!(concurrency
                 .mean
                 .is_some_and(|mean| mean > 0.0 && mean <= 1.0));
+            assert_eq!(outcome.claimed_paths, vec![PathBuf::from("README.md")]);
+            let decisions =
+                fs::read_to_string(context.run_dir.join(preclaim::PRECLAIM_DECISIONS_RELATIVE))
+                    .expect("read recorded pre-claim decisions");
+            assert!(
+                decisions.contains("\"disposition\":\"claim\"")
+                    || decisions.contains("\"disposition\": \"claim\"")
+            );
+            assert!(decisions.contains("serial-child"));
         }
+    );
+}
+
+#[test]
+fn scheduler_fails_closed_before_claim_when_map_risk_runtime_are_missing() {
+    with_valid_schedule_context!(
+        context,
+        vec![test_assignment("parked-child", "README.md")],
+        1,
+        {
+            let _missing = preclaim::ForceMissingPreclaimEvidence::install();
+            let mut progress = SchedulerProgress::new(1, 1);
+            let cancellation = ProcessCancellation::new();
+            let serial_intents = Mutex::new(Vec::new());
+
+            run_serial_assignment_schedule(&context, &mut progress, &cancellation, &serial_intents)
+                .expect("missing-evidence pre-claim parks without aborting the scheduler");
+
+            let outcome = progress.indexed_outcomes[0]
+                .as_ref()
+                .expect("parked assignment still records an outcome");
+            assert!(outcome.assignment_failed);
+            assert!(outcome.claim_tokens.is_empty());
+            assert!(outcome.claimed_paths.is_empty());
+            assert!(outcome.released_claims.is_empty());
+            assert!(outcome.report.is_none());
+            assert!(outcome.findings.iter().any(|finding| {
+                finding.message.contains("pre-claim viability rejected")
+                    && finding.message.contains("missing map, risk, runtime")
+            }));
+            assert!(context
+                .sync_store
+                .snapshot()
+                .expect("snapshot claims")
+                .is_empty());
+            let concurrency = progress.concurrency.finish();
+            assert_eq!(concurrency.started_assignment_count, 0);
+        }
+    );
+}
+
+#[test]
+fn missing_map_risk_runtime_parks_before_claiming_paths() {
+    with_valid_schedule_context!(
+        context,
+        vec![test_assignment("parked-child", "README.md")],
+        1,
+        {
+            let evidence = PreclaimRunEvidence::missing();
+            let decision =
+                preclaim_assignment(context.artifacts, &context.plan.assignments[0], &evidence)
+                    .expect("record missing-evidence pre-claim decision");
+            assert!(!decision.allows_path_claim());
+            assert!(decision.reason.contains("missing map, risk, runtime"));
+
+            let parked = parked_preclaim_outcome(&context.plan.assignments[0], &decision);
+            assert!(parked.assignment_failed);
+            assert!(parked.claim_tokens.is_empty());
+            assert!(parked.claimed_paths.is_empty());
+            assert!(parked.released_claims.is_empty());
+            assert!(parked.findings.iter().any(|finding| {
+                finding.message.contains("pre-claim viability rejected")
+                    && finding.message.contains("missing map, risk, runtime")
+            }));
+
+            let decisions =
+                fs::read_to_string(context.run_dir.join(preclaim::PRECLAIM_DECISIONS_RELATIVE))
+                    .expect("read recorded pre-claim decisions");
+            let recorded: preclaim::PreclaimDecision = serde_json::from_str(
+                decisions
+                    .lines()
+                    .find(|line| !line.is_empty())
+                    .expect("persisted one decision"),
+            )
+            .expect("parse recorded pre-claim decision");
+            assert_eq!(recorded, decision);
+            assert!(context
+                .sync_store
+                .snapshot()
+                .expect("snapshot claims")
+                .is_empty());
+        }
+    );
+}
+
+#[test]
+fn acquired_map_risk_runtime_allows_claim_on_scheduler_fixture_repo() {
+    let (_temp, repo) = test_repository();
+    let evidence = PreclaimRunEvidence::acquire(&repo, SupervisorRuntime::Fake);
+    let assignment = test_assignment("acquired-child", "README.md");
+    let risk = evidence
+        .risk_for(&assignment.assigned_paths)
+        .expect("fixture repo must produce a risk report");
+    let decision = preclaim::evaluate_preclaim_viability(
+        &assignment.id,
+        evidence.repo_map.as_ref(),
+        Some(&risk),
+        evidence.runtime,
+    );
+    assert!(
+        decision.allows_path_claim(),
+        "fixture repo should supply map/risk/runtime: {}",
+        decision.reason
     );
 }
 
