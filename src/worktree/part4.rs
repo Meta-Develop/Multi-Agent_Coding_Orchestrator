@@ -721,7 +721,7 @@ struct BoundedGitTextInputs {
     info_exclude: Option<Vec<u8>>,
 }
 
-const MACO_STATUS_EXCLUDES: &[u8] = b"\n.maco/\n.maco-cache/\n.agent/temp/\n.agent/storage/\n.agents/live/\n.agents/temp/\n.agents/storage/\ntarget/\n";
+const MACO_STATUS_EXCLUDES: &[u8] = b"\n.maco/\n.maco-cache/\n.agent/temp/\n.agent/storage/\n.agents/live/\n.agents/temp/\n.agents/storage/\ntarget/\n.worktrees/\n.worktrees-quarantine-*/\n";
 
 fn is_bounded_status_runtime_path(path: &Path) -> bool {
     path.starts_with(".maco")
@@ -732,6 +732,7 @@ fn is_bounded_status_runtime_path(path: &Path) -> bool {
         || path.starts_with(".agents/live")
         || path.starts_with(".agents/temp")
         || path.starts_with(".agents/storage")
+        || crate::repo_map::is_ignored_worktree_store_path(path)
 }
 
 #[cfg(test)]
@@ -780,14 +781,18 @@ fn validate_bounded_git_text_inputs_bound(
             if entry.relative_path == Path::new(".git") {
                 return Ok(BoundedTreeWalkAction::Skip);
             }
+            // Treat managed-worktree stores and other runtime roots as walk
+            // boundaries before the nested-marker check so ignored
+            // `.worktrees/` gitfiles do not fail closed and the walker never
+            // descends those trees.
+            if is_bounded_status_runtime_path(&entry.relative_path) {
+                return Ok(BoundedTreeWalkAction::Skip);
+            }
             if entry.relative_path.file_name() == Some(OsStr::new(".git")) {
                 bail!("bounded-status rejects nested Git repository markers");
             }
             if entry.relative_path.file_name() == Some(OsStr::new(".gitmodules")) {
                 bail!("bounded-status rejects submodule metadata");
-            }
-            if is_bounded_status_runtime_path(&entry.relative_path) {
-                return Ok(BoundedTreeWalkAction::Skip);
             }
             if entry.kind == BoundedTreeEntryKind::Directory {
                 return Ok(BoundedTreeWalkAction::RecordAndDescend);

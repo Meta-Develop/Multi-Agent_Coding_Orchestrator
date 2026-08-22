@@ -558,7 +558,7 @@ fn constructed_selection_catalogs(
         catalogs.push(runtime_catalog_from_advertised_slugs(
             "grok",
             observation.catalog().slugs(),
-            format!("grok-injected-sha256:{}", observation.source_sha256()),
+            format!("grok-advertised-sha256:{}", observation.source_sha256()),
             observation.observed_at_unix_millis().to_string(),
             task,
             priors,
@@ -1536,6 +1536,70 @@ mod tests {
         }
     }
 
+    struct FakeGrokRunner {
+        output: crate::runtime_adapter::grok::GrokCatalogCommandOutput,
+    }
+
+    impl FakeGrokRunner {
+        fn successful(stdout: &[u8]) -> Self {
+            Self {
+                output: crate::runtime_adapter::grok::GrokCatalogCommandOutput {
+                    status: Some(0),
+                    stdout: stdout.to_vec(),
+                    stderr: Vec::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    timed_out: false,
+                    process_tree: crate::process_runner::ProcessTreeEvidence::VerifiedEmpty(
+                        crate::process_runner::ContainmentBackend::DirectChild,
+                    ),
+                    side_effects: crate::process_runner::SideEffectConfinementEvidence::Verified(
+                        crate::process_runner::SideEffectConfinementProfileKind::TrustedFixedNetwork,
+                    ),
+                },
+            }
+        }
+    }
+
+    impl crate::runtime_adapter::grok::GrokCatalogCommandRunner for FakeGrokRunner {
+        fn run(
+            &self,
+            _spec: &crate::runtime_adapter::grok::GrokCatalogCommandSpec,
+        ) -> Result<crate::runtime_adapter::grok::GrokCatalogCommandOutput> {
+            Ok(self.output.clone())
+        }
+    }
+
+    fn grok_listing(default: &str, model_lines: &[&str]) -> Vec<u8> {
+        let mut text = format!(
+            "You are logged in with grok.com.\n\nDefault model: {default}\n\nAvailable models:\n"
+        );
+        if !model_lines.is_empty() {
+            text.push_str(&model_lines.join("\n"));
+            text.push('\n');
+        }
+        text.into_bytes()
+    }
+
+    fn discover_grok_observation(
+        stdout: &[u8],
+    ) -> Result<crate::runtime_adapter::grok::GrokAdvertisedCatalogObservation> {
+        crate::runtime_adapter::grok::discover_grok_model_catalog(
+            &FakeGrokRunner::successful(stdout),
+            &crate::runtime_adapter::grok::GrokCatalogCommandSpec::new("/workspace"),
+            Some(CAPTURED_CURSOR_AT_UNIX_MILLIS),
+        )
+    }
+
+    fn advertised_with_grok(
+        observation: crate::runtime_adapter::grok::GrokAdvertisedCatalogObservation,
+    ) -> AdvertisedCatalogSet {
+        AdvertisedCatalogSet {
+            cursor: None,
+            grok: Some(observation),
+        }
+    }
+
     fn worker_assignment() -> OrchestratorAssignment {
         OrchestratorAssignment {
             id: "worker-a".to_string(),
@@ -1742,6 +1806,128 @@ mod tests {
             .candidate_set
             .iter()
             .all(|evaluation| evaluation.candidate.model != grok_prior.model));
+        Ok(())
+    }
+
+    #[test]
+    fn observed_grok_catalog_joins_and_withdrawal_removes_membership() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let priors = selection::built_in_prior_dataset()?;
+        let grok_prior = priors
+            .models
+            .iter()
+            .find(|prior| prior.runtime == "grok")
+            .context("built-in Grok prior")?;
+        let observed = discover_grok_observation(&grok_listing(
+            &grok_prior.model,
+            &[&format!("  * {} (default)", grok_prior.model)],
+        ))?;
+        assert!(observed.catalog().contains(&grok_prior.model));
+
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised_with_grok(observed),
+        )?;
+        let worker = resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Worker)
+            .context("worker decision")?;
+        assert!(worker.provenance.candidate_set.iter().any(|evaluation| {
+            evaluation.candidate.runtime == "grok"
+                && evaluation.candidate.model == grok_prior.model
+                && evaluation.eligible
+        }));
+        assert!(worker
+            .provenance
+            .normalized_input
+            .catalogs
+            .iter()
+            .any(|runtime_catalog| runtime_catalog
+                .revision
+                .starts_with("grok-advertised-sha256:")));
+
+        let withdrawn = discover_grok_observation(&grok_listing(
+            "worker-stable",
+            &["  * worker-stable (default)"],
+        ))?;
+        assert!(!withdrawn.catalog().contains(&grok_prior.model));
+        let mut withdrawn_plan = test_plan();
+        let withdrawn_resolution = initialize_supervisor_selection(
+            &mut withdrawn_plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised_with_grok(withdrawn),
+        )?;
+        let withdrawn_worker = withdrawn_resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Worker)
+            .context("withdrawn worker decision")?;
+        assert!(withdrawn_worker
+            .provenance
+            .candidate_set
+            .iter()
+            .all(|evaluation| evaluation.candidate.model != grok_prior.model));
+        Ok(())
+    }
+
+    #[test]
+    fn observed_grok_catalog_stays_fail_closed_for_judgment_roles() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let priors = selection::built_in_prior_dataset()?;
+        let grok_prior = priors
+            .models
+            .iter()
+            .find(|prior| prior.runtime == "grok")
+            .context("built-in Grok prior")?;
+        let observation = discover_grok_observation(&grok_listing(
+            &grok_prior.model,
+            &[&format!("  * {} (default)", grok_prior.model)],
+        ))?;
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised_with_grok(observation),
+        )?;
+        for role in [
+            AgentRole::Supervisor,
+            AgentRole::Auditor,
+            AgentRole::GateClassifier,
+            AgentRole::ChildOrchestrator,
+        ] {
+            let decision = resolution
+                .decisions
+                .iter()
+                .find(|decision| decision.role == role)
+                .with_context(|| format!("{} decision", role.as_str()))?;
+            let mut pressured = decision.provenance.normalized_input.clone();
+            if let Some(pool) = pressured
+                .pools
+                .iter_mut()
+                .find(|pool| pool.runtime == "codex")
+            {
+                pool.pool_pressure_basis_points = 10_000;
+            }
+            let pressured = selection::select(&pressured)?;
+            if let Some(choice) = &pressured.choice {
+                assert_ne!(choice.candidate.runtime, "grok", "{}", role.as_str());
+                assert_ne!(
+                    choice.candidate.model,
+                    grok_prior.model,
+                    "{}",
+                    role.as_str()
+                );
+            }
+        }
         Ok(())
     }
 

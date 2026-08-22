@@ -45,6 +45,12 @@ impl TransitionClass {
 }
 
 /// Classify a candidate relative to the currently active action.
+///
+/// An unknown current action is not a switch: treating every action-bearing
+/// candidate as [`TransitionClass::FreshSessionOrWorktree`] would apply the
+/// large fresh-session prior and skew a mixed action/non-action set toward
+/// non-action policies. Explicit [`RestartMode::CleanRestart`] still prices
+/// as a fresh session.
 pub fn classify_transition(
     previous: Option<&ModelAction>,
     next: Option<&ModelAction>,
@@ -54,8 +60,7 @@ pub fn classify_transition(
         return TransitionClass::FreshSessionOrWorktree;
     }
     match (previous, next) {
-        (None, Some(_)) => TransitionClass::FreshSessionOrWorktree,
-        (Some(_), None) => TransitionClass::Continue,
+        (None, Some(_)) | (Some(_), None) | (None, None) => TransitionClass::Continue,
         (Some(prev), Some(next)) => {
             if prev.backend_id != next.backend_id {
                 TransitionClass::RuntimeAdapterChange
@@ -65,7 +70,6 @@ pub fn classify_transition(
                 TransitionClass::Continue
             }
         }
-        (None, None) => TransitionClass::Continue,
     }
 }
 
@@ -585,6 +589,23 @@ mod tests {
         );
         assert_eq!(
             classify_transition(Some(&current), Some(&same), RestartMode::CleanRestart),
+            TransitionClass::FreshSessionOrWorktree
+        );
+    }
+
+    #[test]
+    fn unknown_previous_does_not_price_action_as_fresh_session() {
+        let next = action("adapter-a", "model-a");
+        assert_eq!(
+            classify_transition(None, Some(&next), RestartMode::Continuation),
+            TransitionClass::Continue
+        );
+        assert_eq!(
+            classify_transition(None, None, RestartMode::Continuation),
+            TransitionClass::Continue
+        );
+        assert_eq!(
+            classify_transition(None, Some(&next), RestartMode::CleanRestart),
             TransitionClass::FreshSessionOrWorktree
         );
     }
