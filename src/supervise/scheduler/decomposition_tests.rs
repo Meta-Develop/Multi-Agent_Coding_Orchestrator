@@ -159,7 +159,12 @@ fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
         model_policy.apply(&plan).role_models[&AgentRole::ChildOrchestrator]
             .model
             .as_deref(),
-        Some(ECONOMY_PROFILE_MODEL)
+        Some(FRONTIER_PROFILE_MODEL),
+        "measured-ineligible luna must not become a child degrade target"
+    );
+    assert_eq!(
+        controller.effective_fan_out, 4,
+        "ineligible static tier must skip to fan-out rather than override measured evidence"
     );
     controller
         .assignment_policy(
@@ -170,8 +175,8 @@ fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
             &catalog,
             SupervisorRuntime::Codex,
         )
-        .expect("fan-out degradation")
-        .expect("fan-out admission");
+        .expect("exhausted degradation")
+        .expect("exhausted admission");
     assert_eq!(controller.effective_fan_out, 4);
 
     let hard = ledger
@@ -196,30 +201,21 @@ fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
         .expect("halt decision")
         .is_none());
 
-    assert_eq!(controller.records.len(), 4);
+    assert_eq!(controller.records.len(), 3);
     assert!(matches!(
         &controller.records[0].change,
         BudgetDegradationChange::ReasoningEffort { before, after, .. }
             if before == "xhigh" && after == "high"
     ));
-    assert!(matches!(
-        &controller.records[1].change,
-        BudgetDegradationChange::ModelTier {
-            before,
-            after,
-            resolved_candidate_index: 0,
-            ..
-        } if before == FRONTIER_PROFILE_MODEL && after == ECONOMY_PROFILE_MODEL
-    ));
     assert_eq!(
-        controller.records[2].change,
+        controller.records[1].change,
         BudgetDegradationChange::FanOut {
             before: 8,
             after: 4
         }
     );
     assert_eq!(
-        controller.records[3].change,
+        controller.records[2].change,
         BudgetDegradationChange::Halt {
             before_new_dispatch_allowed: true,
             after_new_dispatch_allowed: false
@@ -244,30 +240,19 @@ fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
                 "assignment_id": "model-assignment",
                 "budget_action": "degrade",
                 "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
-                "change": {"kind": "model_tier", "role": "child_orchestrator", "before": FRONTIER_PROFILE_MODEL, "after": ECONOMY_PROFILE_MODEL, "resolved_candidate_index": 0},
-                "effective_child_model": ECONOMY_PROFILE_MODEL,
-                "effective_child_reasoning_effort": "high",
-                "effective_fan_out": 8,
-                "observation": "admission_policy_resolved"
-            },
-            {
-                "sequence": 3,
-                "assignment_id": "fanout-assignment",
-                "budget_action": "degrade",
-                "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
                 "change": {"kind": "fan_out", "before": 8, "after": 4},
-                "effective_child_model": ECONOMY_PROFILE_MODEL,
+                "effective_child_model": FRONTIER_PROFILE_MODEL,
                 "effective_child_reasoning_effort": "high",
                 "effective_fan_out": 4,
                 "observation": "admission_policy_resolved"
             },
             {
-                "sequence": 4,
+                "sequence": 3,
                 "assignment_id": "halted-assignment",
                 "budget_action": "owner_escalation",
                 "budget_reasons": ["soft_token_ceiling_reached", "hard_token_ceiling_reached", "missing_pricing"],
                 "change": {"kind": "halt", "before_new_dispatch_allowed": true, "after_new_dispatch_allowed": false},
-                "effective_child_model": ECONOMY_PROFILE_MODEL,
+                "effective_child_model": null,
                 "effective_child_reasoning_effort": "high",
                 "effective_fan_out": 4,
                 "observation": "admission_policy_resolved"

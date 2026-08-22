@@ -4,7 +4,7 @@
 //! slug table. Unknown models have no judgment authority (fail closed).
 
 use super::AgentRole;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -191,8 +191,12 @@ impl ModelCapabilityPolicy {
         self.models.iter().find(|entry| entry.model == model)
     }
 
-    /// Eligible capability for `model`, or `None` when the slug is unknown or
-    /// explicitly ineligible.
+    /// Eligible capability for `model` from this static/overlay table.
+    ///
+    /// This lookup does not consult measured catalog/evidence. Callers that
+    /// grant judgment authority must go through
+    /// [`validate_known_judgment_role_model`], which fail-closes when this
+    /// table would override a dated ineligibility.
     pub fn capability_for(&self, model: &str) -> Option<ModelCapabilityClass> {
         self.lookup(model)
             .and_then(|entry| entry.eligible.then_some(entry.capability))
@@ -201,10 +205,12 @@ impl ModelCapabilityPolicy {
 
 /// Shipped default: dated 2026-08 priors from agent-registry#38.
 ///
-/// `gpt-5.6-sol` is the judgment/planner tier. `gpt-5.6-luna` is a capable
-/// worker for tightly specified leaves, not a weak-mechanical-only model.
-/// `gpt-5.6-terra` is recorded as ineligible: weaker than luna on agentic
-/// coding and more expensive per solved task.
+/// This table is fallback-only when no measured catalog/evidence prior exists
+/// for a slug. It must not authorize a model that dated evidence marks
+/// ineligible. `gpt-5.6-sol` is the judgment/planner tier. `gpt-5.6-luna` is a
+/// capable worker for tightly specified leaves, not a weak-mechanical-only
+/// model. `gpt-5.6-terra` is recorded as ineligible: weaker than luna on
+/// agentic coding and more expensive per solved task.
 pub fn default_model_capability_policy() -> ModelCapabilityPolicy {
     ModelCapabilityPolicy {
         id: "maco-default-model-capability-v1".to_string(),
@@ -428,11 +434,42 @@ pub fn authorize_resolved_judgment_model(
     }
 }
 
+fn authority_role_for(role: AgentRole) -> crate::selection::AuthorityRole {
+    match role {
+        AgentRole::Supervisor => crate::selection::AuthorityRole::AcceptanceGate,
+        AgentRole::ChildOrchestrator => crate::selection::AuthorityRole::Delegating,
+        AgentRole::Worker => crate::selection::AuthorityRole::TerminalLeaf,
+        AgentRole::GateClassifier => crate::selection::AuthorityRole::FailureClassification,
+        AgentRole::Auditor => crate::selection::AuthorityRole::ReviewAuditor,
+    }
+}
+
+fn reject_static_tier_override_of_measured(role: AgentRole, model: &str) -> Result<()> {
+    let eligibility = crate::selection::measured_authority_eligibility(model, authority_role_for(role))
+        .map_err(|error| {
+            anyhow!(
+                "measured catalog/evidence eligibility could not be loaded for model '{model}': {error}"
+            )
+        })?;
+    match eligibility {
+        crate::selection::MeasuredAuthorityEligibility::Ineligible { reason } => {
+            bail!(
+                "model '{model}' is ineligible by measured catalog/evidence for role '{}': {reason}; static capability tier cannot override measured eligibility",
+                role.as_str()
+            );
+        }
+        crate::selection::MeasuredAuthorityEligibility::Eligible
+        | crate::selection::MeasuredAuthorityEligibility::NoDatedEvidence => Ok(()),
+    }
+}
+
 /// Fail-closed authority check for a resolved role/model pair.
 ///
 /// Missing model identity and unknown/ineligible slugs cannot grant judgment
-/// authority. Workers are not granted weak-mechanical authority here; that
-/// requires a future typed executor.
+/// authority. Measured catalog/evidence ineligibility wins over a static tier
+/// row. The static table remains fallback only when no dated prior exists.
+/// Workers are not granted weak-mechanical authority here; that requires a
+/// future typed executor.
 pub fn validate_known_judgment_role_model(role: AgentRole, model: Option<&str>) -> Result<()> {
     let Some(model) = model else {
         bail!(
@@ -440,6 +477,7 @@ pub fn validate_known_judgment_role_model(role: AgentRole, model: Option<&str>) 
             role.as_str()
         );
     };
+    reject_static_tier_override_of_measured(role, model)?;
     let Some(capability) = trusted_model_capability(model) else {
         bail!("model '{model}' has no trusted capability policy");
     };
@@ -524,18 +562,73 @@ mod tests {
         let terra =
             validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("gpt-5.6-terra"))
                 .expect_err("ineligible terra");
-        assert!(terra
-            .to_string()
-            .contains("has no trusted capability policy"));
+        let terra_message = terra.to_string();
+        assert!(
+            terra_message.contains("static capability tier cannot override measured eligibility")
+                || terra_message.contains("has no trusted capability policy"),
+            "{terra_message}"
+        );
 
-        validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("gpt-5.6-luna"))
-            .expect("luna is general judgment");
+        let luna_child =
+            validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("gpt-5.6-luna"))
+                .expect_err("luna measured evidence forbids delegating judgment");
+        assert!(luna_child
+            .to_string()
+            .contains("static capability tier cannot override measured eligibility"));
+        validate_known_judgment_role_model(AgentRole::Worker, Some("gpt-5.6-luna"))
+            .expect("luna remains a measured leaf worker");
         validate_known_judgment_role_model(AgentRole::Auditor, Some("gpt-5.6-sol"))
             .expect("sol is critical judgment");
         let auditor_luna =
             validate_known_judgment_role_model(AgentRole::Auditor, Some("gpt-5.6-luna"))
                 .expect_err("luna is below auditor floor");
-        assert!(auditor_luna.to_string().contains("judgment floor"));
+        let auditor_message = auditor_luna.to_string();
+        assert!(
+            auditor_message.contains("static capability tier cannot override measured eligibility")
+                || auditor_message.contains("judgment floor"),
+            "{auditor_message}"
+        );
+    }
+
+    #[test]
+    fn static_tier_cannot_override_measured_ineligibility() {
+        let policy = default_model_capability_policy();
+        assert_eq!(
+            policy.capability_for("gpt-5.6-luna"),
+            Some(ModelCapabilityClass::GeneralJudgment),
+            "static table remains as fallback classification"
+        );
+        let error =
+            validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("gpt-5.6-luna"))
+                .expect_err("static GeneralJudgment must not authorize luna for delegating");
+        assert!(error
+            .to_string()
+            .contains("static capability tier cannot override measured eligibility"));
+
+        let overlay = install_model_capability_policy(ModelCapabilityPolicy {
+            id: "maco-test-terra-override-v1".to_string(),
+            version: 1,
+            source: "test overlay that tries to revive a measured-ineligible slug".to_string(),
+            models: vec![ModelCapabilityEvidence {
+                model: "gpt-5.6-terra".to_string(),
+                capability: ModelCapabilityClass::CriticalJudgment,
+                eligible: true,
+                evidence: "overlay must not beat measured prohibition".to_string(),
+                as_of: "test".to_string(),
+            }],
+        })
+        .expect("install contradictory overlay");
+        assert_eq!(
+            current_model_capability_policy().capability_for("gpt-5.6-terra"),
+            Some(ModelCapabilityClass::CriticalJudgment)
+        );
+        let terra =
+            validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("gpt-5.6-terra"))
+                .expect_err("overlay cannot revive measured-ineligible terra");
+        assert!(terra
+            .to_string()
+            .contains("static capability tier cannot override measured eligibility"));
+        drop(overlay);
     }
 
     #[test]
