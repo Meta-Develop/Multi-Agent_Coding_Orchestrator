@@ -111,6 +111,8 @@ mod plan_api;
 pub use plan_api::*;
 mod model_policy;
 pub use model_policy::*;
+mod role_authority;
+pub use role_authority::*;
 
 mod follow_up_cascade;
 use follow_up_cascade::*;
@@ -1854,6 +1856,14 @@ impl AgentRole {
             Self::Worker => "worker",
             Self::GateClassifier => "gate_classifier",
             Self::Auditor => "auditor",
+        }
+    }
+
+    pub const fn authority_category(self) -> RoleCategory {
+        match self {
+            Self::Supervisor | Self::ChildOrchestrator => RoleCategory::DelegatingCoordinator,
+            Self::Worker => RoleCategory::NonDelegatingTerminalWorker,
+            Self::GateClassifier | Self::Auditor => RoleCategory::ReadOnlyReviewAuditor,
         }
     }
 

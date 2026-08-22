@@ -39,13 +39,13 @@ fn bind_selected_runtime_launch(
         launch_runtime,
         SupervisorRuntime::Grok | SupervisorRuntime::Cursor
     ) {
-        if assignment.role != AgentRole::Worker {
-            bail!(
+        authorize_bounded_leaf_runtime_role(assignment.role).with_context(|| {
+            format!(
                 "selected runtime '{}' cannot launch judgment or delegating role '{}'",
                 crate::runtime_adapter::AdapterId::from_runtime(launch_runtime),
                 assignment.role.as_str()
-            );
-        }
+            )
+        })?;
         command.program = selected_runtime_program(launch_runtime, options);
         command = command.with_runtime_adapter(
             launch_runtime,
