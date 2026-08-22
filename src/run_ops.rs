@@ -215,48 +215,50 @@ pub fn persist_launch_preflight(
     collision: &LiveRunCollisionReport,
 ) -> Result<LaunchPreflightIndex> {
     let repo = discover_repo_root(repo.as_ref())?;
-    let mut captures = Vec::new();
-
-    captures.push(write_capture(
-        writer,
-        "git_status",
-        PREFLIGHT_GIT_STATUS_RELATIVE,
-        PREFLIGHT_GIT_STATUS_MARKER,
-        capture_git_status_text(&repo),
-    )?);
-    captures.push(write_json_capture(
-        writer,
-        "repo_map",
-        PREFLIGHT_REPO_MAP_RELATIVE,
-        PREFLIGHT_REPO_MAP_MARKER,
-        capture_repo_map(&repo),
-    )?);
-    captures.push(write_json_capture(
-        writer,
-        "sync_status",
-        PREFLIGHT_SYNC_STATUS_RELATIVE,
-        PREFLIGHT_SYNC_STATUS_MARKER,
-        capture_sync_status(&repo),
-    )?);
-    captures.push(write_json_capture(
-        writer,
-        "runtime",
-        PREFLIGHT_RUNTIME_RELATIVE,
-        PREFLIGHT_RUNTIME_MARKER,
-        capture_runtime_probe(spec),
-    )?);
-    write_json_artifact(writer, PREFLIGHT_RUN_RELATIVE, spec)?;
-    write_json_artifact(writer, PREFLIGHT_LIVE_RUNS_RELATIVE, collision)?;
-    captures.push(CaptureOutcome {
-        name: "run_parameters".to_string(),
-        status: CaptureStatus::Ok,
-        error: None,
-    });
-    captures.push(CaptureOutcome {
-        name: "live_runs".to_string(),
-        status: CaptureStatus::Ok,
-        error: None,
-    });
+    let captures = vec![
+        write_capture(
+            writer,
+            "git_status",
+            PREFLIGHT_GIT_STATUS_RELATIVE,
+            PREFLIGHT_GIT_STATUS_MARKER,
+            capture_git_status_text(&repo),
+        )?,
+        write_json_capture(
+            writer,
+            "repo_map",
+            PREFLIGHT_REPO_MAP_RELATIVE,
+            PREFLIGHT_REPO_MAP_MARKER,
+            capture_repo_map(&repo),
+        )?,
+        write_json_capture(
+            writer,
+            "sync_status",
+            PREFLIGHT_SYNC_STATUS_RELATIVE,
+            PREFLIGHT_SYNC_STATUS_MARKER,
+            capture_sync_status(&repo),
+        )?,
+        write_json_capture(
+            writer,
+            "runtime",
+            PREFLIGHT_RUNTIME_RELATIVE,
+            PREFLIGHT_RUNTIME_MARKER,
+            capture_runtime_probe(spec),
+        )?,
+        {
+            write_json_artifact(writer, PREFLIGHT_RUN_RELATIVE, spec)?;
+            write_json_artifact(writer, PREFLIGHT_LIVE_RUNS_RELATIVE, collision)?;
+            CaptureOutcome {
+                name: "run_parameters".to_string(),
+                status: CaptureStatus::Ok,
+                error: None,
+            }
+        },
+        CaptureOutcome {
+            name: "live_runs".to_string(),
+            status: CaptureStatus::Ok,
+            error: None,
+        },
+    ];
 
     let index = LaunchPreflightIndex {
         version: 1,
