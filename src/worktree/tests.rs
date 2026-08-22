@@ -1031,6 +1031,76 @@ fn bounded_git_input_preflight_rejects_oversized_and_linked_ignore_files() {
 }
 
 #[test]
+fn bounded_git_input_preflight_skips_ignored_worktree_store_git_markers() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    fs::create_dir_all(repo_path.join(".worktrees/lane/src")).expect("create lane");
+    fs::write(
+        repo_path.join(".worktrees/lane/.git"),
+        "gitdir: /tmp/fake-worktree\n",
+    )
+    .expect("write nested gitfile");
+    fs::write(repo_path.join(".worktrees/lane/.gitignore"), "target/\n")
+        .expect("write nested ignore");
+    fs::create_dir_all(repo_path.join(".worktrees-quarantine-20260811/old"))
+        .expect("create quarantine");
+    fs::write(
+        repo_path.join(".worktrees-quarantine-20260811/old/.git"),
+        "gitdir: /tmp/fake-quarantine\n",
+    )
+    .expect("write quarantine gitfile");
+
+    validate_bounded_git_text_inputs(
+        &repo_path,
+        repo.path(),
+        repo.commondir(),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .expect("ignored worktree-store git markers must not fail prevalidation");
+
+    fs::create_dir_all(repo_path.join("vendor")).expect("create vendor");
+    fs::write(repo_path.join("vendor/.git"), "gitdir: /tmp/unsafe\n")
+        .expect("write vendor gitfile");
+    let error = match validate_bounded_git_text_inputs(
+        &repo_path,
+        repo.path(),
+        repo.commondir(),
+        Instant::now() + Duration::from_secs(2),
+    ) {
+        Ok(_) => panic!("nested git markers outside worktree stores must still fail"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("bounded-status rejects nested Git repository markers"));
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_git_input_preflight_does_not_follow_worktree_store_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let outside = temp.path().join("outside-store");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    fs::create_dir_all(outside.join("lane")).expect("create outside lane");
+    fs::write(outside.join("lane/.git"), "gitdir: /tmp/outside\n").expect("write outside gitfile");
+    symlink(&outside, repo_path.join(".worktrees")).expect("link worktree store");
+
+    validate_bounded_git_text_inputs(
+        &repo_path,
+        repo.path(),
+        repo.commondir(),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .expect("worktree-store symlink must be a no-follow boundary");
+}
+
+#[test]
 fn bounded_status_rejects_unverified_side_effect_evidence() {
     let output = ProcessOutput {
         status: None,

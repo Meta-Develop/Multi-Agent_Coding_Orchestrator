@@ -443,10 +443,121 @@ fn plain_text_task_without_actionable_scope_returns_guidance() {
     fs::write(&task_file, "Explain the unmatched frobnicator.\n").expect("write task");
 
     let error = supervisor_plan_document_from_task_file(&repo, &task_file)
-        .expect_err("scope-free task must fail")
-        .to_string();
+        .expect_err("scope-free task must fail");
+    let error = format!("{error:#}");
     assert!(error.contains("produced no actionable workstreams"));
     assert!(error.contains("repository path, Rust module, or Rust symbol"));
+    assert!(error.contains("documentation, policy, and script files are valid scopes"));
+}
+
+#[test]
+fn plain_text_policy_and_script_task_emits_workstreams() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    Repository::init(&repo).expect("initialize repository");
+    fs::create_dir_all(repo.join(".agents/skills/agent-orchestration")).expect("create skills");
+    fs::create_dir_all(repo.join(".agents/scripts")).expect("create scripts");
+    fs::write(
+        repo.join(".agents/skills/agent-orchestration/SKILL.md"),
+        "# Orchestration\n",
+    )
+    .expect("write skill");
+    fs::write(repo.join(".agents/scripts/o2-autopilot"), "#!/bin/sh\n").expect("write script");
+    let task_file = temp.path().join("task.md");
+    fs::write(
+        &task_file,
+        "- Update `.agents/skills/agent-orchestration/SKILL.md`.\n\
+         - Update `.agents/scripts/o2-autopilot`.\n",
+    )
+    .expect("write task");
+
+    let document = supervisor_plan_document_from_task_file(&repo, &task_file)
+        .expect("plan policy/script task");
+    let assignments = document["assignments"]
+        .as_array()
+        .expect("assignments array");
+    assert_eq!(assignments.len(), 4);
+    let scopes = assignments
+        .iter()
+        .map(|assignment| {
+            assignment["assigned_paths"]
+                .as_array()
+                .expect("paths")
+                .iter()
+                .map(|path| path.as_str().expect("path").to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        scopes,
+        BTreeSet::from([
+            vec![".agents/scripts/o2-autopilot".to_string()],
+            vec![".agents/skills/agent-orchestration/SKILL.md".to_string()],
+        ])
+    );
+}
+
+#[test]
+fn plain_text_gitignored_policy_path_emits_workstream() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    Repository::init(&repo).expect("initialize repository");
+    fs::write(repo.join(".gitignore"), ".agents/\n").expect("write gitignore");
+    fs::create_dir_all(repo.join(".agents/skills/agent-orchestration")).expect("create skills");
+    fs::write(
+        repo.join(".agents/skills/agent-orchestration/SKILL.md"),
+        "# Orchestration\n",
+    )
+    .expect("write skill");
+    fs::write(repo.join("README.md"), "# fixture\n").expect("write readme");
+    let task_file = temp.path().join("task.md");
+    fs::write(
+        &task_file,
+        "- Update `.agents/skills/agent-orchestration/SKILL.md`.\n",
+    )
+    .expect("write task");
+
+    let document = supervisor_plan_document_from_task_file(&repo, &task_file)
+        .expect("plan gitignored policy path");
+    let assignments = document["assignments"]
+        .as_array()
+        .expect("assignments array");
+    assert_eq!(assignments.len(), 2);
+    let scopes = assignments
+        .iter()
+        .map(|assignment| {
+            assignment["assigned_paths"]
+                .as_array()
+                .expect("paths")
+                .iter()
+                .map(|path| path.as_str().expect("path").to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        scopes,
+        BTreeSet::from([vec![
+            ".agents/skills/agent-orchestration/SKILL.md".to_string()
+        ]])
+    );
+}
+
+#[test]
+fn plain_text_task_with_missing_named_path_surfaces_cause() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    Repository::init(&repo).expect("initialize repository");
+    fs::write(repo.join("README.md"), "# fixture\n").expect("write readme");
+    let task_file = temp.path().join("task.md");
+    fs::write(&task_file, "- Update `.agents/skills/missing/SKILL.md`.\n").expect("write task");
+
+    let error = supervisor_plan_document_from_task_file(&repo, &task_file)
+        .expect_err("missing named path must fail");
+    let error = format!("{error:#}");
+    assert!(error.contains("failed to plan plain-text task specification"));
+    assert!(error.contains("failed to decompose goal/spec into repository workstreams"));
+    assert!(error.contains(".agents/skills/missing/SKILL.md"));
+    assert!(error.contains("not a readable regular file"));
 }
 
 #[test]

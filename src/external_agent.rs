@@ -1428,7 +1428,18 @@ fn run_external_agent_runtime(
     let mut argv = if duplex_review_required {
         Vec::new()
     } else {
-        command_argv_with_controls(&target_spec, &target_controls)
+        match command_argv_with_controls(&target_spec, &target_controls) {
+            Ok(argv) => argv,
+            Err(error) => {
+                return failed_external_run(
+                    spec,
+                    started,
+                    command_display(&resolved_program, &[]),
+                    false,
+                    format!("runtime adapter launch configuration is invalid: {error:#}"),
+                );
+            }
+        }
     };
     let mut bound_argv_digest = if duplex_review_required {
         None

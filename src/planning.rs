@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
-    fmt,
+    fmt, fs,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -27,6 +27,7 @@ const TASK_PROPOSAL_MAX_ASSIGNMENTS: usize = 128;
 const TASK_PROPOSAL_MAX_SCOPE_ITEMS_PER_ASSIGNMENT: usize = 4096;
 const TASK_PROPOSAL_MAX_TOTAL_SCOPE_ITEMS: usize = 16_384;
 const TASK_PROPOSAL_MAX_REPORTED_CONFLICTS: usize = 4096;
+const MAX_NAMED_PATH_EXPANSION: usize = 128;
 const PROVIDER_PLANNING_MAX_FEEDBACK_ITEMS: usize = 128;
 const PROVIDER_PLANNING_MAX_FEEDBACK_ITEM_BYTES: usize = 16 * 1024;
 const PROVIDER_PLANNING_MAX_TOTAL_FEEDBACK_BYTES: usize = 256 * 1024;
@@ -586,9 +587,9 @@ pub fn propose_task_decomposition(
     body: &str,
 ) -> Result<TaskDecompositionProposal> {
     let fragments = task_spec_fragments(title, body)?;
-    let files = collect_repo_files(repo)?;
-    let file_set = files.iter().cloned().collect::<BTreeSet<_>>();
     let mut diagnostics = TaskPathProposalDiagnostics::default();
+    let files = collect_planning_files(repo, title, body, &mut diagnostics)?;
+    let file_set = files.iter().cloned().collect::<BTreeSet<_>>();
     let semantic_map = match repo_semantic::scan_repository(repo) {
         Ok(map) => {
             if !map.errors.is_empty() {
@@ -611,8 +612,10 @@ pub fn propose_task_decomposition(
 
     let mut candidates = Vec::new();
     let mut coverage_gaps = Vec::new();
+    let mut unresolved_named_paths = Vec::new();
     for fragment in &fragments {
-        let proposed = propose_fragment_scope(fragment, &files, &file_set, semantic_map.as_ref());
+        let proposed =
+            propose_fragment_scope(fragment, repo, &files, &file_set, semantic_map.as_ref());
         let candidate = proposed.assignment;
         if proposed.suppressed_broad_paths > 0 {
             diagnostics.notes.push(format!(
@@ -620,15 +623,24 @@ pub fn propose_task_decomposition(
                 fragment.id, proposed.suppressed_broad_paths
             ));
         }
+        diagnostics.notes.extend(proposed.notes);
         if candidate.assigned_paths.is_empty()
             && candidate.semantic_symbols.is_empty()
             && candidate.semantic_modules.is_empty()
         {
+            let message = if let Some(path) = proposed.unresolved_named_paths.first() {
+                unresolved_named_paths.push(path.clone());
+                format!(
+                    "named repository path '{path}' is not a readable regular file in the repository"
+                )
+            } else {
+                "no repository path (documentation, policy, script, or other file) or Rust semantic intent matched this fragment"
+                    .to_string()
+            };
             coverage_gaps.push(TaskCoverageGap {
                 fragment_id: fragment.id.clone(),
                 kind: TaskCoverageGapKind::UnmatchedScope,
-                message: "no bounded repository path or Rust semantic intent matched this fragment"
-                    .to_string(),
+                message,
             });
         } else {
             candidates.push(candidate);
@@ -659,6 +671,13 @@ pub fn propose_task_decomposition(
     let disjointness = task_assignment_disjointness(&assignments)?;
     if !disjointness.disjoint {
         anyhow::bail!("internal task decomposition produced overlapping assignment scopes");
+    }
+    if assignments.is_empty() {
+        if let Some(path) = unresolved_named_paths.first() {
+            anyhow::bail!(
+                "named repository path '{path}' is not a readable regular file in the repository; provide an existing Git-visible or on-disk repo-relative file (documentation, policy, script, or other), or a Rust module/symbol"
+            );
+        }
     }
 
     Ok(TaskDecompositionProposal {
@@ -1538,6 +1557,7 @@ fn normalize_feedback_ids(
 
 fn propose_fragment_scope(
     fragment: &TaskSpecFragment,
+    repo: &Path,
     files: &[PathBuf],
     file_set: &BTreeSet<PathBuf>,
     semantic_map: Option<&repo_semantic::SemanticRepoMap>,
@@ -1549,6 +1569,7 @@ fn propose_fragment_scope(
     let mut exact_symbol_paths = BTreeSet::new();
     let mut semantic_symbols = BTreeSet::new();
     let mut semantic_modules = BTreeSet::new();
+    let mut notes = Vec::new();
 
     for file in files {
         let display = file.to_string_lossy().to_ascii_lowercase();
@@ -1556,7 +1577,13 @@ fn propose_fragment_scope(
             explicit_paths.insert(file.clone());
         }
     }
-    propose_docs_paths(&normalized_text, file_set, &mut explicit_paths);
+    let named = match_named_paths_in_text(repo, &fragment.text, files, file_set);
+    explicit_paths.extend(named.resolved);
+    notes.extend(named.notes);
+    if explicit_paths.is_empty() {
+        propose_docs_paths(&normalized_text, file_set, &mut explicit_paths);
+        propose_non_rust_identifier_paths(&normalized_text, files, &mut explicit_paths);
+    }
 
     if let Some(map) = semantic_map {
         for file in &map.files {
@@ -1623,12 +1650,16 @@ fn propose_fragment_scope(
             semantic_modules: semantic_modules.into_iter().collect(),
         },
         suppressed_broad_paths,
+        unresolved_named_paths: named.unresolved,
+        notes,
     }
 }
 
 struct ProposedFragmentScope {
     assignment: TaskAssignmentProposal,
     suppressed_broad_paths: usize,
+    unresolved_named_paths: Vec<String>,
+    notes: Vec<String>,
 }
 
 fn module_matches(normalized_text: &str, module_path: &[String]) -> bool {
@@ -1808,10 +1839,10 @@ pub fn propose_task_path_proposal(
     let text = format!("{title}\n{body}");
     let lowered = text.to_ascii_lowercase();
     let normalized_text = normalize_text(&text);
-    let files = collect_repo_files(repo)?;
+    let mut diagnostics = TaskPathProposalDiagnostics::default();
+    let files = collect_planning_files(repo, title, body, &mut diagnostics)?;
     let file_set = files.iter().cloned().collect::<BTreeSet<_>>();
     let mut proposed = BTreeSet::new();
-    let mut diagnostics = TaskPathProposalDiagnostics::default();
 
     for file in &files {
         let display = file.to_string_lossy().to_ascii_lowercase();
@@ -1819,8 +1850,12 @@ pub fn propose_task_path_proposal(
             proposed.insert(file.clone());
         }
     }
+    let named = match_named_paths_in_text(repo, &text, &files, &file_set);
+    proposed.extend(named.resolved);
+    diagnostics.notes.extend(named.notes);
 
     propose_docs_paths(&normalized_text, &file_set, &mut proposed);
+    propose_non_rust_identifier_paths(&normalized_text, &files, &mut proposed);
     propose_rust_paths(
         repo,
         &normalized_text,
@@ -1880,13 +1915,7 @@ fn propose_docs_paths(
     {
         let docs_paths = file_set
             .iter()
-            .filter(|path| {
-                path.starts_with("docs")
-                    || path
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
-            })
+            .filter(|path| is_conventional_documentation_path(path))
             .cloned()
             .collect::<Vec<_>>();
         if docs_paths.is_empty() && file_set.contains(Path::new("README.md")) {
@@ -2027,6 +2056,358 @@ fn contains_path_mention(text: &str, path: &str) -> bool {
         || text.contains(&format!("`{path}`"))
         || text.contains(&format!("'{}'", path))
         || text.contains(&format!("\"{path}\""))
+}
+
+fn collect_planning_files(
+    repo: &Path,
+    title: &str,
+    body: &str,
+    diagnostics: &mut TaskPathProposalDiagnostics,
+) -> Result<Vec<PathBuf>> {
+    let named_on_disk = named_paths_present_on_disk(repo, &format!("{title}\n{body}"));
+    match collect_repo_files(repo) {
+        Ok(mut files) => {
+            let mut file_set = files.iter().cloned().collect::<BTreeSet<_>>();
+            for path in named_on_disk {
+                if file_set.insert(path.clone()) {
+                    diagnostics.notes.push(format!(
+                        "included explicitly named path '{}' that was not in the Git-visible inventory",
+                        path.display()
+                    ));
+                    files.push(path);
+                }
+            }
+            files.sort();
+            Ok(files)
+        }
+        Err(error) => {
+            if let Some(path) = unresolved_explicit_named_file(repo, &format!("{title}\n{body}")) {
+                anyhow::bail!(
+                    "named repository path '{path}' is not a readable regular file in the repository"
+                );
+            }
+            if named_on_disk.is_empty() {
+                return Err(error).context(
+                    "repository inventory failed and the spec named no resolvable repository paths",
+                );
+            }
+            diagnostics.degraded = true;
+            diagnostics.notes.push(format!(
+                "repository inventory failed ({error:#}); using {} explicitly named repository path(s)",
+                named_on_disk.len()
+            ));
+            Ok(named_on_disk)
+        }
+    }
+}
+
+fn named_paths_present_on_disk(repo: &Path, text: &str) -> Vec<PathBuf> {
+    extract_path_like_tokens(text)
+        .into_iter()
+        .filter_map(|token| resolve_named_repo_file(repo, Path::new(&token)))
+        .collect()
+}
+
+fn unresolved_explicit_named_file(repo: &Path, text: &str) -> Option<String> {
+    extract_path_like_tokens(text).into_iter().find(|token| {
+        let Ok(normalized) = normalize_repo_relative_path(token) else {
+            return false;
+        };
+        normalized.components().count() > 1
+            && normalized
+                .extension()
+                .is_some_and(|extension| !extension.is_empty())
+            && !is_excluded_planning_path(&normalized)
+            && resolve_named_repo_file(repo, &normalized).is_none()
+    })
+}
+
+struct NamedPathMatch {
+    resolved: BTreeSet<PathBuf>,
+    unresolved: Vec<String>,
+    notes: Vec<String>,
+}
+
+fn match_named_paths_in_text(
+    repo: &Path,
+    text: &str,
+    files: &[PathBuf],
+    file_set: &BTreeSet<PathBuf>,
+) -> NamedPathMatch {
+    let mut resolved = BTreeSet::new();
+    let mut unresolved = Vec::new();
+    let mut notes = Vec::new();
+    for token in extract_path_like_tokens(text) {
+        let matches = resolve_path_token(repo, &token, files, file_set, &mut notes);
+        if matches.is_empty() {
+            unresolved.push(token);
+        } else {
+            resolved.extend(matches);
+        }
+    }
+    NamedPathMatch {
+        resolved,
+        unresolved,
+        notes,
+    }
+}
+
+fn resolve_path_token(
+    repo: &Path,
+    token: &str,
+    files: &[PathBuf],
+    file_set: &BTreeSet<PathBuf>,
+    notes: &mut Vec<String>,
+) -> BTreeSet<PathBuf> {
+    let Ok(normalized) = normalize_repo_relative_path(token) else {
+        return BTreeSet::new();
+    };
+    if normalized.as_os_str().is_empty() || is_excluded_planning_path(&normalized) {
+        return BTreeSet::new();
+    }
+
+    let mut resolved = BTreeSet::new();
+    if normalized.components().count() == 1 {
+        let file_name = normalized.file_name();
+        for file in files {
+            if file.file_name() == file_name {
+                resolved.insert(file.clone());
+            }
+        }
+        if resolved.len() > MAX_NAMED_PATH_EXPANSION {
+            notes.push(format!(
+                "bare path '{token}' matches {} inventoried files; name a more specific repository-relative path",
+                resolved.len()
+            ));
+            resolved.clear();
+        }
+        if resolved.is_empty() {
+            if let Some(on_disk) = resolve_named_repo_file(repo, &normalized) {
+                resolved.insert(on_disk);
+            }
+        }
+        return resolved;
+    }
+
+    if file_set.contains(&normalized) {
+        resolved.insert(normalized);
+        return resolved;
+    }
+    if !is_overbroad_prefix(&normalized) {
+        for file in files {
+            if file.starts_with(&normalized) {
+                resolved.insert(file.clone());
+            }
+        }
+        if resolved.len() > MAX_NAMED_PATH_EXPANSION {
+            notes.push(format!(
+                "named path prefix '{token}' matches {} inventoried files; name a more specific repository-relative file",
+                resolved.len()
+            ));
+            resolved.clear();
+        }
+    }
+    if resolved.is_empty() {
+        if let Some(on_disk) = resolve_named_repo_file(repo, &normalized) {
+            resolved.insert(on_disk);
+        }
+    }
+    resolved
+}
+
+fn resolve_named_repo_file(repo: &Path, relative: &Path) -> Option<PathBuf> {
+    let normalized = normalize_repo_relative_path(relative).ok()?;
+    if normalized.as_os_str().is_empty() || is_excluded_planning_path(&normalized) {
+        return None;
+    }
+    let metadata = fs::symlink_metadata(repo.join(&normalized)).ok()?;
+    metadata.is_file().then_some(normalized)
+}
+
+fn is_excluded_planning_path(path: &Path) -> bool {
+    is_runtime_path(path)
+        || path.starts_with(".git")
+        || path
+            .components()
+            .any(|component| component.as_os_str() == ".git")
+}
+
+fn is_overbroad_prefix(path: &Path) -> bool {
+    if path.components().count() != 1 {
+        return false;
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    name.starts_with('.')
+        || matches!(
+            name,
+            "src" | "docs" | "scripts" | "tests" | "test" | "target" | "bin" | "lib"
+        )
+}
+
+fn extract_path_like_tokens(text: &str) -> Vec<String> {
+    let mut tokens = BTreeSet::new();
+    let mut current = String::new();
+    let mut quote = None;
+    for ch in text.chars() {
+        match quote {
+            Some(q) if ch == q => {
+                consider_path_token(&mut tokens, &current);
+                current.clear();
+                quote = None;
+            }
+            Some(_) => current.push(ch),
+            None if matches!(ch, '`' | '\'' | '"') => {
+                consider_path_token(&mut tokens, &current);
+                current.clear();
+                quote = Some(ch);
+            }
+            None if ch.is_whitespace() => {
+                consider_path_token(&mut tokens, &current);
+                current.clear();
+            }
+            None => current.push(ch),
+        }
+    }
+    consider_path_token(&mut tokens, &current);
+    tokens.into_iter().collect()
+}
+
+fn consider_path_token(tokens: &mut BTreeSet<String>, raw: &str) {
+    if let Some(token) = normalize_path_token(raw) {
+        if looks_like_repo_relative_path(&token) {
+            tokens.insert(token);
+        }
+    }
+}
+
+fn normalize_path_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches(|c: char| {
+        matches!(c, ',' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}' | '!')
+    });
+    if trimmed.is_empty() {
+        return None;
+    }
+    let trimmed = trimmed.strip_prefix("./").unwrap_or(trimmed);
+    let trimmed = match trimmed.strip_suffix('.') {
+        Some(stripped) if looks_like_repo_relative_path(stripped) => stripped,
+        _ => trimmed,
+    };
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn looks_like_repo_relative_path(token: &str) -> bool {
+    if token.is_empty() || token == "." || token == ".." || token.contains("://") {
+        return false;
+    }
+    let path = Path::new(token);
+    if path.is_absolute() {
+        return false;
+    }
+    token.contains('/')
+        || token.starts_with('.')
+        || path
+            .extension()
+            .is_some_and(|extension| !extension.is_empty())
+}
+
+fn propose_non_rust_identifier_paths(
+    normalized_text: &str,
+    files: &[PathBuf],
+    proposed: &mut BTreeSet<PathBuf>,
+) {
+    for file in files {
+        if is_rust_source_path(file) {
+            continue;
+        }
+        if distinctive_non_rust_path_matches(normalized_text, file) {
+            proposed.insert(file.clone());
+        }
+    }
+}
+
+fn distinctive_non_rust_path_matches(normalized_text: &str, path: &Path) -> bool {
+    if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+        if !is_generic_file_stem(stem) && identifier_matches_text(normalized_text, stem) {
+            return true;
+        }
+    }
+    path.parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            !is_generic_dir_name(name) && identifier_matches_text(normalized_text, name)
+        })
+}
+
+fn is_generic_file_stem(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "skill"
+            | "readme"
+            | "license"
+            | "changelog"
+            | "contributing"
+            | "makefile"
+            | "dockerfile"
+            | "index"
+            | "config"
+            | "script"
+            | "test"
+            | "spec"
+            | "doc"
+            | "docs"
+            | "mod"
+            | "lib"
+            | "main"
+            | "package"
+            | "cargo"
+    )
+}
+
+fn is_generic_dir_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "src"
+            | "docs"
+            | "scripts"
+            | "script"
+            | "skills"
+            | "skill"
+            | "agents"
+            | ".agents"
+            | ".agent"
+            | "bin"
+            | "lib"
+            | "test"
+            | "tests"
+            | "spec"
+            | "config"
+    )
+}
+
+fn is_rust_source_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
+}
+
+fn is_markdown_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+}
+
+fn is_conventional_documentation_path(path: &Path) -> bool {
+    path.starts_with("docs")
+        || path.starts_with(".agents/docs")
+        || (path.components().count() == 1 && is_markdown_path(path))
 }
 
 fn contains_phrase(text: &str, phrase: &str) -> bool {
@@ -3171,6 +3552,157 @@ mod tests {
             assert!(proposal.coverage_gaps.is_empty());
             assert!(proposal.disjointness.disjoint);
         });
+    }
+
+    #[test]
+    fn propose_task_decomposition_matches_policy_and_script_paths() {
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(
+                repo,
+                ".agents/skills/agent-orchestration/SKILL.md",
+                "# Orchestration\n",
+            );
+            write_file(repo, ".agents/scripts/o2-autopilot", "#!/bin/sh\n");
+            write_file(repo, "docs/guide.md", "# Guide\n");
+
+            let proposal = propose_task_decomposition(
+                repo,
+                "Coordinate policy and script work.",
+                "- Update `.agents/skills/agent-orchestration/SKILL.md`.\n\
+                 - Update `.agents/scripts/o2-autopilot`.\n",
+            )
+            .expect("propose policy/script decomposition");
+
+            let mut scopes = proposal
+                .assignments
+                .iter()
+                .map(|assignment| assignment.assigned_paths.clone())
+                .collect::<Vec<_>>();
+            scopes.sort();
+            assert_eq!(
+                scopes,
+                vec![
+                    vec![PathBuf::from(".agents/scripts/o2-autopilot")],
+                    vec![PathBuf::from(".agents/skills/agent-orchestration/SKILL.md")],
+                ]
+            );
+            assert!(proposal.assignments.iter().all(|assignment| {
+                assignment.semantic_symbols.is_empty() && assignment.semantic_modules.is_empty()
+            }));
+        });
+    }
+
+    #[test]
+    fn propose_task_paths_does_not_sweep_nested_policy_markdown() {
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "README.md", "# Project\n");
+            write_file(repo, "docs/guide.md", "# Guide\n");
+            write_file(repo, ".agents/skills/demo/SKILL.md", "# Skill\n");
+
+            let docs_paths = propose_task_paths(repo, "Update docs", "Refresh documentation.")
+                .expect("propose docs paths");
+            assert_eq!(
+                docs_paths,
+                vec![PathBuf::from("README.md"), PathBuf::from("docs/guide.md")]
+            );
+            assert!(!docs_paths
+                .iter()
+                .any(|path| path.starts_with(".agents/skills")));
+        });
+    }
+
+    #[test]
+    fn propose_task_decomposition_includes_explicit_gitignored_policy_path() {
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, ".gitignore", ".agents/\n");
+            write_file(repo, ".agents/skills/demo/SKILL.md", "# Skill\n");
+            write_file(repo, "README.md", "# Project\n");
+
+            let proposal =
+                propose_task_decomposition(repo, "", "- Update `.agents/skills/demo/SKILL.md`.")
+                    .expect("named gitignored policy path");
+
+            assert_eq!(proposal.assignments.len(), 1);
+            assert_eq!(
+                proposal.assignments[0].assigned_paths,
+                vec![PathBuf::from(".agents/skills/demo/SKILL.md")]
+            );
+        });
+    }
+
+    #[test]
+    fn propose_task_decomposition_matches_script_basename() {
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, ".agents/scripts/o2-autopilot", "#!/bin/sh\n");
+
+            let proposal = propose_task_decomposition(repo, "", "- Update o2-autopilot.")
+                .expect("script basename");
+
+            assert_eq!(proposal.assignments.len(), 1);
+            assert_eq!(
+                proposal.assignments[0].assigned_paths,
+                vec![PathBuf::from(".agents/scripts/o2-autopilot")]
+            );
+        });
+    }
+
+    #[test]
+    fn sentence_period_is_not_a_named_repository_path() {
+        assert!(!looks_like_repo_relative_path("frobnicator."));
+        assert!(!looks_like_repo_relative_path("frobnicator"));
+        assert!(looks_like_repo_relative_path("README.md"));
+        assert!(looks_like_repo_relative_path(
+            ".agents/scripts/o2-autopilot"
+        ));
+    }
+
+    #[test]
+    fn propose_task_decomposition_names_missing_explicit_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
+        write_file(repo, "README.md", "# Project\n");
+
+        let error =
+            propose_task_decomposition(repo, "", "- Update `.agents/skills/missing/SKILL.md`.")
+                .expect_err("missing named path");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(".agents/skills/missing/SKILL.md"),
+            "{message}"
+        );
+        assert!(message.contains("not a readable regular file"), "{message}");
+    }
+
+    #[test]
+    fn propose_task_decomposition_uses_named_paths_when_inventory_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
+        write_file(repo, ".agents/skills/demo/SKILL.md", "# Skill\n");
+        let _override = RepositoryInventoryDurationOverride::set(Duration::from_nanos(1));
+
+        let proposal =
+            propose_task_decomposition(repo, "", "- Update `.agents/skills/demo/SKILL.md`.")
+                .expect("named path survives inventory failure");
+
+        assert_eq!(proposal.assignments.len(), 1);
+        assert_eq!(
+            proposal.assignments[0].assigned_paths,
+            vec![PathBuf::from(".agents/skills/demo/SKILL.md")]
+        );
     }
 
     #[test]

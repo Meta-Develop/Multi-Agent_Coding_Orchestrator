@@ -4,6 +4,24 @@
 //! work. Merging by an independent reviewer is reachable only when every
 //! recorded gate passes. The always-false `auto_merge_performed` pin is
 //! replaced by these checks.
+//!
+//! # Caller-trusted inputs
+//!
+//! This library does not observe CI, simulate merges, or recover lens
+//! provenance. The following [`MergeRequest`] fields are caller-trusted.
+//! Integration that later wires [`decide_merge`] must derive them from ground
+//! truth, not from the requesting agent:
+//!
+//! - [`MergeRequest::certified`] — recorded CI or certification status
+//! - [`MergeRequest::branch_merges_cleanly`] — an actual merge simulation
+//! - [`MergeRequest::lenses`] — recorded lens provenance (identity, framing,
+//!   information scope, and decision)
+//! - [`MergeRequest::checks`] — recorded CI or required-check status
+//! - [`MergeRequest::changed_paths`] — the actual reviewable change set
+//!
+//! Empty or denied evidence fails closed. A caller that cannot attest a field
+//! must leave it in the denying state (`certified = false`,
+//! `branch_merges_cleanly = false`, empty lenses, or empty checks).
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -81,7 +99,8 @@ pub fn assess_independence(
     if same_agent && !same_session {
         notes.push("a fresh session for the same producer is not independence".to_string());
     }
-    let independent = !same_agent && author_overlap.is_empty() && committer_overlap.is_empty();
+    let independent =
+        !same_agent && !same_session && author_overlap.is_empty() && committer_overlap.is_empty();
     IndependenceReport {
         independent,
         producer_agent: producer.actor.agent.stable_id.clone(),
@@ -217,7 +236,8 @@ pub fn never_auto_merge_reason(paths: &[PathBuf]) -> Option<NeverAutoMergeClass>
 fn classify_never_auto_merge(path: &Path) -> Option<NeverAutoMergeClass> {
     let rendered = path.to_string_lossy().replace('\\', "/");
     let lower = rendered.to_ascii_lowercase();
-    if lower.contains("src/review.rs")
+    if is_repository_policy_path(&lower)
+        || lower.contains("src/review.rs")
         || lower.contains("src/optimizer/merge_authority.rs")
         || lower.contains("review_aggregation")
         || lower.contains("merge_authority")
@@ -247,16 +267,44 @@ fn classify_never_auto_merge(path: &Path) -> Option<NeverAutoMergeClass> {
     None
 }
 
+fn is_repository_policy_path(lower: &str) -> bool {
+    let trimmed = lower.trim_start_matches("./");
+    let file_name = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    matches!(file_name, "agents.md" | "claude.md")
+        || trimmed == ".agents"
+        || trimmed.starts_with(".agents/")
+        || trimmed.contains("/.agents/")
+}
+
+fn failed_verification_checks(checks: &[VerificationCheck]) -> Vec<String> {
+    if checks.is_empty() {
+        return vec!["required-verification-checks:Missing".to_string()];
+    }
+    checks
+        .iter()
+        .filter(|check| check.status.counts_as_failure())
+        .map(|check| format!("{}:{:?}", check.name, check.status))
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeRequest {
     pub requested: bool,
     pub producer: ProducerFingerprint,
     pub reviewer: MergeActor,
+    /// Caller-trusted lens verdicts. Integration must supply recorded lens
+    /// provenance, not a self-report from the requesting agent.
     pub lenses: Vec<LensVerdict>,
+    /// Caller-trusted required-check results. Integration must derive these
+    /// from recorded CI or gate status. An empty list is missing evidence.
     pub checks: Vec<VerificationCheck>,
+    /// Caller-trusted clean-merge flag. Integration must derive this from an
+    /// actual merge simulation.
     pub branch_merges_cleanly: bool,
     pub completion_mode: CompletionMode,
     pub changed_paths: Vec<PathBuf>,
+    /// Caller-trusted certification flag. Integration must derive this from
+    /// recorded CI or certification status.
     pub certified: bool,
     pub decided_at: TimestampMillis,
 }
@@ -278,12 +326,7 @@ pub fn decide_merge(request: &MergeRequest) -> Result<MergeDecision, OptimizerEr
     let independence = assess_independence(&request.producer, &request.reviewer);
     let lenses = aggregate_lenses(&request.lenses);
     let never_auto_merge = never_auto_merge_reason(&request.changed_paths);
-    let failed_checks: Vec<String> = request
-        .checks
-        .iter()
-        .filter(|check| check.status.counts_as_failure())
-        .map(|check| format!("{}:{:?}", check.name, check.status))
-        .collect();
+    let failed_checks = failed_verification_checks(&request.checks);
 
     let mut blocked = Vec::new();
     if !request.requested {
@@ -535,6 +578,50 @@ mod tests {
     }
 
     #[test]
+    fn empty_checks_list_fails_closed() {
+        let mut request = allowed_request();
+        request.checks.clear();
+        let decision = decide_merge(&request).expect("decide");
+        assert!(!decision.auto_merge_performed);
+        assert!(
+            decision
+                .failed_checks
+                .iter()
+                .any(|check| check.contains("required-verification-checks")),
+            "empty checks must count as a missing required check: {:?}",
+            decision.failed_checks
+        );
+        assert!(decision.explanation.contains("required checks"));
+    }
+
+    #[test]
+    fn different_agent_same_session_is_not_independent() {
+        let mut request = allowed_request();
+        request.reviewer.session = request.producer.actor.session.clone();
+        let decision = decide_merge(&request).expect("decide");
+        assert!(!decision.independence.same_agent);
+        assert!(decision.independence.same_session);
+        assert!(!decision.independence.independent);
+        assert!(!decision.auto_merge_performed);
+        assert!(decision.explanation.contains("producing session"));
+    }
+
+    #[test]
+    fn caller_trusted_certification_inputs_fail_closed_when_denied() {
+        let mut request = allowed_request();
+        request.certified = false;
+        let uncertified = decide_merge(&request).expect("uncertified");
+        assert!(!uncertified.auto_merge_performed);
+        assert!(uncertified.explanation.contains("not certified"));
+
+        request.certified = true;
+        request.lenses.clear();
+        let no_lenses = decide_merge(&request).expect("no lenses");
+        assert!(!no_lenses.auto_merge_performed);
+        assert!(no_lenses.explanation.contains("no review lens accepted"));
+    }
+
+    #[test]
     fn never_auto_merge_set_is_reviewed_but_not_completed() {
         let mut request = allowed_request();
         request.changed_paths = vec![PathBuf::from(".github/workflows/ci.yml")];
@@ -566,6 +653,28 @@ mod tests {
             Some(NeverAutoMergeClass::ProtectedPath)
         );
         assert!(!protected.auto_merge_performed);
+
+        request.changed_paths = vec![PathBuf::from("AGENTS.md")];
+        let agents = decide_merge(&request).expect("agents");
+        assert_eq!(
+            agents.never_auto_merge,
+            Some(NeverAutoMergeClass::ReviewOrMergePolicy)
+        );
+        assert!(!agents.auto_merge_performed);
+
+        request.changed_paths = vec![PathBuf::from("CLAUDE.md")];
+        let claude = decide_merge(&request).expect("claude");
+        assert_eq!(
+            claude.never_auto_merge,
+            Some(NeverAutoMergeClass::ReviewOrMergePolicy)
+        );
+
+        request.changed_paths = vec![PathBuf::from(".agents/skills/core-agent-skills/SKILL.md")];
+        let agents_dir = decide_merge(&request).expect("agents-dir");
+        assert_eq!(
+            agents_dir.never_auto_merge,
+            Some(NeverAutoMergeClass::ReviewOrMergePolicy)
+        );
     }
 
     #[test]

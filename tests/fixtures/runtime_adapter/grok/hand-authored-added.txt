@@ -1,0 +1,7 @@
+You are logged in with grok.com.
+
+Default model: worker-stable
+
+Available models:
+  * worker-stable (default)
+  - worker-new
