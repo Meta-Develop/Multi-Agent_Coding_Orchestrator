@@ -2698,6 +2698,65 @@ fn validate_single_component(name: &OsStr) -> Result<()> {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
+enum DirectoryOpenIntent {
+    /// Search-only ancestor handle. Linux uses `O_PATH` (execute/search), not
+    /// `O_RDONLY`, so a directory the caller can traverse but not list is accepted.
+    /// World-execute is not required; a symlink or missing search permission fails closed.
+    Traverse,
+    /// Usable directory handle for the leaf being created or bound.
+    Operate,
+}
+
+#[cfg(unix)]
+fn directory_component_open_flags(intent: DirectoryOpenIntent) -> libc::c_int {
+    let mut flags = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    match intent {
+        DirectoryOpenIntent::Operate => flags |= libc::O_RDONLY,
+        DirectoryOpenIntent::Traverse => {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                flags |= libc::O_PATH;
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                flags |= libc::O_RDONLY;
+            }
+        }
+    }
+    flags
+}
+
+#[cfg(unix)]
+fn directory_component_intent(is_final: bool) -> DirectoryOpenIntent {
+    if is_final {
+        DirectoryOpenIntent::Operate
+    } else {
+        DirectoryOpenIntent::Traverse
+    }
+}
+
+#[cfg(unix)]
+fn open_directory_component_at(
+    parent: &File,
+    name: &std::ffi::CStr,
+    intent: DirectoryOpenIntent,
+) -> std::io::Result<File> {
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            directory_component_open_flags(intent),
+        )
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(unix)]
 fn secure_create_directory(path: &Path, policy: RootPolicy) -> Result<File> {
     let segments = path
         .components()
@@ -2707,63 +2766,52 @@ fn secure_create_directory(path: &Path, policy: RootPolicy) -> Result<File> {
         })
         .collect::<Vec<_>>();
     let mut current = open_filesystem_root()?;
+    let mut walked = PathBuf::from(std::path::MAIN_SEPARATOR_STR);
     let mut final_created = false;
     for (index, segment) in segments.iter().enumerate() {
+        walked.push(segment);
         let name = c_string(segment)?;
-        let fd = unsafe {
-            libc::openat(
-                current.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        let fd = if fd >= 0 {
-            fd
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::NotFound {
+        let is_final = index + 1 == segments.len();
+        let intent = directory_component_intent(is_final);
+        match open_directory_component_at(&current, &name, intent) {
+            Ok(opened) => {
+                current = opened;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let result = unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) };
+                let mut created = result == 0;
+                if result != 0 {
+                    let mkdir_error = std::io::Error::last_os_error();
+                    if mkdir_error.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(mkdir_error).with_context(|| {
+                            format!(
+                                "failed to create safe directory component {}",
+                                walked.display()
+                            )
+                        });
+                    }
+                    created = false;
+                }
+                current =
+                    open_directory_component_at(&current, &name, intent).with_context(|| {
+                        format!(
+                            "failed to re-open safe directory component {}",
+                            walked.display()
+                        )
+                    })?;
+                if is_final {
+                    final_created = created;
+                }
+            }
+            Err(error) => {
                 return Err(error).with_context(|| {
                     format!(
                         "failed to open safe directory component {}",
-                        segment.to_string_lossy()
+                        walked.display()
                     )
                 });
             }
-            let result = unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) };
-            let mut created = result == 0;
-            if result != 0 {
-                let mkdir_error = std::io::Error::last_os_error();
-                if mkdir_error.kind() != std::io::ErrorKind::AlreadyExists {
-                    return Err(mkdir_error).with_context(|| {
-                        format!(
-                            "failed to create safe directory component {}",
-                            segment.to_string_lossy()
-                        )
-                    });
-                }
-                created = false;
-            }
-            let opened = unsafe {
-                libc::openat(
-                    current.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if opened < 0 {
-                return Err(std::io::Error::last_os_error()).with_context(|| {
-                    format!(
-                        "failed to re-open safe directory component {}",
-                        segment.to_string_lossy()
-                    )
-                });
-            }
-            if index + 1 == segments.len() {
-                final_created = created;
-            }
-            opened
-        };
-        current = unsafe { File::from_raw_fd(fd) };
+        }
     }
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(current.as_raw_fd(), &mut stat) } != 0 {
@@ -2818,27 +2866,24 @@ fn open_existing_directory(path: &Path) -> Result<File> {
 fn open_unix_directory(path: &Path) -> Result<File> {
     let path = absolute_normalized(path)?;
     let mut current = open_filesystem_root()?;
-    for component in path.components() {
-        let Component::Normal(segment) = component else {
-            continue;
-        };
+    let mut walked = PathBuf::from(std::path::MAIN_SEPARATOR_STR);
+    let segments = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(segment) => Some(segment),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for (index, segment) in segments.iter().enumerate() {
+        walked.push(segment);
         let name = c_string(segment)?;
-        let fd = unsafe {
-            libc::openat(
-                current.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        let intent = directory_component_intent(index + 1 == segments.len());
+        current = open_directory_component_at(&current, &name, intent).with_context(|| {
+            format!(
+                "failed to open directory component without following links: {}",
+                walked.display()
             )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error()).with_context(|| {
-                format!(
-                    "failed to open directory component without following links: {}",
-                    segment.to_string_lossy()
-                )
-            });
-        }
-        current = unsafe { File::from_raw_fd(fd) };
+        })?;
     }
     Ok(current)
 }
@@ -3201,44 +3246,53 @@ fn same_file_generation(before: &fs::Metadata, after: &fs::Metadata) -> bool {
 fn open_relative_regular_unix_allow_mounts(root: &Path, relative: &Path) -> Result<File> {
     let mut directory = open_unix_directory(root)?;
     let components = relative.components().collect::<Vec<_>>();
+    let mut walked = root.to_path_buf();
     for (index, component) in components.iter().enumerate() {
         let Component::Normal(segment) = component else {
             bail!("invalid relative component in {}", relative.display());
         };
+        walked.push(segment);
         let name = c_string(segment)?;
         let is_final = index + 1 == components.len();
-        let flags = if is_final {
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
-        } else {
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        if !is_final {
+            let intent = DirectoryOpenIntent::Traverse;
+            let opened =
+                open_directory_component_at(&directory, &name, intent).with_context(|| {
+                    format!(
+                        "failed to open repository-relative component {} without following links",
+                        walked.display()
+                    )
+                })?;
+            let metadata = opened.metadata().with_context(|| {
+                format!("failed to inspect directory component {}", walked.display())
+            })?;
+            if !metadata.file_type().is_dir() {
+                bail!(
+                    "relative path component is not a directory: {}",
+                    walked.display()
+                );
+            }
+            directory = opened;
+            continue;
+        }
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
         };
-        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error()).with_context(|| {
                 format!(
                     "failed to open repository-relative component {} without following links",
-                    segment.to_string_lossy()
+                    walked.display()
                 )
             });
         }
         let opened = unsafe { File::from_raw_fd(fd) };
-        if is_final {
-            identity_from_file(&opened, &root.join(relative))?;
-            return Ok(opened);
-        }
-        let metadata = opened.metadata().with_context(|| {
-            format!(
-                "failed to inspect directory component {}",
-                segment.to_string_lossy()
-            )
-        })?;
-        if !metadata.file_type().is_dir() {
-            bail!(
-                "relative path component is not a directory: {}",
-                segment.to_string_lossy()
-            );
-        }
-        directory = opened;
+        identity_from_file(&opened, &root.join(relative))?;
+        return Ok(opened);
     }
     bail!(
         "relative path has no final component: {}",
