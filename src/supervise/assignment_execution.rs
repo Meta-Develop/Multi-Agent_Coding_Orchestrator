@@ -881,6 +881,7 @@ fn prepare_child_attempt<'a>(
         options.run_id.as_str(),
         &assignment.id,
     );
+    command = command.with_agent_parent(journal_parent_id);
     command = bind_supervisor_machine_global_staging_cleanup(command, options)?;
     command =
         apply_canonical_environment_requirements(command, &preflight.environment_requirements);
@@ -1049,11 +1050,39 @@ fn dispatch_and_collect_child_attempt<'a>(
         Some(journal_parent_id),
         OrchestrationRole::Orchestrator,
         OrchestrationEventKind::Spawn,
-        json!({
-            "attempt": attempt,
-            "corrective_retry": corrective_retry_used,
-        }),
+        record_supervision_spawn_payload(
+            &assignment.id,
+            journal_parent_id,
+            OrchestrationRole::Orchestrator,
+            assignment.role.as_str(),
+            write_boundary_refs(&assignment.assigned_paths),
+            &assignment_scope_ref(&assignment.id),
+            json!({
+                "attempt": attempt,
+                "corrective_retry": corrective_retry_used,
+            }),
+        )?,
     )?;
+    if attempt == 1 {
+        let (owner_role, owner_legacy_role) = if journal_parent_id == options.run_id.as_str() {
+            (OrchestrationRole::Supervisor, "supervisor")
+        } else {
+            (OrchestrationRole::Orchestrator, "child_orchestrator")
+        };
+        record_shared_gate_ownership(
+            artifacts,
+            journal_parent_id,
+            None,
+            owner_role,
+            GateOwnershipRecord::assign(
+                &assignment.id,
+                journal_parent_id,
+                owner_role,
+                owner_legacy_role,
+                "initial_parent_gate",
+            )?,
+        )?;
+    }
     record_shared_orchestration_event(
         artifacts,
         &assignment.id,
@@ -1952,7 +1981,8 @@ fn prepare_parent_auditor<'a>(
                 AgentRole::Auditor.as_str(),
                 options.run_id.as_str(),
                 &auditor_id,
-            );
+            )
+            .with_agent_parent(&assignment.id);
     auditor_command = bind_supervisor_machine_global_staging_cleanup(auditor_command, options)?;
     auditor_command = apply_canonical_environment_requirements(
         auditor_command,
@@ -2140,15 +2170,23 @@ fn dispatch_and_collect_parent_auditor(
         Some(&assignment.id),
         OrchestrationRole::Auditor,
         OrchestrationEventKind::Spawn,
-        json!({
-            "attempt": auditor_attempt,
-            "review_lens_id": lens.id,
-            "backend_id": lens.backend.backend_id(),
-            "model": lens.backend.model(),
-            "reasoning_effort": lens.backend.reasoning_effort(),
-            "information_scope": lens.information_scope,
-            "request_binding": expected_request.request_binding,
-        }),
+        record_supervision_spawn_payload(
+            &auditor_id,
+            &assignment.id,
+            OrchestrationRole::Auditor,
+            AgentRole::Auditor.as_str(),
+            Vec::new(),
+            &assignment_scope_ref(&assignment.id),
+            json!({
+                "attempt": auditor_attempt,
+                "review_lens_id": lens.id,
+                "backend_id": lens.backend.backend_id(),
+                "model": lens.backend.model(),
+                "reasoning_effort": lens.backend.reasoning_effort(),
+                "information_scope": lens.information_scope,
+                "request_binding": expected_request.request_binding,
+            }),
+        )?,
     )?;
     record_shared_orchestration_event(
         artifacts,
@@ -3356,6 +3394,7 @@ mod decomposition_tests {
             codex_bin: PathBuf::from("unused-codex"),
             runtime: SupervisorRuntime::Fake,
             allow_dirty_primary: false,
+            allow_live_run_collision: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: crate::supervise::RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -3649,6 +3688,7 @@ mod decomposition_tests {
             codex_bin: PathBuf::from("unused-codex"),
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
+            allow_live_run_collision: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: crate::supervise::RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -3744,6 +3784,7 @@ done
             codex_bin: agent.clone(),
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
+            allow_live_run_collision: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: crate::supervise::RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -3979,6 +4020,7 @@ done
             codex_bin: PathBuf::from("unused-codex"),
             runtime,
             allow_dirty_primary: false,
+            allow_live_run_collision: false,
             admission_overrides: SupervisorAdmissionConfig::default(),
             budget_overrides: RunBudgetLimits::default(),
             budget_max_duration_seconds: None,

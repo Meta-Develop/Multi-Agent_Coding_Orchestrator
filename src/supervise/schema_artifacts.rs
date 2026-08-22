@@ -1835,6 +1835,15 @@ mod selection_schema_tests {
         let tracked_event =
             &tracked["$defs"]["execution"]["properties"]["selection_decisions"]["items"];
         assert_eq!(tracked_event, event);
+        assert!(required_contains(
+            &tracked["$defs"]["execution"],
+            "assignment_selection_ledger"
+        ));
+        assert!(required_contains(
+            &supervisor_final_report_schema_value()["properties"]["role_economics_profile"]
+                ["properties"]["execution"],
+            "assignment_selection_ledger"
+        ));
         Ok(())
     }
 }

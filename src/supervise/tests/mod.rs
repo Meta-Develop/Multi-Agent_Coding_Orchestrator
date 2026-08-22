@@ -17,6 +17,9 @@ use crate::{
         SandboxDenialRetryability, SandboxDeniedOperation,
     },
     field_guide::{encode_utf8_lower_hex, FIELD_GUIDE_PROMPT_ENTRY_PREFIX},
+    hierarchy_ledger::{
+        reconstruct_hierarchy_ledger, GATE_OWNERSHIP_FIELD, SUPERVISION_EDGE_FIELD,
+    },
     orchestration_event::{
         set_orchestration_event_append_fault, OrchestrationEvent, ORCHESTRATION_EVENT_PATH,
     },
@@ -506,6 +509,7 @@ fn injected_options(repo: &Path, root: &Path, run_id: &str) -> SupervisorRunOpti
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,

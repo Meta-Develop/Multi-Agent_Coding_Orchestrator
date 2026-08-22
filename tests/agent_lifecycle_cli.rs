@@ -74,6 +74,7 @@ fn agents_list_and_stop_json_surface_registered_process() -> Result<()> {
     assert_eq!(listed[0]["role"], "worker");
     assert_eq!(listed[0]["run_id"], "cli-run");
     assert_eq!(listed[0]["task_id"], "cli-task");
+    assert!(listed[0].get("parent").is_none());
 
     let stop = Command::new(BIN)
         .args([
@@ -97,5 +98,43 @@ fn agents_list_and_stop_json_surface_registered_process() -> Result<()> {
     assert_eq!(stopped["stopped"][0]["process"]["pid"], pid);
     assert_eq!(stopped["stopped"][0]["outcome"], "terminated");
     assert!(!child.0.wait().context("wait stopped child")?.success());
+    Ok(())
+}
+
+#[test]
+fn agents_list_json_exposes_parent_linkage() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    Repository::init(temp.path()).context("init repository")?;
+    let registry = AgentRegistry::open(temp.path())?;
+    let mut child = SleepChild::spawn()?;
+    let pid = child.0.id();
+    registry.register(
+        &AgentLaunchMetadata::new(temp.path(), "worker", "cli-run", "cli-task")?
+            .with_parent("cli-parent")?,
+        pid,
+        vec!["sleep".to_string(), "60".to_string()],
+    )?;
+
+    let list = Command::new(BIN)
+        .args([
+            "agents",
+            "list",
+            "--repo",
+            temp.path().to_str().context("repo path utf8")?,
+            "--run-id",
+            "cli-run",
+            "--json",
+        ])
+        .output()
+        .context("run agents list")?;
+    assert!(
+        list.status.success(),
+        "agents list failed: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&list.stdout).context("parse agents list JSON")?;
+    assert_eq!(listed[0]["pid"], pid);
+    assert_eq!(listed[0]["parent"], "cli-parent");
+    let _ = child.0.kill();
     Ok(())
 }

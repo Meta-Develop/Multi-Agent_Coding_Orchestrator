@@ -2584,6 +2584,16 @@ specification.
 treats the bounded UTF-8 file as a high-level goal/spec, even if its contents
 happen to be valid JSON.
 
+`supervise run` and `autopilot run` persist launch preflight evidence under
+`preflight/` (git status, repository map, sync status, and in-process runtime
+probe outcomes, each with an explicit success/failure marker). They also append
+an operator heartbeat ledger at `liveness/heartbeat.jsonl` and write
+`SUMMARY.md` at finalization. A second launch targeting the same repository
+refuses while another live supervise or autopilot process is still registered;
+stale leftover records are reported without blocking. `--force-live-run` is
+launch-only and does not authorize killing, interrupting, reverting, or
+discarding another run.
+
 ### Explicit bounded primary-worktree target
 
 Managed child worktrees remain the default. An authored plan can opt one

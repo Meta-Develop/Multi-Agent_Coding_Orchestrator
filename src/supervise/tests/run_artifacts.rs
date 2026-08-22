@@ -233,6 +233,59 @@ fn supervise_status_distinguishes_absent_active_finalized_and_corrupt_runs() {
     );
 }
 
+#[test]
+fn supervise_status_exposes_heartbeat_and_preflight_sidecars() {
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("artifact-status-heartbeat").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "supervise-test",
+    )
+    .expect("reserve run");
+    let index = crate::run_ops::persist_launch_preflight(
+        &mut writer,
+        &repo_path,
+        &crate::run_ops::LaunchPreflightSpec {
+            family: RunArtifactFamily::Supervise,
+            run_id: run_id.clone(),
+            runtime: "fake".to_string(),
+            runtime_bin: Some(PathBuf::from("fake")),
+            allow_dirty_primary: true,
+            allow_live_run_collision: false,
+        },
+        &crate::run_ops::inspect_supervisor_process_collisions(&repo_path)
+            .expect("inspect collisions"),
+    )
+    .expect("persist preflight");
+    assert!(index
+        .captures
+        .iter()
+        .any(|capture| capture.name == "git_status"));
+    crate::run_ops::append_run_heartbeat(&mut writer, "initialized", None, "ok", None)
+        .expect("heartbeat");
+    crate::run_ops::write_operator_summary(
+        &mut writer,
+        "# Supervise run artifact-status-heartbeat\n\nNext: collect\n",
+    )
+    .expect("summary");
+    let status = supervisor_status(&repo_path, run_id).expect("status");
+    assert_eq!(status.heartbeat_count, 1);
+    assert_eq!(
+        status
+            .last_heartbeat
+            .as_ref()
+            .map(|record| record.phase.as_str()),
+        Some("initialized")
+    );
+    assert!(status.operator_summary_exists);
+    assert!(writer
+        .run_dir()
+        .join(crate::run_ops::PREFLIGHT_INDEX_RELATIVE)
+        .is_file());
+}
+
 fn interrupted_final_report_checkpoint(
     repo: &Path,
     run_id: &RunId,
@@ -1403,7 +1456,35 @@ fn fake_supervise_run_finalizes_manifested_report_tree_events() {
             && event.role == OrchestrationRole::Orchestrator
             && event.kind == OrchestrationEventKind::Spawn
             && event.payload["attempt"] == 1
+            && event.payload[SUPERVISION_EDGE_FIELD]["child_agent_id"] == assignment.id
+            && event.payload[SUPERVISION_EDGE_FIELD]["parent_agent_id"] == run_id.as_str()
+            && event.payload[SUPERVISION_EDGE_FIELD]["role_category"] == "delegating_coordinator"
+            && event.payload[SUPERVISION_EDGE_FIELD]["legacy_role"] == "child_orchestrator"
+            && event.payload[SUPERVISION_EDGE_FIELD]["scope_ref"]
+                == format!("assignment:{}", assignment.id)
     }));
+    assert!(events.iter().any(|event| {
+        event.kind == OrchestrationEventKind::Gate
+            && event.payload[GATE_OWNERSHIP_FIELD]["action"] == "assign"
+            && event.payload[GATE_OWNERSHIP_FIELD]["task_id"] == assignment.id
+            && event.payload[GATE_OWNERSHIP_FIELD]["owner_agent_id"] == run_id.as_str()
+            && event.payload[GATE_OWNERSHIP_FIELD]["reason"] == "initial_parent_gate"
+    }));
+    let hierarchy = reconstruct_hierarchy_ledger(&events).expect("reconstruct hierarchy ledger");
+    assert_eq!(
+        hierarchy
+            .edges
+            .get(&assignment.id)
+            .map(|edge| edge.parent_agent_id.as_str()),
+        Some(run_id.as_str())
+    );
+    assert_eq!(
+        hierarchy
+            .gate_owners
+            .get(&assignment.id)
+            .map(|owner| owner.owner_agent_id.as_str()),
+        Some(run_id.as_str())
+    );
     let injection_events = events
         .iter()
         .filter(|event| {
@@ -2041,6 +2122,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         codex_bin: PathBuf::from("unused-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,

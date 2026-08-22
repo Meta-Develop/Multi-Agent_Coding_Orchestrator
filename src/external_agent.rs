@@ -222,6 +222,7 @@ pub struct ExternalAgentLifecycleIdentity {
     pub role: String,
     pub run_id: String,
     pub task_id: String,
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -736,7 +737,15 @@ impl ExternalAgentCommand {
             role: role.into(),
             run_id: run_id.into(),
             task_id: task_id.into(),
+            parent: None,
         });
+        self
+    }
+
+    pub fn with_agent_parent(mut self, parent: impl Into<String>) -> Self {
+        if let Some(identity) = &mut self.agent_lifecycle {
+            identity.parent = Some(parent.into());
+        }
         self
     }
 
@@ -1473,7 +1482,11 @@ fn run_external_agent_runtime(
             &identity.role,
             &identity.run_id,
             &identity.task_id,
-        ) {
+        )
+        .and_then(|metadata| match &identity.parent {
+            Some(parent) => metadata.with_parent(parent.clone()),
+            None => Ok(metadata),
+        }) {
             Ok(metadata) => Some(metadata),
             Err(error) => {
                 report.duration_ms = duration_millis(started.elapsed());
