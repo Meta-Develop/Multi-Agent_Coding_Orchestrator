@@ -1176,6 +1176,7 @@ fn assert_pre_dispatch_autopilot_cleanup(
 #[cfg(target_os = "linux")]
 #[test]
 fn autopilot_max_zero_refuses_source_before_any_dispatch_and_leaves_no_state() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = create_committed_autopilot_repo(temp.path());
     let run_name = "autopilot-max-zero-source-refused";
@@ -1240,6 +1241,7 @@ fn autopilot_max_zero_refuses_source_before_any_dispatch_and_leaves_no_state() {
 #[cfg(target_os = "linux")]
 #[test]
 fn autopilot_cancellation_after_source_gate_refuses_dispatch_and_finalizes_cancelled() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = create_committed_autopilot_repo(temp.path());
     let run_name = "autopilot-source-gate-cancelled";
@@ -1303,6 +1305,7 @@ fn autopilot_cancellation_after_source_gate_refuses_dispatch_and_finalizes_cance
 #[cfg(target_os = "linux")]
 #[test]
 fn autopilot_source_child_cancellation_propagates_and_cleanly_unwinds() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = create_committed_autopilot_repo(temp.path());
     let run_name = "autopilot-source-child-cancelled";
@@ -1471,6 +1474,7 @@ fn autopilot_source_child_cancellation_propagates_and_cleanly_unwinds() {
 #[cfg(target_os = "linux")]
 #[test]
 fn autopilot_max_child_dispatches_refuses_first_follow_up_before_dispatch_and_releases_claim() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = create_committed_autopilot_repo(temp.path());
     let run_name = "autopilot-max-one-follow-up-refused";
@@ -1581,6 +1585,7 @@ fn autopilot_max_child_dispatches_refuses_first_follow_up_before_dispatch_and_re
 #[cfg(target_os = "linux")]
 #[test]
 fn autopilot_authenticated_follow_up_dispatch_sets_boolean_after_real_gates() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = create_committed_autopilot_repo(temp.path());
     let head_before = crate::git_repository::open(&repo)
@@ -1641,6 +1646,7 @@ fn autopilot_authenticated_follow_up_dispatch_sets_boolean_after_real_gates() {
 #[cfg(target_os = "linux")]
 #[test]
 fn autopilot_cascade_error_after_authenticated_follow_up_start_never_reports_false() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = create_committed_autopilot_repo(temp.path());
     let primary_before = supervise::verified_whole_primary_snapshot_sha256(&repo)
@@ -1686,6 +1692,7 @@ fn autopilot_cascade_error_after_authenticated_follow_up_start_never_reports_fal
 #[cfg(target_os = "linux")]
 #[test]
 fn autopilot_marker_without_child_checkpoint_refuses_a_false_final_report() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = create_committed_autopilot_repo(temp.path());
     let run_name = "autopilot-unobservable-generated-dispatch";
@@ -1733,6 +1740,7 @@ fn autopilot_marker_without_child_checkpoint_refuses_a_false_final_report() {
 #[cfg(target_os = "linux")]
 #[test]
 fn autopilot_generated_plan_refusal_keeps_dispatch_boolean_false() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = create_committed_autopilot_repo(temp.path());
     supervise::set_before_generated_follow_up_plan_load_hook(|path| {
@@ -1786,6 +1794,7 @@ fn autopilot_generated_plan_refusal_keeps_dispatch_boolean_false() {
 #[cfg(target_os = "linux")]
 #[test]
 fn interrupted_autopilot_queue_resumes_through_supervise_without_duplicate_identity() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = create_committed_autopilot_repo(temp.path());
     let run_name = "autopilot-cross-entrypoint-resume";
@@ -2019,6 +2028,7 @@ fn repository_binding_rejects_root_swap_after_safety_preflight() {
 
 #[test]
 fn autopilot_rechecks_dirty_primary_immediately_before_supervisor_dispatch() {
+    skip_without_containment!();
     use crate::gate_denial::GateDenialReason;
 
     let temp = tempfile::tempdir().expect("tempdir");
@@ -2093,6 +2103,7 @@ fn autopilot_rechecks_dirty_primary_immediately_before_supervisor_dispatch() {
 
 #[test]
 fn autopilot_reloads_effective_profile_at_call_site_before_starting_supervisor() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = create_committed_autopilot_repo(temp.path());
     let plan_path = temp.path().join("plan.json");
@@ -2213,6 +2224,7 @@ fn public_autopilot_plan_refuses_unsupported_or_malformed_depth_shape() {
 
 #[test]
 fn unsupported_depth_shapes_are_typed_preflight_permission_expansions() {
+    skip_without_containment!();
     use crate::gate_denial::{
         GateDenialReason, GateDenialRoute, GateRetryability, NextSafeOperation,
     };
@@ -2378,6 +2390,7 @@ fn autopilot_plan_input_refuses_symlink_leaf_and_ancestor() {
 
 #[test]
 fn bounded_repository_status_detects_present_deleted_and_untracked_paths() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo, _manager) = create_managed_worktree_fixture(temp.path(), "status-agent");
     assert!(bounded_repository_dirty_paths(&repo)
@@ -2797,6 +2810,7 @@ fn assert_no_remote_publication_state(repo: &Path) {
 
 #[test]
 fn validate_autopilot_plan_refuses_empty_path_proposal() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     git2::Repository::init(repo).expect("init repo");
@@ -3114,6 +3128,7 @@ fn real_publication_rejects_fake_blocking_and_failed_review_before_publish() {
 #[cfg(target_os = "linux")]
 #[test]
 fn empty_validation_refuses_real_publication_before_review_or_publish() {
+    skip_without_containment!();
     let _fixture_guard = lock_prepublication_fixture_test();
     let temp = tempfile::tempdir().expect("tempdir");
     let agent_id = "empty-validation-agent";
@@ -3152,6 +3167,7 @@ fn empty_validation_refuses_real_publication_before_review_or_publish() {
 #[cfg(target_os = "linux")]
 #[test]
 fn review_mutation_changes_binding_and_prevents_publication() {
+    skip_without_containment!();
     let _fixture_guard = lock_prepublication_fixture_test();
     let temp = tempfile::tempdir().expect("tempdir");
     let agent_id = "review-mutation-agent";
@@ -3192,6 +3208,7 @@ fn review_mutation_changes_binding_and_prevents_publication() {
 #[cfg(target_os = "linux")]
 #[test]
 fn fake_forge_with_fake_reviewer_is_local_and_non_authoritative() {
+    skip_without_containment!();
     let _fixture_guard = lock_prepublication_fixture_test();
     let temp = tempfile::tempdir().expect("tempdir");
     let agent_id = "fake-local-agent";
@@ -3348,6 +3365,7 @@ fn publication_hook_report_forge_and_base_mismatch_are_nonretryable() {
 #[cfg(target_os = "linux")]
 #[test]
 fn write_lease_excludes_competing_access_through_review_and_releases_on_error() {
+    skip_without_containment!();
     let _fixture_guard = lock_prepublication_fixture_test();
     let temp = tempfile::tempdir().expect("tempdir");
     let agent_id = "review-lease-agent";

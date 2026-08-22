@@ -769,6 +769,7 @@ fn newest_numeric_state_json(root: &Path) -> Option<PathBuf> {
 
 #[test]
 fn megafile_policy_is_warn_only_by_default_and_reuses_typed_blocker_detail() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo_path, agent) =
         create_semantic_merge_fixture(temp.path(), &[("README.md", "# Test\n")]);
@@ -841,6 +842,7 @@ fn megafile_policy_is_warn_only_by_default_and_reuses_typed_blocker_detail() {
 
 #[test]
 fn decomposition_bypass_requires_finalized_evidence_and_diff_backed_structure() {
+    skip_without_containment!();
     let bare_temp = tempfile::tempdir().expect("bare tempdir");
     let (bare_repo, bare_agent) =
         create_semantic_merge_fixture(bare_temp.path(), &[("README.md", "# Test\n")]);
@@ -975,6 +977,7 @@ fn decomposition_bypass_requires_finalized_evidence_and_diff_backed_structure() 
 
 #[test]
 fn decomposition_completion_is_persisted_only_after_successful_merge() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo_path, agent) =
         create_semantic_merge_fixture(temp.path(), &[("README.md", "# Test\n")]);
@@ -1061,6 +1064,7 @@ fn decomposition_completion_is_persisted_only_after_successful_merge() {
 
 #[test]
 fn decomposition_rejects_same_path_content_substitution_after_finalized_review() {
+    skip_without_containment!();
     for changed_file in ["target", "replacement"] {
         let temp = tempfile::tempdir().expect("tempdir");
         let (repo_path, agent) =
@@ -1132,6 +1136,7 @@ fn decomposition_rejects_same_path_content_substitution_after_finalized_review()
 
 #[test]
 fn collision_decision_is_persisted_without_weakening_merge_blockers() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo_path, agent) =
         create_semantic_merge_fixture(temp.path(), &[("README.md", "# Test\n")]);
@@ -1175,6 +1180,7 @@ fn collision_decision_is_persisted_without_weakening_merge_blockers() {
 
 #[test]
 fn authenticated_megafile_failure_refuses_merge_before_primary_mutation() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo_path, agent) =
         create_semantic_merge_fixture(temp.path(), &[("README.md", "# Test\n")]);
@@ -1211,6 +1217,7 @@ fn authenticated_megafile_failure_refuses_merge_before_primary_mutation() {
 
 #[test]
 fn semantic_conflicts_report_same_function_and_dependent_files() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo_path, agent) = create_semantic_merge_fixture(
         temp.path(),
@@ -1299,6 +1306,7 @@ fn semantic_conflicts_report_same_function_and_dependent_files() {
 
 #[test]
 fn semantic_conflicts_classify_import_only_as_low_risk() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo_path, agent) = create_semantic_merge_fixture(
         temp.path(),
@@ -1344,6 +1352,7 @@ fn semantic_conflicts_classify_import_only_as_low_risk() {
 
 #[test]
 fn semantic_conflicts_report_signature_and_impl_overlap() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo_path, agent) = create_semantic_merge_fixture(
             temp.path(),
@@ -1392,6 +1401,7 @@ fn semantic_conflicts_report_signature_and_impl_overlap() {
 
 #[test]
 fn semantic_conflicts_mark_unresolved_paths_as_degraded() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo_path, agent) = create_semantic_merge_fixture(
         temp.path(),
@@ -1424,6 +1434,7 @@ fn semantic_conflicts_mark_unresolved_paths_as_degraded() {
 
 #[test]
 fn candidate_collection_holds_read_lease_until_snapshot_finishes() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo_path, manager, agent_a, agent_b) = create_managed_merge_fixture(temp.path());
     fs::write(agent_a.path.join("README.md"), "# Agent change\n").expect("edit agent worktree");
@@ -1652,6 +1663,7 @@ fn successful_status_cannot_bypass_nonverified_containment_seam() {
 
 #[test]
 fn candidate_validation_total_deadline_returns_failed_report() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let started = std::time::Instant::now();
     let report = run_candidate_validation_command_with_timeout(
@@ -1675,6 +1687,7 @@ fn candidate_validation_total_deadline_returns_failed_report() {
 
 #[test]
 fn candidate_validation_clears_shell_startup_and_private_network_environment() {
+    skip_without_containment!();
     let _environment_guard = VALIDATION_ENVIRONMENT_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2114,6 +2127,7 @@ fn repo_common_lock_persists_file_and_kernel_unlocks_on_drop() {
 
 #[test]
 fn initialized_repository_fingerprint_ignores_ignored_output() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = Repository::init(temp.path()).expect("init repo");
     fs::write(temp.path().join(".gitignore"), "ignored/\n").expect("write ignore");
