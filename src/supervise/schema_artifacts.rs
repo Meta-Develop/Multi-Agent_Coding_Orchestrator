@@ -214,7 +214,7 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                 "required": [
                     "assignment_count", "started_assignment_count", "completed_assignment_count",
                     "concurrency", "role_bindings", "assignment_effort_bindings",
-                    "budget_degradations", "usage"
+                    "budget_degradations", "assignment_selection_ledger", "usage"
                 ],
                 "properties": {
                     "assignment_count": {"type": "integer", "minimum": 0},
@@ -224,6 +224,7 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                     "role_bindings": role_map_schema_value(role_binding),
                     "assignment_effort_bindings": assignment_effort_bindings_schema_value(),
                     "budget_degradations": budget_degradation_records_schema_value(),
+                    "assignment_selection_ledger": assignment_selection_ledger_schema_value(),
                     "selection_decisions": selection_decisions_schema_value(),
                     "usage": execution_usage_schema_value()
                 }
@@ -236,6 +237,81 @@ fn selection_decisions_schema_value() -> serde_json::Value {
     json!({
         "type": "array",
         "items": crate::selection::selection_event_schema_value(),
+    })
+}
+
+fn assignment_selection_ledger_schema_value() -> serde_json::Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "assignment_id", "attempt", "role", "selection_source", "selected_runtime",
+                "selected_model", "selected_reasoning_effort", "catalog_source",
+                "catalog_snapshot_digest", "catalog_revisions", "rejected_candidates",
+                "evidence_gap"
+            ],
+            "properties": {
+                "assignment_id": {"type": "string", "minLength": 1},
+                "attempt": {"type": "integer", "minimum": 0},
+                "role": agent_role_schema_value(),
+                "selection_source": {
+                    "type": "string",
+                    "enum": [
+                        "automatic", "plan_role_models", "operator_override", "budget_degrade",
+                        "retry", "legacy_fake", "legacy_nonpublishable_simulation"
+                    ]
+                },
+                "selected_runtime": {"type": ["string", "null"], "minLength": 1},
+                "selected_model": {"type": ["string", "null"], "minLength": 1},
+                "selected_reasoning_effort": {"type": ["string", "null"], "minLength": 1},
+                "catalog_source": {
+                    "type": "string",
+                    "enum": ["runtime_advertised", "operator_declared", "none"]
+                },
+                "catalog_snapshot_digest": {"type": ["string", "null"], "minLength": 1},
+                "catalog_revisions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["runtime", "revision", "advertised_at"],
+                        "properties": {
+                            "runtime": {"type": "string", "minLength": 1},
+                            "revision": {"type": "string", "minLength": 1},
+                            "advertised_at": {"type": "string", "minLength": 1}
+                        }
+                    }
+                },
+                "rejected_candidates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["runtime", "model", "effort", "reasons"],
+                        "properties": {
+                            "runtime": {"type": "string", "minLength": 1},
+                            "model": {"type": "string", "minLength": 1},
+                            "effort": {"type": "string", "minLength": 1},
+                            "reasons": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["code", "detail"],
+                                    "properties": {
+                                        "code": {"type": "string", "minLength": 1},
+                                        "detail": {"type": "string", "minLength": 1}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "evidence_gap": {"type": ["string", "null"], "minLength": 1}
+            }
+        }
     })
 }
 

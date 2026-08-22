@@ -641,6 +641,45 @@ mod tests {
         .expect("reserve artifacts")
     }
 
+    fn capture_named<'a>(index: &'a LaunchPreflightIndex, name: &str) -> &'a CaptureOutcome {
+        index
+            .captures
+            .iter()
+            .find(|capture| capture.name == name)
+            .unwrap_or_else(|| panic!("missing {name} capture in {index:?}"))
+    }
+
+    fn assert_capture_marker(writer: &ArtifactRunWriter, capture: &CaptureOutcome, marker: &str) {
+        let marker_body = fs::read_to_string(writer.run_dir().join(marker))
+            .unwrap_or_else(|error| panic!("{} marker {}: {error}", capture.name, marker));
+        match capture.status {
+            CaptureStatus::Ok => {
+                assert!(
+                    capture.error.is_none(),
+                    "{} ok capture has error: {:?}",
+                    capture.name,
+                    capture.error
+                );
+                assert_eq!(marker_body, "ok\n", "{} marker", capture.name);
+            }
+            CaptureStatus::Failed => {
+                assert!(
+                    capture
+                        .error
+                        .as_ref()
+                        .is_some_and(|error| !error.is_empty()),
+                    "{} failed capture is missing error",
+                    capture.name
+                );
+                assert!(
+                    marker_body.starts_with("failed:"),
+                    "{} failure marker: {marker_body}",
+                    capture.name
+                );
+            }
+        }
+    }
+
     #[test]
     fn launch_preflight_records_success_and_failure_markers() {
         let (_temp, repo) = test_repo();
@@ -657,25 +696,43 @@ mod tests {
         let index =
             persist_launch_preflight(&mut writer, &repo, &spec, &LiveRunCollisionReport::empty())
                 .expect("persist preflight");
-        assert!(index
-            .captures
-            .iter()
-            .any(|capture| capture.name == "git_status" && capture.status == CaptureStatus::Ok));
-        assert!(index
-            .captures
-            .iter()
-            .any(|capture| capture.name == "repo_map" && capture.status == CaptureStatus::Ok));
-        assert!(index
-            .captures
-            .iter()
-            .any(|capture| capture.name == "runtime" && capture.status == CaptureStatus::Ok));
-        let git_status = fs::read_to_string(writer.run_dir().join(PREFLIGHT_GIT_STATUS_RELATIVE))
-            .expect("git status");
-        assert!(git_status.contains("dirty.txt"), "{git_status}");
+        let git_status = capture_named(&index, "git_status");
+        assert_eq!(git_status.status, CaptureStatus::Ok, "{index:?}");
+        assert_capture_marker(&writer, git_status, PREFLIGHT_GIT_STATUS_MARKER);
+        let git_status_text =
+            fs::read_to_string(writer.run_dir().join(PREFLIGHT_GIT_STATUS_RELATIVE))
+                .expect("git status");
+        assert!(git_status_text.contains("dirty.txt"), "{git_status_text}");
+
+        // repo_map uses bounded Git status, the same path skipped in CI without a
+        // delegated user manager. Launch must still persist a matching marker.
+        let repo_map = capture_named(&index, "repo_map");
+        assert_capture_marker(&writer, repo_map, PREFLIGHT_REPO_MAP_MARKER);
+        if repo_map.status == CaptureStatus::Ok {
+            assert!(
+                writer.run_dir().join(PREFLIGHT_REPO_MAP_RELATIVE).is_file(),
+                "repo_map ok capture is missing its artifact"
+            );
+        }
+
+        let runtime = capture_named(&index, "runtime");
+        assert_eq!(runtime.status, CaptureStatus::Ok, "{index:?}");
+        assert_capture_marker(&writer, runtime, PREFLIGHT_RUNTIME_MARKER);
+
+        let forced = write_json_capture(
+            &mut writer,
+            "forced_failure",
+            "preflight/forced.json",
+            "preflight/forced.status",
+            Err(anyhow::anyhow!("forced capture failure")),
+        )
+        .expect("record forced failure");
+        assert_eq!(forced.status, CaptureStatus::Failed);
+        assert_eq!(forced.error.as_deref(), Some("forced capture failure"));
         assert_eq!(
-            fs::read_to_string(writer.run_dir().join(PREFLIGHT_GIT_STATUS_MARKER))
-                .expect("git status marker"),
-            "ok\n"
+            fs::read_to_string(writer.run_dir().join("preflight/forced.status"))
+                .expect("forced failure marker"),
+            "failed: forced capture failure\n"
         );
     }
 
