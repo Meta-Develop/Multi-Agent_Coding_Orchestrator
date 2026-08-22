@@ -459,7 +459,7 @@ impl TwoStageRouter {
                 vec![policy.policy().policy_id.clone()],
             );
             annotate_stage(&mut diagnostics, &front);
-            return Ok(select_policy_for_tests(
+            return Ok(select_resolved_policy(
                 state,
                 policy.policy(),
                 diagnostics,
@@ -494,7 +494,7 @@ impl OnlineRouter for TwoStageRouter {
                 vec![policy.policy().policy_id.clone()],
             );
             annotate_stage(&mut diagnostics, &front);
-            return Ok(select_policy_for_tests(
+            return Ok(select_resolved_policy(
                 state,
                 policy.policy(),
                 diagnostics,
@@ -542,7 +542,7 @@ impl CheckpointRouter {
                 vec![policy.policy().policy_id.clone()],
             );
             annotate_stage(&mut diagnostics, &front);
-            let router = select_policy_for_tests(
+            let router = select_resolved_policy(
                 state,
                 policy.policy(),
                 diagnostics,
@@ -581,7 +581,7 @@ impl CheckpointRouter {
 
 /// Narrow helper so stage 1 can emit a `RouterDecision` without exposing
 /// the private `select_policy` constructor. Tests also use this.
-pub fn select_policy_for_tests(
+pub fn select_resolved_policy(
     state: &OptimizerState,
     policy: &PolicyGraph,
     mut diagnostics: DecisionDiagnostics,

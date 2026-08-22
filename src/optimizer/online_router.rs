@@ -23,7 +23,7 @@ use super::predictor::{
     feature_bool, feature_keys, feature_text, insert_text, is_frontier_role, mean_i64,
     primary_action, PolicyOutcomeDistribution, PolicyPredictor,
 };
-use super::resources::Quantity;
+use super::resources::{ObservationKind, Quantity};
 use super::state::{OptimizerState, PosteriorSummary};
 use super::switch_cost::{
     apply_switch_cost, current_action_from_candidates, estimate_switch, oscillation_count,
@@ -179,6 +179,11 @@ impl ObjectiveEvaluator for TailRiskObjective {
 pub struct RouterConfig {
     pub feasibility: FeasibilityConfig,
     pub permit_high_capability_fallback: bool,
+    /// When false, inferred (unobserved) switch-cost priors are recorded on
+    /// diagnostics but not added to the objective. Measured switch
+    /// observations still apply. Live dispatch wiring should enable this
+    /// only after reviewing the priors.
+    pub apply_inferred_switch_priors: bool,
 }
 
 impl Default for RouterConfig {
@@ -186,12 +191,18 @@ impl Default for RouterConfig {
         Self {
             feasibility: FeasibilityConfig::default(),
             permit_high_capability_fallback: true,
+            apply_inferred_switch_priors: false,
         }
     }
 }
 
 /// Production contextual router. Provider-neutral: selection inputs are
 /// evidence, constraints, and measured outcomes.
+///
+/// Inferred switch-cost priors stay out of the objective unless
+/// [`RouterConfig::apply_inferred_switch_priors`] is enabled. Measured
+/// switch observations still apply. Live dispatch wiring should review those
+/// priors before turning the flag on.
 pub struct SafeContextualRouter {
     predictor: Box<dyn PolicyPredictor + Send + Sync>,
     feasibility: ChanceConstraintChecker,
@@ -199,6 +210,7 @@ pub struct SafeContextualRouter {
     voi: Option<Box<dyn ValueOfInformation + Send + Sync>>,
     config: RouterConfig,
     switch_costs: SwitchCostModel,
+    taxonomy: TaxonomySpec,
     calibration: Option<CalibrationResponse>,
     baseline_policy: Option<PolicyId>,
 }
@@ -217,6 +229,7 @@ impl SafeContextualRouter {
             voi: None,
             config,
             switch_costs: SwitchCostModel::new(),
+            taxonomy: TaxonomySpec::v1(),
             calibration: None,
             baseline_policy: None,
         }
@@ -230,6 +243,26 @@ impl SafeContextualRouter {
     pub fn with_switch_costs(mut self, switch_costs: SwitchCostModel) -> Self {
         self.switch_costs = switch_costs;
         self
+    }
+
+    pub fn with_taxonomy(mut self, taxonomy: TaxonomySpec) -> Self {
+        self.taxonomy = taxonomy;
+        self
+    }
+
+    pub fn with_inferred_switch_priors(mut self, enabled: bool) -> Self {
+        self.config.apply_inferred_switch_priors = enabled;
+        self
+    }
+
+    fn should_price_switch(&self, switch: &SwitchCostEstimate) -> bool {
+        switch.observation == ObservationKind::Measured || self.config.apply_inferred_switch_priors
+    }
+
+    fn apply_priced_switch(&self, value: &mut ObjectiveValue, switch: &SwitchCostEstimate) {
+        if self.should_price_switch(switch) {
+            apply_switch_cost(value, switch, self.switch_costs.hysteresis());
+        }
     }
 
     pub fn with_calibration(
@@ -270,7 +303,7 @@ impl SafeContextualRouter {
             let switch = estimate_switch(&self.switch_costs, previous, policy);
             let objective = if feasibility.feasible {
                 let mut value = self.objective.evaluate(distribution)?;
-                apply_switch_cost(&mut value, &switch, self.switch_costs.hysteresis());
+                self.apply_priced_switch(&mut value, &switch);
                 Some(value)
             } else {
                 None
@@ -360,12 +393,8 @@ impl OnlineRouter for SafeContextualRouter {
             .collect();
         let mut diagnostics = DecisionDiagnostics::new(state.horizon.now, candidate_ids);
         diagnostics.fill_reserves(&state.budget.snapshot(state.horizon.now));
-        classify(
-            &state.task_features,
-            &state.repo_features,
-            &TaxonomySpec::v1(),
-        )
-        .record_on(&mut diagnostics, None);
+        classify(&state.task_features, &state.repo_features, &self.taxonomy)
+            .record_on(&mut diagnostics, None);
         diagnostics.oscillation_count =
             Some(oscillation_count(&trajectory_identities(state, candidates)));
 
@@ -816,11 +845,7 @@ fn four_way_comparison(
                 if let Ok(predicted) = router.predictor.predict(state, policy) {
                     if let Ok(mut objective) = router.objective.evaluate(&predicted) {
                         let switch = estimate_switch(&router.switch_costs, previous, policy);
-                        apply_switch_cost(
-                            &mut objective,
-                            &switch,
-                            router.switch_costs.hysteresis(),
-                        );
+                        router.apply_priced_switch(&mut objective, &switch);
                         comparison.clean_restart =
                             Some(compared(policy, &predicted, &objective, &switch));
                     }
@@ -842,7 +867,7 @@ fn four_way_comparison(
             continue;
         };
         let switch = estimate_switch(&router.switch_costs, previous, policy);
-        apply_switch_cost(&mut objective, &switch, router.switch_costs.hysteresis());
+        router.apply_priced_switch(&mut objective, &switch);
         let slot = compared(policy, &predicted, &objective, &switch);
         if is_clean_restart(policy) {
             comparison.clean_restart = Some(slot);
@@ -1196,6 +1221,7 @@ mod tests {
                     ..FeasibilityConfig::default()
                 },
                 permit_high_capability_fallback: true,
+                apply_inferred_switch_priors: false,
             },
         )
     }
@@ -1628,6 +1654,7 @@ mod tests {
             "keep",
         );
         let decision = router(predictor)
+            .with_inferred_switch_priors(true)
             .select(
                 &state,
                 &[
@@ -1671,6 +1698,144 @@ mod tests {
             Some("continue")
         );
         assert_eq!(decision.diagnostics().switch_cost_micros, Some(0));
+    }
+
+    #[test]
+    fn inferred_switch_priors_are_not_default_on() {
+        let mut predictor = ScriptedPredictor::new();
+        predictor.insert(dist("keep", 9_500, 5_000, 5_000, 50, 1));
+        predictor.insert(dist("swap", 9_500, 4_900, 4_900, 40, 1));
+        let mut state = capable_state();
+        insert_text(
+            &mut state.task_features,
+            feature_keys::CURRENT_POLICY,
+            "keep",
+        );
+        let decision = router(predictor)
+            .select(
+                &state,
+                &[
+                    execute_policy(
+                        "keep",
+                        "model-a",
+                        CanonicalEffort::Low,
+                        RestartMode::Continuation,
+                    ),
+                    execute_policy(
+                        "swap",
+                        "model-b",
+                        CanonicalEffort::Low,
+                        RestartMode::Continuation,
+                    ),
+                ],
+            )
+            .expect("select");
+        assert_eq!(
+            decision.selected_policy().map(PolicyId::as_str),
+            Some("swap")
+        );
+        let swap = decision
+            .diagnostics()
+            .candidate_predictions
+            .iter()
+            .find(|pred| pred.policy.as_str() == "swap")
+            .expect("swap pred");
+        let keep = decision
+            .diagnostics()
+            .candidate_predictions
+            .iter()
+            .find(|pred| pred.policy.as_str() == "keep")
+            .expect("keep pred");
+        assert!(
+            swap.objective_value_micros.unwrap_or(0) < keep.objective_value_micros.unwrap_or(0),
+            "default config must not add inferred switch priors to the objective"
+        );
+    }
+
+    #[test]
+    fn measured_switch_observations_apply_without_inferred_priors() {
+        let mut predictor = ScriptedPredictor::new();
+        predictor.insert(dist("keep", 9_500, 5_000, 5_000, 50, 1));
+        predictor.insert(dist("swap", 9_500, 4_900, 4_900, 40, 1));
+        let mut switch_costs = SwitchCostModel::new();
+        switch_costs.observe(
+            crate::optimizer::switch_cost::TransitionClass::ModelChangeSameRuntime,
+            10_000,
+            0,
+            0,
+            0,
+        );
+        let mut state = capable_state();
+        insert_text(
+            &mut state.task_features,
+            feature_keys::CURRENT_POLICY,
+            "keep",
+        );
+        let decision = router(predictor)
+            .with_switch_costs(switch_costs)
+            .select(
+                &state,
+                &[
+                    execute_policy(
+                        "keep",
+                        "model-a",
+                        CanonicalEffort::Low,
+                        RestartMode::Continuation,
+                    ),
+                    execute_policy(
+                        "swap",
+                        "model-b",
+                        CanonicalEffort::Low,
+                        RestartMode::Continuation,
+                    ),
+                ],
+            )
+            .expect("select");
+        assert_eq!(
+            decision.selected_policy().map(PolicyId::as_str),
+            Some("keep")
+        );
+        let swap = decision
+            .diagnostics()
+            .candidate_predictions
+            .iter()
+            .find(|pred| pred.policy.as_str() == "swap")
+            .expect("swap pred");
+        let keep = decision
+            .diagnostics()
+            .candidate_predictions
+            .iter()
+            .find(|pred| pred.policy.as_str() == "keep")
+            .expect("keep pred");
+        assert!(
+            swap.objective_value_micros.unwrap_or(0) > keep.objective_value_micros.unwrap_or(0),
+            "measured switch observations must still enter the objective"
+        );
+    }
+
+    #[test]
+    fn injected_taxonomy_spec_is_used_for_classification() {
+        let mut spec = TaxonomySpec::v1();
+        spec.version = 2;
+        let parsed = crate::optimizer::taxonomy::parse_taxonomy_spec(
+            &serde_json::to_vec(&spec).expect("json"),
+        )
+        .expect("parse");
+        let mut predictor = ScriptedPredictor::new();
+        predictor.insert(dist("keep", 9_500, 1_000, 1_000, 10, 1));
+        let decision = router(predictor)
+            .with_taxonomy(parsed)
+            .select(
+                &capable_state(),
+                &[execute_policy(
+                    "keep",
+                    "model-a",
+                    CanonicalEffort::Low,
+                    RestartMode::Continuation,
+                )],
+            )
+            .expect("select");
+        assert_eq!(decision.diagnostics().taxonomy_version, Some(2));
     }
 
     #[test]
