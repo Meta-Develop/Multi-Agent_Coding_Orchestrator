@@ -1,5 +1,8 @@
 use super::*;
 
+pub(super) const MAX_ENVIRONMENT_FAILURE_DIAGNOSTIC_CHARS: usize = 1024;
+pub(super) const ENVIRONMENT_FAILURE_DIAGNOSTIC_TRUNCATION_MARKER: &str = "…<truncated>";
+
 pub(super) fn render_supervisor_operator_summary(report: &SupervisorFinalReport) -> String {
     let mut lines = vec![
         format!("# Supervise run {}", report.run_id.as_str()),
@@ -34,7 +37,8 @@ pub(super) fn render_supervisor_operator_summary(report: &SupervisorFinalReport)
         lines.push("## Failures".to_string());
         lines.push(String::new());
         for failure in &report.environment_failures {
-            lines.push(format!("- environment: {:?}", failure.category));
+            let failure = sanitize_environment_failure(failure.clone());
+            lines.push(format!("- environment: {}", failure.summary));
         }
         for denial in &report.gate_denials {
             lines.push(format!("- gate: {}", denial.denial_id.as_str()));
@@ -560,11 +564,68 @@ fn environment_failure_categories(failures: &[EnvironmentFailure]) -> String {
         .join(", ")
 }
 
+fn sanitize_environment_failure_diagnostic(
+    summary: &str,
+    canonical_summary: &str,
+) -> Option<String> {
+    let diagnostic = summary
+        .strip_prefix(canonical_summary)
+        .map(|suffix| suffix.strip_prefix(": ").unwrap_or(suffix))
+        .unwrap_or(summary);
+    let diagnostic = diagnostic
+        .chars()
+        .map(|character| match character {
+            '\r' => '\n',
+            character if character.is_control() && character != '\n' => ' ',
+            character => character,
+        })
+        .collect::<String>();
+    let redacted = crate::llm::Redactor::new().redact(&diagnostic).text;
+    // The generic redactor intentionally preserves a secret assignment's key and delimiter.
+    // Remove that delimiter from the already-redacted representation so a subsequent report
+    // normalization remains idempotent instead of treating the rest of the single-line summary
+    // as the assignment value.
+    let redacted = redacted
+        .replace("= <redacted:secret>", " <redacted:secret>")
+        .replace("=<redacted:secret>", " <redacted:secret>")
+        .replace(": <redacted:secret>", " <redacted:secret>")
+        .replace(":<redacted:secret>", " <redacted:secret>");
+    let single_line = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.is_empty() {
+        return None;
+    }
+
+    let mut characters = single_line.chars();
+    let bounded = characters
+        .by_ref()
+        .take(MAX_ENVIRONMENT_FAILURE_DIAGNOSTIC_CHARS)
+        .collect::<String>();
+    if characters.next().is_none() {
+        return Some(bounded);
+    }
+
+    let marker_chars = ENVIRONMENT_FAILURE_DIAGNOSTIC_TRUNCATION_MARKER
+        .chars()
+        .count();
+    let retained_chars = MAX_ENVIRONMENT_FAILURE_DIAGNOSTIC_CHARS.saturating_sub(marker_chars);
+    let mut truncated = bounded.chars().take(retained_chars).collect::<String>();
+    truncated.push_str(ENVIRONMENT_FAILURE_DIAGNOSTIC_TRUNCATION_MARKER);
+    Some(truncated)
+}
+
 fn sanitize_environment_failure(mut failure: EnvironmentFailure) -> EnvironmentFailure {
-    failure.summary = format!(
+    let canonical_summary = format!(
         "environment preflight reported {}",
         environment_failure_category_name(failure.category)
     );
+    failure.summary =
+        if failure.category == EnvironmentFailureCategory::RuntimeModelCatalogUnavailable {
+            sanitize_environment_failure_diagnostic(&failure.summary, &canonical_summary)
+                .map(|diagnostic| format!("{canonical_summary}: {diagnostic}"))
+                .unwrap_or(canonical_summary)
+        } else {
+            canonical_summary
+        };
     failure.remediation = match failure.category {
         EnvironmentFailureCategory::MissingExecutable
         | EnvironmentFailureCategory::VersionMismatch => vec![

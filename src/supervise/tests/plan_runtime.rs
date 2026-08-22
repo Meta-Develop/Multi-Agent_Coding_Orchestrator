@@ -2185,6 +2185,11 @@ fn runtime_model_catalog_preflight_is_typed_persisted_and_short_circuits_assignm
         panic!("catalog preflight failure must prevent assignment environment preflight")
     };
     let run_id = options.run_id.clone();
+    let secret = "CATALOG_SECRET_MARKER_83";
+    let catalog_diagnostic = format!(
+        "injected catalog acquisition failure\r\nAPI_TOKEN={secret}\n{}",
+        "long diagnostic tail ".repeat(MAX_ENVIRONMENT_FAILURE_DIAGNOSTIC_CHARS)
+    );
 
     let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
         plan,
@@ -2192,7 +2197,7 @@ fn runtime_model_catalog_preflight_is_typed_persisted_and_short_circuits_assignm
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
         Err(Box::new(EnvironmentFailure::runtime_model_catalog(
-            "injected catalog acquisition failure".to_string(),
+            catalog_diagnostic,
         ))),
         &mut runner,
     )
@@ -2242,17 +2247,71 @@ fn runtime_model_catalog_preflight_is_typed_persisted_and_short_circuits_assignm
         EnvironmentFailureCategory::RuntimeModelCatalogUnavailable
     );
     assert!(report.environment_failures[0].requirement.is_none());
+    let canonical_prefix = "environment preflight reported runtime_model_catalog_unavailable";
+    let summary = &report.environment_failures[0].summary;
+    assert!(summary.starts_with(&format!(
+        "{canonical_prefix}: injected catalog acquisition failure "
+    )));
+    assert!(summary.contains("API_TOKEN <redacted:secret>"));
+    assert!(!summary.contains(secret));
+    assert!(!summary
+        .chars()
+        .any(|character| matches!(character, '\r' | '\n')));
+    let diagnostic = summary
+        .strip_prefix(&format!("{canonical_prefix}: "))
+        .expect("catalog failure summary retains a canonical bounded diagnostic");
+    assert!(
+        diagnostic.chars().count() <= MAX_ENVIRONMENT_FAILURE_DIAGNOSTIC_CHARS,
+        "catalog diagnostic exceeded its Unicode-scalar limit"
+    );
+    assert!(diagnostic.ends_with(ENVIRONMENT_FAILURE_DIAGNOSTIC_TRUNCATION_MARKER));
+    assert!(!report.environment_failures[0].remediation.is_empty());
+    let operator_summary = render_supervisor_operator_summary(&report);
+    assert!(operator_summary.contains(&format!("- environment: {summary}")));
+    assert!(!operator_summary.contains(secret));
+
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+        .expect("typed catalog failure must finalize authenticated supervisor artifacts");
+    let persisted_summary = String::from_utf8(
+        reader
+            .read(Path::new("SUMMARY.md"))
+            .expect("read authenticated operator summary"),
+    )
+    .expect("authenticated operator summary is UTF-8");
+    let persisted_environment_line = persisted_summary
+        .lines()
+        .find(|line| line.starts_with("- environment: "))
+        .expect("operator summary contains the typed environment failure");
+    assert_eq!(
+        persisted_environment_line,
+        format!("- environment: {summary}")
+    );
+    assert!(persisted_environment_line.contains("injected catalog acquisition failure"));
+    assert!(persisted_environment_line.contains("API_TOKEN <redacted:secret>"));
+    assert!(!persisted_summary.contains(secret));
+    let persisted = read_supervisor_final_report(&reader)
+        .expect("read persisted runtime catalog environment failure report");
+    assert_eq!(persisted, report);
+    assert_eq!(persisted.environment_failures[0].summary, *summary);
+}
+
+#[test]
+fn runtime_model_catalog_empty_diagnostic_normalization_is_idempotent() {
+    let run_id = RunId::new("model-catalog-empty-diagnostic").expect("valid run id");
+    let mut report = artifact_test_final_report(&run_id);
+    report.environment_failures = vec![EnvironmentFailure::runtime_model_catalog(
+        "\r\n\t".to_string(),
+    )];
+
+    enforce_supervisor_final_environment_failure_outcome(&mut report);
+    let normalized = report.environment_failures.clone();
+    enforce_supervisor_final_environment_failure_outcome(&mut report);
+
+    assert_eq!(report.environment_failures, normalized);
     assert_eq!(
         report.environment_failures[0].summary,
         "environment preflight reported runtime_model_catalog_unavailable"
     );
-    assert!(!report.environment_failures[0].remediation.is_empty());
-
-    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
-        .expect("typed catalog failure must finalize authenticated supervisor artifacts");
-    let persisted = read_supervisor_final_report(&reader)
-        .expect("read persisted runtime catalog environment failure report");
-    assert_eq!(persisted, report);
 }
 
 #[test]
