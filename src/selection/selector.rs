@@ -21,6 +21,18 @@ pub fn built_in_prior_dataset() -> Result<PriorDataset, SelectionError> {
     serde_json::from_str(BUILT_IN_PRIORS).map_err(|error| SelectionError::Data(error.to_string()))
 }
 
+/// Dated catalog/evidence eligibility for `model` under `authority`.
+///
+/// Unknown slugs return [`MeasuredAuthorityEligibility::NoDatedEvidence`] so a
+/// static capability tier can still be used as fallback. Measured ineligibility
+/// must fail closed and cannot be overridden by that table.
+pub fn measured_authority_eligibility(
+    model: &str,
+    authority: AuthorityRole,
+) -> Result<MeasuredAuthorityEligibility, SelectionError> {
+    Ok(built_in_prior_dataset()?.measured_authority_eligibility(model, authority))
+}
+
 pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionError> {
     let mut normalized = input.clone();
     normalize_input(&mut normalized);
