@@ -1369,6 +1369,19 @@ mod tests {
                 Some("blocking_pre_action_callback != All"),
                 "{id} writable gate must be capability-derived, not vendor-named"
             );
+            if matches!(id, AdapterId::ClaudeCode | AdapterId::GeminiCli) {
+                assert_eq!(
+                    id.writable_leaf_launch_refusal(),
+                    Some("blocking_pre_action_callback != All"),
+                    "{id} must refuse writable leaf launch until a blocking callback is hosted"
+                );
+            } else if matches!(id, AdapterId::Grok | AdapterId::Cursor) {
+                assert_eq!(
+                    id.writable_leaf_launch_refusal(),
+                    None,
+                    "{id} already ships as an unverified leaf worker"
+                );
+            }
         }
         // Codex remains the unresolved default by operator policy.
         assert_eq!(resolve_runtime(None, None), RuntimeId::Codex);

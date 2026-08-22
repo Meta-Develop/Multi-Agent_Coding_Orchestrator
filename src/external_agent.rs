@@ -243,6 +243,16 @@ impl ExternalAgentInvocation {
             Self::Grok | Self::Cursor | Self::ClaudeCode | Self::GeminiCli
         )
     }
+
+    pub const fn adapter_id(self) -> Option<AdapterId> {
+        match self {
+            Self::CodexSupervisor | Self::CodexConsultant => Some(AdapterId::Codex),
+            Self::ClaudeConsultant | Self::ClaudeCode => Some(AdapterId::ClaudeCode),
+            Self::Grok => Some(AdapterId::Grok),
+            Self::Cursor => Some(AdapterId::Cursor),
+            Self::GeminiCli => Some(AdapterId::GeminiCli),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1321,6 +1331,28 @@ fn run_external_agent_runtime(
                 )),
                 error.to_string(),
             );
+        }
+    }
+    if spec.invocation.is_adapter_subprocess()
+        && spec.workspace_access == WorkspaceAccess::ReadWrite
+    {
+        if let Some(adapter) = spec.invocation.adapter_id() {
+            if let Some(capability) = adapter.writable_leaf_launch_refusal() {
+                return failed_external_environment_run(
+                    spec,
+                    started,
+                    command_display(&spec.program, &[]),
+                    false,
+                    EnvironmentFailureCategory::SandboxUnavailable,
+                    Some(EnvironmentRequirement::sandbox(
+                        EnvironmentSandboxCapability::VerifiedExternalCodex,
+                    )),
+                    format!(
+                        "writable {} failed closed before launch: {capability}",
+                        adapter.as_str()
+                    ),
+                );
+            }
         }
     }
     let program_trust = external_program_trust(spec);
