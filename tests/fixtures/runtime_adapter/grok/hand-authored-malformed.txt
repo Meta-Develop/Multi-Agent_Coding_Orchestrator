@@ -1,0 +1,6 @@
+You are logged in with grok.com.
+
+Default model: worker-stable
+
+Available models:
+  this entry has no delimiter

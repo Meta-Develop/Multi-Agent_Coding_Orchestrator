@@ -3273,7 +3273,12 @@ fn publication_network_capability_callsites_are_exactly_audited() {
     runners.sort();
     assert_eq!(
         constructors,
-        ["process_runner.rs", "publication.rs", "publication.rs"]
+        [
+            "process_runner.rs",
+            "publication.rs",
+            "publication.rs",
+            "runtime_adapter.rs"
+        ]
     );
     assert_eq!(runners, ["publication.rs", "publication.rs"]);
 }
