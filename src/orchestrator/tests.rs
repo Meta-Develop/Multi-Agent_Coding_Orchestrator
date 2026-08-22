@@ -3099,13 +3099,20 @@ fn orchestration_profile_binds_git_common_and_hides_sensitive_state() {
         working_directory: worktree.path,
         env: BTreeMap::new(),
         timeout: None,
-        visible_read_only_roots: vec![common.clone()],
+        visible_read_only_roots: Vec::new(),
+        visible_read_write_roots: vec![common.clone()],
         hidden_roots: vec![sensitive.clone()],
         runtime: OrchestrationExecutionRuntime::Verified,
     };
-    let rendered = format!("{:?}", strict_command_profile(&spec));
-    assert!(rendered.contains(&common.display().to_string()));
-    assert!(rendered.contains(&sensitive.display().to_string()));
+    let profile = strict_command_profile(&spec);
+    assert!(
+        profile.visible_read_write_roots().contains(&common),
+        "orchestrate agent commands must write the linked Git common dir so commits can persist objects and refs"
+    );
+    assert!(
+        profile.hidden_roots().contains(&sensitive),
+        "orchestrate agent commands must hide repository sensitive state"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -3680,6 +3687,7 @@ fn agent_command_drains_large_output_before_timeout() {
             env: BTreeMap::new(),
             timeout: Some(Duration::from_secs(3)),
             visible_read_only_roots: Vec::new(),
+            visible_read_write_roots: Vec::new(),
             hidden_roots: Vec::new(),
             runtime: OrchestrationExecutionRuntime::NonpublishableSimulation,
         })

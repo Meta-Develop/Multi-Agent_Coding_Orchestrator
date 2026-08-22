@@ -1042,7 +1042,8 @@ fn command_spec(
         working_directory,
         env: agent.env.clone(),
         timeout: agent.timeout,
-        visible_read_only_roots: vec![git_common_root],
+        visible_read_only_roots: Vec::new(),
+        visible_read_write_roots: vec![git_common_root],
         hidden_roots: vec![sensitive_root],
         runtime,
     })
@@ -1739,6 +1740,7 @@ fn run_validation_command(
         env: validation.env.clone(),
         timeout: validation.timeout,
         visible_read_only_roots,
+        visible_read_write_roots: Vec::new(),
         hidden_roots,
         runtime,
     });
@@ -1817,6 +1819,7 @@ struct CommandRunSpec {
     env: BTreeMap<String, String>,
     timeout: Option<Duration>,
     visible_read_only_roots: Vec<PathBuf>,
+    visible_read_write_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
     runtime: OrchestrationExecutionRuntime,
 }
@@ -1825,6 +1828,10 @@ fn strict_command_profile(spec: &CommandRunSpec) -> StrictOfflineWorkspaceProfil
     let profile = spec.visible_read_only_roots.iter().fold(
         StrictOfflineWorkspaceProfile::read_write(&spec.workspace_root),
         |profile, visible| profile.with_visible_read_only_root(visible),
+    );
+    let profile = spec.visible_read_write_roots.iter().fold(
+        profile,
+        |profile, visible| profile.with_visible_read_write_root(visible),
     );
     spec.hidden_roots
         .iter()

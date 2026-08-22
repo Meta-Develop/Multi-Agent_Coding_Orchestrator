@@ -950,6 +950,11 @@ impl StrictOfflineWorkspaceProfile {
         self
     }
 
+    pub fn with_visible_read_write_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_write_root(root);
+        self
+    }
+
     pub fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_hidden_root(root);
         self
@@ -968,6 +973,11 @@ impl StrictOfflineWorkspaceProfile {
     #[cfg(test)]
     pub(crate) fn visible_read_only_roots(&self) -> &[PathBuf] {
         &self.config.visible_read_only_roots
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visible_read_write_roots(&self) -> &[PathBuf] {
+        &self.config.visible_read_write_roots
     }
 
     #[cfg(test)]

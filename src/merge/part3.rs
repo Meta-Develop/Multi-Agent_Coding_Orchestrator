@@ -383,9 +383,7 @@ fn run_isolated_git_process_os(
     stdin: StdinMode,
     label: &str,
 ) -> Result<GitCommandOutput> {
-    let profile = StrictOfflineWorkspaceProfile::read_write(worktree_path)
-        .with_writable_artifact_root(&context.directory)
-        .with_visible_read_only_root(&context.alternate_object_directory);
+    let profile = isolated_git_workspace_profile(context, worktree_path)?;
     run_required_direct(
         label,
         resolve_trusted_executable("git")?,
@@ -398,6 +396,46 @@ fn run_isolated_git_process_os(
         GIT_STDIN_LIMIT_BYTES,
         profile,
     )
+}
+
+fn isolated_git_workspace_profile(
+    context: &TemporaryIndex,
+    worktree_path: &Path,
+) -> Result<StrictOfflineWorkspaceProfile> {
+    let common_dir = context
+        .alternate_object_directory
+        .parent()
+        .context("alternate object directory omitted its Git common directory")?;
+    let common_dir = fs::canonicalize(common_dir).with_context(|| {
+        format!(
+            "failed to resolve Git common directory {}",
+            common_dir.display()
+        )
+    })?;
+    let profile = StrictOfflineWorkspaceProfile::read_write(worktree_path)
+        .with_writable_artifact_root(&context.directory)
+        .with_visible_read_only_root(&context.alternate_object_directory)
+        .with_visible_read_only_root(&common_dir);
+    hide_sensitive_state_if_present(profile, &common_dir)
+}
+
+fn hide_sensitive_state_if_present(
+    profile: StrictOfflineWorkspaceProfile,
+    common_dir: &Path,
+) -> Result<StrictOfflineWorkspaceProfile> {
+    let state_path = common_dir.join("maco").join("state");
+    match fs::symlink_metadata(&state_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(profile),
+        Err(error) => Err(error).context(format!(
+            "failed to inspect repository sensitive state {}",
+            state_path.display()
+        )),
+        Ok(_) => Ok(profile.with_hidden_root(
+            crate::artifacts::state_auth::sensitive_state_root(common_dir).context(
+                "repository sensitive state could not be bound for child-process masking",
+            )?,
+        )),
+    }
 }
 
 fn initialize_isolated_index(
