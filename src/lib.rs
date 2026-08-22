@@ -1,57 +1,63 @@
 #![deny(unsafe_op_in_unsafe_fn)]
-
 pub mod agent;
 pub mod agent_lifecycle;
 pub mod artifacts;
-pub(crate) mod authenticated_snapshot;
 pub mod autopilot;
-pub(crate) mod checkpoint_wire;
 pub mod cli;
-pub(crate) mod collect_revalidation;
 pub mod consult;
 pub mod decision_claim;
-pub(crate) mod effect_wal;
 pub mod evaluation;
+pub mod evaluation_gate_policy;
+pub mod execution_capability;
 pub mod external_agent;
 pub mod field_guide;
-#[cfg(any(windows, test))]
-pub(crate) mod file_identity;
-pub(crate) mod follow_up_queue;
 pub mod gate_denial;
-mod git_repository;
 pub mod inbox;
+pub mod lane_build;
 pub mod live_claim;
 pub mod llm;
 pub mod machine_global;
 pub mod megafile;
 pub mod merge;
-pub(crate) mod merge_freshness;
-pub(crate) mod merge_semantic;
+pub mod objective_profile;
 pub mod optimizer;
 pub mod orchestration_event;
 pub mod orchestrator;
-pub(crate) mod pinned_exec;
 pub mod planning;
 pub mod pre_action_review;
 pub mod process_runner;
 pub mod protected_path;
 pub mod publication;
+pub mod quota;
 pub mod repo_map;
 pub mod repo_semantic;
 pub mod review;
 pub mod runtime_adapter;
 pub mod safe_state;
 pub mod scope;
-pub(crate) mod secure_output;
+pub mod selection;
 pub mod semantic_coord;
-pub(crate) mod state_journal;
-pub(crate) mod state_migration;
 pub mod supervise;
-mod supervise_budget;
 pub mod swarm_health;
 pub mod sync;
 pub mod sync_store;
 pub mod worktree;
+
+pub(crate) mod authenticated_snapshot;
+pub(crate) mod checkpoint_wire;
+pub(crate) mod collect_revalidation;
+pub(crate) mod effect_wal;
+#[cfg(any(windows, test))]
+pub(crate) mod file_identity;
+pub(crate) mod follow_up_queue;
+mod git_repository;
+pub(crate) mod merge_freshness;
+pub(crate) mod merge_semantic;
+pub(crate) mod pinned_exec;
+pub(crate) mod secure_output;
+pub(crate) mod state_journal;
+pub(crate) mod state_migration;
+mod supervise_budget;
 
 #[doc(hidden)]
 pub use git_repository::configure_libgit2_repository_extensions;

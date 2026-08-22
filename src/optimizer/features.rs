@@ -90,6 +90,12 @@ pub mod keys {
     pub const TRAJ_QUOTA_EXHAUSTED: &str = "traj.quota_exhausted";
     pub const TRAJ_PUBLIC_API_BREAK: &str = "traj.public_api_break";
     pub const TRAJ_CERTIFIED: &str = "traj.certified";
+
+    pub const TASK_TAXONOMY_VERSION: &str = "task.taxonomy.version";
+    pub const TASK_TAXONOMY_DOMAIN: &str = "task.taxonomy.domain";
+    pub const TASK_TAXONOMY_KIND: &str = "task.taxonomy.kind";
+    pub const TASK_TAXONOMY_MODIFIERS: &str = "task.taxonomy.modifiers";
+    pub const TASK_TAXONOMY_CONFIDENCE_BP: &str = "task.taxonomy.confidence_bp";
 }
 
 /// Deterministic feature value. Fractional quantities use millionths.
@@ -142,6 +148,13 @@ impl FeatureBag {
     pub fn boolean(&self, key: &str) -> Option<bool> {
         match self.get(&feature_id(key)?) {
             Some(FeatureValue::Boolean(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn text(&self, key: &str) -> Option<&str> {
+        match self.get(&feature_id(key)?) {
+            Some(FeatureValue::Text(value)) => Some(value.as_str()),
             _ => None,
         }
     }

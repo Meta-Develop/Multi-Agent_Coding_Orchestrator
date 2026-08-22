@@ -394,6 +394,94 @@ fn authenticated_resume_finalizes_without_reexecuting_completed_work_and_preserv
 }
 
 #[test]
+fn resume_refuses_scheduler_closed_budget_that_differs_only_in_elapsed_seconds() {
+    let (_temp, repo) = injected_repository();
+    let run_id = RunId::new("clock-skewed-budget-binding").expect("valid clock-skew run id");
+    let assignment = injected_assignment(false);
+    let plan = injected_plan(assignment.clone(), 0);
+    let ledger =
+        RunBudgetLedger::new(RunBudgetLimits::default()).expect("clock-skew budget ledger");
+    let writer = ArtifactRunWriter::reserve(
+        &repo,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "clock-skew-budget-test",
+    )
+    .expect("reserve clock-skew artifact run");
+    let mut checkpoint = SupervisorCheckpointWriter::create(
+        &repo,
+        SupervisorCheckpointPreparation::new(
+            &run_id,
+            &current_head_oid(&repo).expect("clock-skew primary base"),
+            normalized_supervisor_plan_sha256(
+                &plan,
+                &SupervisorConsultantPlan::default(),
+                &AssignmentMetadata::new(),
+                &SupervisorPlanMetadata::default(),
+            )
+            .expect("clock-skew normalized plan"),
+            1,
+            &plan,
+            writer
+                .resume_binding()
+                .expect("clock-skew prepared binding"),
+            ledger.report().expect("clock-skew initial budget"),
+        ),
+    )
+    .expect("create clock-skew checkpoint");
+    checkpoint
+        .assignment_started(
+            &assignment,
+            0,
+            Some(
+                writer
+                    .resume_binding()
+                    .expect("clock-skew assignment start binding"),
+            ),
+            ledger.report().expect("clock-skew assignment start budget"),
+        )
+        .expect("checkpoint assignment start");
+    let closed_budget = ledger.report().expect("scheduler-closed budget snapshot");
+    checkpoint
+        .scheduler_closed(
+            writer
+                .resume_binding()
+                .expect("clock-skew scheduler close binding"),
+            closed_budget.clone(),
+        )
+        .expect("checkpoint scheduler closure");
+    let mut report_budget = closed_budget;
+    report_budget.elapsed_seconds = report_budget.elapsed_seconds.saturating_add(1);
+    if let Some(remaining_duration) = report_budget.remaining.max_duration_seconds.as_mut() {
+        *remaining_duration = remaining_duration.saturating_sub(1);
+    }
+    let mut report = artifact_test_final_report(&run_id);
+    report.run_budget = Some(report_budget);
+    let report_bytes = encode_final_report(&report).expect("encode clock-skewed final report");
+    checkpoint
+        .final_report_planned(
+            &report,
+            &report_bytes,
+            writer
+                .resume_binding()
+                .expect("clock-skew final report plan binding"),
+        )
+        .expect("plan clock-skewed final report");
+    drop(checkpoint);
+    drop(writer);
+
+    let error = match open_supervisor_checkpoint(&repo, &run_id) {
+        Ok(_) => panic!("clock-skewed budget snapshots must remain an integrity failure"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:#}")
+            .contains("authenticated planned supervisor report binding is inconsistent"),
+        "unexpected integrity error: {error:#}"
+    );
+}
+
+#[test]
 fn scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch() {
     let (temp, repo) = injected_repository();
     let assignment = injected_assignment(false);
@@ -752,6 +840,105 @@ fn resume_refuses_dispatch_started_without_durable_completion_as_uncertain() {
             state: ExternalSideEffectState::Ambiguous,
         }
     );
+}
+
+#[test]
+fn owning_assignment_id_maps_auditor_dispatch_subjects() {
+    let assignment_ids = vec!["child-a".to_string(), "child-b".to_string()];
+    assert_eq!(
+        owning_assignment_id_for_dispatch_subject("child-a", &assignment_ids),
+        "child-a"
+    );
+    assert_eq!(
+        owning_assignment_id_for_dispatch_subject("child-a-review-auditor", &assignment_ids),
+        "child-a"
+    );
+    assert_eq!(
+        owning_assignment_id_for_dispatch_subject("child-b-review-auditor-lens-2", &assignment_ids),
+        "child-b"
+    );
+    assert_eq!(
+        owning_assignment_id_for_dispatch_subject("orphan-review-auditor-lens-1", &assignment_ids),
+        "orphan-review-auditor-lens-1"
+    );
+}
+
+#[test]
+fn resume_attributes_incomplete_auditor_dispatch_to_owning_assignment() {
+    let (_temp, repo) = injected_repository();
+    let run_id = RunId::new("authenticated-resume-auditor-uncertain")
+        .expect("valid auditor uncertain run id");
+    let assignment = injected_assignment(false);
+    let plan = injected_plan(assignment.clone(), 0);
+    let ledger =
+        RunBudgetLedger::new(RunBudgetLimits::default()).expect("auditor uncertain budget ledger");
+    let writer = ArtifactRunWriter::reserve(
+        &repo,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "auditor-uncertain-resume-test",
+    )
+    .expect("reserve auditor uncertain artifact run");
+    let mut checkpoint = SupervisorCheckpointWriter::create(
+        &repo,
+        SupervisorCheckpointPreparation::new(
+            &run_id,
+            &current_head_oid(&repo).expect("auditor uncertain primary base"),
+            normalized_supervisor_plan_sha256(
+                &plan,
+                &SupervisorConsultantPlan::default(),
+                &AssignmentMetadata::new(),
+                &SupervisorPlanMetadata::default(),
+            )
+            .expect("auditor uncertain normalized plan"),
+            1,
+            &plan,
+            writer
+                .resume_binding()
+                .expect("auditor uncertain prepared binding"),
+            ledger.report().expect("auditor uncertain initial budget"),
+        ),
+    )
+    .expect("create auditor uncertain checkpoint");
+    checkpoint
+        .assignment_started(
+            &assignment,
+            0,
+            Some(
+                writer
+                    .resume_binding()
+                    .expect("auditor uncertain assignment binding"),
+            ),
+            ledger
+                .report()
+                .expect("auditor uncertain assignment budget"),
+        )
+        .expect("checkpoint auditor uncertain assignment start");
+    checkpoint
+        .dispatch_started(true, &review_lens_auditor_id(&assignment, 1), 1)
+        .expect("checkpoint auditor dispatch start");
+    drop(checkpoint);
+    drop(writer);
+
+    let snapshot = match open_supervisor_checkpoint(&repo, &run_id) {
+        Ok((_opened, snapshot)) => snapshot,
+        Err(error) => panic!("incomplete auditor dispatch must remain analyzable: {error:#}"),
+    };
+    assert_eq!(snapshot.uncertain_assignments, vec!["child-a"]);
+    assert!(
+        !snapshot
+            .uncertain_assignments
+            .iter()
+            .any(|id| id.contains("review-auditor")),
+        "synthetic auditor IDs must not appear as uncertain assignments: {:?}",
+        snapshot.uncertain_assignments
+    );
+
+    let collect = collect_supervisor_run(&repo, run_id.clone()).expect("collect auditor uncertain");
+    assert_eq!(collect.run_lifecycle, SupervisorRunLifecycle::Uncertain);
+    let refusal = resume_supervisor_run(&repo, run_id).expect("typed auditor uncertain refusal");
+    assert_eq!(refusal.lifecycle, SupervisorRunLifecycle::Uncertain);
+    assert_eq!(refusal.uncertain_assignments, vec!["child-a"]);
 }
 
 fn prepared_dispatch_evidence_checkpoint(

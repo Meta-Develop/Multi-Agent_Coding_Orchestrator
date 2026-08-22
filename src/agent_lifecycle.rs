@@ -556,40 +556,150 @@ fn signal_process(_pid: u32, _signal: libc::c_int) -> Result<bool> {
     bail!("agent process signals are not implemented on this platform")
 }
 
-fn terminate_process(record: &AgentProcessRecord, wait: Duration) -> Result<AgentStopOutcome> {
+#[cfg(target_os = "linux")]
+enum LinuxSignalTarget {
+    Pidfd(std::os::fd::OwnedFd),
+    RawPid(u32),
+}
+
+#[cfg(target_os = "linux")]
+enum PidfdOpen {
+    Open(std::os::fd::OwnedFd),
+    Gone,
+    Unsupported,
+}
+
+#[cfg(target_os = "linux")]
+fn open_pidfd(pid: u32) -> Result<PidfdOpen> {
+    let pid = libc::pid_t::try_from(pid).context("PID does not fit Unix pid_t")?;
+    // SAFETY: pidfd_open only consumes a positive PID and flags; it does not access Rust memory.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(PidfdOpen::Gone),
+            Some(libc::ENOSYS) => Ok(PidfdOpen::Unsupported),
+            _ => Err(error).context("failed to open a pidfd for the recorded agent process"),
+        };
+    }
+    let fd = i32::try_from(fd).context("pidfd did not fit a file descriptor")?;
+    // SAFETY: pidfd_open returned a new owned file descriptor on success.
+    Ok(PidfdOpen::Open(unsafe {
+        std::os::fd::FromRawFd::from_raw_fd(fd)
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn bind_linux_signal_target(record: &AgentProcessRecord) -> Result<Option<LinuxSignalTarget>> {
     match process_state(record.pid, &record.process_start_time)? {
-        ProcessIdentityState::Gone | ProcessIdentityState::Reused => {
+        ProcessIdentityState::Gone | ProcessIdentityState::Reused => return Ok(None),
+        ProcessIdentityState::Live => {}
+    }
+    match open_pidfd(record.pid)? {
+        PidfdOpen::Gone => Ok(None),
+        PidfdOpen::Unsupported => Ok(Some(LinuxSignalTarget::RawPid(record.pid))),
+        PidfdOpen::Open(pidfd) => match process_state(record.pid, &record.process_start_time)? {
+            ProcessIdentityState::Reused => Ok(None),
+            ProcessIdentityState::Live | ProcessIdentityState::Gone => {
+                Ok(Some(LinuxSignalTarget::Pidfd(pidfd)))
+            }
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_linux_target(target: &LinuxSignalTarget, signal: libc::c_int) -> Result<bool> {
+    match target {
+        LinuxSignalTarget::RawPid(pid) => signal_process(*pid, signal),
+        LinuxSignalTarget::Pidfd(pidfd) => {
+            use std::os::fd::AsRawFd;
+            // SAFETY: pidfd is an owned pidfd; a null siginfo and zero flags request a
+            // plain signal to that process instance, not a recycled PID.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::c_void>(),
+                    0_u32,
+                )
+            };
+            if rc == 0 {
+                return Ok(true);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(false)
+            } else {
+                Err(error).context("failed to signal agent process through its pidfd")
+            }
+        }
+    }
+}
+
+fn terminate_process(record: &AgentProcessRecord, wait: Duration) -> Result<AgentStopOutcome> {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(target) = bind_linux_signal_target(record)? else {
+            return Ok(AgentStopOutcome::AlreadyExited);
+        };
+        if !signal_linux_target(&target, libc::SIGTERM)? {
             return Ok(AgentStopOutcome::AlreadyExited);
         }
-        ProcessIdentityState::Live => {}
-    }
-    #[cfg(unix)]
-    let term_signal = libc::SIGTERM;
-    #[cfg(not(unix))]
-    let term_signal = 0;
-    if !signal_process(record.pid, term_signal)? {
-        return Ok(AgentStopOutcome::AlreadyExited);
-    }
-    if wait_until_identity_gone(record, wait)? {
-        return Ok(AgentStopOutcome::Terminated);
-    }
-    match process_state(record.pid, &record.process_start_time)? {
-        ProcessIdentityState::Gone | ProcessIdentityState::Reused => {
+        if wait_until_identity_gone(record, wait)? {
             return Ok(AgentStopOutcome::Terminated);
         }
-        ProcessIdentityState::Live => {}
+        match process_state(record.pid, &record.process_start_time)? {
+            ProcessIdentityState::Gone | ProcessIdentityState::Reused => {
+                return Ok(AgentStopOutcome::Terminated);
+            }
+            ProcessIdentityState::Live => {}
+        }
+        if !signal_linux_target(&target, libc::SIGKILL)? {
+            return Ok(AgentStopOutcome::Killed);
+        }
+        if wait_until_identity_gone(record, KILL_CONFIRMATION_WAIT)? {
+            Ok(AgentStopOutcome::Killed)
+        } else {
+            bail!("PID {} remained live after SIGKILL escalation", record.pid)
+        }
     }
-    #[cfg(unix)]
-    let kill_signal = libc::SIGKILL;
-    #[cfg(not(unix))]
-    let kill_signal = 0;
-    if !signal_process(record.pid, kill_signal)? {
-        return Ok(AgentStopOutcome::Killed);
-    }
-    if wait_until_identity_gone(record, KILL_CONFIRMATION_WAIT)? {
-        Ok(AgentStopOutcome::Killed)
-    } else {
-        bail!("PID {} remained live after SIGKILL escalation", record.pid)
+    #[cfg(not(target_os = "linux"))]
+    {
+        match process_state(record.pid, &record.process_start_time)? {
+            ProcessIdentityState::Gone | ProcessIdentityState::Reused => {
+                return Ok(AgentStopOutcome::AlreadyExited);
+            }
+            ProcessIdentityState::Live => {}
+        }
+        #[cfg(unix)]
+        let term_signal = libc::SIGTERM;
+        #[cfg(not(unix))]
+        let term_signal = 0;
+        if !signal_process(record.pid, term_signal)? {
+            return Ok(AgentStopOutcome::AlreadyExited);
+        }
+        if wait_until_identity_gone(record, wait)? {
+            return Ok(AgentStopOutcome::Terminated);
+        }
+        match process_state(record.pid, &record.process_start_time)? {
+            ProcessIdentityState::Gone | ProcessIdentityState::Reused => {
+                return Ok(AgentStopOutcome::Terminated);
+            }
+            ProcessIdentityState::Live => {}
+        }
+        #[cfg(unix)]
+        let kill_signal = libc::SIGKILL;
+        #[cfg(not(unix))]
+        let kill_signal = 0;
+        if !signal_process(record.pid, kill_signal)? {
+            return Ok(AgentStopOutcome::Killed);
+        }
+        if wait_until_identity_gone(record, KILL_CONFIRMATION_WAIT)? {
+            Ok(AgentStopOutcome::Killed)
+        } else {
+            bail!("PID {} remained live after SIGKILL escalation", record.pid)
+        }
     }
 }
 
@@ -792,6 +902,43 @@ mod tests {
         let status = child.0.wait().context("wait stopped child")?;
         assert!(!status.success());
         assert!(registry.snapshot_all()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn terminate_process_does_not_signal_a_reused_pid() -> Result<()> {
+        let current_pid = std::process::id();
+        let record = AgentProcessRecord {
+            pid: current_pid,
+            process_start_time: "0:1".to_string(),
+            role: "worker".to_string(),
+            run_id: "run-reused".to_string(),
+            task_id: "reused".to_string(),
+            repo: PathBuf::from("/tmp/maco-agent-lifecycle-reused"),
+            argv: vec!["test".to_string()],
+            launch_timestamp_ms: unix_timestamp_ms()?,
+        };
+        let outcome = terminate_process(&record, Duration::from_millis(10))?;
+        assert_eq!(outcome, AgentStopOutcome::AlreadyExited);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_stop_binds_a_pidfd_for_the_recorded_start_time() -> Result<()> {
+        let child = SleepChild::spawn()?;
+        let record = AgentProcessRecord {
+            pid: child.pid(),
+            process_start_time: process_start_time(child.pid())?,
+            role: "worker".to_string(),
+            run_id: "run-pidfd".to_string(),
+            task_id: "pidfd".to_string(),
+            repo: PathBuf::from("/tmp/maco-agent-lifecycle-pidfd"),
+            argv: vec!["sleep".to_string()],
+            launch_timestamp_ms: unix_timestamp_ms()?,
+        };
+        let target = bind_linux_signal_target(&record)?.context("live process must bind")?;
+        assert!(matches!(target, LinuxSignalTarget::Pidfd(_)));
         Ok(())
     }
 }

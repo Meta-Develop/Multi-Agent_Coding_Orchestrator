@@ -28,12 +28,15 @@ exceptions = [
     # arbitrary AGPL dependencies.
     { allow = ["AGPL-3.0-or-later"], crate = "multi-agent-coding-orchestrator@0.3.0" },
     # libz-sys embeds stock zlib when the static vendored build is selected.
-    # Keep Zlib scoped to that exact crate release.
-    { allow = ["Zlib"], crate = "libz-sys@1.1.28" },
+    # Keep Zlib scoped to that crate; the clarification below verifies the
+    # exact expression and license-file hashes for every resolved release.
+    { allow = ["Zlib"], crate = "libz-sys" },
 ]
 
 [[licenses.clarify]]
-crate = "libz-sys@1.1.28"
+# If an upgrade changes this evidence, review the upstream license files and
+# update the expression and hashes together; never bypass a hash mismatch.
+crate = "libz-sys"
 expression = "(MIT OR Apache-2.0) AND Zlib"
 license-files = [
     { path = "LICENSE-APACHE", hash = 0x24b54f4b },
@@ -57,9 +60,12 @@ allow = []
 allow-workspace = true
 deny = []
 skip = []
-skip-tree = []
+skip-tree = [
+    { crate = "syn:>=2,<3", depth = 0, reason = "Newer serde_derive and clap_derive require syn 3 while the workspace and remaining proc-macro graph still require syn 2." },
+]
 
-# Keep the duplicate allowlists empty. The dev path
+# The depth-zero syn 2 entry above is the sole scoped duplicate bridge; keep
+# `skip` empty and do not extend the exception beyond that major series. The dev path
 # `workspace -> tempfile -> getrandom` overlaps the native build path
 # `workspace -> git2 -> libgit2-sys -> cc -> jobserver -> getrandom`, so both
 # resolve to getrandom 0.3.4. That also removes the duplicate dev/target-only

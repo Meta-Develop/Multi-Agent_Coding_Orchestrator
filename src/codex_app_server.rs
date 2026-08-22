@@ -15,11 +15,14 @@ use std::{
 };
 use thiserror::Error;
 
-const HARD_MAX_LINE_BYTES: usize = 1024 * 1024;
+const OUTPUT_AGENT_MESSAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// JSON envelope around a completed `agentMessage` so the advertised 8MB text
+/// bound remains receivable as a single JSONL line.
+const AGENT_MESSAGE_JSON_ENVELOPE_BYTES: usize = 256 * 1024;
+const HARD_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 const HARD_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const HARD_MAX_MESSAGES: usize = 16_384;
 const HARD_MAX_PROMPT_BYTES: usize = 1024 * 1024;
-const OUTPUT_AGENT_MESSAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EXTERNAL_CODEX_PERMISSION_PROFILE: &str = "maco_external_codex";
 
@@ -210,8 +213,9 @@ pub(crate) struct AppServerLimits {
 impl Default for AppServerLimits {
     fn default() -> Self {
         Self {
-            max_line_bytes: 256 * 1024,
-            max_total_bytes: 8 * 1024 * 1024,
+            max_line_bytes: OUTPUT_AGENT_MESSAGE_MAX_BYTES
+                .saturating_add(AGENT_MESSAGE_JSON_ENVELOPE_BYTES),
+            max_total_bytes: HARD_MAX_TOTAL_BYTES,
             max_messages: 8_192,
             turn_timeout: Duration::from_secs(300),
             approval_timeout: Duration::from_secs(30),
@@ -789,14 +793,10 @@ where
         &mut state, transport, &thread_id, &turn_id, reviewer, &cancelled,
     ) {
         Ok(outcome) => Ok(outcome),
-        Err(error @ AppServerError::Timeout { .. })
-        | Err(error @ AppServerError::Cancelled { .. })
-        | Err(error @ AppServerError::ApprovalTimeout)
-        | Err(error @ AppServerError::ApprovalReviewerLost) => {
+        Err(error) => {
             state.interrupt(transport, &thread_id, &turn_id);
             Err(error)
         }
-        Err(error) => Err(error),
     }
 }
 
@@ -1935,6 +1935,13 @@ mod tests {
         }
     }
 
+    fn sent_interrupt(transport: &FakeTransport) -> bool {
+        transport
+            .sent
+            .iter()
+            .any(|message| message.get("method") == Some(&json!("turn/interrupt")))
+    }
+
     fn approval_response(transport: &FakeTransport, id: u64) -> Option<&Value> {
         transport.sent.iter().find(|message| {
             message.get("id").and_then(Value::as_u64) == Some(id)
@@ -2691,10 +2698,178 @@ mod tests {
         )
         .expect_err("turn cancellation");
         assert_eq!(error, AppServerError::Cancelled { phase: "turn" });
-        assert!(transport
-            .sent
-            .iter()
-            .any(|message| message.get("method") == Some(&json!("turn/interrupt"))));
+        assert!(sent_interrupt(&transport));
+    }
+
+    fn assert_mid_turn_fault_sends_interrupt(
+        label: &str,
+        extra: ReaderEvent,
+        matches_error: impl Fn(&AppServerError) -> bool,
+    ) {
+        let mut incoming = FakeTransport::from_values(base_messages()).incoming;
+        incoming.insert(0, extra);
+        let mut transport = FakeTransport {
+            incoming,
+            sent: Vec::new(),
+            reads: None,
+            force_timeout: false,
+        };
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test(label)),
+            || false,
+        )
+        .expect_err(label);
+        assert!(
+            matches_error(&error),
+            "{label} produced unexpected error: {error:?}"
+        );
+        assert!(
+            sent_interrupt(&transport),
+            "{label} must interrupt the in-flight turn"
+        );
+    }
+
+    #[test]
+    fn mid_turn_protocol_faults_send_interrupt_once_ids_are_known() {
+        assert_mid_turn_fault_sends_interrupt(
+            "unsupported method",
+            ReaderEvent::Line(
+                json!({
+                    "method": "item/newVendorProgress",
+                    "params": {"threadId": "thread-1", "turnId": "turn-1"}
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+            |error| {
+                matches!(
+                    error,
+                    AppServerError::Unexpected { phase: "turn", message }
+                        if message.contains("unsupported method")
+                )
+            },
+        );
+        assert_mid_turn_fault_sends_interrupt(
+            "malformed JSON",
+            ReaderEvent::Line(b"{not-json".to_vec()),
+            |error| matches!(error, AppServerError::Malformed { phase: "turn", .. }),
+        );
+        assert_mid_turn_fault_sends_interrupt(
+            "remote error",
+            ReaderEvent::Line(
+                json!({
+                    "method": "error",
+                    "params": {"message": "child exploded"}
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+            |error| matches!(error, AppServerError::Remote { phase: "turn", .. }),
+        );
+        assert_mid_turn_fault_sends_interrupt(
+            "transport failure",
+            ReaderEvent::Failed("pipe broken".to_string()),
+            |error| {
+                matches!(
+                    error,
+                    AppServerError::Transport { message } if message.contains("pipe broken")
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn initialize_faults_do_not_send_interrupt_before_turn_ids() {
+        let mut transport = FakeTransport {
+            incoming: vec![ReaderEvent::Line(b"{malformed".to_vec())],
+            sent: Vec::new(),
+            reads: None,
+            force_timeout: false,
+        };
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("pre-turn")),
+            || false,
+        )
+        .expect_err("initialize malformed");
+        assert!(matches!(error, AppServerError::Malformed { .. }));
+        assert!(!sent_interrupt(&transport));
+    }
+
+    #[test]
+    fn default_line_bound_reaches_the_agent_message_ceiling() {
+        let limits = AppServerLimits::default()
+            .validate()
+            .expect("default limits must be valid");
+        assert!(
+            limits.max_line_bytes >= OUTPUT_AGENT_MESSAGE_MAX_BYTES,
+            "duplex default line bound must admit the advertised 8MB agent message"
+        );
+        assert!(
+            limits.max_line_bytes <= HARD_MAX_LINE_BYTES,
+            "default line bound must stay under the hard ceiling"
+        );
+        assert!(limits.max_total_bytes >= limits.max_line_bytes);
+        assert!(AppServerLimits {
+            max_line_bytes: OUTPUT_AGENT_MESSAGE_MAX_BYTES,
+            max_total_bytes: HARD_MAX_TOTAL_BYTES,
+            ..AppServerLimits::default()
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn completed_agent_message_past_the_old_line_cap_is_received() {
+        let text = "x".repeat(300 * 1024);
+        let mut messages = base_messages();
+        messages.extend([
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "final-msg", "type": "agentMessage", "status": "inProgress"}
+                }
+            }),
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 2,
+                    "item": {
+                        "id": "final-msg",
+                        "type": "agentMessage",
+                        "status": "completed",
+                        "text": text
+                    }
+                }
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed", "items": []}
+                }
+            }),
+        ]);
+        let mut transport = FakeTransport::from_values(messages);
+        let outcome = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("large-message")),
+            || false,
+        )
+        .expect("300KiB completed agent message must be receivable");
+        assert_eq!(outcome.final_message.as_deref(), Some(text.as_str()));
+        assert_eq!(outcome.completed_items, 1);
     }
 
     #[test]

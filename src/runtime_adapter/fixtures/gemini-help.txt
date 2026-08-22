@@ -1,0 +1,7 @@
+Usage: gemini [options] [command]
+
+Options:
+  -m, --model                     Model
+  -p, --prompt                    Run in non-interactive (headless) mode
+  -r, --resume                    Resume a previous session
+  -o, --output-format             The format of the CLI output

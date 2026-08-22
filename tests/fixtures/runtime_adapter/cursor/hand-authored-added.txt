@@ -1,0 +1,6 @@
+Available models
+
+worker-stable - Worker Stable
+worker-new - Worker New
+
+Tip: hand-authored test case

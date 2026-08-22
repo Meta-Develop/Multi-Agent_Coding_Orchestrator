@@ -940,7 +940,9 @@ fn analyze_checkpoint_records(
         .iter()
         .filter_map(|(id, state)| (*state == AssignmentResumeState::Started).then_some(id.clone()))
         .collect::<BTreeSet<_>>();
-    uncertain_assignments.extend(dispatches.into_iter().map(|(_, subject, _)| subject));
+    uncertain_assignments.extend(dispatches.into_iter().map(|(_, subject, _)| {
+        owning_assignment_id_for_dispatch_subject(&subject, &prepared.assignment_ids).to_string()
+    }));
     Ok(SupervisorCheckpointSnapshot {
         completed_assignments,
         pending_assignments,

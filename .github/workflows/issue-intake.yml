@@ -9,8 +9,8 @@ permissions:
   issues: write
 
 concurrency:
-  group: issue-intake-${{ github.event.issue.number }}
-  cancel-in-progress: false
+  group: issue-intake-${{ github.event.issue.user.login }}
+  cancel-in-progress: true
 
 jobs:
   mark-inbox:
@@ -53,14 +53,11 @@ jobs:
 
       - name: Triage issue
         if: ${{ steps.triage_gate.outputs.enabled == 'true' }}
-        uses: anthropics/claude-code-action@d40ddef4c030e508327d6e35a9c45f3368482c50 # v1
+        uses: anthropics/claude-code-action@d40ddef4c030e508327d6e35a9c45f3368482c50 # v1.0.195
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
-          # Community issues must be triageable, so non-write authors are allowed on
-          # purpose. The concurrency group above is what bounds run stacking.
-          allowed_non_write_users: "*"
           prompt: |
             Perform triage only for issue #${{ github.event.issue.number }} in ${{ github.repository }}.
 

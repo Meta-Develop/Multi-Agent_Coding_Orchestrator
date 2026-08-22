@@ -1307,19 +1307,25 @@ fn supervise_run_refuses_clean_stale_reused_child_worktree_before_execution() ->
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("stale-worktree.json");
     write_simple_plan(&plan_path, "child-clean")?;
-    let first = run_success_json(&[
-        "supervise",
-        "run",
-        path_str(&plan_path)?,
+    let child = run_success_json(&[
+        "worktree",
+        "create",
+        "child-clean",
         "--repo",
         path_str(&repo_path)?,
-        "--run-id",
-        "clean-first",
-        "--runtime",
-        "fake",
         "--json",
     ])?;
-    assert_eq!(first["success"], true);
+    assert_eq!(child["name"], "child-clean");
+    let child_path = PathBuf::from(
+        child["path"]
+            .as_str()
+            .context("managed child worktree path")?,
+    );
+    assert_eq!(
+        child_path,
+        temp.path().join(".maco/worktrees/repo/child-clean")
+    );
+    assert!(child_path.is_dir());
     fs::write(repo_path.join("README.md"), "# advanced\n")?;
     let repo = Repository::open(&repo_path)?;
     commit_all(&repo, "advance primary")?;
@@ -1340,7 +1346,6 @@ fn supervise_run_refuses_clean_stale_reused_child_worktree_before_execution() ->
     assert!(!repo_path
         .join(".maco/o2/runs/clean-stale/evidence/incoming/child-clean.json")
         .exists());
-    assert!(repo_path.join(".maco/o2/runs/clean-first").exists());
     Ok(())
 }
 

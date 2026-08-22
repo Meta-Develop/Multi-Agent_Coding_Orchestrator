@@ -1187,6 +1187,173 @@ fn serial_assignment_terminal_checkpoint_precedes_claim_release() {
 }
 
 #[test]
+fn degraded_manifest_boundary_finalization_still_releases_serial_claims() {
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_named_assignment("degraded-serial", "README.md");
+    let plan = injected_multi_plan(vec![assignment.clone()], 0);
+    let options = injected_options(&repo_path, temp.path(), "degraded-serial-release");
+    let runner = move |command: &ExternalAgentCommand| {
+        write_injected_assignment_report(command, &assignment);
+        injected_verified_run(command)
+    };
+    set_force_degraded_checkpoint_finalization();
+
+    let report = run_supervisor_plan_with_concurrent_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        1,
+        &runner,
+    )
+    .expect("degraded finalization remains reportable");
+
+    assert!(report.success, "degraded finalization report: {report:#?}");
+    assert_eq!(report.released_claims.len(), 1);
+    assert_eq!(report.released_claims[0].agent_id, "degraded-serial");
+    assert!(report.release_errors.is_empty());
+    assert!(SyncStore::open(&repo_path)
+        .expect("open claims after degraded finalization")
+        .snapshot()
+        .expect("snapshot claims after degraded finalization")
+        .is_empty());
+}
+
+#[test]
+fn admission_commit_recv_failure_cancels_and_drains_active_assignments() {
+    let (temp, repo_path) = injected_repository();
+    let assignments = vec![
+        injected_named_assignment("admit-a", "README.md"),
+        injected_named_assignment("admit-b", "src/lib.rs"),
+    ];
+    let plan = injected_multi_plan(assignments.clone(), 0);
+    let options = injected_options(&repo_path, temp.path(), "admission-recv-drain");
+    let cancelled_active = Arc::new(AtomicUsize::new(0));
+    let runner = {
+        let assignments = assignments.clone();
+        let cancelled_active = Arc::clone(&cancelled_active);
+        move |command: &ExternalAgentCommand,
+              cancellation: &ProcessCancellation,
+              _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+            let id = injected_command_assignment_id(command);
+            if id == "admit-a" {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !cancellation.is_cancelled() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "active assignment was not cancelled after admission-commit recv failure"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                cancelled_active.fetch_add(1, Ordering::SeqCst);
+            }
+            let assignment = assignments
+                .iter()
+                .find(|assignment| assignment.id == id)
+                .expect("admission drain assignment");
+            write_injected_assignment_report(command, assignment);
+            injected_verified_run(command)
+        }
+    };
+    set_abort_admission_commit_on_spawn(&options.run_id, 2);
+
+    let report = run_supervisor_plan_with_concurrent_cancellable_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        2,
+        &runner,
+    )
+    .expect("admission-commit recv failure remains reportable after drain");
+
+    assert!(!report.success);
+    assert!(
+        report.findings.iter().any(|finding| finding
+            .message
+            .contains("ended before committing or declining budget admission")),
+        "admission-commit failure must remain visible: {:#?}",
+        report.findings
+    );
+    assert_eq!(cancelled_active.load(Ordering::SeqCst), 1);
+    assert!(
+        report
+            .released_claims
+            .iter()
+            .any(|claim| claim.agent_id == "admit-a"),
+        "drained active assignment claim must be released: {:#?}",
+        report.released_claims
+    );
+    assert!(report.release_errors.is_empty());
+    assert!(SyncStore::open(&repo_path)
+        .expect("open claims after admission drain")
+        .snapshot()
+        .expect("snapshot claims after admission drain")
+        .is_empty());
+}
+
+#[test]
+fn serial_scheduler_error_after_completion_collects_outcomes_and_releases_claims() {
+    let (temp, repo_path) = injected_repository();
+    let assignments = vec![
+        injected_named_assignment("serial-collect-a", "README.md"),
+        injected_named_assignment("serial-collect-b", "src/lib.rs"),
+    ];
+    let plan = injected_multi_plan(assignments.clone(), 0);
+    let run_id = RunId::new("serial-collect-after-error").expect("valid serial collect run id");
+    let options = injected_options(&repo_path, temp.path(), run_id.as_str());
+    let runner = {
+        let assignments = assignments.clone();
+        let run_id = run_id.clone();
+        move |command: &ExternalAgentCommand| {
+            let id = injected_command_assignment_id(command);
+            if id == "serial-collect-a" {
+                install_checkpoint_failure(run_id.as_str(), "assignment_started");
+            }
+            let assignment = assignments
+                .iter()
+                .find(|assignment| assignment.id == id)
+                .expect("serial collect assignment");
+            write_injected_assignment_report(command, assignment);
+            injected_verified_run(command)
+        }
+    };
+
+    let report = run_supervisor_plan_with_concurrent_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        1,
+        &runner,
+    )
+    .expect("serial scheduling error remains reportable after collecting completed work");
+
+    assert!(!report.success);
+    assert_eq!(
+        report
+            .orchestrator_reports
+            .iter()
+            .map(|child| child.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["serial-collect-a"]
+    );
+    assert_eq!(report.released_claims.len(), 1);
+    assert_eq!(report.released_claims[0].agent_id, "serial-collect-a");
+    assert!(report.release_errors.is_empty());
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.message.contains("assignment_started")),
+        "scheduler error must remain visible in the final report: {:#?}",
+        report.findings
+    );
+    assert!(SyncStore::open(&repo_path)
+        .expect("open claims after serial collect")
+        .snapshot()
+        .expect("snapshot claims after serial collect")
+        .is_empty());
+}
+
+#[test]
 fn concurrent_assignment_terminal_checkpoint_precedes_claim_release() {
     let (temp, repo_path) = injected_repository();
     let assignments = vec![

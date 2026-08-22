@@ -1,5 +1,13 @@
 use super::*;
 
+fn install_budget_fixture_models() -> InstalledModelCapabilityPolicy {
+    install_test_fixture_models(&[
+        ("priced-model", ModelCapabilityClass::CriticalJudgment),
+        ("unpriced-model", ModelCapabilityClass::CriticalJudgment),
+    ])
+    .expect("budget fixture capability policy")
+}
+
 #[test]
 fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
     let legacy_source = json!({
@@ -158,6 +166,7 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
 
 #[test]
 fn budget_integration_serial_scheduler_accounts_exact_hard_boundary_by_process_role() {
+    let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
@@ -229,6 +238,7 @@ fn budget_integration_serial_scheduler_accounts_exact_hard_boundary_by_process_r
 
 #[test]
 fn budget_integration_auditor_admission_refusal_reaches_typed_child_and_final_reports() {
+    let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
@@ -323,6 +333,7 @@ fn budget_integration_auditor_admission_refusal_reaches_typed_child_and_final_re
 
 #[test]
 fn budget_integration_cost_enforcement_refuses_missing_model_pricing_before_launch() {
+    let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment, 0);
@@ -387,6 +398,7 @@ fn budget_integration_cost_enforcement_refuses_missing_model_pricing_before_laun
 
 #[test]
 fn budget_integration_concurrent_scheduler_cannot_oversubscribe_and_drains_admitted_work() {
+    let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let assignments = vec![
         injected_named_assignment("child-a", "a.txt"),
@@ -552,7 +564,7 @@ fn budget_integration_scheduler_applies_and_persists_degrade_ladder_before_halt(
     );
     assert_eq!(
         child_bindings["degrade-child-2"],
-        (BALANCED_PROFILE_MODEL.to_string(), "high".to_string())
+        (ECONOMY_PROFILE_MODEL.to_string(), "high".to_string())
     );
     assert!(!child_bindings.contains_key("degrade-child-6"));
 
@@ -641,6 +653,7 @@ fn budget_integration_parseable_partial_usage_from_timeout_is_estimated_and_latc
 
 #[test]
 fn budget_lifecycle_child_pre_runner_failure_releases_reservation_and_stops_pending() {
+    let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let mut child_a = injected_named_assignment("child-a", "README.md");
     child_a.task = Some("x".repeat(8 * 1024 + 1));
@@ -694,6 +707,7 @@ fn budget_lifecycle_child_pre_runner_failure_releases_reservation_and_stops_pend
 
 #[test]
 fn budget_lifecycle_auditor_pre_runner_failure_releases_reservation_and_stops_pending() {
+    let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let child_a = injected_assignment(true);
     let child_b = injected_named_assignment("child-b", "src/lib.rs");
@@ -759,6 +773,7 @@ fn budget_lifecycle_auditor_pre_runner_failure_releases_reservation_and_stops_pe
 
 #[test]
 fn budget_lifecycle_child_runner_panic_reconciles_missing_and_stops_pending() {
+    let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let child_a = injected_named_assignment("child-a", "README.md");
     let child_b = injected_named_assignment("child-b", "src/lib.rs");
@@ -815,6 +830,7 @@ fn budget_lifecycle_child_runner_panic_reconciles_missing_and_stops_pending() {
 
 #[test]
 fn budget_lifecycle_auditor_runner_panic_reconciles_missing_and_stops_pending() {
+    let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let child_a = injected_assignment(true);
     let child_b = injected_named_assignment("child-b", "src/lib.rs");
@@ -882,6 +898,7 @@ fn budget_lifecycle_auditor_runner_panic_reconciles_missing_and_stops_pending() 
 
 #[test]
 fn budget_integration_reservation_is_released_when_codex_process_never_starts() {
+    let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment.clone(), 0);
@@ -922,6 +939,7 @@ fn budget_integration_reservation_is_released_when_codex_process_never_starts() 
 
 #[test]
 fn budget_integration_uncertain_start_is_conservatively_reconciled_not_released() {
+    let _capability = install_budget_fixture_models();
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment, 0);
     inject_priced_process_roles(&mut plan, "priced-model", 1.0);
@@ -978,6 +996,7 @@ fn budget_integration_uncertain_start_is_conservatively_reconciled_not_released(
 
 #[test]
 fn budget_integration_parseable_usage_without_verified_containment_is_estimated() {
+    let _capability = install_budget_fixture_models();
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment, 0);
     inject_priced_process_roles(&mut plan, "priced-model", 1.0);
@@ -1047,6 +1066,7 @@ fn budget_integration_parseable_usage_without_verified_containment_is_estimated(
 
 #[test]
 fn budget_integration_parseable_usage_from_truncated_capture_is_estimated() {
+    let _capability = install_budget_fixture_models();
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment, 0);
     inject_priced_process_roles(&mut plan, "priced-model", 1.0);

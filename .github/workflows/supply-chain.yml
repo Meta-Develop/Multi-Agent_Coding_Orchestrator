@@ -43,8 +43,35 @@ jobs:
 
       - name: Install pinned supply-chain tools
         run: |
-          cargo install --locked --version 0.22.2 cargo-audit
-          cargo install --locked --version 0.20.2 cargo-deny
+          eval "$(
+            python3 - <<'PY'
+          import pathlib
+          import tomllib
+
+          pins = tomllib.loads(
+              pathlib.Path("scripts/supply_chain_pins.toml").read_text(encoding="utf-8")
+          )
+          for name in ("cargo_audit", "cargo_deny"):
+              value = pins.get(name)
+              if not isinstance(value, str) or not value:
+                  raise SystemExit(f"scripts/supply_chain_pins.toml missing {name}")
+              print(f"{name.upper()}={value}")
+          PY
+          )"
+          cargo install --locked --version "${CARGO_AUDIT}" cargo-audit
+          cargo install --locked --version "${CARGO_DENY}" cargo-deny
+          installed_audit="$(cargo audit --version | awk '{ print $2; exit }')"
+          installed_deny="$(cargo deny --version | awk '{ print $2; exit }')"
+          if [[ "${installed_audit}" != "${CARGO_AUDIT}" ]]; then
+            echo "expected cargo-audit ${CARGO_AUDIT}, got ${installed_audit}" >&2
+            exit 1
+          fi
+          if [[ "${installed_deny}" != "${CARGO_DENY}" ]]; then
+            echo "expected cargo-deny ${CARGO_DENY}, got ${installed_deny}" >&2
+            exit 1
+          fi
+          cargo audit --version
+          cargo deny --version
 
       - name: Check RustSec advisories
         run: cargo audit --deny warnings

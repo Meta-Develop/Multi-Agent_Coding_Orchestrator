@@ -105,7 +105,7 @@ impl FakeProvider {
     }
 
     fn enforce_input_budget(&self, request: &LlmRequest) -> Result<usize, ProviderError> {
-        let input_chars = request.prompt.render().len();
+        let input_chars = request.prompt.render().chars().count();
         if self.budget_behavior == FakeBudgetBehavior::Ignore {
             return Ok(input_chars);
         }
@@ -126,7 +126,7 @@ impl FakeProvider {
         input_chars: usize,
         request: &LlmRequest,
     ) -> Result<Usage, ProviderError> {
-        let output_chars = proposal.rendered_len();
+        let output_chars = proposal.render_for_transcript().chars().count();
         let usage = Usage::from_char_counts(input_chars, output_chars);
 
         if self.budget_behavior == FakeBudgetBehavior::Ignore {
@@ -317,5 +317,49 @@ mod tests {
             .expect("budget ignored");
 
         assert_eq!(response.proposal.summary, "long output");
+    }
+
+    #[test]
+    fn fake_provider_input_budget_counts_unicode_chars_not_bytes() {
+        let mut provider = FakeProvider::new("fake", "fake-model");
+        provider.push_response("unicode", WorkProposal::summary("ok"));
+
+        let prompt = PromptContext::new("é", "agent-a").assemble_prompt(&Redactor::new());
+        let rendered = prompt.render();
+        let char_count = rendered.chars().count();
+        let byte_count = rendered.len();
+        assert!(
+            byte_count > char_count,
+            "fixture must use a multi-byte character so bytes and chars diverge"
+        );
+
+        let accepted = LlmRequest::new("unicode", "fake-model", prompt.clone())
+            .with_budget(RequestBudget::new(char_count, 4096, 4096));
+        provider
+            .complete(accepted)
+            .expect("char-count budget must accept a preview-approved non-ASCII prompt");
+
+        provider.push_response("unicode-over", WorkProposal::summary("ok"));
+        let rejected = LlmRequest::new("unicode-over", "fake-model", prompt)
+            .with_budget(RequestBudget::new(char_count.saturating_sub(1), 4096, 4096));
+        let error = provider
+            .complete(rejected)
+            .expect_err("one fewer char must exceed the char budget");
+        assert_eq!(
+            error,
+            ProviderError::BudgetExceeded {
+                field: "input_chars",
+                used: char_count,
+                limit: char_count.saturating_sub(1),
+            }
+        );
+        assert_ne!(
+            match error {
+                ProviderError::BudgetExceeded { used, .. } => used,
+                _ => 0,
+            },
+            byte_count,
+            "BudgetExceeded.used must be a character count, not a UTF-8 byte count"
+        );
     }
 }
