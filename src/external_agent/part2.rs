@@ -2257,7 +2257,7 @@ pub(crate) fn command_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
                 .map(PathBuf::from),
             ..ProtectedWorktreeControls::default()
         });
-    command_argv_with_controls(spec, &controls)
+    command_argv_with_controls(spec, &controls).expect("command argv")
 }
 
 #[cfg(test)]
@@ -2275,18 +2275,18 @@ pub(crate) fn app_server_command_argv(spec: &ExternalAgentCommand) -> Vec<OsStri
 fn command_argv_with_controls(
     spec: &ExternalAgentCommand,
     controls: &ProtectedWorktreeControls,
-) -> Vec<OsString> {
+) -> Result<Vec<OsString>> {
     match spec.invocation {
-        ExternalAgentInvocation::CodexSupervisor => codex_supervisor_argv(spec, controls),
-        ExternalAgentInvocation::CodexConsultant => codex_consultant_argv(spec, controls),
-        ExternalAgentInvocation::ClaudeConsultant => claude_consultant_argv(),
+        ExternalAgentInvocation::CodexSupervisor => Ok(codex_supervisor_argv(spec, controls)),
+        ExternalAgentInvocation::CodexConsultant => Ok(codex_consultant_argv(spec, controls)),
+        ExternalAgentInvocation::ClaudeConsultant => Ok(claude_consultant_argv()),
         ExternalAgentInvocation::Grok | ExternalAgentInvocation::Cursor => {
             runtime_adapter_argv(spec)
         }
     }
 }
 
-fn runtime_adapter_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
+fn runtime_adapter_argv(spec: &ExternalAgentCommand) -> Result<Vec<OsString>> {
     let config = spec.runtime_adapter.clone().unwrap_or_else(|| {
         RuntimeAdapterConfig::defaults(match spec.invocation {
             ExternalAgentInvocation::Grok => RuntimeId::Grok,
@@ -2294,16 +2294,13 @@ fn runtime_adapter_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
             _ => RuntimeId::Codex,
         })
     });
-    config
-        .render(&LaunchContext {
-            prompt: &spec.prompt,
-            model: spec.model.as_deref(),
-            effort: spec.reasoning_effort.as_deref(),
-            cwd: &spec.cwd,
-            output: &spec.output_last_message,
-        })
-        .map(|launch| launch.argv.into_iter().map(OsString::from).collect())
-        .unwrap_or_default()
+    config.render_os_argv(&LaunchContext {
+        prompt: &spec.prompt,
+        model: spec.model.as_deref(),
+        effort: spec.reasoning_effort.as_deref(),
+        cwd: &spec.cwd,
+        output: &spec.output_last_message,
+    })
 }
 
 fn codex_supervisor_argv(
