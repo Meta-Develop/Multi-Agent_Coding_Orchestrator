@@ -1,5 +1,77 @@
 use super::*;
 
+pub(super) fn render_supervisor_operator_summary(report: &SupervisorFinalReport) -> String {
+    let mut lines = vec![
+        format!("# Supervise run {}", report.run_id.as_str()),
+        String::new(),
+        format!("- Status: {}", review_status_label(report.status)),
+        format!("- Success: {}", report.success),
+        format!("- Accepted: {}", report.accepted),
+        format!("- Rejected: {}", report.rejected),
+        format!("- Lifecycle: {}", lifecycle_label(report.run_lifecycle)),
+        String::new(),
+        "## Assignments".to_string(),
+        String::new(),
+    ];
+    if report.orchestrator_reports.is_empty() {
+        lines.push("No assignment reports were persisted.".to_string());
+    } else {
+        for child in &report.orchestrator_reports {
+            lines.push(format!(
+                "- `{}`: {} (accepted={}, rejected={})",
+                child.id,
+                review_status_label(child.status),
+                child.accepted,
+                child.rejected
+            ));
+            if !child.next_safe_action.is_empty() {
+                lines.push(format!("  next: {}", child.next_safe_action));
+            }
+        }
+    }
+    if !report.environment_failures.is_empty() || !report.gate_denials.is_empty() {
+        lines.push(String::new());
+        lines.push("## Failures".to_string());
+        lines.push(String::new());
+        for failure in &report.environment_failures {
+            lines.push(format!("- environment: {:?}", failure.category));
+        }
+        for denial in &report.gate_denials {
+            lines.push(format!("- gate: {}", denial.denial_id.as_str()));
+        }
+    }
+    lines.push(String::new());
+    lines.push("## Remaining risk".to_string());
+    lines.push(String::new());
+    lines.push(report.remaining_risk.clone());
+    lines.push(String::new());
+    lines.push("## Next safe action".to_string());
+    lines.push(String::new());
+    lines.push(report.next_safe_action.clone());
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn review_status_label(status: ReviewStatus) -> &'static str {
+    match status {
+        ReviewStatus::Pending => "pending",
+        ReviewStatus::Succeeded => "succeeded",
+        ReviewStatus::Failed => "failed",
+        ReviewStatus::Rejected => "rejected",
+        ReviewStatus::Missing => "missing",
+    }
+}
+
+fn lifecycle_label(lifecycle: SupervisorRunLifecycle) -> &'static str {
+    match lifecycle {
+        SupervisorRunLifecycle::Active => "active",
+        SupervisorRunLifecycle::Interrupted => "interrupted",
+        SupervisorRunLifecycle::Uncertain => "uncertain",
+        SupervisorRunLifecycle::Resumable => "resumable",
+        SupervisorRunLifecycle::Finalized => "finalized",
+    }
+}
+
 pub(super) fn apply_execution_target_reporting(
     report: &mut SupervisorFinalReport,
     execution_target: Option<&SupervisorExecutionTarget>,

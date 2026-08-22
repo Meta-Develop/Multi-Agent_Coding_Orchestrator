@@ -20,7 +20,7 @@
   "claim_tokens": [],
   "semantic_intent_tokens": [],
   "role_economics_profile": {
-    "schema_version": 5,
+    "schema_version": 6,
     "name": "schema-fixture-profile",
     "evidence": "synthetic fixture evidence",
     "evidence_notice": "fixture only",
@@ -112,6 +112,7 @@
       },
       "assignment_effort_bindings": [],
       "budget_degradations": [],
+      "assignment_selection_ledger": [],
       "usage": {
         "total_usage": {
           "input_tokens": 0,

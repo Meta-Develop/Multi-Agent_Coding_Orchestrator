@@ -107,6 +107,82 @@ pub(super) fn initialize_orchestration_event_journal(
     }
 }
 
+pub(super) fn write_boundary_refs(paths: &[PathBuf]) -> Vec<String> {
+    paths.iter().map(|path| serializable_path(path)).collect()
+}
+
+pub(super) fn assignment_scope_ref(assignment_id: &str) -> String {
+    format!("assignment:{assignment_id}")
+}
+
+pub(super) fn run_scope_ref(run_id: &str) -> String {
+    format!("run:{run_id}")
+}
+
+pub(super) fn worker_scope_ref(worker_id: &str) -> String {
+    format!("worker:{worker_id}")
+}
+
+pub(super) fn record_supervision_spawn_payload(
+    child_agent_id: &str,
+    parent_agent_id: &str,
+    role: OrchestrationRole,
+    legacy_role: &str,
+    write_boundary: Vec<String>,
+    scope_ref: &str,
+    mut payload: Value,
+) -> Result<Value> {
+    let edge = SupervisionEdgeRecord::new(
+        child_agent_id,
+        parent_agent_id,
+        role,
+        legacy_role,
+        write_boundary,
+        scope_ref,
+    )?;
+    insert_supervision_edge(&mut payload, &edge)?;
+    Ok(payload)
+}
+
+pub(super) fn record_gate_ownership(
+    journal: &mut Option<OrchestrationEventJournal>,
+    writer: &mut ArtifactRunWriter,
+    node: &str,
+    parent: Option<&str>,
+    role: OrchestrationRole,
+    record: &GateOwnershipRecord,
+) {
+    match gate_ownership_payload(record) {
+        Ok(payload) => record_orchestration_event(
+            journal,
+            writer,
+            node,
+            parent,
+            role,
+            OrchestrationEventKind::Gate,
+            payload,
+        ),
+        Err(error) => tracing::warn!(
+            error = %error,
+            node,
+            "refused to append malformed gate-ownership ledger record"
+        ),
+    }
+}
+
+pub(super) fn record_shared_gate_ownership(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    node: &str,
+    parent: Option<&str>,
+    role: OrchestrationRole,
+    record: GateOwnershipRecord,
+) -> Result<()> {
+    with_supervisor_artifacts(artifacts, |writer, journal| {
+        record_gate_ownership(journal, writer, node, parent, role, &record);
+        Ok(())
+    })
+}
+
 pub(super) fn record_orchestration_event(
     journal: &mut Option<OrchestrationEventJournal>,
     writer: &mut ArtifactRunWriter,
@@ -116,6 +192,7 @@ pub(super) fn record_orchestration_event(
     kind: OrchestrationEventKind,
     payload: Value,
 ) {
+    append_phase_heartbeat(writer, node, kind, &payload);
     let Some(active_journal) = journal.as_mut() else {
         return;
     };
@@ -130,6 +207,72 @@ pub(super) fn record_orchestration_event(
             "disabled supervise orchestration event journal after append failure"
         );
         *journal = None;
+    }
+}
+
+fn append_phase_heartbeat(
+    writer: &mut ArtifactRunWriter,
+    node: &str,
+    kind: OrchestrationEventKind,
+    payload: &Value,
+) {
+    match kind {
+        OrchestrationEventKind::Spawn
+        | OrchestrationEventKind::Status
+        | OrchestrationEventKind::Gate
+        | OrchestrationEventKind::Accept
+        | OrchestrationEventKind::Reject
+        | OrchestrationEventKind::Escalate => {}
+        OrchestrationEventKind::Journal | OrchestrationEventKind::Claim => return,
+    }
+    let status = payload
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            payload
+                .get("success")
+                .and_then(Value::as_bool)
+                .map(|success| {
+                    if success {
+                        "ok".to_string()
+                    } else {
+                        "failed".to_string()
+                    }
+                })
+        })
+        .unwrap_or_else(|| heartbeat_kind_status(kind).to_string());
+    crate::run_ops::append_run_heartbeat_best_effort(
+        writer,
+        heartbeat_kind_name(kind),
+        Some(node.to_string()),
+        status,
+        None,
+    );
+}
+
+fn heartbeat_kind_name(kind: OrchestrationEventKind) -> &'static str {
+    match kind {
+        OrchestrationEventKind::Spawn => "spawn",
+        OrchestrationEventKind::Status => "status",
+        OrchestrationEventKind::Gate => "gate",
+        OrchestrationEventKind::Accept => "accept",
+        OrchestrationEventKind::Reject => "reject",
+        OrchestrationEventKind::Escalate => "escalate",
+        OrchestrationEventKind::Journal => "journal",
+        OrchestrationEventKind::Claim => "claim",
+    }
+}
+
+fn heartbeat_kind_status(kind: OrchestrationEventKind) -> &'static str {
+    match kind {
+        OrchestrationEventKind::Spawn => "started",
+        OrchestrationEventKind::Accept => "accepted",
+        OrchestrationEventKind::Reject => "rejected",
+        OrchestrationEventKind::Escalate => "escalated",
+        OrchestrationEventKind::Gate => "gate",
+        OrchestrationEventKind::Status => "ok",
+        OrchestrationEventKind::Journal | OrchestrationEventKind::Claim => "ok",
     }
 }
 
@@ -312,6 +455,57 @@ pub(super) fn record_worker_journal_events(
             WorkerExecutionJournalStatus::Missing => ("missing", None, None),
             WorkerExecutionJournalStatus::Invalid(error) => ("invalid", None, Some(error.as_str())),
         };
+        let write_boundary = assignment
+            .worker_assignments
+            .iter()
+            .find(|worker| worker.id == *worker_id)
+            .map(|worker| write_boundary_refs(&worker.assigned_paths))
+            .unwrap_or_default();
+        match record_supervision_spawn_payload(
+            worker_id,
+            &assignment.id,
+            OrchestrationRole::Worker,
+            "worker",
+            write_boundary,
+            &worker_scope_ref(worker_id),
+            json!({}),
+        ) {
+            Ok(payload) => record_orchestration_event(
+                journal,
+                writer,
+                worker_id,
+                Some(&assignment.id),
+                OrchestrationRole::Worker,
+                OrchestrationEventKind::Spawn,
+                payload,
+            ),
+            Err(error) => tracing::warn!(
+                error = %error,
+                worker_id,
+                "refused to append malformed worker supervision-edge record"
+            ),
+        }
+        match GateOwnershipRecord::assign(
+            worker_id,
+            &assignment.id,
+            OrchestrationRole::Orchestrator,
+            "child_orchestrator",
+            "initial_parent_gate",
+        ) {
+            Ok(record) => record_gate_ownership(
+                journal,
+                writer,
+                &assignment.id,
+                None,
+                OrchestrationRole::Orchestrator,
+                &record,
+            ),
+            Err(error) => tracing::warn!(
+                error = %error,
+                worker_id,
+                "refused to append malformed worker gate-ownership record"
+            ),
+        }
         record_orchestration_event(
             journal,
             writer,

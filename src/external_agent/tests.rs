@@ -1703,6 +1703,7 @@ fn environment_preflight_uses_the_target_runtime_context() {
         run_id: "run-31".to_string(),
         task_id: "task-31".to_string(),
         repo: PathBuf::from("/registry"),
+        parent: None,
     };
     let prepared = with_external_runtime_context(
         ProcessSpec::direct(

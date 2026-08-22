@@ -101,6 +101,10 @@ pub struct AutopilotRunOptions {
     pub codex_bin: Option<PathBuf>,
     pub reviewer_command: Option<String>,
     pub allow_dirty_primary: bool,
+    /// Launch-only override for a live same-repository supervise/autopilot
+    /// collision. Grants no authority to kill, interrupt, revert, or discard
+    /// another run.
+    pub allow_live_run_collision: bool,
     /// Maximum supervisor-plan child dispatches admitted across the source plan and generated
     /// follow-up plans. `None` preserves the unbounded behavior of existing callers.
     pub max_child_dispatches: Option<usize>,
@@ -392,6 +396,87 @@ pub enum AutopilotRunStatus {
     Cancelled,
 }
 
+fn persist_autopilot_launch_preflight(
+    writer: &mut ArtifactRunWriter,
+    repo: &Path,
+    options: &AutopilotRunOptions,
+    collision: &crate::run_ops::LiveRunCollisionReport,
+) -> Result<()> {
+    let runtime = if options.codex_bin.is_some() {
+        "codex"
+    } else {
+        "fake"
+    };
+    let spec = crate::run_ops::LaunchPreflightSpec {
+        family: RunArtifactFamily::Autopilot,
+        run_id: options.run_id.clone(),
+        runtime: runtime.to_string(),
+        runtime_bin: options.codex_bin.clone(),
+        allow_dirty_primary: options.allow_dirty_primary,
+        allow_live_run_collision: options.allow_live_run_collision,
+    };
+    crate::run_ops::persist_launch_preflight(writer, repo, &spec, collision)?;
+    Ok(())
+}
+
+fn finalize_autopilot_run_artifacts(
+    mut writer: ArtifactRunWriter,
+    report: &AutopilotFinalReport,
+    publish_requested: bool,
+) -> Result<()> {
+    crate::run_ops::append_run_heartbeat_best_effort(
+        &mut writer,
+        "finalizing",
+        None,
+        if report.success { "ok" } else { "failed" },
+        None,
+    );
+    crate::run_ops::write_operator_summary(
+        &mut writer,
+        &render_autopilot_operator_summary(report),
+    )?;
+    write_private_json(&mut writer, "final-report.json", report)?;
+    writer.finalize("final-report.json", publish_requested)?;
+    Ok(())
+}
+
+fn render_autopilot_operator_summary(report: &AutopilotFinalReport) -> String {
+    let status = match report.status {
+        AutopilotRunStatus::Succeeded => "succeeded",
+        AutopilotRunStatus::Failed => "failed",
+        AutopilotRunStatus::Refused => "refused",
+        AutopilotRunStatus::Cancelled => "cancelled",
+    };
+    let supervisor = report.supervisor.as_ref().map(|supervisor| {
+        format!(
+            "- Supervisor `{}`: success={} accepted={} rejected={}",
+            supervisor.run_id.as_str(),
+            supervisor.success,
+            supervisor.accepted,
+            supervisor.rejected
+        )
+    });
+    let mut lines = vec![
+        format!("# Autopilot run {}", report.run_id.as_str()),
+        String::new(),
+        format!("- Status: {status}"),
+        format!("- Success: {}", report.success),
+        format!("- Attempts: {}", report.attempt_count),
+        String::new(),
+    ];
+    if let Some(supervisor) = supervisor {
+        lines.push("## Supervisor".to_string());
+        lines.push(String::new());
+        lines.push(supervisor);
+        lines.push(String::new());
+    }
+    lines.push("## Next action".to_string());
+    lines.push(String::new());
+    lines.push(report.next_action.clone());
+    lines.push(String::new());
+    lines.join("\n")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AutopilotArtifactPaths {
     pub plan: PathBuf,
@@ -510,6 +595,12 @@ pub struct AutopilotStatusReport {
     pub run_id: RunId,
     pub run_dir: PathBuf,
     pub artifacts: AutopilotArtifactStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat: Option<crate::run_ops::HeartbeatRecord>,
+    #[serde(default)]
+    pub heartbeat_count: usize,
+    #[serde(default)]
+    pub operator_summary_exists: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_report: Option<Value>,
 }
@@ -1087,6 +1178,16 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     let source_dispatch_started = AtomicBool::new(false);
 
     let repo = discover_repo_root(&options.repo)?;
+    let collision = crate::run_ops::refuse_live_run_collision(
+        &repo,
+        RunArtifactFamily::Autopilot,
+        &options.run_id,
+        options.allow_live_run_collision,
+    )?;
+    let _process_registration =
+        crate::run_ops::register_current_supervisor_process(&repo, "autopilot", &options.run_id)
+            .ok()
+            .flatten();
     let source_is_goal_derived = matches!(&source, AutopilotRunSource::GoalSpec { .. });
     let LoadedAutopilotPlan {
         plan,
@@ -1137,6 +1238,14 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         options.run_id.clone(),
         "autopilot",
     )?;
+    persist_autopilot_launch_preflight(&mut artifact_writer, &repo, &options, &collision)?;
+    crate::run_ops::append_run_heartbeat_best_effort(
+        &mut artifact_writer,
+        "initialized",
+        None,
+        "ok",
+        None,
+    );
     let run_dir = artifact_writer.run_dir().to_path_buf();
     if let Some(derived_supervisor_plan) = &derived_supervisor_plan {
         write_private_json(
@@ -1173,8 +1282,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             auto_merge_requested: plan.auto_merge,
             generated_follow_up_dispatch_performed: false,
         });
-        write_private_json(&mut artifact_writer, "final-report.json", &report)?;
-        artifact_writer.finalize("final-report.json", false)?;
+        finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
         return Ok(report);
     }
 
@@ -1217,8 +1325,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             auto_merge_requested: plan.auto_merge,
             generated_follow_up_dispatch_performed: false,
         });
-        write_private_json(&mut artifact_writer, "final-report.json", &report)?;
-        artifact_writer.finalize("final-report.json", false)?;
+        finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
         return Ok(report);
     }
 
@@ -1286,8 +1393,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             auto_merge_requested: plan.auto_merge,
             generated_follow_up_dispatch_performed: false,
         });
-        write_private_json(&mut artifact_writer, "final-report.json", &report)?;
-        artifact_writer.finalize("final-report.json", false)?;
+        finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
         return Ok(report);
     }
     let (codex_bin, runtime) = match options.codex_bin {
@@ -1321,6 +1427,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         // Autopilot's own authenticated artifacts are local runtime state. The
         // outer typed dirty-primary gate already handled operator worktree state.
         allow_dirty_primary: true,
+        allow_live_run_collision: options.allow_live_run_collision,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides,
         budget_max_duration_seconds,
@@ -1542,8 +1649,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 auto_merge_requested: plan.auto_merge,
                 generated_follow_up_dispatch_performed,
             });
-            write_private_json(&mut artifact_writer, "final-report.json", &report)?;
-            artifact_writer.finalize("final-report.json", false)?;
+            finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
             return Ok(report);
         }
     };
@@ -1633,8 +1739,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         auto_merge_requested: plan.auto_merge,
         generated_follow_up_dispatch_performed,
     });
-    write_private_json(&mut artifact_writer, "final-report.json", &report)?;
-    artifact_writer.finalize("final-report.json", false)?;
+    finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
     Ok(report)
 }
 
@@ -1701,8 +1806,7 @@ fn run_autopilot_plan_file_disabled_legacy(
             auto_merge_requested: plan.auto_merge,
             generated_follow_up_dispatch_performed: false,
         });
-        write_private_json(&mut artifact_writer, "final-report.json", &report)?;
-        artifact_writer.finalize("final-report.json", false)?;
+        finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
         return Ok(report);
     }
 
@@ -1782,6 +1886,7 @@ fn run_autopilot_plan_file_disabled_legacy(
             // Autopilot already ran the real primary-change preflight; nested
             // supervise should not reject autopilot's own runtime artifacts.
             allow_dirty_primary: true,
+            allow_live_run_collision: options.allow_live_run_collision,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: options.budget_overrides,
             budget_max_duration_seconds: options.budget_max_duration_seconds,
@@ -2018,7 +2123,6 @@ fn run_autopilot_plan_file_disabled_legacy(
         auto_merge_requested: plan.auto_merge,
         generated_follow_up_dispatch_performed: false,
     });
-    write_private_json(&mut artifact_writer, "final-report.json", &report)?;
     let publish_requested = publish_requested_for_audit(
         real_runtime_requested,
         plan.forge_mode,
@@ -2027,7 +2131,7 @@ fn run_autopilot_plan_file_disabled_legacy(
             .iter()
             .any(|attempt| attempt.publication_attempted),
     );
-    artifact_writer.finalize("final-report.json", publish_requested)?;
+    finalize_autopilot_run_artifacts(artifact_writer, &report, publish_requested)?;
     Ok(report)
 }
 
@@ -2041,10 +2145,17 @@ pub fn autopilot_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<Autopil
             (artifact_status(&reader), final_report)
         }
     };
+    let absolute_run_dir = repo
+        .join(RunArtifactFamily::Autopilot.run_root())
+        .join(run_id.as_str());
+    let heartbeats = crate::run_ops::read_heartbeat_ledger(&absolute_run_dir).unwrap_or_default();
     Ok(AutopilotStatusReport {
         run_dir: public_run_dir().join(run_id.as_str()),
         run_id,
         artifacts,
+        last_heartbeat: heartbeats.last().cloned(),
+        heartbeat_count: heartbeats.len(),
+        operator_summary_exists: crate::run_ops::operator_summary_exists(&absolute_run_dir),
         final_report,
     })
 }
