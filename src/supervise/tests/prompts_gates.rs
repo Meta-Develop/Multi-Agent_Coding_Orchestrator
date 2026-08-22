@@ -556,6 +556,7 @@ fn gate_terminal_append_failure_retains_active_denial_without_false_outcome() {
 
 #[test]
 fn safe_claim_conflict_narrows_scope_before_child_launch() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     fs::write(repo_path.join("FREE.md"), "free\n").expect("write free path");
     commit_injected_repository(&repo_path, "add free path");
@@ -623,6 +624,7 @@ fn safe_claim_conflict_narrows_scope_before_child_launch() {
 
 #[test]
 fn validation_gate_reenters_child_with_injection_safe_prompt_and_journal() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment.clone(), 0);
@@ -713,6 +715,7 @@ fn validation_gate_reenters_child_with_injection_safe_prompt_and_journal() {
 
 #[test]
 fn repeated_validation_denial_uses_one_correlation_across_prompts_and_journal() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment.clone(), 0);
@@ -879,6 +882,7 @@ fn primary_integrity_failure_dominates_validation_retry() {
 
 #[test]
 fn auditor_rejection_reenters_child_and_parent_auditor() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
@@ -949,6 +953,7 @@ fn auditor_rejection_reenters_child_and_parent_auditor() {
 
 #[test]
 fn repeated_auditor_denial_uses_one_correlation_across_prompts_and_journal() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);

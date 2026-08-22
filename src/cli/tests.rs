@@ -761,6 +761,7 @@ fn merge_auto_reap_is_default_off_and_apply_requires_classification() {
 
 #[test]
 fn merge_apply_json_delivers_unclaimed_edits_denial_to_integration_controller() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo_path = temp.path().join("repo");
     WorktreeManager::init_repository(&repo_path, "main").expect("init repository");
@@ -880,6 +881,7 @@ fn merge_apply_json_delivers_unclaimed_edits_denial_to_integration_controller() 
 
 #[test]
 fn merge_apply_auto_reap_waits_for_trunk_then_reaps_on_finalization_rerun() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo_path = temp.path().join("repo");
     WorktreeManager::init_repository(&repo_path, "main").expect("init repository");
@@ -1114,6 +1116,7 @@ fn completion_reap_skips_when_no_managed_worktrees_exist() {
 
 #[test]
 fn completion_reap_removes_merged_and_preserves_unmerged_and_dirty_worktrees() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let signature = init_committed_repo(&repo_path);

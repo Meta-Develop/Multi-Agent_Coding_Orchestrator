@@ -109,6 +109,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn acquire_fails_closed_when_the_primary_repository_is_dirty() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let (repo_path, manager) = clean_repo(&temp).expect("clean repo");
         fs::write(repo_path.join("README.md"), "dirty\n").expect("dirty");
@@ -123,6 +124,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn capability_bound_create_succeeds_on_a_clean_repository() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let (_, manager) = clean_repo(&temp).expect("clean repo");
         let capability =
@@ -145,6 +147,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn public_create_without_the_capability_still_fails_closed() {
+        skip_without_containment!();
         let dirty = TempDir::new().expect("tempdir");
         let (dirty_repo, dirty_manager) = clean_repo(&dirty).expect("clean repo");
         fs::write(dirty_repo.join("README.md"), "dirty\n").expect("dirty");

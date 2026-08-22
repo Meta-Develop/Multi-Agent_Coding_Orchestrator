@@ -89,6 +89,7 @@ impl Drop for IsolatedLicensedAutopilot {
 #[cfg(target_os = "linux")]
 #[test]
 fn isolated_licensed_autopilot_fixture_disables_split_index_and_unique_run_ids() {
+    skip_without_containment!();
     let first = IsolatedLicensedAutopilot::new("isolation-probe");
     let first_name = first.run_name.clone();
     let split_index = crate::git_repository::open(&first.repo)
@@ -1265,11 +1266,12 @@ fn assert_pre_dispatch_autopilot_cleanup(
 #[cfg(target_os = "linux")]
 #[test]
 fn autopilot_max_zero_refuses_source_before_any_dispatch_and_leaves_no_state() {
+    skip_without_containment!();
     let fixture = IsolatedLicensedAutopilot::new("autopilot-max-zero-source-refused");
     let repo = &fixture.repo;
     let run_name = fixture.run_name.as_str();
     let source_run_id = RunId::new(format!("{run_name}-supervise")).expect("bounded source run id");
-    let primary_before = supervise::verified_whole_primary_snapshot_sha256(&repo)
+    let primary_before = supervise::verified_whole_primary_snapshot_sha256(repo)
         .expect("capture max-zero Autopilot primary baseline");
     let primary_readme_before =
         fs::read(repo.join("README.md")).expect("read max-zero Autopilot primary bytes");
@@ -1282,7 +1284,7 @@ fn autopilot_max_zero_refuses_source_before_any_dispatch_and_leaves_no_state() {
     let (report, source_child_dispatches, follow_up_child_dispatches) =
         run_injected_licensed_autopilot_cascade_result_with_bounds(
             fixture.temp_path(),
-            &repo,
+            repo,
             run_name,
             Some(0),
             None,
@@ -1309,14 +1311,14 @@ fn autopilot_max_zero_refuses_source_before_any_dispatch_and_leaves_no_state() {
         "{:#?}",
         observations.borrow()
     );
-    assert_pre_dispatch_autopilot_cleanup(&repo, &report, &source_run_id);
+    assert_pre_dispatch_autopilot_cleanup(repo, &report, &source_run_id);
     assert_eq!(
-        collect_autopilot_run(&repo, report.run_id.clone())
-            .expect("collect max-zero Autopilot run")["status"],
+        collect_autopilot_run(repo, report.run_id.clone()).expect("collect max-zero Autopilot run")
+            ["status"],
         Value::String("refused".to_string())
     );
     assert_eq!(
-        supervise::verified_whole_primary_snapshot_sha256(&repo)
+        supervise::verified_whole_primary_snapshot_sha256(repo)
             .expect("capture max-zero Autopilot final primary"),
         primary_before
     );
@@ -1329,6 +1331,7 @@ fn autopilot_max_zero_refuses_source_before_any_dispatch_and_leaves_no_state() {
 #[cfg(target_os = "linux")]
 #[test]
 fn autopilot_cancellation_after_source_gate_refuses_dispatch_and_finalizes_cancelled() {
+    skip_without_containment!();
     let fixture = IsolatedLicensedAutopilot::new("autopilot-source-gate-cancelled");
     let repo = &fixture.repo;
     let run_name = fixture.run_name.as_str();
@@ -1337,7 +1340,7 @@ fn autopilot_cancellation_after_source_gate_refuses_dispatch_and_finalizes_cance
     let caller_cancellation = ProcessCancellation::new();
     let hook_cancellation = caller_cancellation.clone();
     set_autopilot_profile_callsite_hook(move |_effective| hook_cancellation.cancel());
-    let primary_before = supervise::verified_whole_primary_snapshot_sha256(&repo)
+    let primary_before = supervise::verified_whole_primary_snapshot_sha256(repo)
         .expect("capture source-gate cancellation primary baseline");
     let primary_readme_before =
         fs::read(repo.join("README.md")).expect("read source-gate cancellation primary bytes");
@@ -1350,7 +1353,7 @@ fn autopilot_cancellation_after_source_gate_refuses_dispatch_and_finalizes_cance
     let (report, source_child_dispatches, follow_up_child_dispatches) =
         run_injected_licensed_autopilot_cascade_result_with_bounds(
             fixture.temp_path(),
-            &repo,
+            repo,
             run_name,
             None,
             Some(caller_cancellation.clone()),
@@ -1372,14 +1375,14 @@ fn autopilot_cancellation_after_source_gate_refuses_dispatch_and_finalizes_cance
         "{:#?}",
         observations.borrow()
     );
-    assert_pre_dispatch_autopilot_cleanup(&repo, &report, &source_run_id);
+    assert_pre_dispatch_autopilot_cleanup(repo, &report, &source_run_id);
     assert_eq!(
-        collect_autopilot_run(&repo, report.run_id.clone())
+        collect_autopilot_run(repo, report.run_id.clone())
             .expect("collect source-gate cancelled Autopilot run")["status"],
         Value::String("cancelled".to_string())
     );
     assert_eq!(
-        supervise::verified_whole_primary_snapshot_sha256(&repo)
+        supervise::verified_whole_primary_snapshot_sha256(repo)
             .expect("capture source-gate cancellation final primary"),
         primary_before
     );
@@ -1392,6 +1395,7 @@ fn autopilot_cancellation_after_source_gate_refuses_dispatch_and_finalizes_cance
 #[cfg(target_os = "linux")]
 #[test]
 fn autopilot_source_child_cancellation_propagates_and_cleanly_unwinds() {
+    skip_without_containment!();
     let fixture = IsolatedLicensedAutopilot::new("autopilot-source-child-cancelled");
     let repo = &fixture.repo;
     let run_name = fixture.run_name.as_str();
@@ -1427,7 +1431,7 @@ fn autopilot_source_child_cancellation_propagates_and_cleanly_unwinds() {
         Arc::clone(&source_child_dispatches),
         Arc::clone(&follow_up_child_dispatches),
     );
-    let primary_before = supervise::verified_whole_primary_snapshot_sha256(&repo)
+    let primary_before = supervise::verified_whole_primary_snapshot_sha256(repo)
         .expect("capture cancelling Autopilot primary baseline");
     let primary_readme_before =
         fs::read(repo.join("README.md")).expect("read cancelling Autopilot primary bytes");
@@ -1475,7 +1479,7 @@ fn autopilot_source_child_cancellation_propagates_and_cleanly_unwinds() {
     assert!(source.success, "{source:#?}");
     assert_eq!(source.generated_follow_up_tasks.len(), 1, "{source:#?}");
 
-    let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &report.run_id)
+    let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Autopilot, &report.run_id)
         .expect("open finalized cancelled Autopilot artifacts");
     let cascade = serde_json::from_slice::<supervise::SupervisorCascadeOutcome>(
         &reader
@@ -1490,9 +1494,9 @@ fn autopilot_source_child_cancellation_propagates_and_cleanly_unwinds() {
         cascade.follow_up_environment_failures.is_empty(),
         "{cascade:#?}"
     );
-    assert!(cancelled_cascade_cleanup_completed(&repo, &cascade, true)
+    assert!(cancelled_cascade_cleanup_completed(repo, &cascade, true)
         .expect("classify completed cancellation cleanup"));
-    assert!(!cancelled_cascade_cleanup_completed(&repo, &cascade, false)
+    assert!(!cancelled_cascade_cleanup_completed(repo, &cascade, false)
         .expect("classify cancellation with changed primary worktree"));
     let mut release_failed = cascade.clone();
     release_failed
@@ -1500,7 +1504,7 @@ fn autopilot_source_child_cancellation_propagates_and_cleanly_unwinds() {
         .release_errors
         .push("injected unreleased claim".to_string());
     assert!(
-        !cancelled_cascade_cleanup_completed(&repo, &release_failed, true)
+        !cancelled_cascade_cleanup_completed(repo, &release_failed, true)
             .expect("classify cancellation with failed claim release")
     );
     let mut queue_ambiguous = cascade.clone();
@@ -1510,7 +1514,7 @@ fn autopilot_source_child_cancellation_propagates_and_cleanly_unwinds() {
         .expect("cancelled queue summary for cleanup classification")
         .held_ambiguous_count = 1;
     assert!(
-        !cancelled_cascade_cleanup_completed(&repo, &queue_ambiguous, true)
+        !cancelled_cascade_cleanup_completed(repo, &queue_ambiguous, true)
             .expect("classify cancellation with ambiguous queue item")
     );
     assert_undispatched_generated_follow_up_queue(
@@ -1541,14 +1545,14 @@ fn autopilot_source_child_cancellation_propagates_and_cleanly_unwinds() {
         );
     drop(observations);
 
-    assert_finalized_autopilot_source_cleanup(&repo, &report, &source_run_id);
+    assert_finalized_autopilot_source_cleanup(repo, &report, &source_run_id);
     assert_eq!(
-        collect_autopilot_run(&repo, report.run_id.clone())
+        collect_autopilot_run(repo, report.run_id.clone())
             .expect("collect cancelled Autopilot run")["status"],
         Value::String("cancelled".to_string())
     );
     assert_eq!(
-        supervise::verified_whole_primary_snapshot_sha256(&repo)
+        supervise::verified_whole_primary_snapshot_sha256(repo)
             .expect("capture cancelling Autopilot final primary"),
         primary_before
     );
@@ -1562,11 +1566,12 @@ fn autopilot_source_child_cancellation_propagates_and_cleanly_unwinds() {
 #[cfg(target_os = "linux")]
 #[test]
 fn autopilot_max_child_dispatches_refuses_first_follow_up_before_dispatch_and_releases_claim() {
+    skip_without_containment!();
     let fixture = IsolatedLicensedAutopilot::new("autopilot-max-one-follow-up-refused");
     let repo = &fixture.repo;
     let run_name = fixture.run_name.as_str();
     let source_run_id = RunId::new(format!("{run_name}-supervise")).expect("bounded source run id");
-    let primary_before = supervise::verified_whole_primary_snapshot_sha256(&repo)
+    let primary_before = supervise::verified_whole_primary_snapshot_sha256(repo)
         .expect("capture bounded Autopilot primary baseline");
     let primary_readme_before =
         fs::read(repo.join("README.md")).expect("read bounded Autopilot primary bytes");
@@ -1579,7 +1584,7 @@ fn autopilot_max_child_dispatches_refuses_first_follow_up_before_dispatch_and_re
     let (report, source_child_dispatches, follow_up_child_dispatches) =
         run_injected_licensed_autopilot_cascade_result_with_bounds(
             fixture.temp_path(),
-            &repo,
+            repo,
             run_name,
             Some(1),
             None,
@@ -1611,7 +1616,7 @@ fn autopilot_max_child_dispatches_refuses_first_follow_up_before_dispatch_and_re
         crate::gate_denial::NextSafeOperation::ReviewRunBudgetAndStartNewRun
     );
 
-    let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &report.run_id)
+    let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Autopilot, &report.run_id)
         .expect("open bounded Autopilot artifacts");
     let cascade = serde_json::from_slice::<supervise::SupervisorCascadeOutcome>(
         &reader
@@ -1651,14 +1656,14 @@ fn autopilot_max_child_dispatches_refuses_first_follow_up_before_dispatch_and_re
         observations.borrow()
     );
 
-    assert_finalized_autopilot_source_cleanup(&repo, &report, &source_run_id);
+    assert_finalized_autopilot_source_cleanup(repo, &report, &source_run_id);
     assert_eq!(
-        collect_autopilot_run(&repo, report.run_id.clone()).expect("collect bounded Autopilot run")
+        collect_autopilot_run(repo, report.run_id.clone()).expect("collect bounded Autopilot run")
             ["status"],
         Value::String("refused".to_string())
     );
     assert_eq!(
-        supervise::verified_whole_primary_snapshot_sha256(&repo)
+        supervise::verified_whole_primary_snapshot_sha256(repo)
             .expect("capture bounded Autopilot final primary"),
         primary_before
     );
@@ -1672,6 +1677,7 @@ fn autopilot_max_child_dispatches_refuses_first_follow_up_before_dispatch_and_re
 #[cfg(target_os = "linux")]
 #[test]
 fn autopilot_authenticated_follow_up_dispatch_sets_boolean_after_real_gates() {
+    skip_without_containment!();
     let fixture = IsolatedLicensedAutopilot::new("autopilot-licensed-follow-up-allowed");
     let repo = &fixture.repo;
     let head_before = crate::git_repository::open(repo)
@@ -1693,10 +1699,10 @@ fn autopilot_authenticated_follow_up_dispatch_sets_boolean_after_real_gates() {
     assert!(report.supervisor.as_ref().is_some_and(|source| {
         source.success && source.publishable && source.generated_follow_up_tasks.len() == 1
     }));
-    let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &report.run_id)
+    let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Autopilot, &report.run_id)
         .expect("open injected Autopilot final artifacts");
     assert_eq!(
-        collect_autopilot_run(&repo, report.run_id.clone())
+        collect_autopilot_run(repo, report.run_id.clone())
             .expect("collect completed Autopilot run")["status"],
         Value::String("succeeded".to_string())
     );
@@ -1715,7 +1721,7 @@ fn autopilot_authenticated_follow_up_dispatch_sets_boolean_after_real_gates() {
         1
     );
     assert_eq!(
-        crate::git_repository::open(&repo)
+        crate::git_repository::open(repo)
             .expect("reopen injected Autopilot repository")
             .head()
             .expect("reread injected Autopilot HEAD")
@@ -1729,6 +1735,7 @@ fn autopilot_authenticated_follow_up_dispatch_sets_boolean_after_real_gates() {
 #[cfg(target_os = "linux")]
 #[test]
 fn autopilot_cascade_error_after_authenticated_follow_up_start_never_reports_false() {
+    skip_without_containment!();
     let fixture = IsolatedLicensedAutopilot::new("autopilot-post-authenticated-start-error");
     let repo = &fixture.repo;
     let primary_before = supervise::verified_whole_primary_snapshot_sha256(repo)
@@ -1751,7 +1758,7 @@ fn autopilot_cascade_error_after_authenticated_follow_up_start_never_reports_fal
     assert!(report.primary_worktree_untouched);
     assert!(!report.auto_merge_performed);
     assert!(report.next_action.contains("dispatch started"));
-    let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &report.run_id)
+    let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Autopilot, &report.run_id)
         .expect("open finalized honest post-start Autopilot report");
     let final_report: Value = serde_json::from_slice(
         &reader
@@ -1764,7 +1771,7 @@ fn autopilot_cascade_error_after_authenticated_follow_up_start_never_reports_fal
         Value::Bool(true)
     );
     assert_eq!(
-        supervise::verified_whole_primary_snapshot_sha256(&repo)
+        supervise::verified_whole_primary_snapshot_sha256(repo)
             .expect("capture primary after post-start failure"),
         primary_before
     );
@@ -1774,16 +1781,17 @@ fn autopilot_cascade_error_after_authenticated_follow_up_start_never_reports_fal
 #[cfg(target_os = "linux")]
 #[test]
 fn autopilot_marker_without_child_checkpoint_refuses_a_false_final_report() {
+    skip_without_containment!();
     let fixture = IsolatedLicensedAutopilot::new("autopilot-unobservable-generated-dispatch");
     let repo = &fixture.repo;
     let run_name = fixture.run_name.as_str();
     let run_id = RunId::new(run_name).expect("unobservable Autopilot run id");
-    let primary_before = supervise::verified_whole_primary_snapshot_sha256(&repo)
+    let primary_before = supervise::verified_whole_primary_snapshot_sha256(repo)
         .expect("capture primary before marker-only interruption");
     supervise::set_interrupt_after_follow_up_dispatch_started();
 
     let (report, source_child_dispatches, follow_up_child_dispatches) =
-        run_injected_licensed_autopilot_cascade_result(fixture.temp_path(), &repo, run_name);
+        run_injected_licensed_autopilot_cascade_result(fixture.temp_path(), repo, run_name);
     let error = report.expect_err("marker-only dispatch state must not finalize false");
 
     assert_eq!(source_child_dispatches, 1);
@@ -1795,23 +1803,22 @@ fn autopilot_marker_without_child_checkpoint_refuses_a_false_final_report() {
         "{message}"
     );
     assert!(
-        !crate::artifacts::final_report_path(&repo, RunArtifactFamily::Autopilot, &run_id,)
-            .exists()
+        !crate::artifacts::final_report_path(repo, RunArtifactFamily::Autopilot, &run_id,).exists()
     );
-    assert!(ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &run_id).is_err());
+    assert!(ArtifactRunReader::open(repo, RunArtifactFamily::Autopilot, &run_id).is_err());
     assert!(!repo
         .join(RunArtifactFamily::Autopilot.run_root())
         .join(run_id.as_str())
         .join(ARTIFACT_FINAL_MARKER)
         .exists());
-    let collect_error = collect_autopilot_run(&repo, run_id.clone())
+    let collect_error = collect_autopilot_run(repo, run_id.clone())
         .expect_err("crashed or interrupted Autopilot run must stay uncollectable");
     assert!(
         format!("{collect_error:#}").contains("active or unfinalized"),
         "{collect_error:#}"
     );
     assert_eq!(
-        supervise::verified_whole_primary_snapshot_sha256(&repo)
+        supervise::verified_whole_primary_snapshot_sha256(repo)
             .expect("capture primary after marker-only interruption"),
         primary_before
     );
@@ -1821,6 +1828,7 @@ fn autopilot_marker_without_child_checkpoint_refuses_a_false_final_report() {
 #[cfg(target_os = "linux")]
 #[test]
 fn autopilot_generated_plan_refusal_keeps_dispatch_boolean_false() {
+    skip_without_containment!();
     let fixture = IsolatedLicensedAutopilot::new("autopilot-licensed-follow-up-refused");
     let repo = &fixture.repo;
     supervise::set_before_generated_follow_up_plan_load_hook(|path| {
@@ -1852,7 +1860,7 @@ fn autopilot_generated_plan_refusal_keeps_dispatch_boolean_false() {
             }
         )
     }));
-    let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &report.run_id)
+    let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Autopilot, &report.run_id)
         .expect("open refused injected Autopilot artifacts");
     let cascade = serde_json::from_slice::<supervise::SupervisorCascadeOutcome>(
         &reader
@@ -1871,6 +1879,7 @@ fn autopilot_generated_plan_refusal_keeps_dispatch_boolean_false() {
 #[cfg(target_os = "linux")]
 #[test]
 fn interrupted_autopilot_queue_resumes_through_supervise_without_duplicate_identity() {
+    skip_without_containment!();
     let fixture = IsolatedLicensedAutopilot::new("autopilot-cross-entrypoint-resume");
     let repo = &fixture.repo;
     let run_name = fixture.run_name.as_str();
@@ -1908,13 +1917,13 @@ fn interrupted_autopilot_queue_resumes_through_supervise_without_duplicate_ident
     supervise::set_generated_follow_up_queue_observer(move |observation| {
         observed.borrow_mut().push(observation);
     });
-    let head_before = crate::git_repository::open(&repo)
+    let head_before = crate::git_repository::open(repo)
         .expect("open cross-entrypoint repository")
         .head()
         .expect("read cross-entrypoint HEAD")
         .target()
         .expect("cross-entrypoint HEAD oid");
-    let primary_before = supervise::verified_whole_primary_snapshot_sha256(&repo)
+    let primary_before = supervise::verified_whole_primary_snapshot_sha256(repo)
         .expect("capture cross-entrypoint primary baseline");
 
     supervise::set_interrupt_after_follow_up_enqueue();
@@ -2027,12 +2036,12 @@ fn interrupted_autopilot_queue_resumes_through_supervise_without_duplicate_ident
         started.subordinate_run_ids
     );
     assert_eq!(
-        supervise::verified_whole_primary_snapshot_sha256(&repo)
+        supervise::verified_whole_primary_snapshot_sha256(repo)
             .expect("capture cross-entrypoint final primary"),
         primary_before
     );
     assert_eq!(
-        crate::git_repository::open(&repo)
+        crate::git_repository::open(repo)
             .expect("reopen cross-entrypoint repository")
             .head()
             .expect("reread cross-entrypoint HEAD")
@@ -2106,6 +2115,7 @@ fn repository_binding_rejects_root_swap_after_safety_preflight() {
 
 #[test]
 fn autopilot_rechecks_dirty_primary_immediately_before_supervisor_dispatch() {
+    skip_without_containment!();
     use crate::gate_denial::GateDenialReason;
 
     let temp = tempfile::tempdir().expect("tempdir");
@@ -2180,6 +2190,7 @@ fn autopilot_rechecks_dirty_primary_immediately_before_supervisor_dispatch() {
 
 #[test]
 fn autopilot_reloads_effective_profile_at_call_site_before_starting_supervisor() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = create_committed_autopilot_repo(temp.path());
     let plan_path = temp.path().join("plan.json");
@@ -2300,6 +2311,7 @@ fn public_autopilot_plan_refuses_unsupported_or_malformed_depth_shape() {
 
 #[test]
 fn unsupported_depth_shapes_are_typed_preflight_permission_expansions() {
+    skip_without_containment!();
     use crate::gate_denial::{
         GateDenialReason, GateDenialRoute, GateRetryability, NextSafeOperation,
     };
@@ -2465,6 +2477,7 @@ fn autopilot_plan_input_refuses_symlink_leaf_and_ancestor() {
 
 #[test]
 fn bounded_repository_status_detects_present_deleted_and_untracked_paths() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo, _manager) = create_managed_worktree_fixture(temp.path(), "status-agent");
     assert!(bounded_repository_dirty_paths(&repo)
@@ -2884,6 +2897,7 @@ fn assert_no_remote_publication_state(repo: &Path) {
 
 #[test]
 fn validate_autopilot_plan_refuses_empty_path_proposal() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     git2::Repository::init(repo).expect("init repo");
@@ -3201,6 +3215,7 @@ fn real_publication_rejects_fake_blocking_and_failed_review_before_publish() {
 #[cfg(target_os = "linux")]
 #[test]
 fn empty_validation_refuses_real_publication_before_review_or_publish() {
+    skip_without_containment!();
     let _fixture_guard = lock_prepublication_fixture_test();
     let temp = tempfile::tempdir().expect("tempdir");
     let agent_id = "empty-validation-agent";
@@ -3239,6 +3254,7 @@ fn empty_validation_refuses_real_publication_before_review_or_publish() {
 #[cfg(target_os = "linux")]
 #[test]
 fn review_mutation_changes_binding_and_prevents_publication() {
+    skip_without_containment!();
     let _fixture_guard = lock_prepublication_fixture_test();
     let temp = tempfile::tempdir().expect("tempdir");
     let agent_id = "review-mutation-agent";
@@ -3279,6 +3295,7 @@ fn review_mutation_changes_binding_and_prevents_publication() {
 #[cfg(target_os = "linux")]
 #[test]
 fn fake_forge_with_fake_reviewer_is_local_and_non_authoritative() {
+    skip_without_containment!();
     let _fixture_guard = lock_prepublication_fixture_test();
     let temp = tempfile::tempdir().expect("tempdir");
     let agent_id = "fake-local-agent";
@@ -3435,6 +3452,7 @@ fn publication_hook_report_forge_and_base_mismatch_are_nonretryable() {
 #[cfg(target_os = "linux")]
 #[test]
 fn write_lease_excludes_competing_access_through_review_and_releases_on_error() {
+    skip_without_containment!();
     let _fixture_guard = lock_prepublication_fixture_test();
     let temp = tempfile::tempdir().expect("tempdir");
     let agent_id = "review-lease-agent";
