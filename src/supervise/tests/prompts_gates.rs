@@ -1414,3 +1414,128 @@ fn structured_merge_blocker_routes_only_typed_remediation() {
         assert_eq!(denial.route, GateDenialRoute::IntegrationController);
     }
 }
+
+#[test]
+fn weak_model_mechanical_worker_prompt_contains_lite_constraints() {
+    let assignment = injected_assignment(true);
+    let worker = &assignment.worker_assignments[0];
+    let mut plan = injected_plan(assignment.clone(), 0);
+    plan.role_models.insert(
+        AgentRole::Worker,
+        RoleModelSelection {
+            model: Some(BALANCED_PROFILE_MODEL.to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+        },
+    );
+    let prompt = worker_prompt(
+        &plan,
+        &assignment,
+        worker,
+        Path::new("/tmp/maco-run"),
+        Path::new("/tmp/maco-run/schemas/worker-report.schema.json"),
+    )
+    .expect("render weak mechanical worker prompt");
+
+    assert!(prompt.contains("INSTRUCTION_PROFILE: maco-weak-mechanical-lite-v1"));
+    assert!(prompt.contains("Execute only the assigned mechanical steps"));
+    assert!(prompt.contains("stop and report the block"));
+    assert!(prompt.contains("Discovery, triage, merge, and acceptance decisions are out of scope"));
+    assert!(lite_instruction_profile_applies(
+        AgentRole::Worker,
+        OrchestrationPhase::MechanicalTerminal,
+        Some(BALANCED_PROFILE_MODEL),
+    ));
+}
+
+#[test]
+fn judgment_and_auditor_prompts_do_not_receive_lite_profile() {
+    let assignment = injected_assignment(true);
+    let mut plan = injected_plan(assignment.clone(), 0);
+    for role in [AgentRole::ChildOrchestrator, AgentRole::Auditor] {
+        plan.role_models.insert(
+            role,
+            RoleModelSelection {
+                model: Some(BALANCED_PROFILE_MODEL.to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+    }
+    let auditor = review_auditor_prompt(
+        &plan,
+        &assignment,
+        Path::new("/tmp/maco-run"),
+        Path::new("/tmp/maco-run/schemas/auditor-report.schema.json"),
+    )
+    .expect("render auditor prompt");
+    assert!(
+        !auditor.contains("INSTRUCTION_PROFILE:"),
+        "judgment/auditor prompts must stay hard-excluded from lite"
+    );
+    assert!(!lite_instruction_profile_applies(
+        AgentRole::Auditor,
+        OrchestrationPhase::Audit,
+        Some(BALANCED_PROFILE_MODEL),
+    ));
+    assert!(!budget_degrade_attaches_lite_instruction_profile(
+        AgentRole::Auditor,
+        OrchestrationPhase::Audit,
+        None,
+        ModelCapabilityClass::WeakMechanical,
+    ));
+    assert!(!budget_degrade_attaches_lite_instruction_profile(
+        AgentRole::ChildOrchestrator,
+        OrchestrationPhase::Implementation,
+        None,
+        ModelCapabilityClass::GeneralJudgment,
+    ));
+}
+
+#[test]
+fn unknown_and_weak_models_cannot_take_excluded_phases() {
+    for phase in [
+        OrchestrationPhase::Discovery,
+        OrchestrationPhase::Triage,
+        OrchestrationPhase::Merge,
+        OrchestrationPhase::GateClassification,
+        OrchestrationPhase::ReviewAcceptance,
+        OrchestrationPhase::Audit,
+    ] {
+        assert!(
+            phase.hard_excludes_weak_models(),
+            "{} must exclude weak models",
+            phase.as_str()
+        );
+        assert!(!lite_instruction_profile_applies(
+            AgentRole::Worker,
+            phase,
+            Some(BALANCED_PROFILE_MODEL),
+        ));
+        assert!(!lite_instruction_profile_applies(
+            AgentRole::Auditor,
+            phase,
+            Some("unknown-local-model"),
+        ));
+        let weak = validate_phase_model_binding(
+            AgentRole::ChildOrchestrator,
+            phase,
+            None,
+            ModelCapabilityClass::WeakMechanical,
+        )
+        .expect_err("weak model cannot take excluded phase");
+        assert!(weak.to_string().contains("weak-model binding is forbidden"));
+        let unknown =
+            validate_known_judgment_role_model(AgentRole::Auditor, Some("unknown-local-model"))
+                .expect_err("unknown model cannot take excluded phase");
+        assert!(unknown
+            .to_string()
+            .contains("has no trusted capability policy"));
+        assert!(!budget_degrade_attaches_lite_instruction_profile(
+            AgentRole::Auditor,
+            phase,
+            None,
+            ModelCapabilityClass::WeakMechanical,
+        ));
+    }
+}
