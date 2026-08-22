@@ -2881,6 +2881,34 @@ fn isolated_git_environment_pins_c_locale() {
 }
 
 #[test]
+fn isolated_git_workspace_profile_exposes_primary_common_dir() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    let context = TemporaryIndex::create(repo.commondir()).expect("create isolated index");
+    let common_dir = std::fs::canonicalize(repo.commondir()).expect("canonicalize commondir");
+    let objects = std::fs::canonicalize(common_dir.join("objects")).expect("canonicalize objects");
+    let profile =
+        isolated_git_workspace_profile(&context, &repo_path).expect("isolated git profile");
+    let visible = profile.visible_read_only_roots();
+    assert!(
+        visible.contains(&objects),
+        "isolated git profile must expose the primary object store, got {visible:?}"
+    );
+    assert!(
+        visible.contains(&common_dir),
+        "isolated git profile must expose the primary Git common dir, got {visible:?}"
+    );
+    if let Ok(sensitive) = crate::artifacts::state_auth::sensitive_state_root(&common_dir) {
+        assert!(
+            profile.hidden_roots().contains(&sensitive),
+            "isolated git profile must hide repository sensitive state"
+        );
+    }
+}
+
+#[test]
 fn validation_reports_accept_external_and_summary_shapes() {
     let value = serde_json::json!({
         "agents": [

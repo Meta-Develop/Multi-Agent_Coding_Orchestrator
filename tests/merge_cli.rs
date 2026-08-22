@@ -352,7 +352,6 @@ fn merge_apply_rejects_stale_binding_after_agent_candidate_changes() -> Result<(
 }
 
 #[test]
-#[ignore = "candidate snapshot alternates cannot resolve the primary .git/objects inside strict confinement; tracked by #238"]
 fn merge_apply_revalidates_clean_committed_primary_after_candidate_validation() -> Result<()> {
     support::require_containment!(
         "merge_apply_revalidates_clean_committed_primary_after_candidate_validation"
@@ -488,7 +487,6 @@ fn merge_apply_refuses_when_repo_common_lock_is_held() -> Result<()> {
 }
 
 #[test]
-#[ignore = "candidate snapshot alternates cannot resolve the primary .git/objects inside strict confinement; tracked by #238"]
 fn pr_publish_cannot_run_while_merge_apply_validates_candidate() -> Result<()> {
     support::require_containment!("pr_publish_cannot_run_while_merge_apply_validates_candidate");
     let temp = TempDir::new().context("tempdir")?;
@@ -1090,7 +1088,6 @@ fn merge_preview_required_validation_blocks_missing_not_run_and_skipped_evidence
 }
 
 #[test]
-#[ignore = "candidate snapshot alternates cannot resolve the primary .git/objects inside strict confinement; tracked by #238"]
 fn merge_apply_candidate_validation_failure_blocks_before_primary_apply() -> Result<()> {
     support::require_containment!(
         "merge_apply_candidate_validation_failure_blocks_before_primary_apply"
@@ -1144,7 +1141,6 @@ fn merge_apply_candidate_validation_failure_blocks_before_primary_apply() -> Res
 }
 
 #[test]
-#[ignore = "candidate snapshot alternates cannot resolve the primary .git/objects inside strict confinement; tracked by #238"]
 fn merge_apply_rejects_successful_validation_that_mutates_candidate_sandbox() -> Result<()> {
     support::require_containment!(
         "merge_apply_rejects_successful_validation_that_mutates_candidate_sandbox"
@@ -1188,7 +1184,6 @@ fn merge_apply_rejects_successful_validation_that_mutates_candidate_sandbox() ->
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "candidate snapshot alternates cannot resolve the primary .git/objects inside strict confinement; tracked by #238"]
 fn merge_apply_kills_setsid_validation_descendant_before_accepting_success() -> Result<()> {
     support::require_containment!(
         "merge_apply_kills_setsid_validation_descendant_before_accepting_success"
@@ -1240,7 +1235,6 @@ fn merge_apply_kills_setsid_validation_descendant_before_accepting_success() -> 
 }
 
 #[test]
-#[ignore = "candidate snapshot alternates cannot resolve the primary .git/objects inside strict confinement; tracked by #238"]
 fn merge_apply_rejects_successful_validation_that_mutates_initialized_submodule() -> Result<()> {
     support::require_containment!(
         "merge_apply_rejects_successful_validation_that_mutates_initialized_submodule"
