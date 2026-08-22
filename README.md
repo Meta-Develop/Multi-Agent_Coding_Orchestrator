@@ -992,8 +992,11 @@ cargo run -- consult ask \
 
 Claude consultant mode is currently refused before launch because MACO cannot
 enforce an equivalent inner read-only permission contract. Supplying an
-executable does not weaken that refusal. The command form below demonstrates
-the expected fail-closed response; it does not launch Claude.
+executable does not weaken that refusal. Selecting `runtime: claude-code` or
+`runtime: gemini-cli` on a supervise assignment is accepted, but writable
+worker or supervisor launch stays refused until the adapter hosts
+`blocking_pre_action_callback == All`. The command form below demonstrates
+the expected fail-closed consultant response; it does not launch Claude.
 
 ```bash
 cargo run -- consult ask \

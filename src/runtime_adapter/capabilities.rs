@@ -103,6 +103,20 @@ impl AdapterId {
         }
     }
 
+    /// ReadWrite launch gate consulted before a child starts.
+    ///
+    /// Grok and Cursor already ship as unverified leaf workers. Claude and
+    /// Gemini stay refused so a selectable runtime does not become a fake
+    /// writable worker or supervisor. Once
+    /// [`RuntimeCapabilities::admits_writable_release`] is true, this returns
+    /// `None` and the existing adapter launch path can proceed.
+    pub const fn writable_leaf_launch_refusal(self) -> Option<&'static str> {
+        if matches!(self, Self::Grok | Self::Cursor) {
+            return None;
+        }
+        self.capabilities().writable_refusal()
+    }
+
     pub const fn capabilities(self) -> RuntimeCapabilities {
         match self {
             Self::Codex => RuntimeCapabilities::CODEX,
@@ -363,7 +377,8 @@ impl RuntimeCapabilities {
 
     pub const CLAUDE_CODE: Self = Self {
         // `--permission-mode` and PreToolUse hooks exist on the CLI, but this
-        // adapter does not yet host a blocking MACO callback.
+        // adapter does not yet host a blocking MACO callback. Selectable
+        // supervise admission must not start a writable child.
         blocking_pre_action_callback: BlockingPreActionCallback::None,
         writable_workspace: WorkspaceWritability::Partial,
         side_effect_confinement: SideEffectConfinement::Unverified,
@@ -645,6 +660,40 @@ mod tests {
             Some("blocking_pre_action_callback != All")
         );
         assert!(!RuntimeCapabilities::CLAUDE_CODE.admits_writable_release());
+        assert_eq!(
+            AdapterId::ClaudeCode.writable_leaf_launch_refusal(),
+            Some("blocking_pre_action_callback != All")
+        );
+        assert_eq!(
+            AdapterId::GeminiCli.writable_leaf_launch_refusal(),
+            Some("blocking_pre_action_callback != All")
+        );
+        assert_eq!(AdapterId::Grok.writable_leaf_launch_refusal(), None);
+        assert_eq!(AdapterId::Cursor.writable_leaf_launch_refusal(), None);
+    }
+
+    #[test]
+    fn hosted_blocking_callback_is_the_only_writable_release_admission() {
+        let admitted = RuntimeCapabilities {
+            blocking_pre_action_callback: BlockingPreActionCallback::All,
+            writable_workspace: WorkspaceWritability::Supported,
+            side_effect_confinement: SideEffectConfinement::Verified,
+            model_catalog: ModelCatalogSource::OperatorDeclared,
+            usage_reporting: UsageReporting::None,
+            session_resume: SessionResume::Supported,
+        };
+        assert_eq!(admitted.writable_refusal(), None);
+        assert!(admitted.admits_writable_release());
+        assert!(!RuntimeCapabilities::CLAUDE_CODE.admits_writable_release());
+        assert!(!RuntimeCapabilities::GEMINI_CLI.admits_writable_release());
+        assert_eq!(
+            RuntimeCapabilities::CLAUDE_CODE.writable_refusal(),
+            Some("blocking_pre_action_callback != All")
+        );
+        assert_eq!(
+            RuntimeCapabilities::GEMINI_CLI.writable_refusal(),
+            Some("blocking_pre_action_callback != All")
+        );
     }
 
     #[test]
