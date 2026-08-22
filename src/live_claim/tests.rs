@@ -1642,3 +1642,80 @@ fn validation_includes_parser_errors_and_duplicate_claim_ids_without_raw_values(
     assert!(!serialized.contains("malformed-secret-timestamp"));
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn apply_accepts_empty_claim_board_lock_with_synthesized_0755() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let directory = claims_dir(temp.path());
+    std::fs::create_dir_all(&directory)?;
+    let lock_path = directory.join(BOARD_LOCK_FILE);
+    std::fs::write(&lock_path, b"")?;
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o755))?;
+
+    let draft = temp.path().join("claim-draft.md");
+    let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
+    std::fs::write(
+        &draft,
+        initial_draft_text(
+            "ntfs-lock",
+            "repro-owner",
+            "active",
+            now.raw(),
+            "src/live_claim.rs",
+        ),
+    )?;
+    let created = apply_with_clock(temp.path(), &draft, "repro-owner", &now)?;
+    assert!(created.created);
+    assert!(directory.join("ntfs-lock.md").exists());
+    assert_eq!(std::fs::read(&lock_path)?, b"");
+    assert_eq!(
+        std::fs::symlink_metadata(&lock_path)?.permissions().mode() & 0o777,
+        0o755
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_rejects_writable_or_nonempty_claim_board_lock() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let directory = claims_dir(temp.path());
+    std::fs::create_dir_all(&directory)?;
+    let draft = temp.path().join("claim-draft.md");
+    let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
+    std::fs::write(
+        &draft,
+        initial_draft_text(
+            "lock-reject",
+            "repro-owner",
+            "active",
+            now.raw(),
+            "src/live_claim.rs",
+        ),
+    )?;
+
+    let lock_path = directory.join(BOARD_LOCK_FILE);
+    std::fs::write(&lock_path, b"")?;
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o775))?;
+    let writable = apply_with_clock(temp.path(), &draft, "repro-owner", &now)
+        .expect_err("group-writable claim board lock must fail");
+    assert!(writable
+        .to_string()
+        .contains("claim board lock is unsafe or unavailable"));
+    assert!(!directory.join("lock-reject.md").exists());
+
+    std::fs::write(&lock_path, b"not-empty")?;
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o755))?;
+    let nonempty = apply_with_clock(temp.path(), &draft, "repro-owner", &now)
+        .expect_err("nonempty claim board lock must fail");
+    assert!(nonempty
+        .to_string()
+        .contains("claim board lock is unsafe or unavailable"));
+    assert!(!directory.join("lock-reject.md").exists());
+    Ok(())
+}

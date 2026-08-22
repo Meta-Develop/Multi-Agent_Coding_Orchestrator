@@ -1684,8 +1684,8 @@ fn open_claims_root(claims_dir: &Path) -> Result<Option<SafeRoot>> {
 }
 
 fn acquire_claim_board_lock(root: &SafeRoot) -> Result<KernelStateLock> {
-    let lock = KernelStateLock::acquire_direct(root, BOARD_LOCK_FILE)
-        .map_err(|_| anyhow::anyhow!("claim board lock is unsafe or unavailable"))?;
+    let lock = KernelStateLock::acquire_direct_empty_coordination(root, BOARD_LOCK_FILE)
+        .map_err(|error| error.context("claim board lock is unsafe or unavailable"))?;
     lock.verify_direct_binding(root)
         .map_err(|_| anyhow::anyhow!("claim board lock binding changed"))?;
     Ok(lock)

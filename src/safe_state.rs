@@ -1852,6 +1852,21 @@ fn take_temp_scavenge_after_quarantine_fault() -> bool {
     false
 }
 
+/// Distinguishes owner-private state locks from the persistent empty
+/// coordination lock used by the live claim board.
+///
+/// `OwnerPrivate` keeps the exact mode `0600` contract for state payloads and
+/// secrets. `EmptyCoordination` still requires no-follow access, current-user
+/// ownership, a regular single-link empty file, no group or world write, no
+/// setuid/setgid bits, stable inode and `flock` handling, and parent binding.
+/// It accepts filesystems that synthesize a non-`0600` mode such as `0755`
+/// after a `0600` creation request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockFilePolicy {
+    OwnerPrivate,
+    EmptyCoordination,
+}
+
 /// A stable lock file guarded by the operating system. The file is never
 /// unlinked on release, so a waiter cannot lock a different inode by racing a
 /// stale-file cleanup path.
@@ -1862,6 +1877,7 @@ pub struct KernelStateLock {
     file_name: OsString,
     identity: FileIdentity,
     root_identity: FileIdentity,
+    policy: LockFilePolicy,
 }
 
 pub(crate) enum ExistingExclusiveLock {
@@ -1894,17 +1910,45 @@ impl KernelStateLock {
         Self::acquire_direct_with_timeout(root, file_name, LOCK_ACQUIRE_TIMEOUT)
     }
 
+    /// Acquires the persistent empty coordination lock used by the live claim
+    /// board. This must not be used for state payloads or secrets.
+    pub(crate) fn acquire_direct_empty_coordination(
+        root: &SafeRoot,
+        file_name: impl AsRef<OsStr>,
+    ) -> Result<Self> {
+        Self::acquire_direct_with_timeout_and_policy(
+            root,
+            file_name,
+            LOCK_ACQUIRE_TIMEOUT,
+            LockFilePolicy::EmptyCoordination,
+        )
+    }
+
     pub(crate) fn acquire_direct_with_timeout(
         root: &SafeRoot,
         file_name: impl AsRef<OsStr>,
         timeout: Duration,
     ) -> Result<Self> {
+        Self::acquire_direct_with_timeout_and_policy(
+            root,
+            file_name,
+            timeout,
+            LockFilePolicy::OwnerPrivate,
+        )
+    }
+
+    fn acquire_direct_with_timeout_and_policy(
+        root: &SafeRoot,
+        file_name: impl AsRef<OsStr>,
+        timeout: Duration,
+        policy: LockFilePolicy,
+    ) -> Result<Self> {
         let file_name = file_name.as_ref();
         validate_single_component(file_name)?;
         root.verify()?;
         let path = root.direct_child(file_name)?;
-        let file = open_stable_private_file_at(root, file_name)?;
-        let identity = verify_open_lock_binding(root, file_name, &file, None, &path)?;
+        let file = open_stable_private_file_at(root, file_name, policy)?;
+        let identity = verify_open_lock_binding(root, file_name, &file, None, &path, policy)?;
         lock_file(&file, &path, timeout)?;
         run_kernel_lock_after_flock_hook(&path);
         let lock = Self {
@@ -1913,6 +1957,7 @@ impl KernelStateLock {
             file_name: file_name.to_os_string(),
             identity,
             root_identity: root.identity().clone(),
+            policy,
         };
         lock.verify_direct_binding(root)?;
         Ok(lock)
@@ -1931,7 +1976,14 @@ impl KernelStateLock {
         let file = open_existing_stable_private_file_at(root, file_name)?.with_context(|| {
             format!("required kernel state lock is missing: {}", path.display())
         })?;
-        let identity = verify_open_lock_binding(root, file_name, &file, None, &path)?;
+        let identity = verify_open_lock_binding(
+            root,
+            file_name,
+            &file,
+            None,
+            &path,
+            LockFilePolicy::OwnerPrivate,
+        )?;
         lock_file(&file, &path, LOCK_ACQUIRE_TIMEOUT)?;
         run_kernel_lock_after_flock_hook(&path);
         let lock = Self {
@@ -1940,6 +1992,7 @@ impl KernelStateLock {
             file_name: file_name.to_os_string(),
             identity,
             root_identity: root.identity().clone(),
+            policy: LockFilePolicy::OwnerPrivate,
         };
         lock.verify_direct_binding(root)?;
         Ok(lock)
@@ -1958,7 +2011,14 @@ impl KernelStateLock {
         let Some(file) = open_existing_stable_private_file_at(root, file_name)? else {
             return Ok(ExistingExclusiveLock::Missing);
         };
-        let identity = verify_open_lock_binding(root, file_name, &file, None, &path)?;
+        let identity = verify_open_lock_binding(
+            root,
+            file_name,
+            &file,
+            None,
+            &path,
+            LockFilePolicy::OwnerPrivate,
+        )?;
         if !try_lock_file_if_idle(&file, &path)? {
             return Ok(ExistingExclusiveLock::Busy);
         }
@@ -1969,6 +2029,7 @@ impl KernelStateLock {
             file_name: file_name.to_os_string(),
             identity,
             root_identity: root.identity().clone(),
+            policy: LockFilePolicy::OwnerPrivate,
         };
         lock.verify_direct_binding(root)?;
         Ok(ExistingExclusiveLock::Acquired(lock))
@@ -2004,8 +2065,15 @@ impl KernelStateLock {
         validate_single_component(file_name)?;
         root.verify()?;
         let path = root.direct_child(file_name)?;
-        let file = open_stable_private_file_at(root, file_name)?;
-        let identity = verify_open_lock_binding(root, file_name, &file, None, &path)?;
+        let file = open_stable_private_file_at(root, file_name, LockFilePolicy::OwnerPrivate)?;
+        let identity = verify_open_lock_binding(
+            root,
+            file_name,
+            &file,
+            None,
+            &path,
+            LockFilePolicy::OwnerPrivate,
+        )?;
         try_lock_file(&file, &path, operation)?;
         run_kernel_lock_after_flock_hook(&path);
         let lock = Self {
@@ -2014,6 +2082,7 @@ impl KernelStateLock {
             file_name: file_name.to_os_string(),
             identity,
             root_identity: root.identity().clone(),
+            policy: LockFilePolicy::OwnerPrivate,
         };
         lock.verify_direct_binding(root)?;
         Ok(lock)
@@ -2040,6 +2109,7 @@ impl KernelStateLock {
             &self.file,
             Some(&self.identity),
             &self.path,
+            self.policy,
         )?;
         if observed != self.identity {
             bail!(
@@ -2093,13 +2163,14 @@ fn verify_open_lock_binding(
     file: &File,
     expected: Option<&FileIdentity>,
     path: &Path,
+    policy: LockFilePolicy,
 ) -> Result<FileIdentity> {
     root.verify()?;
     let descriptor = fstat(file.as_raw_fd())?;
-    validate_private_lock_stat(&descriptor, path)?;
+    validate_lock_stat(&descriptor, path, policy)?;
     let name = c_string(file_name)?;
     let pathname = fstatat_no_follow(root.directory.as_raw_fd(), &name)?;
-    validate_private_lock_stat(&pathname, path)?;
+    validate_lock_stat(&pathname, path, policy)?;
     let descriptor_identity = identity_from_stat(&descriptor);
     let pathname_identity = identity_from_stat(&pathname);
     if descriptor_identity != pathname_identity {
@@ -2125,11 +2196,20 @@ fn verify_open_lock_binding(
     _file: &File,
     _expected: Option<&FileIdentity>,
     path: &Path,
+    _policy: LockFilePolicy,
 ) -> Result<FileIdentity> {
     bail!(
         "descriptor/path lock binding verification is unsupported on this platform: {}",
         path.display()
     )
+}
+
+#[cfg(unix)]
+fn validate_lock_stat(stat: &libc::stat, path: &Path, policy: LockFilePolicy) -> Result<()> {
+    match policy {
+        LockFilePolicy::OwnerPrivate => validate_private_lock_stat(stat, path),
+        LockFilePolicy::EmptyCoordination => validate_empty_coordination_lock_stat(stat, path),
+    }
 }
 
 #[cfg(unix)]
@@ -2141,6 +2221,34 @@ fn validate_private_lock_stat(stat: &libc::stat, path: &Path) -> Result<()> {
     {
         bail!(
             "kernel state lock is not an owner-private single-link regular file: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_empty_coordination_lock_stat(stat: &libc::stat, path: &Path) -> Result<()> {
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || stat.st_nlink != 1
+        || stat.st_uid != unsafe { libc::geteuid() }
+    {
+        bail!(
+            "empty coordination lock is not a current-user single-link regular file: {}",
+            path.display()
+        );
+    }
+    let mode = unsigned_to_u32(stat.st_mode & 0o7777);
+    if mode & 0o022 != 0 || mode & 0o6000 != 0 {
+        bail!(
+            "empty coordination lock has group/world write or special bits {:04o}: {}",
+            mode,
+            path.display()
+        );
+    }
+    if stat.st_size != 0 {
+        bail!(
+            "empty coordination lock must remain empty: {}",
             path.display()
         );
     }
@@ -3451,7 +3559,11 @@ fn open_new_private_file_at(root: &SafeRoot, file_name: &OsStr) -> Result<File> 
 }
 
 #[cfg(unix)]
-fn open_stable_private_file_at(root: &SafeRoot, file_name: &OsStr) -> Result<File> {
+fn open_stable_private_file_at(
+    root: &SafeRoot,
+    file_name: &OsStr,
+    policy: LockFilePolicy,
+) -> Result<File> {
     let name = c_string(file_name)?;
     let exclusive_fd = unsafe {
         libc::openat(
@@ -3491,32 +3603,62 @@ fn open_stable_private_file_at(root: &SafeRoot, file_name: &OsStr) -> Result<Fil
         });
     }
     let file = unsafe { File::from_raw_fd(fd) };
+    let path = root.path().join(file_name);
     let metadata = file.metadata()?;
-    ensure_regular_single_link_metadata(&root.path().join(file_name), &metadata)?;
+    ensure_regular_single_link_metadata(&path, &metadata)?;
     if metadata.uid() != unsafe { libc::geteuid() } {
         bail!(
             "stable lock file is not owned by the current user: {}",
-            root.path().join(file_name).display()
+            path.display()
         );
     }
     let mode = metadata.permissions().mode() & 0o777;
     if created {
         if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
-            return Err(std::io::Error::last_os_error()).with_context(|| {
-                format!(
-                    "failed to set private lock mode on {}",
-                    root.path().join(file_name).display()
-                )
-            });
+            let chmod_error = std::io::Error::last_os_error();
+            if policy != LockFilePolicy::EmptyCoordination {
+                return Err(chmod_error).with_context(|| {
+                    format!("failed to set private lock mode on {}", path.display())
+                });
+            }
         }
-    } else if mode != 0o600 {
+    } else if policy == LockFilePolicy::OwnerPrivate && mode != 0o600 {
         bail!(
             "existing stable lock file has unsafe mode {:04o}; refusing to change it: {}",
             mode,
-            root.path().join(file_name).display()
+            path.display()
         );
     }
+    if policy == LockFilePolicy::EmptyCoordination {
+        validate_empty_coordination_lock_metadata(&path, &file.metadata()?)?;
+    }
     Ok(file)
+}
+
+#[cfg(unix)]
+fn validate_empty_coordination_lock_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    ensure_regular_single_link_metadata(path, metadata)?;
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!(
+            "empty coordination lock is not owned by the current user: {}",
+            path.display()
+        );
+    }
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode & 0o022 != 0 || mode & 0o6000 != 0 {
+        bail!(
+            "empty coordination lock has group/world write or special bits {:04o}: {}",
+            mode,
+            path.display()
+        );
+    }
+    if metadata.len() != 0 {
+        bail!(
+            "empty coordination lock must remain empty: {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 include!("safe_state/part2.rs");

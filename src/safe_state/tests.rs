@@ -557,6 +557,79 @@ fn supported_unix_errno_abi_can_be_cleared_explicitly() {
 
 #[cfg(unix)]
 #[test]
+fn empty_coordination_lock_accepts_synthesized_0755_without_weakening_private_locks() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = SafeRoot::open_or_create_managed(temp.path().join("claims")).expect("managed root");
+    let lock_path = root.path().join("board.lock");
+    fs::write(&lock_path, "").expect("empty lock");
+    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o755)).expect("synthesized mode");
+
+    let lock = KernelStateLock::acquire_direct_empty_coordination(&root, "board.lock")
+        .expect("empty 0755 coordination lock");
+    lock.verify_direct_binding(&root)
+        .expect("0755 empty coordination lock stays bound");
+    drop(lock);
+
+    let error = KernelStateLock::acquire_direct(&root, "board.lock")
+        .expect_err("strict private locks must still reject 0755");
+    let message = error.to_string();
+    assert!(
+        message.contains("unsafe mode") || message.contains("owner-private"),
+        "strict lock error should mention the private-mode contract: {message}"
+    );
+    assert_eq!(
+        fs::symlink_metadata(&lock_path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn empty_coordination_lock_rejects_group_write_and_nonempty_payload() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = SafeRoot::open_or_create_managed(temp.path().join("claims")).expect("managed root");
+
+    let writable = root.path().join("writable.lock");
+    fs::write(&writable, "").expect("empty lock");
+    fs::set_permissions(&writable, fs::Permissions::from_mode(0o775)).expect("group write");
+    let writable_error = KernelStateLock::acquire_direct_empty_coordination(&root, "writable.lock")
+        .expect_err("group-writable coordination lock must fail");
+    assert!(
+        writable_error.to_string().contains("group/world write"),
+        "{}",
+        writable_error
+    );
+
+    let nonempty = root.path().join("nonempty.lock");
+    fs::write(&nonempty, b"payload").expect("nonempty lock");
+    fs::set_permissions(&nonempty, fs::Permissions::from_mode(0o755)).expect("synthesized mode");
+    let nonempty_error = KernelStateLock::acquire_direct_empty_coordination(&root, "nonempty.lock")
+        .expect_err("nonempty coordination lock must fail");
+    assert!(
+        nonempty_error.to_string().contains("must remain empty"),
+        "{}",
+        nonempty_error
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn empty_coordination_lock_verify_accepts_mode_0755_after_create() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = SafeRoot::open_or_create_managed(temp.path().join("claims")).expect("managed root");
+    let lock = KernelStateLock::acquire_direct_empty_coordination(&root, "board.lock")
+        .expect("create coordination lock");
+    fs::set_permissions(lock.path(), fs::Permissions::from_mode(0o755)).expect("synthesize 0755");
+    lock.verify_direct_binding(&root)
+        .expect("verify must accept synthesized 0755 on an empty coordination lock");
+}
+
+#[cfg(unix)]
+#[test]
 fn stable_lock_refuses_unsafe_existing_mode_without_changing_it() {
     let temp = TempDir::new().expect("tempdir");
     let root = SafeRoot::open_or_create(temp.path().join("state")).expect("state root");
