@@ -97,6 +97,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn create_retention_applies_after_new_worktree_creation() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let worktree_root = temp.path().join("worktrees");
@@ -129,6 +130,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn create_size_retention_reserves_the_new_lane_before_reclaiming_older_lanes() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let worktree_root = temp.path().join("worktrees");
@@ -203,6 +205,7 @@
 
     #[test]
     fn gc_full_apply_reports_removal_despite_stale_git_registration() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let worktree_root = temp.path().join("worktrees");
@@ -338,6 +341,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn gc_dry_run_reports_without_removing_worktree_or_target() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let worktree_root = temp.path().join("worktrees");
@@ -1098,6 +1102,7 @@
 
     #[test]
     fn bounded_status_refuses_entry_output_and_time_budget_exhaustion() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -1148,6 +1153,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn bounded_status_ignores_ambient_and_repository_process_helpers() {
+        skip_without_containment!();
         use std::os::unix::fs::PermissionsExt;
 
         struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
@@ -1377,6 +1383,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn bounded_status_scavenges_prior_crash_index_and_symlink_tree() {
+        skip_without_containment!();
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().expect("tempdir");
@@ -1566,6 +1573,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn bounded_status_concurrent_lifecycles_serialize_without_cross_deletion() {
+        skip_without_containment!();
         use std::{sync::mpsc, thread};
 
         let temp = TempDir::new().expect("tempdir");
@@ -3024,6 +3032,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn create_writes_lane_build_config_outside_the_lane_and_gc_does_not_prune_it() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let worktree_root = temp.path().join("worktrees");
@@ -3213,6 +3222,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn lifecycle_requires_explicit_trunk_containment_without_changing_manual_gc() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let root = temp.path().join("worktrees");
@@ -3270,6 +3280,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn lifecycle_retry_supersedes_exact_authenticated_predecessor_despite_retention() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let root = temp.path().join("worktrees");
@@ -3383,6 +3394,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn lifecycle_dry_run_aggregates_worktree_and_explicit_o2_artifact_policy() {
+        skip_without_containment!();
         use std::os::unix::fs::PermissionsExt;
 
         let temp = TempDir::new().expect("tempdir");

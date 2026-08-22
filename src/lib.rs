@@ -1,10 +1,17 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+
+#[cfg(test)]
+#[macro_use]
+mod test_containment;
+
 pub mod agent;
 pub mod agent_lifecycle;
 pub mod artifacts;
 pub mod autopilot;
 pub mod cli;
 pub mod consult;
+#[doc(hidden)]
+pub mod containment_probe;
 pub mod decision_claim;
 pub mod evaluation;
 pub mod evaluation_gate_policy;

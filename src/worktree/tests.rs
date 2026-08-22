@@ -555,6 +555,7 @@ fn neutral_worktree_uses_fresh_default_branch_at_exact_base_without_claim() {
 #[cfg(target_os = "linux")]
 #[test]
 fn neutral_worktree_production_cleanliness_seam_uses_exact_base_without_claim() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -597,6 +598,7 @@ fn neutral_worktree_production_cleanliness_seam_uses_exact_base_without_claim() 
 #[cfg(target_os = "linux")]
 #[test]
 fn repository_cleanliness_capability_creates_clean_managed_worktree() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -640,6 +642,7 @@ fn repository_cleanliness_capability_creates_clean_managed_worktree() {
 #[cfg(target_os = "linux")]
 #[test]
 fn public_create_derives_cleanliness_from_a_clean_repository() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -669,6 +672,7 @@ fn public_create_derives_cleanliness_from_a_clean_repository() {
 #[cfg(target_os = "linux")]
 #[test]
 fn repository_cleanliness_capability_refuses_dirty_primary_before_create() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -703,6 +707,7 @@ fn repository_cleanliness_capability_refuses_dirty_primary_before_create() {
 #[cfg(target_os = "linux")]
 #[test]
 fn repository_cleanliness_capability_rejects_cross_repository_use() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let first_path = temp.path().join("first");
     let second_path = temp.path().join("second");
@@ -738,6 +743,7 @@ fn repository_cleanliness_capability_rejects_cross_repository_use() {
 #[cfg(target_os = "linux")]
 #[test]
 fn repository_cleanliness_capability_rejects_binding_drift() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -1190,6 +1196,7 @@ fn creates_lists_and_removes_worktree() {
 #[cfg(target_os = "linux")]
 #[test]
 fn workspace_sweep_defaults_to_dry_run_and_requires_apply_for_removal() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let workspace = temp.path().join("workspace");
     let repo_path = workspace.join("repo+name");
@@ -1251,6 +1258,7 @@ fn workspace_sweep_defaults_to_dry_run_and_requires_apply_for_removal() {
 #[cfg(target_os = "linux")]
 #[test]
 fn workspace_sweep_discovers_repository_local_worktree_root() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -1286,6 +1294,7 @@ fn workspace_sweep_discovers_repository_local_worktree_root() {
 #[cfg(target_os = "linux")]
 #[test]
 fn repository_local_sweep_uses_primary_hint_despite_stale_lane_metadata() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -1394,6 +1403,7 @@ fn repository_local_dry_run_previews_registered_only_untracked_lane() {
 #[cfg(target_os = "linux")]
 #[test]
 fn workspace_sweep_discovers_direct_child_repo_local_and_managed_roots_once_each() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let workspace = temp.path().join("workspace");
     let repo_path = workspace.join("repo");
@@ -1601,6 +1611,7 @@ fn workspace_sweep_reports_zero_roots_as_a_distinct_discovery_state() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_scopes_managed_bindings_to_the_exact_requested_root() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -1624,6 +1635,7 @@ fn gc_scopes_managed_bindings_to_the_exact_requested_root() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_without_requested_root_preserves_all_authenticated_root_scope() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -1672,6 +1684,7 @@ fn gc_rejects_requested_root_beneath_intermediate_symlink() {
 #[cfg(target_os = "linux")]
 #[test]
 fn workspace_sweep_inspects_repository_and_group_with_maco_prefix() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let workspace = temp.path().join("workspace");
     let repo_path = workspace.join(".maco-repository");
@@ -1734,6 +1747,7 @@ fn workspace_sweep_rejects_symlinked_metadata_root_before_outside_gc() {
 #[cfg(target_os = "linux")]
 #[test]
 fn workspace_sweep_reports_symlinked_group_and_continues_valid_group() {
+    skip_without_containment!();
     use std::os::unix::fs::symlink;
 
     let temp = TempDir::new().expect("tempdir");
@@ -1802,6 +1816,7 @@ fn workspace_sweep_reports_symlinked_group_and_continues_valid_group() {
 #[cfg(target_os = "linux")]
 #[test]
 fn workspace_sweep_continues_after_typed_repository_open_failure() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let workspace = temp.path().join("workspace");
     let repo_path = workspace.join("valid+repo");
@@ -1863,6 +1878,7 @@ fn workspace_sweep_continues_after_typed_repository_open_failure() {
 #[cfg(target_os = "linux")]
 #[test]
 fn workspace_sweep_passes_retention_and_keep_target_options_to_gc() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let workspace = temp.path().join("workspace");
     let repo_path = workspace.join("retained+repo");
@@ -1989,6 +2005,7 @@ fn workspace_sweep_marks_gc_error_as_effectful_failure_without_clean_report() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_removes_finished_clean_worktree_and_keeps_branch() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -2014,6 +2031,7 @@ fn gc_removes_finished_clean_worktree_and_keeps_branch() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_protects_dirty_worktree() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -2040,6 +2058,7 @@ fn gc_protects_dirty_worktree() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_classifies_untracked_only_and_requires_exact_allowlist_for_lane_removal() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -2105,6 +2124,7 @@ fn gc_classifies_untracked_only_and_requires_exact_allowlist_for_lane_removal() 
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_protects_ignored_only_output_until_its_exact_path_is_allowed() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -2140,6 +2160,7 @@ fn gc_protects_ignored_only_output_until_its_exact_path_is_allowed() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_refuses_late_ignored_output_after_reviewed_snapshot() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -2174,6 +2195,7 @@ fn gc_refuses_late_ignored_output_after_reviewed_snapshot() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_ignored_inventory_excludes_large_runtime_categories_before_bounds() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -2239,6 +2261,7 @@ fn gc_rejects_non_exact_untracked_allowlist_paths() {
 #[cfg(unix)]
 #[test]
 fn gc_report_serializes_non_utf8_untracked_paths_losslessly_and_escapes_human_text() {
+    skip_without_containment!();
     use std::os::unix::ffi::OsStringExt;
 
     let temp = TempDir::new().expect("tempdir");
@@ -2354,6 +2377,7 @@ fn gc_protects_active_path_claim_for_agent() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_retention_keeps_newest_and_removes_retained_target() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -2463,6 +2487,7 @@ fn lane_rebuild_cost_sidecar_round_trips_and_ignores_garbage() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_size_retention_keeps_expensive_rebuild_ahead_of_newer_cheap_lane() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -2512,6 +2537,7 @@ fn gc_size_retention_keeps_expensive_rebuild_ahead_of_newer_cheap_lane() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_size_retention_keeps_the_newest_prefix_and_counts_lane_bytes_once() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -2595,6 +2621,7 @@ fn gc_size_retention_keeps_the_newest_prefix_and_counts_lane_bytes_once() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_late_protection_does_not_consume_count_or_size_retention() {
+    skip_without_containment!();
     // Conservative retention bias: a live/dirty hold must not evict an older
     // finished lane. Protected candidates stay off the max_count / size budget.
     let temp = TempDir::new().expect("tempdir");
@@ -2702,6 +2729,7 @@ fn gc_size_measurement_failure_protects_the_lane_without_byte_credit() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_targets_only_reclaims_untracked_lane_target_and_keeps_lane_branch_and_orphan() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -2751,6 +2779,7 @@ fn gc_targets_only_reclaims_untracked_lane_target_and_keeps_lane_branch_and_orph
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_refuses_live_nested_cargo_target_for_full_and_target_only_reclaim() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -2795,6 +2824,7 @@ fn gc_refuses_live_nested_cargo_target_for_full_and_target_only_reclaim() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_refuses_target_replacement_between_probe_and_removal() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -2886,6 +2916,7 @@ fn gc_apply_boundary_maps_file_and_symlink_target_replacements_to_identity_chang
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_unknown_and_live_evidence_protects_every_target_reclaim_path() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -3194,6 +3225,7 @@ fn identity_ancestry_detects_alias_containment_in_both_directions_and_bounds() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_revalidates_tracked_and_unapproved_output_after_liveness() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -3240,6 +3272,7 @@ fn gc_revalidates_tracked_and_unapproved_output_after_liveness() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_target_cleanup_rechecks_dirtiness_after_boundary_liveness() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -3294,6 +3327,7 @@ fn gc_target_cleanup_rechecks_dirtiness_after_boundary_liveness() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_full_removal_reports_final_approved_untracked_paths() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -3332,6 +3366,7 @@ fn gc_full_removal_reports_final_approved_untracked_paths() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_boundary_protection_does_not_consume_count_or_size_retention() {
+    skip_without_containment!();
     // Conservative retention bias: apply-time dirtiness must not spend the
     // budget that would otherwise keep the older finished lane.
     let temp = TempDir::new().expect("tempdir");
@@ -3478,6 +3513,7 @@ fn explicit_force_remove_recovery_still_refuses_live_or_unknown_target() {
 #[cfg(target_os = "linux")]
 #[test]
 fn remove_prepared_gc_recovery_refuses_changed_dirtiness_snapshot() {
+    skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let worktree_root = temp.path().join("worktrees");
@@ -3794,6 +3830,7 @@ fn f3_legacy_digest_round_trips_authenticated_and_remains_ambiguous() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gc_dirtiness_snapshot_preserves_non_utf8_paths_and_detects_exact_change() {
+    skip_without_containment!();
     for changed in [false, true] {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");

@@ -1122,6 +1122,7 @@ fn external_codex_held_file_capability_rejects_replacement_before_resolution() {
 #[cfg(target_os = "linux")]
 #[test]
 fn external_codex_outer_sandbox_enforces_control_and_report_write_boundaries() {
+    skip_without_containment!();
     const CHILD_ENV: &str = "MACO_TEST_EXTERNAL_CODEX_WRITE_BOUNDARY_CHILD";
     const ASSIGNED_PATH_ENV: &str = "MACO_TEST_EXTERNAL_CODEX_ASSIGNED_PATH";
     const REPORT_PATH_ENV: &str = "MACO_TEST_EXTERNAL_CODEX_REPORT_PATH";
@@ -2316,6 +2317,7 @@ fn required_containment_verifies_normal_nonzero_and_timeout_units_empty() {
 #[cfg(target_os = "linux")]
 #[test]
 fn unsupported_path_masking_refuses_before_target_and_leaves_no_residue() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let marker = temp.path().join("target-ran");
     let result = run_process(
@@ -2540,6 +2542,7 @@ fn exact_git_read_roots_do_not_expose_private_tmp_sibling() {
 #[cfg(target_os = "linux")]
 #[test]
 fn strict_target_cannot_launch_sibling_user_unit() {
+    skip_without_containment!();
     if !strict_backend_available_for_tests() {
         return;
     }
@@ -2616,6 +2619,7 @@ fn strict_target_cannot_launch_sibling_user_unit() {
 #[cfg(target_os = "linux")]
 #[test]
 fn strict_target_cannot_create_hardlinks_or_fifos_after_start_gate() {
+    skip_without_containment!();
     if !strict_backend_available_for_tests() {
         return;
     }
@@ -2722,6 +2726,7 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
 #[cfg(target_os = "linux")]
 #[test]
 fn required_containment_kills_setsid_delayed_mutation_with_closed_stdio() {
+    skip_without_containment!();
     if !strict_backend_available_for_tests() {
         return;
     }
@@ -2829,6 +2834,7 @@ fn exhausted_total_budget_returns_typed_setup_timeout_without_starting_target() 
 #[cfg(target_os = "linux")]
 #[test]
 fn strict_runtime_files_ignore_ambient_tmpdir() {
+    skip_without_containment!();
     const CHILD_ENV: &str = "MACO_TEST_AMBIENT_TMP_CHILD";
     if env::var_os(CHILD_ENV).is_some() {
         let ambient = PathBuf::from(env::var_os("MACO_TEST_AMBIENT_TMP_PATH").expect("ambient"));
@@ -3066,6 +3072,7 @@ fn parent_sigkill_after_environment_publish_removes_secret_and_unit() {
 #[cfg(target_os = "linux")]
 #[test]
 fn target_environment_cannot_overwrite_guardian_gate_state() {
+    skip_without_containment!();
     if !strict_backend_available_for_tests() {
         return;
     }
