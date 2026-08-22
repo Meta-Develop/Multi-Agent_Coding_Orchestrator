@@ -9,9 +9,16 @@
 //! Detection is provenance-by-elimination: MACO knows which hunks it produced.
 //! A later change to those hunks that MACO did not produce is human. Commit
 //! authorship is never consulted.
+//!
+//! The first slice attributes one dense implicit outcome row to the originating
+//! policy `DecisionId` and persists it append-only. It does not update a
+//! predictor, router, or other learner.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 
 use super::certification::CertificationResult;
 use super::error::OptimizerError;
@@ -179,6 +186,11 @@ impl OperatorLabel {
         if self.kind.phase() == ObservationPhase::AttentionDependent && !self.attention_observed {
             return Err(OptimizerError::invalid(
                 "attention-dependent operator labels require attention_observed",
+            ));
+        }
+        if self.root_decision_id.is_none() {
+            return Err(OptimizerError::invalid(
+                "operator label must attribute to a root_decision_id",
             ));
         }
         Ok(())
@@ -349,15 +361,97 @@ impl LearnedPolicyOutcome {
     }
 }
 
+/// Dense implicit outcome attributed to one policy decision.
+///
+/// Written even when no negative signal fired. An empty signal list is
+/// censored, never implicit acceptance. There is no `certified` field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttributedDecisionLabel {
+    pub schema_version: u32,
+    pub label_id: OperatorLabelId,
+    pub root_decision_id: DecisionId,
+    pub policy_execution_id: PolicyExecutionId,
+    pub observed_at: TimestampMillis,
+    pub window_closes_at: TimestampMillis,
+    pub window: WindowStatus,
+    pub polarity: SignalPolarity,
+    pub attention_observed: bool,
+    pub excluded_from_model_stats: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusion_reason: Option<String>,
+    #[serde(default)]
+    pub signal_labels: Vec<OperatorLabel>,
+}
+
+impl AttributedDecisionLabel {
+    pub fn validate(&self) -> Result<(), OptimizerError> {
+        if self.schema_version == 0 {
+            return Err(OptimizerError::invalid(
+                "attributed decision label schema_version must be at least 1",
+            ));
+        }
+        if self.signal_labels.is_empty() {
+            if self.polarity != SignalPolarity::Censored {
+                return Err(OptimizerError::invalid(
+                    "dense implicit outcome without signals must be censored",
+                ));
+            }
+        } else if self.polarity != SignalPolarity::Negative {
+            return Err(OptimizerError::invalid(
+                "dense implicit outcome with signals is negative evidence only",
+            ));
+        }
+        for label in &self.signal_labels {
+            label.validate()?;
+            if label.policy_execution_id != self.policy_execution_id {
+                return Err(OptimizerError::invalid(
+                    "signal label policy_execution_id does not match attributed decision",
+                ));
+            }
+            match &label.root_decision_id {
+                Some(decision) if decision == &self.root_decision_id => {}
+                _ => {
+                    return Err(OptimizerError::invalid(
+                        "signal label must attribute to the same root_decision_id",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Append-only ledger of derived labels. Original #159 records stay intact.
+///
+/// Optional JSONL persistence stores dense [`AttributedDecisionLabel`] rows.
+/// Reloading reconstructs both those rows and their nested signal labels.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatorLabelLedger {
     labels: Vec<OperatorLabel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attributed: Vec<AttributedDecisionLabel>,
+    #[serde(skip)]
+    durable_path: Option<PathBuf>,
 }
 
 impl OperatorLabelLedger {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn open_durable(path: impl AsRef<Path>) -> Result<Self, OptimizerError> {
+        let path = path.as_ref().to_path_buf();
+        let attributed = load_attributed_jsonl(&path)?;
+        let mut labels = Vec::new();
+        for record in &attributed {
+            record.validate()?;
+            labels.extend(record.signal_labels.iter().cloned());
+        }
+        Ok(Self {
+            labels,
+            attributed,
+            durable_path: Some(path),
+        })
     }
 
     pub fn append(&mut self, label: OperatorLabel) -> Result<(), OptimizerError> {
@@ -380,12 +474,167 @@ impl OperatorLabelLedger {
         &self.labels
     }
 
+    pub fn attributed(&self) -> &[AttributedDecisionLabel] {
+        &self.attributed
+    }
+
     pub fn for_execution(&self, execution: &PolicyExecutionId) -> Vec<&OperatorLabel> {
         self.labels
             .iter()
             .filter(|label| &label.policy_execution_id == execution)
             .collect()
     }
+
+    pub fn for_decision(&self, decision: &DecisionId) -> Vec<&OperatorLabel> {
+        self.labels
+            .iter()
+            .filter(|label| label.root_decision_id.as_ref() == Some(decision))
+            .collect()
+    }
+
+    pub fn attributed_for_decision(&self, decision: &DecisionId) -> Vec<&AttributedDecisionLabel> {
+        self.attributed
+            .iter()
+            .filter(|record| &record.root_decision_id == decision)
+            .collect()
+    }
+
+    /// Derive signal labels, attribute one dense outcome to `decision_id`,
+    /// and persist that row. Does not update a learner.
+    pub fn attribute_and_persist(
+        &mut self,
+        decision_id: &DecisionId,
+        execution: &CompletedExecution,
+        observation: &OperatorObservation,
+        now: TimestampMillis,
+    ) -> Result<AttributedDecisionLabel, OptimizerError> {
+        require_matching_decision(decision_id, execution)?;
+        let signal_labels = derive_labels(execution, observation, now)?;
+        let polarity = if signal_labels.is_empty() {
+            SignalPolarity::Censored
+        } else {
+            SignalPolarity::Negative
+        };
+        let exclusion_reason = execution
+            .in_run_failure_class
+            .filter(|label| is_non_model_failure(*label))
+            .map(|label| format!("non_model_failure:{label:?}"));
+        let record = AttributedDecisionLabel {
+            schema_version: LABEL_SCHEMA_VERSION,
+            label_id: OperatorLabelId::new(format!(
+                "{}:{}:{}",
+                decision_id,
+                execution.policy_execution_id,
+                now.as_millis()
+            ))?,
+            root_decision_id: decision_id.clone(),
+            policy_execution_id: execution.policy_execution_id.clone(),
+            observed_at: now,
+            window_closes_at: execution.window_closes_at(),
+            window: execution.window_status(now),
+            polarity,
+            attention_observed: observation.attention_observed,
+            excluded_from_model_stats: exclusion_reason.is_some(),
+            exclusion_reason,
+            signal_labels,
+        };
+        record.validate()?;
+        if self
+            .attributed
+            .iter()
+            .any(|existing| existing.label_id == record.label_id)
+            || record.signal_labels.iter().any(|label| {
+                self.labels
+                    .iter()
+                    .any(|existing| existing.label_id == label.label_id)
+            })
+        {
+            return Err(OptimizerError::invalid(format!(
+                "append-only operator ledger already contains {}",
+                record.label_id
+            )));
+        }
+        if let Some(path) = &self.durable_path {
+            append_attributed_jsonl(path, &record)?;
+        }
+        self.labels.extend(record.signal_labels.iter().cloned());
+        self.attributed.push(record.clone());
+        Ok(record)
+    }
+}
+
+fn require_matching_decision(
+    decision_id: &DecisionId,
+    execution: &CompletedExecution,
+) -> Result<(), OptimizerError> {
+    match &execution.root_decision_id {
+        Some(existing) if existing == decision_id => Ok(()),
+        Some(existing) => Err(OptimizerError::invalid(format!(
+            "cannot attribute labels for decision {decision_id} to execution owned by {existing}"
+        ))),
+        None => Err(OptimizerError::invalid(
+            "cannot attribute labels without a root_decision_id on the completed execution",
+        )),
+    }
+}
+
+fn load_attributed_jsonl(path: &Path) -> Result<Vec<AttributedDecisionLabel>, OptimizerError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = File::open(path).map_err(|error| {
+        OptimizerError::invalid(format!("failed to open operator label log: {error}"))
+    })?;
+    let mut records = Vec::new();
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|error| {
+            OptimizerError::invalid(format!("failed to read operator label log: {error}"))
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: AttributedDecisionLabel = serde_json::from_str(&line).map_err(|error| {
+            OptimizerError::invalid(format!(
+                "operator label log line {} is not a valid AttributedDecisionLabel: {error}",
+                index + 1
+            ))
+        })?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn append_attributed_jsonl(
+    path: &Path,
+    record: &AttributedDecisionLabel,
+) -> Result<(), OptimizerError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                OptimizerError::invalid(format!(
+                    "failed to create operator label directory: {error}"
+                ))
+            })?;
+        }
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| {
+            OptimizerError::invalid(format!("failed to append operator label log: {error}"))
+        })?;
+    let line = serde_json::to_string(record).map_err(|error| {
+        OptimizerError::invalid(format!(
+            "failed to serialize attributed decision label: {error}"
+        ))
+    })?;
+    writeln!(file, "{line}").map_err(|error| {
+        OptimizerError::invalid(format!("failed to write operator label log: {error}"))
+    })?;
+    file.flush().map_err(|error| {
+        OptimizerError::invalid(format!("failed to flush operator label log: {error}"))
+    })
 }
 
 /// Derive labels from a local observation. Phase-2 kinds are dropped when
@@ -611,6 +860,7 @@ mod tests {
     use crate::optimizer::ids::CandidateId;
     use crate::optimizer::resources::ResourceVector;
     use crate::optimizer::telemetry::InvocationRecord;
+    use tempfile::TempDir;
 
     fn execution(id: &str, certified: bool, finished_at: u64) -> CompletedExecution {
         CompletedExecution {
@@ -868,5 +1118,205 @@ mod tests {
     #[test]
     fn human_rework_dimension_is_provider_neutral() {
         assert_eq!(human_rework_dimension().as_str(), "human_rework_cost");
+    }
+
+    fn fixup_observation() -> OperatorObservation {
+        OperatorObservation {
+            attention_observed: true,
+            later_changes: vec![PathChange {
+                path: "src/optimizer/online_router.rs".to_string(),
+                produced_by_maco: false,
+            }],
+            ..OperatorObservation::default()
+        }
+    }
+
+    #[test]
+    fn unattributed_label_fails_validation() {
+        let exec = execution("missing-decision", true, 1_000);
+        let mut orphan = exec.clone();
+        orphan.root_decision_id = None;
+        let now = TimestampMillis::from_millis(2_000);
+        let err = derive_labels(
+            &orphan,
+            &OperatorObservation {
+                manual_redispatch: true,
+                ..OperatorObservation::default()
+            },
+            now,
+        )
+        .expect_err("unattributed");
+        assert!(err.to_string().contains("root_decision_id"));
+    }
+
+    #[test]
+    fn attribute_and_persist_binds_decision_and_reloads() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("operator-labels.jsonl");
+        let mut ledger = OperatorLabelLedger::open_durable(&path).expect("open");
+        let exec = execution("persist-1", true, 1_000);
+        let decision = exec.root_decision_id.clone().expect("decision");
+        let now = TimestampMillis::from_millis(2_000);
+        let record = ledger
+            .attribute_and_persist(&decision, &exec, &fixup_observation(), now)
+            .expect("persist");
+
+        assert_eq!(record.root_decision_id, decision);
+        assert_eq!(record.polarity, SignalPolarity::Negative);
+        assert_eq!(ledger.for_decision(&decision).len(), 1);
+        assert_eq!(ledger.attributed_for_decision(&decision).len(), 1);
+        assert!(ledger
+            .for_decision(&decision)
+            .iter()
+            .all(|label| label.root_decision_id.as_ref() == Some(&decision)));
+
+        drop(ledger);
+        let reloaded = OperatorLabelLedger::open_durable(&path).expect("reload");
+        assert_eq!(reloaded.attributed().len(), 1);
+        assert_eq!(
+            reloaded.attributed()[0].root_decision_id.as_str(),
+            decision.as_str()
+        );
+        assert_eq!(reloaded.for_decision(&decision).len(), 1);
+        let json = serde_json::to_value(&reloaded.attributed()[0]).expect("json");
+        assert!(json.get("certified").is_none());
+        assert_eq!(json["root_decision_id"], decision.as_str());
+    }
+
+    #[test]
+    fn dense_outcome_without_signals_is_censored_and_persisted() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("operator-labels.jsonl");
+        let mut ledger = OperatorLabelLedger::open_durable(&path).expect("open");
+        let exec = execution("quiet", true, 1_000);
+        let decision = exec.root_decision_id.clone().expect("decision");
+        let now = TimestampMillis::from_millis(2_000);
+        let record = ledger
+            .attribute_and_persist(
+                &decision,
+                &exec,
+                &OperatorObservation {
+                    attention_observed: true,
+                    ..OperatorObservation::default()
+                },
+                now,
+            )
+            .expect("persist");
+
+        assert_eq!(record.polarity, SignalPolarity::Censored);
+        assert!(record.signal_labels.is_empty());
+        assert_eq!(record.window, WindowStatus::OpenCensored);
+        assert_eq!(ledger.for_decision(&decision).len(), 0);
+        assert_eq!(ledger.attributed_for_decision(&decision).len(), 1);
+        let outcome = learn_outcome(&exec, &[], now);
+        assert!(!outcome.treated_as_positive_implicit_signal());
+    }
+
+    #[test]
+    fn mismatched_or_missing_decision_id_fails_closed() {
+        let mut ledger = OperatorLabelLedger::new();
+        let exec = execution("mismatch", true, 1_000);
+        let now = TimestampMillis::from_millis(2_000);
+        let other = DecisionId::new("dec-other").expect("dec");
+        let err = ledger
+            .attribute_and_persist(&other, &exec, &fixup_observation(), now)
+            .expect_err("mismatch");
+        assert!(err.to_string().contains("cannot attribute"));
+
+        let mut missing = exec.clone();
+        missing.root_decision_id = None;
+        let err = ledger
+            .attribute_and_persist(
+                &DecisionId::new("dec-mismatch").expect("dec"),
+                &missing,
+                &fixup_observation(),
+                now,
+            )
+            .expect_err("missing");
+        assert!(err.to_string().contains("root_decision_id"));
+    }
+
+    #[test]
+    fn later_label_appends_without_rewriting_persisted_row() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("operator-labels.jsonl");
+        let mut ledger = OperatorLabelLedger::open_durable(&path).expect("open");
+        let exec = execution("append-later", true, 1_000);
+        let decision = exec.root_decision_id.clone().expect("decision");
+        let first = ledger
+            .attribute_and_persist(
+                &decision,
+                &exec,
+                &OperatorObservation {
+                    attention_observed: true,
+                    ..OperatorObservation::default()
+                },
+                TimestampMillis::from_millis(2_000),
+            )
+            .expect("first");
+        let second = ledger
+            .attribute_and_persist(
+                &decision,
+                &exec,
+                &fixup_observation(),
+                TimestampMillis::from_millis(3_000),
+            )
+            .expect("second");
+
+        assert_ne!(first.label_id, second.label_id);
+        assert_eq!(first.polarity, SignalPolarity::Censored);
+        assert_eq!(second.polarity, SignalPolarity::Negative);
+        assert_eq!(ledger.attributed_for_decision(&decision).len(), 2);
+
+        let persisted = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(persisted.lines().count(), 2);
+        assert!(persisted
+            .lines()
+            .next()
+            .expect("first line")
+            .contains("censored"));
+        drop(ledger);
+        let reloaded = OperatorLabelLedger::open_durable(&path).expect("reload");
+        assert_eq!(reloaded.attributed().len(), 2);
+        assert_eq!(reloaded.attributed()[0], first);
+        assert_eq!(reloaded.attributed()[1], second);
+    }
+
+    #[test]
+    fn certified_pair_persists_distinct_decision_outcomes() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("operator-labels.jsonl");
+        let mut ledger = OperatorLabelLedger::open_durable(&path).expect("open");
+        let untouched = execution("ok", true, 1_000);
+        let reworked = execution("fixup", true, 1_000);
+        let now = TimestampMillis::from_millis(1_000 + DEFAULT_WINDOW_MILLIS);
+        let ok_decision = untouched.root_decision_id.clone().expect("ok dec");
+        let bad_decision = reworked.root_decision_id.clone().expect("bad dec");
+
+        let ok = ledger
+            .attribute_and_persist(
+                &ok_decision,
+                &untouched,
+                &OperatorObservation {
+                    attention_observed: true,
+                    ..OperatorObservation::default()
+                },
+                now,
+            )
+            .expect("ok");
+        let bad = ledger
+            .attribute_and_persist(&bad_decision, &reworked, &fixup_observation(), now)
+            .expect("bad");
+
+        assert_ne!(ok, bad);
+        assert_eq!(ok.polarity, SignalPolarity::Censored);
+        assert_eq!(bad.polarity, SignalPolarity::Negative);
+        assert!(bad.signal_labels.iter().any(|label| {
+            label.kind == OperatorSignalKind::HumanFixupOnProducedPaths
+                && label.root_decision_id.as_ref() == Some(&bad_decision)
+        }));
+        assert!(ok.signal_labels.is_empty());
+        assert_eq!(ledger.attributed_for_decision(&ok_decision).len(), 1);
+        assert_eq!(ledger.for_decision(&bad_decision).len(), 1);
     }
 }
