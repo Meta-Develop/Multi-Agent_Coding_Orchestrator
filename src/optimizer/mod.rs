@@ -64,6 +64,7 @@ pub mod taxonomy;
 pub mod telemetry;
 pub mod trajectory;
 pub mod value_of_information;
+mod weight_profile;
 
 pub use action::{
     enumerate_compatible_actions, ActionTemplate, AgentRole, CanonicalEffort, EffortMapper,
