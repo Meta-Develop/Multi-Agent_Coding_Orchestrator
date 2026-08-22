@@ -147,7 +147,9 @@ fn evaluation_help_exposes_execution_and_real_provider_gate() -> Result<()> {
     assert!(family_help.status.success());
     let family_help = String::from_utf8(family_help.stdout).context("decode evaluation help")?;
     assert!(family_help.contains("run"));
+    assert!(family_help.contains("experiment"));
     assert!(family_help.contains("Generate deterministic fixture output"));
+    assert!(family_help.contains("isolated Fake supervise"));
 
     let run_help = Command::new(BIN)
         .args(["evaluation", "run", "--help"])
@@ -178,6 +180,43 @@ fn evaluation_help_exposes_execution_and_real_provider_gate() -> Result<()> {
             "help omitted boundary '{boundary}': {help}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn evaluation_experiment_cli_runs_two_profiles_as_json() -> Result<()> {
+    let working = TempDir::new().context("create empty experiment cwd")?;
+    let manifest_path = fixture_path("experiment-manifest-v1.json");
+
+    let output = Command::new(BIN)
+        .current_dir(working.path())
+        .arg("evaluation")
+        .arg("experiment")
+        .arg(&manifest_path)
+        .arg("--json")
+        .output()
+        .context("run Fake supervise experiment")?;
+
+    assert!(
+        output.status.success(),
+        "experiment failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let results: Value =
+        serde_json::from_slice(&output.stdout).context("parse experiment results JSON")?;
+    assert_eq!(results["schema"], "evaluation_experiment_result_v1");
+    assert_eq!(results["evidence"]["production_eligible"], false);
+    assert_eq!(results["evidence"]["real_provider_executed"], false);
+    assert_eq!(results["evidence"]["isolated_fake_supervise_state"], true);
+    let summaries = results["profile_summaries"]
+        .as_array()
+        .context("profile summaries")?;
+    assert_eq!(summaries.len(), 2);
+    assert_eq!(
+        summaries[0]["mean_assignment_count"],
+        summaries[1]["mean_assignment_count"]
+    );
     Ok(())
 }
 

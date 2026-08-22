@@ -1573,3 +1573,97 @@ fn loc_or_held_out_pass_inflation_alone_cannot_win_quality() {
     assert!(dominates(&broad, &inflated));
     assert!(!dominates(&inflated, &broad));
 }
+
+fn experiment_manifest() -> ExperimentManifest {
+    ExperimentManifest {
+        version: EXPERIMENT_MANIFEST_SCHEMA_VERSION,
+        experiment_id: "issue-26-fake-supervise".to_string(),
+        goal: "Record the same isolated Fake supervise goal under two profiles.".to_string(),
+        spec: "Keep production_eligible false and compare machine-readable summaries.".to_string(),
+        limits: EvaluationLimits {
+            wall_time_seconds: 120,
+            max_dispatches: 4,
+        },
+        held_out_validation: vec![HeldOutValidation {
+            id: "held-out-unit".to_string(),
+            command: vec!["true".to_string()],
+        }],
+        repetitions: 1,
+        profiles: vec![
+            profile("hybrid-mix", "planner-fast", "worker-fast"),
+            profile("all-frontier", "planner-frontier", "worker-frontier"),
+        ],
+    }
+}
+
+#[test]
+fn two_profiles_produce_comparable_machine_readable_summary() {
+    let manifest = experiment_manifest();
+    let results = run_fake_supervise_experiment(&manifest, ExperimentRunRequest::default())
+        .expect("isolated Fake supervise experiment");
+
+    results
+        .validate_against(&manifest)
+        .expect("experiment results validate");
+    assert_eq!(results.schema, EXPERIMENT_RESULT_SCHEMA);
+    assert_eq!(results.runs.len(), 2);
+    assert_eq!(results.profile_summaries.len(), 2);
+    assert!(!results.evidence.production_eligible);
+    assert!(!results.evidence.real_provider_executed);
+    assert!(results.evidence.isolated_fake_supervise_state);
+    assert!(
+        !results
+            .dispatch_comparability_claim
+            .provider_execution_difference_established
+    );
+
+    let left = &results.profile_summaries[0];
+    let right = &results.profile_summaries[1];
+    assert_ne!(left.profile_id, right.profile_id);
+    assert_eq!(left.repetitions, right.repetitions);
+    assert_eq!(left.mean_assignment_count, right.mean_assignment_count);
+    assert_eq!(
+        left.mean_quality.held_out_basis_points.count,
+        right.mean_quality.held_out_basis_points.count
+    );
+    assert!(results.runs.iter().all(|run| {
+        !run.production_eligible
+            && run.assignment_count > 0
+            && run.held_out_validation.len() == manifest.held_out_validation.len()
+            && run.quality.overall_basis_points <= BASIS_POINTS
+    }));
+    assert_ne!(
+        results.runs[0].isolated_run_id,
+        results.runs[1].isolated_run_id
+    );
+    assert!(
+        results.pareto_conclusion.status == ParetoConclusionStatus::Available
+            || results.pareto_conclusion.status
+                == ParetoConclusionStatus::RefusedNoDispatchDifference
+    );
+}
+
+#[test]
+fn fake_supervise_experiment_refuses_real_provider() {
+    let manifest = experiment_manifest();
+    assert_eq!(
+        run_fake_supervise_experiment(
+            &manifest,
+            ExperimentRunRequest {
+                execution: EvaluationExecution::RealProvider,
+                allow_real_provider: false,
+            },
+        ),
+        Err(EvaluationError::RealProviderOptInRequired)
+    );
+    assert_eq!(
+        run_fake_supervise_experiment(
+            &manifest,
+            ExperimentRunRequest {
+                execution: EvaluationExecution::RealProvider,
+                allow_real_provider: true,
+            },
+        ),
+        Err(EvaluationError::RealProviderUnavailableInPhaseA)
+    );
+}
