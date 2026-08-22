@@ -136,9 +136,11 @@ jobs:
           planning::tests::optional_provider_uses_heuristic_fallback_when_unconfigured
           planning::tests::propose_task_decomposition_coalesces_transitive_scope_overlap
           planning::tests::propose_task_decomposition_is_deterministic_and_exposes_coverage_and_intents
+          planning::tests::propose_task_decomposition_matches_script_basename
           planning::tests::propose_task_path_proposal_keeps_empty_result_without_readme
           planning::tests::propose_task_path_proposal_reports_filename_only_degradation
           planning::tests::propose_task_paths_does_not_match_common_symbol_words
+          planning::tests::propose_task_paths_does_not_sweep_nested_policy_markdown
           planning::tests::propose_task_paths_matches_real_symbol_mentions
           planning::tests::propose_task_paths_requires_standalone_short_identifier_tokens
           planning::tests::propose_task_paths_routes_docs_and_rust_tasks_separately

@@ -2081,6 +2081,11 @@ fn collect_planning_files(
             Ok(files)
         }
         Err(error) => {
+            if let Some(path) = unresolved_explicit_named_file(repo, &format!("{title}\n{body}")) {
+                anyhow::bail!(
+                    "named repository path '{path}' is not a readable regular file in the repository"
+                );
+            }
             if named_on_disk.is_empty() {
                 return Err(error).context(
                     "repository inventory failed and the spec named no resolvable repository paths",
@@ -2101,6 +2106,20 @@ fn named_paths_present_on_disk(repo: &Path, text: &str) -> Vec<PathBuf> {
         .into_iter()
         .filter_map(|token| resolve_named_repo_file(repo, Path::new(&token)))
         .collect()
+}
+
+fn unresolved_explicit_named_file(repo: &Path, text: &str) -> Option<String> {
+    extract_path_like_tokens(text).into_iter().find(|token| {
+        let Ok(normalized) = normalize_repo_relative_path(token) else {
+            return false;
+        };
+        normalized.components().count() > 1
+            && normalized
+                .extension()
+                .is_some_and(|extension| !extension.is_empty())
+            && !is_excluded_planning_path(&normalized)
+            && resolve_named_repo_file(repo, &normalized).is_none()
+    })
 }
 
 struct NamedPathMatch {
