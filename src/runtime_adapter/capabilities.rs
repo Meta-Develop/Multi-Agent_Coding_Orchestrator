@@ -376,8 +376,9 @@ impl RuntimeCapabilities {
     };
 
     pub const CLAUDE_CODE: Self = Self {
-        // `--permission-mode` and PreToolUse hooks exist on the CLI, but this
-        // adapter does not yet host a blocking MACO callback. Selectable
+        // `--permission-mode` and PreToolUse hooks exist on the CLI. The static
+        // descriptor stays `None` until a MACO-owned host in `hosted_callback`
+        // is attached and covers every tool/fs/destructive action. Unattached
         // supervise admission must not start a writable child.
         blocking_pre_action_callback: BlockingPreActionCallback::None,
         writable_workspace: WorkspaceWritability::Partial,
@@ -444,6 +445,21 @@ impl RuntimeCapabilities {
 
     pub const fn admits_writable_release(self) -> bool {
         self.writable_refusal().is_none()
+    }
+
+    /// Writable-release pair used only after a host covers every action.
+    ///
+    /// Do not map this from [`AdapterId::capabilities`]. The static Claude
+    /// descriptor stays fail-closed until a hosted PreToolUse attachment is real.
+    pub const fn with_hosted_blocking_callback(self) -> Self {
+        Self {
+            blocking_pre_action_callback: BlockingPreActionCallback::All,
+            writable_workspace: WorkspaceWritability::Supported,
+            side_effect_confinement: self.side_effect_confinement,
+            model_catalog: self.model_catalog,
+            usage_reporting: self.usage_reporting,
+            session_resume: self.session_resume,
+        }
     }
 }
 
@@ -694,6 +710,22 @@ mod tests {
             RuntimeCapabilities::GEMINI_CLI.writable_refusal(),
             Some("blocking_pre_action_callback != All")
         );
+        let hosted = RuntimeCapabilities::CLAUDE_CODE.with_hosted_blocking_callback();
+        assert_eq!(
+            hosted.blocking_pre_action_callback,
+            BlockingPreActionCallback::All
+        );
+        assert_eq!(hosted.writable_workspace, WorkspaceWritability::Supported);
+        assert!(hosted.admits_writable_release());
+        assert_eq!(
+            AdapterId::ClaudeCode.capabilities(),
+            RuntimeCapabilities::CLAUDE_CODE
+        );
+        assert_eq!(
+            RuntimeCapabilities::CODEX.blocking_pre_action_callback,
+            BlockingPreActionCallback::CommandsOnly
+        );
+        assert!(!RuntimeCapabilities::FAKE.admits_writable_release());
     }
 
     #[test]

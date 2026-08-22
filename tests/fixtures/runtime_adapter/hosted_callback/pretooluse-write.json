@@ -1,0 +1,1 @@
+{"hook_event_name":"PreToolUse","session_id":"sess-write","cwd":"/workspace","transcript_path":"/tmp/transcript.jsonl","tool_name":"Write","tool_input":{"file_path":"/workspace/src/lib.rs","content":"fn main() {}"},"tool_use_id":"toolu-write"}
