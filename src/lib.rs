@@ -55,6 +55,7 @@ pub mod sync_store;
 pub mod worktree;
 
 pub(crate) mod authenticated_snapshot;
+pub(crate) mod budget_ledger;
 pub(crate) mod checkpoint_wire;
 pub(crate) mod collect_revalidation;
 pub(crate) mod effect_wal;

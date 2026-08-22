@@ -20,7 +20,9 @@ use crate::process_runner::{
     WorkspaceAccess,
 };
 use crate::protected_path::{DeclaredPathCoordinate, ProtectedPathSpec};
-use crate::runtime_adapter::{AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId};
+use crate::runtime_adapter::{
+    AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId, WritableLaunchTarget,
+};
 use crate::safe_state::unsigned_to_u32;
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
 use anyhow::{bail, Context, Result};
@@ -212,6 +214,9 @@ pub struct ExternalAgentCommand {
     /// directory. Absence keeps the legacy path as an attributed cooperative bypass.
     pub machine_global_retention: Option<ExternalMachineGlobalRetentionBinding>,
     pub runtime_adapter: Option<RuntimeAdapterConfig>,
+    /// Isolated child worktree vs primary checkout. Default constructors use a
+    /// managed child worktree; primary-target launch stays fail-closed.
+    pub writable_launch_target: WritableLaunchTarget,
 }
 
 pub type ExternalMachineGlobalRetentionBinding = MachineGlobalRetentionBinding;
@@ -641,6 +646,7 @@ impl ExternalAgentCommand {
             environment_requirements: Vec::new(),
             machine_global_retention: None,
             runtime_adapter: None,
+            writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
         }
     }
 
@@ -671,6 +677,7 @@ impl ExternalAgentCommand {
             environment_requirements: Vec::new(),
             machine_global_retention: None,
             runtime_adapter: None,
+            writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
         }
     }
 
@@ -701,6 +708,7 @@ impl ExternalAgentCommand {
             environment_requirements: Vec::new(),
             machine_global_retention: None,
             runtime_adapter: None,
+            writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
         }
     }
 
@@ -797,6 +805,11 @@ impl ExternalAgentCommand {
         binding: ExternalMachineGlobalRetentionBinding,
     ) -> Self {
         self.machine_global_retention = Some(binding);
+        self
+    }
+
+    pub fn with_writable_launch_target(mut self, target: WritableLaunchTarget) -> Self {
+        self.writable_launch_target = target;
         self
     }
 }
@@ -1302,42 +1315,9 @@ fn run_external_agent_runtime(
             "external agent was cancelled before executable preflight".to_string(),
         );
     }
-    let duplex_review_required = runtime == ExternalExecutionRuntime::Verified
-        && spec.invocation == ExternalAgentInvocation::CodexSupervisor
-        && spec.workspace_access == WorkspaceAccess::ReadWrite;
-    if duplex_review_required && review_runtime.is_none() {
-        return failed_external_environment_run(
-            spec,
-            started,
-            command_display(&spec.program, &[]),
-            false,
-            EnvironmentFailureCategory::SandboxUnavailable,
-            Some(EnvironmentRequirement::sandbox(
-                EnvironmentSandboxCapability::VerifiedExternalCodex,
-            )),
-            "writable verified Codex requires a duplex MACO pre-action reviewer".to_string(),
-        );
-    }
-    if duplex_review_required {
-        if let Err(error) = validate_universal_pre_action_coverage() {
-            return failed_external_environment_run(
-                spec,
-                started,
-                command_display(&spec.program, &[]),
-                false,
-                EnvironmentFailureCategory::SandboxUnavailable,
-                Some(EnvironmentRequirement::sandbox(
-                    EnvironmentSandboxCapability::VerifiedExternalCodex,
-                )),
-                error.to_string(),
-            );
-        }
-    }
-    if spec.invocation.is_adapter_subprocess()
-        && spec.workspace_access == WorkspaceAccess::ReadWrite
-    {
+    if spec.workspace_access == WorkspaceAccess::ReadWrite {
         if let Some(adapter) = spec.invocation.adapter_id() {
-            if let Some(capability) = adapter.writable_leaf_launch_refusal() {
+            if let Some(capability) = adapter.writable_launch_refusal(spec.writable_launch_target) {
                 return failed_external_environment_run(
                     spec,
                     started,
@@ -1353,6 +1333,30 @@ fn run_external_agent_runtime(
                     ),
                 );
             }
+        }
+    }
+    // Hosted duplex review is optional defense-in-depth. Isolated worktree
+    // children launch with native permission/sandbox mode; they are not
+    // blocked on a parent All-callback or a missing reviewer.
+    let duplex_review_required = runtime == ExternalExecutionRuntime::Verified
+        && spec.invocation == ExternalAgentInvocation::CodexSupervisor
+        && spec.workspace_access == WorkspaceAccess::ReadWrite
+        && review_runtime.is_some();
+    if spec.workspace_access == WorkspaceAccess::ReadWrite
+        && spec.writable_launch_target == WritableLaunchTarget::PrimaryWorktree
+    {
+        if let Err(error) = validate_universal_pre_action_coverage(spec.writable_launch_target) {
+            return failed_external_environment_run(
+                spec,
+                started,
+                command_display(&spec.program, &[]),
+                false,
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(EnvironmentRequirement::sandbox(
+                    EnvironmentSandboxCapability::VerifiedExternalCodex,
+                )),
+                error.to_string(),
+            );
         }
     }
     let program_trust = external_program_trust(spec);
@@ -2269,16 +2273,17 @@ fn run_external_agent_runtime(
     report
 }
 
-fn validate_universal_pre_action_coverage() -> Result<()> {
-    // Codex 0.144.4 exposes client callbacks only for actions for which the server chooses to ask
-    // approval. AskForApproval has no force-review-every-action mode, and `approvalsReviewer=user`
-    // does not block reads, writes, or tools already permitted by the active sandbox. The MACO
-    // policy additionally distinguishes safe writes from destructive writes, which a static
-    // filesystem sandbox cannot express. Until the protocol supplies a blocking callback for
-    // every relevant proposed action, a writable production child must not be released.
-    bail!(
-        "writable Codex failed closed before launch: the current app-server protocol does not guarantee a blocking MACO callback for every in-sandbox read, write, destructive operation, and tool action"
-    )
+fn validate_universal_pre_action_coverage(target: WritableLaunchTarget) -> Result<()> {
+    // Isolated worktree children use native permission/sandbox mode. The Codex
+    // app-server still has no force-review-every-action callback; that gap is
+    // no longer a worktree-launch blocker. Primary-writable release still
+    // requires a hosted All-callback.
+    match target {
+        WritableLaunchTarget::ManagedChildWorktree => Ok(()),
+        WritableLaunchTarget::PrimaryWorktree => bail!(
+            "writable primary Codex failed closed before launch: blocking_pre_action_callback != All"
+        ),
+    }
 }
 
 fn validate_duplex_app_server_version(version: EnvironmentVersion) -> Result<()> {
