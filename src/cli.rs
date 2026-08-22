@@ -1066,6 +1066,9 @@ struct PlanSuperviseArgs {
 #[derive(Debug, Clone, Copy, Default, Args)]
 struct RunBudgetArgs {
     /// Hard ceiling for total provider tokens committed by this supervise run.
+    ///
+    /// Tightens the plan `run_budget` by taking the minimum and is retained on
+    /// the run budget ledger as `sources.cli` alongside the original plan values.
     #[arg(
         long = "max-tokens",
         visible_alias = "max-total-tokens",
@@ -1073,6 +1076,9 @@ struct RunBudgetArgs {
     )]
     max_tokens: Option<usize>,
     /// Hard ceiling for total provider cost committed by this supervise run, in USD.
+    ///
+    /// Tightens the plan `run_budget` by taking the minimum and is retained on
+    /// the run budget ledger as `sources.cli` alongside the original plan values.
     #[arg(
         long = "max-cost-usd",
         visible_alias = "max-total-cost-usd",
@@ -1080,6 +1086,9 @@ struct RunBudgetArgs {
     )]
     max_cost_usd: Option<f64>,
     /// Maximum elapsed duration for admitting new supervise dispatches.
+    ///
+    /// Tightens `run_budget.max_duration_seconds` by taking the minimum and is
+    /// retained on the run budget ledger as `sources.cli`.
     #[arg(
         long = "max-duration-seconds",
         visible_alias = "max-total-duration-seconds",
