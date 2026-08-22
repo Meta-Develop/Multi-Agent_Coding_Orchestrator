@@ -1031,7 +1031,7 @@ fn run_git_apply(
         AgentExecutionRuntime::Verified => process_spec
             .with_private_runtime_home(true)
             .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
-                StrictOfflineWorkspaceProfile::read_write(worktree_path),
+                git_apply_workspace_profile(worktree_path)?,
             )),
         #[cfg(test)]
         AgentExecutionRuntime::NonpublishableSimulation => process_spec
@@ -1071,6 +1071,52 @@ fn run_git_apply(
         stdout: summarize_output(&output.stdout),
         stderr: summarize_output(&output.stderr),
     })
+}
+
+fn git_apply_workspace_profile(worktree_path: &Path) -> Result<StrictOfflineWorkspaceProfile> {
+    let repository = crate::git_repository::open(worktree_path).with_context(|| {
+        format!(
+            "failed to resolve Git administration roots for git apply in {}",
+            worktree_path.display()
+        )
+    })?;
+    let common_dir = std::fs::canonicalize(repository.commondir()).with_context(|| {
+        format!(
+            "failed to resolve Git common directory {}",
+            repository.commondir().display()
+        )
+    })?;
+    let git_dir = std::fs::canonicalize(repository.path()).with_context(|| {
+        format!(
+            "failed to resolve Git directory {}",
+            repository.path().display()
+        )
+    })?;
+    let mut profile = StrictOfflineWorkspaceProfile::read_write(worktree_path)
+        .with_visible_read_only_root(&common_dir);
+    if git_dir != common_dir {
+        profile = profile.with_visible_read_only_root(git_dir);
+    }
+    hide_sensitive_state_if_present(profile, &common_dir)
+}
+
+fn hide_sensitive_state_if_present(
+    profile: StrictOfflineWorkspaceProfile,
+    common_dir: &Path,
+) -> Result<StrictOfflineWorkspaceProfile> {
+    let state_path = common_dir.join("maco").join("state");
+    match std::fs::symlink_metadata(&state_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(profile),
+        Err(error) => Err(error).context(format!(
+            "failed to inspect repository sensitive state {}",
+            state_path.display()
+        )),
+        Ok(_) => Ok(profile.with_hidden_root(
+            crate::artifacts::state_auth::sensitive_state_root(common_dir).context(
+                "repository sensitive state could not be bound for child-process masking",
+            )?,
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1428,6 +1474,62 @@ diff --git a/README.md b/README.md
             message.contains("timed out") || message.contains("timeout"),
             "git apply must report a timeout, got: {message}"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn git_apply_workspace_profile_exposes_linked_primary_git_roots() -> Result<()> {
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let manager = WorktreeManager::new(&repo_path);
+        let worktree = manager
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(temp.path().join("worktrees")),
+            })
+            .context("create linked worktree")?;
+        let repository =
+            crate::git_repository::open(&worktree.path).context("open linked worktree")?;
+        let common_dir =
+            fs::canonicalize(repository.commondir()).context("canonicalize commondir")?;
+        let git_dir = fs::canonicalize(repository.path()).context("canonicalize gitdir")?;
+        let objects =
+            fs::canonicalize(common_dir.join("objects")).context("canonicalize objects")?;
+        let worktree_path = fs::canonicalize(&worktree.path).context("canonicalize worktree")?;
+        assert_ne!(
+            git_dir, common_dir,
+            "linked worktree must use a separate gitdir"
+        );
+        assert!(
+            !common_dir.starts_with(&worktree_path),
+            "primary Git common dir must live outside the linked worktree"
+        );
+
+        let profile = git_apply_workspace_profile(&worktree.path)?;
+        let visible = profile.visible_read_only_roots();
+        assert!(
+            visible
+                .iter()
+                .any(|root| *root == common_dir || common_dir.starts_with(root)),
+            "git apply profile must expose the primary Git common dir, got {visible:?}"
+        );
+        assert!(
+            visible.iter().any(|root| objects.starts_with(root)),
+            "git apply profile must expose the shared object store, got {visible:?}"
+        );
+        assert!(
+            visible.iter().any(|root| git_dir.starts_with(root)),
+            "git apply profile must expose the linked gitdir, got {visible:?}"
+        );
+        if let Ok(sensitive) = crate::artifacts::state_auth::sensitive_state_root(&common_dir) {
+            assert!(
+                profile.hidden_roots().contains(&sensitive),
+                "git apply profile must hide repository sensitive state"
+            );
+        }
 
         Ok(())
     }
