@@ -5,6 +5,10 @@
 //! silently pollute a real cell's statistics. Promotion into a cell requires
 //! both #169's absolute LCB floor *and* a paired comparison against that
 //! cell's incumbent.
+//!
+//! This first slice adds typed coverage-map keys, a decision-facing evidence
+//! view with explicit uncertainty, and the taxonomy fields every telemetry
+//! record should carry. CLI/GUI surfacing remains a later slice.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -14,6 +18,7 @@ use super::explanation::DecisionDiagnostics;
 use super::features::{keys, FeatureBag};
 use super::ids::{PolicyId, TimestampMillis};
 use super::predictor::wilson_lcb_bp;
+use super::telemetry::InvocationRecord;
 
 pub const TAXONOMY_SCHEMA_VERSION: u32 = 1;
 pub const UNKNOWN_AXIS: &str = "unknown";
@@ -402,6 +407,118 @@ impl RecommendationSource {
     }
 }
 
+/// Typed `(model, effort)` slot inside a cell. String maps stay for replay.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ModelEffortKey {
+    pub model: String,
+    pub effort: String,
+}
+
+impl ModelEffortKey {
+    pub fn new(model: impl Into<String>, effort: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            effort: effort.into(),
+        }
+    }
+
+    pub fn slot(&self) -> String {
+        format!("{}@{}", self.model, self.effort)
+    }
+
+    pub fn parse_slot(slot: &str) -> Self {
+        match slot.split_once('@') {
+            Some((model, effort)) => Self::new(model, effort),
+            None => Self::new(slot, UNKNOWN_AXIS),
+        }
+    }
+}
+
+/// How wide the recommendation's uncertainty is. Zero-observation cells are
+/// prior-driven at full width so they cannot look like measured evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceUncertainty {
+    pub width_bp: u16,
+    pub source: RecommendationSource,
+}
+
+impl EvidenceUncertainty {
+    pub const PRIOR_WIDTH_BP: u16 = 10_000;
+    pub const POOLED_WIDTH_BP: u16 = 4_000;
+    pub const MEASURED_WIDTH_BP: u16 = 800;
+
+    pub fn for_source(source: RecommendationSource) -> Self {
+        let width_bp = match source {
+            RecommendationSource::PriorDriven => Self::PRIOR_WIDTH_BP,
+            RecommendationSource::PartiallyPooled => Self::POOLED_WIDTH_BP,
+            RecommendationSource::Measured => Self::MEASURED_WIDTH_BP,
+        };
+        Self { width_bp, source }
+    }
+
+    pub fn is_wide(&self) -> bool {
+        self.width_bp >= Self::POOLED_WIDTH_BP
+    }
+}
+
+/// Fields every telemetry record should carry (issue #202).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryTaxonomy {
+    pub version: u32,
+    pub cell: TaxonomyCell,
+    pub confidence_bp: u16,
+}
+
+impl TelemetryTaxonomy {
+    pub fn from_classification(classification: &CellClassification) -> Self {
+        Self {
+            version: classification.taxonomy_version,
+            cell: classification.cell.clone(),
+            confidence_bp: classification.confidence_bp,
+        }
+    }
+
+    pub fn unknown(version: u32) -> Self {
+        Self {
+            version,
+            cell: TaxonomyCell::unknown(version),
+            confidence_bp: 0,
+        }
+    }
+}
+
+/// Decision-facing coverage view. Zero-observation cells stay prior-driven
+/// with wide uncertainty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionCoverage {
+    pub cell: TaxonomyCell,
+    pub observations: u32,
+    pub effective_sample_size_milli: u32,
+    pub uncertainty: EvidenceUncertainty,
+    pub coverage_by_slot: BTreeMap<ModelEffortKey, u32>,
+}
+
+impl DecisionCoverage {
+    pub fn from_cell(coverage: &CellCoverage) -> Self {
+        let coverage_by_slot = if coverage.coverage_by_slot.is_empty() {
+            coverage
+                .coverage_by_model_effort
+                .iter()
+                .map(|(slot, count)| (ModelEffortKey::parse_slot(slot), *count))
+                .collect()
+        } else {
+            coverage.coverage_by_slot.clone()
+        };
+        Self {
+            cell: coverage.cell.clone(),
+            observations: coverage.observations,
+            effective_sample_size_milli: coverage.effective_sample_size_milli,
+            uncertainty: EvidenceUncertainty::for_source(coverage.recommendation_source),
+            coverage_by_slot,
+        }
+    }
+}
+
 /// Exponential time decay used for effective sample size (#170-compatible).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeDecay {
@@ -449,12 +566,41 @@ pub struct CoverageObservation {
     pub observed_at: TimestampMillis,
 }
 
+impl CoverageObservation {
+    pub fn from_invocation(record: &InvocationRecord, cell: TaxonomyCell) -> Self {
+        let model = record
+            .resolved_model
+            .as_ref()
+            .or(record.requested_model.as_ref())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| UNKNOWN_AXIS.to_string());
+        let effort = record
+            .resolved_effort
+            .as_ref()
+            .or(record.requested_effort.as_ref())
+            .map(|effort| effort.as_label().to_string())
+            .unwrap_or_else(|| UNKNOWN_AXIS.to_string());
+        Self {
+            cell,
+            model,
+            effort,
+            observed_at: record.finished_at.unwrap_or(record.started_at),
+        }
+    }
+
+    pub fn slot(&self) -> ModelEffortKey {
+        ModelEffortKey::new(&self.model, &self.effort)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellCoverage {
     pub cell: TaxonomyCell,
     pub observations: u32,
     pub effective_sample_size_milli: u32,
     pub coverage_by_model_effort: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub coverage_by_slot: BTreeMap<ModelEffortKey, u32>,
     pub recommendation_source: RecommendationSource,
 }
 
@@ -465,6 +611,7 @@ impl CellCoverage {
             observations: 0,
             effective_sample_size_milli: 0,
             coverage_by_model_effort: BTreeMap::new(),
+            coverage_by_slot: BTreeMap::new(),
             recommendation_source: RecommendationSource::PriorDriven,
         }
     }
@@ -505,8 +652,12 @@ impl CoverageMap {
                     .as_millis()
                     .saturating_sub(row.observed_at.as_millis());
                 effective = effective.saturating_add(decay.weight_milli(age));
-                let slot = format!("{}@{}", row.model, row.effort);
-                *coverage.coverage_by_model_effort.entry(slot).or_insert(0) += 1;
+                let key = row.slot();
+                *coverage
+                    .coverage_by_model_effort
+                    .entry(key.slot())
+                    .or_insert(0) += 1;
+                *coverage.coverage_by_slot.entry(key).or_insert(0) += 1;
             }
             coverage.effective_sample_size_milli = effective;
             coverage.recommendation_source = if coverage.observations == 0 {
@@ -530,6 +681,19 @@ impl CoverageMap {
             .get(&cell.key())
             .cloned()
             .unwrap_or_else(|| CellCoverage::empty(cell.clone()))
+    }
+
+    pub fn explain(&self, cell: &TaxonomyCell) -> DecisionCoverage {
+        DecisionCoverage::from_cell(&self.coverage_for(cell))
+    }
+
+    pub fn attach_decision(
+        &self,
+        classification: &CellClassification,
+        diagnostics: &mut DecisionDiagnostics,
+    ) {
+        let coverage = self.coverage_for(&classification.cell);
+        classification.record_on(diagnostics, Some(&coverage));
     }
 
     /// Low-coverage cells first so #169's exploration budget can target them.
@@ -897,5 +1061,110 @@ mod tests {
             RecommendationSource::Measured
         );
         assert!(map.render_text().contains("prior_driven") || map.render_text().contains("n="));
+    }
+
+    fn invocation(
+        model: &str,
+        effort: crate::optimizer::action::CanonicalEffort,
+    ) -> InvocationRecord {
+        let mut record = InvocationRecord::new(
+            PolicyId::new("p").expect("id"),
+            crate::optimizer::ids::CandidateId::new("c").expect("id"),
+            TimestampMillis::from_millis(10),
+            crate::optimizer::resources::ResourceVector::new()
+                .snapshot(TimestampMillis::from_millis(10)),
+        );
+        record.resolved_model = Some(crate::optimizer::ids::RuntimeSlug::new(model).expect("slug"));
+        record.resolved_effort = Some(effort);
+        record.finished_at = Some(TimestampMillis::from_millis(20));
+        record
+    }
+
+    #[test]
+    fn zero_observation_decision_is_prior_driven_with_wide_uncertainty() {
+        let spec = TaxonomySpec::v1();
+        let map = CoverageMap::from_ledger(
+            &[],
+            &spec,
+            TimeDecay::default(),
+            TimestampMillis::from_millis(10),
+        );
+        let cell = TaxonomyCell {
+            version: 1,
+            domain: "backend".into(),
+            task_kind: "test".into(),
+            modifiers: vec!["bounded_edit".into()],
+        };
+        let explained = map.explain(&cell);
+        assert_eq!(explained.observations, 0);
+        assert_eq!(
+            explained.uncertainty.source,
+            RecommendationSource::PriorDriven
+        );
+        assert_eq!(
+            explained.uncertainty.width_bp,
+            EvidenceUncertainty::PRIOR_WIDTH_BP
+        );
+        assert!(explained.uncertainty.is_wide());
+        let classification = CellClassification {
+            cell: cell.clone(),
+            confidence_bp: 0,
+            taxonomy_version: 1,
+        };
+        let mut diagnostics = DecisionDiagnostics::new(TimestampMillis::from_millis(1), vec![]);
+        map.attach_decision(&classification, &mut diagnostics);
+        assert_eq!(
+            diagnostics.recommendation_source.as_deref(),
+            Some("prior_driven")
+        );
+        assert_eq!(diagnostics.evidence_observations, Some(0));
+    }
+
+    #[test]
+    fn coverage_map_types_track_model_effort_slots() {
+        let spec = TaxonomySpec::v1();
+        let cell = TaxonomyCell {
+            version: 1,
+            domain: "backend".into(),
+            task_kind: "bug_fix".into(),
+            modifiers: vec!["bounded_edit".into()],
+        };
+        let record = CoverageObservation::from_invocation(
+            &invocation("runtime-a", crate::optimizer::action::CanonicalEffort::Low),
+            cell.clone(),
+        );
+        assert_eq!(record.model, "runtime-a");
+        assert_eq!(record.effort, "low");
+        assert_eq!(record.observed_at, TimestampMillis::from_millis(20));
+        let map = CoverageMap::from_ledger(
+            &[record],
+            &spec,
+            TimeDecay::default(),
+            TimestampMillis::from_millis(30),
+        );
+        let explained = map.explain(&cell);
+        let key = ModelEffortKey::new("runtime-a", "low");
+        assert_eq!(explained.coverage_by_slot.get(&key), Some(&1));
+        assert_eq!(
+            explained.uncertainty.source,
+            RecommendationSource::PartiallyPooled
+        );
+        assert!(explained.uncertainty.is_wide());
+    }
+
+    #[test]
+    fn telemetry_taxonomy_carries_version_cell_and_confidence() {
+        let spec = TaxonomySpec::v1();
+        let mut task = FeatureBag::new();
+        put_text(&mut task, keys::TASK_LANGUAGE, "rust");
+        put_bool(&mut task, keys::TASK_PUBLIC_API_IMPACT, true);
+        let classification = classify(&task, &FeatureBag::new(), &spec);
+        let carried = TelemetryTaxonomy::from_classification(&classification);
+        assert_eq!(carried.version, spec.version);
+        assert_eq!(carried.cell, classification.cell);
+        assert_eq!(carried.confidence_bp, classification.confidence_bp);
+        let unknown = TelemetryTaxonomy::unknown(spec.version);
+        assert!(unknown.cell.is_unknown());
+        assert_eq!(unknown.confidence_bp, 0);
     }
 }

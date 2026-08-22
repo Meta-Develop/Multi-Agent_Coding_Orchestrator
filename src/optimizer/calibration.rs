@@ -4,11 +4,15 @@
 //! scored. Miscalibration walks an ordered ladder — widen posteriors, raise
 //! the LCB margin, restrict to the known-safe baseline, then fail closed.
 //! Nothing here can set, clear, or weaken a certification result.
+//!
+//! This first slice joins a #167 decision explanation with a measured outcome
+//! and materializes a replayable [`FailSafeAudit`] plus per-profile
+//! [`EnvelopeTable`]. Production telemetry-sink wiring remains a later slice.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use super::explanation::DecisionDiagnostics;
+use super::explanation::{CandidatePrediction, DecisionDiagnostics};
 use super::ids::TimestampMillis;
 use super::objective::PreferenceProfileId;
 use super::operator_labels::LearnedPolicyOutcome;
@@ -54,6 +58,53 @@ impl PredictedQuantities {
                 .collect(),
             human_intervention_bp: distribution.details.human_intervention_bp,
         }
+    }
+
+    pub fn from_candidate(prediction: &CandidatePrediction) -> Self {
+        Self {
+            certified_probability_bp: prediction.certified_probability_bp,
+            time_to_cert_micros: prediction.expected_latency_micros,
+            time_p95_micros: prediction.tail_latency_p95_micros,
+            time_samples_micros: Vec::new(),
+            expected_cost_micros: prediction.expected_cost_micros,
+            consumption: BTreeMap::new(),
+            human_intervention_bp: 0,
+        }
+    }
+
+    /// Recover predicted quantities from a stored decision explanation.
+    pub fn from_diagnostics(diagnostics: &DecisionDiagnostics) -> Self {
+        let mut predicted = diagnostics
+            .selected_policy
+            .as_ref()
+            .and_then(|selected| {
+                diagnostics
+                    .candidate_predictions
+                    .iter()
+                    .find(|prediction| &prediction.policy == selected)
+            })
+            .or_else(|| diagnostics.candidate_predictions.first())
+            .map(Self::from_candidate)
+            .unwrap_or_else(|| Self {
+                certified_probability_bp: 0,
+                time_to_cert_micros: 0,
+                time_p95_micros: diagnostics
+                    .predicted_p95_time_to_certification_micros
+                    .unwrap_or(0),
+                time_samples_micros: Vec::new(),
+                expected_cost_micros: 0,
+                consumption: BTreeMap::new(),
+                human_intervention_bp: 0,
+            });
+        if predicted.consumption.is_empty() && !diagnostics.predicted_consumption.is_empty() {
+            predicted.consumption = diagnostics.predicted_consumption.clone();
+        }
+        if predicted.time_p95_micros == 0 {
+            if let Some(p95) = diagnostics.predicted_p95_time_to_certification_micros {
+                predicted.time_p95_micros = p95;
+            }
+        }
+        predicted
     }
 }
 
@@ -511,18 +562,7 @@ impl CostEnvelope {
             .filter(|row| row.profile_id.as_deref() == Some(profile.as_str()) && &row.cell == cell)
             .collect();
         if (rows.len() as u32) < MIN_ENVELOPE_OBSERVATIONS {
-            return Self {
-                profile_id: profile.as_str().to_string(),
-                cell: cell.clone(),
-                status: EnvelopeStatus::Unknown,
-                expected_cost_micros: None,
-                p95_cost_micros: None,
-                expected_latency_micros: None,
-                p95_latency_micros: None,
-                consumption: BTreeMap::new(),
-                realized_vs_forecast_gap_micros: None,
-                observation_count: u32::try_from(rows.len()).unwrap_or(0),
-            };
+            return Self::unknown(profile, cell.clone(), rows.len());
         }
         let costs: Vec<i64> = rows
             .iter()
@@ -563,6 +603,21 @@ impl CostEnvelope {
             consumption,
             realized_vs_forecast_gap_micros: Some(realized_mean.saturating_sub(forecast_mean)),
             observation_count: u32::try_from(rows.len()).unwrap_or(u32::MAX),
+        }
+    }
+
+    pub fn unknown(profile: &PreferenceProfileId, cell: TaxonomyCell, rows: usize) -> Self {
+        Self {
+            profile_id: profile.as_str().to_string(),
+            cell,
+            status: EnvelopeStatus::Unknown,
+            expected_cost_micros: None,
+            p95_cost_micros: None,
+            expected_latency_micros: None,
+            p95_latency_micros: None,
+            consumption: BTreeMap::new(),
+            realized_vs_forecast_gap_micros: None,
+            observation_count: u32::try_from(rows).unwrap_or(0),
         }
     }
 }
@@ -662,6 +717,119 @@ pub fn reconcile_invocation(
         measured,
         observed_at,
     }
+}
+
+/// Join a stored #167 decision explanation with the measured outcome.
+pub fn reconcile_decision(
+    diagnostics: &DecisionDiagnostics,
+    measured: MeasuredOutcome,
+    cell: TaxonomyCell,
+    model: impl Into<String>,
+    effort: impl Into<String>,
+    observed_at: TimestampMillis,
+) -> ScoredRecord {
+    ScoredRecord {
+        cell,
+        model: model.into(),
+        effort: effort.into(),
+        profile_id: None,
+        predicted: PredictedQuantities::from_diagnostics(diagnostics),
+        measured,
+        observed_at,
+    }
+}
+
+/// Ordered miscalibration response for one ledger snapshot. Replayable.
+///
+/// There is no `certified` field — this type cannot represent a
+/// certification mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailSafeAudit {
+    pub metrics: CalibrationMetrics,
+    pub response: CalibrationResponse,
+}
+
+impl FailSafeAudit {
+    pub fn from_ledger(
+        ledger: &CalibrationLedger,
+        auditor: &CalibrationAuditor,
+        decay: TimeDecay,
+        as_of: TimestampMillis,
+    ) -> Self {
+        Self::from_records(ledger.records(), None, None, None, auditor, decay, as_of)
+    }
+
+    pub fn from_records(
+        records: &[ScoredRecord],
+        cell: Option<&TaxonomyCell>,
+        model: Option<&str>,
+        effort: Option<&str>,
+        auditor: &CalibrationAuditor,
+        decay: TimeDecay,
+        as_of: TimestampMillis,
+    ) -> Self {
+        let metrics = CalibrationMetrics::from_ledger(records, cell, model, effort, decay, as_of);
+        let response = auditor.respond(&metrics);
+        Self { metrics, response }
+    }
+
+    pub fn constraint(&self) -> SelectionConstraint {
+        self.response.selection_constraint()
+    }
+
+    pub fn constrain<'a>(
+        &self,
+        candidates: &'a [super::policy::PolicyGraph],
+        baseline: Option<&super::ids::PolicyId>,
+    ) -> Vec<&'a super::policy::PolicyGraph> {
+        constrain_candidates(candidates, &self.response, baseline)
+    }
+
+    pub fn apply_to_predictor(&self, predictor: &mut HierarchicalPolicyPredictor) {
+        CalibrationAuditor::apply_to_predictor(predictor, &self.response);
+    }
+
+    pub fn record_on(&self, diagnostics: &mut DecisionDiagnostics) {
+        CalibrationAuditor::record_on(diagnostics, &self.response);
+    }
+}
+
+/// Published envelopes for every `(profile, cell)` seen in a ledger snapshot.
+/// Missing or thin cells stay [`EnvelopeStatus::Unknown`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct EnvelopeTable {
+    pub envelopes: BTreeMap<String, CostEnvelope>,
+}
+
+impl EnvelopeTable {
+    pub fn from_records(records: &[ScoredRecord]) -> Self {
+        let mut envelopes = BTreeMap::new();
+        for row in records {
+            let Some(profile) = row.profile_id.as_deref() else {
+                continue;
+            };
+            let Ok(id) = PreferenceProfileId::new(profile) else {
+                continue;
+            };
+            let key = envelope_key(&id, &row.cell);
+            if envelopes.contains_key(&key) {
+                continue;
+            }
+            envelopes.insert(key, CostEnvelope::from_records(records, &id, &row.cell));
+        }
+        Self { envelopes }
+    }
+
+    pub fn get(&self, profile: &PreferenceProfileId, cell: &TaxonomyCell) -> CostEnvelope {
+        self.envelopes
+            .get(&envelope_key(profile, cell))
+            .cloned()
+            .unwrap_or_else(|| CostEnvelope::unknown(profile, cell.clone(), 0))
+    }
+}
+
+fn envelope_key(profile: &PreferenceProfileId, cell: &TaxonomyCell) -> String {
+    format!("{}|{}", profile.as_str(), cell.key())
 }
 
 #[cfg(test)]
@@ -931,5 +1099,102 @@ mod tests {
         assert_eq!(ledger.records().len(), 1);
         let envelope = ledger.envelope(&PreferenceProfileId::new("default").expect("id"), &cell());
         assert_eq!(envelope.status, EnvelopeStatus::Unknown);
+    }
+
+    fn diagnostics_for(certified_p: u16, p95: i64, cost: i64) -> DecisionDiagnostics {
+        let policy = PolicyId::new("p").expect("id");
+        let mut diagnostics =
+            DecisionDiagnostics::new(TimestampMillis::from_millis(4), vec![policy.clone()]);
+        diagnostics.selected_policy = Some(policy.clone());
+        diagnostics.predicted_p95_time_to_certification_micros = Some(p95);
+        diagnostics
+            .predicted_consumption
+            .insert("input_tokens".into(), 12);
+        diagnostics.record_prediction(crate::optimizer::explanation::CandidatePrediction {
+            policy,
+            quality_lcb_bp: 8_000,
+            certified_probability_bp: certified_p,
+            expected_cost_micros: cost,
+            expected_latency_micros: p95 / 2,
+            tail_latency_p95_micros: p95,
+            cvar95_latency_micros: p95,
+            objective_value_micros: Some(cost),
+            feasible: true,
+        });
+        diagnostics
+    }
+
+    #[test]
+    fn reconcile_decision_joins_explanation_predictions_with_measured_outcome() {
+        let scored = reconcile_decision(
+            &diagnostics_for(9_900, 1_000, 80),
+            MeasuredOutcome {
+                certified: false,
+                time_to_cert_micros: Some(1_500),
+                cost_micros: Some(200),
+                consumption: BTreeMap::new(),
+                human_intervention: false,
+            },
+            cell(),
+            "runtime-a",
+            "low",
+            TimestampMillis::from_millis(9),
+        );
+        assert_eq!(scored.predicted.certified_probability_bp, 9_900);
+        assert_eq!(scored.predicted.time_p95_micros, 1_000);
+        assert_eq!(scored.predicted.consumption.get("input_tokens"), Some(&12));
+        assert!(!scored.measured.certified);
+    }
+
+    #[test]
+    fn fail_safe_audit_is_replayable_and_records_the_triggering_metric() {
+        let records: Vec<ScoredRecord> = (0..20)
+            .map(|i| scored(9_900, i % 5 == 0, 1_000, 900))
+            .collect();
+        let mut ledger = CalibrationLedger::new();
+        for record in records {
+            ledger.append(record);
+        }
+        let as_of = TimestampMillis::from_millis(10);
+        let left = FailSafeAudit::from_ledger(
+            &ledger,
+            &CalibrationAuditor::default(),
+            TimeDecay::default(),
+            as_of,
+        );
+        let right = FailSafeAudit::from_ledger(
+            &ledger,
+            &CalibrationAuditor::default(),
+            TimeDecay::default(),
+            as_of,
+        );
+        assert_eq!(left, right);
+        assert_eq!(left.response.triggering_metric.as_deref(), Some("ece_bp"));
+        assert!(!left.response.steps.is_empty());
+        assert_eq!(left.constraint(), SelectionConstraint::FailClosed);
+        let json = serde_json::to_value(&left).expect("json");
+        assert!(json.get("certified").is_none());
+        assert!(json["response"].get("certified").is_none());
+        let mut diagnostics = DecisionDiagnostics::new(TimestampMillis::from_millis(1), vec![]);
+        left.record_on(&mut diagnostics);
+        assert_eq!(diagnostics.calibration_metric.as_deref(), Some("ece_bp"));
+        assert_eq!(diagnostics.calibration_step.as_deref(), Some("fail_closed"));
+        let graph = empty_graph("baseline");
+        assert!(left
+            .constrain(std::slice::from_ref(&graph), Some(&graph.policy_id))
+            .is_empty());
+    }
+
+    #[test]
+    fn envelope_table_reports_unknown_for_thin_or_missing_cells() {
+        let records = vec![scored(8_000, true, 1_000, 800)];
+        let table = EnvelopeTable::from_records(&records);
+        let profile = PreferenceProfileId::new("default").expect("id");
+        let known_cell = table.get(&profile, &cell());
+        assert_eq!(known_cell.status, EnvelopeStatus::Unknown);
+        assert!(known_cell.expected_cost_micros.is_none());
+        let missing = table.get(&PreferenceProfileId::new("cost").expect("id"), &cell());
+        assert_eq!(missing.status, EnvelopeStatus::Unknown);
+        assert_eq!(missing.observation_count, 0);
     }
 }

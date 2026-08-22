@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "default",
+  "version": 1,
+  "provider_weights": {},
+  "reserve_margin_native": 0,
+  "latency_weight_bp": 5000,
+  "cost_weight_bp": 5000,
+  "human_intervention_aversion_bp": 0,
+  "uncertainty_aversion_bp": 0,
+  "exploration": {},
+  "hedge": {
+    "max_concurrent_hedges": 1,
+    "min_delay_seconds": 0,
+    "max_delay_seconds": 60
+  },
+  "task_class_overrides": {}
+}
