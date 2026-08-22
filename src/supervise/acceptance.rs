@@ -948,6 +948,46 @@ pub(super) fn report_has_field_guide_suggestions(report: &OrchestratorReviewRepo
             .any(|worker| !worker.field_guide_entries.is_empty())
 }
 
+pub(super) fn inspect_fake_simulation_candidate(
+    repo: &Path,
+    assignment: &OrchestratorAssignment,
+    worktree_write_lease: &ManagedWorktreeWriteLease,
+) -> Result<SupervisorCandidateInspection> {
+    let repo_root = discover_repo_root(repo)?;
+    WorktreeManager::new(&repo_root)
+        .verify_write_execution_lease(&assignment.id, worktree_write_lease)
+        .context("fake simulation candidate has no exclusive write lease")?;
+    let record = worktree_write_lease.record();
+    let primary_head = current_head_oid(&repo_root)?;
+    let agent_head = current_head_oid(&record.path)?;
+    let changed_paths = normalize_paths(collect_paths_changed_since_base(
+        &record.path,
+        &primary_head,
+    )?)
+    .context("fake simulation candidate paths are invalid")?;
+    let raw_diff =
+        collect_diff_since_base(&record.path, &primary_head, REVIEW_LENS_REQUEST_LIMIT_BYTES)
+            .context("failed to capture fake simulation candidate diff")?;
+    let binding = candidate_validation_binding(
+        &WorktreeMergeMetadata {
+            agent_id: assignment.id.clone(),
+            worktree_path: record.path.clone(),
+            branch: record.branch.clone(),
+            primary_repo_root: repo_root,
+            primary_head: Some(primary_head.to_string()),
+            agent_head: Some(agent_head.to_string()),
+            merge_base: Some(primary_head.to_string()),
+            base_matches_primary: Some(true),
+        },
+        raw_diff.as_bytes(),
+    )
+    .context("fake simulation candidate binding is invalid")?;
+    Ok(SupervisorCandidateInspection {
+        binding,
+        changed_paths,
+    })
+}
+
 pub(super) fn inspect_supervisor_candidate(
     repo: &Path,
     assignment: &OrchestratorAssignment,

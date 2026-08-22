@@ -1321,6 +1321,68 @@ fn verified_run_entry_refuses_dirty_repository_before_assignment_creation() {
 }
 
 #[test]
+fn writable_fake_runtime_assignment_creation_is_reachable_without_network() {
+    // Stay on Fake + NonpublishableSimulation/TestOnly. The verified
+    // plan-file helper acquires Bound cleanliness and fails closed on hosts
+    // without a delegated systemd user manager; that is not a Fake-runtime
+    // capability refusal. Candidate binding for this path uses git2 so it
+    // stays reachable without isolated git.
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let plan = injected_plan(assignment.clone(), 0);
+    let mut options = injected_options(&repo_path, temp.path(), "fake-writable-assignment-create");
+    options.runtime = SupervisorRuntime::Fake;
+    options.allow_dirty_primary = false;
+
+    let mut runner = |_command: &ExternalAgentCommand| -> ExternalAgentRun {
+        panic!("fake runtime must not invoke an external runner or a network provider")
+    };
+
+    let report = match run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut runner,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            let message = format!("{error:#}");
+            if is_named_writable_capability_refusal(&message) {
+                eprintln!("skipping writable fake assignment creation: {message}");
+                return;
+            }
+            panic!("fake writable assignment creation must be reachable: {message}");
+        }
+    };
+
+    assert!(report.success, "unexpected failed report: {report:#?}");
+    assert!(!report.publishable);
+    assert_eq!(report.runtime, SupervisorRuntime::Fake);
+    assert!(report
+        .orchestrator_reports
+        .iter()
+        .any(|child| child.accepted));
+    let records = WorktreeManager::new(&repo_path)
+        .list_managed_verified()
+        .expect("list fake assignment worktree");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].name, "child-a");
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md")).expect("read primary"),
+        "baseline\n"
+    );
+    assert_eq!(
+        fs::read_to_string(records[0].path.join("README.md")).expect("read child worktree"),
+        "baseline\n"
+    );
+    let lease = WorktreeManager::new(&repo_path)
+        .acquire_write_execution_lease("child-a")
+        .expect("writable fake child must expose a write lease after the run");
+    assert_eq!(lease.record().path, records[0].path);
+}
+
+#[test]
 fn dirty_primary_refusal_is_written_and_finalized_without_launching_a_child() {
     let (temp, repo_path) = injected_repository();
     fs::write(repo_path.join("README.md"), "dirty\n").expect("dirty primary");
@@ -2567,4 +2629,10 @@ fn injected_runner_retries_structural_report_once_then_runs_parent_auditor() {
             && event.payload["scope"] == "attempt"
             && event.payload["attempt"] == 1
     }));
+}
+
+fn is_named_writable_capability_refusal(message: &str) -> bool {
+    message.contains("failed closed before launch")
+        && (message.contains("blocking_pre_action_callback != All")
+            || message.contains("writable_workspace != supported"))
 }
