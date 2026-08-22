@@ -115,6 +115,22 @@ pub fn supervisor_plan_from_task_planning_session(
     Ok(supervisor_plan_and_consultant_from_task_planning_session(goal, spec, None, session)?.plan)
 }
 
+/// Applies the heuristic feedback re-plan hook and lowers the revised remaining
+/// work into an ordinary supervisor plan. This does not invoke a planner model.
+pub fn supervisor_plan_from_feedback_replan(
+    repo: impl AsRef<Path>,
+    goal: &str,
+    spec: &str,
+    session: &mut planning::TaskPlanningSession,
+    feedback: &planning::TaskExecutionFeedback,
+) -> Result<SupervisorPlan> {
+    let repo = discover_repo_root(repo.as_ref())?;
+    planning::replan_task_decomposition_from_feedback(&repo, session, feedback)
+        .context("failed to re-plan remaining work from execution feedback")?;
+    supervisor_plan_from_task_planning_session(goal, spec, session)
+        .context("failed to lower the feedback re-plan into a supervisor plan")
+}
+
 /// Lowers an already validated planning session into the normalized,
 /// round-trippable supervisor plan document used by the file-entry APIs.
 pub fn supervisor_plan_document_from_task_planning_session(
