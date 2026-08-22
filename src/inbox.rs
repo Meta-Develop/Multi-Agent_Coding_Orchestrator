@@ -2495,6 +2495,7 @@ fn run_inbox_item(
             codex_bin: context.codex_bin.clone(),
             reviewer_command: None,
             allow_dirty_primary: false,
+            allow_live_run_collision: false,
             max_child_dispatches: None,
             budget_overrides: crate::supervise::RunBudgetLimits::default(),
             budget_max_duration_seconds: None,

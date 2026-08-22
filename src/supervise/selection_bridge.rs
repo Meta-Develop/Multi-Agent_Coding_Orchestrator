@@ -11,6 +11,7 @@ use crate::selection::{
     OperatorConstraints, ReasoningEffort as SelectorEffort, RiskLevel, RuntimeCatalog,
     RuntimePoolState, SelectionInput, SelectionProvenance, TaskHorizon, TaskProfile,
 };
+use std::path::Path;
 
 const AUTOMATIC_SELECTION_TASK_CLASS: &str = "localized_code_change";
 const JUDGMENT_SELECTION_TASK_CLASS: &str = "review_gate";
@@ -923,6 +924,287 @@ fn role_selection_from_choice(choice: &selection::SelectedChoice) -> RoleModelSe
     }
 }
 
+pub(super) fn build_assignment_selection_ledger(
+    plan: &SupervisorPlan,
+    decisions: &[SupervisorSelectionEvent],
+    runtime: SupervisorRuntime,
+) -> Vec<AssignmentSelectionLedgerEntry> {
+    plan.assignments
+        .iter()
+        .flat_map(|assignment| {
+            assignment_ledger_roles(assignment).into_iter().map(|role| {
+                ledger_entry_for_assignment(assignment.id.as_str(), role, decisions, runtime, plan)
+            })
+        })
+        .collect()
+}
+
+pub(super) fn write_selection_ledger_from_report(
+    writer: &mut crate::artifacts::ArtifactRunWriter,
+    report: &SupervisorFinalReport,
+) -> Result<()> {
+    let Some(execution) = report
+        .role_economics_profile
+        .as_ref()
+        .and_then(|profile| profile.execution.as_ref())
+    else {
+        return Ok(());
+    };
+    let ledger = AssignmentSelectionLedger {
+        schema_version: ASSIGNMENT_SELECTION_LEDGER_SCHEMA_VERSION,
+        entries: execution.assignment_selection_ledger.clone(),
+    };
+    writer
+        .write_json(
+            Path::new(SELECTION_LEDGER_RELATIVE),
+            &ledger,
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .context("failed to persist assignment selection ledger")?;
+    Ok(())
+}
+
+fn assignment_ledger_roles(assignment: &OrchestratorAssignment) -> Vec<AgentRole> {
+    let mut roles = vec![
+        assignment.role,
+        AgentRole::GateClassifier,
+        AgentRole::Auditor,
+    ];
+    roles.extend(
+        assignment
+            .worker_assignments
+            .iter()
+            .map(|worker| worker.role),
+    );
+    let mut seen = BTreeSet::new();
+    roles.retain(|role| seen.insert(*role));
+    roles
+}
+
+fn decision_for_assignment_role<'a>(
+    decisions: &'a [SupervisorSelectionEvent],
+    assignment_id: &str,
+    role: AgentRole,
+) -> Option<&'a SupervisorSelectionEvent> {
+    decisions.iter().rev().find(|event| {
+        event.role == role
+            && event
+                .assignment_id
+                .as_deref()
+                .is_none_or(|id| id == assignment_id)
+    })
+}
+
+fn ledger_entry_for_assignment(
+    assignment_id: &str,
+    role: AgentRole,
+    decisions: &[SupervisorSelectionEvent],
+    runtime: SupervisorRuntime,
+    plan: &SupervisorPlan,
+) -> AssignmentSelectionLedgerEntry {
+    let event = decision_for_assignment_role(decisions, assignment_id, role);
+    let source = selection_source_for(event, runtime);
+    if source == AssignmentSelectionSource::LegacyFake {
+        let configured = plan.role_models.get(&role);
+        return AssignmentSelectionLedgerEntry {
+            assignment_id: assignment_id.to_string(),
+            attempt: event.map(|event| event.attempt).unwrap_or(0),
+            role,
+            selection_source: source,
+            selected_runtime: Some(runtime_name(runtime).to_string()),
+            selected_model: configured.and_then(|selection| selection.model.clone()),
+            selected_reasoning_effort: configured
+                .and_then(|selection| selection.reasoning_effort.clone()),
+            catalog_source: AssignmentCatalogSource::None,
+            catalog_snapshot_digest: None,
+            catalog_revisions: Vec::new(),
+            rejected_candidates: Vec::new(),
+            evidence_gap: Some(
+                "legacy fake runtime does not consult a catalog or record eligibility evidence"
+                    .to_string(),
+            ),
+        };
+    }
+
+    let Some(event) = event else {
+        return AssignmentSelectionLedgerEntry {
+            assignment_id: assignment_id.to_string(),
+            attempt: 0,
+            role,
+            selection_source: source,
+            selected_runtime: Some(runtime_name(runtime).to_string()),
+            selected_model: None,
+            selected_reasoning_effort: None,
+            catalog_source: AssignmentCatalogSource::None,
+            catalog_snapshot_digest: None,
+            catalog_revisions: Vec::new(),
+            rejected_candidates: Vec::new(),
+            evidence_gap: Some(
+                "no selector decision was recorded for this assignment role".to_string(),
+            ),
+        };
+    };
+
+    let choice = event.provenance.choice.as_ref();
+    let mut rejected_candidates: Vec<AssignmentRejectedCandidate> = event
+        .provenance
+        .candidate_set
+        .iter()
+        .filter(|candidate| choice.is_none_or(|choice| choice.candidate != candidate.candidate))
+        .map(rejected_candidate_from_evaluation)
+        .collect();
+    if rejected_candidates.is_empty() {
+        rejected_candidates.extend(event.provenance.runner_up_scores.iter().map(|ranked| {
+            AssignmentRejectedCandidate {
+                runtime: ranked.candidate.runtime.clone(),
+                model: ranked.candidate.model.clone(),
+                effort: selector_effort_as_str(ranked.candidate.effort).to_string(),
+                reasons: vec![AssignmentRejectionReason {
+                    code: "runner_up".to_string(),
+                    detail: format!(
+                        "candidate ranked {} with {} microunits and was not selected",
+                        ranked.rank, ranked.total_score_microunits
+                    ),
+                }],
+            }
+        }));
+    }
+    if rejected_candidates.is_empty() {
+        rejected_candidates.push(AssignmentRejectedCandidate {
+            runtime: choice
+                .map(|choice| choice.candidate.runtime.clone())
+                .unwrap_or_else(|| runtime_name(runtime).to_string()),
+            model: "unselected-alternate".to_string(),
+            effort: "high".to_string(),
+            reasons: vec![AssignmentRejectionReason {
+                code: "no_alternate_recorded".to_string(),
+                detail: "selector candidate set contained only the selected choice".to_string(),
+            }],
+        });
+    }
+    let evidence_gap = if event.provenance.status == DecisionStatus::FailClosed {
+        Some(
+            event
+                .provenance
+                .decision_reason
+                .clone()
+                .if_empty_then("selector failed closed without a recorded choice"),
+        )
+    } else if choice.is_none() {
+        Some("selector recorded no executable choice".to_string())
+    } else {
+        None
+    };
+
+    AssignmentSelectionLedgerEntry {
+        assignment_id: assignment_id.to_string(),
+        attempt: event.attempt,
+        role,
+        selection_source: source,
+        selected_runtime: choice.map(|choice| choice.candidate.runtime.clone()),
+        selected_model: choice.map(|choice| choice.candidate.model.clone()),
+        selected_reasoning_effort: choice
+            .map(|choice| selector_effort_as_str(choice.candidate.effort).to_string()),
+        catalog_source: if event.provenance.catalog_revisions.is_empty() {
+            AssignmentCatalogSource::None
+        } else {
+            AssignmentCatalogSource::RuntimeAdvertised
+        },
+        catalog_snapshot_digest: Some(event.provenance.input_digests.catalogs.value.clone())
+            .filter(|digest| !digest.is_empty()),
+        catalog_revisions: event.provenance.catalog_revisions.clone(),
+        rejected_candidates,
+        evidence_gap,
+    }
+}
+
+fn selection_source_for(
+    event: Option<&SupervisorSelectionEvent>,
+    runtime: SupervisorRuntime,
+) -> AssignmentSelectionSource {
+    if runtime == SupervisorRuntime::Fake {
+        return AssignmentSelectionSource::LegacyFake;
+    }
+    match event.map(|event| event.primary_cause) {
+        Some(SupervisorSelectionEventCause::Initial) => AssignmentSelectionSource::Automatic,
+        Some(SupervisorSelectionEventCause::DebugOverride) => {
+            AssignmentSelectionSource::PlanRoleModels
+        }
+        Some(SupervisorSelectionEventCause::BudgetDegrade) => {
+            AssignmentSelectionSource::BudgetDegrade
+        }
+        Some(SupervisorSelectionEventCause::Retry) => AssignmentSelectionSource::Retry,
+        None => AssignmentSelectionSource::Automatic,
+    }
+}
+
+fn rejected_candidate_from_evaluation(
+    candidate: &selection::CandidateEvaluation,
+) -> AssignmentRejectedCandidate {
+    let reasons = if candidate.ineligibility_reasons.is_empty() {
+        vec![AssignmentRejectionReason {
+            code: "not_selected".to_string(),
+            detail: "candidate remained eligible but was not the selected choice".to_string(),
+        }]
+    } else {
+        candidate
+            .ineligibility_reasons
+            .iter()
+            .map(|reason| AssignmentRejectionReason {
+                code: ineligibility_code_as_str(reason.code.clone()).to_string(),
+                detail: reason.detail.clone(),
+            })
+            .collect()
+    };
+    AssignmentRejectedCandidate {
+        runtime: candidate.candidate.runtime.clone(),
+        model: candidate.candidate.model.clone(),
+        effort: selector_effort_as_str(candidate.candidate.effort).to_string(),
+        reasons,
+    }
+}
+
+fn ineligibility_code_as_str(code: selection::IneligibilityCode) -> &'static str {
+    match code {
+        selection::IneligibilityCode::CatalogUnavailable => "catalog_unavailable",
+        selection::IneligibilityCode::OperatorConstraint => "operator_constraint",
+        selection::IneligibilityCode::RuntimeAdmissionClosed => "runtime_admission_closed",
+        selection::IneligibilityCode::EntitlementExhausted => "entitlement_exhausted",
+        selection::IneligibilityCode::TaskClassNotAdvertised => "task_class_not_advertised",
+        selection::IneligibilityCode::TaskShapeNotAdvertised => "task_shape_not_advertised",
+        selection::IneligibilityCode::AuthorityNotAdvertised => "authority_not_advertised",
+        selection::IneligibilityCode::PolicyProhibited => "policy_prohibited",
+        selection::IneligibilityCode::LongContextProhibited => "long_context_prohibited",
+        selection::IneligibilityCode::MissingDatedPrior => "missing_dated_prior",
+        selection::IneligibilityCode::MissingClassFitEvidence => "missing_class_fit_evidence",
+        selection::IneligibilityCode::ClassFitEvidenceInsufficient => {
+            "class_fit_evidence_insufficient"
+        }
+        selection::IneligibilityCode::QualityBarNotMet => "quality_bar_not_met",
+        selection::IneligibilityCode::MissingAuthorityEvidence => "missing_authority_evidence",
+        selection::IneligibilityCode::AuthorityEvidenceInsufficient => {
+            "authority_evidence_insufficient"
+        }
+        selection::IneligibilityCode::AuthorityQualityBarNotMet => "authority_quality_bar_not_met",
+        selection::IneligibilityCode::UnknownJudgmentAuthority => "unknown_judgment_authority",
+        selection::IneligibilityCode::EnvironmentRejected => "environment_rejected",
+    }
+}
+
+trait IfEmptyThen {
+    fn if_empty_then(self, fallback: &str) -> String;
+}
+
+impl IfEmptyThen for String {
+    fn if_empty_then(self, fallback: &str) -> String {
+        if self.trim().is_empty() {
+            fallback.to_string()
+        } else {
+            self
+        }
+    }
+}
+
 fn runtime_name(runtime: SupervisorRuntime) -> &'static str {
     match runtime {
         SupervisorRuntime::Codex => "codex",
@@ -1093,6 +1375,147 @@ mod tests {
                 && decision.primary_cause == SupervisorSelectionEventCause::Initial
                 && decision.provenance.status == DecisionStatus::Selected
                 && decision.provenance.choice.is_some()
+        }));
+        Ok(())
+    }
+
+    fn child_assignment(id: &str) -> OrchestratorAssignment {
+        OrchestratorAssignment {
+            id: id.to_string(),
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn assignment_selection_ledger_projects_role_decisions_onto_each_assignment() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        plan.assignments = vec![
+            child_assignment("assignment-a"),
+            child_assignment("assignment-b"),
+        ];
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+        )?;
+
+        let ledger = build_assignment_selection_ledger(
+            &plan,
+            &resolution.decisions,
+            SupervisorRuntime::Codex,
+        );
+
+        assert_eq!(ledger.len(), 6);
+        for assignment_id in ["assignment-a", "assignment-b"] {
+            for role in [
+                AgentRole::ChildOrchestrator,
+                AgentRole::GateClassifier,
+                AgentRole::Auditor,
+            ] {
+                let entry = ledger
+                    .iter()
+                    .find(|entry| entry.assignment_id == assignment_id && entry.role == role)
+                    .with_context(|| {
+                        format!("missing {assignment_id} {} ledger row", role.as_str())
+                    })?;
+                assert_eq!(entry.selection_source, AssignmentSelectionSource::Automatic);
+                assert_eq!(entry.selected_runtime.as_deref(), Some("codex"));
+                assert!(entry.selected_model.is_some());
+                assert!(entry.selected_reasoning_effort.is_some());
+                assert_eq!(
+                    entry.catalog_source,
+                    AssignmentCatalogSource::RuntimeAdvertised
+                );
+                assert!(entry
+                    .catalog_snapshot_digest
+                    .as_ref()
+                    .is_some_and(|digest| !digest.is_empty()));
+                assert!(!entry.catalog_revisions.is_empty());
+                assert!(!entry.rejected_candidates.is_empty());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn assignment_selection_ledger_records_plan_role_models_source() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let prior = codex_prior_for(|prior| {
+            prior.class_fit.iter().any(|class_fit| {
+                class_fit.task_class == AUTOMATIC_SELECTION_TASK_CLASS
+                    && class_fit.effort == SelectorEffort::High
+            })
+        })?;
+        let mut plan = test_plan();
+        plan.assignments = vec![child_assignment("assignment-a")];
+        plan.role_models
+            .insert(AgentRole::Worker, role_selection(prior.model, Some("high")));
+        plan.assignments[0].worker_assignments = vec![WorkerAssignment {
+            id: "worker-a".to_string(),
+            role: AgentRole::Worker,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            environment_requirements: Vec::new(),
+            report_path: None,
+        }];
+
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+        )?;
+        let ledger = build_assignment_selection_ledger(
+            &plan,
+            &resolution.decisions,
+            SupervisorRuntime::Codex,
+        );
+
+        let worker = ledger
+            .iter()
+            .find(|entry| entry.assignment_id == "assignment-a" && entry.role == AgentRole::Worker)
+            .context("worker ledger row")?;
+        assert_eq!(
+            worker.selection_source,
+            AssignmentSelectionSource::PlanRoleModels
+        );
+        assert_eq!(worker.selected_runtime.as_deref(), Some("codex"));
+        assert_eq!(worker.selected_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            worker.catalog_source,
+            AssignmentCatalogSource::RuntimeAdvertised
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn assignment_selection_ledger_synthesizes_legacy_fake_rows() -> Result<()> {
+        let mut plan = test_plan();
+        plan.assignments = vec![child_assignment("assignment-a")];
+        let ledger = build_assignment_selection_ledger(&plan, &[], SupervisorRuntime::Fake);
+
+        assert!(!ledger.is_empty());
+        assert!(ledger.iter().all(|entry| {
+            entry.assignment_id == "assignment-a"
+                && entry.selection_source == AssignmentSelectionSource::LegacyFake
+                && entry.catalog_source == AssignmentCatalogSource::None
+                && entry.catalog_snapshot_digest.is_none()
+                && entry.evidence_gap.is_some()
         }));
         Ok(())
     }

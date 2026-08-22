@@ -2399,11 +2399,12 @@ fn print_agent_processes(processes: &[AgentProcessRecord], json: bool) -> Result
     } else {
         for process in processes {
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 process.pid,
                 process.role,
                 process.run_id,
                 process.task_id,
+                process.parent.as_deref().unwrap_or("-"),
                 process.repo.display(),
                 process.launch_timestamp_ms,
                 process.argv.join(" ")

@@ -29,6 +29,9 @@ use crate::{
         GateCheckSource, GateDenial, GateDenialReason, GateDenialRoute, GateRetryability,
         ResumeCheckpointDenial, VerifiedGateContext,
     },
+    hierarchy_ledger::{
+        gate_ownership_payload, insert_supervision_edge, GateOwnershipRecord, SupervisionEdgeRecord,
+    },
     llm::provider::{ModelPricing, Usage},
     merge::{
         collect_agent_result_with_evidence_and_write_lease, ApplyBlockerDetail,
@@ -327,6 +330,10 @@ pub struct SupervisorRunOptions {
     pub codex_bin: PathBuf,
     pub runtime: SupervisorRuntime,
     pub allow_dirty_primary: bool,
+    /// Launch-only override for a live same-repository supervise/autopilot
+    /// collision. Grants no authority to kill, interrupt, revert, or discard
+    /// another run.
+    pub allow_live_run_collision: bool,
     pub admission_overrides: SupervisorAdmissionConfig,
     pub budget_overrides: RunBudgetLimits,
     pub budget_max_duration_seconds: Option<u64>,
@@ -1044,7 +1051,76 @@ pub struct SupervisorExecutionMetadata {
     /// this field and deserialize to an empty decision history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selection_decisions: Vec<SupervisorSelectionEvent>,
+    /// Per-assignment projection of selector decisions, catalog evidence, and
+    /// eligibility gaps. Older reports omit this field.
+    #[serde(default)]
+    pub assignment_selection_ledger: Vec<AssignmentSelectionLedgerEntry>,
     pub usage: SupervisorExecutionUsageReport,
+}
+
+pub const ASSIGNMENT_SELECTION_LEDGER_SCHEMA_VERSION: u32 = 1;
+pub const SELECTION_LEDGER_RELATIVE: &str = "selection/assignment-selection-ledger.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentSelectionSource {
+    Automatic,
+    PlanRoleModels,
+    OperatorOverride,
+    BudgetDegrade,
+    Retry,
+    LegacyFake,
+    LegacyNonpublishableSimulation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentCatalogSource {
+    RuntimeAdvertised,
+    OperatorDeclared,
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentRejectedCandidate {
+    pub runtime: String,
+    pub model: String,
+    pub effort: String,
+    pub reasons: Vec<AssignmentRejectionReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentRejectionReason {
+    pub code: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentSelectionLedgerEntry {
+    pub assignment_id: String,
+    pub attempt: usize,
+    pub role: AgentRole,
+    pub selection_source: AssignmentSelectionSource,
+    pub selected_runtime: Option<String>,
+    pub selected_model: Option<String>,
+    pub selected_reasoning_effort: Option<String>,
+    pub catalog_source: AssignmentCatalogSource,
+    pub catalog_snapshot_digest: Option<String>,
+    #[serde(default)]
+    pub catalog_revisions: Vec<crate::selection::CatalogRevisionProvenance>,
+    #[serde(default)]
+    pub rejected_candidates: Vec<AssignmentRejectedCandidate>,
+    pub evidence_gap: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentSelectionLedger {
+    pub schema_version: u32,
+    pub entries: Vec<AssignmentSelectionLedgerEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -2504,6 +2580,12 @@ pub struct SupervisorStatusReport {
     pub lifecycle: SupervisorRunLifecycle,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_gate_denial: Option<GateDenial>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat: Option<crate::run_ops::HeartbeatRecord>,
+    #[serde(default)]
+    pub heartbeat_count: usize,
+    #[serde(default)]
+    pub operator_summary_exists: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_report: Option<SupervisorFinalReport>,
 }
