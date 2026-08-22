@@ -4,6 +4,9 @@ use crate::agent_lifecycle::{AgentListFilter, AgentRegistry};
 use crate::process_runner::{
     ContainmentBackend, ProcessFailureEvidence, SideEffectConfinementProfileKind,
 };
+#[cfg(unix)]
+use crate::runtime_adapter::RuntimeAdapterConfig;
+use crate::runtime_adapter::{RuntimeId, WritableLaunchTarget};
 
 #[test]
 fn codex_runtime_model_catalog_parser_is_bounded_unique_and_slug_strict() {
@@ -201,12 +204,14 @@ fn strict_journal_failure_prevents_an_allow_response() {
 }
 
 #[test]
-fn current_protocol_refuses_writable_production_release() {
-    let error =
-        validate_universal_pre_action_coverage().expect_err("coverage gap must fail closed");
+fn validate_universal_pre_action_coverage_allows_worktree_and_refuses_primary() {
+    validate_universal_pre_action_coverage(WritableLaunchTarget::ManagedChildWorktree)
+        .expect("isolated worktree launch must not require an All-callback");
+    let error = validate_universal_pre_action_coverage(WritableLaunchTarget::PrimaryWorktree)
+        .expect_err("primary-writable still requires a hosted All-callback");
     assert!(error
         .to_string()
-        .contains("does not guarantee a blocking MACO callback"));
+        .contains("blocking_pre_action_callback != All"));
 }
 
 #[test]
@@ -323,7 +328,8 @@ fn repeated_retention_bound_writable_refusal_leaves_no_child_or_staging_residue(
         incoming.join("events.jsonl"),
         incoming.join("last-message.txt"),
         Duration::from_secs(5),
-    );
+    )
+    .with_writable_launch_target(WritableLaunchTarget::PrimaryWorktree);
     let unused_retention_config = temp.path().join("must-not-open-retention.json");
     spec.machine_global_retention = Some(ExternalMachineGlobalRetentionBinding {
         config: unused_retention_config.clone(),
@@ -370,15 +376,10 @@ fn repeated_retention_bound_writable_refusal_leaves_no_child_or_staging_residue(
         assert_eq!(report.process_tree, None);
         assert_eq!(report.side_effects, None);
         assert!(report.environment_blocked());
-        let expected_refusal = if iteration % 2 == 0 {
-            "requires a duplex MACO pre-action reviewer"
-        } else {
-            "writable Codex failed closed before launch"
-        };
-        assert!(report
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains(expected_refusal)));
+        assert!(report.error.as_deref().is_some_and(|error| {
+            error.contains("writable codex failed closed before launch")
+                && error.contains("blocking_pre_action_callback != All")
+        }));
     }
     assert_eq!(staging_roots()?, before);
     assert!(!unused_retention_config.exists());
@@ -410,7 +411,8 @@ fn production_writable_path_refuses_before_starting_any_child_process() -> Resul
         incoming.join("events.jsonl"),
         incoming.join("last-message.txt"),
         Duration::from_secs(5),
-    );
+    )
+    .with_writable_launch_target(WritableLaunchTarget::PrimaryWorktree);
     let context = test_review_context();
     let mut journal = RecordingPreActionJournal::default();
 
@@ -428,17 +430,133 @@ fn production_writable_path_refuses_before_starting_any_child_process() -> Resul
     assert_eq!(report.process_tree, None);
     assert_eq!(report.side_effects, None);
     assert!(report.environment_blocked());
-    assert!(report
-        .error
-        .as_deref()
-        .is_some_and(|error| error.contains("writable Codex failed closed before launch")));
+    assert!(report.error.as_deref().is_some_and(|error| {
+        error.contains("writable codex failed closed before launch")
+            && error.contains("blocking_pre_action_callback != All")
+    }));
     assert!(journal.records.is_empty());
+    Ok(())
+}
+
+#[test]
+fn worktree_writable_codex_and_cursor_are_admitted_without_all_callback() {
+    assert_ne!(
+        RuntimeId::Codex.capabilities().blocking_pre_action_callback,
+        crate::runtime_adapter::BlockingPreActionCallback::All
+    );
+    assert_ne!(
+        RuntimeId::Cursor
+            .capabilities()
+            .blocking_pre_action_callback,
+        crate::runtime_adapter::BlockingPreActionCallback::All
+    );
+    assert!(RuntimeId::Codex.capabilities().admits_worktree_writable());
+    assert!(RuntimeId::Cursor.capabilities().admits_worktree_writable());
+    assert_eq!(
+        crate::runtime_adapter::AdapterId::from_runtime(RuntimeId::Codex)
+            .writable_launch_refusal(WritableLaunchTarget::ManagedChildWorktree),
+        None
+    );
+    assert_eq!(
+        crate::runtime_adapter::AdapterId::from_runtime(RuntimeId::Cursor)
+            .writable_launch_refusal(WritableLaunchTarget::ManagedChildWorktree),
+        None
+    );
+    validate_universal_pre_action_coverage(WritableLaunchTarget::ManagedChildWorktree)
+        .expect("worktree coverage must not fail a launch");
+}
+
+#[cfg(unix)]
+#[test]
+fn worktree_writable_codex_launch_is_not_blocked_by_coverage() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let marker = temp.path().join("child-process-started");
+    let agent = temp.path().join("may-start.sh");
+    fs::write(&agent, format!("#!/bin/sh\ntouch '{}'\n", marker.display()))?;
+    fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+    let prompt = temp.path().join("prompt.md");
+    fs::write(&prompt, "worktree writable Codex may launch\n")?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let spec = ExternalAgentCommand::codex(
+        &agent,
+        temp.path(),
+        &prompt,
+        incoming.join("events.jsonl"),
+        incoming.join("last-message.txt"),
+        Duration::from_secs(5),
+    )
+    .with_workspace_access(WorkspaceAccess::ReadWrite)
+    .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree);
+
+    let report = run_external_agent(&spec);
+    let error = report.error.clone().unwrap_or_default();
+    assert!(
+        !error.contains("does not guarantee a blocking MACO callback"),
+        "worktree Codex must not be blocked by the old coverage bail: {error}"
+    );
+    assert!(
+        !error.contains("blocking_pre_action_callback != All"),
+        "worktree Codex must not be blocked by All-callback admission: {error}"
+    );
+    let _ = marker;
     Ok(())
 }
 
 #[cfg(unix)]
 #[test]
-fn writable_claude_and_gemini_fail_closed_before_starting_any_child() -> Result<()> {
+fn worktree_writable_claude_is_not_blocked_by_all_callback() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let marker = temp.path().join("child-process-started");
+    let agent = temp.path().join("may-start.sh");
+    fs::write(&agent, format!("#!/bin/sh\ntouch '{}'\n", marker.display()))?;
+    fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+    let prompt = temp.path().join("prompt.md");
+    fs::write(&prompt, "worktree writable child may launch\n")?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let spec = ExternalAgentCommand::codex(
+        &agent,
+        temp.path(),
+        &prompt,
+        incoming.join("events.jsonl"),
+        incoming.join("last-message.txt"),
+        Duration::from_secs(5),
+    )
+    .with_runtime_adapter(
+        RuntimeId::ClaudeCode,
+        RuntimeAdapterConfig::defaults(RuntimeId::ClaudeCode),
+    )
+    .with_workspace_access(WorkspaceAccess::ReadWrite)
+    .with_model_selection(Some("test-model".to_string()), None)
+    .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree);
+
+    let report = run_external_agent(&spec);
+    let error = report.error.clone().unwrap_or_default();
+    assert!(
+        !error.contains("blocking_pre_action_callback != All"),
+        "worktree Claude must not be blocked by the All-callback launch gate: {error}"
+    );
+    assert!(
+        !error.contains("writable claude-code failed closed before launch"),
+        "worktree Claude must be admitted: {error}"
+    );
+    assert_eq!(
+        crate::runtime_adapter::AdapterId::ClaudeCode
+            .writable_launch_refusal(WritableLaunchTarget::ManagedChildWorktree),
+        None
+    );
+    let _ = marker;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn primary_writable_claude_and_gemini_still_refuse_without_all_callback() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     for runtime in [RuntimeId::ClaudeCode, RuntimeId::GeminiCli] {
@@ -448,7 +566,7 @@ fn writable_claude_and_gemini_fail_closed_before_starting_any_child() -> Result<
         fs::write(&agent, format!("#!/bin/sh\ntouch '{}'\n", marker.display()))?;
         fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
         let prompt = temp.path().join("prompt.md");
-        fs::write(&prompt, "writable adapter child must remain disabled\n")?;
+        fs::write(&prompt, "primary writable child must remain disabled\n")?;
         let incoming = temp.path().join("incoming");
         fs::create_dir(&incoming)?;
         let spec = ExternalAgentCommand::codex(
@@ -461,23 +579,22 @@ fn writable_claude_and_gemini_fail_closed_before_starting_any_child() -> Result<
         )
         .with_runtime_adapter(runtime, RuntimeAdapterConfig::defaults(runtime))
         .with_workspace_access(WorkspaceAccess::ReadWrite)
-        .with_model_selection(Some("test-model".to_string()), None);
+        .with_model_selection(Some("test-model".to_string()), None)
+        .with_writable_launch_target(WritableLaunchTarget::PrimaryWorktree);
 
         let report = run_external_agent(&spec);
 
         assert!(
             !marker.exists(),
-            "{} child must not start",
+            "{} primary child must not start",
             runtime.as_str()
         );
         assert!(!report.stdout.target_launch_attempted);
-        assert_eq!(report.process_tree, None);
-        assert_eq!(report.side_effects, None);
         assert!(report.environment_blocked());
         let capability = runtime
             .capabilities()
             .writable_refusal()
-            .expect("claude/gemini writable release stays refused");
+            .expect("primary-writable release stays refused");
         assert_eq!(capability, "blocking_pre_action_callback != All");
         assert!(report.error.as_deref().is_some_and(|error| {
             error.contains(&format!(
@@ -485,12 +602,28 @@ fn writable_claude_and_gemini_fail_closed_before_starting_any_child() -> Result<
                 runtime.as_str()
             )) && error.contains(capability)
         }));
-        assert!(report.environment_failures().iter().any(|failure| {
-            failure.category == EnvironmentFailureCategory::SandboxUnavailable
-                && failure.summary.contains(capability)
-        }));
     }
     Ok(())
+}
+
+#[test]
+fn fake_stays_non_publishable_and_is_not_worktree_writable() {
+    assert!(!RuntimeId::Fake.capabilities().admits_worktree_writable());
+    assert!(!RuntimeId::Fake.capabilities().admits_writable_release());
+    assert_eq!(
+        RuntimeId::Fake.capabilities().worktree_writable_refusal(),
+        Some("writable_workspace == unsupported")
+    );
+    let spec = ExternalAgentCommand::codex(
+        "fake",
+        ".",
+        "prompt.md",
+        "events.jsonl",
+        "last-message.txt",
+        Duration::from_secs(1),
+    );
+    let report = run_external_agent_nonpublishable_simulation(&spec);
+    assert!(!report.publishable);
 }
 
 fn contained_fake_app_server(

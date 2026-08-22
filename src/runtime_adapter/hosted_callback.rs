@@ -396,8 +396,8 @@ pub fn review_pretooluse(gate: &mut HostedPreActionGate, stdin: &[u8]) -> Result
 
 /// Adapter-id consult used by tests and future launch wiring.
 ///
-/// Production [`AdapterId::writable_leaf_launch_refusal`] stays fail-closed for
-/// Claude until a caller supplies an attachment that covers every action.
+/// A hosted All-callback can still grant primary-writable release. Isolated
+/// worktree launch no longer waits for that attachment.
 pub fn writable_leaf_launch_refusal_with_host(
     adapter: AdapterId,
     host: Option<&HostedCallbackAttachment>,
@@ -703,7 +703,7 @@ mod tests {
         adapter.require_writable_release().expect_err("unattached");
         assert_eq!(
             writable_leaf_launch_refusal_with_host(AdapterId::ClaudeCode, None),
-            Some("blocking_pre_action_callback != All")
+            None
         );
 
         let temp = tempfile::tempdir()?;
@@ -728,8 +728,11 @@ mod tests {
             ),
             None
         );
+        assert_eq!(AdapterId::ClaudeCode.writable_leaf_launch_refusal(), None);
         assert_eq!(
-            AdapterId::ClaudeCode.writable_leaf_launch_refusal(),
+            AdapterId::ClaudeCode.writable_launch_refusal(
+                crate::runtime_adapter::WritableLaunchTarget::PrimaryWorktree
+            ),
             Some("blocking_pre_action_callback != All")
         );
         assert_eq!(
@@ -764,9 +767,20 @@ mod tests {
             );
             if row.adapter == AdapterId::Fake {
                 assert!(!row.admits_writable_release);
+                assert!(!row.admits_worktree_writable);
+            } else {
+                assert!(!row.admits_writable_release);
+                assert!(row.admits_worktree_writable);
             }
         }
-        assert!(!matrix.to_markdown().contains("| admitted |"));
+        let markdown = matrix.to_markdown();
+        assert!(markdown.contains("worktree_writable"));
+        assert!(markdown.contains("| admitted |"));
+        assert!(!markdown.lines().any(|line| {
+            line.starts_with("| claude-code |") && line.contains("| supported |") && {
+                line.split('|').nth(2).map(str::trim) == Some("supported")
+            }
+        }));
     }
 
     #[test]
