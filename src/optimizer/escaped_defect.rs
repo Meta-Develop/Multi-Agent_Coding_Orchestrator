@@ -84,7 +84,7 @@ pub fn contract_version(contract: &QualityContract) -> Result<ContentHash, Optim
     let encoded = serde_json::to_vec(contract).map_err(|error| {
         OptimizerError::invalid(format!("failed to fingerprint quality contract: {error}"))
     })?;
-    Ok(ContentHash::from_hex(sha256_hex(&encoded))?)
+    ContentHash::from_hex(sha256_hex(&encoded))
 }
 
 /// Append-only amendment. There is no remove or weaken method.
