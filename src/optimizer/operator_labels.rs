@@ -26,10 +26,10 @@ pub const LABEL_SCHEMA_VERSION: u32 = 1;
 /// Default post-run window, in milliseconds (seven days).
 pub const DEFAULT_WINDOW_MILLIS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
-/// Distinct resource dimension for human rework cost. Open string — not a
-/// well-known constant in `ids.rs` (that module is not owned here).
+/// Distinct resource dimension for human rework cost. The identifier is a
+/// static well-known string so construction cannot fail at runtime.
 pub fn human_rework_dimension() -> ResourceDimensionId {
-    ResourceDimensionId::new("human_rework_cost").expect("static identifier")
+    ResourceDimensionId::well_known(ResourceDimensionId::HUMAN_REWORK_COST)
 }
 
 macro_rules! label_id {
@@ -396,13 +396,11 @@ pub fn derive_labels(
     observation: &OperatorObservation,
     now: TimestampMillis,
 ) -> Result<Vec<OperatorLabel>, OptimizerError> {
-    let excluded = execution.confounder_excluded();
-    let exclusion_reason = excluded.then(|| {
-        format!(
-            "non_model_failure:{:?}",
-            execution.in_run_failure_class.expect("excluded")
-        )
-    });
+    let exclusion_reason = execution
+        .in_run_failure_class
+        .filter(|label| is_non_model_failure(*label))
+        .map(|label| format!("non_model_failure:{label:?}"));
+    let excluded = exclusion_reason.is_some();
     let window_closes_at = execution.window_closes_at();
     let mut labels = Vec::new();
 
@@ -787,6 +785,9 @@ mod tests {
         )
         .expect("labels");
         assert!(labels.iter().all(|label| label.excluded_from_model_stats));
+        assert!(labels.iter().all(|label| {
+            label.exclusion_reason.as_deref() == Some("non_model_failure:OracleFailure")
+        }));
         let outcome = learn_outcome(&exec, &labels, now);
         assert!(!outcome.included_in_model_stats);
         assert!(outcome.rework.is_some());

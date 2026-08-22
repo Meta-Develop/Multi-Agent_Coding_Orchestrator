@@ -1940,6 +1940,30 @@ fn codex_argv_applies_primary_model_selection_safely() {
 }
 
 #[test]
+fn runtime_adapter_argv_propagates_render_failure() {
+    let mut command = ExternalAgentCommand::codex(
+        "codex",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    );
+    // with_runtime_adapter copies program into config.binary — force empty after:
+    if let Some(config) = command.runtime_adapter.as_mut() {
+        config.binary = Some(PathBuf::new());
+    }
+    let error = runtime_adapter_argv(&command).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("runtime adapter binary is not configured"));
+}
+
+#[test]
 fn codex_app_server_argv_preserves_the_external_codex_ceiling() {
     let command = ExternalAgentCommand::codex(
         "codex",

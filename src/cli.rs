@@ -177,7 +177,7 @@ enum Command {
     Coord(CoordCommand),
     /// Run local orchestration plans.
     Orchestrate(OrchestrateCommand),
-    /// Run opt-in Codex CLI supervisor-of-orchestrators plans.
+    /// Run opt-in supervisor-of-orchestrators plans for supported runtimes.
     Supervise(SuperviseCommand),
     /// Ask a read-only cross-runtime consultant for advice.
     Consult(ConsultCommand),
@@ -1024,7 +1024,7 @@ fn read_supervise_goal_file(goal_file: &Path) -> Result<String> {
 enum SuperviseSubcommand {
     /// Build a validated plan from a goal/spec, task file, or JSON supervisor plan.
     Plan(PlanSuperviseArgs),
-    /// Run a supervisor plan with child Codex CLI orchestrators.
+    /// Run a supervisor plan with child orchestrators for a selected runtime.
     Run(RunSuperviseArgs),
     /// Re-run only evidence/report and parent audit stages for a preserved assignment diff.
     #[command(name = "re-audit")]

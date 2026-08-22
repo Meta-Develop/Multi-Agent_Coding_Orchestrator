@@ -763,6 +763,131 @@ fn supervise_plan_plain_text_without_actionable_workstreams_is_an_error() -> Res
     ])?;
     assert!(error.contains("goal/spec produced no actionable workstreams"));
     assert!(error.contains("repository path, Rust module, or Rust symbol"));
+    assert!(error.contains("documentation, policy, and script files are valid scopes"));
+    assert!(!repo_path.join(".maco/o2").exists());
+    Ok(())
+}
+
+#[test]
+fn supervise_plan_plain_text_policy_and_script_paths_emit_workstreams() -> Result<()> {
+    support::require_containment!(
+        "supervise_plan_plain_text_policy_and_script_paths_emit_workstreams"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    fs::create_dir_all(repo_path.join(".agents/skills/agent-orchestration"))?;
+    fs::create_dir_all(repo_path.join(".agents/scripts"))?;
+    fs::write(
+        repo_path.join(".agents/skills/agent-orchestration/SKILL.md"),
+        "# Orchestration\n",
+    )?;
+    fs::write(
+        repo_path.join(".agents/scripts/o2-autopilot"),
+        "#!/bin/sh\n",
+    )?;
+    let repo = Repository::open(&repo_path)?;
+    commit_all(&repo, "add policy and script paths")?;
+    let task_path = temp.path().join("policy-plan-task.md");
+    fs::write(
+        &task_path,
+        "- Update `.agents/skills/agent-orchestration/SKILL.md`.\n\
+         - Update `.agents/scripts/o2-autopilot`.\n",
+    )?;
+
+    let plan = run_success_json(&[
+        "supervise",
+        "plan",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    let assignments = plan["assignments"].as_array().context("assignments")?;
+    assert_eq!(assignments.len(), 4);
+    let scopes = assignments
+        .iter()
+        .map(|assignment| {
+            assignment["assigned_paths"]
+                .as_array()
+                .context("assigned_paths")
+                .and_then(|paths| {
+                    paths
+                        .iter()
+                        .map(|path| {
+                            path.as_str()
+                                .map(str::to_string)
+                                .context("assigned path must be a string")
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    assert_eq!(
+        scopes,
+        BTreeSet::from([
+            vec![".agents/scripts/o2-autopilot".to_string()],
+            vec![".agents/skills/agent-orchestration/SKILL.md".to_string()],
+        ])
+    );
+    assert!(!repo_path.join(".maco/o2").exists());
+    Ok(())
+}
+
+#[test]
+fn supervise_plan_plain_text_gitignored_policy_path_emits_workstream() -> Result<()> {
+    support::require_containment!(
+        "supervise_plan_plain_text_gitignored_policy_path_emits_workstream"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    fs::write(repo_path.join(".gitignore"), ".agents/\n")?;
+    fs::create_dir_all(repo_path.join(".agents/skills/agent-orchestration"))?;
+    fs::write(
+        repo_path.join(".agents/skills/agent-orchestration/SKILL.md"),
+        "# Orchestration\n",
+    )?;
+    let repo = Repository::open(&repo_path)?;
+    commit_all(&repo, "ignore policy tree")?;
+    let task_path = temp.path().join("gitignored-policy-plan-task.md");
+    fs::write(
+        &task_path,
+        "- Update `.agents/skills/agent-orchestration/SKILL.md`.\n",
+    )?;
+
+    let plan = run_success_json(&[
+        "supervise",
+        "plan",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    let assignments = plan["assignments"].as_array().context("assignments")?;
+    assert_eq!(assignments.len(), 2);
+    let scopes = assignments
+        .iter()
+        .map(|assignment| {
+            assignment["assigned_paths"]
+                .as_array()
+                .context("assigned_paths")
+                .and_then(|paths| {
+                    paths
+                        .iter()
+                        .map(|path| {
+                            path.as_str()
+                                .map(str::to_string)
+                                .context("assigned path must be a string")
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    assert_eq!(
+        scopes,
+        BTreeSet::from([vec![
+            ".agents/skills/agent-orchestration/SKILL.md".to_string()
+        ]])
+    );
     assert!(!repo_path.join(".maco/o2").exists());
     Ok(())
 }
@@ -938,6 +1063,30 @@ fn supervise_run_help_documents_auto_concurrency_default() -> Result<()> {
     assert!(stdout.contains("--max-concurrent-children <MAX_CONCURRENT_CHILDREN>"));
     assert!(stdout.contains("auto` uses the conservative network-bound default"));
     assert!(stdout.contains("[default: auto]"));
+    Ok(())
+}
+
+#[test]
+fn supervise_help_is_runtime_neutral() -> Result<()> {
+    let top = Command::new(BIN).args(["--help"]).output()?;
+    assert!(top.status.success());
+    let top_stdout = String::from_utf8(top.stdout).context("UTF-8 maco help")?;
+    assert!(top_stdout.contains("supervisor-of-orchestrators"));
+    assert!(
+        !top_stdout.contains("Codex CLI supervisor-of-orchestrators"),
+        "top-level supervise help must not imply a Codex-only lane: {top_stdout}"
+    );
+
+    let run = Command::new(BIN)
+        .args(["supervise", "run", "--help"])
+        .output()?;
+    assert!(run.status.success());
+    let run_stdout = String::from_utf8(run.stdout).context("UTF-8 supervise run help")?;
+    assert!(run_stdout.contains("child orchestrators"));
+    assert!(
+        !run_stdout.contains("child Codex CLI orchestrators"),
+        "supervise run help must not imply Codex-only children: {run_stdout}"
+    );
     Ok(())
 }
 
