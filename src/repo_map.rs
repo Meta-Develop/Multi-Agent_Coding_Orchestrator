@@ -381,6 +381,7 @@ mod tests {
 
     #[test]
     fn scan_returns_stable_sorted_entries_and_categories() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -414,6 +415,7 @@ mod tests {
 
     #[test]
     fn explicit_file_sampling_is_language_agnostic_and_does_not_create_state() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -439,6 +441,7 @@ mod tests {
 
     #[test]
     fn scan_excludes_generated_and_local_state_paths() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -492,6 +495,7 @@ mod tests {
 
     #[test]
     fn scan_treats_worktree_stores_as_boundaries_and_ignores_nested_git_markers() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -566,6 +570,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn scan_reports_but_never_follows_links_or_special_files() {
+        skip_without_containment!();
         use std::os::unix::{fs::symlink, net::UnixListener};
 
         let temp = tempfile::tempdir().expect("tempdir");

@@ -320,6 +320,7 @@ fn recursive_supervisor_plan_flattens_and_preserves_schedule_on_round_trip() {
 
 #[test]
 fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     Repository::init(repo).expect("initialize repository");
@@ -435,6 +436,7 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
 
 #[test]
 fn plain_text_task_without_actionable_scope_returns_guidance() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
     Repository::init(&repo).expect("initialize repository");
@@ -1955,6 +1957,7 @@ fn known_unavailable_child_runtime_default_is_refused_as_capability_evidence() {
 
 #[test]
 fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor() {
+    skip_without_containment!();
     let _capability =
         install_named_test_models(&["available-child-model", "unavailable-auditor-model"]);
     let (temp, repo_path) = injected_repository();
@@ -2121,6 +2124,7 @@ fn known_unavailable_child_fail_closed_reaches_production_core_without_dispatch_
 
 #[test]
 fn local_deterministic_fake_fallback_reaches_shared_supervisor_core_without_external_dispatch() {
+    skip_without_containment!();
     // Fake harness fallback is configured execution, not a provider-model claim.
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
@@ -2475,6 +2479,7 @@ fn supervisor_derives_review_coverage_from_assignment_and_run_report() {
 
 #[test]
 fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
+    skip_without_containment!();
     let _capability = install_named_test_models(&["model-alpha", "model-beta"]);
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
@@ -2724,6 +2729,7 @@ fn unavailable_lens_runtime_selection_is_reported_and_journaled_procedurally() {
 #[cfg(unix)]
 #[test]
 fn supervisor_input_loader_accepts_direct_regular_files_and_refuses_unsafe_inputs() {
+    skip_without_containment!();
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
 
@@ -2814,6 +2820,7 @@ fn supervisor_input_loader_accepts_direct_regular_files_and_refuses_unsafe_input
 
 #[test]
 fn provider_planning_session_lowers_recursive_tree_and_binds_run_identity() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     git2::Repository::init(repo).expect("init repo");

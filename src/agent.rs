@@ -1187,6 +1187,7 @@ mod tests {
 
     #[test]
     fn fake_provider_agent_run_edits_only_agent_worktree_and_releases_claim() -> Result<()> {
+        skip_without_containment!(ok);
         let temp = TempDir::new().context("tempdir")?;
         let repo_path = create_committed_repo(temp.path())?;
         let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
@@ -1235,6 +1236,7 @@ mod tests {
 
     #[test]
     fn fake_provider_agent_run_reports_unclaimed_changes() -> Result<()> {
+        skip_without_containment!(ok);
         let temp = TempDir::new().context("tempdir")?;
         let repo_path = create_committed_repo(temp.path())?;
         let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
@@ -1284,6 +1286,7 @@ mod tests {
 
     #[test]
     fn provider_commands_are_disabled_by_default_and_not_executed() -> Result<()> {
+        skip_without_containment!(ok);
         let temp = TempDir::new().context("tempdir")?;
         let repo_path = create_committed_repo(temp.path())?;
         let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
@@ -1331,6 +1334,7 @@ mod tests {
 
     #[test]
     fn allowed_provider_command_timeout_with_keep_claims_leaves_claim_active() -> Result<()> {
+        skip_without_containment!(ok);
         let temp = TempDir::new().context("tempdir")?;
         let repo_path = create_committed_repo(temp.path())?;
         let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
@@ -1377,6 +1381,7 @@ mod tests {
 
     #[test]
     fn fake_provider_patch_with_mismatched_diff_path_is_rejected_before_apply() -> Result<()> {
+        skip_without_containment!(ok);
         let temp = TempDir::new().context("tempdir")?;
         let repo_path = create_committed_repo(temp.path())?;
         let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);

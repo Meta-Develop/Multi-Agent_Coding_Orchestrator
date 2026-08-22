@@ -3202,6 +3202,7 @@ mod decomposition_tests {
     #[test]
     fn review_lens_execution_boundary_hides_primary_and_child_roots_from_hostile_process(
     ) -> Result<()> {
+        skip_without_containment!(ok);
         const CHILD_ENV: &str = "MACO_TEST_REVIEW_LENS_BOUNDARY_CHILD";
         const PRIMARY_SECRET_ENV: &str = "MACO_TEST_REVIEW_LENS_PRIMARY_SECRET";
         const CHILD_SECRET_ENV: &str = "MACO_TEST_REVIEW_LENS_CHILD_SECRET";

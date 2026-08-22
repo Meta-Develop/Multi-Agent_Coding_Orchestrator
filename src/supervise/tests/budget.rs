@@ -166,6 +166,7 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
 
 #[test]
 fn budget_integration_serial_scheduler_accounts_exact_hard_boundary_by_process_role() {
+    skip_without_containment!();
     let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);

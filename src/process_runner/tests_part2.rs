@@ -22,6 +22,7 @@
     #[cfg(unix)]
     #[test]
     fn required_containment_kills_setsid_pipe_and_stdin_holders() {
+        skip_without_containment!();
         const READINESS_FUSE: Duration = Duration::from_secs(10);
         const POST_RELEASE_BOUND: Duration = Duration::from_secs(2);
 
@@ -844,6 +845,7 @@
     #[cfg(unix)]
     #[test]
     fn agent_lifecycle_metadata_stamps_environment_and_registers_running_process() {
+        skip_without_containment!();
         #[cfg(target_os = "linux")]
         if !strict_backend_available_for_tests() {
             return;

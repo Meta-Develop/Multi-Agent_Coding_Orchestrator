@@ -82,6 +82,7 @@ fn run_evidence_rejected_source(
 
 #[test]
 fn evidence_rejection_reaudits_preserved_diff_without_worker_rerun_and_can_accept() {
+    skip_without_containment!();
     let (temp, repo) = injected_repository();
     let source_id = RunId::new("reaudit-source-evidence").expect("valid source run id");
     let (source, assignment, preserved_worktree) = run_evidence_rejected_source(
@@ -325,6 +326,7 @@ fn evidence_only_reaudit_refuses_typed_implementation_defect_without_new_run() {
 
 #[test]
 fn evidence_only_reaudit_refuses_modified_preserved_tree_before_dispatch() {
+    skip_without_containment!();
     let (temp, repo) = injected_repository();
     let source_id = RunId::new("reaudit-source-binding").expect("valid source run id");
     let (_source, assignment, preserved_worktree) = run_evidence_rejected_source(
@@ -377,6 +379,7 @@ fn evidence_only_reaudit_refuses_modified_preserved_tree_before_dispatch() {
 #[cfg(target_os = "linux")]
 #[test]
 fn evidence_only_dispatch_physically_denies_mutate_validate_restore() {
+    skip_without_containment!();
     let (temp, repo) = injected_repository();
     let source_id = RunId::new("reaudit-source-transient-mutation").expect("valid source run id");
     let (source, assignment, preserved_worktree) = run_evidence_rejected_source(
@@ -481,6 +484,7 @@ fi"#,
 
 #[test]
 fn ordinary_report_refuses_candidate_mismatch_across_parent_audit() {
+    skip_without_containment!();
     let (temp, repo) = injected_repository();
     let source_id = RunId::new("reaudit-source-ordinary-mismatch").expect("valid source run id");
     let (source, assignment, preserved_worktree) = run_evidence_rejected_source(

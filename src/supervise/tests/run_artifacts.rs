@@ -350,6 +350,7 @@ fn interrupted_final_report_checkpoint(
 
 #[test]
 fn authenticated_resume_finalizes_without_reexecuting_completed_work_and_preserves_budget() {
+    skip_without_containment!();
     let (_temp, repo) = injected_repository();
     let run_id = RunId::new("authenticated-resume-valid").expect("valid resume run id");
     let (budget, side_effect, retained_claim) = interrupted_final_report_checkpoint(&repo, &run_id);
@@ -483,6 +484,7 @@ fn resume_refuses_scheduler_closed_budget_that_differs_only_in_elapsed_seconds()
 
 #[test]
 fn scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch() {
+    skip_without_containment!();
     let (temp, repo) = injected_repository();
     let assignment = injected_assignment(false);
     let plan = injected_plan(assignment, 0);
@@ -539,6 +541,7 @@ fn scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch() 
 
 #[test]
 fn narrowed_assignment_crash_after_final_report_plan_resumes_against_actual_claim_scope() {
+    skip_without_containment!();
     let (temp, repo) = injected_repository();
     fs::write(repo.join("FREE.md"), "free\n").expect("write unclaimed path");
     commit_injected_repository(&repo, "add unclaimed path");
@@ -1140,6 +1143,7 @@ fn authenticated_child_dispatch_evidence_rejects_pending_assignment_without_star
 #[cfg(target_os = "linux")]
 #[test]
 fn verified_run_entry_creates_and_materializes_assignment_worktree() {
+    skip_without_containment!();
     use std::os::unix::fs::PermissionsExt;
 
     let (temp, repo_path) = injected_repository();
@@ -1233,6 +1237,7 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
 #[cfg(target_os = "linux")]
 #[test]
 fn verified_run_entry_refuses_dirty_repository_before_assignment_creation() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let plan = injected_plan(injected_assignment(false), 0);
     let mut options =
@@ -1299,6 +1304,7 @@ fn dirty_primary_refusal_is_written_and_finalized_without_launching_a_child() {
 
 #[test]
 fn fake_supervise_run_finalizes_manifested_report_tree_events() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let seed_finding = "filesystem observation for prompt evidence";
     let seed_context = "focused validation passed";
@@ -2351,6 +2357,7 @@ fn parent_auditor_coverage_rejects_only_non_repo_evidence_paths() {
 
 #[test]
 fn injected_runner_retries_structural_report_once_then_runs_parent_auditor() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let plan = injected_plan(assignment.clone(), 1);

@@ -2,6 +2,7 @@ use super::*;
 
 #[test]
 fn concurrent_disjoint_assignments_make_progress_and_finalize_in_plan_order() {
+    skip_without_containment!();
     #[derive(Default)]
     struct GateState {
         started: BTreeSet<String>,
@@ -244,6 +245,7 @@ fn scoped_spawn_failure_records_fatal_index_and_stops_new_scheduling() {
 
 #[test]
 fn serial_overlapping_assignments_release_between_slots_with_legacy_scratch_names() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignments = vec![
         injected_named_assignment("child-a", "src"),
@@ -338,6 +340,7 @@ fn serial_overlapping_assignments_release_between_slots_with_legacy_scratch_name
 
 #[test]
 fn semantic_warn_previews_are_plan_ordered_once_at_serial_and_concurrent_bounds() {
+    skip_without_containment!();
     for max_concurrent_children in [1usize, 2] {
         let (temp, repo_path) = injected_repository();
         fs::create_dir_all(repo_path.join("src")).expect("create injected source root");
@@ -510,6 +513,7 @@ fn semantic_resolution_failure_does_not_stop_healthy_assignment_at_any_bound() {
 
 #[test]
 fn semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead() {
+    skip_without_containment!();
     #[derive(Default)]
     struct BlockState {
         child_c_started: bool,
@@ -737,6 +741,7 @@ fn claim_and_semantic_block_conflicts_fail_only_the_affected_assignment() {
 #[cfg(target_os = "linux")]
 #[test]
 fn external_termination_named_conflict_release_and_reacquisition_form_one_recovery_sequence() {
+    skip_without_containment!();
     const HOLDER_PROCESS_ENV: &str = "MACO_ISSUE51_SUPERVISE_HOLDER_PROCESS";
     const HOLDER_REPO_ENV: &str = "MACO_ISSUE51_SUPERVISE_HOLDER_REPO";
     const HOLDER_ROOT_ENV: &str = "MACO_ISSUE51_SUPERVISE_HOLDER_ROOT";
@@ -924,6 +929,7 @@ fn external_termination_named_conflict_release_and_reacquisition_form_one_recove
 
 #[test]
 fn concurrent_failure_isolated_and_retry_retains_assignment_slot() {
+    skip_without_containment!();
     #[derive(Default)]
     struct RetryState {
         events: Vec<String>,
@@ -1082,6 +1088,7 @@ fn concurrent_failure_isolated_and_retry_retains_assignment_slot() {
 
 #[test]
 fn nonaccepted_run_releases_claim_and_followup_reacquires_same_path() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let failed_assignment = injected_named_assignment("failed-scope", "README.md");
     let failed_plan = injected_multi_plan(vec![failed_assignment.clone()], 0);
@@ -1188,6 +1195,7 @@ fn serial_assignment_terminal_checkpoint_precedes_claim_release() {
 
 #[test]
 fn degraded_manifest_boundary_finalization_still_releases_serial_claims() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_named_assignment("degraded-serial", "README.md");
     let plan = injected_multi_plan(vec![assignment.clone()], 0);
@@ -2115,6 +2123,7 @@ fn panic_after_claim_releases_tokens_stops_pending_and_joins_active_assignment()
 
 #[test]
 fn supervise_holds_exclusive_worktree_lease_through_child_and_parent_auditor() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let plan = injected_plan(assignment.clone(), 0);

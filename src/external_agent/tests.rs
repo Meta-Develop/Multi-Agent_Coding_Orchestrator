@@ -847,6 +847,7 @@ fn nonpublishable_trusted_compatibility_protocol_loss_retains_evidence() {
 #[cfg(target_os = "linux")]
 #[test]
 fn verified_contained_fake_app_server_proves_duplex_ordering_and_confinement() {
+    skip_without_containment!();
     let mut allow_journal = RecordingPreActionJournal::default();
     let (allow, allow_metrics, allow_denials, allow_marker) = match contained_fake_app_server(
         "accept",

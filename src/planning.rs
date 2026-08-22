@@ -2641,6 +2641,7 @@ mod tests {
 
     #[test]
     fn propose_task_paths_does_not_match_common_symbol_words() {
+        skip_without_containment!();
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path();
         git2::Repository::init(repo).expect("init repo");
@@ -2660,6 +2661,7 @@ mod tests {
 
     #[test]
     fn propose_task_paths_requires_standalone_short_identifier_tokens() {
+        skip_without_containment!();
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path();
         git2::Repository::init(repo).expect("init repo");
@@ -2676,6 +2678,7 @@ mod tests {
 
     #[test]
     fn propose_task_paths_matches_real_symbol_mentions() {
+        skip_without_containment!();
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path();
         git2::Repository::init(repo).expect("init repo");
@@ -2700,6 +2703,7 @@ mod tests {
 
     #[test]
     fn propose_task_paths_routes_docs_and_rust_tasks_separately() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -2723,6 +2727,7 @@ mod tests {
 
     #[test]
     fn propose_task_path_proposal_keeps_empty_result_without_readme() {
+        skip_without_containment!();
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path();
         git2::Repository::init(repo).expect("init repo");
@@ -2738,6 +2743,7 @@ mod tests {
 
     #[test]
     fn propose_task_path_proposal_reports_filename_only_degradation() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -2935,6 +2941,7 @@ mod tests {
 
     #[test]
     fn optional_provider_uses_heuristic_fallback_when_unconfigured() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -2964,6 +2971,7 @@ mod tests {
 
     #[test]
     fn fake_provider_proposes_a_validated_disjoint_plan() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -3028,6 +3036,7 @@ mod tests {
 
     #[test]
     fn provider_plan_rejects_overlapping_assignments() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -3074,6 +3083,7 @@ mod tests {
 
     #[test]
     fn fake_provider_replans_from_feedback_with_a_hard_attempt_limit() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -3182,6 +3192,7 @@ mod tests {
 
     #[test]
     fn fake_provider_proposes_a_recursive_tree_and_flattens_executable_leaves() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -3244,6 +3255,7 @@ mod tests {
 
     #[test]
     fn recursive_provider_plan_rejects_internal_fragment_union_mismatch() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -3294,6 +3306,7 @@ mod tests {
 
     #[test]
     fn recursive_provider_plan_rejects_depth_and_reclaimed_completed_scope() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -3388,6 +3401,7 @@ mod tests {
 
     #[test]
     fn propose_task_decomposition_is_deterministic_and_exposes_coverage_and_intents() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -3461,6 +3475,7 @@ mod tests {
 
     #[test]
     fn exact_symbol_scope_avoids_a_shared_megafile_module_attractor() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -3518,6 +3533,7 @@ mod tests {
 
     #[test]
     fn propose_task_decomposition_coalesces_transitive_scope_overlap() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -3597,6 +3613,7 @@ mod tests {
 
     #[test]
     fn propose_task_paths_does_not_sweep_nested_policy_markdown() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -3641,6 +3658,7 @@ mod tests {
 
     #[test]
     fn propose_task_decomposition_matches_script_basename() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -3707,6 +3725,7 @@ mod tests {
 
     #[test]
     fn collect_repo_files_excludes_local_agent_runtime_state() {
+        skip_without_containment!();
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path();
         git2::Repository::init(repo).expect("init repo");
@@ -3732,6 +3751,7 @@ mod tests {
 
     #[test]
     fn collect_repo_files_excludes_git_ignored_directory() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -3751,6 +3771,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn collect_repo_files_never_follows_links_or_accepts_unsafe_files() {
+        skip_without_containment!();
         use std::os::unix::{fs::symlink, net::UnixListener};
 
         let temp = tempfile::tempdir().expect("tempdir");

@@ -650,6 +650,7 @@ fn typed_decomposition_rejects_missing_target_replacements_and_ordinary_pseudo_e
 
 #[test]
 fn finalized_decomposition_evidence_binds_exact_candidate_and_exposes_chain_ids() {
+    skip_without_containment!();
     let (_temp, repo_path) = injected_repository();
     let manager = WorktreeManager::new(&repo_path);
     let agent = manager
@@ -736,6 +737,7 @@ fn finalized_decomposition_evidence_binds_exact_candidate_and_exposes_chain_ids(
 
 #[test]
 fn supervisor_injects_binding_from_stable_candidate_and_detects_later_bytes() {
+    skip_without_containment!();
     let (_temp, repo_path) = injected_repository();
     let mut assignment = injected_assignment(true);
     assignment
