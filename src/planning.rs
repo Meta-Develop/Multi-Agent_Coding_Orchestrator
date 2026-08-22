@@ -4052,6 +4052,9 @@ mod tests {
 
     #[test]
     fn heuristic_replan_rejects_completed_scope_reclaim_and_provider_sessions() {
+        // Heuristic rematch already refuses completed-scope reclaim. Inventory
+        // and provider-session setup still use isolated git.
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
