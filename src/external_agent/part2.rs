@@ -894,7 +894,15 @@ struct ProtectedWorktreeControls {
     read_only_files: Vec<ProtectedWorktreeControl>,
     read_write_roots: Vec<ProtectedWorktreeControl>,
     read_write_files: Vec<ProtectedWorktreeControl>,
+    managed_git: Option<ManagedWorktreeGitMetadata>,
     writable_artifact_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedWorktreeGitMetadata {
+    worktree_git_dir: PathBuf,
+    common_read_only_roots: Vec<PathBuf>,
+    common_read_only_files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -985,8 +993,271 @@ impl ProtectedWorktreeControls {
 fn protected_worktree_controls(spec: &ExternalAgentCommand) -> Result<ProtectedWorktreeControls> {
     let mut controls =
         protected_worktree_controls_for(&spec.cwd, &spec.worktree_control_exceptions)?;
+    if spec.invocation == ExternalAgentInvocation::CodexSupervisor
+        && spec.writable_launch_target == WritableLaunchTarget::ManagedChildWorktree
+        && spec.agent_lifecycle.is_some()
+    {
+        controls.managed_git = managed_worktree_git_metadata(&spec.cwd)?;
+    }
     controls.writable_artifact_root = Some(validate_artifact_parent_disjoint(spec, &controls)?);
     Ok(controls)
+}
+
+fn managed_worktree_git_metadata(workspace: &Path) -> Result<Option<ManagedWorktreeGitMetadata>> {
+    let marker = workspace.join(".git");
+    let marker_metadata = fs::symlink_metadata(&marker)
+        .context("managed child worktree is missing its .git marker")?;
+    if marker_metadata.file_type().is_symlink() {
+        bail!("managed child worktree .git marker may not be a symlink");
+    }
+    if marker_metadata.is_dir() {
+        return Ok(None);
+    }
+    if !marker_metadata.is_file() {
+        bail!("managed child worktree .git marker is not a regular file");
+    }
+    #[cfg(unix)]
+    if {
+        use std::os::unix::fs::MetadataExt;
+        marker_metadata.nlink() != 1
+    } {
+        bail!("managed child worktree .git marker has a hard-link alias");
+    }
+
+    let canonical_workspace = fs::canonicalize(workspace)
+        .context("managed child worktree root could not be resolved")?;
+    let marker_target = parse_git_path_file(&marker, Some("gitdir: "), "worktree .git marker")?;
+    let worktree_git_dir = canonicalize_git_path(&canonical_workspace, &marker_target)
+        .context("managed child worktree .git marker target could not be resolved")?;
+    let repository = crate::git_repository::open(&canonical_workspace)
+        .map_err(|_| anyhow::anyhow!("managed child worktree could not be opened by libgit2"))?;
+    let repository_workdir = repository
+        .workdir()
+        .context("managed child Git repository has no worktree")?;
+    let repository_workdir = fs::canonicalize(repository_workdir)
+        .context("managed child Git worktree could not be resolved")?;
+    let repository_git_dir = fs::canonicalize(repository.path())
+        .context("managed child Git directory could not be resolved")?;
+    let common_dir = fs::canonicalize(repository.commondir())
+        .context("managed child Git common directory could not be resolved")?;
+    if repository_workdir != canonical_workspace || repository_git_dir != worktree_git_dir {
+        bail!("managed child .git marker does not match the libgit2 repository binding");
+    }
+
+    let commondir_target = parse_git_path_file(
+        &worktree_git_dir.join("commondir"),
+        None,
+        "linked-worktree commondir",
+    )?;
+    let marker_common_dir = canonicalize_git_path(&worktree_git_dir, &commondir_target)
+        .context("linked-worktree commondir target could not be resolved")?;
+    if marker_common_dir != common_dir {
+        bail!("linked-worktree commondir does not match the libgit2 common directory");
+    }
+    let expected_worktrees_root = common_dir.join("worktrees");
+    if worktree_git_dir.parent() != Some(expected_worktrees_root.as_path()) {
+        bail!("managed child Git directory is not an exact child of the common worktrees directory");
+    }
+
+    let backlink_target = parse_git_path_file(
+        &worktree_git_dir.join("gitdir"),
+        None,
+        "linked-worktree backlink",
+    )?;
+    let backlink = canonicalize_git_path(&worktree_git_dir, &backlink_target)
+        .context("linked-worktree backlink target could not be resolved")?;
+    let canonical_marker = fs::canonicalize(&marker)
+        .context("managed child worktree .git marker could not be rebound")?;
+    if backlink != canonical_marker {
+        bail!("linked-worktree backlink does not name the managed child .git marker");
+    }
+
+    let objects = canonical_git_directory(&common_dir.join("objects"), "Git object directory")?;
+    reject_git_object_aliases(&objects)?;
+    let refs = canonical_git_directory(&common_dir.join("refs"), "Git refs directory")?;
+    reject_git_read_only_tree_aliases(&refs, "Git refs")?;
+    let config = canonical_git_file(&common_dir.join("config"), "Git common config")?;
+    let mut common_read_only_files = vec![config];
+    for (relative, label) in [
+        ("packed-refs", "Git packed refs"),
+        ("info/exclude", "Git exclude file"),
+        ("shallow", "Git shallow boundary"),
+    ] {
+        if let Some(file) = canonical_optional_git_file(&common_dir.join(relative), label)? {
+            common_read_only_files.push(file);
+        }
+    }
+    common_read_only_files.sort();
+    common_read_only_files.dedup();
+    let mut common_read_only_roots = vec![objects, refs];
+    common_read_only_roots.sort();
+    common_read_only_roots.dedup();
+
+    for read_only in common_read_only_roots
+        .iter()
+        .chain(common_read_only_files.iter())
+    {
+        if read_only.starts_with(&worktree_git_dir) || worktree_git_dir.starts_with(read_only) {
+            bail!("managed child writable Git metadata overlaps common read-only metadata");
+        }
+    }
+    for forbidden in [
+        common_dir.join("HEAD"),
+        common_dir.join("index"),
+        common_dir.join("maco"),
+        expected_worktrees_root,
+    ] {
+        if common_read_only_roots
+            .iter()
+            .chain(common_read_only_files.iter())
+            .any(|allowed| allowed == &forbidden || allowed.starts_with(&forbidden))
+        {
+            bail!("managed child Git metadata allowlist includes private common metadata");
+        }
+    }
+
+    Ok(Some(ManagedWorktreeGitMetadata {
+        worktree_git_dir,
+        common_read_only_roots,
+        common_read_only_files,
+    }))
+}
+
+fn parse_git_path_file(path: &Path, prefix: Option<&str>, label: &str) -> Result<PathBuf> {
+    const MAX_GIT_PATH_FILE_BYTES: u64 = 16 * 1024;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("{label} is missing"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_GIT_PATH_FILE_BYTES
+    {
+        bail!("{label} is not a bounded regular file");
+    }
+    #[cfg(unix)]
+    if {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() != 1
+    } {
+        bail!("{label} has a hard-link alias");
+    }
+    let bytes = fs::read(path).with_context(|| format!("failed to read {label}"))?;
+    let text = std::str::from_utf8(&bytes).with_context(|| format!("{label} is not UTF-8"))?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    let text = text.strip_suffix('\r').unwrap_or(text);
+    let value = match prefix {
+        Some(prefix) => text
+            .strip_prefix(prefix)
+            .with_context(|| format!("{label} has an invalid prefix"))?,
+        None => text,
+    };
+    if value.is_empty() || value.chars().any(char::is_control) {
+        bail!("{label} contains an invalid path");
+    }
+    Ok(PathBuf::from(value))
+}
+
+fn canonicalize_git_path(base: &Path, value: &Path) -> std::io::Result<PathBuf> {
+    if value.is_absolute() {
+        fs::canonicalize(value)
+    } else {
+        fs::canonicalize(base.join(value))
+    }
+}
+
+fn canonical_git_directory(path: &Path, label: &str) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(path).with_context(|| format!("{label} is missing"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("{label} is not a non-symlink directory");
+    }
+    fs::canonicalize(path).with_context(|| format!("{label} could not be resolved"))
+}
+
+fn canonical_git_file(path: &Path, label: &str) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(path).with_context(|| format!("{label} is missing"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("{label} is not a non-symlink regular file");
+    }
+    #[cfg(unix)]
+    if {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() != 1
+    } {
+        bail!(
+            "{label} has a hard-link alias; recreate the launch repository with --no-hardlinks before retrying"
+        );
+    }
+    fs::canonicalize(path).with_context(|| format!("{label} could not be resolved"))
+}
+
+fn canonical_optional_git_file(path: &Path, label: &str) -> Result<Option<PathBuf>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {label}")),
+        Ok(_) => canonical_git_file(path, label).map(Some),
+    }
+}
+
+#[cfg(unix)]
+fn reject_git_object_aliases(objects: &Path) -> Result<()> {
+    for alternate in ["info/alternates", "info/http-alternates"] {
+        match fs::symlink_metadata(objects.join(alternate)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("failed to inspect Git object alternates"),
+            Ok(_) => bail!(
+                "managed child Git object alternates are unsupported; recreate the launch repository without --reference before retrying"
+            ),
+        }
+    }
+
+    reject_git_read_only_tree_aliases(objects, "Git object storage")
+}
+
+#[cfg(unix)]
+fn reject_git_read_only_tree_aliases(root: &Path, label: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    const MAX_GIT_METADATA_ENTRIES: usize = 200_000;
+    let mut remaining = MAX_GIT_METADATA_ENTRIES;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = fs::read_dir(&directory).with_context(|| format!("failed to inspect {label}"))?;
+        for entry in entries {
+            if remaining == 0 {
+                bail!(
+                    "managed child {label} alias inspection exceeded its {MAX_GIT_METADATA_ENTRIES}-entry safety bound"
+                );
+            }
+            remaining -= 1;
+            let entry = entry.with_context(|| format!("failed to inspect {label} entry"))?;
+            let metadata = fs::symlink_metadata(entry.path())
+                .with_context(|| format!("failed to inspect {label} entry type"))?;
+            if metadata.file_type().is_symlink() {
+                bail!("managed child {label} contains a symlink alias");
+            }
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                if metadata.nlink() != 1 {
+                    bail!(
+                        "managed child {label} contains hard-link aliases; recreate the launch repository with --no-hardlinks and without --reference before retrying"
+                    );
+                }
+            } else {
+                bail!("managed child {label} contains a special file");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reject_git_object_aliases(_objects: &Path) -> Result<()> {
+    bail!("managed child Git object alias validation is unsupported on this platform")
+}
+
+#[cfg(not(unix))]
+fn reject_git_read_only_tree_aliases(_root: &Path, _label: &str) -> Result<()> {
+    bail!("managed child Git metadata alias validation is unsupported on this platform")
 }
 
 fn protected_worktree_controls_for(
@@ -1155,6 +1426,17 @@ fn validate_artifact_parent_disjoint(
             continue;
         }
         bail!("external-agent output parent overlaps a protected worktree control");
+    }
+    if let Some(git) = &controls.managed_git {
+        for protected in std::iter::once(&git.worktree_git_dir)
+            .chain(&git.common_read_only_roots)
+            .chain(&git.common_read_only_files)
+        {
+            let protected = normalized_absolute_path(protected, "managed Git metadata")?;
+            if parent.starts_with(&protected) || protected.starts_with(&parent) {
+                bail!("external-agent output parent overlaps managed Git metadata");
+            }
+        }
     }
     Ok(parent)
 }
@@ -1834,6 +2116,22 @@ fn external_side_effect_profile(
                         })?;
                 }
                 profile = profile.with_visible_read_write_file(&control.absolute);
+            }
+            if let Some(git) = &protected_controls.managed_git {
+                for root in &git.common_read_only_roots {
+                    profile = profile.with_visible_read_only_root(root);
+                }
+                for file in &git.common_read_only_files {
+                    profile = profile.with_visible_read_only_file(file);
+                }
+                profile = match spec.workspace_access {
+                    WorkspaceAccess::ReadOnly => {
+                        profile.with_visible_read_only_root(&git.worktree_git_dir)
+                    }
+                    WorkspaceAccess::ReadWrite => {
+                        profile.with_visible_read_write_root(&git.worktree_git_dir)
+                    }
+                };
             }
             let canonical_workspace = fs::canonicalize(&spec.cwd)?;
             if !program.starts_with(&canonical_workspace) {
@@ -2531,6 +2829,26 @@ fn codex_filesystem_permissions(
     {
         if let Some(absolute) = control.absolute.to_str() {
             path_permissions.insert(absolute.to_string(), "read");
+        }
+    }
+    if let Some(git) = &controls.managed_git {
+        for path in git
+            .common_read_only_roots
+            .iter()
+            .chain(&git.common_read_only_files)
+        {
+            if let Some(path) = path.to_str() {
+                path_permissions.insert(path.to_string(), "read");
+            }
+        }
+        if let Some(path) = git.worktree_git_dir.to_str() {
+            path_permissions.insert(
+                path.to_string(),
+                match spec.workspace_access {
+                    WorkspaceAccess::ReadOnly => "read",
+                    WorkspaceAccess::ReadWrite => "write",
+                },
+            );
         }
     }
     for control in controls

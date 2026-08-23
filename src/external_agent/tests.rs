@@ -1164,6 +1164,306 @@ fn create_mandatory_control_roots(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn create_linked_git_metadata_fixture(root: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+    let primary = root.join("primary");
+    let child = root.join("child");
+    let peer = root.join("peer");
+    let repository = git2::Repository::init(&primary)?;
+    fs::write(primary.join("RELEASE_NOTES.md"), "initial\n")?;
+    let mut index = repository.index()?;
+    index.add_path(Path::new("RELEASE_NOTES.md"))?;
+    let tree_id = index.write_tree()?;
+    index.write()?;
+    let tree = repository.find_tree(tree_id)?;
+    let signature = git2::Signature::now("Fixture Owner", "fixture@example.invalid")?;
+    repository.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])?;
+    drop(tree);
+
+    let add = git2::WorktreeAddOptions::new();
+    repository.worktree("child", &child, Some(&add))?;
+    let peer_add = git2::WorktreeAddOptions::new();
+    repository.worktree("peer", &peer, Some(&peer_add))?;
+    for root in PERMANENT_CONTROL_ROOTS.iter().chain(POLICY_CONTROL_ROOTS) {
+        fs::create_dir_all(child.join(root))?;
+    }
+    let program = child.join("fixture-codex");
+    fs::write(&program, "#!/bin/sh\nexit 0\n")?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700))?;
+    }
+    let common = fs::canonicalize(repository.commondir())?;
+    fs::write(
+        common.join("packed-refs"),
+        "# pack-refs with: peeled fully-peeled sorted\n",
+    )?;
+    fs::create_dir_all(common.join("maco/state"))?;
+    let child_repository = crate::git_repository::open(&child)?;
+    let child_git_dir = fs::canonicalize(child_repository.path())?;
+    Ok((primary, child, common, child_git_dir))
+}
+
+#[cfg(unix)]
+fn managed_git_command(child: &Path, incoming: &Path) -> ExternalAgentCommand {
+    ExternalAgentCommand::codex(
+        child.join("fixture-codex"),
+        child,
+        child.join("prompt.md"),
+        child.join("events.jsonl"),
+        incoming.join("report.json"),
+        Duration::from_secs(1),
+    )
+    .with_agent_lifecycle(child, "child_orchestrator", "run-299", "assignment-299")
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_linked_worktree_git_roots_are_exact_and_exclude_primary_metadata() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (primary, child, common, child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    let metadata = managed_worktree_git_metadata(&child)?.context("linked metadata")?;
+
+    assert_eq!(metadata.worktree_git_dir, child_git_dir);
+    assert_eq!(
+        metadata.common_read_only_roots,
+        vec![
+            fs::canonicalize(common.join("objects"))?,
+            fs::canonicalize(common.join("refs"))?,
+        ]
+    );
+    for required in ["config", "packed-refs", "info/exclude"] {
+        assert!(metadata
+            .common_read_only_files
+            .contains(&fs::canonicalize(common.join(required))?));
+    }
+
+    let forbidden = [
+        fs::canonicalize(common.join("HEAD"))?,
+        fs::canonicalize(primary.join(".git/index"))?,
+        fs::canonicalize(common.join("worktrees/peer"))?,
+        fs::canonicalize(common.join("maco"))?,
+        common.join("config.worktree"),
+    ];
+    for path in forbidden {
+        assert_ne!(metadata.worktree_git_dir, path);
+        assert!(!metadata
+            .common_read_only_roots
+            .iter()
+            .any(|root| { path == *root || path.starts_with(root) || root.starts_with(&path) }));
+        assert!(!metadata
+            .common_read_only_files
+            .iter()
+            .any(|file| file == &path || file.starts_with(&path)));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_git_metadata_is_own_gitdir_write_and_common_components_read_in_both_layers() -> Result<()>
+{
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, common, child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let command = managed_git_command(&child, &incoming);
+    let controls = protected_worktree_controls(&command)?;
+    let git = controls
+        .managed_git
+        .as_ref()
+        .context("managed Git controls")?;
+    let permissions = codex_filesystem_permissions(&command, &controls);
+
+    assert!(permissions.contains(&format!(
+        "{}=\"write\"",
+        toml_basic_string(child_git_dir.to_str().context("UTF-8 child gitdir")?)
+    )));
+    for path in git
+        .common_read_only_roots
+        .iter()
+        .chain(&git.common_read_only_files)
+    {
+        assert!(permissions.contains(&format!(
+            "{}=\"read\"",
+            toml_basic_string(path.to_str().context("UTF-8 common metadata")?)
+        )));
+    }
+    for forbidden in [
+        common.join("HEAD"),
+        common.join("index"),
+        common.join("worktrees/peer"),
+        common.join("maco"),
+        common.join("config.worktree"),
+    ] {
+        let quoted = toml_basic_string(forbidden.to_str().context("UTF-8 forbidden path")?);
+        assert!(!permissions.contains(&format!("{quoted}=\"read\"")));
+        assert!(!permissions.contains(&format!("{quoted}=\"write\"")));
+    }
+
+    let actual = external_side_effect_profile(
+        &command,
+        &child.join("fixture-codex"),
+        ExternalProgramTrust::TrustedSystemCodex,
+        &controls,
+    )?;
+    let SideEffectConfinementProfile::ExternalCodex(actual) = actual else {
+        bail!("expected ExternalCodex profile");
+    };
+    let mut expected = ExternalCodexProfile::read_write(&child);
+    for control in &controls.read_only_roots {
+        expected = expected.with_visible_read_only_root(&control.absolute);
+    }
+    for control in &controls.read_only_files {
+        expected = expected.with_visible_read_only_file(&control.absolute);
+    }
+    for control in &controls.read_write_roots {
+        expected = expected.with_visible_read_write_root(&control.absolute);
+    }
+    for control in &controls.read_write_files {
+        expected = expected.with_visible_read_write_file(&control.absolute);
+    }
+    for root in &git.common_read_only_roots {
+        expected = expected.with_visible_read_only_root(root);
+    }
+    for file in &git.common_read_only_files {
+        expected = expected.with_visible_read_only_file(file);
+    }
+    expected = expected
+        .with_visible_read_write_root(&git.worktree_git_dir)
+        .with_writable_artifact_root(&incoming);
+    assert_eq!(actual, expected);
+    assert!(actual.visible_read_write_roots().contains(&child_git_dir));
+    for root in &git.common_read_only_roots {
+        assert!(actual.visible_read_only_roots().contains(root));
+    }
+    for forbidden in [
+        common.join("worktrees"),
+        common.join("worktrees/peer"),
+        common.join("maco"),
+        common.join("config.worktree"),
+    ] {
+        assert!(!actual
+            .visible_read_only_roots()
+            .iter()
+            .chain(actual.visible_read_write_roots())
+            .any(|allowed| allowed == &forbidden));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_git_metadata_cannot_overlap_writable_artifact_staging() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, common, child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    for output in [
+        common.join("objects/report.json"),
+        common.join("refs/report.json"),
+        child_git_dir.join("report.json"),
+    ] {
+        let command = ExternalAgentCommand::codex(
+            child.join("fixture-codex"),
+            &child,
+            child.join("prompt.md"),
+            child.join("events.jsonl"),
+            output,
+            Duration::from_secs(1),
+        )
+        .with_agent_lifecycle(&child, "child_orchestrator", "run-299", "assignment-299");
+        let error = protected_worktree_controls(&command)
+            .expect_err("managed Git metadata must not become writable staging");
+        assert_eq!(
+            error.to_string(),
+            "external-agent output parent overlaps managed Git metadata"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_git_hardlink_alias_fails_as_typed_actionable_sandbox_error() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, common, _child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    let alias_source = common.join("objects/aa/alias-object");
+    fs::create_dir_all(alias_source.parent().context("alias parent")?)?;
+    fs::write(&alias_source, "object bytes")?;
+    fs::hard_link(&alias_source, temp.path().join("object-alias"))?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+
+    let run = run_external_agent_nonpublishable_simulation(&managed_git_command(&child, &incoming));
+    assert_eq!(run.environment_failures().len(), 1);
+    assert_eq!(
+        run.environment_failures()[0].category,
+        EnvironmentFailureCategory::SandboxUnavailable
+    );
+    let message = run.error.context("sandbox failure message")?;
+    assert!(message.contains("hard-link aliases"), "{message}");
+    assert!(message.contains("--no-hardlinks"), "{message}");
+    assert!(!message.contains(&temp.path().display().to_string()));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_git_ref_alias_to_primary_index_fails_as_typed_sandbox_error() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (primary, child, common, _child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    fs::hard_link(
+        primary.join(".git/index"),
+        common.join("refs/heads/primary-index-alias"),
+    )?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+
+    let run = run_external_agent_nonpublishable_simulation(&managed_git_command(&child, &incoming));
+    assert_eq!(run.environment_failures().len(), 1);
+    assert_eq!(
+        run.environment_failures()[0].category,
+        EnvironmentFailureCategory::SandboxUnavailable
+    );
+    let message = run.error.context("sandbox failure message")?;
+    assert!(
+        message.contains("Git refs contains hard-link aliases"),
+        "{message}"
+    );
+    assert!(message.contains("--no-hardlinks"), "{message}");
+    assert!(!message.contains(&temp.path().display().to_string()));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_git_alternates_fail_closed_with_reference_remediation() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, common, _child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    fs::write(
+        common.join("objects/info/alternates"),
+        "/external/reference/objects\n",
+    )?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+
+    let run = run_external_agent_nonpublishable_simulation(&managed_git_command(&child, &incoming));
+    assert_eq!(run.environment_failures().len(), 1);
+    assert_eq!(
+        run.environment_failures()[0].category,
+        EnvironmentFailureCategory::SandboxUnavailable
+    );
+    let message = run.error.context("sandbox failure message")?;
+    assert!(
+        message.contains("object alternates are unsupported"),
+        "{message}"
+    );
+    assert!(message.contains("without --reference"), "{message}");
+    assert!(!message.contains(&temp.path().display().to_string()));
+    Ok(())
+}
+
 #[test]
 fn environment_preflight_requirements_are_bounded_and_canonical() {
     let cargo = EnvironmentRequirement::executable(
