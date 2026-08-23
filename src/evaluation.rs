@@ -569,7 +569,7 @@ pub struct PreciseMean {
 }
 
 impl PreciseMean {
-    fn new(total: u64, count: u32) -> Result<Self, EvaluationError> {
+    pub(crate) fn new(total: u64, count: u32) -> Result<Self, EvaluationError> {
         if count == 0 {
             return Err(invalid_results(
                 "profile_summaries",
@@ -945,6 +945,10 @@ pub enum EvaluationError {
     DeclaredInputsSerialization { message: String },
     #[error("invalid gate-policy corpus field '{field}': {message}")]
     InvalidGatePolicyCorpus { field: String, message: String },
+    #[error("unsupported evaluation experiment manifest version {found}; supported version is {supported}")]
+    UnsupportedExperimentManifestVersion { found: u32, supported: u32 },
+    #[error("fake supervise experiment failed: {message}")]
+    FakeSuperviseExperiment { message: String },
 }
 
 /// Run a manifest-bound evaluation request.
@@ -2657,7 +2661,7 @@ fn validate_review_dimension(
     Ok(())
 }
 
-fn calculate_quality(
+pub(crate) fn calculate_quality(
     held_out: &[HeldOutValidationResult],
     review: &ReviewQuality,
 ) -> Result<QualityScore, EvaluationError> {
@@ -3194,7 +3198,10 @@ fn invalid_manifest(field: impl Into<String>, message: impl Into<String>) -> Eva
     }
 }
 
-fn invalid_results(field: impl Into<String>, message: impl Into<String>) -> EvaluationError {
+pub(crate) fn invalid_results(
+    field: impl Into<String>,
+    message: impl Into<String>,
+) -> EvaluationError {
     EvaluationError::InvalidResults {
         field: field.into(),
         message: message.into(),
@@ -3216,6 +3223,14 @@ impl fmt::Display for EvaluationEvidenceKind {
         }
     }
 }
+
+mod experiment;
+pub use experiment::{
+    parse_experiment_manifest, run_fake_supervise_experiment, ExperimentEvidence,
+    ExperimentEvidenceKind, ExperimentManifest, ExperimentProfileSummary, ExperimentResults,
+    ExperimentRun, ExperimentRunRequest, EXPERIMENT_MANIFEST_SCHEMA_VERSION,
+    EXPERIMENT_RESULTS_SCHEMA_VERSION, EXPERIMENT_RESULT_SCHEMA,
+};
 
 #[cfg(test)]
 mod tests;

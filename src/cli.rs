@@ -3717,6 +3717,7 @@ impl EvaluationCommand {
     fn run(self) -> Result<()> {
         match self.command {
             EvaluationSubcommand::Run(args) => run_evaluation_command(args),
+            EvaluationSubcommand::Experiment(args) => run_evaluation_experiment_command(args),
         }
     }
 }
@@ -3725,6 +3726,8 @@ impl EvaluationCommand {
 enum EvaluationSubcommand {
     /// Generate deterministic fixture output for every manifest profile and repetition.
     Run(RunEvaluationArgs),
+    /// Run the same goal/spec under multiple profiles through isolated Fake supervise.
+    Experiment(RunExperimentArgs),
 }
 
 #[derive(Debug, Args)]
@@ -3756,6 +3759,55 @@ struct RunEvaluationArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunExperimentArgs {
+    /// Versioned experiment manifest binding goal/spec, profiles, and repetitions.
+    manifest: PathBuf,
+    /// Reserved source-repository path; unused because each profile uses isolated Fake state.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Requested mode; this command supports deterministic-fake and refuses real-provider.
+    #[arg(
+        long,
+        default_value = "deterministic-fake",
+        value_parser = parse_evaluation_execution
+    )]
+    execution: crate::evaluation::EvaluationExecution,
+    /// Acknowledge future real-provider execution; the current runner still refuses it.
+    #[arg(long)]
+    allow_real_provider: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+fn run_evaluation_experiment_command(args: RunExperimentArgs) -> Result<()> {
+    let manifest_bytes =
+        BoundedRegularReader::read_tree_no_follow(&args.manifest, MAX_EVALUATION_MANIFEST_BYTES)
+            .with_context(|| {
+                format!(
+                    "failed to read evaluation experiment manifest {}",
+                    args.manifest.display()
+                )
+            })?;
+    let manifest =
+        crate::evaluation::parse_experiment_manifest(&manifest_bytes).with_context(|| {
+            format!(
+                "failed to parse evaluation experiment manifest {}",
+                args.manifest.display()
+            )
+        })?;
+    let _repo = args.repo;
+    let results = crate::evaluation::run_fake_supervise_experiment(
+        &manifest,
+        crate::evaluation::ExperimentRunRequest {
+            execution: args.execution,
+            allow_real_provider: args.allow_real_provider,
+        },
+    )?;
+    print_query_report(&results, args.json)
 }
 
 #[derive(Debug, Args)]
