@@ -973,9 +973,9 @@ fn prepare_child_attempt<'a>(
         runtime_model_catalog,
     )?;
     command = bind_runtime_output_schema(command, launch_runtime, schema_path);
-    // A linked managed worktree's `.git` file resolves into the owning repository's
-    // primary/common checkout. Keep that checkout visible under the outer sandbox's
-    // read-only baseline; only `command.cwd` is mounted as the writable workspace.
+    // Agent lifecycle records and binds repository metadata. Child-visible Git paths are
+    // derived separately from `command.cwd` as an exact linked-worktree allowlist; the
+    // owning primary/common checkout is not made visible.
     command = command.with_agent_lifecycle(
         repo,
         assignment.role.as_str(),

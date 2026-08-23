@@ -1014,6 +1014,19 @@ cargo run -- consult ask \
   --json
 ```
 
+For writable Codex launches in a managed linked worktree, MACO grants read-write
+access only to that worktree's own per-worktree Git directory. The common Git
+allowlist is read-only: `objects/`, `refs/`, `config`, `packed-refs`,
+`info/exclude`, and optional `shallow`. The primary `HEAD`, `index`, and
+`config.worktree`, MACO common state, and peer worktree entries are not exposed.
+The same exact allowlist applies to the outer process confinement and the inner
+Codex filesystem policy; primary merge, apply, and publish gates remain in force.
+
+Launch fails closed when Git markers or allowlisted metadata contain symlinks,
+hard-link aliases, special files, or object alternates. Recreate the launch
+repository with `git clone --no-hardlinks` and without `--reference` before
+retrying; MACO does not repack the primary repository as remediation.
+
 Consultant advice is advisory evidence only. It does not override project
 rules, assigned ownership, validation requirements, review gates, or merge
 gates.
