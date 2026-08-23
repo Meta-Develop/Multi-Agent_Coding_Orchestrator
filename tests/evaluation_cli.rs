@@ -1,3 +1,5 @@
+mod support;
+
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::{fs, path::PathBuf, process::Command};
@@ -185,6 +187,8 @@ fn evaluation_help_exposes_execution_and_real_provider_gate() -> Result<()> {
 
 #[test]
 fn evaluation_experiment_cli_runs_two_profiles_as_json() -> Result<()> {
+    support::require_containment!("evaluation_experiment_cli_runs_two_profiles_as_json");
+
     let working = TempDir::new().context("create empty experiment cwd")?;
     let manifest_path = fixture_path("experiment-manifest-v1.json");
 
