@@ -56,6 +56,7 @@ fn injected_primary_repository() -> (tempfile::TempDir, PathBuf) {
 
 #[test]
 fn primary_worktree_outside_scope_mutation_fails_integrity_and_releases_claim() {
+    skip_without_containment!();
     let (temp, repo) = injected_primary_repository();
     let assignment = primary_assignment(false);
     let loaded = validated_primary_loaded(assignment.clone());
@@ -162,6 +163,7 @@ fn primary_execution_target_rejects_missing_broad_and_git_scopes() {
 
 #[test]
 fn dirty_primary_scope_refuses_before_dispatch_and_releases_claim() {
+    skip_without_containment!();
     let (temp, repo) = injected_primary_repository();
     run_injected_git(&repo, &["add", "-f", PRIMARY_SCOPE]);
     commit_injected_repository(&repo, "track deployment state for dirty-scope test");
@@ -203,6 +205,7 @@ fn dirty_primary_scope_refuses_before_dispatch_and_releases_claim() {
 
 #[test]
 fn bounded_primary_command_run_mutates_scope_holds_and_releases_claim_and_marks_reports() {
+    skip_without_containment!();
     let (temp, repo) = injected_primary_repository();
     let assignment = primary_assignment(false);
     let loaded = validated_primary_loaded(assignment.clone());

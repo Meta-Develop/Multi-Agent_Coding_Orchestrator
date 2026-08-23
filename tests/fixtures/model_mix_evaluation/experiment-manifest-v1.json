@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "experiment_id": "issue-26-fake-supervise",
+  "goal": "Record the same isolated Fake supervise goal under two profiles.",
+  "spec": "Keep production_eligible false and compare machine-readable summaries.",
+  "limits": {
+    "wall_time_seconds": 120,
+    "max_dispatches": 4
+  },
+  "held_out_validation": [
+    {
+      "id": "held-out-unit",
+      "command": ["true"]
+    }
+  ],
+  "repetitions": 1,
+  "profiles": [
+    {
+      "id": "hybrid-mix",
+      "role_models": {
+        "child_orchestrator": {
+          "model": "planner-fast",
+          "reasoning_effort": "high",
+          "unavailable_model_fallback": "fail_closed"
+        },
+        "worker": {
+          "model": "worker-fast",
+          "reasoning_effort": "medium",
+          "unavailable_model_fallback": "fail_closed"
+        }
+      }
+    },
+    {
+      "id": "all-frontier",
+      "role_models": {
+        "child_orchestrator": {
+          "model": "planner-frontier",
+          "reasoning_effort": "high",
+          "unavailable_model_fallback": "fail_closed"
+        },
+        "worker": {
+          "model": "worker-frontier",
+          "reasoning_effort": "medium",
+          "unavailable_model_fallback": "fail_closed"
+        }
+      }
+    }
+  ]
+}

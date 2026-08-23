@@ -5,7 +5,14 @@
 //! as zero cost. This module is kept private to `supervise` so the run lifecycle remains the single
 //! owner of both usage accounting and enforcement.
 
-use crate::supervise::AgentRole;
+use crate::{
+    budget_ledger::{
+        current_rolling_binding, provider_error_is_rate_limited, unix_now, RollingBudgetQuota,
+        WorkspaceBudgetLedger,
+    },
+    llm::ProviderError,
+    supervise::AgentRole,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -189,10 +196,29 @@ pub struct RoleBudgetReport {
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct RunBudgetSource {
+    pub limits: RunBudgetLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunBudgetSources {
+    pub plan: RunBudgetSource,
+    pub cli: RunBudgetSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunBudgetReport {
     pub limits: RunBudgetLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_duration_seconds: Option<u64>,
+    /// Original plan and CLI ceilings before strictest-wins composition.
+    /// Present only when a CLI flag actually set a token, cost, or duration bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<RunBudgetSources>,
     pub consumed: BudgetAmount,
     pub reserved: BudgetAmount,
     pub committed: BudgetAmount,
@@ -314,6 +340,8 @@ pub(super) enum BudgetError {
     InconsistentState,
     #[error("budget ledger lock is poisoned")]
     Poisoned,
+    #[error("workspace rolling budget ledger is unavailable or corrupt: {0}")]
+    RollingLedgerUnavailable(String),
 }
 
 pub(super) type Result<T> = std::result::Result<T, BudgetError>;
@@ -322,8 +350,17 @@ pub(super) type Result<T> = std::result::Result<T, BudgetError>;
 pub(super) struct RunBudgetLedger {
     limits: RunBudgetLimits,
     max_duration_seconds: Option<u64>,
+    sources: Option<RunBudgetSources>,
     started_at: Instant,
     inner: Arc<Mutex<LedgerState>>,
+    rolling: Option<Arc<Mutex<AttachedRollingBudget>>>,
+}
+
+#[derive(Debug)]
+struct AttachedRollingBudget {
+    ledger: WorkspaceBudgetLedger,
+    quota: RollingBudgetQuota,
+    run_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -404,21 +441,80 @@ impl RunBudgetLedger {
         Self::new_with_duration(limits, None)
     }
 
+    #[cfg(test)]
     pub(super) fn new_with_duration(
         limits: RunBudgetLimits,
         max_duration_seconds: Option<u64>,
     ) -> Result<Self> {
-        if max_duration_seconds == Some(0) {
-            return Err(BudgetError::ZeroLimit {
-                name: "maximum duration",
-            });
-        }
-        Ok(Self {
-            limits: limits.validate()?,
+        Self::new_composed(
+            limits,
+            RunBudgetLimits::default(),
             max_duration_seconds,
+            None,
+        )
+    }
+
+    /// Compose plan and CLI ceilings by taking the strictest bound of each
+    /// resource, and retain both inputs on the ledger when the CLI set any.
+    pub(super) fn new_composed(
+        plan_limits: RunBudgetLimits,
+        cli_limits: RunBudgetLimits,
+        plan_max_duration_seconds: Option<u64>,
+        cli_max_duration_seconds: Option<u64>,
+    ) -> Result<Self> {
+        validate_duration(plan_max_duration_seconds)?;
+        validate_duration(cli_max_duration_seconds)?;
+        let limits = plan_limits.strictest(cli_limits)?;
+        let max_duration_seconds = match (plan_max_duration_seconds, cli_max_duration_seconds) {
+            (Some(plan), Some(cli)) => Some(plan.min(cli)),
+            (plan, cli) => plan.or(cli),
+        };
+        let sources = (cli_limits.has_any_ceiling() || cli_max_duration_seconds.is_some())
+            .then_some(RunBudgetSources {
+                plan: RunBudgetSource {
+                    limits: plan_limits,
+                    max_duration_seconds: plan_max_duration_seconds,
+                },
+                cli: RunBudgetSource {
+                    limits: cli_limits,
+                    max_duration_seconds: cli_max_duration_seconds,
+                },
+            });
+        let mut ledger = Self {
+            limits,
+            max_duration_seconds,
+            sources,
             started_at: Instant::now(),
             inner: Arc::new(Mutex::new(LedgerState::default())),
-        })
+            rolling: None,
+        };
+        ledger.attach_rolling_budget()?;
+        Ok(ledger)
+    }
+
+    fn attach_rolling_budget(&mut self) -> Result<()> {
+        let Some(binding) = current_rolling_binding() else {
+            return Ok(());
+        };
+        let ledger =
+            WorkspaceBudgetLedger::open_or_create(&binding.repo).map_err(rolling_ledger_error)?;
+        let attached = AttachedRollingBudget {
+            ledger,
+            quota: binding.quota,
+            run_id: binding.run_id,
+        };
+        let now = unix_now().map_err(rolling_ledger_error)?;
+        if let Some(reasons) = attached.admission_block_reasons(now)? {
+            let mut state = self.lock_state()?;
+            state.force_stop = true;
+            state.persistent_reasons.extend(reasons);
+        }
+        self.rolling = Some(Arc::new(Mutex::new(attached)));
+        Ok(())
+    }
+
+    pub(super) fn effective_limits(&self) -> RunBudgetLimits {
+        self.limits
     }
 
     #[cfg(test)]
@@ -507,6 +603,28 @@ impl RunBudgetLedger {
             }
         }
 
+        if let Some(refusal) = self.rolling_admission_refusal(&state, &request)? {
+            let mut next = state.clone();
+            next.force_stop = true;
+            match &refusal {
+                BudgetAdmissionRefusal::HardTokenCeiling { .. } => {
+                    next.persistent_reasons
+                        .insert(BudgetReason::HardTokenCeilingReached);
+                }
+                BudgetAdmissionRefusal::HardCostCeiling { .. } => {
+                    next.persistent_reasons
+                        .insert(BudgetReason::HardCostCeilingReached);
+                }
+                BudgetAdmissionRefusal::MissingCostEstimate => {
+                    next.persistent_reasons.insert(BudgetReason::MissingPricing);
+                }
+                BudgetAdmissionRefusal::NewDispatchStopped => {}
+            }
+            let report = self.report_for_state(&next)?;
+            *state = next;
+            return Ok(BudgetAdmission::Refused { refusal, report });
+        }
+
         let id = BudgetReservationId(state.next_reservation_id);
         let next_id = state
             .next_reservation_id
@@ -546,6 +664,11 @@ impl RunBudgetLedger {
         let mut next = state.clone();
         remove_reservation(&mut next, id)?;
         apply_charge(&mut next, reservation.role, &charge, self.limits)?;
+        let rolling_reasons = self.persist_rolling_consumption(&charge)?;
+        if !rolling_reasons.is_empty() {
+            next.persistent_reasons.extend(rolling_reasons);
+            next.force_stop = true;
+        }
         let report = self.report_for_state(&next)?;
         *state = next;
         Ok(BudgetReconciliation {
@@ -580,6 +703,7 @@ impl RunBudgetLedger {
         report_for(
             self.limits,
             self.max_duration_seconds,
+            self.sources.clone(),
             state,
             self.started_at.elapsed(),
         )
@@ -588,6 +712,178 @@ impl RunBudgetLedger {
     fn lock_state(&self) -> Result<MutexGuard<'_, LedgerState>> {
         self.inner.lock().map_err(|_| BudgetError::Poisoned)
     }
+
+    fn lock_rolling(&self) -> Result<Option<MutexGuard<'_, AttachedRollingBudget>>> {
+        self.rolling
+            .as_ref()
+            .map(|rolling| rolling.lock().map_err(|_| BudgetError::Poisoned))
+            .transpose()
+    }
+
+    fn rolling_admission_refusal(
+        &self,
+        state: &LedgerState,
+        request: &BudgetReservationRequest,
+    ) -> Result<Option<BudgetAdmissionRefusal>> {
+        let Some(rolling) = self.lock_rolling()? else {
+            return Ok(None);
+        };
+        let now = unix_now().map_err(rolling_ledger_error)?;
+        if rolling.admission_block_reasons(now)?.is_some() {
+            return Ok(Some(BudgetAdmissionRefusal::NewDispatchStopped));
+        }
+        if request.cost_usd.is_none() && rolling.quota.max_cost_usd.is_some() {
+            return Ok(Some(BudgetAdmissionRefusal::MissingCostEstimate));
+        }
+        let usage = rolling
+            .ledger
+            .usage_in_window(rolling.quota.window_seconds, now)
+            .map_err(rolling_ledger_error)?;
+        let projected_tokens = usage
+            .tokens
+            .checked_add(state.reserved_tokens)
+            .and_then(|tokens| tokens.checked_add(request.tokens))
+            .ok_or(BudgetError::TokenOverflow)?;
+        if let Some(limit) = rolling
+            .quota
+            .max_tokens
+            .filter(|limit| projected_tokens > *limit)
+        {
+            return Ok(Some(BudgetAdmissionRefusal::HardTokenCeiling {
+                limit,
+                committed: usage
+                    .tokens
+                    .checked_add(state.reserved_tokens)
+                    .ok_or(BudgetError::TokenOverflow)?,
+                requested: request.tokens,
+            }));
+        }
+        if let (Some(requested_usd), Some(limit_usd)) =
+            (request.cost_usd, rolling.quota.max_cost_usd)
+        {
+            let Some(window_cost) = usage.cost_usd else {
+                return Ok(Some(BudgetAdmissionRefusal::MissingCostEstimate));
+            };
+            let committed_usd = checked_cost_add(window_cost, state.reserved_cost_usd)?;
+            let projected_cost_usd = checked_cost_add(committed_usd, requested_usd)?;
+            if crate::budget_ledger::rolling_cost_exceeds(projected_cost_usd, limit_usd) {
+                return Ok(Some(BudgetAdmissionRefusal::HardCostCeiling {
+                    limit_usd,
+                    committed_usd,
+                    requested_usd,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn persist_rolling_consumption(
+        &self,
+        charge: &ReconciliationCharge,
+    ) -> Result<Vec<BudgetReason>> {
+        let Some(mut rolling) = self.lock_rolling()? else {
+            return Ok(Vec::new());
+        };
+        let now = unix_now().map_err(rolling_ledger_error)?;
+        let run_id = rolling.run_id.clone();
+        rolling
+            .ledger
+            .record_consumption(
+                run_id,
+                charge.tokens,
+                charge.cost_complete.then_some(charge.cost_usd),
+                now,
+            )
+            .map_err(rolling_ledger_error)?;
+        Ok(rolling.admission_block_reasons(now)?.unwrap_or_default())
+    }
+
+    /// Records a runtime provider error on the workspace rolling ledger.
+    ///
+    /// `ProviderError::RateLimited` latches the default pool for the configured
+    /// window and stops new admission. Other errors are ignored. The runtime
+    /// attachment seam lives here so dispatch paths can fail closed without
+    /// this module depending on forbidden callers.
+    #[allow(dead_code)]
+    pub(super) fn record_provider_error(&self, error: &ProviderError) -> Result<()> {
+        if !provider_error_is_rate_limited(error) {
+            return Ok(());
+        }
+        let ProviderError::RateLimited(detail) = error else {
+            return Ok(());
+        };
+        let mut state = self.lock_state()?;
+        let Some(mut rolling) = self.lock_rolling()? else {
+            return Err(BudgetError::RollingLedgerUnavailable(
+                "provider rate limit reported without a bound rolling budget ledger".to_string(),
+            ));
+        };
+        let now = unix_now().map_err(rolling_ledger_error)?;
+        let window_seconds = rolling.quota.window_seconds;
+        rolling
+            .ledger
+            .record_rate_limited(
+                crate::budget_ledger::DEFAULT_RATE_LIMIT_POOL,
+                detail,
+                window_seconds,
+                now,
+            )
+            .map_err(rolling_ledger_error)?;
+        state.force_stop = true;
+        state
+            .persistent_reasons
+            .insert(BudgetReason::MissingProviderUsage);
+        Ok(())
+    }
+}
+
+impl AttachedRollingBudget {
+    fn admission_block_reasons(&self, now: u64) -> Result<Option<Vec<BudgetReason>>> {
+        if self.ledger.any_active_rate_limit(now).is_some() {
+            return Ok(Some(vec![BudgetReason::MissingProviderUsage]));
+        }
+        let usage = self
+            .ledger
+            .usage_in_window(self.quota.window_seconds, now)
+            .map_err(rolling_ledger_error)?;
+        let mut reasons = Vec::new();
+        if self
+            .quota
+            .max_tokens
+            .is_some_and(|limit| usage.tokens >= limit)
+        {
+            reasons.push(BudgetReason::HardTokenCeilingReached);
+        }
+        if let Some(limit) = self.quota.max_cost_usd {
+            match usage.cost_usd {
+                Some(cost)
+                    if crate::budget_ledger::rolling_cost_exceeds(cost, limit) || cost >= limit =>
+                {
+                    reasons.push(BudgetReason::HardCostCeilingReached);
+                }
+                None => reasons.push(BudgetReason::MissingPricing),
+                Some(_) => {}
+            }
+        }
+        if reasons.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(reasons))
+        }
+    }
+}
+
+fn rolling_ledger_error(error: anyhow::Error) -> BudgetError {
+    BudgetError::RollingLedgerUnavailable(format!("{error:#}"))
+}
+
+fn validate_duration(value: Option<u64>) -> Result<()> {
+    if value == Some(0) {
+        return Err(BudgetError::ZeroLimit {
+            name: "maximum duration",
+        });
+    }
+    Ok(())
 }
 
 fn validate_token_limit(value: Option<usize>, name: &'static str) -> Result<()> {
@@ -819,6 +1115,7 @@ fn apply_charge(
 fn report_for(
     limits: RunBudgetLimits,
     max_duration_seconds: Option<u64>,
+    sources: Option<RunBudgetSources>,
     state: &LedgerState,
     elapsed: Duration,
 ) -> Result<RunBudgetReport> {
@@ -900,6 +1197,7 @@ fn report_for(
     Ok(RunBudgetReport {
         limits,
         max_duration_seconds,
+        sources,
         consumed: BudgetAmount {
             tokens: state.consumed_tokens,
             cost_usd: state.cost_complete.then_some(state.consumed_cost_usd),
@@ -1078,6 +1376,55 @@ mod tests {
                 hard_cost_usd: Some(0.4),
             }
         );
+    }
+
+    #[test]
+    fn composed_cli_overrides_persist_plan_and_cli_sources_on_the_ledger() {
+        let plan = RunBudgetLimits {
+            soft_tokens: Some(100),
+            hard_tokens: Some(200),
+            soft_cost_usd: Some(0.5),
+            hard_cost_usd: Some(1.0),
+        };
+        let cli = RunBudgetLimits {
+            hard_tokens: Some(50),
+            hard_cost_usd: Some(0.4),
+            ..RunBudgetLimits::default()
+        };
+        let ledger = RunBudgetLedger::new_composed(plan, cli, Some(600), Some(300))
+            .expect("composed ledger");
+        let report = ledger.report().expect("composed report");
+
+        assert_eq!(
+            report.limits,
+            RunBudgetLimits {
+                soft_tokens: Some(50),
+                hard_tokens: Some(50),
+                soft_cost_usd: Some(0.4),
+                hard_cost_usd: Some(0.4),
+            }
+        );
+        assert_eq!(report.max_duration_seconds, Some(300));
+        assert_eq!(
+            report.sources,
+            Some(RunBudgetSources {
+                plan: RunBudgetSource {
+                    limits: plan,
+                    max_duration_seconds: Some(600),
+                },
+                cli: RunBudgetSource {
+                    limits: cli,
+                    max_duration_seconds: Some(300),
+                },
+            })
+        );
+
+        let plan_only = RunBudgetLedger::new_with_duration(plan, Some(600)).expect("plan ledger");
+        assert!(plan_only
+            .report()
+            .expect("plan-only report")
+            .sources
+            .is_none());
     }
 
     #[test]
@@ -1601,5 +1948,124 @@ mod tests {
         assert_eq!(release.report.consumed.tokens, 0);
         assert_eq!(release.report.reserved.tokens, 0);
         assert!(release.report.new_dispatch_allowed);
+    }
+
+    fn rolling_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::TempDir::new().expect("temporary directory");
+        let repo = temp.path().join("repo");
+        git2::Repository::init(&repo).expect("initialize repository");
+        (temp, repo)
+    }
+
+    fn rolling_quota(max_tokens: usize) -> crate::budget_ledger::RollingBudgetQuota {
+        crate::budget_ledger::RollingBudgetQuota {
+            max_tokens: Some(max_tokens),
+            max_cost_usd: None,
+            window_seconds: crate::budget_ledger::DEFAULT_ROLLING_WINDOW_SECONDS,
+        }
+    }
+
+    #[test]
+    fn rolling_quota_refuses_when_the_workspace_window_is_exhausted() {
+        let (_temp, repo) = rolling_repo();
+        let _guard = crate::budget_ledger::bind_rolling_budget(&repo, rolling_quota(50), "run-a")
+            .expect("bind rolling quota");
+        let ledger = RunBudgetLedger::new(RunBudgetLimits::default()).expect("rolling ledger");
+        let first = admitted_reservation(ledger.reserve(request(40, None)).expect("reserve"));
+        ledger
+            .reconcile(
+                first.id,
+                UsageMeasurement::Reliable {
+                    tokens: 40,
+                    cost_usd: None,
+                },
+            )
+            .expect("reconcile");
+
+        let refused = ledger.reserve(request(20, None)).expect("rolling refusal");
+        assert!(matches!(
+            refused,
+            BudgetAdmission::Refused {
+                refusal: BudgetAdmissionRefusal::HardTokenCeiling { limit: 50, .. },
+                ..
+            }
+        ));
+        assert!(!refused.report().new_dispatch_allowed);
+    }
+
+    #[test]
+    fn second_run_sees_first_run_rolling_consumption() {
+        let (_temp, repo) = rolling_repo();
+        let _guard = crate::budget_ledger::bind_rolling_budget(&repo, rolling_quota(100), "run-1")
+            .expect("bind rolling quota");
+        {
+            let first = RunBudgetLedger::new(RunBudgetLimits::default()).expect("first run");
+            let reservation =
+                admitted_reservation(first.reserve(request(80, None)).expect("first reserve"));
+            first
+                .reconcile(
+                    reservation.id,
+                    UsageMeasurement::Reliable {
+                        tokens: 80,
+                        cost_usd: None,
+                    },
+                )
+                .expect("first reconcile");
+            assert_eq!(first.report().expect("first report").consumed.tokens, 80);
+        }
+
+        let second = RunBudgetLedger::new(RunBudgetLimits::default()).expect("second run");
+        assert!(second.report().expect("second report").new_dispatch_allowed);
+        let remaining = admitted_reservation(
+            second
+                .reserve(request(20, None))
+                .expect("remaining reserve"),
+        );
+        assert_eq!(remaining.tokens, 20);
+        assert!(matches!(
+            second
+                .reserve(request(1, None))
+                .expect("over-window refusal"),
+            BudgetAdmission::Refused {
+                refusal: BudgetAdmissionRefusal::HardTokenCeiling { limit: 100, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn provider_rate_limit_latches_the_workspace_pool_across_runs() {
+        let (_temp, repo) = rolling_repo();
+        let _guard =
+            crate::budget_ledger::bind_rolling_budget(&repo, rolling_quota(10_000), "run-rl")
+                .expect("bind rolling quota");
+        {
+            let first = RunBudgetLedger::new(RunBudgetLimits::default()).expect("rate-limit run");
+            first
+                .record_provider_error(&crate::llm::ProviderError::RateLimited(
+                    "tokens per minute".to_string(),
+                ))
+                .expect("record rate limit");
+            assert!(matches!(
+                first.reserve(request(1, None)).expect("latched refusal"),
+                BudgetAdmission::Refused {
+                    refusal: BudgetAdmissionRefusal::NewDispatchStopped,
+                    ..
+                }
+            ));
+        }
+
+        let second = RunBudgetLedger::new(RunBudgetLimits::default()).expect("next run");
+        assert!(
+            !second
+                .report()
+                .expect("latched report")
+                .new_dispatch_allowed
+        );
+        assert!(second
+            .report()
+            .expect("latched report")
+            .reasons
+            .contains(&BudgetReason::MissingProviderUsage));
     }
 }

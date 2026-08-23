@@ -1047,6 +1047,7 @@ fn fake_pr_url_calls() -> usize {
 #[cfg(target_os = "linux")]
 #[test]
 fn prepare_dirty_candidate_commits_exact_content_without_external_effects() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
     fs::write(agent_a.path.join("README.md"), "# Prepared dirty\n").expect("edit dirty candidate");
@@ -1090,6 +1091,7 @@ fn prepare_dirty_candidate_commits_exact_content_without_external_effects() {
 #[cfg(target_os = "linux")]
 #[test]
 fn prepare_already_clean_candidate_preserves_existing_commit() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
     let existing = commit_agent_readme(&agent_a.path, "# Already clean\n", "clean candidate");
@@ -1115,6 +1117,7 @@ fn prepare_already_clean_candidate_preserves_existing_commit() {
 #[cfg(target_os = "linux")]
 #[test]
 fn prepare_refuses_drift_before_creating_local_commit() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
     fs::write(agent_a.path.join("README.md"), "# Reviewed candidate\n")
@@ -1156,6 +1159,7 @@ fn prepare_refuses_drift_before_creating_local_commit() {
 #[cfg(target_os = "linux")]
 #[test]
 fn strict_prepared_publish_blocks_candidate_drift_before_effects() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
     fs::write(agent_a.path.join("README.md"), "# Prepared candidate\n")
@@ -1194,6 +1198,7 @@ fn strict_prepared_publish_blocks_candidate_drift_before_effects() {
 #[cfg(target_os = "linux")]
 #[test]
 fn strict_prepared_publish_accepts_matching_bound_evidence() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
     fs::write(agent_a.path.join("README.md"), "# Matching candidate\n")
@@ -1227,6 +1232,7 @@ fn strict_prepared_publish_accepts_matching_bound_evidence() {
 #[cfg(target_os = "linux")]
 #[test]
 fn prepare_holds_and_releases_worktree_and_repository_locks() {
+    skip_without_containment!();
     enum PreparationEvent {
         LocksHeld,
         Completed(Box<Result<PrPublicationReport>>),
@@ -1303,6 +1309,7 @@ fn prepare_holds_and_releases_worktree_and_repository_locks() {
 #[cfg(target_os = "linux")]
 #[test]
 fn borrowed_write_lease_publishes_without_nested_read_lease() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
     fs::write(agent_a.path.join("README.md"), "# Borrowed authority\n")
@@ -1328,6 +1335,7 @@ fn borrowed_write_lease_publishes_without_nested_read_lease() {
 #[cfg(target_os = "linux")]
 #[test]
 fn standalone_publish_excludes_same_worktree_for_full_lifecycle() {
+    skip_without_containment!();
     enum PublicationEvent {
         LocksHeld,
         Completed(Box<Result<PrPublicationReport>>),
@@ -1460,6 +1468,7 @@ fn standalone_publication_error_releases_both_locks() {
 #[cfg(target_os = "linux")]
 #[test]
 fn standalone_preview_coexists_with_reader_and_does_not_commit() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
     fs::write(agent_a.path.join("README.md"), "# Shared preview\n").expect("edit agent worktree");
@@ -3273,7 +3282,13 @@ fn publication_network_capability_callsites_are_exactly_audited() {
     runners.sort();
     assert_eq!(
         constructors,
-        ["process_runner.rs", "publication.rs", "publication.rs"]
+        [
+            "process_runner.rs",
+            "publication.rs",
+            "publication.rs",
+            "runtime_adapter.rs",
+            "supervise.rs",
+        ]
     );
     assert_eq!(runners, ["publication.rs", "publication.rs"]);
 }

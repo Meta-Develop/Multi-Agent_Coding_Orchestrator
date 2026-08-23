@@ -101,6 +101,7 @@ impl ResourceDimensionId {
     pub const API_COST_USD: &'static str = "api_cost_usd";
     pub const LOCAL_COMPUTE_SECONDS: &'static str = "local_compute_seconds";
     pub const HUMAN_MINUTES: &'static str = "human_minutes";
+    pub const HUMAN_REWORK_COST: &'static str = "human_rework_cost";
 
     pub fn well_known(name: &'static str) -> Self {
         Self(name.to_string())

@@ -21,9 +21,10 @@ use crate::process_runner::{
 };
 use crate::protected_path::{DeclaredPathCoordinate, ProtectedPathSpec};
 use crate::runtime_adapter::{
-    screen_env_passthrough_name, LaunchContext, RuntimeAdapterConfig, RuntimeId,
+    AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId, SideEffectConfinement,
+    WritableLaunchTarget,
 };
-use crate::safe_state::unsigned_to_u32;
+use crate::safe_state::{unsigned_to_u32, ReservedDirectory};
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -188,6 +189,8 @@ pub struct ExternalAgentCommand {
     pub json_log: PathBuf,
     pub output_last_message: PathBuf,
     pub output_schema: Option<PathBuf>,
+    /// Exact bounded regular files exposed read-only without exposing their parent directories.
+    pub read_only_input_files: Vec<PathBuf>,
     pub timeout: Duration,
     pub workspace_access: WorkspaceAccess,
     pub hidden_roots: Vec<PathBuf>,
@@ -214,6 +217,9 @@ pub struct ExternalAgentCommand {
     /// directory. Absence keeps the legacy path as an attributed cooperative bypass.
     pub machine_global_retention: Option<ExternalMachineGlobalRetentionBinding>,
     pub runtime_adapter: Option<RuntimeAdapterConfig>,
+    /// Isolated child worktree vs primary checkout. Default constructors use a
+    /// managed child worktree; primary-target launch stays fail-closed.
+    pub writable_launch_target: WritableLaunchTarget,
 }
 
 pub type ExternalMachineGlobalRetentionBinding = MachineGlobalRetentionBinding;
@@ -224,6 +230,7 @@ pub struct ExternalAgentLifecycleIdentity {
     pub role: String,
     pub run_id: String,
     pub task_id: String,
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +240,27 @@ pub enum ExternalAgentInvocation {
     ClaudeConsultant,
     Grok,
     Cursor,
+    ClaudeCode,
+    GeminiCli,
+}
+
+impl ExternalAgentInvocation {
+    pub const fn is_adapter_subprocess(self) -> bool {
+        matches!(
+            self,
+            Self::Grok | Self::Cursor | Self::ClaudeCode | Self::GeminiCli
+        )
+    }
+
+    pub const fn adapter_id(self) -> Option<AdapterId> {
+        match self {
+            Self::CodexSupervisor | Self::CodexConsultant => Some(AdapterId::Codex),
+            Self::ClaudeConsultant | Self::ClaudeCode => Some(AdapterId::ClaudeCode),
+            Self::Grok => Some(AdapterId::Grok),
+            Self::Cursor => Some(AdapterId::Cursor),
+            Self::GeminiCli => Some(AdapterId::GeminiCli),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -251,6 +279,58 @@ pub struct CodexPermissionEvidence {
     pub network_enabled: bool,
     pub argv_digest: String,
     pub executable_identity: String,
+}
+
+pub const WORKTREE_WRITABLE_ADMISSION_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedWorktreeAdmissionKind {
+    ManagedDisposable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedWorktreeAdmission {
+    pub kind: ManagedWorktreeAdmissionKind,
+    pub worktree_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldPathClaimsAdmissionState {
+    Held,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeldPathClaimsAdmission {
+    pub state: HeldPathClaimsAdmissionState,
+    pub token: u64,
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSandboxAdmission {
+    pub runtime: RuntimeId,
+    pub workspace_access: WorkspaceAccess,
+    pub side_effect_confinement: SideEffectConfinement,
+}
+
+/// Parent-derived evidence that all three managed-worktree writable conditions held together.
+/// Primary-worktree execution uses the separate universal callback gate and is never represented
+/// by this record.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeWritableAdmission {
+    pub version: u32,
+    pub assignment_id: String,
+    pub attempt: usize,
+    pub target: WritableLaunchTarget,
+    pub worktree: ManagedWorktreeAdmission,
+    pub claims: HeldPathClaimsAdmission,
+    pub native_sandbox: NativeSandboxAdmission,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -610,6 +690,7 @@ impl ExternalAgentCommand {
             json_log: json_log.into(),
             output_last_message: output_last_message.into(),
             output_schema: None,
+            read_only_input_files: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadWrite,
             hidden_roots: Vec::new(),
@@ -621,6 +702,7 @@ impl ExternalAgentCommand {
             environment_requirements: Vec::new(),
             machine_global_retention: None,
             runtime_adapter: None,
+            writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
         }
     }
 
@@ -640,6 +722,7 @@ impl ExternalAgentCommand {
             json_log: json_log.into(),
             output_last_message: output_last_message.into(),
             output_schema: None,
+            read_only_input_files: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
             hidden_roots: Vec::new(),
@@ -651,6 +734,7 @@ impl ExternalAgentCommand {
             environment_requirements: Vec::new(),
             machine_global_retention: None,
             runtime_adapter: None,
+            writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
         }
     }
 
@@ -670,6 +754,7 @@ impl ExternalAgentCommand {
             json_log: json_log.into(),
             output_last_message: output_last_message.into(),
             output_schema: None,
+            read_only_input_files: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
             hidden_roots: Vec::new(),
@@ -681,6 +766,7 @@ impl ExternalAgentCommand {
             environment_requirements: Vec::new(),
             machine_global_retention: None,
             runtime_adapter: None,
+            writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
         }
     }
 
@@ -689,17 +775,26 @@ impl ExternalAgentCommand {
         self
     }
 
+    pub fn with_read_only_input_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.read_only_input_files.push(path.into());
+        self
+    }
+
     pub fn with_runtime_adapter(
         mut self,
         runtime: RuntimeId,
         mut config: RuntimeAdapterConfig,
     ) -> Self {
-        if matches!(runtime, RuntimeId::Grok | RuntimeId::Cursor) {
+        if runtime.is_adapter_subprocess() {
             config.binary = Some(self.program.clone());
             self.invocation = match runtime {
                 RuntimeId::Grok => ExternalAgentInvocation::Grok,
                 RuntimeId::Cursor => ExternalAgentInvocation::Cursor,
-                _ => unreachable!(),
+                RuntimeId::ClaudeCode => ExternalAgentInvocation::ClaudeCode,
+                RuntimeId::GeminiCli => ExternalAgentInvocation::GeminiCli,
+                RuntimeId::Codex | RuntimeId::Fake => {
+                    return self;
+                }
             };
             self.runtime_adapter = Some(config);
         }
@@ -738,7 +833,15 @@ impl ExternalAgentCommand {
             role: role.into(),
             run_id: run_id.into(),
             task_id: task_id.into(),
+            parent: None,
         });
+        self
+    }
+
+    pub fn with_agent_parent(mut self, parent: impl Into<String>) -> Self {
+        if let Some(identity) = &mut self.agent_lifecycle {
+            identity.parent = Some(parent.into());
+        }
         self
     }
 
@@ -765,6 +868,11 @@ impl ExternalAgentCommand {
         binding: ExternalMachineGlobalRetentionBinding,
     ) -> Self {
         self.machine_global_retention = Some(binding);
+        self
+    }
+
+    pub fn with_writable_launch_target(mut self, target: WritableLaunchTarget) -> Self {
+        self.writable_launch_target = target;
         self
     }
 }
@@ -1270,24 +1378,34 @@ fn run_external_agent_runtime(
             "external agent was cancelled before executable preflight".to_string(),
         );
     }
-    let duplex_review_required = runtime == ExternalExecutionRuntime::Verified
-        && spec.invocation == ExternalAgentInvocation::CodexSupervisor
-        && spec.workspace_access == WorkspaceAccess::ReadWrite;
-    if duplex_review_required && review_runtime.is_none() {
-        return failed_external_environment_run(
-            spec,
-            started,
-            command_display(&spec.program, &[]),
-            false,
-            EnvironmentFailureCategory::SandboxUnavailable,
-            Some(EnvironmentRequirement::sandbox(
-                EnvironmentSandboxCapability::VerifiedExternalCodex,
-            )),
-            "writable verified Codex requires a duplex MACO pre-action reviewer".to_string(),
-        );
+    if spec.workspace_access == WorkspaceAccess::ReadWrite {
+        if let Some(adapter) = spec.invocation.adapter_id() {
+            if let Some(capability) = adapter.writable_launch_refusal(spec.writable_launch_target) {
+                return failed_external_environment_run(
+                    spec,
+                    started,
+                    command_display(&spec.program, &[]),
+                    false,
+                    EnvironmentFailureCategory::SandboxUnavailable,
+                    Some(EnvironmentRequirement::sandbox(
+                        EnvironmentSandboxCapability::VerifiedExternalCodex,
+                    )),
+                    format!(
+                        "writable {} failed closed before launch: {capability}",
+                        adapter.as_str()
+                    ),
+                );
+            }
+        }
     }
-    if duplex_review_required {
-        if let Err(error) = validate_universal_pre_action_coverage() {
+    // Hosted duplex review is optional defense-in-depth. Isolated worktree
+    // children launch with native permission/sandbox mode; they are not
+    // blocked on a parent All-callback or a missing reviewer.
+    let duplex_review_required = should_use_duplex_review(spec, runtime, review_runtime.is_some());
+    if spec.workspace_access == WorkspaceAccess::ReadWrite
+        && spec.writable_launch_target == WritableLaunchTarget::PrimaryWorktree
+    {
+        if let Err(error) = validate_universal_pre_action_coverage(spec.writable_launch_target) {
             return failed_external_environment_run(
                 spec,
                 started,
@@ -1486,7 +1604,11 @@ fn run_external_agent_runtime(
             &identity.role,
             &identity.run_id,
             &identity.task_id,
-        ) {
+        )
+        .and_then(|metadata| match &identity.parent {
+            Some(parent) => metadata.with_parent(parent.clone()),
+            None => Ok(metadata),
+        }) {
             Ok(metadata) => Some(metadata),
             Err(error) => {
                 report.duration_ms = duration_millis(started.elapsed());
@@ -1578,14 +1700,19 @@ fn run_external_agent_runtime(
 
     if spec.invocation == ExternalAgentInvocation::ClaudeConsultant {
         report.duration_ms = duration_millis(started.elapsed());
+        let capability = AdapterId::ClaudeCode
+            .capabilities()
+            .read_only_inner_contract_refusal()
+            .unwrap_or("read_only_inner_contract unmet");
         record_environment_failure(
             &mut report,
             EnvironmentFailureCategory::SandboxUnavailable,
             Some(EnvironmentRequirement::sandbox(
                 EnvironmentSandboxCapability::VerifiedExternalCodex,
             )),
-            "external Claude runtime is refused because no enforceable inner read-only permission contract is available"
-                .to_string(),
+            format!(
+                "external Claude runtime is refused because no enforceable inner read-only permission contract is available ({capability})"
+            ),
         );
         return report;
     }
@@ -1596,12 +1723,13 @@ fn run_external_agent_runtime(
     // side effect in the first place.
     if runtime == ExternalExecutionRuntime::Verified
         && program_trust == ExternalProgramTrust::ExplicitCustom
-        && !matches!(
-            spec.invocation,
-            ExternalAgentInvocation::Grok | ExternalAgentInvocation::Cursor
-        )
+        && !spec.invocation.is_adapter_subprocess()
     {
         report.duration_ms = duration_millis(started.elapsed());
+        // The retained probe metadata describes the version diagnostic, not a released target.
+        // Do not let a clean diagnostic process look like target containment evidence.
+        report.process_tree = None;
+        report.side_effects = None;
         record_environment_failure(
             &mut report,
             EnvironmentFailureCategory::SandboxUnavailable,
@@ -1619,6 +1747,11 @@ fn run_external_agent_runtime(
         .and_then(|_| match &spec.output_schema {
             Some(path) => ensure_safe_read_target(path),
             None => Ok(()),
+        })
+        .and_then(|_| {
+            spec.read_only_input_files
+                .iter()
+                .try_for_each(|path| ensure_safe_read_target(path))
         })
         .and_then(|_| ensure_safe_read_target(&spec.prompt))
     {
@@ -1706,10 +1839,8 @@ fn run_external_agent_runtime(
 
     let side_effect_profile = if runtime == ExternalExecutionRuntime::Verified
         && (program_trust == ExternalProgramTrust::TrustedSystemCodex
-            || matches!(
-                spec.invocation,
-                ExternalAgentInvocation::Grok | ExternalAgentInvocation::Cursor
-            )) {
+            || spec.invocation.is_adapter_subprocess())
+    {
         match external_side_effect_profile(
             &target_spec,
             &resolved_program,
@@ -1750,15 +1881,6 @@ fn run_external_agent_runtime(
     let mut external_environment = allowed_env(spec.invocation, program_trust);
     if let Some(config) = &target_spec.runtime_adapter {
         for key in &config.env_passthrough {
-            if let Err(error) = screen_env_passthrough_name(key) {
-                return failed_external_run(
-                    spec,
-                    started,
-                    command_display(&resolved_program, &[]),
-                    false,
-                    format!("runtime adapter launch configuration is invalid: {error:#}"),
-                );
-            }
             if let Ok(value) = env::var(key) {
                 external_environment.insert(key.clone(), value);
             }
@@ -2220,16 +2342,31 @@ fn run_external_agent_runtime(
     report
 }
 
-fn validate_universal_pre_action_coverage() -> Result<()> {
-    // Codex 0.144.4 exposes client callbacks only for actions for which the server chooses to ask
-    // approval. AskForApproval has no force-review-every-action mode, and `approvalsReviewer=user`
-    // does not block reads, writes, or tools already permitted by the active sandbox. The MACO
-    // policy additionally distinguishes safe writes from destructive writes, which a static
-    // filesystem sandbox cannot express. Until the protocol supplies a blocking callback for
-    // every relevant proposed action, a writable production child must not be released.
-    bail!(
-        "writable Codex failed closed before launch: the current app-server protocol does not guarantee a blocking MACO callback for every in-sandbox read, write, destructive operation, and tool action"
-    )
+fn should_use_duplex_review(
+    spec: &ExternalAgentCommand,
+    runtime: ExternalExecutionRuntime,
+    hosted_reviewer_available: bool,
+) -> bool {
+    runtime == ExternalExecutionRuntime::Verified
+        && spec.invocation == ExternalAgentInvocation::CodexSupervisor
+        && spec.workspace_access == WorkspaceAccess::ReadWrite
+        // Managed worktree children always use Codex's native workspace-write sandbox. Merely
+        // receiving an optional hosted reviewer must not reroute them into app-server duplex.
+        && spec.writable_launch_target == WritableLaunchTarget::PrimaryWorktree
+        && hosted_reviewer_available
+}
+
+fn validate_universal_pre_action_coverage(target: WritableLaunchTarget) -> Result<()> {
+    // Isolated worktree children use native permission/sandbox mode. The Codex
+    // app-server still has no force-review-every-action callback; that gap is
+    // no longer a worktree-launch blocker. Primary-writable release still
+    // requires a hosted All-callback.
+    match target {
+        WritableLaunchTarget::ManagedChildWorktree => Ok(()),
+        WritableLaunchTarget::PrimaryWorktree => bail!(
+            "writable primary Codex failed closed before launch: blocking_pre_action_callback != All"
+        ),
+    }
 }
 
 fn validate_duplex_app_server_version(version: EnvironmentVersion) -> Result<()> {
@@ -2786,10 +2923,7 @@ fn record_completed_target(
             );
         }
     }
-    let adapter_runtime = matches!(
-        context.spec.invocation,
-        ExternalAgentInvocation::Grok | ExternalAgentInvocation::Cursor
-    );
+    let adapter_runtime = context.spec.invocation.is_adapter_subprocess();
     report.publishable = context.runtime == ExternalExecutionRuntime::Verified
         && safety_verified
         && (adapter_runtime
@@ -2898,6 +3032,8 @@ struct ExternalOutputStaging {
     root_path: PathBuf,
     reservation: Option<ReservedOutputFile>,
     machine_global_retention: Option<ExternalMachineGlobalRetentionBinding>,
+    bound_store: Option<MachineGlobalStore>,
+    bound_root_reservation: Option<ReservedDirectory>,
     cleanup_completed: bool,
 }
 
@@ -2914,18 +3050,57 @@ impl ExternalOutputStaging {
     ) -> Result<Self> {
         #[cfg(target_os = "linux")]
         {
+            if let Some(binding) = machine_global_retention {
+                return Self::create_bound(writable_workspace, binding);
+            }
             let runtime_root = crate::process_runner::trusted_linux_runtime_root()
                 .context("owner-private runtime root is unavailable for output staging")?;
-            Self::create_under_with_retention(
-                &runtime_root,
-                writable_workspace,
-                machine_global_retention,
-            )
+            Self::create_under_with_retention(&runtime_root, writable_workspace, None)
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (writable_workspace, machine_global_retention);
             bail!("private external-agent output staging requires the strict Linux runtime")
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_bound(
+        writable_workspace: &Path,
+        binding: ExternalMachineGlobalRetentionBinding,
+    ) -> Result<Self> {
+        let store = MachineGlobalStore::open_config(&binding.config)
+            .context("failed to open machine-global config before output staging")?;
+        let root_reservation = store
+            .reserve_random_direct_child_directory(
+                &binding.root_id,
+                OsStr::new("maco-external-output-"),
+            )
+            .context("failed to reserve output staging under the reviewed machine-global root")?;
+        let root_path = root_reservation.path().to_path_buf();
+        let prepared = (|| -> Result<ReservedOutputFile> {
+            let root = SecureOutputRoot::open_private(&root_path)?;
+            root.reject_inside(writable_workspace)?;
+            root.reserve(OsStr::new("last-message.raw"))
+        })();
+        match prepared {
+            Ok(reservation) => Ok(Self {
+                root_path,
+                reservation: Some(reservation),
+                machine_global_retention: Some(binding),
+                bound_store: Some(store),
+                bound_root_reservation: Some(root_reservation),
+                cleanup_completed: false,
+            }),
+            Err(error) => {
+                store
+                    .remove_empty_reserved_direct_child_directory(
+                        &binding.root_id,
+                        root_reservation,
+                    )
+                    .context("failed to roll back empty reviewed-root output staging")?;
+                Err(error)
+            }
         }
     }
 
@@ -2941,6 +3116,10 @@ impl ExternalOutputStaging {
         machine_global_retention: Option<ExternalMachineGlobalRetentionBinding>,
     ) -> Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
+
+        if let Some(binding) = machine_global_retention {
+            return Self::create_bound(writable_workspace, binding);
+        }
 
         let mut root_path = None;
         for _ in 0..16 {
@@ -2978,7 +3157,9 @@ impl ExternalOutputStaging {
             Ok(reservation) => Ok(Self {
                 root_path,
                 reservation: Some(reservation),
-                machine_global_retention,
+                machine_global_retention: None,
+                bound_store: None,
+                bound_root_reservation: None,
                 cleanup_completed: false,
             }),
             Err(error) => {
@@ -3038,7 +3219,17 @@ impl ExternalOutputStaging {
             return Ok(ExternalOutputCleanup::Bypassed(attribution));
         };
 
+        let bound_store = self
+            .bound_store
+            .as_ref()
+            .context("bound output staging lost its reviewed-root capability")?;
+        bound_store
+            .revalidate_root(&binding.root_id)
+            .context("reviewed output-staging root changed before cleanup")?;
         let store = MachineGlobalStore::open_config(&binding.config)?;
+        if !bound_store.matches_config_binding(&store) {
+            bail!("machine-global config binding changed before output-staging cleanup");
+        }
         let coordinate =
             store.coordinate_for_existing_directory(&binding.root_id, &self.root_path)?;
         let outcome = store.quarantine(
@@ -3049,6 +3240,8 @@ impl ExternalOutputStaging {
         match outcome {
             GateOutcome::Allowed(operation) => {
                 self.reservation.take();
+                self.bound_root_reservation.take();
+                self.bound_store.take();
                 self.cleanup_completed = true;
                 Ok(ExternalOutputCleanup::Quarantined(operation))
             }

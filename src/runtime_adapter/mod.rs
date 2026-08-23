@@ -8,12 +8,19 @@
 mod capabilities;
 pub mod cursor;
 pub mod grok;
+pub mod hosted_callback;
 
 pub use capabilities::{
     parse_adapter_allowlist, registered_adapter_ids, AdapterId, AdapterTrustClass,
     BlockingPreActionCallback, CapabilityMatrix, CapabilityMatrixCell, CapabilityMatrixRow,
     MatrixStatus, ModelCatalogSource, PrivateRuntimeStateHome, RuntimeCapabilities, SessionResume,
-    SideEffectConfinement, UsageReporting, WorkspaceWritability,
+    SideEffectConfinement, UsageReporting, WorkspaceWritability, WritableLaunchTarget,
+};
+pub use hosted_callback::{
+    capabilities_with_hosted_callback, review_pretooluse, writable_leaf_launch_refusal_with_host,
+    ClaudePreToolUseHost, HostedActionKind, HostedCallbackAttachment, HostedCallbackDecision,
+    HostedCallbackFixtureRunner, HostedCallbackPolicy, HostedHookResult, HostedPreActionGate,
+    ProposedHostedAction,
 };
 
 use anyhow::{bail, Context, Result};
@@ -36,6 +43,10 @@ pub enum RuntimeId {
     Fake,
     Grok,
     Cursor,
+    #[serde(rename = "claude-code")]
+    ClaudeCode,
+    #[serde(rename = "gemini-cli")]
+    GeminiCli,
 }
 
 /// Common launch boundary implemented by every subprocess runtime adapter.
@@ -124,13 +135,37 @@ impl AgentRuntimeAdapter for GeminiAdapter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeCodeAdapter {
     config: RuntimeAdapterConfig,
+    hosted_callback: Option<HostedCallbackAttachment>,
 }
 
 impl ClaudeCodeAdapter {
     pub fn from_environment() -> Self {
         Self {
             config: RuntimeAdapterConfig::from_adapter_environment(AdapterId::ClaudeCode),
+            hosted_callback: None,
         }
+    }
+
+    pub fn attach_hosted_pretooluse(
+        &mut self,
+        root: impl AsRef<Path>,
+    ) -> Result<&HostedCallbackAttachment> {
+        let host = ClaudePreToolUseHost::attach(root.as_ref())?;
+        self.hosted_callback = Some(host.into_attachment());
+        self.hosted_callback
+            .as_ref()
+            .context("hosted PreToolUse attachment vanished after install")
+    }
+
+    pub fn hosted_callback(&self) -> Option<&HostedCallbackAttachment> {
+        self.hosted_callback.as_ref()
+    }
+
+    pub fn require_writable_release(&self) -> Result<()> {
+        if let Some(reason) = self.capabilities().writable_refusal() {
+            bail!("writable Claude Code launch failed closed: {reason}");
+        }
+        Ok(())
     }
 }
 
@@ -141,6 +176,34 @@ impl AgentRuntimeAdapter for ClaudeCodeAdapter {
 
     fn config(&self) -> &RuntimeAdapterConfig {
         &self.config
+    }
+
+    fn capabilities(&self) -> RuntimeCapabilities {
+        capabilities_with_hosted_callback(self.hosted_callback.as_ref())
+    }
+
+    fn launch(&self, context: &LaunchContext<'_>) -> Result<LaunchSpec> {
+        let mut spec = self.config().render(context)?;
+        if let Some(host) = &self.hosted_callback {
+            if !host.covers_all_actions() {
+                bail!(
+                    "Claude Code launch failed closed: hosted PreToolUse callback does not cover every action"
+                );
+            }
+            spec.env.insert(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                host.claude_config_dir().display().to_string(),
+            );
+            spec.env.insert(
+                "MACO_HOSTED_CALLBACK_DIR".to_string(),
+                host.callback_dir().display().to_string(),
+            );
+            if !spec.argv.iter().any(|arg| arg == "--permission-mode") {
+                spec.argv
+                    .extend(["--permission-mode".to_string(), "dontAsk".to_string()]);
+            }
+        }
+        Ok(spec)
     }
 }
 
@@ -204,6 +267,10 @@ pub fn adapter_for(id: AdapterId) -> Box<dyn AgentRuntimeAdapter> {
 }
 
 impl RuntimeId {
+    pub const fn as_str(self) -> &'static str {
+        AdapterId::from_runtime(self).as_str()
+    }
+
     pub const fn default_binary(self) -> &'static str {
         AdapterId::from_runtime(self).default_binary()
     }
@@ -214,6 +281,11 @@ impl RuntimeId {
 
     pub const fn capabilities(self) -> RuntimeCapabilities {
         AdapterId::from_runtime(self).capabilities()
+    }
+
+    /// Non-Codex, non-Fake subprocess CLIs launched through the adapter boundary.
+    pub const fn is_adapter_subprocess(self) -> bool {
+        !matches!(self, Self::Codex | Self::Fake)
     }
 }
 
@@ -1056,6 +1128,45 @@ mod tests {
     }
 
     #[test]
+    fn attached_claude_launch_injects_hosted_pretooluse_env() -> Result<()> {
+        let mut adapter = ClaudeCodeAdapter::from_environment();
+        let unattached = adapter.launch(&launch_context(
+            Path::new("prompt.txt"),
+            Some("sonnet"),
+            Some("high"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert!(!unattached.env.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!unattached.argv.iter().any(|arg| arg == "--permission-mode"));
+
+        let temp = tempfile::tempdir()?;
+        adapter.attach_hosted_pretooluse(temp.path())?;
+        let spec = adapter.launch(&launch_context(
+            Path::new("prompt.txt"),
+            Some("sonnet"),
+            Some("high"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        let host = adapter.hosted_callback().expect("attached host");
+        assert_eq!(
+            spec.env.get("CLAUDE_CONFIG_DIR"),
+            Some(&host.claude_config_dir().display().to_string())
+        );
+        assert_eq!(
+            spec.env.get("MACO_HOSTED_CALLBACK_DIR"),
+            Some(&host.callback_dir().display().to_string())
+        );
+        assert!(spec
+            .argv
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "dontAsk"]));
+        assert!(adapter.capabilities().admits_writable_release());
+        Ok(())
+    }
+
+    #[test]
     fn gemini_prompt_text_fails_closed_when_the_file_is_missing() {
         let config = RuntimeAdapterConfig::defaults_for(AdapterId::GeminiCli);
         let error = config
@@ -1356,6 +1467,16 @@ mod tests {
                 Some("blocking_pre_action_callback != All"),
                 "{id} writable gate must be capability-derived, not vendor-named"
             );
+            let expected = if id == AdapterId::Fake {
+                "writable_workspace == unsupported"
+            } else {
+                "side_effect_confinement != verified"
+            };
+            assert_eq!(
+                id.writable_leaf_launch_refusal(),
+                Some(expected),
+                "{id} must not advertise unverified worktree writability"
+            );
         }
         // Codex remains the unresolved default by operator policy.
         assert_eq!(resolve_runtime(None, None), RuntimeId::Codex);
@@ -1390,8 +1511,19 @@ mod tests {
             assert_eq!(config.binary_path(), Path::new(adapter.default_binary()));
             assert!(
                 adapter.capabilities().writable_refusal().is_some(),
-                "{adapter} must refuse writable release until a blocking callback is hosted"
+                "{adapter} must refuse primary-writable release until a hosted All-callback exists"
             );
+            if adapter == AdapterId::Codex {
+                assert!(
+                    adapter.capabilities().admits_worktree_writable(),
+                    "Codex must retain verified managed-worktree admission"
+                );
+            } else {
+                assert!(
+                    adapter.capabilities().worktree_writable_refusal().is_some(),
+                    "{adapter} must not claim managed-worktree writability without verified confinement"
+                );
+            }
             let capabilities = adapter.capabilities();
             assert_eq!(
                 capabilities,

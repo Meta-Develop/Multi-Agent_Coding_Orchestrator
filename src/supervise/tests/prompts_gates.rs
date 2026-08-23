@@ -556,6 +556,7 @@ fn gate_terminal_append_failure_retains_active_denial_without_false_outcome() {
 
 #[test]
 fn safe_claim_conflict_narrows_scope_before_child_launch() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     fs::write(repo_path.join("FREE.md"), "free\n").expect("write free path");
     commit_injected_repository(&repo_path, "add free path");
@@ -574,6 +575,7 @@ fn safe_claim_conflict_narrows_scope_before_child_launch() {
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -623,6 +625,7 @@ fn safe_claim_conflict_narrows_scope_before_child_launch() {
 
 #[test]
 fn validation_gate_reenters_child_with_injection_safe_prompt_and_journal() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment.clone(), 0);
@@ -637,6 +640,7 @@ fn validation_gate_reenters_child_with_injection_safe_prompt_and_journal() {
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -713,6 +717,7 @@ fn validation_gate_reenters_child_with_injection_safe_prompt_and_journal() {
 
 #[test]
 fn repeated_validation_denial_uses_one_correlation_across_prompts_and_journal() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment.clone(), 0);
@@ -729,6 +734,7 @@ fn repeated_validation_denial_uses_one_correlation_across_prompts_and_journal() 
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -801,6 +807,7 @@ fn primary_integrity_failure_dominates_validation_retry() {
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -879,6 +886,7 @@ fn primary_integrity_failure_dominates_validation_retry() {
 
 #[test]
 fn auditor_rejection_reenters_child_and_parent_auditor() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
@@ -949,6 +957,7 @@ fn auditor_rejection_reenters_child_and_parent_auditor() {
 
 #[test]
 fn repeated_auditor_denial_uses_one_correlation_across_prompts_and_journal() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
@@ -1047,6 +1056,7 @@ fn active_gate_is_escalated_when_corrective_child_operation_panics() {
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -1227,6 +1237,7 @@ fn completed_external_side_effect_escalates_through_gate_controller_without_seco
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -1401,5 +1412,130 @@ fn structured_merge_blocker_routes_only_typed_remediation() {
         .expect("construct fail-closed external side-effect denial");
         assert_eq!(denial.retryability, GateRetryability::NotRetryable);
         assert_eq!(denial.route, GateDenialRoute::IntegrationController);
+    }
+}
+
+#[test]
+fn weak_model_mechanical_worker_prompt_contains_lite_constraints() {
+    let assignment = injected_assignment(true);
+    let worker = &assignment.worker_assignments[0];
+    let mut plan = injected_plan(assignment.clone(), 0);
+    plan.role_models.insert(
+        AgentRole::Worker,
+        RoleModelSelection {
+            model: Some(BALANCED_PROFILE_MODEL.to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+        },
+    );
+    let prompt = worker_prompt(
+        &plan,
+        &assignment,
+        worker,
+        Path::new("/tmp/maco-run"),
+        Path::new("/tmp/maco-run/schemas/worker-report.schema.json"),
+    )
+    .expect("render weak mechanical worker prompt");
+
+    assert!(prompt.contains("INSTRUCTION_PROFILE: maco-weak-mechanical-lite-v1"));
+    assert!(prompt.contains("Execute only the assigned mechanical steps"));
+    assert!(prompt.contains("stop and report the block"));
+    assert!(prompt.contains("Discovery, triage, merge, and acceptance decisions are out of scope"));
+    assert!(lite_instruction_profile_applies(
+        AgentRole::Worker,
+        OrchestrationPhase::MechanicalTerminal,
+        Some(BALANCED_PROFILE_MODEL),
+    ));
+}
+
+#[test]
+fn judgment_and_auditor_prompts_do_not_receive_lite_profile() {
+    let assignment = injected_assignment(true);
+    let mut plan = injected_plan(assignment.clone(), 0);
+    for role in [AgentRole::ChildOrchestrator, AgentRole::Auditor] {
+        plan.role_models.insert(
+            role,
+            RoleModelSelection {
+                model: Some(BALANCED_PROFILE_MODEL.to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+    }
+    let auditor = review_auditor_prompt(
+        &plan,
+        &assignment,
+        Path::new("/tmp/maco-run"),
+        Path::new("/tmp/maco-run/schemas/auditor-report.schema.json"),
+    )
+    .expect("render auditor prompt");
+    assert!(
+        !auditor.contains("INSTRUCTION_PROFILE:"),
+        "judgment/auditor prompts must stay hard-excluded from lite"
+    );
+    assert!(!lite_instruction_profile_applies(
+        AgentRole::Auditor,
+        OrchestrationPhase::Audit,
+        Some(BALANCED_PROFILE_MODEL),
+    ));
+    assert!(!budget_degrade_attaches_lite_instruction_profile(
+        AgentRole::Auditor,
+        OrchestrationPhase::Audit,
+        None,
+        ModelCapabilityClass::WeakMechanical,
+    ));
+    assert!(!budget_degrade_attaches_lite_instruction_profile(
+        AgentRole::ChildOrchestrator,
+        OrchestrationPhase::Implementation,
+        None,
+        ModelCapabilityClass::GeneralJudgment,
+    ));
+}
+
+#[test]
+fn unknown_and_weak_models_cannot_take_excluded_phases() {
+    for phase in [
+        OrchestrationPhase::Discovery,
+        OrchestrationPhase::Triage,
+        OrchestrationPhase::Merge,
+        OrchestrationPhase::GateClassification,
+        OrchestrationPhase::ReviewAcceptance,
+        OrchestrationPhase::Audit,
+    ] {
+        assert!(
+            phase.hard_excludes_weak_models(),
+            "{} must exclude weak models",
+            phase.as_str()
+        );
+        assert!(!lite_instruction_profile_applies(
+            AgentRole::Worker,
+            phase,
+            Some(BALANCED_PROFILE_MODEL),
+        ));
+        assert!(!lite_instruction_profile_applies(
+            AgentRole::Auditor,
+            phase,
+            Some("unknown-local-model"),
+        ));
+        let weak = validate_phase_model_binding(
+            AgentRole::ChildOrchestrator,
+            phase,
+            None,
+            ModelCapabilityClass::WeakMechanical,
+        )
+        .expect_err("weak model cannot take excluded phase");
+        assert!(weak.to_string().contains("weak-model binding is forbidden"));
+        let unknown =
+            validate_known_judgment_role_model(AgentRole::Auditor, Some("unknown-local-model"))
+                .expect_err("unknown model cannot take excluded phase");
+        assert!(unknown
+            .to_string()
+            .contains("has no trusted capability policy"));
+        assert!(!budget_degrade_attaches_lite_instruction_profile(
+            AgentRole::Auditor,
+            phase,
+            None,
+            ModelCapabilityClass::WeakMechanical,
+        ));
     }
 }

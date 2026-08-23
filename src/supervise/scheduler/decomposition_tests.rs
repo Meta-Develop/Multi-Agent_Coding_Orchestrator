@@ -159,7 +159,12 @@ fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
         model_policy.apply(&plan).role_models[&AgentRole::ChildOrchestrator]
             .model
             .as_deref(),
-        Some(ECONOMY_PROFILE_MODEL)
+        Some(FRONTIER_PROFILE_MODEL),
+        "measured-ineligible luna must not become a child degrade target"
+    );
+    assert_eq!(
+        controller.effective_fan_out, 4,
+        "ineligible static tier must skip to fan-out rather than override measured evidence"
     );
     controller
         .assignment_policy(
@@ -170,8 +175,8 @@ fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
             &catalog,
             SupervisorRuntime::Codex,
         )
-        .expect("fan-out degradation")
-        .expect("fan-out admission");
+        .expect("exhausted degradation")
+        .expect("exhausted admission");
     assert_eq!(controller.effective_fan_out, 4);
 
     let hard = ledger
@@ -196,30 +201,21 @@ fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
         .expect("halt decision")
         .is_none());
 
-    assert_eq!(controller.records.len(), 4);
+    assert_eq!(controller.records.len(), 3);
     assert!(matches!(
         &controller.records[0].change,
         BudgetDegradationChange::ReasoningEffort { before, after, .. }
             if before == "xhigh" && after == "high"
     ));
-    assert!(matches!(
-        &controller.records[1].change,
-        BudgetDegradationChange::ModelTier {
-            before,
-            after,
-            resolved_candidate_index: 0,
-            ..
-        } if before == FRONTIER_PROFILE_MODEL && after == ECONOMY_PROFILE_MODEL
-    ));
     assert_eq!(
-        controller.records[2].change,
+        controller.records[1].change,
         BudgetDegradationChange::FanOut {
             before: 8,
             after: 4
         }
     );
     assert_eq!(
-        controller.records[3].change,
+        controller.records[2].change,
         BudgetDegradationChange::Halt {
             before_new_dispatch_allowed: true,
             after_new_dispatch_allowed: false
@@ -244,30 +240,19 @@ fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
                 "assignment_id": "model-assignment",
                 "budget_action": "degrade",
                 "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
-                "change": {"kind": "model_tier", "role": "child_orchestrator", "before": FRONTIER_PROFILE_MODEL, "after": ECONOMY_PROFILE_MODEL, "resolved_candidate_index": 0},
-                "effective_child_model": ECONOMY_PROFILE_MODEL,
-                "effective_child_reasoning_effort": "high",
-                "effective_fan_out": 8,
-                "observation": "admission_policy_resolved"
-            },
-            {
-                "sequence": 3,
-                "assignment_id": "fanout-assignment",
-                "budget_action": "degrade",
-                "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
                 "change": {"kind": "fan_out", "before": 8, "after": 4},
-                "effective_child_model": ECONOMY_PROFILE_MODEL,
+                "effective_child_model": FRONTIER_PROFILE_MODEL,
                 "effective_child_reasoning_effort": "high",
                 "effective_fan_out": 4,
                 "observation": "admission_policy_resolved"
             },
             {
-                "sequence": 4,
+                "sequence": 3,
                 "assignment_id": "halted-assignment",
                 "budget_action": "owner_escalation",
                 "budget_reasons": ["soft_token_ceiling_reached", "hard_token_ceiling_reached", "missing_pricing"],
                 "change": {"kind": "halt", "before_new_dispatch_allowed": true, "after_new_dispatch_allowed": false},
-                "effective_child_model": ECONOMY_PROFILE_MODEL,
+                "effective_child_model": null,
                 "effective_child_reasoning_effort": "high",
                 "effective_fan_out": 4,
                 "observation": "admission_policy_resolved"
@@ -456,6 +441,7 @@ fn test_options(repo: &Path, run_id: &str) -> SupervisorRunOptions {
         codex_bin: PathBuf::from("unused-test-codex"),
         runtime: SupervisorRuntime::Fake,
         allow_dirty_primary: true,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -838,8 +824,155 @@ fn serial_scheduler_directly_dispatches_and_completes_fake_assignment() {
             assert!(concurrency
                 .mean
                 .is_some_and(|mean| mean > 0.0 && mean <= 1.0));
+            assert_eq!(outcome.claimed_paths, vec![PathBuf::from("README.md")]);
+            let decisions =
+                fs::read_to_string(context.run_dir.join(preclaim::PRECLAIM_DECISIONS_RELATIVE))
+                    .expect("read recorded pre-claim decisions");
+            assert!(
+                decisions.contains("\"disposition\":\"claim\"")
+                    || decisions.contains("\"disposition\": \"claim\"")
+            );
+            assert!(
+                decisions.contains("\"evidence_source\":\"synthetic_simulation\"")
+                    || decisions.contains("\"evidence_source\": \"synthetic_simulation\"")
+            );
+            assert!(decisions.contains("serial-child"));
         }
     );
+}
+
+#[test]
+fn scheduler_fails_closed_before_claim_when_map_risk_runtime_are_missing() {
+    with_valid_schedule_context!(
+        context,
+        vec![test_assignment("parked-child", "README.md")],
+        1,
+        {
+            let _missing = preclaim::ForceMissingPreclaimEvidence::install();
+            let mut progress = SchedulerProgress::new(1, 1);
+            let cancellation = ProcessCancellation::new();
+            let serial_intents = Mutex::new(Vec::new());
+
+            run_serial_assignment_schedule(&context, &mut progress, &cancellation, &serial_intents)
+                .expect("missing-evidence pre-claim parks without aborting the scheduler");
+
+            let outcome = progress.indexed_outcomes[0]
+                .as_ref()
+                .expect("parked assignment still records an outcome");
+            assert!(outcome.assignment_failed);
+            assert!(outcome.claim_tokens.is_empty());
+            assert!(outcome.claimed_paths.is_empty());
+            assert!(outcome.released_claims.is_empty());
+            assert!(outcome.report.is_none());
+            assert!(outcome.findings.iter().any(|finding| {
+                finding.message.contains("pre-claim viability rejected")
+                    && finding.message.contains("missing map, risk, runtime")
+            }));
+            assert!(context
+                .sync_store
+                .snapshot()
+                .expect("snapshot claims")
+                .is_empty());
+            let concurrency = progress.concurrency.finish();
+            assert_eq!(concurrency.started_assignment_count, 0);
+        }
+    );
+}
+
+#[test]
+fn missing_map_risk_runtime_parks_before_claiming_paths() {
+    with_valid_schedule_context!(
+        context,
+        vec![test_assignment("parked-child", "README.md")],
+        1,
+        {
+            let evidence = PreclaimRunEvidence::missing();
+            let decision =
+                preclaim_assignment(context.artifacts, &context.plan.assignments[0], &evidence)
+                    .expect("record missing-evidence pre-claim decision");
+            assert!(!decision.allows_path_claim());
+            assert!(decision.reason.contains("missing map, risk, runtime"));
+
+            let parked = parked_preclaim_outcome(&context.plan.assignments[0], &decision);
+            assert!(parked.assignment_failed);
+            assert!(parked.claim_tokens.is_empty());
+            assert!(parked.claimed_paths.is_empty());
+            assert!(parked.released_claims.is_empty());
+            assert!(parked.findings.iter().any(|finding| {
+                finding.message.contains("pre-claim viability rejected")
+                    && finding.message.contains("missing map, risk, runtime")
+            }));
+
+            let decisions =
+                fs::read_to_string(context.run_dir.join(preclaim::PRECLAIM_DECISIONS_RELATIVE))
+                    .expect("read recorded pre-claim decisions");
+            let recorded: preclaim::PreclaimDecision = serde_json::from_str(
+                decisions
+                    .lines()
+                    .find(|line| !line.is_empty())
+                    .expect("persisted one decision"),
+            )
+            .expect("parse recorded pre-claim decision");
+            assert_eq!(recorded, decision);
+            assert!(context
+                .sync_store
+                .snapshot()
+                .expect("snapshot claims")
+                .is_empty());
+        }
+    );
+}
+
+#[test]
+fn simulation_acquire_records_synthetic_claim_without_map_risk_scan() {
+    let (_temp, repo) = test_repository();
+    let evidence = PreclaimRunEvidence::acquire(
+        &repo,
+        SupervisorRuntime::Fake,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+    );
+    let assignment = test_assignment("acquired-child", "README.md");
+    assert!(
+        evidence.repo_map.is_none(),
+        "simulation must not require a scanned repository map"
+    );
+    assert!(
+        evidence.risk_for(&assignment.assigned_paths).is_none(),
+        "simulation must not require a scanned risk report"
+    );
+    let decision = preclaim::evaluate_preclaim_viability(
+        &assignment.id,
+        evidence.repo_map.as_ref(),
+        None,
+        evidence.runtime,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+    );
+    assert!(
+        decision.allows_path_claim(),
+        "simulation should record synthetic viability: {}",
+        decision.reason
+    );
+    assert_eq!(
+        decision.evidence_source,
+        preclaim::PreclaimEvidenceSource::SyntheticSimulation
+    );
+}
+
+#[test]
+fn verified_acquire_without_evidence_still_fails_closed() {
+    let decision = preclaim::evaluate_preclaim_viability(
+        "verified-child",
+        None,
+        None,
+        None,
+        SupervisorExecutionRuntime::Verified,
+    );
+    assert!(!decision.allows_path_claim());
+    assert_eq!(
+        decision.evidence_source,
+        preclaim::PreclaimEvidenceSource::Acquired
+    );
+    assert!(decision.reason.contains("missing map, risk, runtime"));
 }
 
 #[test]
@@ -1372,6 +1505,28 @@ fn preflight_composes_cli_budget_overrides_with_plan_by_strictest_limit() {
         }
     );
     assert_eq!(report.max_duration_seconds, Some(300));
+    assert_eq!(
+        report.sources,
+        Some(crate::supervise::RunBudgetSources {
+            plan: crate::supervise::RunBudgetSource {
+                limits: RunBudgetLimits {
+                    soft_tokens: Some(100),
+                    hard_tokens: Some(200),
+                    soft_cost_usd: Some(0.5),
+                    hard_cost_usd: Some(1.0),
+                },
+                max_duration_seconds: Some(600),
+            },
+            cli: crate::supervise::RunBudgetSource {
+                limits: RunBudgetLimits {
+                    hard_tokens: Some(50),
+                    hard_cost_usd: Some(0.4),
+                    ..RunBudgetLimits::default()
+                },
+                max_duration_seconds: Some(300),
+            },
+        })
+    );
 }
 
 #[test]

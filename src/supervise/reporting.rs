@@ -1,5 +1,81 @@
 use super::*;
 
+pub(super) const MAX_ENVIRONMENT_FAILURE_DIAGNOSTIC_CHARS: usize = 1024;
+pub(super) const ENVIRONMENT_FAILURE_DIAGNOSTIC_TRUNCATION_MARKER: &str = "…<truncated>";
+
+pub(super) fn render_supervisor_operator_summary(report: &SupervisorFinalReport) -> String {
+    let mut lines = vec![
+        format!("# Supervise run {}", report.run_id.as_str()),
+        String::new(),
+        format!("- Status: {}", review_status_label(report.status)),
+        format!("- Success: {}", report.success),
+        format!("- Accepted: {}", report.accepted),
+        format!("- Rejected: {}", report.rejected),
+        format!("- Lifecycle: {}", lifecycle_label(report.run_lifecycle)),
+        String::new(),
+        "## Assignments".to_string(),
+        String::new(),
+    ];
+    if report.orchestrator_reports.is_empty() {
+        lines.push("No assignment reports were persisted.".to_string());
+    } else {
+        for child in &report.orchestrator_reports {
+            lines.push(format!(
+                "- `{}`: {} (accepted={}, rejected={})",
+                child.id,
+                review_status_label(child.status),
+                child.accepted,
+                child.rejected
+            ));
+            if !child.next_safe_action.is_empty() {
+                lines.push(format!("  next: {}", child.next_safe_action));
+            }
+        }
+    }
+    if !report.environment_failures.is_empty() || !report.gate_denials.is_empty() {
+        lines.push(String::new());
+        lines.push("## Failures".to_string());
+        lines.push(String::new());
+        for failure in &report.environment_failures {
+            let failure = sanitize_environment_failure(failure.clone());
+            lines.push(format!("- environment: {}", failure.summary));
+        }
+        for denial in &report.gate_denials {
+            lines.push(format!("- gate: {}", denial.denial_id.as_str()));
+        }
+    }
+    lines.push(String::new());
+    lines.push("## Remaining risk".to_string());
+    lines.push(String::new());
+    lines.push(report.remaining_risk.clone());
+    lines.push(String::new());
+    lines.push("## Next safe action".to_string());
+    lines.push(String::new());
+    lines.push(report.next_safe_action.clone());
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn review_status_label(status: ReviewStatus) -> &'static str {
+    match status {
+        ReviewStatus::Pending => "pending",
+        ReviewStatus::Succeeded => "succeeded",
+        ReviewStatus::Failed => "failed",
+        ReviewStatus::Rejected => "rejected",
+        ReviewStatus::Missing => "missing",
+    }
+}
+
+fn lifecycle_label(lifecycle: SupervisorRunLifecycle) -> &'static str {
+    match lifecycle {
+        SupervisorRunLifecycle::Active => "active",
+        SupervisorRunLifecycle::Interrupted => "interrupted",
+        SupervisorRunLifecycle::Uncertain => "uncertain",
+        SupervisorRunLifecycle::Resumable => "resumable",
+        SupervisorRunLifecycle::Finalized => "finalized",
+    }
+}
+
 pub(super) fn apply_execution_target_reporting(
     report: &mut SupervisorFinalReport,
     execution_target: Option<&SupervisorExecutionTarget>,
@@ -350,7 +426,10 @@ fn external_process_quiescent_for_scratch(
         SupervisorRuntime::Codex => run.scratch_quiescence_verified(),
         // Fake mode is an in-process serializer and never launches a child.
         SupervisorRuntime::Fake => true,
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor => run.scratch_quiescence_verified(),
+        SupervisorRuntime::Grok
+        | SupervisorRuntime::Cursor
+        | SupervisorRuntime::ClaudeCode
+        | SupervisorRuntime::GeminiCli => run.scratch_quiescence_verified(),
     }
 }
 
@@ -485,11 +564,68 @@ fn environment_failure_categories(failures: &[EnvironmentFailure]) -> String {
         .join(", ")
 }
 
+fn sanitize_environment_failure_diagnostic(
+    summary: &str,
+    canonical_summary: &str,
+) -> Option<String> {
+    let diagnostic = summary
+        .strip_prefix(canonical_summary)
+        .map(|suffix| suffix.strip_prefix(": ").unwrap_or(suffix))
+        .unwrap_or(summary);
+    let diagnostic = diagnostic
+        .chars()
+        .map(|character| match character {
+            '\r' => '\n',
+            character if character.is_control() && character != '\n' => ' ',
+            character => character,
+        })
+        .collect::<String>();
+    let redacted = crate::llm::Redactor::new().redact(&diagnostic).text;
+    // The generic redactor intentionally preserves a secret assignment's key and delimiter.
+    // Remove that delimiter from the already-redacted representation so a subsequent report
+    // normalization remains idempotent instead of treating the rest of the single-line summary
+    // as the assignment value.
+    let redacted = redacted
+        .replace("= <redacted:secret>", " <redacted:secret>")
+        .replace("=<redacted:secret>", " <redacted:secret>")
+        .replace(": <redacted:secret>", " <redacted:secret>")
+        .replace(":<redacted:secret>", " <redacted:secret>");
+    let single_line = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.is_empty() {
+        return None;
+    }
+
+    let mut characters = single_line.chars();
+    let bounded = characters
+        .by_ref()
+        .take(MAX_ENVIRONMENT_FAILURE_DIAGNOSTIC_CHARS)
+        .collect::<String>();
+    if characters.next().is_none() {
+        return Some(bounded);
+    }
+
+    let marker_chars = ENVIRONMENT_FAILURE_DIAGNOSTIC_TRUNCATION_MARKER
+        .chars()
+        .count();
+    let retained_chars = MAX_ENVIRONMENT_FAILURE_DIAGNOSTIC_CHARS.saturating_sub(marker_chars);
+    let mut truncated = bounded.chars().take(retained_chars).collect::<String>();
+    truncated.push_str(ENVIRONMENT_FAILURE_DIAGNOSTIC_TRUNCATION_MARKER);
+    Some(truncated)
+}
+
 fn sanitize_environment_failure(mut failure: EnvironmentFailure) -> EnvironmentFailure {
-    failure.summary = format!(
+    let canonical_summary = format!(
         "environment preflight reported {}",
         environment_failure_category_name(failure.category)
     );
+    failure.summary =
+        if failure.category == EnvironmentFailureCategory::RuntimeModelCatalogUnavailable {
+            sanitize_environment_failure_diagnostic(&failure.summary, &canonical_summary)
+                .map(|diagnostic| format!("{canonical_summary}: {diagnostic}"))
+                .unwrap_or(canonical_summary)
+        } else {
+            canonical_summary
+        };
     failure.remediation = match failure.category {
         EnvironmentFailureCategory::MissingExecutable
         | EnvironmentFailureCategory::VersionMismatch => vec![
@@ -1284,7 +1420,10 @@ pub(super) fn external_safety_verified(run: &ExternalAgentRun, runtime: Supervis
         SupervisorRuntime::Fake => {
             run.simulation_succeeded() && run.program_trust == ExternalProgramTrust::ExplicitCustom
         }
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor => {
+        SupervisorRuntime::Grok
+        | SupervisorRuntime::Cursor
+        | SupervisorRuntime::ClaudeCode
+        | SupervisorRuntime::GeminiCli => {
             run.process_tree
                 .is_some_and(ProcessTreeEvidence::is_verified_empty)
                 && run

@@ -200,6 +200,7 @@ where
             runtime_root: &runtime_root,
             git_dir: git_dir.path(),
             objects_target: common_objects.path(),
+            core_filemode: git_text_inputs.core_filemode,
         };
         let visible = run_bounded_git_records(
             &git_context,
@@ -719,9 +720,87 @@ fn validate_bounded_git_index_records(bytes: &[u8], max_entries: usize) -> Resul
 
 struct BoundedGitTextInputs {
     info_exclude: Option<Vec<u8>>,
+    core_filemode: bool,
 }
 
-const MACO_STATUS_EXCLUDES: &[u8] = b"\n.maco/\n.maco-cache/\n.agent/temp/\n.agent/storage/\n.agents/live/\n.agents/temp/\n.agents/storage/\ntarget/\n";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoundedLocalGitConfig {
+    pub(crate) core_filemode: bool,
+    pub(crate) core_hooks_path_present: bool,
+}
+
+pub(crate) fn parse_bounded_local_git_config(bytes: Option<&[u8]>) -> Result<BoundedLocalGitConfig> {
+    let Some(bytes) = bytes else {
+        return Ok(BoundedLocalGitConfig {
+            core_filemode: true,
+            core_hooks_path_present: false,
+        });
+    };
+    if bytes.contains(&0) {
+        bail!("repository-local Git config contains a NUL byte");
+    }
+
+    let mut in_core = false;
+    let mut core_filemode = None;
+    let mut core_hooks_path_present = false;
+    for raw_line in bytes.split(|byte| *byte == b'\n') {
+        let raw_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        let line = raw_line.trim_ascii();
+        if line.is_empty() || matches!(line.first(), Some(b'#' | b';')) {
+            continue;
+        }
+        if line.first() == Some(&b'[') {
+            let close = line
+                .iter()
+                .position(|byte| *byte == b']')
+                .context("repository-local Git config contains a malformed section")?;
+            let trailing = line[close.saturating_add(1)..].trim_ascii();
+            if !trailing.is_empty() && !matches!(trailing.first(), Some(b'#' | b';')) {
+                bail!("repository-local Git config contains a malformed section suffix");
+            }
+            in_core = line[1..close].trim_ascii().eq_ignore_ascii_case(b"core");
+            continue;
+        }
+        if !in_core {
+            continue;
+        }
+
+        let key_end = line
+            .iter()
+            .position(|byte| byte.is_ascii_whitespace() || *byte == b'=')
+            .unwrap_or(line.len());
+        let key = &line[..key_end];
+        if !key.eq_ignore_ascii_case(b"filemode")
+            && !key.eq_ignore_ascii_case(b"hookspath")
+        {
+            continue;
+        }
+        let rest = line[key_end..].trim_ascii();
+        let value = rest
+            .strip_prefix(b"=")
+            .context("repository-local Git config policy entry must use an explicit value")?
+            .trim_ascii();
+        if key.eq_ignore_ascii_case(b"hookspath") {
+            core_hooks_path_present = true;
+            continue;
+        }
+        if core_filemode.is_some() {
+            bail!("repository-local core.filemode must appear at most once");
+        }
+        core_filemode = Some(match value {
+            b"true" => true,
+            b"false" => false,
+            _ => bail!("repository-local core.filemode must be exactly true or false"),
+        });
+    }
+
+    Ok(BoundedLocalGitConfig {
+        core_filemode: core_filemode.unwrap_or(true),
+        core_hooks_path_present,
+    })
+}
+
+const MACO_STATUS_EXCLUDES: &[u8] = b"\n.maco/\n.maco-cache/\n.agent/temp/\n.agent/storage/\n.agents/live/\n.agents/temp/\n.agents/storage/\ntarget/\n.worktrees/\n.worktrees-quarantine-*/\n";
 
 fn is_bounded_status_runtime_path(path: &Path) -> bool {
     path.starts_with(".maco")
@@ -732,6 +811,7 @@ fn is_bounded_status_runtime_path(path: &Path) -> bool {
         || path.starts_with(".agents/live")
         || path.starts_with(".agents/temp")
         || path.starts_with(".agents/storage")
+        || crate::repo_map::is_ignored_worktree_store_path(path)
 }
 
 #[cfg(test)]
@@ -780,14 +860,18 @@ fn validate_bounded_git_text_inputs_bound(
             if entry.relative_path == Path::new(".git") {
                 return Ok(BoundedTreeWalkAction::Skip);
             }
+            // Treat managed-worktree stores and other runtime roots as walk
+            // boundaries before the nested-marker check so ignored
+            // `.worktrees/` gitfiles do not fail closed and the walker never
+            // descends those trees.
+            if is_bounded_status_runtime_path(&entry.relative_path) {
+                return Ok(BoundedTreeWalkAction::Skip);
+            }
             if entry.relative_path.file_name() == Some(OsStr::new(".git")) {
                 bail!("bounded-status rejects nested Git repository markers");
             }
             if entry.relative_path.file_name() == Some(OsStr::new(".gitmodules")) {
                 bail!("bounded-status rejects submodule metadata");
-            }
-            if is_bounded_status_runtime_path(&entry.relative_path) {
-                return Ok(BoundedTreeWalkAction::Skip);
             }
             if entry.kind == BoundedTreeEntryKind::Directory {
                 return Ok(BoundedTreeWalkAction::RecordAndDescend);
@@ -845,11 +929,13 @@ fn validate_bounded_git_text_inputs_bound(
             .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
             .context("Git metadata aggregate byte count overflowed")?;
     }
+    let common_config = repository
+        .read_common_relative_optional(Path::new("config"), MAX_WORKTREE_GIT_TEXT_FILE_BYTES)?;
+    let local_config = parse_bounded_local_git_config(common_config.as_deref())?;
     for bytes in [
         repository
             .read_git_relative_optional(Path::new("config"), MAX_WORKTREE_GIT_TEXT_FILE_BYTES)?,
-        repository
-            .read_common_relative_optional(Path::new("config"), MAX_WORKTREE_GIT_TEXT_FILE_BYTES)?,
+        common_config,
         repository.read_common_relative_optional(
             Path::new("config.worktree"),
             MAX_WORKTREE_GIT_TEXT_FILE_BYTES,
@@ -873,6 +959,7 @@ fn validate_bounded_git_text_inputs_bound(
     effective_exclude.extend_from_slice(MACO_STATUS_EXCLUDES);
     Ok(BoundedGitTextInputs {
         info_exclude: Some(effective_exclude),
+        core_filemode: local_config.core_filemode,
     })
 }
 
@@ -1020,6 +1107,7 @@ struct BoundedGitContext<'a> {
     runtime_root: &'a SafeRoot,
     git_dir: &'a Path,
     objects_target: &'a Path,
+    core_filemode: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -1343,6 +1431,15 @@ fn run_bounded_git_records<const N: usize>(
         command_args.push(std::ffi::OsString::from("-c"));
         command_args.push(std::ffi::OsString::from(config));
     }
+    command_args.push(std::ffi::OsString::from("-c"));
+    command_args.push(std::ffi::OsString::from(format!(
+        "core.filemode={}",
+        if context.core_filemode {
+            "true"
+        } else {
+            "false"
+        }
+    )));
     command_args.push(std::ffi::OsString::from("--git-dir"));
     command_args.push(context.git_dir.as_os_str().to_os_string());
     command_args.push(std::ffi::OsString::from("--work-tree"));

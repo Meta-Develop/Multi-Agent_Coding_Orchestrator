@@ -9,6 +9,7 @@ use crate::{
     },
     autopilot::{self, AutopilotRunOptions},
     consult::{self, ConsultAskOptions, ConsultantRuntime, DEFAULT_CONSULT_TIMEOUT_SECONDS},
+    hierarchy_ledger::{is_coordinator_role_label, observe_hierarchy, ObservedHierarchyNode},
     inbox::{
         self, InboxMachineGlobalInput, InboxPermissionMode, InboxRunOptions, InboxScanOptions,
         InboxWatchOptions, InboxWorkspaceRunOptions, InboxWorkspaceScanOptions,
@@ -146,6 +147,7 @@ impl Cli {
             Command::Agents(command) => command.run(),
             Command::Llm(command) => command.run(),
             Command::Evaluation(command) => command.run(),
+            Command::EvalHarness(command) => command.run(),
             Command::Optimizer(command) => command.run(),
         }
     }
@@ -177,7 +179,7 @@ enum Command {
     Coord(CoordCommand),
     /// Run local orchestration plans.
     Orchestrate(OrchestrateCommand),
-    /// Run opt-in Codex CLI supervisor-of-orchestrators plans.
+    /// Run opt-in supervisor-of-orchestrators plans for supported runtimes.
     Supervise(SuperviseCommand),
     /// Ask a read-only cross-runtime consultant for advice.
     Consult(ConsultCommand),
@@ -199,6 +201,8 @@ enum Command {
     Llm(LlmCommand),
     /// Generate deterministic model-mix fixture results from a versioned manifest.
     Evaluation(EvaluationCommand),
+    /// Run a local fake-provider-backed model-mix harness and record mix plus outcomes.
+    EvalHarness(EvalHarnessCommand),
     /// Inspect the optimizer policy library, replay snapshots, and preference profiles.
     Optimizer(OptimizerCommand),
 }
@@ -830,6 +834,7 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             print_query_report(&plan, json)
         }
         SuperviseSubcommand::Run(args) => {
+            let rolling_quota = args.budget.rolling_quota();
             let budget_overrides = args.budget.limits();
             let budget_max_duration_seconds = args.budget.max_duration_seconds();
             let (plan_file, goal_spec) = match (args.supervisor_plan, args.from_goal) {
@@ -891,18 +896,30 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             });
             let json = args.json;
             let reap_repo = resolved_repo.clone();
+            let _rolling_guard = rolling_quota
+                .map(|quota| {
+                    crate::budget_ledger::bind_rolling_budget(
+                        &resolved_repo,
+                        quota,
+                        resolved_run_id.as_str(),
+                    )
+                })
+                .transpose()?;
             let options = SupervisorRunOptions {
                 repo: resolved_repo,
                 plan_file,
                 run_id: resolved_run_id.clone(),
                 parent_node: args.parent_node.map(Into::into),
-                codex_bin: args.runtime_bin.unwrap_or_else(|| match runtime {
-                    supervise::SupervisorRuntime::Grok => PathBuf::from("grok"),
-                    supervise::SupervisorRuntime::Cursor => PathBuf::from("cursor-agent"),
-                    _ => args.codex_bin,
+                codex_bin: args.runtime_bin.unwrap_or_else(|| {
+                    if runtime.is_adapter_subprocess() {
+                        PathBuf::from(runtime.default_binary())
+                    } else {
+                        args.codex_bin
+                    }
                 }),
                 runtime,
                 allow_dirty_primary: args.allow_dirty_primary,
+                allow_live_run_collision: args.force_live_run,
                 admission_overrides,
                 budget_overrides,
                 budget_max_duration_seconds,
@@ -968,10 +985,11 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     assignment_id: args.assignment_id,
                     run_id: resolved.run_id.clone(),
                     codex_bin: args.runtime_bin.unwrap_or_else(|| {
-                        match args.runtime.unwrap_or(supervise::SupervisorRuntime::Codex) {
-                            supervise::SupervisorRuntime::Grok => PathBuf::from("grok"),
-                            supervise::SupervisorRuntime::Cursor => PathBuf::from("cursor-agent"),
-                            _ => args.codex_bin,
+                        let runtime = args.runtime.unwrap_or(supervise::SupervisorRuntime::Codex);
+                        if runtime.is_adapter_subprocess() {
+                            PathBuf::from(runtime.default_binary())
+                        } else {
+                            args.codex_bin
                         }
                     }),
                     runtime: args.runtime.unwrap_or(supervise::SupervisorRuntime::Codex),
@@ -1020,10 +1038,11 @@ fn read_supervise_goal_file(goal_file: &Path) -> Result<String> {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum SuperviseSubcommand {
     /// Build a validated plan from a goal/spec, task file, or JSON supervisor plan.
     Plan(PlanSuperviseArgs),
-    /// Run a supervisor plan with child Codex CLI orchestrators.
+    /// Run a supervisor plan with child orchestrators for a selected runtime.
     Run(RunSuperviseArgs),
     /// Re-run only evidence/report and parent audit stages for a preserved assignment diff.
     #[command(name = "re-audit")]
@@ -1061,6 +1080,9 @@ struct PlanSuperviseArgs {
 #[derive(Debug, Clone, Copy, Default, Args)]
 struct RunBudgetArgs {
     /// Hard ceiling for total provider tokens committed by this supervise run.
+    ///
+    /// Tightens the plan `run_budget` by taking the minimum and is retained on
+    /// the run budget ledger as `sources.cli` alongside the original plan values.
     #[arg(
         long = "max-tokens",
         visible_alias = "max-total-tokens",
@@ -1068,6 +1090,9 @@ struct RunBudgetArgs {
     )]
     max_tokens: Option<usize>,
     /// Hard ceiling for total provider cost committed by this supervise run, in USD.
+    ///
+    /// Tightens the plan `run_budget` by taking the minimum and is retained on
+    /// the run budget ledger as `sources.cli` alongside the original plan values.
     #[arg(
         long = "max-cost-usd",
         visible_alias = "max-total-cost-usd",
@@ -1075,12 +1100,36 @@ struct RunBudgetArgs {
     )]
     max_cost_usd: Option<f64>,
     /// Maximum elapsed duration for admitting new supervise dispatches.
+    ///
+    /// Tightens `run_budget.max_duration_seconds` by taking the minimum and is
+    /// retained on the run budget ledger as `sources.cli`.
     #[arg(
         long = "max-duration-seconds",
         visible_alias = "max-total-duration-seconds",
         value_parser = parse_positive_seconds
     )]
     max_duration_seconds: Option<u64>,
+    /// Hard ceiling for provider tokens consumed across supervise/autopilot runs
+    /// in the workspace rolling window (default 24h).
+    #[arg(
+        long = "max-rolling-tokens",
+        value_parser = parse_positive_usize
+    )]
+    max_rolling_tokens: Option<usize>,
+    /// Hard ceiling for provider cost consumed across supervise/autopilot runs
+    /// in the workspace rolling window, in USD.
+    #[arg(
+        long = "max-rolling-cost-usd",
+        value_parser = parse_positive_finite_f64
+    )]
+    max_rolling_cost_usd: Option<f64>,
+    /// Rolling window used with `--max-rolling-tokens` / `--max-rolling-cost-usd`.
+    /// Defaults to 86400 seconds (24 hours) when a rolling ceiling is set.
+    #[arg(
+        long = "rolling-window-seconds",
+        value_parser = parse_positive_seconds
+    )]
+    rolling_window_seconds: Option<u64>,
 }
 
 impl RunBudgetArgs {
@@ -1095,6 +1144,19 @@ impl RunBudgetArgs {
 
     const fn max_duration_seconds(self) -> Option<u64> {
         self.max_duration_seconds
+    }
+
+    fn rolling_quota(self) -> Option<crate::budget_ledger::RollingBudgetQuota> {
+        if self.max_rolling_tokens.is_none() && self.max_rolling_cost_usd.is_none() {
+            return None;
+        }
+        Some(crate::budget_ledger::RollingBudgetQuota {
+            max_tokens: self.max_rolling_tokens,
+            max_cost_usd: self.max_rolling_cost_usd,
+            window_seconds: self
+                .rolling_window_seconds
+                .unwrap_or(crate::budget_ledger::DEFAULT_ROLLING_WINDOW_SECONDS),
+        })
     }
 }
 
@@ -1131,6 +1193,10 @@ struct RunSuperviseArgs {
     /// Allow supervise to run when the primary worktree is dirty.
     #[arg(long)]
     allow_dirty_primary: bool,
+    /// Launch even when another live supervise or autopilot run still targets this repository.
+    /// Launch-only: grants no authority to kill, interrupt, revert, or discard another run.
+    #[arg(long)]
+    force_live_run: bool,
     /// Acknowledge an exact execution_target.kind=primary_worktree plan declaration.
     #[arg(long)]
     allow_primary_worktree: bool,
@@ -1853,6 +1919,7 @@ impl AutopilotCommand {
             }
             AutopilotSubcommand::Run(args) => {
                 let json = args.json;
+                let rolling_quota = args.budget.rolling_quota();
                 let budget_overrides = args.budget.limits();
                 let budget_max_duration_seconds = args.budget.max_duration_seconds();
                 let (plan_file, goal_spec) = match (args.task_file, args.from_goal) {
@@ -1878,6 +1945,15 @@ impl AutopilotCommand {
                 )?;
                 let parent_node = args.parent_node.map(Into::into);
                 let reap_repo = resolved.repo.clone();
+                let _rolling_guard = rolling_quota
+                    .map(|quota| {
+                        crate::budget_ledger::bind_rolling_budget(
+                            &resolved.repo,
+                            quota,
+                            resolved.run_id.as_str(),
+                        )
+                    })
+                    .transpose()?;
                 let options = AutopilotRunOptions {
                     repo: resolved.repo,
                     plan_file,
@@ -1885,6 +1961,7 @@ impl AutopilotCommand {
                     codex_bin: args.codex_bin,
                     reviewer_command: args.reviewer_command,
                     allow_dirty_primary: args.allow_dirty_primary,
+                    allow_live_run_collision: args.force_live_run,
                     max_child_dispatches: args.max_child_dispatches,
                     budget_overrides,
                     budget_max_duration_seconds,
@@ -2006,6 +2083,10 @@ struct RunAutopilotArgs {
     /// Allow autopilot to run when the primary worktree is dirty.
     #[arg(long)]
     allow_dirty_primary: bool,
+    /// Launch even when another live supervise or autopilot run still targets this repository.
+    /// Launch-only: grants no authority to kill, interrupt, revert, or discard another run.
+    #[arg(long)]
+    force_live_run: bool,
     /// Maximum source plus generated follow-up supervisor-plan dispatches admitted by this run.
     #[arg(long, value_name = "COUNT")]
     max_child_dispatches: Option<usize>,
@@ -3636,6 +3717,7 @@ impl EvaluationCommand {
     fn run(self) -> Result<()> {
         match self.command {
             EvaluationSubcommand::Run(args) => run_evaluation_command(args),
+            EvaluationSubcommand::Experiment(args) => run_evaluation_experiment_command(args),
         }
     }
 }
@@ -3644,6 +3726,8 @@ impl EvaluationCommand {
 enum EvaluationSubcommand {
     /// Generate deterministic fixture output for every manifest profile and repetition.
     Run(RunEvaluationArgs),
+    /// Run the same goal/spec under multiple profiles through isolated Fake supervise.
+    Experiment(RunExperimentArgs),
 }
 
 #[derive(Debug, Args)]
@@ -3675,6 +3759,105 @@ struct RunEvaluationArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunExperimentArgs {
+    /// Versioned experiment manifest binding goal/spec, profiles, and repetitions.
+    manifest: PathBuf,
+    /// Reserved source-repository path; unused because each profile uses isolated Fake state.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Requested mode; this command supports deterministic-fake and refuses real-provider.
+    #[arg(
+        long,
+        default_value = "deterministic-fake",
+        value_parser = parse_evaluation_execution
+    )]
+    execution: crate::evaluation::EvaluationExecution,
+    /// Acknowledge future real-provider execution; the current runner still refuses it.
+    #[arg(long)]
+    allow_real_provider: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+fn run_evaluation_experiment_command(args: RunExperimentArgs) -> Result<()> {
+    let manifest_bytes =
+        BoundedRegularReader::read_tree_no_follow(&args.manifest, MAX_EVALUATION_MANIFEST_BYTES)
+            .with_context(|| {
+                format!(
+                    "failed to read evaluation experiment manifest {}",
+                    args.manifest.display()
+                )
+            })?;
+    let manifest =
+        crate::evaluation::parse_experiment_manifest(&manifest_bytes).with_context(|| {
+            format!(
+                "failed to parse evaluation experiment manifest {}",
+                args.manifest.display()
+            )
+        })?;
+    let _repo = args.repo;
+    let results = crate::evaluation::run_fake_supervise_experiment(
+        &manifest,
+        crate::evaluation::ExperimentRunRequest {
+            execution: args.execution,
+            allow_real_provider: args.allow_real_provider,
+        },
+    )?;
+    print_query_report(&results, args.json)
+}
+
+#[derive(Debug, Args)]
+struct EvalHarnessCommand {
+    #[command(subcommand)]
+    command: EvalHarnessSubcommand,
+}
+
+impl EvalHarnessCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            EvalHarnessSubcommand::Run(args) => run_eval_harness_command(args),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum EvalHarnessSubcommand {
+    /// Complete each role in a mix through the local fake provider and record outcomes.
+    Run(RunEvalHarnessArgs),
+}
+
+#[derive(Debug, Args)]
+struct RunEvalHarnessArgs {
+    /// Versioned eval-harness manifest JSON.
+    manifest: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+fn run_eval_harness_command(args: RunEvalHarnessArgs) -> Result<()> {
+    let manifest_bytes = BoundedRegularReader::read_tree_no_follow(
+        &args.manifest,
+        crate::eval_harness::MAX_MANIFEST_BYTES,
+    )
+    .with_context(|| {
+        format!(
+            "failed to read eval harness manifest {}",
+            args.manifest.display()
+        )
+    })?;
+    let manifest = crate::eval_harness::parse_manifest(&manifest_bytes).with_context(|| {
+        format!(
+            "failed to parse eval harness manifest {}",
+            args.manifest.display()
+        )
+    })?;
+    let results = crate::eval_harness::run_local_fake_harness(&manifest)?;
+    print_query_report(&results, args.json)
 }
 
 include!("cli/part2.rs");

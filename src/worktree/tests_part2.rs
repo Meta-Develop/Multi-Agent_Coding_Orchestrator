@@ -97,6 +97,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn create_retention_applies_after_new_worktree_creation() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let worktree_root = temp.path().join("worktrees");
@@ -129,6 +130,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn create_size_retention_reserves_the_new_lane_before_reclaiming_older_lanes() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let worktree_root = temp.path().join("worktrees");
@@ -203,6 +205,7 @@
 
     #[test]
     fn gc_full_apply_reports_removal_despite_stale_git_registration() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let worktree_root = temp.path().join("worktrees");
@@ -338,6 +341,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn gc_dry_run_reports_without_removing_worktree_or_target() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let worktree_root = temp.path().join("worktrees");
@@ -1098,6 +1102,7 @@
 
     #[test]
     fn bounded_status_refuses_entry_output_and_time_budget_exhaustion() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -1147,7 +1152,109 @@
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn bounded_status_honors_only_canonical_local_core_filemode() {
+        skip_without_containment!();
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let readme = repo_path.join("README.md");
+        fs::set_permissions(&readme, fs::Permissions::from_mode(0o755))
+            .expect("make tracked worktree file executable");
+        let mut config = repo.config().expect("open repository config");
+
+        config
+            .set_bool("core.filemode", false)
+            .expect("disable filemode tracking");
+        assert!(
+            bounded_worktree_is_clean(
+                &repo_path,
+                MAX_WORKTREE_STATUS_ENTRIES,
+                MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+                WORKTREE_STATUS_TIMEOUT,
+            )
+            .expect("bounded status with core.filemode=false"),
+            "100644 index versus 0755 worktree must be clean when local core.filemode=false"
+        );
+        fs::write(&readme, "content drift remains visible\n")
+            .expect("change content while filemode tracking is disabled");
+        assert!(
+            !bounded_worktree_is_clean(
+                &repo_path,
+                MAX_WORKTREE_STATUS_ENTRIES,
+                MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+                WORKTREE_STATUS_TIMEOUT,
+            )
+            .expect("bounded status content drift with core.filemode=false"),
+            "core.filemode=false must not hide content changes"
+        );
+        fs::write(&readme, "# Test\n").expect("restore tracked contents");
+
+        config
+            .set_bool("core.filemode", true)
+            .expect("enable filemode tracking");
+        assert!(
+            !bounded_worktree_is_clean(
+                &repo_path,
+                MAX_WORKTREE_STATUS_ENTRIES,
+                MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+                WORKTREE_STATUS_TIMEOUT,
+            )
+            .expect("bounded status with core.filemode=true"),
+            "explicit core.filemode=true must preserve executable-mode dirtiness"
+        );
+
+        config
+            .remove("core.filemode")
+            .expect("remove local core.filemode");
+        assert!(
+            !bounded_worktree_is_clean(
+                &repo_path,
+                MAX_WORKTREE_STATUS_ENTRIES,
+                MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+                WORKTREE_STATUS_TIMEOUT,
+            )
+            .expect("bounded status with default core.filemode"),
+            "absent core.filemode must fail closed to mode-sensitive status"
+        );
+    }
+
+    #[test]
+    fn bounded_local_git_config_policy_is_narrow_and_fail_closed() {
+        let disabled = parse_bounded_local_git_config(Some(
+            b"[core]\n\tfilemode = false\n[include]\n\tpath = /must/not/be/read\n",
+        ))
+        .expect("canonical local filemode");
+        assert!(!disabled.core_filemode);
+        assert!(!disabled.core_hooks_path_present);
+
+        let hooks = parse_bounded_local_git_config(Some(
+            b"[core]\n\tfilemode = true\n\thooksPath = private-hooks\n",
+        ))
+        .expect("detect local hooksPath without resolving it");
+        assert!(hooks.core_filemode);
+        assert!(hooks.core_hooks_path_present);
+
+        for malformed in [
+            b"[core]\nfilemode = yes\n".as_slice(),
+            b"[core]\nfilemode = false\nfilemode = true\n".as_slice(),
+            b"[core\nfilemode = false\n".as_slice(),
+        ] {
+            parse_bounded_local_git_config(Some(malformed))
+                .expect_err("malformed or duplicate local policy must fail closed");
+        }
+        assert!(parse_bounded_local_git_config(None)
+            .expect("absent local config")
+            .core_filemode);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn bounded_status_ignores_ambient_and_repository_process_helpers() {
+        skip_without_containment!();
         use std::os::unix::fs::PermissionsExt;
 
         struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
@@ -1377,6 +1484,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn bounded_status_scavenges_prior_crash_index_and_symlink_tree() {
+        skip_without_containment!();
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().expect("tempdir");
@@ -1566,6 +1674,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn bounded_status_concurrent_lifecycles_serialize_without_cross_deletion() {
+        skip_without_containment!();
         use std::{sync::mpsc, thread};
 
         let temp = TempDir::new().expect("tempdir");
@@ -3024,6 +3133,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn create_writes_lane_build_config_outside_the_lane_and_gc_does_not_prune_it() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let worktree_root = temp.path().join("worktrees");
@@ -3213,6 +3323,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn lifecycle_requires_explicit_trunk_containment_without_changing_manual_gc() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let root = temp.path().join("worktrees");
@@ -3270,6 +3381,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn lifecycle_retry_supersedes_exact_authenticated_predecessor_despite_retention() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let root = temp.path().join("worktrees");
@@ -3383,6 +3495,7 @@
     #[cfg(target_os = "linux")]
     #[test]
     fn lifecycle_dry_run_aggregates_worktree_and_explicit_o2_artifact_policy() {
+        skip_without_containment!();
         use std::os::unix::fs::PermissionsExt;
 
         let temp = TempDir::new().expect("tempdir");

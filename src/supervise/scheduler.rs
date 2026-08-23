@@ -1,5 +1,8 @@
 use super::*;
 
+mod preclaim;
+use preclaim::{parked_preclaim_outcome, preclaim_assignment, PreclaimRunEvidence};
+
 /// Admission policy for concurrently runnable supervisor children.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SupervisorConcurrencyPolicy {
@@ -1056,6 +1059,11 @@ fn run_serial_assignment_schedule(
     cancellation: &ProcessCancellation,
     serial_semantic_warn_intents: &Mutex<Vec<(usize, SemanticIntent)>>,
 ) -> Result<()> {
+    let preclaim_evidence = PreclaimRunEvidence::acquire(
+        context.repo,
+        context.options.runtime,
+        context.execution_runtime,
+    );
     let mut pending = (0..context.plan.assignments.len()).collect::<BTreeSet<_>>();
     while !pending.is_empty() {
         suppress_failed_descendants(
@@ -1119,8 +1127,14 @@ fn run_serial_assignment_schedule(
                 .extend(pending.iter().copied());
             break;
         };
-        pending.remove(&index);
         let assignment = &context.plan.assignments[index];
+        let preclaim = preclaim_assignment(context.artifacts, assignment, &preclaim_evidence)?;
+        if !preclaim.allows_path_claim() {
+            pending.remove(&index);
+            progress.indexed_outcomes[index] = Some(parked_preclaim_outcome(assignment, &preclaim));
+            continue;
+        }
+        pending.remove(&index);
         record_assignment_started_checkpoint(
             context.artifacts,
             assignment,
@@ -1226,6 +1240,11 @@ fn run_concurrent_assignment_schedule(
     cancellation: &ProcessCancellation,
     semantic_block_gate: &SemanticBlockGate,
 ) -> Result<()> {
+    let preclaim_evidence = PreclaimRunEvidence::acquire(
+        context.repo,
+        context.options.runtime,
+        context.execution_runtime,
+    );
     thread::scope(|scope| -> Result<()> {
         let (completion_sender, completion_receiver) = mpsc::channel::<usize>();
         let mut pending = (0..context.plan.assignments.len()).collect::<BTreeSet<_>>();
@@ -1295,8 +1314,16 @@ fn run_concurrent_assignment_schedule(
                     if active.len() >= progress.budget_degradation.effective_fan_out {
                         break;
                     }
-                    pending.remove(&index);
                     let assignment = &context.plan.assignments[index];
+                    let preclaim =
+                        preclaim_assignment(context.artifacts, assignment, &preclaim_evidence)?;
+                    if !preclaim.allows_path_claim() {
+                        pending.remove(&index);
+                        progress.indexed_outcomes[index] =
+                            Some(parked_preclaim_outcome(assignment, &preclaim));
+                        continue;
+                    }
+                    pending.remove(&index);
                     record_assignment_started_checkpoint(
                         context.artifacts,
                         assignment,
@@ -1888,7 +1915,12 @@ fn build_supervisor_final_report(
         role_bindings,
         assignment_effort_bindings,
         budget_degradations,
-        selection_decisions,
+        selection_decisions: selection_decisions.clone(),
+        assignment_selection_ledger: build_assignment_selection_ledger(
+            plan,
+            &selection_decisions,
+            runtime,
+        ),
         usage: supervisor_execution_usage_report(total_usage, total_cost_usd, usage_complete),
     });
     SupervisorFinalReport {
@@ -2232,6 +2264,17 @@ fn persist_supervisor_final_report(
     }
     #[cfg(test)]
     run_before_supervisor_final_report_persist_hook(&mut final_report);
+    crate::run_ops::append_run_heartbeat_best_effort(
+        &mut artifact_writer,
+        "finalizing",
+        None,
+        if final_report.success { "ok" } else { "failed" },
+        None,
+    );
+    crate::run_ops::write_operator_summary(
+        &mut artifact_writer,
+        &render_supervisor_operator_summary(&final_report),
+    )?;
     let report_bytes = encode_final_report(&final_report)?;
     let mut checkpoint_writer = checkpoint_writer;
     if let Some(checkpoint) = checkpoint_writer.as_deref_mut() {
@@ -2251,6 +2294,7 @@ fn persist_supervisor_final_report(
             ArtifactFileDisposition::PrivateEvidence,
         )
         .context("failed to write normalized supervisor final report")?;
+    write_selection_ledger_from_report(&mut artifact_writer, &final_report)?;
     if let Some(checkpoint) = checkpoint_writer.as_deref_mut() {
         checkpoint.final_report_committed(
             &final_report,
@@ -2329,11 +2373,49 @@ fn initialize_scheduler_evidence(
         &initialization.options.run_id,
         initialization.options.parent_node.as_deref(),
     );
+    let run_id = initialization.options.run_id.as_str();
+    let parent_node = initialization.options.parent_node.as_deref();
+    let supervisor_spawn_payload = if let Some(parent) = parent_node {
+        record_supervision_spawn_payload(
+            run_id,
+            parent,
+            OrchestrationRole::Supervisor,
+            AgentRole::Supervisor,
+            Vec::new(),
+            &run_scope_ref(run_id),
+            json!({}),
+        )?
+    } else {
+        json!({})
+    };
     record_orchestration_event(
         initialization.orchestration_journal,
         initialization.artifact_writer,
-        initialization.options.run_id.as_str(),
-        None,
+        run_id,
+        parent_node,
+        OrchestrationRole::Supervisor,
+        OrchestrationEventKind::Spawn,
+        supervisor_spawn_payload,
+    );
+    record_gate_ownership(
+        initialization.orchestration_journal,
+        initialization.artifact_writer,
+        run_id,
+        parent_node,
+        OrchestrationRole::Supervisor,
+        &GateOwnershipRecord::assign(
+            run_id,
+            run_id,
+            OrchestrationRole::Supervisor,
+            "supervisor",
+            "run_acceptance_gate",
+        )?,
+    );
+    record_orchestration_event(
+        initialization.orchestration_journal,
+        initialization.artifact_writer,
+        run_id,
+        parent_node,
         OrchestrationRole::Supervisor,
         OrchestrationEventKind::Status,
         lifecycle_event_payload("running", None, None),
@@ -2375,6 +2457,7 @@ struct PreparedSupervisorRun {
     run_dir: PathBuf,
     dirs: RunDirs,
     manager: WorktreeManager,
+    _process_registration: Option<crate::run_ops::SupervisorProcessGuard>,
 }
 
 fn prepare_supervisor_run(
@@ -2392,21 +2475,14 @@ fn prepare_supervisor_run(
         mut plan_metadata,
     } = loaded;
     validate_max_concurrent_children(max_concurrent_children)?;
-    plan_metadata.run_budget.limits = plan_metadata
-        .run_budget
-        .limits
-        .strictest(options.budget_overrides)
-        .context("failed to compose plan and CLI run budgets")?;
-    let max_duration_seconds = match (
+    let budget_ledger = RunBudgetLedger::new_composed(
+        plan_metadata.run_budget.limits,
+        options.budget_overrides,
         plan_metadata.run_budget_max_duration_seconds,
         options.budget_max_duration_seconds,
-    ) {
-        (Some(plan), Some(cli)) => Some(plan.min(cli)),
-        (plan, cli) => plan.or(cli),
-    };
-    let budget_ledger =
-        RunBudgetLedger::new_with_duration(plan_metadata.run_budget.limits, max_duration_seconds)
-            .context("failed to initialize the supervise run budget ledger")?;
+    )
+    .context("failed to initialize the supervise run budget ledger")?;
+    plan_metadata.run_budget.limits = budget_ledger.effective_limits();
     match worktree_creation {
         SupervisorWorktreeCreation::Bound(_)
             if execution_runtime != SupervisorExecutionRuntime::Verified =>
@@ -2464,12 +2540,13 @@ fn prepare_supervisor_run(
             selection_preflight_failure: None,
         },
         Ok(catalog) => {
+            let advertised = advertised_catalogs_for_launch(&repo)?;
             let resolution = initialize_supervisor_selection(
                 &mut plan,
                 runtime,
                 catalog,
                 &admission_policy_input,
-                &AdvertisedCatalogSet::empty(),
+                &advertised,
             )?;
             if resolution.selection_preflight_failure.is_none() {
                 bind_selected_assignment_runtimes(&mut plan, &resolution.decisions)?;
@@ -2495,12 +2572,45 @@ fn prepare_supervisor_run(
         })
         .transpose()?;
     let assignment_schedule = validated_scheduler_assignment_schedule(&plan, &plan_metadata)?;
-    let artifact_writer = ArtifactRunWriter::reserve(
+    let collision = crate::run_ops::refuse_live_run_collision(
+        &repo,
+        RunArtifactFamily::Supervise,
+        &options.run_id,
+        options.allow_live_run_collision,
+    )?;
+    let process_registration =
+        crate::run_ops::register_current_supervisor_process(&repo, "supervise", &options.run_id)
+            .ok()
+            .flatten();
+    let mut artifact_writer = ArtifactRunWriter::reserve(
         &repo,
         RunArtifactFamily::Supervise,
         options.run_id.clone(),
         "maco-supervise",
     )?;
+    let preflight_spec = crate::run_ops::LaunchPreflightSpec {
+        family: RunArtifactFamily::Supervise,
+        run_id: options.run_id.clone(),
+        runtime: crate::runtime_adapter::AdapterId::from_runtime(options.runtime)
+            .as_str()
+            .to_string(),
+        runtime_bin: Some(options.codex_bin.clone()),
+        allow_dirty_primary: options.allow_dirty_primary,
+        allow_live_run_collision: options.allow_live_run_collision,
+    };
+    crate::run_ops::persist_launch_preflight(
+        &mut artifact_writer,
+        &repo,
+        &preflight_spec,
+        &collision,
+    )?;
+    crate::run_ops::append_run_heartbeat_best_effort(
+        &mut artifact_writer,
+        "initialized",
+        None,
+        "ok",
+        None,
+    );
     let primary_base = current_head_oid(&repo)?;
     let normalized_plan_sha256 = normalized_supervisor_plan_sha256(
         &requested_plan,
@@ -2546,6 +2656,7 @@ fn prepare_supervisor_run(
         run_dir,
         dirs,
         manager,
+        _process_registration: process_registration,
     })
 }
 
@@ -2706,6 +2817,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         run_dir,
         dirs,
         manager,
+        _process_registration,
     } = prepare_supervisor_run(
         loaded,
         &options,
@@ -3358,6 +3470,7 @@ mod selection_policy_tests {
             codex_bin: PathBuf::from("unused-selector-codex"),
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: true,
+            allow_live_run_collision: false,
             admission_overrides: SupervisorAdmissionConfig::default(),
             budget_overrides: RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -3746,10 +3859,33 @@ mod selection_policy_tests {
         );
         assert!(events[0].provenance.choice.is_none());
         assert!(!events[0].provenance.candidate_set.is_empty());
+        let ledger = &profile
+            .execution
+            .as_ref()
+            .context("selection failure execution metadata")?
+            .assignment_selection_ledger;
+        assert!(ledger.iter().any(|entry| {
+            entry.assignment_id == "assignment-a"
+                && entry.role == AgentRole::Auditor
+                && entry.selection_source == AssignmentSelectionSource::PlanRoleModels
+                && entry.selected_model.is_none()
+                && entry.evidence_gap.is_some()
+                && !entry.rejected_candidates.is_empty()
+        }));
 
         let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)?;
         let persisted = read_supervisor_final_report(&reader)?;
         assert_eq!(persisted, report);
+        let persisted_ledger: AssignmentSelectionLedger = serde_json::from_slice(
+            &reader
+                .read(Path::new(SELECTION_LEDGER_RELATIVE))
+                .context("read persisted selection ledger")?,
+        )?;
+        assert_eq!(
+            persisted_ledger.schema_version,
+            ASSIGNMENT_SELECTION_LEDGER_SCHEMA_VERSION
+        );
+        assert_eq!(persisted_ledger.entries, *ledger);
         Ok(())
     }
 }

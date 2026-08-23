@@ -54,6 +54,24 @@ impl CursorCatalogCommandSpec {
         }
     }
 
+    pub fn with_program(mut self, program: impl Into<PathBuf>) -> Self {
+        self.program = program.into();
+        self
+    }
+
+    /// Add host values named by the operator's `MACO_CURSOR_ENV` list.
+    ///
+    /// This uses the same two screens as the live runtime adapter: denied
+    /// names are dropped from the operator list, then every retained name is
+    /// checked again before its value is collected. Names that are absent from
+    /// the host or have non-Unicode values are omitted.
+    pub fn with_screened_env_passthrough(mut self, raw_names: &str) -> Result<Self> {
+        let names = super::env_passthrough_names_from_operator_list(raw_names);
+        self.environment
+            .extend(super::collect_screened_passthrough_env(&names)?);
+        Ok(self)
+    }
+
     pub fn program(&self) -> &Path {
         &self.program
     }
@@ -354,7 +372,7 @@ fn validate_cursor_model_display_name(display_name: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::process_runner::ContainmentBackend;
-    use std::cell::RefCell;
+    use std::{cell::RefCell, env};
 
     const CAPTURED_CATALOG: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -454,6 +472,73 @@ mod tests {
             observation.source_sha256(),
             "af088f298dd5b96cd0703887635cab1ea198047f5558f5ff128d02195ece83c1"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn command_spec_adds_only_present_screened_operator_passthrough() -> Result<()> {
+        let expected_path =
+            env::var("PATH").context("cargo test PATH is missing or non-Unicode")?;
+        let spec = CursorCatalogCommandSpec::new("/workspace").with_screened_env_passthrough(
+            " PATH,MACO_DEFINITELY_MISSING_CURSOR_CATALOG_ENV, PATH ",
+        )?;
+
+        assert_eq!(spec.environment().get("PATH"), Some(&expected_path));
+        assert!(!spec
+            .environment()
+            .contains_key("MACO_DEFINITELY_MISSING_CURSOR_CATALOG_ENV"));
+        assert_eq!(spec.environment().len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn command_spec_drops_denied_operator_passthrough_names() -> Result<()> {
+        let expected_path =
+            env::var("PATH").context("cargo test PATH is missing or non-Unicode")?;
+        let spec = CursorCatalogCommandSpec::new("/workspace")
+            .with_screened_env_passthrough("PATH,BASH_ENV,LD_PRELOAD,OPENAI_API_KEY,BAD=NAME")?;
+
+        assert_eq!(spec.environment().get("PATH"), Some(&expected_path));
+        for denied in ["BASH_ENV", "LD_PRELOAD", "OPENAI_API_KEY", "BAD=NAME"] {
+            assert!(!spec.environment().contains_key(denied), "{denied}");
+        }
+        assert_eq!(spec.environment().len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn command_spec_reuses_the_runtime_adapter_operator_env_contract() -> Result<()> {
+        let raw_names = concat!(
+            " PATH,PATH,",
+            "BASH_ENV,",
+            "LD_PRELOAD,",
+            "MALLOC_CONF,",
+            "PYTHONPATH,",
+            "OPENAI_API_KEY,",
+            "BAD=NAME,",
+            "MACO_DEFINITELY_MISSING_CURSOR_CATALOG_ENV "
+        );
+        let screened_names = super::super::env_passthrough_names_from_operator_list(raw_names);
+        let mut expected_environment = BTreeMap::from([
+            ("NO_COLOR".to_string(), "1".to_string()),
+            ("TERM".to_string(), "dumb".to_string()),
+        ]);
+        expected_environment.extend(super::super::collect_screened_passthrough_env(
+            &screened_names,
+        )?);
+
+        let spec =
+            CursorCatalogCommandSpec::new("/workspace").with_screened_env_passthrough(raw_names)?;
+
+        assert_eq!(
+            screened_names,
+            vec![
+                "PATH".to_string(),
+                "PATH".to_string(),
+                "MACO_DEFINITELY_MISSING_CURSOR_CATALOG_ENV".to_string(),
+            ]
+        );
+        assert_eq!(spec.environment(), &expected_environment);
         Ok(())
     }
 

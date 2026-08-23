@@ -1,20 +1,24 @@
 //! Context-switch cost as a first-class objective term (issue #201).
 //!
 //! Switching runtime, model, or session invalidates prompt cache and forces
-//! re-priming. Offline replay cannot reconstruct cache state, so replay
-//! estimates are labelled `switch-cost-uncorrected` and cannot promote a
-//! policy into the safe set on their own.
+//! re-priming. Those two effects are priced as explicit, independently fitted
+//! terms — not a lumped residual later split for display. Offline replay
+//! cannot reconstruct cache state, so replay estimates are labelled
+//! `switch-cost-uncorrected` and cannot promote a policy into the safe set
+//! on their own.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use super::action::{ModelAction, RestartMode};
 use super::error::OptimizerError;
+use super::ids::ResourceDimensionId;
 use super::objective::{ObjectiveEvaluator, ObjectiveValue};
 use super::policy::PolicyGraph;
 use super::predictor::{feature_keys, feature_text, primary_action, SampleCell};
 use super::resources::ObservationKind;
 use super::state::OptimizerState;
+use super::telemetry::InvocationRecord;
 
 pub const REPLAY_UNCORRECTED_LABEL: &str = "switch-cost-uncorrected";
 pub const DEFAULT_HYSTERESIS_BP: u16 = 1_000;
@@ -45,6 +49,12 @@ impl TransitionClass {
 }
 
 /// Classify a candidate relative to the currently active action.
+///
+/// An unknown current action is not a switch: treating every action-bearing
+/// candidate as [`TransitionClass::FreshSessionOrWorktree`] would apply the
+/// large fresh-session prior and skew a mixed action/non-action set toward
+/// non-action policies. Explicit [`RestartMode::CleanRestart`] still prices
+/// as a fresh session.
 pub fn classify_transition(
     previous: Option<&ModelAction>,
     next: Option<&ModelAction>,
@@ -54,8 +64,7 @@ pub fn classify_transition(
         return TransitionClass::FreshSessionOrWorktree;
     }
     match (previous, next) {
-        (None, Some(_)) => TransitionClass::FreshSessionOrWorktree,
-        (Some(_), None) => TransitionClass::Continue,
+        (None, Some(_)) | (Some(_), None) | (None, None) => TransitionClass::Continue,
         (Some(prev), Some(next)) => {
             if prev.backend_id != next.backend_id {
                 TransitionClass::RuntimeAdapterChange
@@ -65,7 +74,6 @@ pub fn classify_transition(
                 TransitionClass::Continue
             }
         }
-        (None, None) => TransitionClass::Continue,
     }
 }
 
@@ -82,15 +90,63 @@ pub struct SwitchCostEstimate {
 
 impl SwitchCostEstimate {
     pub fn zero(class: TransitionClass) -> Self {
-        Self {
+        Self::from_explicit_terms(class, 0, 0, 0, 0, ObservationKind::Measured)
+    }
+
+    /// Price `S(a_prev → a)` from the four explicit terms. The scalar total is
+    /// derived; callers must not invent a total that disagrees with the terms.
+    pub fn from_explicit_terms(
+        class: TransitionClass,
+        cached_prefix_invalidation_tokens: i64,
+        context_reprime_tokens: i64,
+        runtime_startup_micros: i64,
+        lost_checkpoint_cost_micros: i64,
+        observation: ObservationKind,
+    ) -> Self {
+        let mut estimate = Self {
             class,
-            cached_prefix_invalidation_tokens: 0,
-            context_reprime_tokens: 0,
-            runtime_startup_micros: 0,
-            lost_checkpoint_cost_micros: 0,
+            cached_prefix_invalidation_tokens,
+            context_reprime_tokens,
+            runtime_startup_micros,
+            lost_checkpoint_cost_micros,
             total_cost_micros: 0,
-            observation: ObservationKind::Measured,
+            observation,
+        };
+        estimate.total_cost_micros = estimate.explicit_objective_term_micros();
+        estimate
+    }
+
+    /// Cache invalidation + re-priming + startup + lost checkpoint.
+    /// This is the routing-objective term; [`Self::total_cost_micros`] mirrors it.
+    pub fn explicit_objective_term_micros(&self) -> i64 {
+        token_cost_micros(self.cached_prefix_invalidation_tokens)
+            .saturating_add(token_cost_micros(self.context_reprime_tokens))
+            .saturating_add(self.runtime_startup_micros)
+            .saturating_add(self.lost_checkpoint_cost_micros)
+    }
+
+    /// Per-resource-dimension view (#162). Token terms stay on `api_cost_usd`;
+    /// process warmup and lost checkpoint stay on `local_compute_seconds`.
+    pub fn cost_by_dimension(&self) -> BTreeMap<ResourceDimensionId, i64> {
+        let mut costs = BTreeMap::new();
+        let token = token_cost_micros(self.cached_prefix_invalidation_tokens)
+            .saturating_add(token_cost_micros(self.context_reprime_tokens));
+        if token != 0 {
+            costs.insert(
+                ResourceDimensionId::well_known(ResourceDimensionId::API_COST_USD),
+                token,
+            );
         }
+        let runtime = self
+            .runtime_startup_micros
+            .saturating_add(self.lost_checkpoint_cost_micros);
+        if runtime != 0 {
+            costs.insert(
+                ResourceDimensionId::well_known(ResourceDimensionId::LOCAL_COMPUTE_SECONDS),
+                runtime,
+            );
+        }
+        costs
     }
 
     pub fn observation_label(&self) -> &'static str {
@@ -126,9 +182,18 @@ impl SwitchHysteresis {
 }
 
 /// Hierarchical per-class switch costs fitted from #159 cache-token fields.
+///
+/// Cache-prefix invalidation and context re-priming are stored as their own
+/// token cells. The lumped micros cell remains only as a wide prior for
+/// classes that have never been observed.
 #[derive(Debug, Clone)]
 pub struct SwitchCostModel {
     cells: BTreeMap<TransitionClass, SampleCell>,
+    cache_invalidation: BTreeMap<TransitionClass, SampleCell>,
+    reprime: BTreeMap<TransitionClass, SampleCell>,
+    startup: BTreeMap<TransitionClass, SampleCell>,
+    checkpoint: BTreeMap<TransitionClass, SampleCell>,
+    hit_ratio_bp: BTreeMap<TransitionClass, SampleCell>,
     hysteresis: SwitchHysteresis,
 }
 
@@ -165,6 +230,11 @@ impl Default for SwitchCostModel {
         );
         Self {
             cells,
+            cache_invalidation: BTreeMap::new(),
+            reprime: BTreeMap::new(),
+            startup: BTreeMap::new(),
+            checkpoint: BTreeMap::new(),
+            hit_ratio_bp: BTreeMap::new(),
             hysteresis: SwitchHysteresis::default(),
         }
     }
@@ -196,12 +266,101 @@ impl SwitchCostModel {
             .saturating_add(token_cost_micros(reprime_tokens))
             .saturating_add(startup_micros)
             .saturating_add(lost_checkpoint_micros);
+        self.cache_invalidation
+            .entry(class)
+            .or_default()
+            .observe(cached_miss_tokens);
+        self.reprime
+            .entry(class)
+            .or_default()
+            .observe(reprime_tokens);
+        self.startup
+            .entry(class)
+            .or_default()
+            .observe(startup_micros);
+        self.checkpoint
+            .entry(class)
+            .or_default()
+            .observe(lost_checkpoint_micros);
         self.cells.entry(class).or_default().observe(total);
+    }
+
+    /// Fit cache-invalidation / re-priming terms from #159 invocation records.
+    /// Records missing `input_tokens` or `cached_input_tokens` are skipped
+    /// rather than zero-filled.
+    pub fn observe_invocations(&mut self, records: &[InvocationRecord]) {
+        let mut groups: BTreeMap<String, Vec<&InvocationRecord>> = BTreeMap::new();
+        for record in records {
+            groups
+                .entry(trajectory_key(record))
+                .or_default()
+                .push(record);
+        }
+        for group in groups.values_mut() {
+            group.sort_by_key(|record| record.started_at.as_millis());
+            let mut previous = None;
+            for next in group.iter().copied() {
+                self.observe_invocation_transition(previous, next);
+                previous = Some(next);
+            }
+        }
+    }
+
+    pub fn observe_invocation_transition(
+        &mut self,
+        previous: Option<&InvocationRecord>,
+        next: &InvocationRecord,
+    ) {
+        let Some(class) = classify_invocation_transition(previous, next) else {
+            return;
+        };
+        if let (Some(input), Some(cached)) = (next.input_tokens, next.cached_input_tokens) {
+            if input > 0 {
+                let cached = cached.min(input);
+                let hit_bp =
+                    i64::try_from(u128::from(cached).saturating_mul(10_000) / u128::from(input))
+                        .unwrap_or(10_000);
+                self.hit_ratio_bp.entry(class).or_default().observe(hit_bp);
+            }
+        }
+        if !class.is_switch() {
+            self.observe(class, 0, 0, 0, 0);
+            return;
+        }
+        let Some(input) = next.input_tokens else {
+            return;
+        };
+        let Some(cached) = next.cached_input_tokens else {
+            return;
+        };
+        let reprime = tokens_i64(input.saturating_sub(cached.min(input)));
+        let invalidation = previous
+            .and_then(|record| record.cached_input_tokens)
+            .map(tokens_i64)
+            .unwrap_or(0);
+        self.observe(class, invalidation, reprime, 0, 0);
+    }
+
+    pub fn cache_hit_ratio_bp(&self, class: TransitionClass) -> Option<(u16, ObservationKind)> {
+        let cell = self.hit_ratio_bp.get(&class)?;
+        if cell.samples.is_empty() {
+            return None;
+        }
+        let mean = super::predictor::mean_i64(&cell.samples).clamp(0, 10_000) as u16;
+        let kind = if cell.observations == 0 {
+            ObservationKind::Inferred
+        } else {
+            ObservationKind::Measured
+        };
+        Some((mean, kind))
     }
 
     pub fn estimate(&self, class: TransitionClass) -> SwitchCostEstimate {
         if class == TransitionClass::Continue {
             return SwitchCostEstimate::zero(class);
+        }
+        if let Some(estimate) = self.estimate_from_measured_terms(class) {
+            return estimate;
         }
         let cell = self.cells.get(&class);
         let (samples, observations) = match cell {
@@ -214,20 +373,69 @@ impl SwitchCostModel {
         } else {
             super::predictor::mean_i64(samples)
         };
-        let (cache, reprime, startup, checkpoint) = split_components(class, total);
-        SwitchCostEstimate {
+        let (cache, reprime, startup, checkpoint) = explicit_terms_from_lumped(class, total);
+        SwitchCostEstimate::from_explicit_terms(
             class,
-            cached_prefix_invalidation_tokens: cache,
-            context_reprime_tokens: reprime,
-            runtime_startup_micros: startup,
-            lost_checkpoint_cost_micros: checkpoint,
-            total_cost_micros: total,
-            observation: if inferred {
+            cache,
+            reprime,
+            startup,
+            checkpoint,
+            if inferred {
                 ObservationKind::Inferred
             } else {
                 ObservationKind::Measured
             },
+        )
+    }
+
+    fn estimate_from_measured_terms(&self, class: TransitionClass) -> Option<SwitchCostEstimate> {
+        let cache = measured_mean(&self.cache_invalidation, class);
+        let reprime = measured_mean(&self.reprime, class);
+        let startup = measured_mean(&self.startup, class);
+        let checkpoint = measured_mean(&self.checkpoint, class);
+        if cache.is_none() && reprime.is_none() && startup.is_none() && checkpoint.is_none() {
+            return None;
         }
+        let (prior_cache, prior_reprime, prior_startup, prior_checkpoint) =
+            explicit_terms_from_lumped(class, mean_prior(class));
+        Some(SwitchCostEstimate::from_explicit_terms(
+            class,
+            cache.unwrap_or(prior_cache),
+            reprime.unwrap_or(prior_reprime),
+            startup.unwrap_or(prior_startup),
+            checkpoint.unwrap_or(prior_checkpoint),
+            ObservationKind::Measured,
+        ))
+    }
+}
+
+/// Classify consecutive #159 records. Incomplete identity is not guessed.
+pub fn classify_invocation_transition(
+    previous: Option<&InvocationRecord>,
+    next: &InvocationRecord,
+) -> Option<TransitionClass> {
+    let Some(prev) = previous else {
+        if next.backend.is_some() || next.resolved_model.is_some() {
+            return Some(TransitionClass::FreshSessionOrWorktree);
+        }
+        return None;
+    };
+    match (
+        prev.backend.as_ref(),
+        next.backend.as_ref(),
+        prev.resolved_model.as_ref(),
+        next.resolved_model.as_ref(),
+    ) {
+        (Some(prev_backend), Some(next_backend), Some(prev_model), Some(next_model)) => {
+            Some(if prev_backend != next_backend {
+                TransitionClass::RuntimeAdapterChange
+            } else if prev_model != next_model {
+                TransitionClass::ModelChangeSameRuntime
+            } else {
+                TransitionClass::Continue
+            })
+        }
+        _ => None,
     }
 }
 
@@ -292,7 +500,7 @@ impl ObjectiveEvaluator for SwitchAwareObjective {
         let mut value = self.inner.evaluate(distribution)?;
         value.risk_adjusted_cost_micros = value
             .risk_adjusted_cost_micros
-            .saturating_add(self.switch.total_cost_micros);
+            .saturating_add(self.switch.explicit_objective_term_micros());
         Ok(value)
     }
 }
@@ -304,7 +512,7 @@ pub fn apply_switch_cost(
 ) {
     value.risk_adjusted_cost_micros = value
         .risk_adjusted_cost_micros
-        .saturating_add(hysteresis.priced_switch_cost(estimate.total_cost_micros));
+        .saturating_add(hysteresis.priced_switch_cost(estimate.explicit_objective_term_micros()));
 }
 
 /// Replay cannot reconstruct cache state.
@@ -384,8 +592,45 @@ pub fn identity_of(action: &ModelAction) -> String {
     )
 }
 
+const TOKEN_MICROS: i64 = 50;
+
 fn token_cost_micros(tokens: i64) -> i64 {
-    tokens.saturating_mul(50)
+    tokens.saturating_mul(TOKEN_MICROS)
+}
+
+fn tokens_i64(tokens: u64) -> i64 {
+    i64::try_from(tokens).unwrap_or(i64::MAX)
+}
+
+fn measured_mean(
+    cells: &BTreeMap<TransitionClass, SampleCell>,
+    class: TransitionClass,
+) -> Option<i64> {
+    let cell = cells.get(&class)?;
+    if cell.observations == 0 || cell.samples.is_empty() {
+        return None;
+    }
+    Some(super::predictor::mean_i64(&cell.samples))
+}
+
+fn explicit_terms_from_lumped(class: TransitionClass, total: i64) -> (i64, i64, i64, i64) {
+    let (cache_share, reprime_share, startup, checkpoint) = split_components(class, total);
+    (
+        cache_share / TOKEN_MICROS,
+        reprime_share / TOKEN_MICROS,
+        startup,
+        checkpoint,
+    )
+}
+
+fn trajectory_key(record: &InvocationRecord) -> String {
+    if let Some(execution) = &record.policy_execution_id {
+        return format!("exec:{}", execution.as_str());
+    }
+    if let Some(run) = &record.optimization_run_id {
+        return format!("run:{}", run.as_str());
+    }
+    format!("row:{}", record.started_at.as_millis())
 }
 
 fn mean_prior(class: TransitionClass) -> i64 {
@@ -446,12 +691,14 @@ mod tests {
         ReviewTopology, RuntimeModelId, TopologySpec, WorkerTopology,
     };
     use crate::optimizer::ids::{
-        BackendId, CatalogVersion, ModelFamilyId, PolicyId, PolicyNodeId, ProviderId, RuntimeSlug,
-        TimestampMillis, VerifierProfileId,
+        BackendId, CandidateId, CatalogVersion, ModelFamilyId, PolicyId, PolicyNodeId, ProviderId,
+        RuntimeSlug, TimestampMillis, VerifierProfileId,
     };
     use crate::optimizer::policy::PolicyNode;
     use crate::optimizer::predictor::{insert_text, PolicyOutcomeDistribution};
+    use crate::optimizer::resources::ResourceVector;
     use crate::optimizer::state::DecisionHorizon;
+    use crate::optimizer::telemetry::{InvocationId, PolicyExecutionId};
 
     fn action(backend: &str, slug: &str) -> ModelAction {
         ModelAction {
@@ -511,6 +758,12 @@ mod tests {
             model.estimate(TransitionClass::Continue).total_cost_micros,
             0
         );
+        assert_eq!(
+            estimate.total_cost_micros,
+            estimate.explicit_objective_term_micros()
+        );
+        assert!(estimate.cached_prefix_invalidation_tokens > 0);
+        assert!(estimate.context_reprime_tokens > 0);
     }
 
     #[test]
@@ -525,6 +778,12 @@ mod tests {
         let after = model.estimate(TransitionClass::ModelChangeSameRuntime);
         assert_eq!(after.observation, ObservationKind::Measured);
         assert!(after.total_cost_micros < before);
+        assert_eq!(after.cached_prefix_invalidation_tokens, 10);
+        assert_eq!(after.context_reprime_tokens, 10);
+        assert_eq!(
+            after.total_cost_micros,
+            after.explicit_objective_term_micros()
+        );
     }
 
     #[test]
@@ -589,6 +848,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unknown_previous_does_not_price_action_as_fresh_session() {
+        let next = action("adapter-a", "model-a");
+        assert_eq!(
+            classify_transition(None, Some(&next), RestartMode::Continuation),
+            TransitionClass::Continue
+        );
+        assert_eq!(
+            classify_transition(None, None, RestartMode::Continuation),
+            TransitionClass::Continue
+        );
+        assert_eq!(
+            classify_transition(None, Some(&next), RestartMode::CleanRestart),
+            TransitionClass::FreshSessionOrWorktree
+        );
+    }
+
     struct ConstantObjective;
 
     impl ObjectiveEvaluator for ConstantObjective {
@@ -606,15 +882,15 @@ mod tests {
 
     #[test]
     fn switch_aware_objective_adds_the_term() {
-        let switch = SwitchCostEstimate {
-            class: TransitionClass::ModelChangeSameRuntime,
-            cached_prefix_invalidation_tokens: 10,
-            context_reprime_tokens: 10,
-            runtime_startup_micros: 0,
-            lost_checkpoint_cost_micros: 0,
-            total_cost_micros: 500,
-            observation: ObservationKind::Measured,
-        };
+        let switch = SwitchCostEstimate::from_explicit_terms(
+            TransitionClass::ModelChangeSameRuntime,
+            10,
+            10,
+            0,
+            0,
+            ObservationKind::Measured,
+        );
+        assert_eq!(switch.total_cost_micros, 1_000);
         let objective = SwitchAwareObjective::new(Box::new(ConstantObjective), switch);
         let value = objective
             .evaluate(&PolicyOutcomeDistribution::new(
@@ -625,7 +901,7 @@ mod tests {
                 9_000,
             ))
             .expect("eval");
-        assert_eq!(value.risk_adjusted_cost_micros, 600);
+        assert_eq!(value.risk_adjusted_cost_micros, 1_100);
     }
 
     #[test]
@@ -649,5 +925,115 @@ mod tests {
         let stay = estimate_switch(&SwitchCostModel::new(), previous, &continue_policy);
         assert_eq!(stay.class, TransitionClass::Continue);
         assert_eq!(stay.total_cost_micros, 0);
+    }
+
+    fn invocation(
+        id: &str,
+        backend: &str,
+        model: &str,
+        started: u64,
+        input: Option<u64>,
+        cached: Option<u64>,
+    ) -> InvocationRecord {
+        let mut record = InvocationRecord::new(
+            PolicyId::new("p").expect("policy"),
+            CandidateId::new("c").expect("cand"),
+            TimestampMillis::from_millis(started),
+            ResourceVector::new().snapshot(TimestampMillis::from_millis(started)),
+        );
+        record.policy_execution_id = Some(PolicyExecutionId::new("exec-1").expect("exec"));
+        record.invocation_id = Some(InvocationId::new(id).expect("id"));
+        record.backend = Some(BackendId::new(backend).expect("backend"));
+        record.resolved_model = Some(RuntimeSlug::new(model).expect("model"));
+        record.input_tokens = input;
+        record.cached_input_tokens = cached;
+        record
+    }
+
+    #[test]
+    fn telemetry_fits_explicit_cache_invalidation_and_reprime() {
+        let warm = invocation("warm", "adapter-a", "model-a", 1, Some(1_000), Some(800));
+        let switched = invocation("swap", "adapter-a", "model-b", 2, Some(900), Some(0));
+        let mut model = SwitchCostModel::new();
+        model.observe_invocations(&[warm, switched]);
+
+        let estimate = model.estimate(TransitionClass::ModelChangeSameRuntime);
+        assert_eq!(estimate.observation, ObservationKind::Measured);
+        assert_eq!(estimate.cached_prefix_invalidation_tokens, 800);
+        assert_eq!(estimate.context_reprime_tokens, 900);
+        assert_eq!(
+            estimate.total_cost_micros,
+            token_cost_micros(800).saturating_add(token_cost_micros(900))
+        );
+        assert_eq!(
+            estimate
+                .cost_by_dimension()
+                .get(&ResourceDimensionId::well_known(
+                    ResourceDimensionId::API_COST_USD
+                )),
+            Some(&estimate.total_cost_micros)
+        );
+
+        let stay = model.estimate(TransitionClass::Continue);
+        assert_eq!(stay.total_cost_micros, 0);
+        let (hit_bp, hit_kind) = model
+            .cache_hit_ratio_bp(TransitionClass::ModelChangeSameRuntime)
+            .expect("hit ratio");
+        assert_eq!(hit_kind, ObservationKind::Measured);
+        assert_eq!(hit_bp, 0);
+
+        let hysteresis = SwitchHysteresis { margin_bp: 1_000 };
+        assert!(!hysteresis.should_switch(1_000, estimate.explicit_objective_term_micros()));
+    }
+
+    #[test]
+    fn continue_records_high_cache_hit_and_zero_switch_term() {
+        let first = invocation("a", "adapter-a", "model-a", 1, Some(1_000), Some(200));
+        let again = invocation("b", "adapter-a", "model-a", 2, Some(1_000), Some(900));
+        let mut model = SwitchCostModel::new();
+        model.observe_invocations(&[first, again]);
+        assert_eq!(
+            model
+                .estimate(TransitionClass::Continue)
+                .explicit_objective_term_micros(),
+            0
+        );
+        let (hit_bp, kind) = model
+            .cache_hit_ratio_bp(TransitionClass::Continue)
+            .expect("continue hit");
+        assert_eq!(kind, ObservationKind::Measured);
+        assert_eq!(hit_bp, 9_000);
+        assert_eq!(
+            model
+                .estimate(TransitionClass::ModelChangeSameRuntime)
+                .observation,
+            ObservationKind::Inferred
+        );
+    }
+
+    #[test]
+    fn missing_token_fields_are_not_fabricated_as_measured_zeros() {
+        let previous = invocation("a", "adapter-a", "model-a", 1, None, None);
+        let next = invocation("b", "adapter-a", "model-b", 2, None, None);
+        let mut model = SwitchCostModel::new();
+        model.observe_invocations(&[previous, next]);
+        let estimate = model.estimate(TransitionClass::ModelChangeSameRuntime);
+        assert_eq!(estimate.observation, ObservationKind::Inferred);
+        assert!(estimate.explicit_objective_term_micros() > 0);
+        assert!(model
+            .cache_hit_ratio_bp(TransitionClass::ModelChangeSameRuntime)
+            .is_none());
+    }
+
+    #[test]
+    fn inferred_prior_exposes_nonzero_cache_and_reprime_terms() {
+        let estimate = SwitchCostModel::new().estimate(TransitionClass::RuntimeAdapterChange);
+        assert_eq!(estimate.observation, ObservationKind::Inferred);
+        assert!(estimate.cached_prefix_invalidation_tokens > 0);
+        assert!(estimate.context_reprime_tokens > 0);
+        assert_eq!(
+            estimate.total_cost_micros,
+            estimate.explicit_objective_term_micros()
+        );
     }
 }

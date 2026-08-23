@@ -1,17 +1,27 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+
+#[cfg(test)]
+#[macro_use]
+mod test_containment;
+
 pub mod agent;
 pub mod agent_lifecycle;
 pub mod artifacts;
 pub mod autopilot;
 pub mod cli;
 pub mod consult;
+#[doc(hidden)]
+pub mod containment_probe;
 pub mod decision_claim;
+pub mod eval_harness;
 pub mod evaluation;
 pub mod evaluation_gate_policy;
 pub mod execution_capability;
+pub mod executor;
 pub mod external_agent;
 pub mod field_guide;
 pub mod gate_denial;
+pub mod hierarchy_ledger;
 pub mod inbox;
 pub mod lane_build;
 pub mod live_claim;
@@ -32,6 +42,7 @@ pub mod quota;
 pub mod repo_map;
 pub mod repo_semantic;
 pub mod review;
+pub mod run_ops;
 pub mod runtime_adapter;
 pub mod safe_state;
 pub mod scope;
@@ -44,6 +55,7 @@ pub mod sync_store;
 pub mod worktree;
 
 pub(crate) mod authenticated_snapshot;
+pub(crate) mod budget_ledger;
 pub(crate) mod checkpoint_wire;
 pub(crate) mod collect_revalidation;
 pub(crate) mod effect_wal;

@@ -308,12 +308,29 @@ const REPOSITORY_SCAN_IGNORED_ROOTS: &[&str] = &[
     ".agents/storage",
 ];
 
+/// Repository-local managed-worktree stores. These trees contain nested Git
+/// worktree markers and must stay walk boundaries so mapping and raw
+/// prevalidation neither reject the markers nor descend tens of GiB of lane
+/// state. `Path::starts_with(".worktrees")` does not match dated
+/// `.worktrees-quarantine-*` leftovers, so first-component matching is required.
+pub fn is_ignored_worktree_store_path(path: &Path) -> bool {
+    path.components().next().is_some_and(|component| {
+        let name = component.as_os_str();
+        name == ".worktrees"
+            || name
+                .to_str()
+                .is_some_and(|name| name.starts_with(".worktrees-quarantine"))
+    })
+}
+
 pub fn is_runtime_control_path(path: &Path) -> bool {
     path_is_under_any(path, REPOSITORY_RUNTIME_ROOTS)
 }
 
 pub fn is_ignored_scan_path(path: &Path) -> bool {
-    is_runtime_control_path(path) || path_is_under_any(path, REPOSITORY_SCAN_IGNORED_ROOTS)
+    is_runtime_control_path(path)
+        || path_is_under_any(path, REPOSITORY_SCAN_IGNORED_ROOTS)
+        || is_ignored_worktree_store_path(path)
 }
 
 fn is_ignored_path(path: &Path) -> bool {
@@ -364,6 +381,7 @@ mod tests {
 
     #[test]
     fn scan_returns_stable_sorted_entries_and_categories() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -397,6 +415,7 @@ mod tests {
 
     #[test]
     fn explicit_file_sampling_is_language_agnostic_and_does_not_create_state() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -422,6 +441,7 @@ mod tests {
 
     #[test]
     fn scan_excludes_generated_and_local_state_paths() {
+        skip_without_containment!();
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -474,6 +494,46 @@ mod tests {
     }
 
     #[test]
+    fn scan_treats_worktree_stores_as_boundaries_and_ignores_nested_git_markers() {
+        skip_without_containment!();
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
+        fs::create_dir_all(repo_path.join(".worktrees/lane/src")).expect("create lane");
+        fs::write(
+            repo_path.join(".worktrees/lane/.git"),
+            "gitdir: /tmp/fake-worktree\n",
+        )
+        .expect("write nested gitfile");
+        fs::write(
+            repo_path.join(".worktrees/lane/src/lib.rs"),
+            "fn skip() {}\n",
+        )
+        .expect("write lane source");
+        fs::create_dir_all(repo_path.join(".worktrees-quarantine-20260811/old"))
+            .expect("create quarantine");
+        fs::write(
+            repo_path.join(".worktrees-quarantine-20260811/old/.git"),
+            "gitdir: /tmp/fake-quarantine\n",
+        )
+        .expect("write quarantine gitfile");
+
+        let map = scan_repository(&repo_path).expect("scan with nested worktree markers");
+        let paths = map
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&PathBuf::from("README.md")));
+        assert!(!paths.iter().any(|path| path.starts_with(".worktrees")));
+        assert!(!paths
+            .iter()
+            .any(|path| path.starts_with(".worktrees-quarantine-20260811")));
+    }
+
+    #[test]
     fn runtime_control_roots_do_not_treat_maco_as_maco_cache() {
         assert!(is_runtime_control_path(Path::new(".maco")));
         assert!(is_runtime_control_path(Path::new(".maco/state")));
@@ -485,11 +545,32 @@ mod tests {
         assert!(!is_runtime_control_path(Path::new("src/lib.rs")));
         assert!(!is_ignored_scan_path(Path::new(".agents/docs/rules.md")));
         assert!(is_ignored_scan_path(Path::new(".maco-cache/index")));
+        assert!(is_ignored_worktree_store_path(Path::new(".worktrees")));
+        assert!(is_ignored_worktree_store_path(Path::new(
+            ".worktrees/lane/.git"
+        )));
+        assert!(is_ignored_worktree_store_path(Path::new(
+            ".worktrees-quarantine-20260811/old/.git"
+        )));
+        assert!(!is_ignored_worktree_store_path(Path::new(
+            "src/.worktrees/nested"
+        )));
+        assert!(!is_ignored_worktree_store_path(Path::new(
+            ".worktrees-backup"
+        )));
+        assert!(is_ignored_scan_path(Path::new(
+            ".worktrees/lane/src/lib.rs"
+        )));
+        assert!(is_ignored_scan_path(Path::new(
+            ".worktrees-quarantine-20260811/old/README.md"
+        )));
+        assert!(!is_runtime_control_path(Path::new(".worktrees/lane")));
     }
 
     #[cfg(unix)]
     #[test]
     fn scan_reports_but_never_follows_links_or_special_files() {
+        skip_without_containment!();
         use std::os::unix::{fs::symlink, net::UnixListener};
 
         let temp = tempfile::tempdir().expect("tempdir");

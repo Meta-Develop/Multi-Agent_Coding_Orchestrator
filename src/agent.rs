@@ -1187,6 +1187,7 @@ mod tests {
 
     #[test]
     fn fake_provider_agent_run_edits_only_agent_worktree_and_releases_claim() -> Result<()> {
+        skip_without_containment!(ok);
         let temp = TempDir::new().context("tempdir")?;
         let repo_path = create_committed_repo(temp.path())?;
         let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
@@ -1235,6 +1236,7 @@ mod tests {
 
     #[test]
     fn fake_provider_agent_run_reports_unclaimed_changes() -> Result<()> {
+        skip_without_containment!(ok);
         let temp = TempDir::new().context("tempdir")?;
         let repo_path = create_committed_repo(temp.path())?;
         let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
@@ -1284,6 +1286,7 @@ mod tests {
 
     #[test]
     fn provider_commands_are_disabled_by_default_and_not_executed() -> Result<()> {
+        skip_without_containment!(ok);
         let temp = TempDir::new().context("tempdir")?;
         let repo_path = create_committed_repo(temp.path())?;
         let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
@@ -1331,6 +1334,7 @@ mod tests {
 
     #[test]
     fn allowed_provider_command_timeout_with_keep_claims_leaves_claim_active() -> Result<()> {
+        skip_without_containment!(ok);
         let temp = TempDir::new().context("tempdir")?;
         let repo_path = create_committed_repo(temp.path())?;
         let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
@@ -1377,6 +1381,7 @@ mod tests {
 
     #[test]
     fn fake_provider_patch_with_mismatched_diff_path_is_rejected_before_apply() -> Result<()> {
+        skip_without_containment!(ok);
         let temp = TempDir::new().context("tempdir")?;
         let repo_path = create_committed_repo(temp.path())?;
         let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
@@ -1429,6 +1434,81 @@ diff --git a/src/lib.rs b/src/lib.rs
             "pub fn ok() -> bool { true }\n"
         );
         assert!(report.candidate.changed_paths.is_empty());
+        assert!(SyncStore::open(&repo_path)?.snapshot()?.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn writable_fake_provider_e2e_is_reachable_without_network() -> Result<()> {
+        // FakeProvider applies a canned patch on the simulation path. Candidate
+        // snapshot capture still uses isolated git, so self-skip when that
+        // sandbox is unavailable. A named writable-capability refusal is also
+        // skipped; production fail-closed is unchanged.
+        skip_without_containment!(ok);
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
+        provider.push_response(
+            "agent-run-fake-e2e",
+            WorkProposal::summary("writable fake-provider e2e").with_patch(ProposedPatch::new(
+                "README.md",
+                "\
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1,3 @@
+ # Test
++
++fake-provider writable e2e
+",
+            )),
+        );
+
+        let report = match run_agent_with_provider_simulation(
+            AgentRunOptions {
+                repo: repo_path.clone(),
+                agent_id: "fake-e2e".to_string(),
+                task: "Apply a canned fake-provider patch in an isolated worktree.".to_string(),
+                request_id: Some("agent-run-fake-e2e".to_string()),
+                model: None,
+                claimed_paths: vec![PathBuf::from("README.md")],
+                validation_commands: Vec::new(),
+                keep_claims: false,
+                worktree_reuse: AgentWorktreeReusePolicy::Clean,
+                provider_command_policy: ProviderCommandPolicy::Disabled,
+                command_timeout: DEFAULT_COMMAND_TIMEOUT,
+            },
+            &mut provider,
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                let message = format!("{error:#}");
+                if message.contains("failed closed before launch")
+                    && (message.contains("blocking_pre_action_callback != All")
+                        || message.contains("writable_workspace != supported"))
+                {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        };
+
+        assert!(report.success, "unexpected failed report: {report:#?}");
+        assert_eq!(report.provider_id, "fake");
+        assert_eq!(report.model, DEFAULT_MODEL);
+        assert_eq!(
+            report.candidate.changed_paths,
+            vec![PathBuf::from("README.md")]
+        );
+        assert!(report.candidate.unclaimed_changed_paths.is_empty());
+        assert_eq!(provider.calls().len(), 1);
+        assert_eq!(fs::read_to_string(repo_path.join("README.md"))?, "# Test\n");
+        assert_eq!(
+            fs::read_to_string(report.worktree.path.join("README.md"))?,
+            "# Test\n\nfake-provider writable e2e\n"
+        );
+        assert_ne!(report.worktree.path, repo_path);
         assert!(SyncStore::open(&repo_path)?.snapshot()?.is_empty());
 
         Ok(())

@@ -660,28 +660,90 @@ fn trusted_network_properties_require_exact_ip_families_without_private_network(
         ),
         ("PrivateNetwork".to_string(), "no".to_string()),
     ]);
-    verify_systemd_network_properties(
+    for kind in [
         SideEffectConfinementProfileKind::TrustedFixedNetwork,
-        &properties,
-    )
-    .expect("exact trusted network properties");
+        SideEffectConfinementProfileKind::TrustedCompatibility,
+    ] {
+        verify_systemd_network_properties(kind, &properties)
+            .unwrap_or_else(|error| panic!("exact {kind:?} network properties: {error}"));
+    }
 
     properties.insert(
         "RestrictAddressFamilies".to_string(),
-        "AF_UNIX AF_INET AF_INET6".to_string(),
+        "AF_INET AF_INET6 AF_NETLINK".to_string(),
     );
-    assert!(verify_systemd_network_properties(
+    for kind in [
         SideEffectConfinementProfileKind::TrustedFixedNetwork,
-        &properties,
-    )
-    .is_err());
+        SideEffectConfinementProfileKind::TrustedCompatibility,
+    ] {
+        assert!(verify_systemd_network_properties(kind, &properties).is_err());
+    }
     properties.insert(
         "RestrictAddressFamilies".to_string(),
         "AF_INET AF_INET6".to_string(),
     );
     properties.insert("PrivateNetwork".to_string(), "yes".to_string());
-    assert!(verify_systemd_network_properties(
+    for kind in [
         SideEffectConfinementProfileKind::TrustedFixedNetwork,
+        SideEffectConfinementProfileKind::TrustedCompatibility,
+    ] {
+        assert!(verify_systemd_network_properties(kind, &properties).is_err());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn strict_offline_network_properties_reject_external_codex_netlink() {
+    let mut properties = BTreeMap::from([
+        ("RestrictAddressFamilies".to_string(), "AF_UNIX".to_string()),
+        ("PrivateNetwork".to_string(), "yes".to_string()),
+    ]);
+    verify_systemd_network_properties(
+        SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+        &properties,
+    )
+    .expect("exact strict offline network properties");
+
+    properties.insert(
+        "RestrictAddressFamilies".to_string(),
+        "AF_UNIX AF_NETLINK".to_string(),
+    );
+    assert!(verify_systemd_network_properties(
+        SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+        &properties,
+    )
+    .is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn external_codex_network_properties_require_exact_netlink_family() {
+    let mut properties = BTreeMap::from([
+        (
+            "RestrictAddressFamilies".to_string(),
+            "AF_NETLINK AF_INET6 AF_INET".to_string(),
+        ),
+        ("PrivateNetwork".to_string(), "no".to_string()),
+    ]);
+    verify_systemd_network_properties(SideEffectConfinementProfileKind::ExternalCodex, &properties)
+        .expect("exact ExternalCodex network properties");
+
+    properties.insert(
+        "RestrictAddressFamilies".to_string(),
+        "AF_INET AF_INET6".to_string(),
+    );
+    assert!(verify_systemd_network_properties(
+        SideEffectConfinementProfileKind::ExternalCodex,
+        &properties,
+    )
+    .is_err());
+
+    properties.insert(
+        "RestrictAddressFamilies".to_string(),
+        "AF_UNIX AF_INET AF_INET6 AF_NETLINK".to_string(),
+    );
+    assert!(verify_systemd_network_properties(
+        SideEffectConfinementProfileKind::ExternalCodex,
         &properties,
     )
     .is_err());
@@ -1122,6 +1184,7 @@ fn external_codex_held_file_capability_rejects_replacement_before_resolution() {
 #[cfg(target_os = "linux")]
 #[test]
 fn external_codex_outer_sandbox_enforces_control_and_report_write_boundaries() {
+    skip_without_containment!();
     const CHILD_ENV: &str = "MACO_TEST_EXTERNAL_CODEX_WRITE_BOUNDARY_CHILD";
     const ASSIGNED_PATH_ENV: &str = "MACO_TEST_EXTERNAL_CODEX_ASSIGNED_PATH";
     const REPORT_PATH_ENV: &str = "MACO_TEST_EXTERNAL_CODEX_REPORT_PATH";
@@ -1943,6 +2006,110 @@ fn system_call_filter_accepts_retained_and_complete_expanded_deny_forms() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
+    let mut external = program_visibility_sandbox(Path::new("/worktree"));
+    external.kind = SideEffectConfinementProfileKind::ExternalCodex;
+    let mut command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(&mut command, &external);
+    let arguments = command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(arguments
+        .iter()
+        .any(|argument| argument == "--property=RestrictNamespaces=no"));
+    assert!(arguments.iter().any(|argument| {
+        argument == "--property=RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK"
+    }));
+    let external_filter = arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--property=SystemCallFilter="))
+        .expect("ExternalCodex syscall filter");
+    verify_effective_system_call_filter(
+        SideEffectConfinementProfileKind::ExternalCodex,
+        external_filter,
+    )
+    .expect("ExternalCodex bubblewrap-compatible deny list");
+    verify_effective_namespace_restriction(SideEffectConfinementProfileKind::ExternalCodex, "no")
+        .expect("ExternalCodex namespaces are available to bubblewrap");
+    assert!(verify_effective_namespace_restriction(
+        SideEffectConfinementProfileKind::ExternalCodex,
+        "yes",
+    )
+    .is_err());
+
+    for kind in [
+        SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+        SideEffectConfinementProfileKind::TrustedFixedNetwork,
+        SideEffectConfinementProfileKind::TrustedCompatibility,
+    ] {
+        let mut ordinary = program_visibility_sandbox(Path::new("/worktree"));
+        ordinary.kind = kind;
+        let mut command = Command::new("systemd-run");
+        apply_systemd_sandbox_properties(&mut command, &ordinary);
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "--property=RestrictNamespaces=yes"),
+            "{kind:?} namespace confinement changed"
+        );
+        let expected_address_families = match kind {
+            SideEffectConfinementProfileKind::StrictOfflineWorkspace => {
+                "--property=RestrictAddressFamilies=AF_UNIX"
+            }
+            SideEffectConfinementProfileKind::TrustedFixedNetwork
+            | SideEffectConfinementProfileKind::TrustedCompatibility => {
+                "--property=RestrictAddressFamilies=AF_INET AF_INET6"
+            }
+            SideEffectConfinementProfileKind::ExternalCodex => {
+                unreachable!("ExternalCodex is checked separately")
+            }
+        };
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == expected_address_families),
+            "{kind:?} address-family confinement changed"
+        );
+        assert!(
+            arguments
+                .iter()
+                .all(|argument| !argument.contains("AF_NETLINK")),
+            "{kind:?} unexpectedly gained AF_NETLINK"
+        );
+        let filter = arguments
+            .iter()
+            .find_map(|argument| argument.strip_prefix("--property=SystemCallFilter="))
+            .unwrap_or_else(|| panic!("{kind:?} syscall filter"));
+        verify_effective_system_call_filter(kind, filter)
+            .unwrap_or_else(|error| panic!("{kind:?} syscall confinement changed: {error}"));
+        verify_effective_namespace_restriction(kind, "yes")
+            .unwrap_or_else(|error| panic!("{kind:?} namespace verification changed: {error}"));
+        assert!(verify_effective_namespace_restriction(kind, "no").is_err());
+        assert!(filter
+            .split_whitespace()
+            .any(|token| token.trim_start_matches('~') == "@mount"));
+    }
+
+    let ordinary_filter = retained_system_call_filter_fixture();
+    assert!(verify_effective_system_call_filter(
+        SideEffectConfinementProfileKind::ExternalCodex,
+        &ordinary_filter,
+    )
+    .is_err());
+    assert!(verify_effective_system_call_filter(
+        SideEffectConfinementProfileKind::TrustedFixedNetwork,
+        external_filter,
+    )
+    .is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn system_call_filter_rejects_each_incomplete_group_and_allow_list() {
     let expanded = expanded_system_call_filter_fixture();
     for (group, representatives) in required_denied_group_representatives() {
@@ -2316,6 +2483,7 @@ fn required_containment_verifies_normal_nonzero_and_timeout_units_empty() {
 #[cfg(target_os = "linux")]
 #[test]
 fn unsupported_path_masking_refuses_before_target_and_leaves_no_residue() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let marker = temp.path().join("target-ran");
     let result = run_process(
@@ -2540,6 +2708,7 @@ fn exact_git_read_roots_do_not_expose_private_tmp_sibling() {
 #[cfg(target_os = "linux")]
 #[test]
 fn strict_target_cannot_launch_sibling_user_unit() {
+    skip_without_containment!();
     if !strict_backend_available_for_tests() {
         return;
     }
@@ -2616,6 +2785,7 @@ fn strict_target_cannot_launch_sibling_user_unit() {
 #[cfg(target_os = "linux")]
 #[test]
 fn strict_target_cannot_create_hardlinks_or_fifos_after_start_gate() {
+    skip_without_containment!();
     if !strict_backend_available_for_tests() {
         return;
     }
@@ -2722,6 +2892,7 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
 #[cfg(target_os = "linux")]
 #[test]
 fn required_containment_kills_setsid_delayed_mutation_with_closed_stdio() {
+    skip_without_containment!();
     if !strict_backend_available_for_tests() {
         return;
     }
@@ -2829,6 +3000,7 @@ fn exhausted_total_budget_returns_typed_setup_timeout_without_starting_target() 
 #[cfg(target_os = "linux")]
 #[test]
 fn strict_runtime_files_ignore_ambient_tmpdir() {
+    skip_without_containment!();
     const CHILD_ENV: &str = "MACO_TEST_AMBIENT_TMP_CHILD";
     if env::var_os(CHILD_ENV).is_some() {
         let ambient = PathBuf::from(env::var_os("MACO_TEST_AMBIENT_TMP_PATH").expect("ambient"));
@@ -3066,6 +3238,7 @@ fn parent_sigkill_after_environment_publish_removes_secret_and_unit() {
 #[cfg(target_os = "linux")]
 #[test]
 fn target_environment_cannot_overwrite_guardian_gate_state() {
+    skip_without_containment!();
     if !strict_backend_available_for_tests() {
         return;
     }

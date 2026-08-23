@@ -320,6 +320,7 @@ fn recursive_supervisor_plan_flattens_and_preserves_schedule_on_round_trip() {
 
 #[test]
 fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     Repository::init(repo).expect("initialize repository");
@@ -434,7 +435,60 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
 }
 
 #[test]
+fn authoritative_single_file_goal_lowers_to_one_planning_execution_pair() {
+    skip_without_containment!();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    Repository::init(repo).expect("initialize repository");
+    fs::write(repo.join("RELEASE_NOTES.md"), "# Releases\n").expect("write release notes");
+    fs::write(
+        repo.join("src.rs"),
+        "pub fn write() {}\npub fn commit() {}\n",
+    )
+    .expect("write semantic decoys");
+
+    let document = supervisor_plan_document_from_goal_spec(
+        repo,
+        "Smoke goal — prove a managed-worktree child write",
+        r#"## Goal
+
+Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other file.
+
+## Spec
+
+- Edit only `RELEASE_NOTES.md`.
+- Commit the change with message `docs: child write`.
+
+## Acceptance
+
+- `RELEASE_NOTES.md` ends with the new line and is committed."#,
+    )
+    .expect("plan authoritative single-file goal");
+
+    let assignments = document["assignments"]
+        .as_array()
+        .expect("assignments array");
+    assert_eq!(assignments.len(), 2);
+    assert_eq!(assignments[0]["id"], "assignment-001-planning");
+    assert_eq!(assignments[1]["id"], "assignment-001");
+    for assignment in assignments {
+        assert_eq!(assignment["assigned_paths"], json!(["RELEASE_NOTES.md"]));
+        assert_eq!(assignment["semantic_symbols"], json!([]));
+        assert_eq!(assignment["semantic_modules"], json!([]));
+    }
+    assert_eq!(
+        document["assignment_schedule"]
+            .as_array()
+            .expect("assignment schedule")
+            .len(),
+        2
+    );
+    assert!(document.get("coverage_gaps").is_none());
+}
+
+#[test]
 fn plain_text_task_without_actionable_scope_returns_guidance() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
     Repository::init(&repo).expect("initialize repository");
@@ -443,10 +497,121 @@ fn plain_text_task_without_actionable_scope_returns_guidance() {
     fs::write(&task_file, "Explain the unmatched frobnicator.\n").expect("write task");
 
     let error = supervisor_plan_document_from_task_file(&repo, &task_file)
-        .expect_err("scope-free task must fail")
-        .to_string();
+        .expect_err("scope-free task must fail");
+    let error = format!("{error:#}");
     assert!(error.contains("produced no actionable workstreams"));
     assert!(error.contains("repository path, Rust module, or Rust symbol"));
+    assert!(error.contains("documentation, policy, and script files are valid scopes"));
+}
+
+#[test]
+fn plain_text_policy_and_script_task_emits_workstreams() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    Repository::init(&repo).expect("initialize repository");
+    fs::create_dir_all(repo.join(".agents/skills/agent-orchestration")).expect("create skills");
+    fs::create_dir_all(repo.join(".agents/scripts")).expect("create scripts");
+    fs::write(
+        repo.join(".agents/skills/agent-orchestration/SKILL.md"),
+        "# Orchestration\n",
+    )
+    .expect("write skill");
+    fs::write(repo.join(".agents/scripts/o2-autopilot"), "#!/bin/sh\n").expect("write script");
+    let task_file = temp.path().join("task.md");
+    fs::write(
+        &task_file,
+        "- Update `.agents/skills/agent-orchestration/SKILL.md`.\n\
+         - Update `.agents/scripts/o2-autopilot`.\n",
+    )
+    .expect("write task");
+
+    let document = supervisor_plan_document_from_task_file(&repo, &task_file)
+        .expect("plan policy/script task");
+    let assignments = document["assignments"]
+        .as_array()
+        .expect("assignments array");
+    assert_eq!(assignments.len(), 4);
+    let scopes = assignments
+        .iter()
+        .map(|assignment| {
+            assignment["assigned_paths"]
+                .as_array()
+                .expect("paths")
+                .iter()
+                .map(|path| path.as_str().expect("path").to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        scopes,
+        BTreeSet::from([
+            vec![".agents/scripts/o2-autopilot".to_string()],
+            vec![".agents/skills/agent-orchestration/SKILL.md".to_string()],
+        ])
+    );
+}
+
+#[test]
+fn plain_text_gitignored_policy_path_emits_workstream() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    Repository::init(&repo).expect("initialize repository");
+    fs::write(repo.join(".gitignore"), ".agents/\n").expect("write gitignore");
+    fs::create_dir_all(repo.join(".agents/skills/agent-orchestration")).expect("create skills");
+    fs::write(
+        repo.join(".agents/skills/agent-orchestration/SKILL.md"),
+        "# Orchestration\n",
+    )
+    .expect("write skill");
+    fs::write(repo.join("README.md"), "# fixture\n").expect("write readme");
+    let task_file = temp.path().join("task.md");
+    fs::write(
+        &task_file,
+        "- Update `.agents/skills/agent-orchestration/SKILL.md`.\n",
+    )
+    .expect("write task");
+
+    let document = supervisor_plan_document_from_task_file(&repo, &task_file)
+        .expect("plan gitignored policy path");
+    let assignments = document["assignments"]
+        .as_array()
+        .expect("assignments array");
+    assert_eq!(assignments.len(), 2);
+    let scopes = assignments
+        .iter()
+        .map(|assignment| {
+            assignment["assigned_paths"]
+                .as_array()
+                .expect("paths")
+                .iter()
+                .map(|path| path.as_str().expect("path").to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        scopes,
+        BTreeSet::from([vec![
+            ".agents/skills/agent-orchestration/SKILL.md".to_string()
+        ]])
+    );
+}
+
+#[test]
+fn plain_text_task_with_missing_named_path_surfaces_cause() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    Repository::init(&repo).expect("initialize repository");
+    fs::write(repo.join("README.md"), "# fixture\n").expect("write readme");
+    let task_file = temp.path().join("task.md");
+    fs::write(&task_file, "- Update `.agents/skills/missing/SKILL.md`.\n").expect("write task");
+
+    let error = supervisor_plan_document_from_task_file(&repo, &task_file)
+        .expect_err("missing named path must fail");
+    let error = format!("{error:#}");
+    assert!(error.contains("failed to plan plain-text task specification"));
+    assert!(error.contains("failed to decompose goal/spec into repository workstreams"));
+    assert!(error.contains(".agents/skills/missing/SKILL.md"));
+    assert!(error.contains("not a readable regular file"));
 }
 
 #[test]
@@ -1844,6 +2009,7 @@ fn known_unavailable_child_runtime_default_is_refused_as_capability_evidence() {
 
 #[test]
 fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor() {
+    skip_without_containment!();
     let _capability =
         install_named_test_models(&["available-child-model", "unavailable-auditor-model"]);
     let (temp, repo_path) = injected_repository();
@@ -2010,6 +2176,7 @@ fn known_unavailable_child_fail_closed_reaches_production_core_without_dispatch_
 
 #[test]
 fn local_deterministic_fake_fallback_reaches_shared_supervisor_core_without_external_dispatch() {
+    skip_without_containment!();
     // Fake harness fallback is configured execution, not a provider-model claim.
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
@@ -2070,6 +2237,11 @@ fn runtime_model_catalog_preflight_is_typed_persisted_and_short_circuits_assignm
         panic!("catalog preflight failure must prevent assignment environment preflight")
     };
     let run_id = options.run_id.clone();
+    let secret = "CATALOG_SECRET_MARKER_83";
+    let catalog_diagnostic = format!(
+        "injected catalog acquisition failure\r\nAPI_TOKEN={secret}\n{}",
+        "long diagnostic tail ".repeat(MAX_ENVIRONMENT_FAILURE_DIAGNOSTIC_CHARS)
+    );
 
     let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
         plan,
@@ -2077,7 +2249,7 @@ fn runtime_model_catalog_preflight_is_typed_persisted_and_short_circuits_assignm
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
         Err(Box::new(EnvironmentFailure::runtime_model_catalog(
-            "injected catalog acquisition failure".to_string(),
+            catalog_diagnostic,
         ))),
         &mut runner,
     )
@@ -2127,17 +2299,71 @@ fn runtime_model_catalog_preflight_is_typed_persisted_and_short_circuits_assignm
         EnvironmentFailureCategory::RuntimeModelCatalogUnavailable
     );
     assert!(report.environment_failures[0].requirement.is_none());
+    let canonical_prefix = "environment preflight reported runtime_model_catalog_unavailable";
+    let summary = &report.environment_failures[0].summary;
+    assert!(summary.starts_with(&format!(
+        "{canonical_prefix}: injected catalog acquisition failure "
+    )));
+    assert!(summary.contains("API_TOKEN <redacted:secret>"));
+    assert!(!summary.contains(secret));
+    assert!(!summary
+        .chars()
+        .any(|character| matches!(character, '\r' | '\n')));
+    let diagnostic = summary
+        .strip_prefix(&format!("{canonical_prefix}: "))
+        .expect("catalog failure summary retains a canonical bounded diagnostic");
+    assert!(
+        diagnostic.chars().count() <= MAX_ENVIRONMENT_FAILURE_DIAGNOSTIC_CHARS,
+        "catalog diagnostic exceeded its Unicode-scalar limit"
+    );
+    assert!(diagnostic.ends_with(ENVIRONMENT_FAILURE_DIAGNOSTIC_TRUNCATION_MARKER));
+    assert!(!report.environment_failures[0].remediation.is_empty());
+    let operator_summary = render_supervisor_operator_summary(&report);
+    assert!(operator_summary.contains(&format!("- environment: {summary}")));
+    assert!(!operator_summary.contains(secret));
+
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+        .expect("typed catalog failure must finalize authenticated supervisor artifacts");
+    let persisted_summary = String::from_utf8(
+        reader
+            .read(Path::new("SUMMARY.md"))
+            .expect("read authenticated operator summary"),
+    )
+    .expect("authenticated operator summary is UTF-8");
+    let persisted_environment_line = persisted_summary
+        .lines()
+        .find(|line| line.starts_with("- environment: "))
+        .expect("operator summary contains the typed environment failure");
+    assert_eq!(
+        persisted_environment_line,
+        format!("- environment: {summary}")
+    );
+    assert!(persisted_environment_line.contains("injected catalog acquisition failure"));
+    assert!(persisted_environment_line.contains("API_TOKEN <redacted:secret>"));
+    assert!(!persisted_summary.contains(secret));
+    let persisted = read_supervisor_final_report(&reader)
+        .expect("read persisted runtime catalog environment failure report");
+    assert_eq!(persisted, report);
+    assert_eq!(persisted.environment_failures[0].summary, *summary);
+}
+
+#[test]
+fn runtime_model_catalog_empty_diagnostic_normalization_is_idempotent() {
+    let run_id = RunId::new("model-catalog-empty-diagnostic").expect("valid run id");
+    let mut report = artifact_test_final_report(&run_id);
+    report.environment_failures = vec![EnvironmentFailure::runtime_model_catalog(
+        "\r\n\t".to_string(),
+    )];
+
+    enforce_supervisor_final_environment_failure_outcome(&mut report);
+    let normalized = report.environment_failures.clone();
+    enforce_supervisor_final_environment_failure_outcome(&mut report);
+
+    assert_eq!(report.environment_failures, normalized);
     assert_eq!(
         report.environment_failures[0].summary,
         "environment preflight reported runtime_model_catalog_unavailable"
     );
-    assert!(!report.environment_failures[0].remediation.is_empty());
-
-    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
-        .expect("typed catalog failure must finalize authenticated supervisor artifacts");
-    let persisted = read_supervisor_final_report(&reader)
-        .expect("read persisted runtime catalog environment failure report");
-    assert_eq!(persisted, report);
 }
 
 #[test]
@@ -2364,6 +2590,7 @@ fn supervisor_derives_review_coverage_from_assignment_and_run_report() {
 
 #[test]
 fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
+    skip_without_containment!();
     let _capability = install_named_test_models(&["model-alpha", "model-beta"]);
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
@@ -2613,6 +2840,7 @@ fn unavailable_lens_runtime_selection_is_reported_and_journaled_procedurally() {
 #[cfg(unix)]
 #[test]
 fn supervisor_input_loader_accepts_direct_regular_files_and_refuses_unsafe_inputs() {
+    skip_without_containment!();
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
 
@@ -2703,6 +2931,7 @@ fn supervisor_input_loader_accepts_direct_regular_files_and_refuses_unsafe_input
 
 #[test]
 fn provider_planning_session_lowers_recursive_tree_and_binds_run_identity() {
+    skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     git2::Repository::init(repo).expect("init repo");
@@ -2777,4 +3006,46 @@ fn provider_planning_session_lowers_recursive_tree_and_binds_run_identity() {
     assert_eq!(bound.execution_binding.run_id(), &run_id);
     assert_eq!(bound.plan.assignments.len(), 3);
     assert!(bound.document.get("assignments").is_some());
+}
+
+#[test]
+fn heuristic_feedback_replan_lowers_remaining_work_only() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    git2::Repository::init(repo).expect("init repo");
+    std::fs::create_dir_all(repo.join("src")).expect("src dir");
+    std::fs::write(repo.join("src/alpha.rs"), "pub fn alpha_task() {}\n").expect("alpha");
+    std::fs::write(repo.join("src/beta.rs"), "pub fn beta_task() {}\n").expect("beta");
+    std::fs::write(repo.join("src/gamma.rs"), "pub fn gamma_task() {}\n").expect("gamma");
+    let config = crate::planning::ProviderPlanningConfig::new("replan", "planner-model");
+    let spec = "- Update alpha_task in src/alpha.rs.\n- Update beta_task in src/beta.rs.";
+    let mut session = crate::planning::propose_task_decomposition_with_optional_provider(
+        repo, "", spec, None, &config,
+    )
+    .expect("heuristic session");
+    let feedback = crate::planning::TaskExecutionFeedback {
+        completed_assignment_ids: vec!["assignment-001".to_string()],
+        failed_assignment_ids: vec!["assignment-002".to_string()],
+        coverage_gap_fragment_ids: vec!["fragment-002".to_string()],
+        notes: vec!["execution found the implementation in src/gamma.rs".to_string()],
+    };
+
+    let plan = supervisor_plan_from_feedback_replan(repo, "", spec, &mut session, &feedback)
+        .expect("lower heuristic feedback re-plan");
+
+    assert_eq!(session.replans_used(), 1);
+    assert_eq!(plan.assignments.len(), 2);
+    assert_eq!(plan.assignments[0].id, "assignment-replan-01-001-planning");
+    assert_eq!(plan.assignments[1].id, "assignment-replan-01-001");
+    assert!(
+        plan.assignments[1]
+            .assigned_paths
+            .contains(&PathBuf::from("src/gamma.rs")),
+        "remaining work should pick up the feedback path: {:?}",
+        plan.assignments[1].assigned_paths
+    );
+    assert!(plan
+        .assignments
+        .iter()
+        .all(|assignment| assignment.id != "assignment-001"));
 }

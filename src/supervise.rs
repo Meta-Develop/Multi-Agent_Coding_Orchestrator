@@ -2,7 +2,7 @@
 use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
 pub use crate::supervise_budget::{
     BudgetAction, BudgetAmount, BudgetReason, BudgetRemaining, RoleBudgetReport, RunBudgetLimits,
-    RunBudgetReport,
+    RunBudgetReport, RunBudgetSource, RunBudgetSources,
 };
 use crate::{
     artifacts::{
@@ -29,11 +29,15 @@ use crate::{
         GateCheckSource, GateDenial, GateDenialReason, GateDenialRoute, GateRetryability,
         ResumeCheckpointDenial, VerifiedGateContext,
     },
+    hierarchy_ledger::{
+        gate_ownership_payload, insert_supervision_edge, role_transition_payload,
+        GateOwnershipRecord, SupervisionEdgeRecord,
+    },
     llm::provider::{ModelPricing, Usage},
     merge::{
-        collect_agent_result_with_evidence_and_write_lease, ApplyBlockerDetail,
-        CandidateValidationBinding, MergeCollectOptions, ValidationEvidenceBundle,
-        VALIDATION_BINDING_VERSION,
+        candidate_validation_binding, collect_agent_result_with_evidence_and_write_lease,
+        ApplyBlockerDetail, CandidateValidationBinding, MergeCollectOptions,
+        ValidationEvidenceBundle, WorktreeMergeMetadata, VALIDATION_BINDING_VERSION,
     },
     orchestration_event::{
         FieldGuideEventKind, OrchestrationEventJournal, OrchestrationEventKind, OrchestrationRole,
@@ -108,13 +112,17 @@ mod plan_api;
 pub use plan_api::*;
 mod model_policy;
 pub use model_policy::*;
+mod role_authority;
+pub use role_authority::*;
+mod role_transition;
+use role_transition::*;
 
 mod follow_up_cascade;
 use follow_up_cascade::*;
 #[cfg(test)]
 pub(crate) use follow_up_cascade::{
-    clear_generated_follow_up_queue_observer, set_before_generated_follow_up_plan_load_hook,
-    set_generated_follow_up_queue_observer,
+    clear_follow_up_cascade_test_isolation, clear_generated_follow_up_queue_observer,
+    set_before_generated_follow_up_plan_load_hook, set_generated_follow_up_queue_observer,
     set_interrupt_after_authenticated_follow_up_child_start,
     set_interrupt_after_follow_up_dispatch_started, set_interrupt_after_follow_up_enqueue,
 };
@@ -166,6 +174,9 @@ use primary_integrity::*;
 mod worktree_controls;
 use worktree_controls::*;
 
+mod instruction_profile;
+pub use instruction_profile::*;
+
 mod prompts;
 pub use prompts::*;
 
@@ -213,6 +224,7 @@ const GITLINK_MODE: u32 = 0o160000;
 const PRIMARY_INDEX_MAX_BYTES: usize = 64 * 1024 * 1024;
 const SNAPSHOT_GIT_CAPTURE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SNAPSHOT_GIT_TIMEOUT: Duration = Duration::from_secs(15);
+const SNAPSHOT_GIT_TRANSIENT_ATTEMPTS: u32 = 3;
 const MAX_SUPERVISOR_REPORT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SUPERVISOR_PROMPT_BYTES: usize = 1024 * 1024;
 const MAX_FIELD_GUIDE_ENTRIES_PER_REPORT: usize = 16;
@@ -327,6 +339,10 @@ pub struct SupervisorRunOptions {
     pub codex_bin: PathBuf,
     pub runtime: SupervisorRuntime,
     pub allow_dirty_primary: bool,
+    /// Launch-only override for a live same-repository supervise/autopilot
+    /// collision. Grants no authority to kill, interrupt, revert, or discard
+    /// another run.
+    pub allow_live_run_collision: bool,
     pub admission_overrides: SupervisorAdmissionConfig,
     pub budget_overrides: RunBudgetLimits,
     pub budget_max_duration_seconds: Option<u64>,
@@ -859,7 +875,10 @@ impl RuntimeModelCatalog {
             )
             .map(Self::Codex),
             SupervisorRuntime::Fake => Ok(Self::LocalDeterministicFake),
-            SupervisorRuntime::Grok | SupervisorRuntime::Cursor => Ok(Self::OperatorDeclared),
+            SupervisorRuntime::Grok
+            | SupervisorRuntime::Cursor
+            | SupervisorRuntime::ClaudeCode
+            | SupervisorRuntime::GeminiCli => Ok(Self::OperatorDeclared),
         }
     }
 
@@ -880,18 +899,21 @@ impl RuntimeModelCatalog {
             (Self::LocalDeterministicFake, SupervisorRuntime::Fake) => {
                 Ok(RoleModelAvailability::Unavailable)
             }
-            (Self::OperatorDeclared, SupervisorRuntime::Grok | SupervisorRuntime::Cursor) => {
+            (Self::OperatorDeclared, runtime) if runtime.is_adapter_subprocess() => {
                 Ok(RoleModelAvailability::Available)
             }
             (Self::Codex(_), SupervisorRuntime::Fake)
             | (Self::LocalDeterministicFake, SupervisorRuntime::Codex)
-            | (Self::Codex(_), SupervisorRuntime::Grok | SupervisorRuntime::Cursor)
             | (Self::OperatorDeclared, SupervisorRuntime::Codex)
-            | (Self::OperatorDeclared, SupervisorRuntime::Fake)
-            | (Self::LocalDeterministicFake, SupervisorRuntime::Grok | SupervisorRuntime::Cursor) =>
+            | (Self::OperatorDeclared, SupervisorRuntime::Fake) => {
+                bail!("runtime model catalog does not match the selected supervisor runtime")
+            }
+            (Self::Codex(_), runtime) | (Self::LocalDeterministicFake, runtime)
+                if runtime.is_adapter_subprocess() =>
             {
                 bail!("runtime model catalog does not match the selected supervisor runtime")
             }
+            _ => bail!("runtime model catalog does not match the selected supervisor runtime"),
         }
     }
 
@@ -1044,7 +1066,80 @@ pub struct SupervisorExecutionMetadata {
     /// this field and deserialize to an empty decision history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selection_decisions: Vec<SupervisorSelectionEvent>,
+    /// Per-assignment projection of selector decisions, catalog evidence, and
+    /// eligibility gaps. Older reports omit this field.
+    #[serde(default)]
+    pub assignment_selection_ledger: Vec<AssignmentSelectionLedgerEntry>,
     pub usage: SupervisorExecutionUsageReport,
+}
+
+pub const ASSIGNMENT_SELECTION_LEDGER_SCHEMA_VERSION: u32 = 1;
+pub const SELECTION_LEDGER_RELATIVE: &str = "selection/assignment-selection-ledger.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentSelectionSource {
+    Automatic,
+    PlanRoleModels,
+    OperatorOverride,
+    BudgetDegrade,
+    Retry,
+    LegacyFake,
+    LegacyNonpublishableSimulation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentCatalogSource {
+    RuntimeAdvertised,
+    OperatorDeclared,
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentRejectedCandidate {
+    pub runtime: String,
+    pub model: String,
+    pub effort: String,
+    pub reasons: Vec<AssignmentRejectionReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentRejectionReason {
+    pub code: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentSelectionLedgerEntry {
+    pub assignment_id: String,
+    pub attempt: usize,
+    pub role: AgentRole,
+    /// Auto-selected or operator-overridden authority category recorded with
+    /// the same provenance rule as #149 (why this role, not a launch tier).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_assignment: Option<RoleAssignmentRecord>,
+    pub selection_source: AssignmentSelectionSource,
+    pub selected_runtime: Option<String>,
+    pub selected_model: Option<String>,
+    pub selected_reasoning_effort: Option<String>,
+    pub catalog_source: AssignmentCatalogSource,
+    pub catalog_snapshot_digest: Option<String>,
+    #[serde(default)]
+    pub catalog_revisions: Vec<crate::selection::CatalogRevisionProvenance>,
+    #[serde(default)]
+    pub rejected_candidates: Vec<AssignmentRejectedCandidate>,
+    pub evidence_gap: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentSelectionLedger {
+    pub schema_version: u32,
+    pub entries: Vec<AssignmentSelectionLedgerEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1780,6 +1875,14 @@ impl AgentRole {
         }
     }
 
+    pub const fn authority_category(self) -> RoleCategory {
+        match self {
+            Self::Supervisor | Self::ChildOrchestrator => RoleCategory::DelegatingCoordinator,
+            Self::Worker => RoleCategory::NonDelegatingTerminalWorker,
+            Self::GateClassifier | Self::Auditor => RoleCategory::ReadOnlyReviewAuditor,
+        }
+    }
+
     const fn reasoning_effort_floor(self) -> Option<ReasoningEffort> {
         match self {
             Self::GateClassifier => Some(ReasoningEffort::High),
@@ -2504,6 +2607,12 @@ pub struct SupervisorStatusReport {
     pub lifecycle: SupervisorRunLifecycle,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_gate_denial: Option<GateDenial>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat: Option<crate::run_ops::HeartbeatRecord>,
+    #[serde(default)]
+    pub heartbeat_count: usize,
+    #[serde(default)]
+    pub operator_summary_exists: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_report: Option<SupervisorFinalReport>,
 }
@@ -2569,11 +2678,6 @@ fn run_supervisor_plan_file_with_runner(
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
 ) -> Result<SupervisorFinalReport> {
     validate_max_concurrent_children(1)?;
-    if options.runtime == SupervisorRuntime::Fake {
-        bail!(
-            "supervisor assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
-        );
-    }
     let repo = discover_repo_root(&options.repo)?;
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;

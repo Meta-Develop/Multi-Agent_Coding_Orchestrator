@@ -284,6 +284,7 @@ pub struct MachineGlobalStore {
     state_root_mount_id: u64,
     roots: BTreeMap<String, ValidatedRoot>,
     config_fingerprint: String,
+    config_identity: FileIdentity,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -324,6 +325,7 @@ impl MachineGlobalStore {
     pub fn open_config(path: impl AsRef<Path>) -> Result<Self> {
         let config_path = require_exact_canonical_regular_file(path.as_ref())
             .context("machine-global config path is not exact and canonical")?;
+        let config_identity = identity_for_path(&config_path)?;
         let bytes = BoundedRegularReader::read_tree_no_follow_validated(
             &config_path,
             CONFIG_MAX_BYTES,
@@ -335,6 +337,9 @@ impl MachineGlobalStore {
                 config_path.display()
             )
         })?;
+        if identity_for_path(&config_path)? != config_identity {
+            bail!("machine-global config identity changed while opening the store");
+        }
         let config: MachineGlobalConfig =
             serde_json::from_slice(&bytes).context("machine-global config is invalid JSON")?;
         if config.version != CONFIG_VERSION {
@@ -439,6 +444,7 @@ impl MachineGlobalStore {
             state_root_mount_id,
             roots,
             config_fingerprint,
+            config_identity,
         })
     }
 
@@ -476,6 +482,50 @@ impl MachineGlobalStore {
         self.validate_coordinate(&coordinate, true)?;
         root.safe.verify_linux_mount_id(root.mount_id)?;
         Ok(coordinate)
+    }
+
+    pub(crate) fn reserve_random_direct_child_directory(
+        &self,
+        root_id: &str,
+        prefix: &OsStr,
+    ) -> Result<crate::safe_state::ReservedDirectory> {
+        let root = self
+            .roots
+            .get(root_id)
+            .with_context(|| format!("undeclared machine-global root {root_id}"))?;
+        root.safe.verify_linux_mount_id(root.mount_id)?;
+        let reserved = root.safe.reserve_random_direct_child_directory(prefix)?;
+        reserved.verify(&root.safe)?;
+        root.safe.verify_linux_mount_id(root.mount_id)?;
+        Ok(reserved)
+    }
+
+    pub(crate) fn revalidate_root(&self, root_id: &str) -> Result<()> {
+        let root = self
+            .roots
+            .get(root_id)
+            .with_context(|| format!("undeclared machine-global root {root_id}"))?;
+        root.safe.verify_linux_mount_id(root.mount_id)
+    }
+
+    pub(crate) fn matches_config_binding(&self, other: &Self) -> bool {
+        self.config_identity == other.config_identity
+            && self.config_fingerprint == other.config_fingerprint
+    }
+
+    pub(crate) fn remove_empty_reserved_direct_child_directory(
+        &self,
+        root_id: &str,
+        reserved: crate::safe_state::ReservedDirectory,
+    ) -> Result<()> {
+        let root = self
+            .roots
+            .get(root_id)
+            .with_context(|| format!("undeclared machine-global root {root_id}"))?;
+        root.safe.verify_linux_mount_id(root.mount_id)?;
+        root.safe
+            .remove_empty_reserved_direct_child_directory(reserved)?;
+        root.safe.verify_linux_mount_id(root.mount_id)
     }
 
     /// Acquires all declared targets atomically against the shared cross-repository state.

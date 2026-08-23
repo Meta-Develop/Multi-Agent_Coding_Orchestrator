@@ -233,6 +233,59 @@ fn supervise_status_distinguishes_absent_active_finalized_and_corrupt_runs() {
     );
 }
 
+#[test]
+fn supervise_status_exposes_heartbeat_and_preflight_sidecars() {
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("artifact-status-heartbeat").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "supervise-test",
+    )
+    .expect("reserve run");
+    let index = crate::run_ops::persist_launch_preflight(
+        &mut writer,
+        &repo_path,
+        &crate::run_ops::LaunchPreflightSpec {
+            family: RunArtifactFamily::Supervise,
+            run_id: run_id.clone(),
+            runtime: "fake".to_string(),
+            runtime_bin: Some(PathBuf::from("fake")),
+            allow_dirty_primary: true,
+            allow_live_run_collision: false,
+        },
+        &crate::run_ops::inspect_supervisor_process_collisions(&repo_path)
+            .expect("inspect collisions"),
+    )
+    .expect("persist preflight");
+    assert!(index
+        .captures
+        .iter()
+        .any(|capture| capture.name == "git_status"));
+    crate::run_ops::append_run_heartbeat(&mut writer, "initialized", None, "ok", None)
+        .expect("heartbeat");
+    crate::run_ops::write_operator_summary(
+        &mut writer,
+        "# Supervise run artifact-status-heartbeat\n\nNext: collect\n",
+    )
+    .expect("summary");
+    let status = supervisor_status(&repo_path, run_id).expect("status");
+    assert_eq!(status.heartbeat_count, 1);
+    assert_eq!(
+        status
+            .last_heartbeat
+            .as_ref()
+            .map(|record| record.phase.as_str()),
+        Some("initialized")
+    );
+    assert!(status.operator_summary_exists);
+    assert!(writer
+        .run_dir()
+        .join(crate::run_ops::PREFLIGHT_INDEX_RELATIVE)
+        .is_file());
+}
+
 fn interrupted_final_report_checkpoint(
     repo: &Path,
     run_id: &RunId,
@@ -350,6 +403,7 @@ fn interrupted_final_report_checkpoint(
 
 #[test]
 fn authenticated_resume_finalizes_without_reexecuting_completed_work_and_preserves_budget() {
+    skip_without_containment!();
     let (_temp, repo) = injected_repository();
     let run_id = RunId::new("authenticated-resume-valid").expect("valid resume run id");
     let (budget, side_effect, retained_claim) = interrupted_final_report_checkpoint(&repo, &run_id);
@@ -483,6 +537,7 @@ fn resume_refuses_scheduler_closed_budget_that_differs_only_in_elapsed_seconds()
 
 #[test]
 fn scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch() {
+    skip_without_containment!();
     let (temp, repo) = injected_repository();
     let assignment = injected_assignment(false);
     let plan = injected_plan(assignment, 0);
@@ -539,6 +594,7 @@ fn scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch() 
 
 #[test]
 fn narrowed_assignment_crash_after_final_report_plan_resumes_against_actual_claim_scope() {
+    skip_without_containment!();
     let (temp, repo) = injected_repository();
     fs::write(repo.join("FREE.md"), "free\n").expect("write unclaimed path");
     commit_injected_repository(&repo, "add unclaimed path");
@@ -1140,6 +1196,7 @@ fn authenticated_child_dispatch_evidence_rejects_pending_assignment_without_star
 #[cfg(target_os = "linux")]
 #[test]
 fn verified_run_entry_creates_and_materializes_assignment_worktree() {
+    skip_without_containment!();
     use std::os::unix::fs::PermissionsExt;
 
     let (temp, repo_path) = injected_repository();
@@ -1181,6 +1238,7 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
         owner: "maco-supervise".to_string(),
         correction_correlation_id: options.run_id.as_str().to_string(),
     });
+    let run_id = options.run_id.clone();
     fs::write(
         &options.plan_file,
         serde_json::to_vec(&plan).expect("serialize verified supervisor plan"),
@@ -1190,6 +1248,16 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
     let mut launched = false;
     let mut runner = |command: &ExternalAgentCommand| {
         launched = true;
+        assert!(
+            command.output_schema.is_none(),
+            "external Codex child and auditor launches must rely on authoritative local report validation"
+        );
+        if command.workspace_access == WorkspaceAccess::ReadWrite {
+            assert!(
+                !command.hidden_roots.iter().any(|root| root == &repo_path),
+                "the linked worktree's owning primary/common checkout must remain visible read-only"
+            );
+        }
         assert_ne!(command.cwd, repo_path);
         assert_eq!(
             fs::read_to_string(command.cwd.join("README.md"))
@@ -1209,6 +1277,72 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
     assert!(launched, "runner was not launched; report: {report:#?}");
     assert!(report.success, "unexpected failed report: {report:#?}");
     assert_eq!(report.orchestrator_reports.len(), 1);
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+        .expect("open finalized verified-run artifacts");
+    let admission_path = "assignments/child-a.attempt-1.worktree-writable-admission.json";
+    let admission: crate::external_agent::WorktreeWritableAdmission = serde_json::from_slice(
+        &reader
+            .read(admission_path)
+            .expect("read persisted worktree writable admission"),
+    )
+    .expect("deserialize typed worktree writable admission");
+    assert_eq!(
+        admission.version,
+        crate::external_agent::WORKTREE_WRITABLE_ADMISSION_SCHEMA_VERSION
+    );
+    assert_eq!(admission.assignment_id, "child-a");
+    assert_eq!(admission.attempt, 1);
+    assert_eq!(
+        admission.target,
+        crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree
+    );
+    assert_eq!(
+        admission.worktree.kind,
+        crate::external_agent::ManagedWorktreeAdmissionKind::ManagedDisposable
+    );
+    assert_eq!(admission.worktree.worktree_id, "child-a");
+    assert_eq!(
+        admission.claims.state,
+        crate::external_agent::HeldPathClaimsAdmissionState::Held
+    );
+    assert_eq!(admission.claims.paths, vec![PathBuf::from("README.md")]);
+    assert_eq!(admission.native_sandbox.runtime, SupervisorRuntime::Codex);
+    assert_eq!(
+        admission.native_sandbox.workspace_access,
+        WorkspaceAccess::ReadWrite
+    );
+    assert_eq!(
+        admission.native_sandbox.side_effect_confinement,
+        crate::runtime_adapter::SideEffectConfinement::Verified
+    );
+    let schema_path = "schemas/child-a.attempt-1.worktree-writable-admission.schema.json";
+    let schema: serde_json::Value = serde_json::from_slice(
+        &reader
+            .read(schema_path)
+            .expect("read persisted worktree writable admission schema"),
+    )
+    .expect("deserialize worktree writable admission schema");
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["properties"]["version"]["const"], 1);
+    assert_eq!(
+        schema["properties"]["target"]["const"],
+        "managed_child_worktree"
+    );
+    assert_eq!(
+        schema["properties"]["native_sandbox"]["properties"]["side_effect_confinement"]["const"],
+        "verified"
+    );
+    for relative in [admission_path, schema_path] {
+        assert!(
+            reader
+                .finalization()
+                .files
+                .iter()
+                .any(|file| file.path == Path::new(relative)
+                    && file.disposition == ArtifactFileDisposition::PrivateEvidence),
+            "typed admission artifact must be finalized as private evidence: {relative}"
+        );
+    }
     let records = WorktreeManager::new(&repo_path)
         .list_managed_verified()
         .expect("list verified assignment worktree");
@@ -1233,6 +1367,7 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
 #[cfg(target_os = "linux")]
 #[test]
 fn verified_run_entry_refuses_dirty_repository_before_assignment_creation() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let plan = injected_plan(injected_assignment(false), 0);
     let mut options =
@@ -1260,6 +1395,68 @@ fn verified_run_entry_refuses_dirty_repository_before_assignment_creation() {
         .expect("reopen dirty primary")
         .find_branch("maco/child-a", git2::BranchType::Local)
         .is_err());
+}
+
+#[test]
+fn writable_fake_runtime_assignment_creation_is_reachable_without_network() {
+    // Stay on Fake + NonpublishableSimulation/TestOnly. The verified
+    // plan-file helper acquires Bound cleanliness and fails closed on hosts
+    // without a delegated systemd user manager; that is not a Fake-runtime
+    // capability refusal. Candidate binding for this path uses git2 so it
+    // stays reachable without isolated git.
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let plan = injected_plan(assignment.clone(), 0);
+    let mut options = injected_options(&repo_path, temp.path(), "fake-writable-assignment-create");
+    options.runtime = SupervisorRuntime::Fake;
+    options.allow_dirty_primary = false;
+
+    let mut runner = |_command: &ExternalAgentCommand| -> ExternalAgentRun {
+        panic!("fake runtime must not invoke an external runner or a network provider")
+    };
+
+    let report = match run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut runner,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            let message = format!("{error:#}");
+            if is_named_writable_capability_refusal(&message) {
+                eprintln!("skipping writable fake assignment creation: {message}");
+                return;
+            }
+            panic!("fake writable assignment creation must be reachable: {message}");
+        }
+    };
+
+    assert!(report.success, "unexpected failed report: {report:#?}");
+    assert!(!report.publishable);
+    assert_eq!(report.runtime, SupervisorRuntime::Fake);
+    assert!(report
+        .orchestrator_reports
+        .iter()
+        .any(|child| child.accepted));
+    let records = WorktreeManager::new(&repo_path)
+        .list_managed_verified()
+        .expect("list fake assignment worktree");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].name, "child-a");
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md")).expect("read primary"),
+        "baseline\n"
+    );
+    assert_eq!(
+        fs::read_to_string(records[0].path.join("README.md")).expect("read child worktree"),
+        "baseline\n"
+    );
+    let lease = WorktreeManager::new(&repo_path)
+        .acquire_write_execution_lease("child-a")
+        .expect("writable fake child must expose a write lease after the run");
+    assert_eq!(lease.record().path, records[0].path);
 }
 
 #[test]
@@ -1299,6 +1496,7 @@ fn dirty_primary_refusal_is_written_and_finalized_without_launching_a_child() {
 
 #[test]
 fn fake_supervise_run_finalizes_manifested_report_tree_events() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let seed_finding = "filesystem observation for prompt evidence";
     let seed_context = "focused validation passed";
@@ -1403,7 +1601,39 @@ fn fake_supervise_run_finalizes_manifested_report_tree_events() {
             && event.role == OrchestrationRole::Orchestrator
             && event.kind == OrchestrationEventKind::Spawn
             && event.payload["attempt"] == 1
+            && event.payload[SUPERVISION_EDGE_FIELD]["child_agent_id"] == assignment.id
+            && event.payload[SUPERVISION_EDGE_FIELD]["parent_agent_id"] == run_id.as_str()
+            && event.payload[SUPERVISION_EDGE_FIELD]["role_category"] == "delegating_coordinator"
+            && event.payload[SUPERVISION_EDGE_FIELD]["legacy_role"] == "child_orchestrator"
+            && event.payload[SUPERVISION_EDGE_FIELD]["scope_ref"]
+                == format!("assignment:{}", assignment.id)
+            && event.payload[ROLE_ASSIGNMENT_FIELD]["agent_id"] == assignment.id
+            && event.payload[ROLE_ASSIGNMENT_FIELD]["category"] == "delegating_coordinator"
+            && event.payload[ROLE_ASSIGNMENT_FIELD]["legacy_role"] == "child_orchestrator"
+            && event.payload[ROLE_ASSIGNMENT_FIELD]["source"] == "derived_from_plan_role"
     }));
+    assert!(events.iter().any(|event| {
+        event.kind == OrchestrationEventKind::Gate
+            && event.payload[GATE_OWNERSHIP_FIELD]["action"] == "assign"
+            && event.payload[GATE_OWNERSHIP_FIELD]["task_id"] == assignment.id
+            && event.payload[GATE_OWNERSHIP_FIELD]["owner_agent_id"] == run_id.as_str()
+            && event.payload[GATE_OWNERSHIP_FIELD]["reason"] == "initial_parent_gate"
+    }));
+    let hierarchy = reconstruct_hierarchy_ledger(&events).expect("reconstruct hierarchy ledger");
+    assert_eq!(
+        hierarchy
+            .edges
+            .get(&assignment.id)
+            .map(|edge| edge.parent_agent_id.as_str()),
+        Some(run_id.as_str())
+    );
+    assert_eq!(
+        hierarchy
+            .gate_owners
+            .get(&assignment.id)
+            .map(|owner| owner.owner_agent_id.as_str()),
+        Some(run_id.as_str())
+    );
     let injection_events = events
         .iter()
         .filter(|event| {
@@ -2041,6 +2271,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         codex_bin: PathBuf::from("unused-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -2351,6 +2582,7 @@ fn parent_auditor_coverage_rejects_only_non_repo_evidence_paths() {
 
 #[test]
 fn injected_runner_retries_structural_report_once_then_runs_parent_auditor() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let plan = injected_plan(assignment.clone(), 1);
@@ -2474,4 +2706,10 @@ fn injected_runner_retries_structural_report_once_then_runs_parent_auditor() {
             && event.payload["scope"] == "attempt"
             && event.payload["attempt"] == 1
     }));
+}
+
+fn is_named_writable_capability_refusal(message: &str) -> bool {
+    message.contains("failed closed before launch")
+        && (message.contains("blocking_pre_action_callback != All")
+            || message.contains("writable_workspace != supported"))
 }

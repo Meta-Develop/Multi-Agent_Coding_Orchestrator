@@ -395,6 +395,7 @@ pub(super) fn run_generated_follow_up_cascade(
             codex_bin: supervisor_template.codex_bin.clone(),
             runtime: supervisor_template.runtime,
             allow_dirty_primary: supervisor_template.allow_dirty_primary,
+            allow_live_run_collision: supervisor_template.allow_live_run_collision,
             admission_overrides: supervisor_template.admission_overrides,
             budget_overrides: supervisor_template.budget_overrides,
             budget_max_duration_seconds: supervisor_template.budget_max_duration_seconds,
@@ -1250,6 +1251,15 @@ pub(crate) fn set_generated_follow_up_queue_observer(
 #[cfg(test)]
 pub(crate) fn clear_generated_follow_up_queue_observer() {
     GENERATED_FOLLOW_UP_QUEUE_OBSERVER.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_follow_up_cascade_test_isolation() {
+    BEFORE_GENERATED_FOLLOW_UP_PLAN_LOAD_HOOK.with(|slot| *slot.borrow_mut() = None);
+    INTERRUPT_AFTER_FOLLOW_UP_ENQUEUE.with(|slot| slot.set(false));
+    INTERRUPT_AFTER_FOLLOW_UP_DISPATCH_STARTED.with(|slot| slot.set(false));
+    INTERRUPT_AFTER_AUTHENTICATED_FOLLOW_UP_CHILD_START.with(|slot| slot.set(false));
+    clear_generated_follow_up_queue_observer();
 }
 
 #[cfg(test)]

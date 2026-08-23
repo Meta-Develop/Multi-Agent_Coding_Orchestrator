@@ -15,7 +15,10 @@ fn selected_runtime_program(
         SupervisorRuntime::Codex if options.runtime == SupervisorRuntime::Codex => {
             options.codex_bin.clone()
         }
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor => {
+        SupervisorRuntime::Grok
+        | SupervisorRuntime::Cursor
+        | SupervisorRuntime::ClaudeCode
+        | SupervisorRuntime::GeminiCli => {
             crate::runtime_adapter::RuntimeAdapterConfig::from_environment(launch_runtime)
                 .binary
                 .filter(|path| !path.as_os_str().is_empty())
@@ -27,6 +30,118 @@ fn selected_runtime_program(
     }
 }
 
+fn bind_runtime_output_schema(
+    mut command: ExternalAgentCommand,
+    runtime: SupervisorRuntime,
+    schema_path: &Path,
+) -> ExternalAgentCommand {
+    // The authoritative local parser/schema gate accepts the full draft-2020-12
+    // report contract. Current external providers, including Codex, reject that
+    // conditional schema at their CLI output-schema boundary. Do not send a
+    // weaker provider schema; omit the provider hint and keep local validation
+    // authoritative. Fake may retain the local binding for deterministic tests.
+    command.output_schema = (runtime == SupervisorRuntime::Fake).then(|| schema_path.to_path_buf());
+    command
+}
+
+fn bind_runtime_read_only_schema_files(
+    mut command: ExternalAgentCommand,
+    runtime: SupervisorRuntime,
+    schema_paths: &[&Path],
+) -> ExternalAgentCommand {
+    if runtime != SupervisorRuntime::Fake {
+        for schema_path in schema_paths {
+            command = command.with_read_only_input_file((*schema_path).to_path_buf());
+        }
+    }
+    command
+}
+
+fn requires_hosted_pre_action_review(command: &ExternalAgentCommand) -> bool {
+    command.workspace_access == WorkspaceAccess::ReadOnly
+        || command.writable_launch_target
+            == crate::runtime_adapter::WritableLaunchTarget::PrimaryWorktree
+}
+
+#[allow(clippy::too_many_arguments)]
+fn worktree_writable_admission_record(
+    assignment_id: &str,
+    assigned_paths: &[PathBuf],
+    attempt: usize,
+    worktree: &WorktreeRecord,
+    claim: &PathClaim,
+    authenticated_claims: &[PathClaim],
+    command: &ExternalAgentCommand,
+    runtime: SupervisorRuntime,
+) -> Result<Option<crate::external_agent::WorktreeWritableAdmission>> {
+    if command.workspace_access == WorkspaceAccess::ReadOnly
+        || command.writable_launch_target
+            == crate::runtime_adapter::WritableLaunchTarget::PrimaryWorktree
+    {
+        return Ok(None);
+    }
+    if command.writable_launch_target
+        != crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree
+    {
+        bail!("writable child launch has an unsupported workspace target");
+    }
+    if worktree.name != assignment_id || command.cwd != worktree.path {
+        bail!(
+            "writable child launch is not bound to assignment '{}' managed worktree",
+            assignment_id
+        );
+    }
+    if claim.agent_id != assignment_id || claim.paths != assigned_paths {
+        bail!(
+            "writable child launch claim does not exactly bind assignment '{}' paths",
+            assignment_id
+        );
+    }
+    if !authenticated_claims.iter().any(|held| held == claim) {
+        bail!(
+            "writable child launch claim for assignment '{}' is not held in authenticated state",
+            assignment_id
+        );
+    }
+    let capabilities = runtime.capabilities();
+    if let Some(reason) = capabilities.writable_launch_refusal(command.writable_launch_target) {
+        bail!(
+            "writable child launch for assignment '{}' lacks verified native sandbox admission: {}",
+            assignment_id,
+            reason
+        );
+    }
+    if capabilities.side_effect_confinement
+        != crate::runtime_adapter::SideEffectConfinement::Verified
+    {
+        bail!(
+            "writable child launch for assignment '{}' lacks verified side-effect confinement",
+            assignment_id
+        );
+    }
+
+    Ok(Some(crate::external_agent::WorktreeWritableAdmission {
+        version: crate::external_agent::WORKTREE_WRITABLE_ADMISSION_SCHEMA_VERSION,
+        assignment_id: assignment_id.to_string(),
+        attempt,
+        target: command.writable_launch_target,
+        worktree: crate::external_agent::ManagedWorktreeAdmission {
+            kind: crate::external_agent::ManagedWorktreeAdmissionKind::ManagedDisposable,
+            worktree_id: worktree.name.clone(),
+        },
+        claims: crate::external_agent::HeldPathClaimsAdmission {
+            state: crate::external_agent::HeldPathClaimsAdmissionState::Held,
+            token: claim.token.get(),
+            paths: claim.paths.clone(),
+        },
+        native_sandbox: crate::external_agent::NativeSandboxAdmission {
+            runtime,
+            workspace_access: command.workspace_access,
+            side_effect_confinement: capabilities.side_effect_confinement,
+        },
+    }))
+}
+
 fn bind_selected_runtime_launch(
     mut command: ExternalAgentCommand,
     assignment: &OrchestratorAssignment,
@@ -35,17 +150,14 @@ fn bind_selected_runtime_launch(
     launch_runtime: SupervisorRuntime,
     catalog: &RuntimeModelCatalog,
 ) -> Result<ExternalAgentCommand> {
-    if matches!(
-        launch_runtime,
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor
-    ) {
-        if assignment.role != AgentRole::Worker {
-            bail!(
+    if launch_runtime.is_adapter_subprocess() {
+        authorize_bounded_leaf_runtime_role(assignment.role).with_context(|| {
+            format!(
                 "selected runtime '{}' cannot launch judgment or delegating role '{}'",
                 crate::runtime_adapter::AdapterId::from_runtime(launch_runtime),
                 assignment.role.as_str()
-            );
-        }
+            )
+        })?;
         command.program = selected_runtime_program(launch_runtime, options);
         command = command.with_runtime_adapter(
             launch_runtime,
@@ -76,10 +188,7 @@ pub(super) fn prerender_selected_runtime_adapter_command(
     command: &ExternalAgentCommand,
     launch_runtime: SupervisorRuntime,
 ) -> Result<()> {
-    if !matches!(
-        launch_runtime,
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor
-    ) {
+    if !launch_runtime.is_adapter_subprocess() {
         return Ok(());
     }
     let config = command.runtime_adapter.as_ref().with_context(|| {
@@ -689,6 +798,7 @@ struct PreparedChildAttempt<'a> {
     incoming_output_root: SecureOutputRoot,
     capture_output_root: SecureOutputRoot,
     budget_reservation: DispatchBudgetReservation<'a>,
+    pre_action_review_context: Option<ReviewContext>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -718,6 +828,7 @@ fn prepare_child_attempt<'a>(
         run_dir,
         dirs,
         execution_runtime,
+        execution_target,
         field_guide,
         artifacts,
         budget_ledger,
@@ -874,13 +985,22 @@ fn prepare_child_attempt<'a>(
         launch_runtime,
         runtime_model_catalog,
     )?;
-    command.output_schema = Some(schema_path.to_path_buf());
-    command = command.with_hidden_root(repo).with_agent_lifecycle(
+    command = bind_runtime_output_schema(command, launch_runtime, schema_path);
+    command = bind_runtime_read_only_schema_files(
+        command,
+        launch_runtime,
+        &[schema_path, worker_schema_path, auditor_schema_path],
+    );
+    // Agent lifecycle records and binds repository metadata. Child-visible Git paths are
+    // derived separately from `command.cwd` as an exact linked-worktree allowlist; the
+    // owning primary/common checkout is not made visible.
+    command = command.with_agent_lifecycle(
         repo,
         assignment.role.as_str(),
         options.run_id.as_str(),
         &assignment.id,
     );
+    command = command.with_agent_parent(journal_parent_id);
     command = bind_supervisor_machine_global_staging_cleanup(command, options)?;
     command =
         apply_canonical_environment_requirements(command, &preflight.environment_requirements);
@@ -889,6 +1009,12 @@ fn prepare_child_attempt<'a>(
     } else {
         configure_writable_child_command(command, &assignment.assigned_paths)?
     };
+    command = command.with_writable_launch_target(match execution_target {
+        Some(SupervisorExecutionTarget::PrimaryWorktree { .. }) => {
+            crate::runtime_adapter::WritableLaunchTarget::PrimaryWorktree
+        }
+        None => crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree,
+    });
 
     let primary_before = primary_worktree_snapshot(repo, *execution_runtime)?;
     if let Some(error) = primary_before.inspection_problem() {
@@ -970,6 +1096,62 @@ fn prepare_child_attempt<'a>(
             return Ok(AssignmentExecutionDisposition::Complete);
         }
     };
+    let pre_action_review_context = if options.runtime == SupervisorRuntime::Codex {
+        match pre_action_review_context(options, assignment, &worktree.path) {
+            Ok(review_context) => Some(review_context),
+            Err(error) => {
+                drop(incoming_output_root);
+                drop(capture_output_root);
+                with_supervisor_artifacts(artifacts, |writer, _| {
+                    discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+                })?;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    if *execution_runtime == SupervisorExecutionRuntime::Verified {
+        let authenticated_claims = context
+            .sync_store
+            .snapshot()
+            .context("failed to revalidate authenticated claims before writable launch")?;
+        if let Some(admission) = worktree_writable_admission_record(
+            &assignment.id,
+            &assignment.assigned_paths,
+            attempt,
+            worktree,
+            &preflight.claim,
+            &authenticated_claims,
+            &command,
+            launch_runtime,
+        )? {
+            let relative = PathBuf::from("assignments").join(format!(
+                "{}.attempt-{attempt}.worktree-writable-admission.json",
+                assignment.id
+            ));
+            let schema_relative = PathBuf::from("schemas").join(format!(
+                "{}.attempt-{attempt}.worktree-writable-admission.schema.json",
+                assignment.id
+            ));
+            with_supervisor_artifacts(artifacts, |writer, _| {
+                write_worktree_writable_admission_schema(writer, &schema_relative)?;
+                write_artifact_json(
+                    writer,
+                    &relative,
+                    &admission,
+                    MAX_SUPERVISOR_REPORT_BYTES,
+                    ArtifactFileDisposition::PrivateEvidence,
+                )
+            })
+            .with_context(|| {
+                format!(
+                    "failed to persist worktree writable admission for assignment '{}' attempt {}",
+                    assignment.id, attempt
+                )
+            })?;
+        }
+    }
     if let Some(signal) = &context.admission_commit {
         signal.notify();
     }
@@ -985,6 +1167,7 @@ fn prepare_child_attempt<'a>(
             incoming_output_root,
             capture_output_root,
             budget_reservation,
+            pre_action_review_context,
         },
     ))
 }
@@ -1042,6 +1225,7 @@ fn dispatch_and_collect_child_attempt<'a>(
     let incoming_output_root = prepared.incoming_output_root;
     let capture_output_root = prepared.capture_output_root;
     let mut budget_reservation = prepared.budget_reservation;
+    let pre_action_review_context = prepared.pre_action_review_context;
 
     record_shared_orchestration_event(
         artifacts,
@@ -1049,11 +1233,39 @@ fn dispatch_and_collect_child_attempt<'a>(
         Some(journal_parent_id),
         OrchestrationRole::Orchestrator,
         OrchestrationEventKind::Spawn,
-        json!({
-            "attempt": attempt,
-            "corrective_retry": corrective_retry_used,
-        }),
+        record_supervision_spawn_payload(
+            &assignment.id,
+            journal_parent_id,
+            OrchestrationRole::Orchestrator,
+            assignment.role,
+            write_boundary_refs(&assignment.assigned_paths),
+            &assignment_scope_ref(&assignment.id),
+            json!({
+                "attempt": attempt,
+                "corrective_retry": corrective_retry_used,
+            }),
+        )?,
     )?;
+    if attempt == 1 {
+        let (owner_role, owner_legacy_role) = if journal_parent_id == options.run_id.as_str() {
+            (OrchestrationRole::Supervisor, "supervisor")
+        } else {
+            (OrchestrationRole::Orchestrator, "child_orchestrator")
+        };
+        record_shared_gate_ownership(
+            artifacts,
+            journal_parent_id,
+            None,
+            owner_role,
+            GateOwnershipRecord::assign(
+                &assignment.id,
+                journal_parent_id,
+                owner_role,
+                owner_legacy_role,
+                "initial_parent_gate",
+            )?,
+        )?;
+    }
     record_shared_orchestration_event(
         artifacts,
         &assignment.id,
@@ -1065,26 +1277,10 @@ fn dispatch_and_collect_child_attempt<'a>(
 
     let external_run_result = match options.runtime {
         SupervisorRuntime::Codex => {
-            let review_context =
-                match pre_action_review_context(options, assignment, &worktree.path) {
-                    Ok(review_context) => review_context,
-                    Err(error) => {
-                        drop(incoming_output_root);
-                        drop(capture_output_root);
-                        with_supervisor_artifacts(artifacts, |writer, _| {
-                            discard_invocation_scratches(
-                                writer,
-                                &incoming_scratch,
-                                &capture_scratch,
-                            )
-                        })?;
-                        return Err(error);
-                    }
-                };
-            let mut review_journal = SupervisorPreActionJournalSink {
-                artifacts,
-                node: &assignment.id,
-                parent: Some(journal_parent_id),
+            let review_context = if requires_hosted_pre_action_review(&command) {
+                pre_action_review_context.as_ref()
+            } else {
+                None
             };
             // All fallible pre-dispatch preparation is complete. Mark
             // invocation only at the external-runner call boundary.
@@ -1098,14 +1294,23 @@ fn dispatch_and_collect_child_attempt<'a>(
             }
             record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                external_runner(
-                    &command,
-                    cancellation,
-                    Some(ExternalPreActionReviewRuntime {
-                        context: &review_context,
-                        journal: &mut review_journal,
-                    }),
-                )
+                if let Some(review_context) = review_context.as_ref() {
+                    let mut review_journal = SupervisorPreActionJournalSink {
+                        artifacts,
+                        node: &assignment.id,
+                        parent: Some(journal_parent_id),
+                    };
+                    external_runner(
+                        &command,
+                        cancellation,
+                        Some(ExternalPreActionReviewRuntime {
+                            context: review_context,
+                            journal: &mut review_journal,
+                        }),
+                    )
+                } else {
+                    external_runner(&command, cancellation, None)
+                }
             })) {
                 Ok(run) => Ok(run),
                 Err(payload) => {
@@ -1118,7 +1323,10 @@ fn dispatch_and_collect_child_attempt<'a>(
                 }
             }
         }
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor => {
+        SupervisorRuntime::Grok
+        | SupervisorRuntime::Cursor
+        | SupervisorRuntime::ClaudeCode
+        | SupervisorRuntime::GeminiCli => {
             if let Err(error) = budget_reservation.mark_invoked() {
                 drop(incoming_output_root);
                 drop(capture_output_root);
@@ -1920,6 +2128,9 @@ fn prepare_parent_auditor<'a>(
     })?;
 
     let scope_workspace = create_review_lens_scope_workspace()?;
+    let auditor_schema_input = scope_workspace.path().join("auditor-report.schema.json");
+    fs::copy(&auditor_schema_path, &auditor_schema_input)
+        .context("failed to materialize the isolated auditor schema input")?;
     let mut auditor_command = ExternalAgentCommand::codex(
         &options.codex_bin,
         scope_workspace.path(),
@@ -1928,10 +2139,7 @@ fn prepare_parent_auditor<'a>(
         &auditor_report_path,
         Duration::from_secs(plan.child_timeout_seconds),
     );
-    if matches!(
-        options.runtime,
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor
-    ) {
+    if options.runtime.is_adapter_subprocess() {
         auditor_command = auditor_command.with_runtime_adapter(
             options.runtime,
             crate::runtime_adapter::RuntimeAdapterConfig::from_environment(options.runtime),
@@ -1944,7 +2152,13 @@ fn prepare_parent_auditor<'a>(
         options.runtime,
         runtime_model_catalog,
     )?;
-    auditor_command.output_schema = Some(auditor_schema_path);
+    auditor_command =
+        bind_runtime_output_schema(auditor_command, options.runtime, &auditor_schema_path);
+    auditor_command = bind_runtime_read_only_schema_files(
+        auditor_command,
+        options.runtime,
+        &[&auditor_schema_input],
+    );
     auditor_command =
         configure_review_lens_execution_boundary(auditor_command, repo, &worktree.path)?
             .with_agent_lifecycle(
@@ -1952,7 +2166,8 @@ fn prepare_parent_auditor<'a>(
                 AgentRole::Auditor.as_str(),
                 options.run_id.as_str(),
                 &auditor_id,
-            );
+            )
+            .with_agent_parent(&assignment.id);
     auditor_command = bind_supervisor_machine_global_staging_cleanup(auditor_command, options)?;
     auditor_command = apply_canonical_environment_requirements(
         auditor_command,
@@ -2140,15 +2355,23 @@ fn dispatch_and_collect_parent_auditor(
         Some(&assignment.id),
         OrchestrationRole::Auditor,
         OrchestrationEventKind::Spawn,
-        json!({
-            "attempt": auditor_attempt,
-            "review_lens_id": lens.id,
-            "backend_id": lens.backend.backend_id(),
-            "model": lens.backend.model(),
-            "reasoning_effort": lens.backend.reasoning_effort(),
-            "information_scope": lens.information_scope,
-            "request_binding": expected_request.request_binding,
-        }),
+        record_supervision_spawn_payload(
+            &auditor_id,
+            &assignment.id,
+            OrchestrationRole::Auditor,
+            AgentRole::Auditor,
+            Vec::new(),
+            &assignment_scope_ref(&assignment.id),
+            json!({
+                "attempt": auditor_attempt,
+                "review_lens_id": lens.id,
+                "backend_id": lens.backend.backend_id(),
+                "model": lens.backend.model(),
+                "reasoning_effort": lens.backend.reasoning_effort(),
+                "information_scope": lens.information_scope,
+                "request_binding": expected_request.request_binding,
+            }),
+        )?,
     )?;
     record_shared_orchestration_event(
         artifacts,
@@ -2194,7 +2417,10 @@ fn dispatch_and_collect_parent_auditor(
                 }
             }
         }
-        SupervisorRuntime::Grok | SupervisorRuntime::Cursor => {
+        SupervisorRuntime::Grok
+        | SupervisorRuntime::Cursor
+        | SupervisorRuntime::ClaudeCode
+        | SupervisorRuntime::GeminiCli => {
             if let Err(error) = auditor_budget_reservation.mark_invoked() {
                 drop(auditor_incoming_root);
                 drop(auditor_capture_root);
@@ -2434,6 +2660,14 @@ fn inspect_assignment_candidate(
         .worktree_write_lease
         .as_ref()
         .context("managed child candidate inspection has no write lease")?;
+    // Fake + NonpublishableSimulation never launches a child and must not depend
+    // on isolated git / delegated systemd. Production Verified collect stays on
+    // the writable fail-closed snapshot path.
+    if context.options.runtime == SupervisorRuntime::Fake
+        && context.execution_runtime == SupervisorExecutionRuntime::NonpublishableSimulation
+    {
+        return inspect_fake_simulation_candidate(context.repo, &preflight.assignment, lease);
+    }
     inspect_supervisor_candidate(context.repo, &preflight.assignment, lease)
 }
 
@@ -2684,9 +2918,38 @@ fn publish_assignment_report(
 ) -> Result<()> {
     let assignment = &preflight.assignment;
     outcome.candidate_inspection = completed_candidate_inspection;
+    let subject_selection = effective_role_model_selection(context.plan, assignment.role);
+    let auditor_selection = effective_role_model_selection(context.plan, AgentRole::Auditor);
+    let subject_capability = model_capability_or_weak(subject_selection.model.as_deref());
+    let auditor_capability = model_capability_or_weak(
+        context
+            .plan
+            .review_lenses
+            .first()
+            .map(|lens| lens.backend.model())
+            .or(auditor_selection.model.as_deref()),
+    );
+    let role_transition = consider_assignment_role_transition(
+        assignment,
+        journal_parent_id,
+        &child_report,
+        subject_capability,
+        auditor_capability,
+    )?;
     with_supervisor_artifacts(context.artifacts, |writer, journal| {
         write_child_report(writer, final_report_relative, &child_report)?;
         record_final_report_decisions(journal, writer, journal_parent_id, &child_report);
+        if let Some(executed) = &role_transition {
+            record_orchestration_event(
+                journal,
+                writer,
+                &assignment.id,
+                Some(journal_parent_id),
+                OrchestrationRole::Orchestrator,
+                OrchestrationEventKind::Journal,
+                role_transition_payload(&executed.record)?,
+            );
+        }
         Ok(())
     })?;
     let failure_flags = final_report_failure_flags(
@@ -3202,9 +3465,11 @@ mod decomposition_tests {
     #[test]
     fn review_lens_execution_boundary_hides_primary_and_child_roots_from_hostile_process(
     ) -> Result<()> {
+        skip_without_containment!(ok);
         const CHILD_ENV: &str = "MACO_TEST_REVIEW_LENS_BOUNDARY_CHILD";
         const PRIMARY_SECRET_ENV: &str = "MACO_TEST_REVIEW_LENS_PRIMARY_SECRET";
         const CHILD_SECRET_ENV: &str = "MACO_TEST_REVIEW_LENS_CHILD_SECRET";
+        const SCHEMA_ENV: &str = "MACO_TEST_REVIEW_LENS_SCHEMA";
 
         if std::env::var_os(CHILD_ENV).is_some() {
             for environment_name in [PRIMARY_SECRET_ENV, CHILD_SECRET_ENV] {
@@ -3218,6 +3483,10 @@ mod decomposition_tests {
                     secret.display()
                 );
             }
+            let schema = PathBuf::from(
+                std::env::var_os(SCHEMA_ENV).context("missing hostile probe schema path")?,
+            );
+            assert_eq!(fs::read_to_string(schema)?, "{\"type\":\"object\"}\n");
             return Ok(());
         }
 
@@ -3238,6 +3507,8 @@ mod decomposition_tests {
         fs::write(&child_secret, "CHILD_SECRET_MUST_BE_HIDDEN\n")?;
 
         let scope_workspace = create_review_lens_scope_workspace()?;
+        let schema = scope_workspace.path().join("auditor-report.schema.json");
+        fs::write(&schema, "{\"type\":\"object\"}\n")?;
         let prompt = scope_workspace.path().join("prompt.md");
         fs::write(&prompt, "Attempt hostile access to omitted lens inputs.\n")?;
         let command = ExternalAgentCommand::codex(
@@ -3248,10 +3519,16 @@ mod decomposition_tests {
             scope_workspace.path().join("report.json"),
             Duration::from_secs(10),
         );
-        let command =
-            configure_review_lens_execution_boundary(command, &primary_root, &child_root)?;
+        let command = configure_review_lens_execution_boundary(
+            command.with_read_only_input_file(&schema),
+            &primary_root,
+            &child_root,
+        )?;
 
         let mut profile = crate::process_runner::ExternalCodexProfile::read_only(&command.cwd);
+        for input in &command.read_only_input_files {
+            profile = profile.with_visible_read_only_file(input);
+        }
         for hidden_root in &command.hidden_roots {
             profile = profile.with_hidden_root(hidden_root);
         }
@@ -3265,6 +3542,7 @@ mod decomposition_tests {
                 CHILD_SECRET_ENV.to_string(),
                 child_secret.display().to_string(),
             ),
+            (SCHEMA_ENV.to_string(), schema.display().to_string()),
         ]);
         let output = match run_process(
             ProcessSpec::direct(
@@ -3356,6 +3634,7 @@ mod decomposition_tests {
             codex_bin: PathBuf::from("unused-codex"),
             runtime: SupervisorRuntime::Fake,
             allow_dirty_primary: false,
+            allow_live_run_collision: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: crate::supervise::RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -3459,6 +3738,9 @@ mod decomposition_tests {
         let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
         let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
         let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+        fs::create_dir_all(&dirs.schemas).expect("create direct phase schema directory");
+        fs::write(&auditor_schema_path, "{\"type\":\"object\"}\n")
+            .expect("materialize direct phase auditor schema");
         let prepared = match prepare_child_attempt(
             &context,
             &mut outcome,
@@ -3485,6 +3767,7 @@ mod decomposition_tests {
             prepared.command.machine_global_retention,
             options.machine_global_retention
         );
+        assert!(prepared.command.read_only_input_files.is_empty());
         let collected = dispatch_and_collect_child_attempt(
             &context,
             &mut outcome,
@@ -3649,6 +3932,7 @@ mod decomposition_tests {
             codex_bin: PathBuf::from("unused-codex"),
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
+            allow_live_run_collision: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: crate::supervise::RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -3744,6 +4028,7 @@ done
             codex_bin: agent.clone(),
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
+            allow_live_run_collision: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: crate::supervise::RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -3979,6 +4264,7 @@ done
             codex_bin: PathBuf::from("unused-codex"),
             runtime,
             allow_dirty_primary: false,
+            allow_live_run_collision: false,
             admission_overrides: SupervisorAdmissionConfig::default(),
             budget_overrides: RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -4015,6 +4301,302 @@ done
     }
 
     #[test]
+    fn only_verified_confinement_admits_worktree_writes_and_primary_stays_refused() {
+        assert!(SupervisorRuntime::Codex
+            .capabilities()
+            .admits_worktree_writable());
+        for runtime in [
+            SupervisorRuntime::Grok,
+            SupervisorRuntime::Cursor,
+            SupervisorRuntime::ClaudeCode,
+            SupervisorRuntime::GeminiCli,
+        ] {
+            assert!(!runtime.capabilities().admits_worktree_writable());
+            assert_eq!(
+                crate::runtime_adapter::AdapterId::from_runtime(runtime)
+                    .writable_leaf_launch_refusal(),
+                Some("side_effect_confinement != verified")
+            );
+        }
+        assert!(!SupervisorRuntime::Codex
+            .capabilities()
+            .admits_writable_release());
+        assert!(!SupervisorRuntime::Fake
+            .capabilities()
+            .admits_worktree_writable());
+        assert_eq!(
+            crate::runtime_adapter::AdapterId::Fake.writable_leaf_launch_refusal(),
+            Some("writable_workspace == unsupported")
+        );
+        let worktree = launch_fixture_command();
+        assert_eq!(
+            worktree.writable_launch_target,
+            crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree
+        );
+        assert_eq!(
+            crate::runtime_adapter::AdapterId::Codex
+                .writable_launch_refusal(worktree.writable_launch_target),
+            None
+        );
+        assert!(worktree.hidden_roots.is_empty());
+        assert!(
+            !requires_hosted_pre_action_review(&worktree),
+            "managed-worktree Codex must use native workspace-write instead of optional duplex review"
+        );
+        let evidence_reaudit = worktree
+            .clone()
+            .with_workspace_access(WorkspaceAccess::ReadOnly);
+        assert!(requires_hosted_pre_action_review(&evidence_reaudit));
+        let primary = launch_fixture_command().with_writable_launch_target(
+            crate::runtime_adapter::WritableLaunchTarget::PrimaryWorktree,
+        );
+        assert_eq!(
+            crate::runtime_adapter::AdapterId::Codex
+                .writable_launch_refusal(primary.writable_launch_target),
+            Some("blocking_pre_action_callback != All")
+        );
+        assert!(requires_hosted_pre_action_review(&primary));
+    }
+
+    #[test]
+    fn worktree_writable_admission_requires_all_three_authenticated_factors() {
+        let assigned_paths = vec![PathBuf::from("README.md")];
+        let worktree = WorktreeRecord {
+            name: "child-a".to_string(),
+            path: PathBuf::from("/tmp/work"),
+            branch: "maco/child-a".to_string(),
+        };
+        let claim = PathClaim {
+            token: crate::sync::ClaimToken::from_u64(7),
+            agent_id: "child-a".to_string(),
+            paths: assigned_paths.clone(),
+        };
+        let command = launch_fixture_command();
+
+        let admission = worktree_writable_admission_record(
+            "child-a",
+            &assigned_paths,
+            2,
+            &worktree,
+            &claim,
+            std::slice::from_ref(&claim),
+            &command,
+            SupervisorRuntime::Codex,
+        )
+        .expect("all three factors admit the managed worktree")
+        .expect("writable managed worktree produces admission evidence");
+        assert_eq!(
+            admission,
+            crate::external_agent::WorktreeWritableAdmission {
+                version: crate::external_agent::WORKTREE_WRITABLE_ADMISSION_SCHEMA_VERSION,
+                assignment_id: "child-a".to_string(),
+                attempt: 2,
+                target: crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree,
+                worktree: crate::external_agent::ManagedWorktreeAdmission {
+                    kind: crate::external_agent::ManagedWorktreeAdmissionKind::ManagedDisposable,
+                    worktree_id: "child-a".to_string(),
+                },
+                claims: crate::external_agent::HeldPathClaimsAdmission {
+                    state: crate::external_agent::HeldPathClaimsAdmissionState::Held,
+                    token: 7,
+                    paths: assigned_paths.clone(),
+                },
+                native_sandbox: crate::external_agent::NativeSandboxAdmission {
+                    runtime: SupervisorRuntime::Codex,
+                    workspace_access: WorkspaceAccess::ReadWrite,
+                    side_effect_confinement:
+                        crate::runtime_adapter::SideEffectConfinement::Verified,
+                },
+            }
+        );
+
+        let mut serialized = serde_json::to_value(&admission).expect("serialize admission");
+        serialized
+            .as_object_mut()
+            .expect("admission is an object")
+            .insert("untrusted".to_string(), serde_json::Value::Bool(true));
+        assert!(
+            serde_json::from_value::<crate::external_agent::WorktreeWritableAdmission>(serialized)
+                .is_err(),
+            "typed admission evidence must reject unknown fields"
+        );
+
+        let primary = command.clone().with_writable_launch_target(
+            crate::runtime_adapter::WritableLaunchTarget::PrimaryWorktree,
+        );
+        assert!(worktree_writable_admission_record(
+            "child-a",
+            &assigned_paths,
+            2,
+            &worktree,
+            &claim,
+            std::slice::from_ref(&claim),
+            &primary,
+            SupervisorRuntime::Codex,
+        )
+        .expect("primary targets use the separate universal callback gate")
+        .is_none());
+
+        let missing_claim = worktree_writable_admission_record(
+            "child-a",
+            &assigned_paths,
+            2,
+            &worktree,
+            &claim,
+            &[],
+            &command,
+            SupervisorRuntime::Codex,
+        )
+        .expect_err("an unauthenticated claim must fail closed");
+        assert!(format!("{missing_claim:#}").contains("not held in authenticated state"));
+
+        let mismatched_worktree = WorktreeRecord {
+            name: "unmanaged-child".to_string(),
+            ..worktree.clone()
+        };
+        let worktree_error = worktree_writable_admission_record(
+            "child-a",
+            &assigned_paths,
+            2,
+            &mismatched_worktree,
+            &claim,
+            std::slice::from_ref(&claim),
+            &command,
+            SupervisorRuntime::Codex,
+        )
+        .expect_err("a mismatched worktree binding must fail closed");
+        assert!(format!("{worktree_error:#}").contains("managed worktree"));
+
+        let confinement_error = worktree_writable_admission_record(
+            "child-a",
+            &assigned_paths,
+            2,
+            &worktree,
+            &claim,
+            std::slice::from_ref(&claim),
+            &command,
+            SupervisorRuntime::Cursor,
+        )
+        .expect_err("unverified native confinement must fail closed");
+        assert!(format!("{confinement_error:#}").contains("verified native sandbox admission"));
+    }
+
+    #[test]
+    fn external_providers_omit_incompatible_output_schema_paths() {
+        let schema = Path::new("/hidden-primary/schemas/report.json");
+        let worker_schema = Path::new("/hidden-primary/schemas/worker.json");
+        let auditor_schema = Path::new("/hidden-primary/schemas/auditor.json");
+        let schemas = [schema, worker_schema, auditor_schema];
+        let codex = bind_runtime_read_only_schema_files(
+            bind_runtime_output_schema(launch_fixture_command(), SupervisorRuntime::Codex, schema),
+            SupervisorRuntime::Codex,
+            &schemas,
+        );
+        assert!(codex.output_schema.is_none());
+        assert_eq!(
+            codex.read_only_input_files,
+            schemas
+                .iter()
+                .map(|path| path.to_path_buf())
+                .collect::<Vec<_>>()
+        );
+
+        for runtime in [
+            SupervisorRuntime::Grok,
+            SupervisorRuntime::Cursor,
+            SupervisorRuntime::ClaudeCode,
+            SupervisorRuntime::GeminiCli,
+        ] {
+            let adapter = bind_runtime_read_only_schema_files(
+                bind_runtime_output_schema(launch_fixture_command(), runtime, schema),
+                runtime,
+                &schemas,
+            );
+            assert!(
+                adapter.output_schema.is_none(),
+                "{runtime:?} must not inherit Codex-only output schema staging"
+            );
+            assert_eq!(
+                adapter.read_only_input_files,
+                schemas
+                    .iter()
+                    .map(|path| path.to_path_buf())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let fake = bind_runtime_read_only_schema_files(
+            bind_runtime_output_schema(launch_fixture_command(), SupervisorRuntime::Fake, schema),
+            SupervisorRuntime::Fake,
+            &schemas,
+        );
+        assert_eq!(fake.output_schema.as_deref(), Some(schema));
+        assert!(fake.read_only_input_files.is_empty());
+    }
+
+    #[test]
+    fn supervise_plan_parses_claude_code_but_managed_writes_remain_refused() -> Result<()> {
+        let assignment: OrchestratorAssignment = serde_json::from_str(
+            r#"{
+                "id": "worker-claude",
+                "runtime": "claude-code",
+                "role": "worker",
+                "assigned_paths": ["README.md"]
+            }"#,
+        )?;
+        assert_eq!(assignment.runtime, Some(SupervisorRuntime::ClaudeCode));
+        assert_eq!(
+            SupervisorRuntime::ClaudeCode
+                .capabilities()
+                .writable_refusal(),
+            Some("blocking_pre_action_callback != All")
+        );
+        assert!(!SupervisorRuntime::ClaudeCode
+            .capabilities()
+            .admits_writable_release());
+        assert!(!SupervisorRuntime::ClaudeCode
+            .capabilities()
+            .admits_worktree_writable());
+        assert_eq!(
+            crate::runtime_adapter::AdapterId::from_runtime(SupervisorRuntime::ClaudeCode)
+                .writable_leaf_launch_refusal(),
+            Some("side_effect_confinement != verified")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn supervise_plan_parses_gemini_cli_but_managed_writes_remain_refused() -> Result<()> {
+        let assignment: OrchestratorAssignment = serde_json::from_str(
+            r#"{
+                "id": "worker-gemini",
+                "runtime": "gemini-cli",
+                "role": "worker",
+                "assigned_paths": ["README.md"]
+            }"#,
+        )?;
+        assert_eq!(assignment.runtime, Some(SupervisorRuntime::GeminiCli));
+        assert_eq!(
+            SupervisorRuntime::GeminiCli
+                .capabilities()
+                .writable_refusal(),
+            Some("blocking_pre_action_callback != All")
+        );
+        assert!(!SupervisorRuntime::GeminiCli
+            .capabilities()
+            .admits_writable_release());
+        assert!(!SupervisorRuntime::GeminiCli
+            .capabilities()
+            .admits_worktree_writable());
+        assert_eq!(
+            crate::runtime_adapter::AdapterId::from_runtime(SupervisorRuntime::GeminiCli)
+                .writable_leaf_launch_refusal(),
+            Some("side_effect_confinement != verified")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn assignment_launch_uses_selected_runtime_pair_not_run_global() -> Result<()> {
         let mut assignment = OrchestratorAssignment {
             id: "worker-a".to_string(),
@@ -4048,6 +4630,33 @@ done
         assert_eq!(
             command.program,
             PathBuf::from(SupervisorRuntime::Cursor.default_binary())
+        );
+
+        assignment.runtime = Some(SupervisorRuntime::ClaudeCode);
+        assignment.role = AgentRole::Worker;
+        assert_eq!(
+            assignment_launch_runtime(&assignment, &options),
+            SupervisorRuntime::ClaudeCode
+        );
+        let command = bind_selected_runtime_launch(
+            launch_fixture_command(),
+            &assignment,
+            &worker_plan("claude-sonnet-4-5"),
+            &options,
+            SupervisorRuntime::ClaudeCode,
+            &RuntimeModelCatalog::OperatorDeclared,
+        )?;
+        assert!(command.runtime_adapter.is_some());
+        assert_eq!(command.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(
+            command.program,
+            PathBuf::from(SupervisorRuntime::ClaudeCode.default_binary())
+        );
+        assert_eq!(
+            SupervisorRuntime::ClaudeCode
+                .capabilities()
+                .writable_refusal(),
+            Some("blocking_pre_action_callback != All")
         );
 
         assignment.role = AgentRole::ChildOrchestrator;

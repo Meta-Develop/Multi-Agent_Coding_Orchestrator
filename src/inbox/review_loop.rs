@@ -7,8 +7,8 @@
 //!
 //! [`open_review_loop`] is the production entry: observe a pull request through
 //! a [`ForgeTransport`], construct [`ReviewLoopState`], and evaluate readiness.
-//! Callers that want a user-facing path still have to wire that function from
-//! `maco review`, a supervisor role, or a workflow. This module does not merge.
+//! Inbox scan and run reach that function through `review_loop_entry`.
+//! This module does not merge.
 
 use crate::{
     artifacts::state_auth::sha256_hex,
@@ -1946,9 +1946,8 @@ fn derive_attempt_id(
 
 /// Observe a pull request and construct the initial review-loop state.
 ///
-/// This is the production entry a CLI subcommand, supervisor role, or
-/// workflow should call. It does not persist state, dispatch fix work,
-/// or grant merge authority.
+/// Inbox scan and run call this through `review_loop_entry`. It does not
+/// persist state, dispatch fix work, or grant merge authority.
 /// [`ReviewLoopReadinessProof::grants_merge_permission`] stays false.
 pub fn open_review_loop<T>(
     transport: &T,

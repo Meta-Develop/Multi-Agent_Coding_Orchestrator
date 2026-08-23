@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
-    fmt,
+    fmt, fs,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -27,6 +27,7 @@ const TASK_PROPOSAL_MAX_ASSIGNMENTS: usize = 128;
 const TASK_PROPOSAL_MAX_SCOPE_ITEMS_PER_ASSIGNMENT: usize = 4096;
 const TASK_PROPOSAL_MAX_TOTAL_SCOPE_ITEMS: usize = 16_384;
 const TASK_PROPOSAL_MAX_REPORTED_CONFLICTS: usize = 4096;
+const MAX_NAMED_PATH_EXPANSION: usize = 128;
 const PROVIDER_PLANNING_MAX_FEEDBACK_ITEMS: usize = 128;
 const PROVIDER_PLANNING_MAX_FEEDBACK_ITEM_BYTES: usize = 16 * 1024;
 const PROVIDER_PLANNING_MAX_TOTAL_FEEDBACK_BYTES: usize = 256 * 1024;
@@ -286,6 +287,14 @@ impl TaskPlanningSession {
     /// validation. Heuristic-only sessions return an empty slice.
     pub fn provider_assignment_tree(&self) -> &[ProviderTaskAssignmentTree] {
         &self.provider_assignment_tree
+    }
+
+    pub fn completed_fragment_ids(&self) -> &BTreeSet<String> {
+        &self.completed_fragment_ids
+    }
+
+    pub fn completed_assignments(&self) -> &[TaskAssignmentProposal] {
+        &self.completed_assignments
     }
 }
 
@@ -586,9 +595,37 @@ pub fn propose_task_decomposition(
     body: &str,
 ) -> Result<TaskDecompositionProposal> {
     let fragments = task_spec_fragments(title, body)?;
-    let files = collect_repo_files(repo)?;
-    let file_set = files.iter().cloned().collect::<BTreeSet<_>>();
+    propose_task_decomposition_from_fragments(repo, fragments, title, body)
+}
+
+fn propose_task_decomposition_from_fragments(
+    repo: &Path,
+    fragments: Vec<TaskSpecFragment>,
+    title: &str,
+    body: &str,
+) -> Result<TaskDecompositionProposal> {
     let mut diagnostics = TaskPathProposalDiagnostics::default();
+    let files = collect_planning_files(repo, title, body, &mut diagnostics)?;
+    let file_set = files.iter().cloned().collect::<BTreeSet<_>>();
+    if let Some(assignment) =
+        authoritative_single_file_assignment(repo, title, body, &fragments, &files, &file_set)
+    {
+        diagnostics.notes.push(
+            "an explicit single-file-only directive bounded the task before semantic inference"
+                .to_string(),
+        );
+        return Ok(TaskDecompositionProposal {
+            fragments,
+            assignments: vec![assignment],
+            coverage_gaps: Vec::new(),
+            diagnostics,
+            disjointness: TaskDisjointnessReport {
+                disjoint: true,
+                conflicts: Vec::new(),
+                conflicts_truncated: false,
+            },
+        });
+    }
     let semantic_map = match repo_semantic::scan_repository(repo) {
         Ok(map) => {
             if !map.errors.is_empty() {
@@ -611,8 +648,10 @@ pub fn propose_task_decomposition(
 
     let mut candidates = Vec::new();
     let mut coverage_gaps = Vec::new();
+    let mut unresolved_named_paths = Vec::new();
     for fragment in &fragments {
-        let proposed = propose_fragment_scope(fragment, &files, &file_set, semantic_map.as_ref());
+        let proposed =
+            propose_fragment_scope(fragment, repo, &files, &file_set, semantic_map.as_ref());
         let candidate = proposed.assignment;
         if proposed.suppressed_broad_paths > 0 {
             diagnostics.notes.push(format!(
@@ -620,15 +659,24 @@ pub fn propose_task_decomposition(
                 fragment.id, proposed.suppressed_broad_paths
             ));
         }
+        diagnostics.notes.extend(proposed.notes);
         if candidate.assigned_paths.is_empty()
             && candidate.semantic_symbols.is_empty()
             && candidate.semantic_modules.is_empty()
         {
+            let message = if let Some(path) = proposed.unresolved_named_paths.first() {
+                unresolved_named_paths.push(path.clone());
+                format!(
+                    "named repository path '{path}' is not a readable regular file in the repository"
+                )
+            } else {
+                "no repository path (documentation, policy, script, or other file) or Rust semantic intent matched this fragment"
+                    .to_string()
+            };
             coverage_gaps.push(TaskCoverageGap {
                 fragment_id: fragment.id.clone(),
                 kind: TaskCoverageGapKind::UnmatchedScope,
-                message: "no bounded repository path or Rust semantic intent matched this fragment"
-                    .to_string(),
+                message,
             });
         } else {
             candidates.push(candidate);
@@ -660,6 +708,13 @@ pub fn propose_task_decomposition(
     if !disjointness.disjoint {
         anyhow::bail!("internal task decomposition produced overlapping assignment scopes");
     }
+    if assignments.is_empty() {
+        if let Some(path) = unresolved_named_paths.first() {
+            anyhow::bail!(
+                "named repository path '{path}' is not a readable regular file in the repository; provide an existing Git-visible or on-disk repo-relative file (documentation, policy, script, or other), or a Rust module/symbol"
+            );
+        }
+    }
 
     Ok(TaskDecompositionProposal {
         fragments,
@@ -668,6 +723,59 @@ pub fn propose_task_decomposition(
         diagnostics,
         disjointness,
     })
+}
+
+fn authoritative_single_file_assignment(
+    repo: &Path,
+    title: &str,
+    body: &str,
+    fragments: &[TaskSpecFragment],
+    files: &[PathBuf],
+    file_set: &BTreeSet<PathBuf>,
+) -> Option<TaskAssignmentProposal> {
+    let full_text = format!("{title}\n{body}");
+    let named = match_named_paths_in_text(repo, &full_text, files, file_set);
+    if named.resolved.len() != 1 || !named.unresolved.is_empty() {
+        return None;
+    }
+    let only_path = named.resolved.iter().next()?.clone();
+    let directive_is_tied_to_path = full_text.lines().any(|line| {
+        let line_named = match_named_paths_in_text(repo, line, files, file_set);
+        line_named.resolved.contains(&only_path) && is_single_file_only_directive(line)
+    });
+    if !directive_is_tied_to_path {
+        return None;
+    }
+
+    Some(TaskAssignmentProposal {
+        id: "assignment-001".to_string(),
+        task: fragments
+            .iter()
+            .map(|fragment| fragment.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        fragment_ids: fragments
+            .iter()
+            .map(|fragment| fragment.id.clone())
+            .collect(),
+        assigned_paths: vec![only_path],
+        semantic_symbols: Vec::new(),
+        semantic_modules: Vec::new(),
+    })
+}
+
+fn is_single_file_only_directive(line: &str) -> bool {
+    let normalized = normalize_text(line);
+    [
+        "edit only",
+        "modify only",
+        "change only",
+        "only edit",
+        "only modify",
+        "only change",
+    ]
+    .iter()
+    .any(|phrase| contains_phrase(&normalized, phrase))
 }
 
 pub fn propose_task_decomposition_with_optional_provider(
@@ -894,6 +1002,158 @@ pub fn replan_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
     session.provider_usage = session.provider_usage.saturating_add(response.usage);
     session.proposal = proposal;
     session.provider_assignment_tree = provider_assignment_tree;
+    session.completed_fragment_ids = next_completed_fragment_ids;
+    session.completed_assignments = next_completed_assignments;
+    Ok(())
+}
+
+/// Revises remaining heuristic work from execution feedback without invoking a planner model.
+///
+/// Completed assignments stay frozen. Remaining fragments are rematched through the
+/// existing deterministic decomposer, optionally steered by feedback notes, then
+/// checked against the same disjointness and completed-scope gates as provider replans.
+/// This is the first #80 slice: a bounded feedback hook, not model-driven recursive planning.
+pub fn replan_task_decomposition_from_feedback(
+    repo: &Path,
+    session: &mut TaskPlanningSession,
+    feedback: &TaskExecutionFeedback,
+) -> Result<()> {
+    if session.source != TaskPlanningSource::Heuristic {
+        anyhow::bail!(
+            "feedback re-planning without a provider requires a heuristic planning session"
+        );
+    }
+    if !session.provider_assignment_tree.is_empty() {
+        anyhow::bail!("heuristic planning session unexpectedly carries a provider assignment tree");
+    }
+    if session.replans_used >= MAX_PROVIDER_REPLANS {
+        anyhow::bail!("re-planning limit of {MAX_PROVIDER_REPLANS} attempt(s) has been exhausted");
+    }
+
+    let normalized_feedback =
+        normalize_execution_feedback(feedback, &session.proposal, &session.completed_fragment_ids)?;
+    let newly_completed_assignments = session
+        .proposal
+        .assignments
+        .iter()
+        .filter(|assignment| {
+            normalized_feedback
+                .completed_assignment_ids
+                .contains(&assignment.id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let newly_completed_fragment_ids = newly_completed_assignments
+        .iter()
+        .flat_map(|assignment| assignment.fragment_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if let Some(overlap) = newly_completed_fragment_ids
+        .intersection(&normalized_feedback.coverage_gap_fragment_ids)
+        .next()
+    {
+        anyhow::bail!(
+            "execution feedback marks newly completed fragment '{overlap}' as a coverage gap"
+        );
+    }
+
+    let mut next_completed_fragment_ids = session.completed_fragment_ids.clone();
+    next_completed_fragment_ids.extend(newly_completed_fragment_ids);
+    let mut next_completed_assignments = session.completed_assignments.clone();
+    next_completed_assignments.extend(newly_completed_assignments);
+
+    let remaining_fragments = session
+        .proposal
+        .fragments
+        .iter()
+        .filter(|fragment| !next_completed_fragment_ids.contains(&fragment.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if remaining_fragments.is_empty() {
+        anyhow::bail!("feedback re-planning has no remaining incomplete fragments");
+    }
+
+    let rematch_body = remaining_fragments
+        .iter()
+        .map(|fragment| format!("- {}", fragment.text))
+        .chain(
+            normalized_feedback
+                .notes
+                .iter()
+                .map(|note| format!("- {note}")),
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rematch_fragments = remaining_fragments
+        .iter()
+        .map(|fragment| {
+            let apply_notes = normalized_feedback
+                .coverage_gap_fragment_ids
+                .contains(&fragment.id)
+                || session.proposal.assignments.iter().any(|assignment| {
+                    normalized_feedback
+                        .failed_assignment_ids
+                        .contains(&assignment.id)
+                        && assignment.fragment_ids.contains(&fragment.id)
+                })
+                || (normalized_feedback.failed_assignment_ids.is_empty()
+                    && normalized_feedback.coverage_gap_fragment_ids.is_empty());
+            let text = if apply_notes && !normalized_feedback.notes.is_empty() {
+                let mut text = fragment.text.clone();
+                for note in &normalized_feedback.notes {
+                    text.push(' ');
+                    text.push_str(note);
+                }
+                text
+            } else {
+                fragment.text.clone()
+            };
+            TaskSpecFragment {
+                id: fragment.id.clone(),
+                text,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let next_attempt = session.replans_used.saturating_add(1);
+    let mut proposal =
+        propose_task_decomposition_from_fragments(repo, rematch_fragments, "", &rematch_body)?;
+    if proposal.assignments.is_empty() {
+        anyhow::bail!("feedback re-planning produced no remaining executable assignments");
+    }
+    for (index, assignment) in proposal.assignments.iter_mut().enumerate() {
+        assignment.id = format!("assignment-replan-{next_attempt:02}-{:03}", index + 1);
+        assignment.task = assignment
+            .fragment_ids
+            .iter()
+            .filter_map(|fragment_id| {
+                remaining_fragments
+                    .iter()
+                    .find(|fragment| &fragment.id == fragment_id)
+                    .map(|fragment| fragment.text.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    let scoped_nodes = proposal
+        .assignments
+        .iter()
+        .enumerate()
+        .map(|(index, assignment)| (vec![index], assignment.clone()))
+        .collect::<Vec<_>>();
+    validate_completed_scope_not_reclaimed(
+        &scoped_nodes,
+        &next_completed_assignments,
+        "feedback re-planning",
+    )?;
+    validate_task_assignment_disjointness(&proposal.assignments)
+        .context("feedback re-planning remaining assignments are not independently assignable")?;
+    proposal.fragments = session.proposal.fragments.clone();
+    proposal.diagnostics.notes.push(format!(
+        "heuristic re-plan attempt {next_attempt} used execution feedback without a planner model"
+    ));
+
+    session.replans_used = next_attempt;
+    session.proposal = proposal;
     session.completed_fragment_ids = next_completed_fragment_ids;
     session.completed_assignments = next_completed_assignments;
     Ok(())
@@ -1423,7 +1683,7 @@ fn normalize_execution_feedback(
         .and_then(|count| count.checked_add(feedback.notes.len()))
         .context("execution feedback item count overflowed")?;
     if item_count == 0 {
-        anyhow::bail!("provider re-planning requires at least one execution feedback item");
+        anyhow::bail!("re-planning requires at least one execution feedback item");
     }
     if item_count > PROVIDER_PLANNING_MAX_FEEDBACK_ITEMS {
         anyhow::bail!(
@@ -1505,7 +1765,7 @@ fn normalize_execution_feedback(
         && coverage_gap_fragment_ids.is_empty()
         && notes.is_empty()
     {
-        anyhow::bail!("provider re-planning requires non-empty normalized execution feedback");
+        anyhow::bail!("re-planning requires non-empty normalized execution feedback");
     }
     Ok(NormalizedTaskExecutionFeedback {
         completed_assignment_ids,
@@ -1538,6 +1798,7 @@ fn normalize_feedback_ids(
 
 fn propose_fragment_scope(
     fragment: &TaskSpecFragment,
+    repo: &Path,
     files: &[PathBuf],
     file_set: &BTreeSet<PathBuf>,
     semantic_map: Option<&repo_semantic::SemanticRepoMap>,
@@ -1549,6 +1810,7 @@ fn propose_fragment_scope(
     let mut exact_symbol_paths = BTreeSet::new();
     let mut semantic_symbols = BTreeSet::new();
     let mut semantic_modules = BTreeSet::new();
+    let mut notes = Vec::new();
 
     for file in files {
         let display = file.to_string_lossy().to_ascii_lowercase();
@@ -1556,7 +1818,13 @@ fn propose_fragment_scope(
             explicit_paths.insert(file.clone());
         }
     }
-    propose_docs_paths(&normalized_text, file_set, &mut explicit_paths);
+    let named = match_named_paths_in_text(repo, &fragment.text, files, file_set);
+    explicit_paths.extend(named.resolved);
+    notes.extend(named.notes);
+    if explicit_paths.is_empty() {
+        propose_docs_paths(&normalized_text, file_set, &mut explicit_paths);
+        propose_non_rust_identifier_paths(&normalized_text, files, &mut explicit_paths);
+    }
 
     if let Some(map) = semantic_map {
         for file in &map.files {
@@ -1623,12 +1891,16 @@ fn propose_fragment_scope(
             semantic_modules: semantic_modules.into_iter().collect(),
         },
         suppressed_broad_paths,
+        unresolved_named_paths: named.unresolved,
+        notes,
     }
 }
 
 struct ProposedFragmentScope {
     assignment: TaskAssignmentProposal,
     suppressed_broad_paths: usize,
+    unresolved_named_paths: Vec<String>,
+    notes: Vec<String>,
 }
 
 fn module_matches(normalized_text: &str, module_path: &[String]) -> bool {
@@ -1808,10 +2080,10 @@ pub fn propose_task_path_proposal(
     let text = format!("{title}\n{body}");
     let lowered = text.to_ascii_lowercase();
     let normalized_text = normalize_text(&text);
-    let files = collect_repo_files(repo)?;
+    let mut diagnostics = TaskPathProposalDiagnostics::default();
+    let files = collect_planning_files(repo, title, body, &mut diagnostics)?;
     let file_set = files.iter().cloned().collect::<BTreeSet<_>>();
     let mut proposed = BTreeSet::new();
-    let mut diagnostics = TaskPathProposalDiagnostics::default();
 
     for file in &files {
         let display = file.to_string_lossy().to_ascii_lowercase();
@@ -1819,8 +2091,12 @@ pub fn propose_task_path_proposal(
             proposed.insert(file.clone());
         }
     }
+    let named = match_named_paths_in_text(repo, &text, &files, &file_set);
+    proposed.extend(named.resolved);
+    diagnostics.notes.extend(named.notes);
 
     propose_docs_paths(&normalized_text, &file_set, &mut proposed);
+    propose_non_rust_identifier_paths(&normalized_text, &files, &mut proposed);
     propose_rust_paths(
         repo,
         &normalized_text,
@@ -1880,13 +2156,7 @@ fn propose_docs_paths(
     {
         let docs_paths = file_set
             .iter()
-            .filter(|path| {
-                path.starts_with("docs")
-                    || path
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
-            })
+            .filter(|path| is_conventional_documentation_path(path))
             .cloned()
             .collect::<Vec<_>>();
         if docs_paths.is_empty() && file_set.contains(Path::new("README.md")) {
@@ -2027,6 +2297,358 @@ fn contains_path_mention(text: &str, path: &str) -> bool {
         || text.contains(&format!("`{path}`"))
         || text.contains(&format!("'{}'", path))
         || text.contains(&format!("\"{path}\""))
+}
+
+fn collect_planning_files(
+    repo: &Path,
+    title: &str,
+    body: &str,
+    diagnostics: &mut TaskPathProposalDiagnostics,
+) -> Result<Vec<PathBuf>> {
+    let named_on_disk = named_paths_present_on_disk(repo, &format!("{title}\n{body}"));
+    match collect_repo_files(repo) {
+        Ok(mut files) => {
+            let mut file_set = files.iter().cloned().collect::<BTreeSet<_>>();
+            for path in named_on_disk {
+                if file_set.insert(path.clone()) {
+                    diagnostics.notes.push(format!(
+                        "included explicitly named path '{}' that was not in the Git-visible inventory",
+                        path.display()
+                    ));
+                    files.push(path);
+                }
+            }
+            files.sort();
+            Ok(files)
+        }
+        Err(error) => {
+            if let Some(path) = unresolved_explicit_named_file(repo, &format!("{title}\n{body}")) {
+                anyhow::bail!(
+                    "named repository path '{path}' is not a readable regular file in the repository"
+                );
+            }
+            if named_on_disk.is_empty() {
+                return Err(error).context(
+                    "repository inventory failed and the spec named no resolvable repository paths",
+                );
+            }
+            diagnostics.degraded = true;
+            diagnostics.notes.push(format!(
+                "repository inventory failed ({error:#}); using {} explicitly named repository path(s)",
+                named_on_disk.len()
+            ));
+            Ok(named_on_disk)
+        }
+    }
+}
+
+fn named_paths_present_on_disk(repo: &Path, text: &str) -> Vec<PathBuf> {
+    extract_path_like_tokens(text)
+        .into_iter()
+        .filter_map(|token| resolve_named_repo_file(repo, Path::new(&token)))
+        .collect()
+}
+
+fn unresolved_explicit_named_file(repo: &Path, text: &str) -> Option<String> {
+    extract_path_like_tokens(text).into_iter().find(|token| {
+        let Ok(normalized) = normalize_repo_relative_path(token) else {
+            return false;
+        };
+        normalized.components().count() > 1
+            && normalized
+                .extension()
+                .is_some_and(|extension| !extension.is_empty())
+            && !is_excluded_planning_path(&normalized)
+            && resolve_named_repo_file(repo, &normalized).is_none()
+    })
+}
+
+struct NamedPathMatch {
+    resolved: BTreeSet<PathBuf>,
+    unresolved: Vec<String>,
+    notes: Vec<String>,
+}
+
+fn match_named_paths_in_text(
+    repo: &Path,
+    text: &str,
+    files: &[PathBuf],
+    file_set: &BTreeSet<PathBuf>,
+) -> NamedPathMatch {
+    let mut resolved = BTreeSet::new();
+    let mut unresolved = Vec::new();
+    let mut notes = Vec::new();
+    for token in extract_path_like_tokens(text) {
+        let matches = resolve_path_token(repo, &token, files, file_set, &mut notes);
+        if matches.is_empty() {
+            unresolved.push(token);
+        } else {
+            resolved.extend(matches);
+        }
+    }
+    NamedPathMatch {
+        resolved,
+        unresolved,
+        notes,
+    }
+}
+
+fn resolve_path_token(
+    repo: &Path,
+    token: &str,
+    files: &[PathBuf],
+    file_set: &BTreeSet<PathBuf>,
+    notes: &mut Vec<String>,
+) -> BTreeSet<PathBuf> {
+    let Ok(normalized) = normalize_repo_relative_path(token) else {
+        return BTreeSet::new();
+    };
+    if normalized.as_os_str().is_empty() || is_excluded_planning_path(&normalized) {
+        return BTreeSet::new();
+    }
+
+    let mut resolved = BTreeSet::new();
+    if normalized.components().count() == 1 {
+        let file_name = normalized.file_name();
+        for file in files {
+            if file.file_name() == file_name {
+                resolved.insert(file.clone());
+            }
+        }
+        if resolved.len() > MAX_NAMED_PATH_EXPANSION {
+            notes.push(format!(
+                "bare path '{token}' matches {} inventoried files; name a more specific repository-relative path",
+                resolved.len()
+            ));
+            resolved.clear();
+        }
+        if resolved.is_empty() {
+            if let Some(on_disk) = resolve_named_repo_file(repo, &normalized) {
+                resolved.insert(on_disk);
+            }
+        }
+        return resolved;
+    }
+
+    if file_set.contains(&normalized) {
+        resolved.insert(normalized);
+        return resolved;
+    }
+    if !is_overbroad_prefix(&normalized) {
+        for file in files {
+            if file.starts_with(&normalized) {
+                resolved.insert(file.clone());
+            }
+        }
+        if resolved.len() > MAX_NAMED_PATH_EXPANSION {
+            notes.push(format!(
+                "named path prefix '{token}' matches {} inventoried files; name a more specific repository-relative file",
+                resolved.len()
+            ));
+            resolved.clear();
+        }
+    }
+    if resolved.is_empty() {
+        if let Some(on_disk) = resolve_named_repo_file(repo, &normalized) {
+            resolved.insert(on_disk);
+        }
+    }
+    resolved
+}
+
+fn resolve_named_repo_file(repo: &Path, relative: &Path) -> Option<PathBuf> {
+    let normalized = normalize_repo_relative_path(relative).ok()?;
+    if normalized.as_os_str().is_empty() || is_excluded_planning_path(&normalized) {
+        return None;
+    }
+    let metadata = fs::symlink_metadata(repo.join(&normalized)).ok()?;
+    metadata.is_file().then_some(normalized)
+}
+
+fn is_excluded_planning_path(path: &Path) -> bool {
+    is_runtime_path(path)
+        || path.starts_with(".git")
+        || path
+            .components()
+            .any(|component| component.as_os_str() == ".git")
+}
+
+fn is_overbroad_prefix(path: &Path) -> bool {
+    if path.components().count() != 1 {
+        return false;
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    name.starts_with('.')
+        || matches!(
+            name,
+            "src" | "docs" | "scripts" | "tests" | "test" | "target" | "bin" | "lib"
+        )
+}
+
+fn extract_path_like_tokens(text: &str) -> Vec<String> {
+    let mut tokens = BTreeSet::new();
+    let mut current = String::new();
+    let mut quote = None;
+    for ch in text.chars() {
+        match quote {
+            Some(q) if ch == q => {
+                consider_path_token(&mut tokens, &current);
+                current.clear();
+                quote = None;
+            }
+            Some(_) => current.push(ch),
+            None if matches!(ch, '`' | '\'' | '"') => {
+                consider_path_token(&mut tokens, &current);
+                current.clear();
+                quote = Some(ch);
+            }
+            None if ch.is_whitespace() => {
+                consider_path_token(&mut tokens, &current);
+                current.clear();
+            }
+            None => current.push(ch),
+        }
+    }
+    consider_path_token(&mut tokens, &current);
+    tokens.into_iter().collect()
+}
+
+fn consider_path_token(tokens: &mut BTreeSet<String>, raw: &str) {
+    if let Some(token) = normalize_path_token(raw) {
+        if looks_like_repo_relative_path(&token) {
+            tokens.insert(token);
+        }
+    }
+}
+
+fn normalize_path_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches(|c: char| {
+        matches!(c, ',' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}' | '!')
+    });
+    if trimmed.is_empty() {
+        return None;
+    }
+    let trimmed = trimmed.strip_prefix("./").unwrap_or(trimmed);
+    let trimmed = match trimmed.strip_suffix('.') {
+        Some(stripped) if looks_like_repo_relative_path(stripped) => stripped,
+        _ => trimmed,
+    };
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn looks_like_repo_relative_path(token: &str) -> bool {
+    if token.is_empty() || token == "." || token == ".." || token.contains("://") {
+        return false;
+    }
+    let path = Path::new(token);
+    if path.is_absolute() {
+        return false;
+    }
+    token.contains('/')
+        || token.starts_with('.')
+        || path
+            .extension()
+            .is_some_and(|extension| !extension.is_empty())
+}
+
+fn propose_non_rust_identifier_paths(
+    normalized_text: &str,
+    files: &[PathBuf],
+    proposed: &mut BTreeSet<PathBuf>,
+) {
+    for file in files {
+        if is_rust_source_path(file) {
+            continue;
+        }
+        if distinctive_non_rust_path_matches(normalized_text, file) {
+            proposed.insert(file.clone());
+        }
+    }
+}
+
+fn distinctive_non_rust_path_matches(normalized_text: &str, path: &Path) -> bool {
+    if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+        if !is_generic_file_stem(stem) && identifier_matches_text(normalized_text, stem) {
+            return true;
+        }
+    }
+    path.parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            !is_generic_dir_name(name) && identifier_matches_text(normalized_text, name)
+        })
+}
+
+fn is_generic_file_stem(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "skill"
+            | "readme"
+            | "license"
+            | "changelog"
+            | "contributing"
+            | "makefile"
+            | "dockerfile"
+            | "index"
+            | "config"
+            | "script"
+            | "test"
+            | "spec"
+            | "doc"
+            | "docs"
+            | "mod"
+            | "lib"
+            | "main"
+            | "package"
+            | "cargo"
+    )
+}
+
+fn is_generic_dir_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "src"
+            | "docs"
+            | "scripts"
+            | "script"
+            | "skills"
+            | "skill"
+            | "agents"
+            | ".agents"
+            | ".agent"
+            | "bin"
+            | "lib"
+            | "test"
+            | "tests"
+            | "spec"
+            | "config"
+    )
+}
+
+fn is_rust_source_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
+}
+
+fn is_markdown_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+}
+
+fn is_conventional_documentation_path(path: &Path) -> bool {
+    path.starts_with("docs")
+        || path.starts_with(".agents/docs")
+        || (path.components().count() == 1 && is_markdown_path(path))
 }
 
 fn contains_phrase(text: &str, phrase: &str) -> bool {
@@ -2260,6 +2882,7 @@ mod tests {
 
     #[test]
     fn propose_task_paths_does_not_match_common_symbol_words() {
+        skip_without_containment!();
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path();
         git2::Repository::init(repo).expect("init repo");
@@ -2279,6 +2902,7 @@ mod tests {
 
     #[test]
     fn propose_task_paths_requires_standalone_short_identifier_tokens() {
+        skip_without_containment!();
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path();
         git2::Repository::init(repo).expect("init repo");
@@ -2295,6 +2919,7 @@ mod tests {
 
     #[test]
     fn propose_task_paths_matches_real_symbol_mentions() {
+        skip_without_containment!();
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path();
         git2::Repository::init(repo).expect("init repo");
@@ -2319,6 +2944,7 @@ mod tests {
 
     #[test]
     fn propose_task_paths_routes_docs_and_rust_tasks_separately() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -2342,6 +2968,7 @@ mod tests {
 
     #[test]
     fn propose_task_path_proposal_keeps_empty_result_without_readme() {
+        skip_without_containment!();
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path();
         git2::Repository::init(repo).expect("init repo");
@@ -2357,6 +2984,7 @@ mod tests {
 
     #[test]
     fn propose_task_path_proposal_reports_filename_only_degradation() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -2554,6 +3182,7 @@ mod tests {
 
     #[test]
     fn optional_provider_uses_heuristic_fallback_when_unconfigured() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -2583,6 +3212,7 @@ mod tests {
 
     #[test]
     fn fake_provider_proposes_a_validated_disjoint_plan() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -2647,6 +3277,7 @@ mod tests {
 
     #[test]
     fn provider_plan_rejects_overlapping_assignments() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -2693,6 +3324,7 @@ mod tests {
 
     #[test]
     fn fake_provider_replans_from_feedback_with_a_hard_attempt_limit() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -2801,6 +3433,7 @@ mod tests {
 
     #[test]
     fn fake_provider_proposes_a_recursive_tree_and_flattens_executable_leaves() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -2863,6 +3496,7 @@ mod tests {
 
     #[test]
     fn recursive_provider_plan_rejects_internal_fragment_union_mismatch() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -2913,6 +3547,7 @@ mod tests {
 
     #[test]
     fn recursive_provider_plan_rejects_depth_and_reclaimed_completed_scope() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -3006,7 +3641,96 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_single_file_goal_stays_single_and_has_no_semantic_leakage() {
+        skip_without_containment!();
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "RELEASE_NOTES.md", "# Releases\n");
+            write_file(
+                repo,
+                "src/lib.rs",
+                "pub fn write() {}\npub fn commit() {}\n",
+            );
+
+            let title = "Smoke goal — prove a managed-worktree child write";
+            let body = r#"## Goal
+
+Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other file.
+
+## Spec
+
+- Edit only `RELEASE_NOTES.md`.
+- Commit the change with message `docs: child write`.
+
+## Acceptance
+
+- `RELEASE_NOTES.md` ends with the new line and is committed."#;
+            let first = propose_task_decomposition(repo, title, body)
+                .expect("authoritative single-file proposal");
+            let second = propose_task_decomposition(repo, title, body)
+                .expect("deterministic authoritative single-file proposal");
+
+            assert_eq!(first, second);
+            assert_eq!(first.assignments.len(), 1);
+            assert_eq!(first.assignments[0].id, "assignment-001");
+            assert_eq!(
+                first.assignments[0].assigned_paths,
+                vec![PathBuf::from("RELEASE_NOTES.md")]
+            );
+            assert_eq!(
+                first.assignments[0].fragment_ids,
+                first
+                    .fragments
+                    .iter()
+                    .map(|fragment| fragment.id.clone())
+                    .collect::<Vec<_>>()
+            );
+            assert!(first.assignments[0].semantic_symbols.is_empty());
+            assert!(first.assignments[0].semantic_modules.is_empty());
+            assert!(first.coverage_gaps.is_empty());
+            assert!(first.disjointness.disjoint);
+            assert!(first
+                .diagnostics
+                .notes
+                .iter()
+                .any(|note| { note.contains("explicit single-file-only directive") }));
+        });
+    }
+
+    #[test]
+    fn one_named_file_without_a_tied_only_directive_uses_normal_decomposition() {
+        skip_without_containment!();
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "RELEASE_NOTES.md", "# Releases\n");
+            write_file(repo, "src/lib.rs", "pub fn write() {}\n");
+
+            let proposal = propose_task_decomposition(
+                repo,
+                "Update release notes",
+                "Add an entry to RELEASE_NOTES.md.\n\nExplain the write behavior.",
+            )
+            .expect("ordinary heuristic proposal");
+
+            assert!(!proposal
+                .diagnostics
+                .notes
+                .iter()
+                .any(|note| { note.contains("explicit single-file-only directive") }));
+            assert!(proposal
+                .assignments
+                .iter()
+                .any(|assignment| !assignment.semantic_symbols.is_empty()));
+        });
+    }
+
+    #[test]
     fn propose_task_decomposition_is_deterministic_and_exposes_coverage_and_intents() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -3080,6 +3804,7 @@ mod tests {
 
     #[test]
     fn exact_symbol_scope_avoids_a_shared_megafile_module_attractor() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -3137,6 +3862,7 @@ mod tests {
 
     #[test]
     fn propose_task_decomposition_coalesces_transitive_scope_overlap() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -3174,7 +3900,161 @@ mod tests {
     }
 
     #[test]
+    fn propose_task_decomposition_matches_policy_and_script_paths() {
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(
+                repo,
+                ".agents/skills/agent-orchestration/SKILL.md",
+                "# Orchestration\n",
+            );
+            write_file(repo, ".agents/scripts/o2-autopilot", "#!/bin/sh\n");
+            write_file(repo, "docs/guide.md", "# Guide\n");
+
+            let proposal = propose_task_decomposition(
+                repo,
+                "Coordinate policy and script work.",
+                "- Update `.agents/skills/agent-orchestration/SKILL.md`.\n\
+                 - Update `.agents/scripts/o2-autopilot`.\n",
+            )
+            .expect("propose policy/script decomposition");
+
+            let mut scopes = proposal
+                .assignments
+                .iter()
+                .map(|assignment| assignment.assigned_paths.clone())
+                .collect::<Vec<_>>();
+            scopes.sort();
+            assert_eq!(
+                scopes,
+                vec![
+                    vec![PathBuf::from(".agents/scripts/o2-autopilot")],
+                    vec![PathBuf::from(".agents/skills/agent-orchestration/SKILL.md")],
+                ]
+            );
+            assert!(proposal.assignments.iter().all(|assignment| {
+                assignment.semantic_symbols.is_empty() && assignment.semantic_modules.is_empty()
+            }));
+        });
+    }
+
+    #[test]
+    fn propose_task_paths_does_not_sweep_nested_policy_markdown() {
+        skip_without_containment!();
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "README.md", "# Project\n");
+            write_file(repo, "docs/guide.md", "# Guide\n");
+            write_file(repo, ".agents/skills/demo/SKILL.md", "# Skill\n");
+
+            let docs_paths = propose_task_paths(repo, "Update docs", "Refresh documentation.")
+                .expect("propose docs paths");
+            assert_eq!(
+                docs_paths,
+                vec![PathBuf::from("README.md"), PathBuf::from("docs/guide.md")]
+            );
+            assert!(!docs_paths
+                .iter()
+                .any(|path| path.starts_with(".agents/skills")));
+        });
+    }
+
+    #[test]
+    fn propose_task_decomposition_includes_explicit_gitignored_policy_path() {
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, ".gitignore", ".agents/\n");
+            write_file(repo, ".agents/skills/demo/SKILL.md", "# Skill\n");
+            write_file(repo, "README.md", "# Project\n");
+
+            let proposal =
+                propose_task_decomposition(repo, "", "- Update `.agents/skills/demo/SKILL.md`.")
+                    .expect("named gitignored policy path");
+
+            assert_eq!(proposal.assignments.len(), 1);
+            assert_eq!(
+                proposal.assignments[0].assigned_paths,
+                vec![PathBuf::from(".agents/skills/demo/SKILL.md")]
+            );
+        });
+    }
+
+    #[test]
+    fn propose_task_decomposition_matches_script_basename() {
+        skip_without_containment!();
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, ".agents/scripts/o2-autopilot", "#!/bin/sh\n");
+
+            let proposal = propose_task_decomposition(repo, "", "- Update o2-autopilot.")
+                .expect("script basename");
+
+            assert_eq!(proposal.assignments.len(), 1);
+            assert_eq!(
+                proposal.assignments[0].assigned_paths,
+                vec![PathBuf::from(".agents/scripts/o2-autopilot")]
+            );
+        });
+    }
+
+    #[test]
+    fn sentence_period_is_not_a_named_repository_path() {
+        assert!(!looks_like_repo_relative_path("frobnicator."));
+        assert!(!looks_like_repo_relative_path("frobnicator"));
+        assert!(looks_like_repo_relative_path("README.md"));
+        assert!(looks_like_repo_relative_path(
+            ".agents/scripts/o2-autopilot"
+        ));
+    }
+
+    #[test]
+    fn propose_task_decomposition_names_missing_explicit_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
+        write_file(repo, "README.md", "# Project\n");
+
+        let error =
+            propose_task_decomposition(repo, "", "- Update `.agents/skills/missing/SKILL.md`.")
+                .expect_err("missing named path");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(".agents/skills/missing/SKILL.md"),
+            "{message}"
+        );
+        assert!(message.contains("not a readable regular file"), "{message}");
+    }
+
+    #[test]
+    fn propose_task_decomposition_uses_named_paths_when_inventory_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
+        write_file(repo, ".agents/skills/demo/SKILL.md", "# Skill\n");
+        let _override = RepositoryInventoryDurationOverride::set(Duration::from_nanos(1));
+
+        let proposal =
+            propose_task_decomposition(repo, "", "- Update `.agents/skills/demo/SKILL.md`.")
+                .expect("named path survives inventory failure");
+
+        assert_eq!(proposal.assignments.len(), 1);
+        assert_eq!(
+            proposal.assignments[0].assigned_paths,
+            vec![PathBuf::from(".agents/skills/demo/SKILL.md")]
+        );
+    }
+
+    #[test]
     fn collect_repo_files_excludes_local_agent_runtime_state() {
+        skip_without_containment!();
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path();
         git2::Repository::init(repo).expect("init repo");
@@ -3200,6 +4080,7 @@ mod tests {
 
     #[test]
     fn collect_repo_files_excludes_git_ignored_directory() {
+        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
@@ -3219,6 +4100,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn collect_repo_files_never_follows_links_or_accepts_unsafe_files() {
+        skip_without_containment!();
         use std::os::unix::{fs::symlink, net::UnixListener};
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -3236,6 +4118,175 @@ mod tests {
 
         let files = collect_repo_files(&repo).expect("collect files");
         assert_eq!(files, vec![PathBuf::from("README.md")]);
+    }
+
+    #[test]
+    fn heuristic_replans_from_feedback_without_a_planner_model() {
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "src/alpha.rs", "pub fn alpha_task() {}\n");
+            write_file(repo, "src/beta.rs", "pub fn beta_task() {}\n");
+            write_file(repo, "src/gamma.rs", "pub fn gamma_task() {}\n");
+            let config = ProviderPlanningConfig::new("feedback", "planner-model");
+            let mut session = propose_task_decomposition_with_optional_provider(
+                repo,
+                "",
+                "- Update alpha_task in src/alpha.rs.\n- Update beta_task in src/beta.rs.",
+                None,
+                &config,
+            )
+            .expect("heuristic session");
+            assert_eq!(session.source(), TaskPlanningSource::Heuristic);
+            assert_eq!(session.proposal().assignments.len(), 2);
+            assert_eq!(
+                session.proposal().assignments[0].assigned_paths,
+                vec![PathBuf::from("src/alpha.rs")]
+            );
+            assert_eq!(
+                session.proposal().assignments[1].assigned_paths,
+                vec![PathBuf::from("src/beta.rs")]
+            );
+
+            let first_feedback = TaskExecutionFeedback {
+                completed_assignment_ids: vec!["assignment-001".to_string()],
+                failed_assignment_ids: vec!["assignment-002".to_string()],
+                coverage_gap_fragment_ids: vec!["fragment-002".to_string()],
+                notes: vec!["execution found the implementation in src/gamma.rs".to_string()],
+            };
+            replan_task_decomposition_from_feedback(repo, &mut session, &first_feedback)
+                .expect("first feedback re-plan");
+            assert_eq!(session.replans_used(), 1);
+            assert_eq!(session.source(), TaskPlanningSource::Heuristic);
+            assert_eq!(session.completed_fragment_ids().len(), 1);
+            assert_eq!(session.completed_assignments().len(), 1);
+            assert_eq!(
+                session.completed_assignments()[0].assigned_paths,
+                vec![PathBuf::from("src/alpha.rs")]
+            );
+            assert_eq!(session.proposal().assignments.len(), 1);
+            assert_eq!(
+                session.proposal().assignments[0].id,
+                "assignment-replan-01-001"
+            );
+            assert!(
+                session.proposal().assignments[0]
+                    .assigned_paths
+                    .contains(&PathBuf::from("src/gamma.rs")),
+                "remaining work should pick up the feedback path: {:?}",
+                session.proposal().assignments[0].assigned_paths
+            );
+            assert!(
+                !session.proposal().assignments[0]
+                    .assigned_paths
+                    .contains(&PathBuf::from("src/alpha.rs")),
+                "remaining work must not reclaim completed alpha"
+            );
+            assert!(session
+                .proposal()
+                .diagnostics
+                .notes
+                .iter()
+                .any(|note| note.contains("without a planner model")));
+
+            let second_feedback = TaskExecutionFeedback {
+                failed_assignment_ids: vec!["assignment-replan-01-001".to_string()],
+                notes: vec!["retry remaining work in src/gamma.rs".to_string()],
+                ..TaskExecutionFeedback::default()
+            };
+            replan_task_decomposition_from_feedback(repo, &mut session, &second_feedback)
+                .expect("second feedback re-plan");
+            assert_eq!(session.replans_used(), MAX_PROVIDER_REPLANS);
+            assert_eq!(
+                session.proposal().assignments[0].id,
+                "assignment-replan-02-001"
+            );
+
+            let limit_error =
+                replan_task_decomposition_from_feedback(repo, &mut session, &second_feedback)
+                    .expect_err("third re-plan must be rejected");
+            assert!(limit_error.to_string().contains("limit of 2 attempt"));
+        });
+    }
+
+    #[test]
+    fn heuristic_replan_rejects_completed_scope_reclaim_and_provider_sessions() {
+        // Heuristic rematch already refuses completed-scope reclaim. Inventory
+        // and provider-session setup still use isolated git.
+        skip_without_containment!();
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "src/alpha.rs", "pub fn alpha_task() {}\n");
+            write_file(repo, "src/beta.rs", "pub fn beta_task() {}\n");
+            let config = ProviderPlanningConfig::new("reclaim", "planner-model");
+            let mut session = propose_task_decomposition_with_optional_provider(
+                repo,
+                "",
+                "- Update alpha_task in src/alpha.rs.\n- Update beta_task in src/beta.rs.",
+                None,
+                &config,
+            )
+            .expect("heuristic session");
+            let reclaim_error = replan_task_decomposition_from_feedback(
+                repo,
+                &mut session,
+                &TaskExecutionFeedback {
+                    completed_assignment_ids: vec!["assignment-001".to_string()],
+                    failed_assignment_ids: vec!["assignment-002".to_string()],
+                    coverage_gap_fragment_ids: vec!["fragment-002".to_string()],
+                    notes: vec!["keep using src/alpha.rs".to_string()],
+                },
+            )
+            .expect_err("reclaiming completed scope must fail");
+            assert!(reclaim_error
+                .to_string()
+                .contains("reclaims completed scope"));
+
+            let empty_error = replan_task_decomposition_from_feedback(
+                repo,
+                &mut session,
+                &TaskExecutionFeedback::default(),
+            )
+            .expect_err("empty feedback must fail");
+            assert!(empty_error
+                .to_string()
+                .contains("re-planning requires at least one execution feedback item"));
+
+            let provider_plan = ProviderTaskPlan {
+                assignments: vec![
+                    provider_assignment("alpha", "Update alpha", "fragment-001", "src/alpha.rs"),
+                    provider_assignment("beta", "Update beta", "fragment-002", "src/beta.rs"),
+                ],
+            };
+            let mut provider = FakeProvider::new("fake-planner", "planner-model");
+            provider
+                .push_json_response("reclaim-proposal", &provider_plan)
+                .expect("script provider plan");
+            let mut provider_session = propose_task_decomposition_with_provider(
+                repo,
+                "",
+                "- Update alpha behavior.\n- Update beta behavior.",
+                &mut provider,
+                &config,
+            )
+            .expect("provider session");
+            let provider_error = replan_task_decomposition_from_feedback(
+                repo,
+                &mut provider_session,
+                &TaskExecutionFeedback {
+                    failed_assignment_ids: vec!["beta".to_string()],
+                    notes: vec!["use heuristic rematch".to_string()],
+                    ..TaskExecutionFeedback::default()
+                },
+            )
+            .expect_err("provider sessions must use the provider re-plan path");
+            assert!(provider_error
+                .to_string()
+                .contains("requires a heuristic planning session"));
+        });
     }
 
     fn write_file(repo: &Path, relative: &str, contents: &str) {

@@ -100,7 +100,7 @@ impl SafeSetStore for MemorySafeSet {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DifficultyPrediction {
     pub score_bp: u16,
     pub lower_bp: u16,
@@ -242,6 +242,105 @@ impl CheapDifficultyPredictor {
     }
 }
 
+/// Which predictor stage produced a difficulty verdict.
+///
+/// [`PredictorStage::Cheap`] is the calibrated first stage. It never calls a
+/// model. [`PredictorStage::Full`] is the existing phase-4 router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictorStage {
+    Cheap,
+    Full,
+}
+
+impl PredictorStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cheap => "cheap",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// Verdict from [`CheapPredictorStage`]. Candidates are never enumerated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredictorStageVerdict {
+    pub stage: PredictorStage,
+    pub prediction: DifficultyPrediction,
+    pub short_circuit: bool,
+}
+
+/// Cheap first-stage difficulty predictor (#200).
+///
+/// Pure and deterministic over static #163 features only. It may skip full
+/// deliberation; it never selects a policy or relaxes a quality constraint.
+#[derive(Debug, Clone)]
+pub struct CheapPredictorStage {
+    predictor: CheapDifficultyPredictor,
+}
+
+impl Default for CheapPredictorStage {
+    fn default() -> Self {
+        Self {
+            predictor: CheapDifficultyPredictor::new(),
+        }
+    }
+}
+
+impl CheapPredictorStage {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_predictor(predictor: CheapDifficultyPredictor) -> Self {
+        Self { predictor }
+    }
+
+    pub fn with_threshold(mut self, threshold_bp: u16) -> Self {
+        self.predictor = self.predictor.with_threshold(threshold_bp);
+        self
+    }
+
+    pub fn threshold_bp(&self) -> u16 {
+        self.predictor.threshold_bp()
+    }
+
+    pub fn predictor(&self) -> &CheapDifficultyPredictor {
+        &self.predictor
+    }
+
+    pub fn predictor_mut(&mut self) -> &mut CheapDifficultyPredictor {
+        &mut self.predictor
+    }
+
+    pub fn into_predictor(self) -> CheapDifficultyPredictor {
+        self.predictor
+    }
+
+    pub fn predict(&self, task: &FeatureBag, repo: &FeatureBag) -> DifficultyPrediction {
+        self.predictor.predict(task, repo)
+    }
+
+    /// Classify the task. Confidently-easy work stays on the cheap stage;
+    /// a straddling or high band escalates to the full router.
+    pub fn decide(&self, task: &FeatureBag, repo: &FeatureBag) -> PredictorStageVerdict {
+        let prediction = self.predict(task, repo);
+        if prediction.confidently_below(self.threshold_bp()) {
+            PredictorStageVerdict {
+                stage: PredictorStage::Cheap,
+                prediction,
+                short_circuit: true,
+            }
+        } else {
+            PredictorStageVerdict {
+                stage: PredictorStage::Full,
+                prediction,
+                short_circuit: false,
+            }
+        }
+    }
+}
+
 fn static_difficulty(task: &FeatureBag, repo: &FeatureBag) -> (u16, u16) {
     let mut score: i64 = 1_500;
     let mut signals = 0u32;
@@ -324,38 +423,115 @@ fn feature_bucket(task: &FeatureBag, repo: &FeatureBag) -> u64 {
         .wrapping_add(size_bin as u64)
 }
 
+/// Explicit ceiling on the router's own decision cost (#200).
+///
+/// The ceiling is a fraction of predicted task cost. Wall-clock microseconds
+/// and any tokens spent on the decision itself are recorded; exceeding the
+/// ceiling is a measured degradation, not a free routing step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouterCostBudget {
+    pub fraction_bp: u16,
+    pub predicted_task_cost_micros: i64,
+    pub wall_clock_micros: i64,
+    #[serde(default)]
+    pub decision_tokens: i64,
+}
+
+impl Default for RouterCostBudget {
+    fn default() -> Self {
+        Self {
+            fraction_bp: DEFAULT_OVERHEAD_FRACTION_BP,
+            predicted_task_cost_micros: 10_000_000,
+            wall_clock_micros: 0,
+            decision_tokens: 0,
+        }
+    }
+}
+
+impl RouterCostBudget {
+    pub fn new(fraction_bp: u16, predicted_task_cost_micros: i64) -> Self {
+        Self {
+            fraction_bp: fraction_bp.min(10_000),
+            predicted_task_cost_micros,
+            wall_clock_micros: 0,
+            decision_tokens: 0,
+        }
+    }
+
+    pub fn with_wall_clock(mut self, wall_clock_micros: i64) -> Self {
+        self.wall_clock_micros = wall_clock_micros;
+        self
+    }
+
+    pub fn with_decision_tokens(mut self, decision_tokens: i64) -> Self {
+        self.decision_tokens = decision_tokens;
+        self
+    }
+
+    pub fn ceiling_micros(&self) -> i64 {
+        self.predicted_task_cost_micros
+            .saturating_mul(i64::from(self.fraction_bp))
+            / 10_000
+    }
+
+    pub fn exceeded(&self) -> bool {
+        self.wall_clock_micros > self.ceiling_micros()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TwoStageConfig {
     pub overhead_fraction_bp: u16,
     pub predicted_task_cost_micros: i64,
     pub scripted_overhead_micros: i64,
+    /// Explicit ceiling on the cost of the routing decision itself.
+    #[serde(default)]
+    pub router_cost_budget: RouterCostBudget,
 }
 
 impl Default for TwoStageConfig {
     fn default() -> Self {
+        let router_cost_budget = RouterCostBudget::default();
         Self {
-            overhead_fraction_bp: DEFAULT_OVERHEAD_FRACTION_BP,
-            predicted_task_cost_micros: 10_000_000,
-            scripted_overhead_micros: 0,
+            overhead_fraction_bp: router_cost_budget.fraction_bp,
+            predicted_task_cost_micros: router_cost_budget.predicted_task_cost_micros,
+            scripted_overhead_micros: router_cost_budget.wall_clock_micros,
+            router_cost_budget,
         }
     }
 }
 
 impl TwoStageConfig {
     pub fn budget_micros(&self) -> i64 {
-        self.predicted_task_cost_micros
-            .saturating_mul(i64::from(self.overhead_fraction_bp))
-            / 10_000
+        self.resolved_router_cost_budget().ceiling_micros()
     }
 
     pub fn overhead_exceeded(&self) -> bool {
-        self.scripted_overhead_micros > self.budget_micros()
+        self.resolved_router_cost_budget().exceeded()
+    }
+
+    /// Prefer the explicit [`Self::router_cost_budget`] field; fill gaps from
+    /// the older scripted fields so existing fixtures keep working.
+    pub fn resolved_router_cost_budget(&self) -> RouterCostBudget {
+        let mut budget = self.router_cost_budget;
+        if budget.fraction_bp == 0 {
+            budget.fraction_bp = self.overhead_fraction_bp;
+        }
+        if budget.predicted_task_cost_micros <= 0 {
+            budget.predicted_task_cost_micros = self.predicted_task_cost_micros;
+        }
+        if budget.wall_clock_micros == 0 {
+            budget.wall_clock_micros = self.scripted_overhead_micros;
+        }
+        budget
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionOverhead {
     pub wall_clock_micros: i64,
+    #[serde(default)]
+    pub decision_tokens: i64,
     pub predicted_task_cost_micros: i64,
     pub budget_micros: i64,
     pub exceeded: bool,
@@ -363,11 +539,16 @@ pub struct DecisionOverhead {
 
 impl DecisionOverhead {
     pub fn from_config(config: &TwoStageConfig) -> Self {
+        Self::from_budget(&config.resolved_router_cost_budget())
+    }
+
+    pub fn from_budget(budget: &RouterCostBudget) -> Self {
         Self {
-            wall_clock_micros: config.scripted_overhead_micros,
-            predicted_task_cost_micros: config.predicted_task_cost_micros,
-            budget_micros: config.budget_micros(),
-            exceeded: config.overhead_exceeded(),
+            wall_clock_micros: budget.wall_clock_micros,
+            decision_tokens: budget.decision_tokens,
+            predicted_task_cost_micros: budget.predicted_task_cost_micros,
+            budget_micros: budget.ceiling_micros(),
+            exceeded: budget.exceeded(),
         }
     }
 }
@@ -383,14 +564,23 @@ pub struct Stage1Gate {
 }
 
 impl Stage1Gate {
+    pub fn cheap_predictor_stage(&self) -> CheapPredictorStage {
+        CheapPredictorStage::from_predictor(self.predictor.clone())
+    }
+
     pub fn decide(&mut self, state: &OptimizerState) -> Result<Stage1Decision, OptimizerError> {
         let economical = SafePolicy::admit(self.economical.clone(), self.safe_set.as_ref())?;
         let baseline = SafePolicy::admit(self.baseline.clone(), self.safe_set.as_ref())?;
-        let prediction = self
-            .predictor
-            .predict(&state.task_features, &state.repo_features);
+        let verdict = self
+            .cheap_predictor_stage()
+            .decide(&state.task_features, &state.repo_features);
+        let prediction = verdict.prediction;
         if self.config.predicted_task_cost_micros <= 0 {
             self.config.predicted_task_cost_micros = predicted_task_cost_micros(state);
+        }
+        if self.config.router_cost_budget.predicted_task_cost_micros <= 0 {
+            self.config.router_cost_budget.predicted_task_cost_micros =
+                self.config.predicted_task_cost_micros;
         }
         let overhead = DecisionOverhead::from_config(&self.config);
         if overhead.exceeded {
@@ -402,7 +592,7 @@ impl Stage1Gate {
                 enumerated_candidates: false,
             });
         }
-        if prediction.confidently_below(self.predictor.threshold_bp()) {
+        if verdict.short_circuit {
             self.predictor.record_short_circuit(false);
             return Ok(Stage1Decision {
                 path: StagePath::Stage1ShortCircuit,
@@ -459,7 +649,7 @@ impl TwoStageRouter {
                 vec![policy.policy().policy_id.clone()],
             );
             annotate_stage(&mut diagnostics, &front);
-            return Ok(select_policy_for_tests(
+            return Ok(select_resolved_policy(
                 state,
                 policy.policy(),
                 diagnostics,
@@ -494,7 +684,7 @@ impl OnlineRouter for TwoStageRouter {
                 vec![policy.policy().policy_id.clone()],
             );
             annotate_stage(&mut diagnostics, &front);
-            return Ok(select_policy_for_tests(
+            return Ok(select_resolved_policy(
                 state,
                 policy.policy(),
                 diagnostics,
@@ -542,7 +732,7 @@ impl CheckpointRouter {
                 vec![policy.policy().policy_id.clone()],
             );
             annotate_stage(&mut diagnostics, &front);
-            let router = select_policy_for_tests(
+            let router = select_resolved_policy(
                 state,
                 policy.policy(),
                 diagnostics,
@@ -581,7 +771,7 @@ impl CheckpointRouter {
 
 /// Narrow helper so stage 1 can emit a `RouterDecision` without exposing
 /// the private `select_policy` constructor. Tests also use this.
-pub fn select_policy_for_tests(
+pub fn select_resolved_policy(
     state: &OptimizerState,
     policy: &PolicyGraph,
     mut diagnostics: DecisionDiagnostics,
@@ -743,6 +933,8 @@ mod tests {
                 overhead_fraction_bp: 500,
                 predicted_task_cost_micros: 10_000_000,
                 scripted_overhead_micros: overhead,
+                router_cost_budget: RouterCostBudget::new(500, 10_000_000)
+                    .with_wall_clock(overhead),
             },
         }
     }
@@ -829,6 +1021,57 @@ mod tests {
         gate.economical = graph("unsafe", "model-z");
         let err = gate.decide(&easy_state()).expect_err("outside");
         assert!(err.to_string().contains("outside the safe set"));
+    }
+
+    #[test]
+    fn cheap_predictor_stage_short_circuits_confidently_easy_tasks() {
+        let stage = CheapPredictorStage::new().with_threshold(8_000);
+        let state = easy_state();
+        let verdict = stage.decide(&state.task_features, &state.repo_features);
+        assert_eq!(verdict.stage, PredictorStage::Cheap);
+        assert!(verdict.short_circuit);
+        assert!(verdict.prediction.confidently_below(8_000));
+        assert!(verdict.prediction.upper_bp >= verdict.prediction.score_bp);
+    }
+
+    #[test]
+    fn cheap_predictor_stage_escalates_when_uncertainty_straddles() {
+        let stage = CheapPredictorStage::new().with_threshold(2_000);
+        let mut task = FeatureBag::new();
+        put_int(&mut task, keys::TASK_ESTIMATED_FILES_AFFECTED, 2);
+        let verdict = stage.decide(&task, &FeatureBag::new());
+        assert!(
+            verdict.prediction.straddles(2_000) || !verdict.prediction.confidently_below(2_000),
+            "pred={:?}",
+            verdict.prediction
+        );
+        if verdict.prediction.straddles(2_000) {
+            assert_eq!(verdict.stage, PredictorStage::Full);
+            assert!(!verdict.short_circuit);
+        }
+    }
+
+    #[test]
+    fn router_cost_budget_is_an_explicit_fraction_of_predicted_task_cost() {
+        let budget = RouterCostBudget::new(500, 10_000_000)
+            .with_wall_clock(9_000_000)
+            .with_decision_tokens(12);
+        assert_eq!(budget.ceiling_micros(), 500_000);
+        assert!(budget.exceeded());
+        assert_eq!(budget.decision_tokens, 12);
+
+        let config = TwoStageConfig {
+            overhead_fraction_bp: 500,
+            predicted_task_cost_micros: 10_000_000,
+            scripted_overhead_micros: 9_000_000,
+            router_cost_budget: budget,
+        };
+        assert_eq!(config.router_cost_budget, budget);
+        assert_eq!(config.budget_micros(), 500_000);
+        let overhead = DecisionOverhead::from_config(&config);
+        assert!(overhead.exceeded);
+        assert_eq!(overhead.decision_tokens, 12);
+        assert_eq!(overhead.budget_micros, 500_000);
     }
 
     #[test]

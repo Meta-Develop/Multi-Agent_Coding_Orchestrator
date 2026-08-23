@@ -4,7 +4,7 @@
 //! slug table. Unknown models have no judgment authority (fail closed).
 
 use super::AgentRole;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -85,6 +85,39 @@ impl OrchestrationPhase {
         !matches!(self, Self::MechanicalTerminal)
     }
 }
+
+/// Tracked lite instruction profile for mechanical-terminal weak models.
+///
+/// Judgment phases never receive this profile. `BudgetAction::Degrade` to a
+/// weaker tier may attach it only when the degraded phase already permits
+/// [`ModelCapabilityClass::WeakMechanical`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackedLiteInstructionProfile {
+    pub id: &'static str,
+    pub version: u32,
+    pub applies_to_phase: OrchestrationPhase,
+}
+
+pub const WEAK_MECHANICAL_LITE_PROFILE_ID: &str = "maco-weak-mechanical-lite-v1";
+pub const WEAK_MECHANICAL_LITE_PROFILE_VERSION: u32 = 1;
+
+/// Shipped mechanical-only lite profile. Discovery, triage, merge, gate, audit,
+/// and review stay hard-excluded.
+pub const WEAK_MECHANICAL_LITE_PROFILE: TrackedLiteInstructionProfile =
+    TrackedLiteInstructionProfile {
+        id: WEAK_MECHANICAL_LITE_PROFILE_ID,
+        version: WEAK_MECHANICAL_LITE_PROFILE_VERSION,
+        applies_to_phase: OrchestrationPhase::MechanicalTerminal,
+    };
+
+const WEAK_MECHANICAL_LITE_PROFILE_BODY: &str = "\
+This session uses the weak-mechanical instruction profile.
+- Execute only the assigned mechanical steps. Do not invent scope, policy, or extra work.
+- Prefer the exact command, path, schema, or helper already named in this prompt.
+- One instruction at a time. Do not stack compound judgment.
+- If a required helper, schema, path, or command is missing or fails, stop and report the block. Do not fall back to open-ended judgment.
+- Discovery, triage, merge, and acceptance decisions are out of scope. Report them upward instead of taking them over.
+- Do not relax ownership, journaling, validation, or audit requirements.";
 
 /// Closed list of duties that a constrained weak-model profile may perform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -191,8 +224,12 @@ impl ModelCapabilityPolicy {
         self.models.iter().find(|entry| entry.model == model)
     }
 
-    /// Eligible capability for `model`, or `None` when the slug is unknown or
-    /// explicitly ineligible.
+    /// Eligible capability for `model` from this static/overlay table.
+    ///
+    /// This lookup does not consult measured catalog/evidence. Callers that
+    /// grant judgment authority must go through
+    /// [`validate_known_judgment_role_model`], which fail-closes when this
+    /// table would override a dated ineligibility.
     pub fn capability_for(&self, model: &str) -> Option<ModelCapabilityClass> {
         self.lookup(model)
             .and_then(|entry| entry.eligible.then_some(entry.capability))
@@ -201,10 +238,12 @@ impl ModelCapabilityPolicy {
 
 /// Shipped default: dated 2026-08 priors from agent-registry#38.
 ///
-/// `gpt-5.6-sol` is the judgment/planner tier. `gpt-5.6-luna` is a capable
-/// worker for tightly specified leaves, not a weak-mechanical-only model.
-/// `gpt-5.6-terra` is recorded as ineligible: weaker than luna on agentic
-/// coding and more expensive per solved task.
+/// This table is fallback-only when no measured catalog/evidence prior exists
+/// for a slug. It must not authorize a model that dated evidence marks
+/// ineligible. `gpt-5.6-sol` is the judgment/planner tier. `gpt-5.6-luna` is a
+/// capable worker for tightly specified leaves, not a weak-mechanical-only
+/// model. `gpt-5.6-terra` is recorded as ineligible: weaker than luna on
+/// agentic coding and more expensive per solved task.
 pub fn default_model_capability_policy() -> ModelCapabilityPolicy {
     ModelCapabilityPolicy {
         id: "maco-default-model-capability-v1".to_string(),
@@ -399,6 +438,67 @@ pub fn validate_budget_model_degradation(
     )
 }
 
+fn recorded_model_capability_class(model: &str) -> Option<ModelCapabilityClass> {
+    current_model_capability_policy()
+        .lookup(model)
+        .map(|entry| entry.capability)
+}
+
+/// Whether `phase` may ever receive the tracked lite instruction profile.
+pub const fn phase_permits_lite_instruction_profile(phase: OrchestrationPhase) -> bool {
+    !phase.hard_excludes_weak_models()
+        && matches!(
+            WEAK_MECHANICAL_LITE_PROFILE.applies_to_phase,
+            OrchestrationPhase::MechanicalTerminal
+        )
+        && matches!(phase, OrchestrationPhase::MechanicalTerminal)
+}
+
+/// Attach the tracked lite profile only for Worker + MechanicalTerminal when
+/// the selected model is recorded [`ModelCapabilityClass::WeakMechanical`].
+pub fn lite_instruction_profile_applies(
+    role: AgentRole,
+    phase: OrchestrationPhase,
+    model: Option<&str>,
+) -> bool {
+    role == AgentRole::Worker
+        && phase_permits_lite_instruction_profile(phase)
+        && matches!(
+            model.and_then(recorded_model_capability_class),
+            Some(ModelCapabilityClass::WeakMechanical)
+        )
+}
+
+/// `BudgetAction::Degrade` to a weaker tier may apply the lite profile only
+/// to phases that already allow `WeakMechanical`. Judgment phases stay
+/// hard-excluded even when the degrade target is a weaker capability.
+pub fn budget_degrade_attaches_lite_instruction_profile(
+    role: AgentRole,
+    phase: OrchestrationPhase,
+    mechanical_duty: Option<MechanicalTerminalDuty>,
+    target_capability: ModelCapabilityClass,
+) -> bool {
+    if !phase_permits_lite_instruction_profile(phase) {
+        return false;
+    }
+    match validate_budget_model_degradation(role, phase, mechanical_duty, target_capability) {
+        Ok(decision) => {
+            decision.weak_model_permitted
+                && target_capability == ModelCapabilityClass::WeakMechanical
+        }
+        Err(_) => false,
+    }
+}
+
+/// Render the tracked lite profile section. Callers must gate with
+/// [`lite_instruction_profile_applies`] so judgment phases never receive it.
+pub fn render_mechanical_lite_instruction_profile_section() -> String {
+    format!(
+        "\nINSTRUCTION_PROFILE: {}\nReason: low_tier_capability\n\n{}\n",
+        WEAK_MECHANICAL_LITE_PROFILE.id, WEAK_MECHANICAL_LITE_PROFILE_BODY
+    )
+}
+
 /// Authorize the model that a catalog resolution actually selected.
 ///
 /// A concrete resolved slug must have trusted capability evidence. Runtime-default
@@ -428,11 +528,42 @@ pub fn authorize_resolved_judgment_model(
     }
 }
 
+fn authority_role_for(role: AgentRole) -> crate::selection::AuthorityRole {
+    match role {
+        AgentRole::Supervisor => crate::selection::AuthorityRole::AcceptanceGate,
+        AgentRole::ChildOrchestrator => crate::selection::AuthorityRole::Delegating,
+        AgentRole::Worker => crate::selection::AuthorityRole::TerminalLeaf,
+        AgentRole::GateClassifier => crate::selection::AuthorityRole::FailureClassification,
+        AgentRole::Auditor => crate::selection::AuthorityRole::ReviewAuditor,
+    }
+}
+
+fn reject_static_tier_override_of_measured(role: AgentRole, model: &str) -> Result<()> {
+    let eligibility = crate::selection::measured_authority_eligibility(model, authority_role_for(role))
+        .map_err(|error| {
+            anyhow!(
+                "measured catalog/evidence eligibility could not be loaded for model '{model}': {error}"
+            )
+        })?;
+    match eligibility {
+        crate::selection::MeasuredAuthorityEligibility::Ineligible { reason } => {
+            bail!(
+                "model '{model}' is ineligible by measured catalog/evidence for role '{}': {reason}; static capability tier cannot override measured eligibility",
+                role.as_str()
+            );
+        }
+        crate::selection::MeasuredAuthorityEligibility::Eligible
+        | crate::selection::MeasuredAuthorityEligibility::NoDatedEvidence => Ok(()),
+    }
+}
+
 /// Fail-closed authority check for a resolved role/model pair.
 ///
 /// Missing model identity and unknown/ineligible slugs cannot grant judgment
-/// authority. Workers are not granted weak-mechanical authority here; that
-/// requires a future typed executor.
+/// authority. Measured catalog/evidence ineligibility wins over a static tier
+/// row. The static table remains fallback only when no dated prior exists.
+/// Workers are not granted weak-mechanical authority here; that requires a
+/// future typed executor.
 pub fn validate_known_judgment_role_model(role: AgentRole, model: Option<&str>) -> Result<()> {
     let Some(model) = model else {
         bail!(
@@ -440,6 +571,7 @@ pub fn validate_known_judgment_role_model(role: AgentRole, model: Option<&str>) 
             role.as_str()
         );
     };
+    reject_static_tier_override_of_measured(role, model)?;
     let Some(capability) = trusted_model_capability(model) else {
         bail!("model '{model}' has no trusted capability policy");
     };
@@ -490,7 +622,7 @@ pub fn install_test_fixture_models(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supervise::{ModelResolutionObservation, SupervisorRuntime};
+    use crate::supervise::{ModelResolutionObservation, SupervisorRuntime, BALANCED_PROFILE_MODEL};
 
     #[test]
     fn default_policy_ranks_luna_above_ineligible_terra() {
@@ -524,18 +656,73 @@ mod tests {
         let terra =
             validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("gpt-5.6-terra"))
                 .expect_err("ineligible terra");
-        assert!(terra
-            .to_string()
-            .contains("has no trusted capability policy"));
+        let terra_message = terra.to_string();
+        assert!(
+            terra_message.contains("static capability tier cannot override measured eligibility")
+                || terra_message.contains("has no trusted capability policy"),
+            "{terra_message}"
+        );
 
-        validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("gpt-5.6-luna"))
-            .expect("luna is general judgment");
+        let luna_child =
+            validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("gpt-5.6-luna"))
+                .expect_err("luna measured evidence forbids delegating judgment");
+        assert!(luna_child
+            .to_string()
+            .contains("static capability tier cannot override measured eligibility"));
+        validate_known_judgment_role_model(AgentRole::Worker, Some("gpt-5.6-luna"))
+            .expect("luna remains a measured leaf worker");
         validate_known_judgment_role_model(AgentRole::Auditor, Some("gpt-5.6-sol"))
             .expect("sol is critical judgment");
         let auditor_luna =
             validate_known_judgment_role_model(AgentRole::Auditor, Some("gpt-5.6-luna"))
                 .expect_err("luna is below auditor floor");
-        assert!(auditor_luna.to_string().contains("judgment floor"));
+        let auditor_message = auditor_luna.to_string();
+        assert!(
+            auditor_message.contains("static capability tier cannot override measured eligibility")
+                || auditor_message.contains("judgment floor"),
+            "{auditor_message}"
+        );
+    }
+
+    #[test]
+    fn static_tier_cannot_override_measured_ineligibility() {
+        let policy = default_model_capability_policy();
+        assert_eq!(
+            policy.capability_for("gpt-5.6-luna"),
+            Some(ModelCapabilityClass::GeneralJudgment),
+            "static table remains as fallback classification"
+        );
+        let error =
+            validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("gpt-5.6-luna"))
+                .expect_err("static GeneralJudgment must not authorize luna for delegating");
+        assert!(error
+            .to_string()
+            .contains("static capability tier cannot override measured eligibility"));
+
+        let overlay = install_model_capability_policy(ModelCapabilityPolicy {
+            id: "maco-test-terra-override-v1".to_string(),
+            version: 1,
+            source: "test overlay that tries to revive a measured-ineligible slug".to_string(),
+            models: vec![ModelCapabilityEvidence {
+                model: "gpt-5.6-terra".to_string(),
+                capability: ModelCapabilityClass::CriticalJudgment,
+                eligible: true,
+                evidence: "overlay must not beat measured prohibition".to_string(),
+                as_of: "test".to_string(),
+            }],
+        })
+        .expect("install contradictory overlay");
+        assert_eq!(
+            current_model_capability_policy().capability_for("gpt-5.6-terra"),
+            Some(ModelCapabilityClass::CriticalJudgment)
+        );
+        let terra =
+            validate_known_judgment_role_model(AgentRole::ChildOrchestrator, Some("gpt-5.6-terra"))
+                .expect_err("overlay cannot revive measured-ineligible terra");
+        assert!(terra
+            .to_string()
+            .contains("static capability tier cannot override measured eligibility"));
+        drop(overlay);
     }
 
     #[test]
@@ -566,6 +753,102 @@ mod tests {
             ModelCapabilityClass::GeneralJudgment,
         )
         .expect_err("auditor cannot degrade below critical");
+
+        for phase in [
+            OrchestrationPhase::Discovery,
+            OrchestrationPhase::Triage,
+            OrchestrationPhase::Planning,
+            OrchestrationPhase::Implementation,
+            OrchestrationPhase::ValidationInterpretation,
+            OrchestrationPhase::Merge,
+            OrchestrationPhase::GateClassification,
+            OrchestrationPhase::ReviewAcceptance,
+            OrchestrationPhase::Audit,
+        ] {
+            assert!(
+                phase.hard_excludes_weak_models(),
+                "{} must stay hard-excluded",
+                phase.as_str()
+            );
+            assert!(!phase_permits_lite_instruction_profile(phase));
+            assert!(!lite_instruction_profile_applies(
+                AgentRole::Worker,
+                phase,
+                Some(BALANCED_PROFILE_MODEL),
+            ));
+            assert!(!budget_degrade_attaches_lite_instruction_profile(
+                AgentRole::Worker,
+                phase,
+                Some(MechanicalTerminalDuty::RunPreselectedCommand),
+                ModelCapabilityClass::WeakMechanical,
+            ));
+            assert!(validate_phase_model_binding(
+                AgentRole::Worker,
+                phase,
+                None,
+                ModelCapabilityClass::WeakMechanical,
+            )
+            .is_err());
+            assert!(validate_known_judgment_role_model(
+                AgentRole::ChildOrchestrator,
+                Some("unknown-local-model"),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn lite_profile_is_mechanical_terminal_only_including_after_budget_degrade() {
+        assert_eq!(
+            WEAK_MECHANICAL_LITE_PROFILE.applies_to_phase,
+            OrchestrationPhase::MechanicalTerminal
+        );
+        assert_eq!(
+            WEAK_MECHANICAL_LITE_PROFILE.id,
+            "maco-weak-mechanical-lite-v1"
+        );
+        assert!(phase_permits_lite_instruction_profile(
+            OrchestrationPhase::MechanicalTerminal
+        ));
+        assert!(lite_instruction_profile_applies(
+            AgentRole::Worker,
+            OrchestrationPhase::MechanicalTerminal,
+            Some(BALANCED_PROFILE_MODEL),
+        ));
+        assert!(!lite_instruction_profile_applies(
+            AgentRole::Worker,
+            OrchestrationPhase::MechanicalTerminal,
+            Some("unknown-local-model"),
+        ));
+        assert!(!lite_instruction_profile_applies(
+            AgentRole::Auditor,
+            OrchestrationPhase::MechanicalTerminal,
+            Some(BALANCED_PROFILE_MODEL),
+        ));
+        assert!(budget_degrade_attaches_lite_instruction_profile(
+            AgentRole::Worker,
+            OrchestrationPhase::MechanicalTerminal,
+            Some(MechanicalTerminalDuty::ValidateAgainstFixedSchema),
+            ModelCapabilityClass::WeakMechanical,
+        ));
+        assert!(!budget_degrade_attaches_lite_instruction_profile(
+            AgentRole::Auditor,
+            OrchestrationPhase::Audit,
+            None,
+            ModelCapabilityClass::WeakMechanical,
+        ));
+        assert!(!budget_degrade_attaches_lite_instruction_profile(
+            AgentRole::ChildOrchestrator,
+            OrchestrationPhase::Implementation,
+            None,
+            ModelCapabilityClass::GeneralJudgment,
+        ));
+        let section = render_mechanical_lite_instruction_profile_section();
+        assert!(section.contains("INSTRUCTION_PROFILE: maco-weak-mechanical-lite-v1"));
+        assert!(section.contains("stop and report the block"));
+        assert!(
+            section.contains("Discovery, triage, merge, and acceptance decisions are out of scope")
+        );
     }
 
     #[test]

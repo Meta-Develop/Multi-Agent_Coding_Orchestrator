@@ -55,6 +55,20 @@ pub enum AuthorityRole {
 }
 
 impl AuthorityRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TerminalLeaf => "terminal_leaf",
+            Self::Delegating => "delegating",
+            Self::AcceptanceGate => "acceptance_gate",
+            Self::ReviewAuditor => "review_auditor",
+            Self::Audit => "audit",
+            Self::ConflictResolution => "conflict_resolution",
+            Self::FailureClassification => "failure_classification",
+            Self::GitPublication => "git_publication",
+            Self::UnknownJudgment => "unknown_judgment",
+        }
+    }
+
     pub(crate) fn requires_exact_judgment_evidence(self) -> bool {
         !matches!(self, Self::TerminalLeaf)
     }
@@ -244,6 +258,79 @@ pub struct PriorDataset {
     pub published_on: String,
     pub objective_profiles: Vec<ObjectiveProfile>,
     pub models: Vec<ModelPrior>,
+}
+
+/// Dated catalog/evidence eligibility for a model/authority pair.
+///
+/// A static capability tier may be used only as fallback when no dated prior
+/// exists. It must not authorize a slug that measured evidence marks ineligible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeasuredAuthorityEligibility {
+    Eligible,
+    Ineligible { reason: String },
+    NoDatedEvidence,
+}
+
+impl ModelPrior {
+    fn denial_for_authority(&self, authority: AuthorityRole) -> Option<String> {
+        if self.prohibited {
+            return Some(self.prohibition_reason.clone().unwrap_or_else(|| {
+                format!("dated prior '{}' prohibits the model", self.source_id)
+            }));
+        }
+        if self.prohibited_authority_roles.contains(&authority) {
+            return Some(format!(
+                "dated prior '{}' prohibits authority '{}'",
+                self.source_id,
+                authority.as_str()
+            ));
+        }
+        if authority.requires_exact_judgment_evidence() {
+            let has_exact = self
+                .authority_evidence
+                .iter()
+                .any(|evidence| evidence.role == authority);
+            let has_fallback = !self.strong_gate_fallback_efforts.is_empty();
+            if !has_exact && !has_fallback {
+                return Some(format!(
+                    "dated prior '{}' does not establish judgment eligibility for authority '{}'",
+                    self.source_id,
+                    authority.as_str()
+                ));
+            }
+        }
+        None
+    }
+}
+
+impl PriorDataset {
+    /// Consult dated priors only. Unknown slugs are `NoDatedEvidence` so a
+    /// static tier table can still act as fallback.
+    pub fn measured_authority_eligibility(
+        &self,
+        model: &str,
+        authority: AuthorityRole,
+    ) -> MeasuredAuthorityEligibility {
+        let matches = self
+            .models
+            .iter()
+            .filter(|prior| prior.model == model)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return MeasuredAuthorityEligibility::NoDatedEvidence;
+        }
+        let deny_reasons = matches
+            .iter()
+            .filter_map(|prior| prior.denial_for_authority(authority))
+            .collect::<Vec<_>>();
+        if deny_reasons.is_empty() {
+            MeasuredAuthorityEligibility::Eligible
+        } else {
+            MeasuredAuthorityEligibility::Ineligible {
+                reason: deny_reasons.join("; "),
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

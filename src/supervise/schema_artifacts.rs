@@ -33,6 +33,72 @@ pub(super) fn write_supervisor_final_schema(
     write_schema(writer, relative, supervisor_final_report_schema_value())
 }
 
+pub(super) fn write_worktree_writable_admission_schema(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+) -> Result<()> {
+    write_schema(writer, relative, worktree_writable_admission_schema_value())
+}
+
+pub(super) fn worktree_writable_admission_schema_value() -> serde_json::Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "WorktreeWritableAdmission",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "version", "assignment_id", "attempt", "target", "worktree", "claims",
+            "native_sandbox"
+        ],
+        "properties": {
+            "version": {
+                "type": "integer",
+                "const": crate::external_agent::WORKTREE_WRITABLE_ADMISSION_SCHEMA_VERSION
+            },
+            "assignment_id": {"type": "string", "minLength": 1},
+            "attempt": {"type": "integer", "minimum": 1},
+            "target": {"const": "managed_child_worktree"},
+            "worktree": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "worktree_id"],
+                "properties": {
+                    "kind": {"const": "managed_disposable"},
+                    "worktree_id": {"type": "string", "minLength": 1}
+                }
+            },
+            "claims": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["state", "token", "paths"],
+                "properties": {
+                    "state": {"const": "held"},
+                    "token": {"type": "integer", "minimum": 1},
+                    "paths": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": true,
+                        "items": {"type": "string", "minLength": 1}
+                    }
+                }
+            },
+            "native_sandbox": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["runtime", "workspace_access", "side_effect_confinement"],
+                "properties": {
+                    "runtime": {
+                        "type": "string",
+                        "enum": ["codex", "fake", "grok", "cursor", "claude-code", "gemini-cli"]
+                    },
+                    "workspace_access": {"const": "read_write"},
+                    "side_effect_confinement": {"const": "verified"}
+                }
+            }
+        }
+    })
+}
+
 pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -214,7 +280,7 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                 "required": [
                     "assignment_count", "started_assignment_count", "completed_assignment_count",
                     "concurrency", "role_bindings", "assignment_effort_bindings",
-                    "budget_degradations", "usage"
+                    "budget_degradations", "assignment_selection_ledger", "usage"
                 ],
                 "properties": {
                     "assignment_count": {"type": "integer", "minimum": 0},
@@ -224,6 +290,7 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                     "role_bindings": role_map_schema_value(role_binding),
                     "assignment_effort_bindings": assignment_effort_bindings_schema_value(),
                     "budget_degradations": budget_degradation_records_schema_value(),
+                    "assignment_selection_ledger": assignment_selection_ledger_schema_value(),
                     "selection_decisions": selection_decisions_schema_value(),
                     "usage": execution_usage_schema_value()
                 }
@@ -236,6 +303,108 @@ fn selection_decisions_schema_value() -> serde_json::Value {
     json!({
         "type": "array",
         "items": crate::selection::selection_event_schema_value(),
+    })
+}
+
+fn role_assignment_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["agent_id", "category", "legacy_role", "source", "reason"],
+        "properties": {
+            "agent_id": {"type": "string", "minLength": 1},
+            "category": {
+                "type": "string",
+                "enum": [
+                    "delegating_coordinator",
+                    "non_delegating_terminal_worker",
+                    "read_only_researcher",
+                    "read_only_review_auditor"
+                ]
+            },
+            "legacy_role": {"type": "string", "minLength": 1},
+            "source": {
+                "type": "string",
+                "enum": ["derived_from_plan_role", "operator_override"]
+            },
+            "reason": {"type": "string", "minLength": 1}
+        }
+    })
+}
+
+fn assignment_selection_ledger_schema_value() -> serde_json::Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "assignment_id", "attempt", "role", "selection_source", "selected_runtime",
+                "selected_model", "selected_reasoning_effort", "catalog_source",
+                "catalog_snapshot_digest", "catalog_revisions", "rejected_candidates",
+                "evidence_gap"
+            ],
+            "properties": {
+                "assignment_id": {"type": "string", "minLength": 1},
+                "attempt": {"type": "integer", "minimum": 0},
+                "role": agent_role_schema_value(),
+                "role_assignment": role_assignment_schema_value(),
+                "selection_source": {
+                    "type": "string",
+                    "enum": [
+                        "automatic", "plan_role_models", "operator_override", "budget_degrade",
+                        "retry", "legacy_fake", "legacy_nonpublishable_simulation"
+                    ]
+                },
+                "selected_runtime": {"type": ["string", "null"], "minLength": 1},
+                "selected_model": {"type": ["string", "null"], "minLength": 1},
+                "selected_reasoning_effort": {"type": ["string", "null"], "minLength": 1},
+                "catalog_source": {
+                    "type": "string",
+                    "enum": ["runtime_advertised", "operator_declared", "none"]
+                },
+                "catalog_snapshot_digest": {"type": ["string", "null"], "minLength": 1},
+                "catalog_revisions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["runtime", "revision", "advertised_at"],
+                        "properties": {
+                            "runtime": {"type": "string", "minLength": 1},
+                            "revision": {"type": "string", "minLength": 1},
+                            "advertised_at": {"type": "string", "minLength": 1}
+                        }
+                    }
+                },
+                "rejected_candidates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["runtime", "model", "effort", "reasons"],
+                        "properties": {
+                            "runtime": {"type": "string", "minLength": 1},
+                            "model": {"type": "string", "minLength": 1},
+                            "effort": {"type": "string", "minLength": 1},
+                            "reasons": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["code", "detail"],
+                                    "properties": {
+                                        "code": {"type": "string", "minLength": 1},
+                                        "detail": {"type": "string", "minLength": 1}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "evidence_gap": {"type": ["string", "null"], "minLength": 1}
+            }
+        }
     })
 }
 
@@ -708,6 +877,49 @@ fn run_budget_report_schema_value() -> serde_json::Value {
                 }
             },
             "max_duration_seconds": {"type": "integer", "minimum": 1},
+            "sources": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["plan", "cli"],
+                "properties": {
+                    "plan": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["limits"],
+                        "properties": {
+                            "limits": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "soft_tokens": {"type": "integer", "minimum": 1},
+                                    "hard_tokens": {"type": "integer", "minimum": 1},
+                                    "soft_cost_usd": {"type": "number", "exclusiveMinimum": 0},
+                                    "hard_cost_usd": {"type": "number", "exclusiveMinimum": 0}
+                                }
+                            },
+                            "max_duration_seconds": {"type": "integer", "minimum": 1}
+                        }
+                    },
+                    "cli": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["limits"],
+                        "properties": {
+                            "limits": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "soft_tokens": {"type": "integer", "minimum": 1},
+                                    "hard_tokens": {"type": "integer", "minimum": 1},
+                                    "soft_cost_usd": {"type": "number", "exclusiveMinimum": 0},
+                                    "hard_cost_usd": {"type": "number", "exclusiveMinimum": 0}
+                                }
+                            },
+                            "max_duration_seconds": {"type": "integer", "minimum": 1}
+                        }
+                    }
+                }
+            },
             "consumed": amount(),
             "reserved": amount(),
             "committed": amount(),
@@ -1835,6 +2047,15 @@ mod selection_schema_tests {
         let tracked_event =
             &tracked["$defs"]["execution"]["properties"]["selection_decisions"]["items"];
         assert_eq!(tracked_event, event);
+        assert!(required_contains(
+            &tracked["$defs"]["execution"],
+            "assignment_selection_ledger"
+        ));
+        assert!(required_contains(
+            &supervisor_final_report_schema_value()["properties"]["role_economics_profile"]
+                ["properties"]["execution"],
+            "assignment_selection_ledger"
+        ));
         Ok(())
     }
 }

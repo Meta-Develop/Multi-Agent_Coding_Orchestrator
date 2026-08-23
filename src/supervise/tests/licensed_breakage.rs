@@ -216,6 +216,7 @@ fn run_licensed_scenario(
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -273,6 +274,7 @@ fn run_licensed_scenario(
 
 #[test]
 fn declared_scoped_breakage_passes_and_journals_dispatchable_follow_up_plan() {
+    skip_without_containment!();
     let assignment = licensed_assignment();
     let child = dependent_failure_child(&assignment, "src/client.rs");
     let scenario = run_licensed_scenario(assignment, child, true, "licensed-breakage-e2e");
@@ -551,6 +553,7 @@ fn generated_follow_up_plan_inherits_gate_context_and_closes_budget() {
 
 #[test]
 fn generated_follow_up_real_loader_rejects_stripped_required_section() {
+    skip_without_containment!();
     let assignment = licensed_assignment();
     let child = dependent_failure_child(&assignment, "src/client.rs");
     let scenario = run_licensed_scenario(
@@ -589,6 +592,7 @@ fn generated_follow_up_real_loader_rejects_stripped_required_section() {
 
 #[test]
 fn licensed_worker_failure_remains_subject_to_child_and_parent_auditor_gates() {
+    skip_without_containment!();
     let mut assignment = licensed_assignment();
     assignment.worker_assignments = vec![WorkerAssignment {
         id: "worker-a".to_string(),
@@ -905,6 +909,7 @@ fn license_is_content_bound_into_checkpoint_plan_and_evidence_only_prompt() {
 
 #[test]
 fn licensed_follow_up_survives_authenticated_final_report_resume_without_redispatch() {
+    skip_without_containment!();
     let (temp, repo) = injected_repository();
     let assignment = licensed_assignment();
     let plan = injected_plan(assignment.clone(), 0);
@@ -917,6 +922,7 @@ fn licensed_follow_up_survives_authenticated_final_report_resume_without_redispa
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: true,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -978,6 +984,7 @@ fn licensed_follow_up_survives_authenticated_final_report_resume_without_redispa
 #[cfg(target_os = "linux")]
 #[test]
 fn licensed_follow_up_cascade_dispatches_one_authenticated_round_and_keeps_primary_untouched() {
+    skip_without_containment!();
     let (temp, repo) = injected_repository();
     let source_assignment = licensed_assignment();
     let follow_up_assignment = licensed_follow_up_assignment();
@@ -997,6 +1004,7 @@ fn licensed_follow_up_cascade_dispatches_one_authenticated_round_and_keeps_prima
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -1130,6 +1138,7 @@ fn licensed_follow_up_cascade_dispatches_one_authenticated_round_and_keeps_prima
 #[cfg(target_os = "linux")]
 #[test]
 fn generated_follow_up_exact_loaded_plan_drift_refuses_before_child_dispatch() {
+    skip_without_containment!();
     let (temp, repo) = injected_repository();
     let source_assignment = licensed_assignment();
     let plan = injected_plan(source_assignment.clone(), 0);
@@ -1149,6 +1158,7 @@ fn generated_follow_up_exact_loaded_plan_drift_refuses_before_child_dispatch() {
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -1295,6 +1305,7 @@ fn run_generated_round_last_moment_mutation(
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -1406,6 +1417,7 @@ fn run_generated_round_last_moment_mutation(
 #[cfg(target_os = "linux")]
 #[test]
 fn generated_follow_up_rechecks_primary_after_profile_before_dispatch() {
+    skip_without_containment!();
     let scenario = run_generated_round_last_moment_mutation(
         "licensed-cascade-last-moment-primary",
         GeneratedRoundLastMomentMutation::Primary,
@@ -1449,6 +1461,7 @@ fn generated_follow_up_rechecks_primary_after_profile_before_dispatch() {
 #[cfg(target_os = "linux")]
 #[test]
 fn generated_follow_up_rechecks_machine_global_after_profile_before_dispatch() {
+    skip_without_containment!();
     let scenario = run_generated_round_last_moment_mutation(
         "licensed-cascade-last-moment-retention",
         GeneratedRoundLastMomentMutation::MachineGlobalConfig,
@@ -1502,6 +1515,7 @@ fn generated_follow_up_rechecks_machine_global_after_profile_before_dispatch() {
 #[cfg(target_os = "linux")]
 #[test]
 fn generated_follow_up_deleted_retention_is_journaled_probe_failed_and_retryable() {
+    skip_without_containment!();
     let scenario = run_generated_round_last_moment_mutation(
         "licensed-cascade-last-moment-retention-deleted",
         GeneratedRoundLastMomentMutation::MachineGlobalConfigDeleted,
@@ -1556,6 +1570,7 @@ fn generated_follow_up_deleted_retention_is_journaled_probe_failed_and_retryable
 #[cfg(target_os = "linux")]
 #[test]
 fn generated_follow_up_initial_deleted_retention_is_typed_without_queue() {
+    skip_without_containment!();
     let (temp, repo) = injected_repository();
     let source_assignment = licensed_assignment();
     let plan = injected_plan(source_assignment.clone(), 0);
@@ -1578,6 +1593,7 @@ fn generated_follow_up_initial_deleted_retention_is_typed_without_queue() {
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -1659,6 +1675,7 @@ fn generated_follow_up_initial_deleted_retention_is_typed_without_queue() {
 #[cfg(target_os = "linux")]
 #[test]
 fn licensed_follow_up_enqueue_interruption_resumes_without_rerunning_source() {
+    skip_without_containment!();
     let (temp, repo) = injected_repository();
     let source_assignment = licensed_assignment();
     let follow_up_assignment = licensed_follow_up_assignment();
@@ -1678,6 +1695,7 @@ fn licensed_follow_up_enqueue_interruption_resumes_without_rerunning_source() {
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -1789,6 +1807,7 @@ fn licensed_follow_up_enqueue_interruption_resumes_without_rerunning_source() {
 #[cfg(target_os = "linux")]
 #[test]
 fn immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan() {
+    skip_without_containment!();
     let (temp, repo) = injected_repository();
     let source_assignment = licensed_assignment();
     let follow_up_assignment = licensed_follow_up_assignment();
@@ -1811,6 +1830,7 @@ fn immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -1939,6 +1959,7 @@ fn immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan
             codex_bin: PathBuf::from("unused-injected-codex"),
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
+            allow_live_run_collision: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: crate::supervise::RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -2044,6 +2065,7 @@ fn run_held_finalized_subordinate_scenario(
         codex_bin: PathBuf::from("unused-injected-codex"),
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
+        allow_live_run_collision: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
@@ -2182,6 +2204,7 @@ fn run_held_finalized_subordinate_scenario(
             codex_bin: PathBuf::from("unused-injected-codex"),
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
+            allow_live_run_collision: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: crate::supervise::RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -2225,6 +2248,7 @@ fn run_held_finalized_subordinate_scenario(
 #[cfg(target_os = "linux")]
 #[test]
 fn held_ambiguous_reconciles_newly_finalized_exact_subordinate() {
+    skip_without_containment!();
     let scenario = run_held_finalized_subordinate_scenario(
         "licensed-held-finalized-exact",
         HeldFinalizedSubordinateVariant::Exact,
@@ -2261,6 +2285,7 @@ fn held_ambiguous_reconciles_newly_finalized_exact_subordinate() {
 #[cfg(target_os = "linux")]
 #[test]
 fn held_ambiguous_refuses_finalized_subordinate_plan_drift_without_counting() {
+    skip_without_containment!();
     let scenario = run_held_finalized_subordinate_scenario(
         "licensed-held-finalized-plan-drift",
         HeldFinalizedSubordinateVariant::PlanDrift,
@@ -2299,6 +2324,7 @@ fn held_ambiguous_refuses_finalized_subordinate_plan_drift_without_counting() {
 #[cfg(target_os = "linux")]
 #[test]
 fn held_ambiguous_finalized_round_two_tasks_refuse_maximum_round() {
+    skip_without_containment!();
     let scenario = run_held_finalized_subordinate_scenario(
         "licensed-held-finalized-maximum-round",
         HeldFinalizedSubordinateVariant::GeneratesThirdRound,

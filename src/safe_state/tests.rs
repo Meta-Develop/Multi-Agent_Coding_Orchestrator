@@ -378,6 +378,109 @@ fn existing_managed_root_accepts_0755_but_strict_state_root_does_not_chmod_it() 
 }
 
 #[cfg(unix)]
+struct RestoreUnixMode {
+    path: PathBuf,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl Drop for RestoreUnixMode {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn safe_root_accepts_execute_only_non_world_traversable_ancestor() {
+    // Owner-execute-only (0100) is the unit-test stand-in for a 0711 ancestor
+    // the caller does not own: both are traversable but not listable.
+    let temp = TempDir::new().expect("tempdir");
+    let ancestor = temp.path().join("restricted");
+    let writable = ancestor.join("writable");
+    let leaf = writable.join("state");
+    fs::create_dir_all(&writable).expect("tree");
+    fs::set_permissions(&writable, fs::Permissions::from_mode(0o700)).expect("writable mode");
+    let _restore = RestoreUnixMode {
+        path: ancestor.clone(),
+        mode: 0o700,
+    };
+    fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o100))
+        .expect("execute-only ancestor");
+
+    let created = SafeRoot::open_or_create(&leaf).expect("create through execute-only ancestor");
+    created.verify().expect("verify created root");
+    let existing = SafeRoot::open_existing(&leaf).expect("reopen through execute-only ancestor");
+    existing.verify().expect("verify existing root");
+    assert_eq!(created.identity(), existing.identity());
+    assert_eq!(
+        fs::symlink_metadata(&ancestor)
+            .expect("ancestor metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o100
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn safe_root_refuses_non_searchable_ancestor_and_names_a_path() {
+    let temp = TempDir::new().expect("tempdir");
+    let ancestor = temp.path().join("blocked");
+    let leaf = ancestor.join("state");
+    fs::create_dir(&ancestor).expect("ancestor");
+    let _restore = RestoreUnixMode {
+        path: ancestor.clone(),
+        mode: 0o700,
+    };
+    fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o000))
+        .expect("non-searchable ancestor");
+
+    let error = SafeRoot::open_or_create(&leaf).expect_err("non-searchable ancestor must fail");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains(&ancestor.display().to_string())
+            || rendered.contains(&leaf.display().to_string()),
+        "error must name the failing path: {rendered}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn safe_root_refuses_symlink_ancestor_and_names_the_failing_path() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().expect("tempdir");
+    let real = temp.path().join("real");
+    let link = temp.path().join("link");
+    fs::create_dir(&real).expect("real");
+    symlink(&real, &link).expect("symlink ancestor");
+    let error = SafeRoot::open_or_create(link.join("state"))
+        .expect_err("symlink ancestor must fail closed");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains(&link.display().to_string()),
+        "error must name the failing path: {rendered}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn safe_root_refuses_non_directory_ancestor_and_names_the_failing_path() {
+    let temp = TempDir::new().expect("tempdir");
+    let file = temp.path().join("not-a-dir");
+    fs::write(&file, b"nope").expect("file ancestor");
+    let error =
+        SafeRoot::open_or_create(file.join("state")).expect_err("file ancestor must fail closed");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains(&file.display().to_string()),
+        "error must name the failing path: {rendered}"
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn tree_delete_refuses_renamed_substitute_identity() {
     let temp = TempDir::new().expect("tempdir");
