@@ -1017,10 +1017,12 @@ fn managed_worktree_git_metadata(workspace: &Path) -> Result<Option<ManagedWorkt
         bail!("managed child worktree .git marker is not a regular file");
     }
     #[cfg(unix)]
-    if {
+    let marker_has_hard_link_alias = {
         use std::os::unix::fs::MetadataExt;
         marker_metadata.nlink() != 1
-    } {
+    };
+    #[cfg(unix)]
+    if marker_has_hard_link_alias {
         bail!("managed child worktree .git marker has a hard-link alias");
     }
 
@@ -1134,10 +1136,12 @@ fn parse_git_path_file(path: &Path, prefix: Option<&str>, label: &str) -> Result
         bail!("{label} is not a bounded regular file");
     }
     #[cfg(unix)]
-    if {
+    let path_file_has_hard_link_alias = {
         use std::os::unix::fs::MetadataExt;
         metadata.nlink() != 1
-    } {
+    };
+    #[cfg(unix)]
+    if path_file_has_hard_link_alias {
         bail!("{label} has a hard-link alias");
     }
     let bytes = fs::read(path).with_context(|| format!("failed to read {label}"))?;
@@ -1178,10 +1182,12 @@ fn canonical_git_file(path: &Path, label: &str) -> Result<PathBuf> {
         bail!("{label} is not a non-symlink regular file");
     }
     #[cfg(unix)]
-    if {
+    let common_file_has_hard_link_alias = {
         use std::os::unix::fs::MetadataExt;
         metadata.nlink() != 1
-    } {
+    };
+    #[cfg(unix)]
+    if common_file_has_hard_link_alias {
         bail!(
             "{label} has a hard-link alias; recreate the launch repository with --no-hardlinks before retrying"
         );
