@@ -2529,8 +2529,8 @@ fn codex_filesystem_permissions(
         .iter()
         .chain(&controls.read_only_files)
     {
-        if let Some(relative) = control.relative().to_str() {
-            path_permissions.insert(relative.to_string(), "read");
+        if let Some(absolute) = control.absolute.to_str() {
+            path_permissions.insert(absolute.to_string(), "read");
         }
     }
     for control in controls
@@ -2538,17 +2538,12 @@ fn codex_filesystem_permissions(
         .iter()
         .chain(&controls.read_write_files)
     {
-        if let Some(relative) = control.relative().to_str() {
-            path_permissions.insert(relative.to_string(), "write");
+        if let Some(absolute) = control.absolute.to_str() {
+            path_permissions.insert(absolute.to_string(), "write");
         }
     }
     if let Some(parent) = &controls.writable_artifact_root {
-        let permission_path = parent
-            .strip_prefix(&spec.cwd)
-            .ok()
-            .filter(|relative| !relative.as_os_str().is_empty())
-            .unwrap_or(parent);
-        if let Some(path) = permission_path.to_str() {
+        if let Some(path) = parent.to_str() {
             path_permissions.insert(path.to_string(), "write");
         }
     }

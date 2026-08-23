@@ -2949,7 +2949,10 @@ fn artifact_parent_allows_only_designated_maco_incoming_layouts() -> Result<()> 
     );
     let controls = protected_worktree_controls(&command)?;
     let permissions = codex_filesystem_permissions(&command, &controls);
-    assert!(permissions.contains("\"incoming\"=\"write\""));
+    assert!(permissions.contains(&format!(
+        "{}=\"write\"",
+        toml_basic_string(incoming.to_str().context("UTF-8 incoming path")?)
+    )));
     let profile = external_side_effect_profile(
         &command,
         &workspace.join("codex"),
@@ -3507,18 +3510,46 @@ fn codex_inner_permissions_keep_exact_reads_writes_and_toml_escaping() -> Result
         ".cursorignore",
         ".codexignore",
     ] {
+        let absolute = workspace.join(path);
         assert!(
-            permissions.contains(&format!("{}=\"read\"", toml_basic_string(path))),
+            permissions.contains(&format!(
+                "{}=\"read\"",
+                toml_basic_string(absolute.to_str().context("UTF-8 control path")?)
+            )),
             "missing exact read entry for {path}: {permissions}"
         );
     }
-    assert!(permissions.contains("\".agents/policy-portable.md\"=\"write\""));
+    assert!(permissions.contains(&format!(
+        "{}=\"write\"",
+        toml_basic_string(
+            workspace
+                .join(&exception)
+                .to_str()
+                .context("UTF-8 exception path")?
+        )
+    )));
     assert_eq!(
         toml_basic_string(".agents/policy\"quoted.md"),
         "\".agents/policy\\\"quoted.md\""
     );
-    assert!(!permissions.contains("\".agents\"=\"write\""));
-    assert!(!permissions.contains("\".maco-cache\"=\"write\""));
+    assert!(!permissions.contains(&format!(
+        "{}=\"write\"",
+        toml_basic_string(
+            workspace
+                .join(".agents")
+                .to_str()
+                .context("UTF-8 agents path")?
+        )
+    )));
+    assert!(!permissions.contains(&format!(
+        "{}=\"write\"",
+        toml_basic_string(
+            workspace
+                .join(".maco-cache")
+                .to_str()
+                .context("UTF-8 cache path")?
+        )
+    )));
     assert!(permissions.contains(&format!(
         "{}=\"write\"",
         toml_basic_string(incoming.to_str().context("UTF-8 incoming path")?)
