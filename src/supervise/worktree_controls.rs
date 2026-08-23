@@ -1,5 +1,43 @@
 use super::*;
 
+const PRE_ACTION_INTENT_SUMMARY_MAX_BYTES: usize = 1024;
+const PRE_ACTION_INTENT_SUMMARY_FALLBACK: &str = "assigned work";
+
+fn sanitize_pre_action_intent_candidate(candidate: &str) -> String {
+    let mut sanitized =
+        String::with_capacity(candidate.len().min(PRE_ACTION_INTENT_SUMMARY_MAX_BYTES));
+    let mut separator_pending = false;
+    for character in candidate.chars() {
+        if character.is_whitespace() || character.is_control() {
+            separator_pending = !sanitized.is_empty();
+            continue;
+        }
+
+        let separator_bytes = usize::from(separator_pending);
+        if sanitized.len() + separator_bytes + character.len_utf8()
+            > PRE_ACTION_INTENT_SUMMARY_MAX_BYTES
+        {
+            break;
+        }
+        if separator_pending {
+            sanitized.push(' ');
+            separator_pending = false;
+        }
+        sanitized.push(character);
+    }
+    sanitized
+}
+
+fn pre_action_intent_summary(task: Option<&str>, notes: Option<&str>, id: &str) -> String {
+    for candidate in task.into_iter().chain(notes).chain(Some(id)) {
+        let sanitized = sanitize_pre_action_intent_candidate(candidate);
+        if !sanitized.is_empty() {
+            return sanitized;
+        }
+    }
+    PRE_ACTION_INTENT_SUMMARY_FALLBACK.to_string()
+}
+
 #[cfg(unix)]
 pub(super) fn worktree_control_identity_from_metadata(
     metadata: &fs::Metadata,
@@ -277,15 +315,15 @@ pub(super) fn pre_action_review_context(
         })
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("failed to bind pre-action review claims")?;
-    let intent = assignment
-        .task
-        .as_deref()
-        .or(assignment.notes.as_deref())
-        .unwrap_or(&assignment.id);
+    let intent = pre_action_intent_summary(
+        assignment.task.as_deref(),
+        assignment.notes.as_deref(),
+        &assignment.id,
+    );
     ReviewContext::new(
         options.run_id.as_str(),
         &assignment.id,
-        intent,
+        &intent,
         claims,
         std::iter::empty::<RepoPathRule>(),
     )
@@ -299,4 +337,52 @@ pub(super) fn configure_read_only_auditor_command(
         bail!("read-only auditor command may not contain worktree control exceptions");
     }
     Ok(command.with_workspace_access(WorkspaceAccess::ReadOnly))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_action_intent_summary_flattens_unicode_whitespace_and_controls() {
+        let summary = sanitize_pre_action_intent_candidate(
+            "\n  Plan\t多言語\r\nvalidation\u{0085}\u{0000} safely  ",
+        );
+
+        assert_eq!(summary, "Plan 多言語 validation safely");
+        assert!(!summary.chars().any(char::is_control));
+        assert!(summary
+            .chars()
+            .filter(|character| character.is_whitespace())
+            .all(|character| character == ' '));
+    }
+
+    #[test]
+    fn pre_action_intent_summary_bounds_unicode_on_a_character_boundary() {
+        let summary =
+            sanitize_pre_action_intent_candidate(&"界".repeat(PRE_ACTION_INTENT_SUMMARY_MAX_BYTES));
+
+        assert!(summary.len() <= PRE_ACTION_INTENT_SUMMARY_MAX_BYTES);
+        assert_eq!(
+            summary.chars().count(),
+            PRE_ACTION_INTENT_SUMMARY_MAX_BYTES / '界'.len_utf8()
+        );
+        assert!(summary.chars().all(|character| character == '界'));
+    }
+
+    #[test]
+    fn pre_action_intent_summary_uses_non_empty_fallbacks() {
+        assert_eq!(
+            pre_action_intent_summary(Some("\n\t\u{0000}"), Some("  useful\tnotes "), "child-a"),
+            "useful notes"
+        );
+        assert_eq!(
+            pre_action_intent_summary(Some(" \r\n"), Some("\u{0007}"), "child-a"),
+            "child-a"
+        );
+        assert_eq!(
+            pre_action_intent_summary(Some("\n"), Some("\t"), "\u{0000}"),
+            PRE_ACTION_INTENT_SUMMARY_FALLBACK
+        );
+    }
 }
