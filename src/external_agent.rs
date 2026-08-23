@@ -27,6 +27,7 @@ use crate::runtime_adapter::{
 use crate::safe_state::{unsigned_to_u32, ReservedDirectory};
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
 use anyhow::{bail, Context, Result};
+use git2::Oid;
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1890,6 +1891,24 @@ fn run_external_agent_runtime(
         external_environment.insert(MACO_RUN_ID_ENV.to_string(), metadata.run_id().to_string());
         external_environment.insert(MACO_TASK_ID_ENV.to_string(), metadata.task_id().to_string());
     }
+    if let Some(git) = &target_controls.managed_git {
+        let git_environment = match managed_git_environment(git) {
+            Ok(environment) => environment,
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_external_error(
+                    &mut report,
+                    format!("failed to bind managed child private Git environment: {error:#}"),
+                );
+                return report;
+            }
+        };
+        external_environment.extend(git_environment);
+        external_environment.insert(
+            "GIT_WORK_TREE".to_string(),
+            target_spec.cwd.display().to_string(),
+        );
+    }
     let credential_redactor =
         match CredentialRedactor::from_runtime(&external_environment, codex_auth.as_ref()) {
             Ok(redactor) => redactor,
@@ -2919,6 +2938,16 @@ fn record_completed_target(
                 report.error.take(),
                 Some(format!(
                     "external-agent output reservation changed: {error}"
+                )),
+            );
+        }
+    }
+    if let Some(git) = &context.protected_controls.managed_git {
+        if let Err(error) = verify_managed_git_boundary_after_launch(git) {
+            report.error = append_external_error(
+                report.error.take(),
+                Some(format!(
+                    "managed child private Git boundary changed during launch: {error:#}"
                 )),
             );
         }

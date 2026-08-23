@@ -902,9 +902,17 @@ struct ProtectedWorktreeControls {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ManagedWorktreeGitMetadata {
     worktree_git_dir: PathBuf,
+    private_git_dir: PathBuf,
+    private_object_dir: PathBuf,
+    shared_object_dir: PathBuf,
+    common_config: PathBuf,
+    active_commit_hook: Option<PathBuf>,
     common_read_only_roots: Vec<PathBuf>,
     common_read_only_files: Vec<PathBuf>,
 }
+
+const MANAGED_CHILD_PRIVATE_GIT_DIR: &str = "maco-private-git-v1";
+const MANAGED_CHILD_PRIVATE_REF: &str = "refs/heads/maco-managed-child";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProtectedWorktreeControl {
@@ -1158,12 +1166,13 @@ fn managed_worktree_git_metadata(workspace: &Path) -> Result<Option<ManagedWorkt
     )? {
         reject_managed_git_hooks_path(&worktree_config, "Git worktree config")?;
     }
-    let mut common_read_only_files = vec![config];
-    if let Some(commit_msg_hook) = canonical_optional_active_git_hook(
+    let mut common_read_only_files = vec![config.clone()];
+    let active_commit_hook = canonical_optional_active_git_hook(
         &common_dir.join("hooks/commit-msg"),
         "Git commit-msg hook",
-    )? {
-        common_read_only_files.push(commit_msg_hook);
+    )?;
+    if let Some(commit_msg_hook) = &active_commit_hook {
+        common_read_only_files.push(commit_msg_hook.clone());
     }
     for (relative, label) in [
         ("packed-refs", "Git packed refs"),
@@ -1203,11 +1212,361 @@ fn managed_worktree_git_metadata(workspace: &Path) -> Result<Option<ManagedWorkt
         }
     }
 
+    let base_oid = repository
+        .head()
+        .context("managed child Git repository has no HEAD")?
+        .peel_to_commit()
+        .context("managed child Git HEAD is not a commit")?
+        .id();
+    let private_git_dir = prepare_managed_child_private_git_dir(
+        &canonical_workspace,
+        &worktree_git_dir,
+        &config,
+        base_oid,
+    )?;
+    let private_object_dir = canonical_git_directory(
+        &private_git_dir.join("objects"),
+        "managed child private Git object directory",
+    )?;
+    if private_git_dir.starts_with(&common_dir) && !private_git_dir.starts_with(&worktree_git_dir) {
+        bail!("managed child private Git directory escaped its per-worktree Git directory");
+    }
+    for read_only in common_read_only_roots
+        .iter()
+        .chain(common_read_only_files.iter())
+    {
+        if private_git_dir.starts_with(read_only) || read_only.starts_with(&private_git_dir) {
+            bail!("managed child private Git directory overlaps shared read-only metadata");
+        }
+    }
+
     Ok(Some(ManagedWorktreeGitMetadata {
         worktree_git_dir,
+        private_git_dir,
+        private_object_dir,
+        shared_object_dir: common_dir.join("objects"),
+        common_config: config,
+        active_commit_hook,
         common_read_only_roots,
         common_read_only_files,
     }))
+}
+
+#[cfg(unix)]
+fn prepare_managed_child_private_git_dir(
+    workspace: &Path,
+    worktree_git_dir: &Path,
+    common_config: &Path,
+    base_oid: Oid,
+) -> Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    fn create_private_directory(path: &Path) -> Result<()> {
+        fs::create_dir(path)
+            .with_context(|| format!("failed to create private Git directory {}", path.display()))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!("failed to harden private Git directory {}", path.display())
+        })
+    }
+
+    fn create_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("failed to create private Git file {}", path.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("failed to write private Git file {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync private Git file {}", path.display()))
+    }
+
+    fn validate_private_regular_file(path: &Path, label: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        let metadata = fs::symlink_metadata(path).with_context(|| format!("{label} is missing"))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.len() > max_bytes
+        {
+            bail!("{label} is not a bounded single-link regular file");
+        }
+        fs::read(path).with_context(|| format!("failed to read {label}"))
+    }
+
+    let common_policy = crate::worktree::parse_bounded_local_git_config(Some(
+        &read_bounded_regular_file_nofollow(common_config, 1024 * 1024)
+            .context("failed to read managed child common Git config")?,
+    ))?;
+    let filemode = if common_policy.core_filemode {
+        "true"
+    } else {
+        "false"
+    };
+    let expected_config = format!(
+        "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tfilemode = {filemode}\n\tlogallrefupdates = true\n[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n"
+    )
+    .into_bytes();
+    let private_git_dir = worktree_git_dir.join(MANAGED_CHILD_PRIVATE_GIT_DIR);
+    match fs::symlink_metadata(&private_git_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            create_private_directory(&private_git_dir)?;
+            for relative in [
+                "objects",
+                "objects/info",
+                "objects/pack",
+                "refs",
+                "refs/heads",
+                "refs/tags",
+            ] {
+                create_private_directory(&private_git_dir.join(relative))?;
+            }
+            let source_index = canonical_git_file(
+                &worktree_git_dir.join("index"),
+                "managed child linked-worktree index",
+            )?;
+            let index_bytes = read_bounded_regular_file_nofollow(&source_index, 16 * 1024 * 1024)
+                .context("failed to read managed child linked-worktree index")?;
+            create_private_file(&private_git_dir.join("index"), &index_bytes)?;
+            create_private_file(
+                &private_git_dir.join("HEAD"),
+                format!("ref: {MANAGED_CHILD_PRIVATE_REF}\n").as_bytes(),
+            )?;
+            create_private_file(
+                &private_git_dir.join(MANAGED_CHILD_PRIVATE_REF),
+                format!("{base_oid}\n").as_bytes(),
+            )?;
+            create_private_file(
+                &private_git_dir.join("config"),
+                &expected_config,
+            )?;
+        }
+        Err(error) => {
+            return Err(error).context("failed to inspect managed child private Git directory")
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!("managed child private Git path is not a non-symlink directory")
+        }
+        Ok(_) => {}
+    }
+
+    let private_git_dir = fs::canonicalize(&private_git_dir)
+        .context("managed child private Git directory could not be resolved")?;
+    if private_git_dir.parent() != Some(worktree_git_dir) {
+        bail!("managed child private Git directory is not an exact child of its worktree Git directory");
+    }
+    let metadata = fs::symlink_metadata(&private_git_dir)
+        .context("failed to rebind managed child private Git directory")?;
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        bail!("managed child private Git directory is not owner-private");
+    }
+    reject_git_read_only_tree_aliases(&private_git_dir, "private Git storage")?;
+    for alternate in ["objects/info/alternates", "objects/info/http-alternates"] {
+        if fs::symlink_metadata(private_git_dir.join(alternate)).is_ok() {
+            bail!("managed child private Git storage contains a persistent object alternate");
+        }
+    }
+    let expected_head = format!("ref: {MANAGED_CHILD_PRIVATE_REF}\n").into_bytes();
+    if validate_private_regular_file(
+        &private_git_dir.join("HEAD"),
+        "managed child private Git HEAD",
+        1024,
+    )? != expected_head
+    {
+        bail!("managed child private Git HEAD changed from its fixed private ref");
+    }
+    let ref_bytes = validate_private_regular_file(
+        &private_git_dir.join(MANAGED_CHILD_PRIVATE_REF),
+        "managed child private Git ref",
+        1024,
+    )?;
+    let ref_text = std::str::from_utf8(&ref_bytes)
+        .context("managed child private Git ref is not UTF-8")?
+        .trim_end_matches(['\r', '\n']);
+    Oid::from_str(ref_text).context("managed child private Git ref is not an object id")?;
+    if validate_private_regular_file(
+        &private_git_dir.join("config"),
+        "managed child private Git config",
+        16 * 1024,
+    )? != expected_config
+    {
+        bail!("managed child private Git config changed from its fixed policy");
+    }
+    validate_private_regular_file(
+        &private_git_dir.join("index"),
+        "managed child private Git index",
+        16 * 1024 * 1024,
+    )?;
+    let canonical_workspace = fs::canonicalize(workspace)
+        .context("managed child workspace changed during private Git setup")?;
+    if canonical_workspace != workspace {
+        bail!("managed child workspace must remain canonical during private Git setup");
+    }
+    Ok(private_git_dir)
+}
+
+#[cfg(not(unix))]
+fn prepare_managed_child_private_git_dir(
+    _workspace: &Path,
+    _worktree_git_dir: &Path,
+    _common_config: &Path,
+    _base_oid: Oid,
+) -> Result<PathBuf> {
+    bail!("managed child private Git storage is unsupported on this platform")
+}
+
+fn managed_git_environment(git: &ManagedWorktreeGitMetadata) -> Result<BTreeMap<String, String>> {
+    let mut environment = BTreeMap::from([
+        (
+            "GIT_DIR".to_string(),
+            git.private_git_dir
+                .to_str()
+                .context("managed child private Git directory is not UTF-8")?
+                .to_string(),
+        ),
+        (
+            "GIT_OBJECT_DIRECTORY".to_string(),
+            git.private_object_dir
+                .to_str()
+                .context("managed child private object directory is not UTF-8")?
+                .to_string(),
+        ),
+        (
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES".to_string(),
+            git.shared_object_dir
+                .to_str()
+                .context("managed child shared object directory is not UTF-8")?
+                .to_string(),
+        ),
+        ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
+        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+    ]);
+    let mut config_entries = vec![("include.path", git.common_config.as_path())];
+    if let Some(hook) = &git.active_commit_hook {
+        config_entries.push((
+            "core.hooksPath",
+            hook.parent().context("managed child commit hook has no parent")?,
+        ));
+    }
+    config_entries.push(("gc.auto", Path::new("0")));
+    config_entries.push(("maintenance.auto", Path::new("false")));
+    environment.insert(
+        "GIT_CONFIG_COUNT".to_string(),
+        config_entries.len().to_string(),
+    );
+    for (index, (key, value)) in config_entries.into_iter().enumerate() {
+        environment.insert(format!("GIT_CONFIG_KEY_{index}"), key.to_string());
+        environment.insert(
+            format!("GIT_CONFIG_VALUE_{index}"),
+            value
+                .to_str()
+                .context("managed child Git config input is not UTF-8")?
+                .to_string(),
+        );
+    }
+    Ok(environment)
+}
+
+#[cfg(unix)]
+fn verify_managed_git_boundary_after_launch(git: &ManagedWorktreeGitMetadata) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let worktree_git_dir = fs::canonicalize(&git.worktree_git_dir)
+        .context("managed child linked-worktree Git directory disappeared after launch")?;
+    if worktree_git_dir != git.worktree_git_dir {
+        bail!("managed child linked-worktree Git directory changed after launch");
+    }
+    let private_git_dir = fs::canonicalize(&git.private_git_dir)
+        .context("managed child private Git directory disappeared after launch")?;
+    if private_git_dir != git.private_git_dir
+        || private_git_dir.parent() != Some(git.worktree_git_dir.as_path())
+    {
+        bail!("managed child private Git directory changed after launch");
+    }
+    let metadata = fs::symlink_metadata(&private_git_dir)
+        .context("failed to inspect managed child private Git directory after launch")?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        bail!("managed child private Git directory lost its owner-private binding after launch");
+    }
+    reject_git_read_only_tree_aliases(&private_git_dir, "private Git storage")?;
+    for alternate in ["objects/info/alternates", "objects/info/http-alternates"] {
+        if fs::symlink_metadata(private_git_dir.join(alternate)).is_ok() {
+            bail!("managed child private Git storage gained a persistent object alternate");
+        }
+    }
+    let head = read_bounded_regular_file_nofollow(&private_git_dir.join("HEAD"), 1024)
+        .context("failed to revalidate managed child private Git HEAD")?;
+    if head != format!("ref: {MANAGED_CHILD_PRIVATE_REF}\n").as_bytes() {
+        bail!("managed child private Git HEAD changed from its fixed private ref after launch");
+    }
+    let ref_bytes = read_bounded_regular_file_nofollow(
+        &private_git_dir.join(MANAGED_CHILD_PRIVATE_REF),
+        1024,
+    )
+    .context("failed to revalidate managed child private Git ref")?;
+    let ref_text = std::str::from_utf8(&ref_bytes)
+        .context("managed child private Git ref is not UTF-8 after launch")?
+        .trim_end_matches(['\r', '\n']);
+    Oid::from_str(ref_text)
+        .context("managed child private Git ref is not an object id after launch")?;
+    let common_config = canonical_git_file(&git.common_config, "Git common config")?;
+    if common_config != git.common_config {
+        bail!("managed child common Git config changed after launch");
+    }
+    let common_policy = crate::worktree::parse_bounded_local_git_config(Some(
+        &read_bounded_regular_file_nofollow(&common_config, 1024 * 1024)
+            .context("failed to re-read managed child common Git config")?,
+    ))?;
+    let filemode = if common_policy.core_filemode {
+        "true"
+    } else {
+        "false"
+    };
+    let expected_config = format!(
+        "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tfilemode = {filemode}\n\tlogallrefupdates = true\n[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n"
+    );
+    let private_config = read_bounded_regular_file_nofollow(
+        &private_git_dir.join("config"),
+        16 * 1024,
+    )
+    .context("failed to revalidate managed child private Git config")?;
+    if private_config != expected_config.as_bytes() {
+        bail!("managed child private Git config changed from its fixed policy after launch");
+    }
+    let private_object_dir = fs::canonicalize(&git.private_object_dir)
+        .context("managed child private object directory disappeared after launch")?;
+    if private_object_dir != git.private_object_dir
+        || private_object_dir.parent() != Some(git.private_git_dir.as_path())
+    {
+        bail!("managed child private object directory changed after launch");
+    }
+    let shared_object_dir = fs::canonicalize(&git.shared_object_dir)
+        .context("managed child shared object directory disappeared after launch")?;
+    if shared_object_dir != git.shared_object_dir {
+        bail!("managed child shared object directory changed after launch");
+    }
+    reject_git_object_aliases(&shared_object_dir)?;
+    if let Some(hook) = &git.active_commit_hook {
+        let rebound = canonical_optional_active_git_hook(hook, "Git commit-msg hook")?
+            .context("managed child active commit-msg hook disappeared after launch")?;
+        if rebound != *hook {
+            bail!("managed child active commit-msg hook changed after launch");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_managed_git_boundary_after_launch(_git: &ManagedWorktreeGitMetadata) -> Result<()> {
+    bail!("managed child private Git revalidation is unsupported on this platform")
 }
 
 fn parse_git_path_file(path: &Path, prefix: Option<&str>, label: &str) -> Result<PathBuf> {
@@ -2258,14 +2617,10 @@ fn external_side_effect_profile(
                 for file in &git.common_read_only_files {
                     profile = profile.with_visible_read_only_file(file);
                 }
-                profile = match spec.workspace_access {
-                    WorkspaceAccess::ReadOnly => {
-                        profile.with_visible_read_only_root(&git.worktree_git_dir)
-                    }
-                    WorkspaceAccess::ReadWrite => {
-                        profile.with_visible_read_write_root(&git.worktree_git_dir)
-                    }
-                };
+                profile = profile.with_visible_read_only_root(&git.worktree_git_dir);
+                if spec.workspace_access == WorkspaceAccess::ReadWrite {
+                    profile = profile.with_visible_read_write_root(&git.private_git_dir);
+                }
             }
             let canonical_workspace = fs::canonicalize(&spec.cwd)?;
             if !program.starts_with(&canonical_workspace) {
@@ -2823,6 +3178,7 @@ fn codex_hardened_argv(
     controls: &ProtectedWorktreeControls,
 ) -> Vec<OsString> {
     let filesystem_permissions = codex_filesystem_permissions(spec, controls);
+    let shell_environment_include_only = codex_shell_environment_include_only(controls);
     let mut argv = vec![
         OsString::from("-a"),
         OsString::from("never"),
@@ -2844,7 +3200,7 @@ fn codex_hardened_argv(
         OsString::from("-c"),
         OsString::from("shell_environment_policy.ignore_default_excludes=false"),
         OsString::from("-c"),
-        OsString::from("shell_environment_policy.include_only=[\"PATH\"]"),
+        OsString::from(shell_environment_include_only),
         OsString::from("-c"),
         OsString::from("web_search=\"disabled\""),
     ];
@@ -2889,6 +3245,7 @@ fn codex_app_server_argv(
     controls: &ProtectedWorktreeControls,
 ) -> Vec<OsString> {
     let filesystem_permissions = codex_filesystem_permissions(spec, controls);
+    let shell_environment_include_only = codex_shell_environment_include_only(controls);
     let mut argv = vec![
         OsString::from("app-server"),
         OsString::from("--stdio"),
@@ -2908,7 +3265,7 @@ fn codex_app_server_argv(
         OsString::from("-c"),
         OsString::from("shell_environment_policy.ignore_default_excludes=false"),
         OsString::from("-c"),
-        OsString::from("shell_environment_policy.include_only=[\"PATH\"]"),
+        OsString::from(shell_environment_include_only),
         OsString::from("-c"),
         OsString::from("web_search=\"disabled\""),
         // app-server has no --ignore-rules flag. A private CODEX_HOME prevents ambient user config,
@@ -2954,6 +3311,40 @@ fn codex_app_server_argv(
     argv
 }
 
+fn codex_shell_environment_include_only(controls: &ProtectedWorktreeControls) -> String {
+    let mut keys = vec!["PATH".to_string()];
+    if let Some(git) = &controls.managed_git {
+        keys.extend(
+            [
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_NOSYSTEM",
+                "GIT_DIR",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_TERMINAL_PROMPT",
+                "GIT_WORK_TREE",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        let config_count = 3 + usize::from(git.active_commit_hook.is_some());
+        for index in 0..config_count {
+            keys.push(format!("GIT_CONFIG_KEY_{index}"));
+            keys.push(format!("GIT_CONFIG_VALUE_{index}"));
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    format!(
+        "shell_environment_policy.include_only=[{}]",
+        keys.iter()
+            .map(|key| toml_basic_string(key))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
 fn codex_filesystem_permissions(
     spec: &ExternalAgentCommand,
     controls: &ProtectedWorktreeControls,
@@ -2979,13 +3370,12 @@ fn codex_filesystem_permissions(
             }
         }
         if let Some(path) = git.worktree_git_dir.to_str() {
-            path_permissions.insert(
-                path.to_string(),
-                match spec.workspace_access {
-                    WorkspaceAccess::ReadOnly => "read",
-                    WorkspaceAccess::ReadWrite => "write",
-                },
-            );
+            path_permissions.insert(path.to_string(), "read");
+        }
+        if spec.workspace_access == WorkspaceAccess::ReadWrite {
+            if let Some(path) = git.private_git_dir.to_str() {
+                path_permissions.insert(path.to_string(), "write");
+            }
         }
     }
     for path in &controls.exact_read_only_input_files {

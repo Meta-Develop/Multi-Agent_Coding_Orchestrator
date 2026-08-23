@@ -1233,6 +1233,20 @@ fn managed_linked_worktree_git_roots_are_exact_and_exclude_primary_metadata() ->
 
     assert_eq!(metadata.worktree_git_dir, child_git_dir);
     assert_eq!(
+        metadata.private_git_dir,
+        child_git_dir.join(MANAGED_CHILD_PRIVATE_GIT_DIR)
+    );
+    assert_eq!(
+        metadata.private_object_dir,
+        metadata.private_git_dir.join("objects")
+    );
+    assert_eq!(metadata.shared_object_dir, common.join("objects"));
+    assert_eq!(metadata.common_config, common.join("config"));
+    assert_eq!(
+        metadata.active_commit_hook,
+        Some(common.join("hooks/commit-msg"))
+    );
+    assert_eq!(
         metadata.common_read_only_roots,
         vec![
             fs::canonicalize(common.join("objects"))?,
@@ -1271,8 +1285,8 @@ fn managed_linked_worktree_git_roots_are_exact_and_exclude_primary_metadata() ->
 
 #[cfg(unix)]
 #[test]
-fn managed_git_metadata_is_own_gitdir_write_and_common_components_read_in_both_layers() -> Result<()>
-{
+fn managed_git_metadata_is_private_gitdir_write_and_shared_components_read_in_both_layers(
+) -> Result<()> {
     let temp = tempfile::tempdir()?;
     let (_primary, child, common, child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
     let incoming = temp.path().join("incoming");
@@ -1284,10 +1298,43 @@ fn managed_git_metadata_is_own_gitdir_write_and_common_components_read_in_both_l
         .as_ref()
         .context("managed Git controls")?;
     let permissions = codex_filesystem_permissions(&command, &controls);
+    let shell_policy = codex_shell_environment_include_only(&controls);
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+    ] {
+        assert!(
+            shell_policy.contains(&toml_basic_string(key)),
+            "managed Git shell policy omitted {key}: {shell_policy}"
+        );
+    }
+    for forbidden in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
+        assert!(!shell_policy.contains(forbidden));
+    }
+    let managed_environment = managed_git_environment(git)?;
+    for key in managed_environment.keys() {
+        assert!(
+            shell_policy.contains(&toml_basic_string(key)),
+            "managed Git shell policy omitted injected key {key}: {shell_policy}"
+        );
+    }
 
     assert!(permissions.contains(&format!(
-        "{}=\"write\"",
+        "{}=\"read\"",
         toml_basic_string(child_git_dir.to_str().context("UTF-8 child gitdir")?)
+    )));
+    assert!(permissions.contains(&format!(
+        "{}=\"write\"",
+        toml_basic_string(
+            git.private_git_dir
+                .to_str()
+                .context("UTF-8 private child gitdir")?
+        )
     )));
     for path in git
         .common_read_only_roots
@@ -1340,10 +1387,14 @@ fn managed_git_metadata_is_own_gitdir_write_and_common_components_read_in_both_l
         expected = expected.with_visible_read_only_file(file);
     }
     expected = expected
-        .with_visible_read_write_root(&git.worktree_git_dir)
+        .with_visible_read_only_root(&git.worktree_git_dir)
+        .with_visible_read_write_root(&git.private_git_dir)
         .with_writable_artifact_root(&incoming);
     assert_eq!(actual, expected);
-    assert!(actual.visible_read_write_roots().contains(&child_git_dir));
+    assert!(actual.visible_read_only_roots().contains(&child_git_dir));
+    assert!(actual
+        .visible_read_write_roots()
+        .contains(&git.private_git_dir));
     for root in &git.common_read_only_roots {
         assert!(actual.visible_read_only_roots().contains(root));
     }
@@ -1418,7 +1469,7 @@ fn managed_git_hooks_path_and_unsafe_commit_hooks_fail_closed() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn contained_managed_commit_runs_hook_then_refuses_common_object_write() -> Result<()> {
+fn contained_managed_commit_uses_private_objects_and_leaves_shared_git_unchanged() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     fn snapshot_tree(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
@@ -1460,16 +1511,11 @@ fn contained_managed_commit_runs_hook_then_refuses_common_object_write() -> Resu
 
     let release_notes = child.join("RELEASE_NOTES.md");
     fs::write(&release_notes, "initial\ncontained child change\n")?;
-    let mut index = repository.index()?;
-    index.add_path(Path::new("RELEASE_NOTES.md"))?;
-    index.write()?;
-    // Seed the changed blob and tree outside containment so the approved commit
-    // reaches the hook and then needs only a new commit object in the shared ODB.
-    index.write_tree()?;
-    index.write()?;
     let objects = common.join("objects");
     let objects_before = snapshot_tree(&objects)?;
+    let refs_before = snapshot_tree(&common.join("refs"))?;
     let child_head_before = repository.head()?.target().context("child HEAD oid")?;
+    let child_index_before = fs::read(child_git_dir.join("index"))?;
     let primary_head_before = fs::read(common.join("HEAD"))?;
     let primary_index_before = fs::read(primary.join(".git/index"))?;
     let peer_head_path = common.join("worktrees/peer/HEAD");
@@ -1532,6 +1578,7 @@ if printf 'tamper\n' >> "$guard" 2>/dev/null; then
   exit 41
 fi
 before="$(git rev-parse HEAD)"
+git add -- RELEASE_NOTES.md
 if GIT_AUTHOR_NAME='Prohibited Agent' \
    GIT_AUTHOR_EMAIL='prohibited@example.invalid' \
    GIT_COMMITTER_NAME='Prohibited Agent' \
@@ -1542,13 +1589,13 @@ fi
 if [ "$(git rev-parse HEAD)" != "$before" ]; then
   exit 43
 fi
-if git commit -m 'approved identity'; then
+if ! git commit -m 'approved identity'; then
   exit 44
 fi
-if [ "$(git rev-parse HEAD)" != "$before" ]; then
+if [ "$(git rev-parse HEAD)" = "$before" ]; then
   exit 45
 fi
-exit 46
+exit 0
 "#,
     )?;
     fs::set_permissions(&program, fs::Permissions::from_mode(0o755))?;
@@ -1557,21 +1604,24 @@ exit 46
     fs::create_dir(&incoming)?;
     let command = managed_git_command(&child, &incoming);
     let controls = protected_worktree_controls(&command)?;
+    let git = controls
+        .managed_git
+        .as_ref()
+        .context("managed Git controls")?;
     let profile = external_side_effect_profile(
         &command,
         &program,
         ExternalProgramTrust::TrustedSystemCodex,
         &controls,
     )?;
-    let environment = BTreeMap::from([
-        ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
-        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
-        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+    let mut environment = managed_git_environment(git)?;
+    environment.extend(BTreeMap::from([
+        ("GIT_WORK_TREE".to_string(), child.display().to_string()),
         ("HOME".to_string(), child.display().to_string()),
         ("LANG".to_string(), "C".to_string()),
         ("LC_ALL".to_string(), "C".to_string()),
         ("PATH".to_string(), TRUSTED_PATH.to_string()),
-    ]);
+    ]));
     let output = crate::process_runner::run_process(
         ProcessSpec::direct(
             "contained managed Git commit proof",
@@ -1590,7 +1640,7 @@ exit 46
     assert!(output.safety_evidence_verified());
     assert_eq!(
         output.status.as_ref().and_then(|status| status.code()),
-        Some(46)
+        Some(0)
     );
     let stdout = String::from_utf8_lossy(output.stdout.as_bytes());
     let stderr = String::from_utf8_lossy(output.stderr.as_bytes());
@@ -1600,13 +1650,6 @@ exit 46
         })?,
         "prohibited\napproved\n"
     );
-    assert!(
-        stderr.contains("insufficient permission")
-            || stderr.contains("Permission denied")
-            || stderr.contains("unable to write")
-            || stderr.contains("failed to write commit object"),
-        "approved commit did not expose the expected common object/ref denial: {stderr}"
-    );
     assert_eq!(repository.head()?.target(), Some(child_head_before));
     assert_eq!(fs::read(common.join("HEAD"))?, primary_head_before);
     assert_eq!(fs::read(primary.join(".git/index"))?, primary_index_before);
@@ -1615,6 +1658,15 @@ exit 46
     assert_eq!(fs::read(checker)?, checker_before);
     assert_eq!(fs::read(hook)?, hook_before);
     assert_eq!(snapshot_tree(&objects)?, objects_before);
+    assert_eq!(snapshot_tree(&common.join("refs"))?, refs_before);
+    assert_eq!(fs::read(child_git_dir.join("index"))?, child_index_before);
+    verify_managed_git_boundary_after_launch(git)?;
+    let private_head = fs::read_to_string(git.private_git_dir.join(MANAGED_CHILD_PRIVATE_REF))?;
+    let private_head = Oid::from_str(private_head.trim())?;
+    assert_ne!(private_head, child_head_before);
+    assert!(snapshot_tree(&git.private_object_dir)?
+        .keys()
+        .any(|path| path.components().count() >= 2));
     assert_eq!(
         fs::read_to_string(release_notes)?,
         "initial\ncontained child change\n"
