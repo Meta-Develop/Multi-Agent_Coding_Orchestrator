@@ -1151,7 +1151,20 @@ fn managed_worktree_git_metadata(workspace: &Path) -> Result<Option<ManagedWorkt
     let refs = canonical_git_directory(&common_dir.join("refs"), "Git refs directory")?;
     reject_git_read_only_tree_aliases(&refs, "Git refs")?;
     let config = canonical_git_file(&common_dir.join("config"), "Git common config")?;
+    reject_managed_git_hooks_path(&config, "Git common config")?;
+    if let Some(worktree_config) = canonical_optional_git_file(
+        &worktree_git_dir.join("config.worktree"),
+        "Git worktree config",
+    )? {
+        reject_managed_git_hooks_path(&worktree_config, "Git worktree config")?;
+    }
     let mut common_read_only_files = vec![config];
+    if let Some(commit_msg_hook) = canonical_optional_active_git_hook(
+        &common_dir.join("hooks/commit-msg"),
+        "Git commit-msg hook",
+    )? {
+        common_read_only_files.push(commit_msg_hook);
+    }
     for (relative, label) in [
         ("packed-refs", "Git packed refs"),
         ("info/exclude", "Git exclude file"),
@@ -1273,6 +1286,49 @@ fn canonical_optional_git_file(path: &Path, label: &str) -> Result<Option<PathBu
         Err(error) => Err(error).with_context(|| format!("failed to inspect {label}")),
         Ok(_) => canonical_git_file(path, label).map(Some),
     }
+}
+
+fn reject_managed_git_hooks_path(config: &Path, label: &str) -> Result<()> {
+    const MAX_MANAGED_GIT_CONFIG_BYTES: usize = 1024 * 1024;
+    let bytes = read_bounded_regular_file_nofollow(config, MAX_MANAGED_GIT_CONFIG_BYTES)
+        .with_context(|| format!("failed to read bounded {label}"))?;
+    let policy = crate::worktree::parse_bounded_local_git_config(Some(&bytes))?;
+    if policy.core_hooks_path_present {
+        bail!(
+            "managed child Git commits require repository-local core.hooksPath to be absent; remove the custom hook path and install the commit-msg hook in the default Git hooks directory"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn canonical_optional_active_git_hook(path: &Path, label: &str) -> Result<Option<PathBuf>> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("failed to inspect {label}")),
+        Ok(metadata) => metadata,
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("{label} is not a non-symlink regular file");
+    }
+    if metadata.nlink() != 1 {
+        bail!(
+            "{label} has a hard-link alias; reinstall the repository hook before retrying"
+        );
+    }
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Ok(None);
+    }
+    fs::canonicalize(path)
+        .map(Some)
+        .with_context(|| format!("{label} could not be resolved"))
+}
+
+#[cfg(not(unix))]
+fn canonical_optional_active_git_hook(_path: &Path, _label: &str) -> Result<Option<PathBuf>> {
+    bail!("managed child Git hook validation is unsupported on this platform")
 }
 
 #[cfg(unix)]

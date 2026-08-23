@@ -1166,6 +1166,8 @@ fn create_mandatory_control_roots(workspace: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn create_linked_git_metadata_fixture(root: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+    use std::os::unix::fs::PermissionsExt;
+
     let primary = root.join("primary");
     let child = root.join("child");
     let peer = root.join("peer");
@@ -1194,6 +1196,11 @@ fn create_linked_git_metadata_fixture(root: &Path) -> Result<(PathBuf, PathBuf, 
         fs::set_permissions(&program, fs::Permissions::from_mode(0o700))?;
     }
     let common = fs::canonicalize(repository.commondir())?;
+    let hooks = common.join("hooks");
+    fs::create_dir_all(&hooks)?;
+    let commit_msg_hook = hooks.join("commit-msg");
+    fs::write(&commit_msg_hook, "#!/bin/sh\nexit 0\n")?;
+    fs::set_permissions(&commit_msg_hook, fs::Permissions::from_mode(0o755))?;
     fs::write(
         common.join("packed-refs"),
         "# pack-refs with: peeled fully-peeled sorted\n",
@@ -1232,11 +1239,14 @@ fn managed_linked_worktree_git_roots_are_exact_and_exclude_primary_metadata() ->
             fs::canonicalize(common.join("refs"))?,
         ]
     );
-    for required in ["config", "packed-refs", "info/exclude"] {
+    for required in ["config", "hooks/commit-msg", "packed-refs", "info/exclude"] {
         assert!(metadata
             .common_read_only_files
             .contains(&fs::canonicalize(common.join(required))?));
     }
+    assert!(!metadata
+        .common_read_only_roots
+        .contains(&fs::canonicalize(common.join("hooks"))?));
 
     let forbidden = [
         fs::canonicalize(common.join("HEAD"))?,
@@ -1342,6 +1352,7 @@ fn managed_git_metadata_is_own_gitdir_write_and_common_components_read_in_both_l
         common.join("worktrees/peer"),
         common.join("maco"),
         common.join("config.worktree"),
+        common.join("hooks"),
     ] {
         assert!(!actual
             .visible_read_only_roots()
@@ -1349,6 +1360,266 @@ fn managed_git_metadata_is_own_gitdir_write_and_common_components_read_in_both_l
             .chain(actual.visible_read_write_roots())
             .any(|allowed| allowed == &forbidden));
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_git_hooks_path_and_unsafe_commit_hooks_fail_closed() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    for worktree_config in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let (_primary, child, common, child_git_dir) =
+            create_linked_git_metadata_fixture(temp.path())?;
+        let config_path = if worktree_config {
+            child_git_dir.join("config.worktree")
+        } else {
+            common.join("config")
+        };
+        if worktree_config {
+            fs::write(&config_path, "[core]\n\thooksPath = alternate-hooks\n")?;
+        } else {
+            let mut config = git2::Config::open(&config_path)?;
+            config.set_str("core.hooksPath", "alternate-hooks")?;
+        }
+        let error = managed_worktree_git_metadata(&child)
+            .expect_err("custom local hooksPath must fail closed");
+        assert!(error.to_string().contains("core.hooksPath"), "{error:#}");
+    }
+
+    let hardlink_temp = tempfile::tempdir()?;
+    let (_primary, hardlink_child, hardlink_common, _child_git_dir) =
+        create_linked_git_metadata_fixture(hardlink_temp.path())?;
+    fs::hard_link(
+        hardlink_common.join("hooks/commit-msg"),
+        hardlink_temp.path().join("commit-msg-alias"),
+    )?;
+    let hardlink_error = managed_worktree_git_metadata(&hardlink_child)
+        .expect_err("hard-linked commit-msg hook must fail closed");
+    assert!(hardlink_error.to_string().contains("hard-link alias"));
+
+    let symlink_temp = tempfile::tempdir()?;
+    let (_primary, symlink_child, symlink_common, _child_git_dir) =
+        create_linked_git_metadata_fixture(symlink_temp.path())?;
+    let hook = symlink_common.join("hooks/commit-msg");
+    fs::remove_file(&hook)?;
+    let target = symlink_temp.path().join("outside-hook");
+    fs::write(&target, "#!/bin/sh\nexit 0\n")?;
+    symlink(&target, &hook)?;
+    let symlink_error = managed_worktree_git_metadata(&symlink_child)
+        .expect_err("symlinked commit-msg hook must fail closed");
+    assert!(symlink_error
+        .to_string()
+        .contains("non-symlink regular file"));
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn contained_managed_commit_runs_hook_then_refuses_common_object_write() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn snapshot_tree(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
+        fn visit(
+            root: &Path,
+            current: &Path,
+            snapshot: &mut BTreeMap<PathBuf, Vec<u8>>,
+        ) -> Result<()> {
+            for entry in fs::read_dir(current)? {
+                let entry = entry?;
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path)?;
+                if metadata.is_dir() {
+                    visit(root, &path, snapshot)?;
+                } else if metadata.is_file() {
+                    snapshot.insert(path.strip_prefix(root)?.to_path_buf(), fs::read(&path)?);
+                } else {
+                    bail!(
+                        "unexpected non-file entry in object store: {}",
+                        path.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        let mut snapshot = BTreeMap::new();
+        visit(root, root, &mut snapshot)?;
+        Ok(snapshot)
+    }
+
+    skip_without_containment!(ok);
+    let temp = tempfile::tempdir()?;
+    let (primary, child, common, child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    let repository = crate::git_repository::open(&child)?;
+    let mut config = repository.config()?;
+    config.set_str("user.name", "Approved Owner")?;
+    config.set_str("user.email", "approved@example.invalid")?;
+
+    let release_notes = child.join("RELEASE_NOTES.md");
+    fs::write(&release_notes, "initial\ncontained child change\n")?;
+    let mut index = repository.index()?;
+    index.add_path(Path::new("RELEASE_NOTES.md"))?;
+    index.write()?;
+    // Seed the changed blob and tree outside containment so the approved commit
+    // reaches the hook and then needs only a new commit object in the shared ODB.
+    index.write_tree()?;
+    index.write()?;
+    let objects = common.join("objects");
+    let objects_before = snapshot_tree(&objects)?;
+    let child_head_before = repository.head()?.target().context("child HEAD oid")?;
+    let primary_head_before = fs::read(common.join("HEAD"))?;
+    let primary_index_before = fs::read(primary.join(".git/index"))?;
+    let peer_head_path = common.join("worktrees/peer/HEAD");
+    let peer_index_path = common.join("worktrees/peer/index");
+    let peer_head_before = fs::read(&peer_head_path)?;
+    let peer_index_before = fs::read(&peer_index_path)?;
+
+    let checker = child.join(".agents/scripts/check-human-authorship");
+    fs::create_dir_all(checker.parent().context("checker parent")?)?;
+    fs::write(
+        &checker,
+        r#"#!/bin/sh
+set -eu
+root="$(git rev-parse --show-toplevel)"
+author="$(git var GIT_AUTHOR_IDENT)"
+committer="$(git var GIT_COMMITTER_IDENT)"
+case "$author" in
+  "Approved Owner <approved@example.invalid> "*) ;;
+  *)
+    printf 'prohibited\n' >> "$root/hook-events"
+    exit 1
+    ;;
+esac
+case "$committer" in
+  "Approved Owner <approved@example.invalid> "*) ;;
+  *)
+    printf 'prohibited\n' >> "$root/hook-events"
+    exit 1
+    ;;
+esac
+printf 'approved\n' >> "$root/hook-events"
+exit 0
+"#,
+    )?;
+    fs::set_permissions(&checker, fs::Permissions::from_mode(0o755))?;
+    let checker_before = fs::read(&checker)?;
+    let hook = common.join("hooks/commit-msg");
+    fs::write(
+        &hook,
+        r#"#!/bin/sh
+set -eu
+guard="$(git rev-parse --show-toplevel)/.agents/scripts/check-human-authorship"
+exec "$guard"
+"#,
+    )?;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))?;
+    let hook_before = fs::read(&hook)?;
+
+    let program = child.join("fixture-codex");
+    fs::write(
+        &program,
+        r#"#!/bin/sh
+set -u
+hook="$(git rev-parse --git-path hooks/commit-msg)"
+guard="$(git rev-parse --show-toplevel)/.agents/scripts/check-human-authorship"
+if printf 'tamper\n' >> "$hook" 2>/dev/null; then
+  exit 40
+fi
+if printf 'tamper\n' >> "$guard" 2>/dev/null; then
+  exit 41
+fi
+before="$(git rev-parse HEAD)"
+if GIT_AUTHOR_NAME='Prohibited Agent' \
+   GIT_AUTHOR_EMAIL='prohibited@example.invalid' \
+   GIT_COMMITTER_NAME='Prohibited Agent' \
+   GIT_COMMITTER_EMAIL='prohibited@example.invalid' \
+   git commit -m 'invalid identity'; then
+  exit 42
+fi
+if [ "$(git rev-parse HEAD)" != "$before" ]; then
+  exit 43
+fi
+if git commit -m 'approved identity'; then
+  exit 44
+fi
+if [ "$(git rev-parse HEAD)" != "$before" ]; then
+  exit 45
+fi
+exit 46
+"#,
+    )?;
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755))?;
+
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let command = managed_git_command(&child, &incoming);
+    let controls = protected_worktree_controls(&command)?;
+    let profile = external_side_effect_profile(
+        &command,
+        &program,
+        ExternalProgramTrust::TrustedSystemCodex,
+        &controls,
+    )?;
+    let environment = BTreeMap::from([
+        ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
+        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        ("HOME".to_string(), child.display().to_string()),
+        ("LANG".to_string(), "C".to_string()),
+        ("LC_ALL".to_string(), "C".to_string()),
+        ("PATH".to_string(), TRUSTED_PATH.to_string()),
+    ]);
+    let output = crate::process_runner::run_process(
+        ProcessSpec::direct(
+            "contained managed Git commit proof",
+            &program,
+            Vec::<OsString>::new(),
+            &child,
+            64 * 1024,
+        )
+        .with_environment(EnvironmentMode::ClearAndSet(environment))
+        .with_containment(crate::process_runner::ContainmentPolicy::Required)
+        .with_side_effect_confinement(profile)
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(Duration::from_secs(10))),
+    )?;
+
+    assert!(output.safety_evidence_verified());
+    assert_eq!(
+        output.status.as_ref().and_then(|status| status.code()),
+        Some(46)
+    );
+    let stdout = String::from_utf8_lossy(output.stdout.as_bytes());
+    let stderr = String::from_utf8_lossy(output.stderr.as_bytes());
+    assert_eq!(
+        fs::read_to_string(child.join("hook-events")).with_context(|| {
+            format!("hook event log was not created; stdout={stdout:?}; stderr={stderr:?}")
+        })?,
+        "prohibited\napproved\n"
+    );
+    assert!(
+        stderr.contains("insufficient permission")
+            || stderr.contains("Permission denied")
+            || stderr.contains("unable to write")
+            || stderr.contains("failed to write commit object"),
+        "approved commit did not expose the expected common object/ref denial: {stderr}"
+    );
+    assert_eq!(repository.head()?.target(), Some(child_head_before));
+    assert_eq!(fs::read(common.join("HEAD"))?, primary_head_before);
+    assert_eq!(fs::read(primary.join(".git/index"))?, primary_index_before);
+    assert_eq!(fs::read(peer_head_path)?, peer_head_before);
+    assert_eq!(fs::read(peer_index_path)?, peer_index_before);
+    assert_eq!(fs::read(checker)?, checker_before);
+    assert_eq!(fs::read(hook)?, hook_before);
+    assert_eq!(snapshot_tree(&objects)?, objects_before);
+    assert_eq!(
+        fs::read_to_string(release_notes)?,
+        "initial\ncontained child change\n"
+    );
+    assert!(child_git_dir.join("index").exists());
     Ok(())
 }
 
