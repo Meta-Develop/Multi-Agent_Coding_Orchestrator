@@ -3,39 +3,50 @@ use super::*;
 const PRE_ACTION_INTENT_SUMMARY_MAX_BYTES: usize = 1024;
 const PRE_ACTION_INTENT_SUMMARY_FALLBACK: &str = "assigned work";
 
-fn sanitize_pre_action_intent_candidate(candidate: &str) -> String {
-    let mut sanitized =
-        String::with_capacity(candidate.len().min(PRE_ACTION_INTENT_SUMMARY_MAX_BYTES));
+fn normalize_pre_action_intent_candidate(candidate: &str) -> String {
+    let mut normalized = String::with_capacity(candidate.len());
     let mut separator_pending = false;
     for character in candidate.chars() {
         if character.is_whitespace() || character.is_control() {
-            separator_pending = !sanitized.is_empty();
+            separator_pending = !normalized.is_empty();
             continue;
         }
 
-        let separator_bytes = usize::from(separator_pending);
-        if sanitized.len() + separator_bytes + character.len_utf8()
-            > PRE_ACTION_INTENT_SUMMARY_MAX_BYTES
-        {
-            break;
-        }
         if separator_pending {
-            sanitized.push(' ');
+            normalized.push(' ');
             separator_pending = false;
         }
-        sanitized.push(character);
+        normalized.push(character);
     }
-    sanitized
+    normalized
 }
 
-fn pre_action_intent_summary(task: Option<&str>, notes: Option<&str>, id: &str) -> String {
+fn normalized_pre_action_intent(task: Option<&str>, notes: Option<&str>, id: &str) -> String {
     for candidate in task.into_iter().chain(notes).chain(Some(id)) {
-        let sanitized = sanitize_pre_action_intent_candidate(candidate);
-        if !sanitized.is_empty() {
-            return sanitized;
+        let normalized = normalize_pre_action_intent_candidate(candidate);
+        if !normalized.is_empty() {
+            return normalized;
         }
     }
     PRE_ACTION_INTENT_SUMMARY_FALLBACK.to_string()
+}
+
+fn bound_pre_action_intent_summary(normalized: &str) -> String {
+    let end = normalized
+        .char_indices()
+        .map(|(index, character)| index.saturating_add(character.len_utf8()))
+        .take_while(|end| *end <= PRE_ACTION_INTENT_SUMMARY_MAX_BYTES)
+        .last()
+        .unwrap_or_default();
+    normalized[..end].trim_end_matches(' ').to_string()
+}
+
+fn sanitize_pre_action_intent_candidate(candidate: &str) -> String {
+    bound_pre_action_intent_summary(&normalize_pre_action_intent_candidate(candidate))
+}
+
+fn pre_action_intent_summary(task: Option<&str>, notes: Option<&str>, id: &str) -> String {
+    sanitize_pre_action_intent_candidate(&normalized_pre_action_intent(task, notes, id))
 }
 
 #[cfg(unix)]
@@ -315,7 +326,24 @@ pub(super) fn pre_action_review_context(
         })
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("failed to bind pre-action review claims")?;
-    let intent = pre_action_intent_summary(
+    let normalized_intent = normalized_pre_action_intent(
+        assignment.task.as_deref(),
+        assignment.notes.as_deref(),
+        &assignment.id,
+    );
+    let validated = ReviewContext::new(
+        options.run_id.as_str(),
+        &assignment.id,
+        &normalized_intent,
+        claims.clone(),
+        std::iter::empty::<RepoPathRule>(),
+    )
+    .context("failed to construct pre-action review context")?;
+    if normalized_intent.len() <= PRE_ACTION_INTENT_SUMMARY_MAX_BYTES {
+        return Ok(validated);
+    }
+
+    let bounded_intent = pre_action_intent_summary(
         assignment.task.as_deref(),
         assignment.notes.as_deref(),
         &assignment.id,
@@ -323,7 +351,7 @@ pub(super) fn pre_action_review_context(
     ReviewContext::new(
         options.run_id.as_str(),
         &assignment.id,
-        &intent,
+        &bounded_intent,
         claims,
         std::iter::empty::<RepoPathRule>(),
     )
@@ -368,6 +396,16 @@ mod tests {
             PRE_ACTION_INTENT_SUMMARY_MAX_BYTES / '界'.len_utf8()
         );
         assert!(summary.chars().all(|character| character == '界'));
+
+        let separated = sanitize_pre_action_intent_candidate(&format!(
+            "{} 界",
+            "x".repeat(PRE_ACTION_INTENT_SUMMARY_MAX_BYTES - 1)
+        ));
+        assert_eq!(
+            separated,
+            "x".repeat(PRE_ACTION_INTENT_SUMMARY_MAX_BYTES - 1)
+        );
+        assert!(!separated.ends_with(' '));
     }
 
     #[test]

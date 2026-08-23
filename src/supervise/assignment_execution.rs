@@ -785,6 +785,7 @@ struct PreparedChildAttempt<'a> {
     incoming_output_root: SecureOutputRoot,
     capture_output_root: SecureOutputRoot,
     budget_reservation: DispatchBudgetReservation<'a>,
+    pre_action_review_context: Option<ReviewContext>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1077,6 +1078,21 @@ fn prepare_child_attempt<'a>(
             return Ok(AssignmentExecutionDisposition::Complete);
         }
     };
+    let pre_action_review_context = if options.runtime == SupervisorRuntime::Codex {
+        match pre_action_review_context(options, assignment, &worktree.path) {
+            Ok(review_context) => Some(review_context),
+            Err(error) => {
+                drop(incoming_output_root);
+                drop(capture_output_root);
+                with_supervisor_artifacts(artifacts, |writer, _| {
+                    discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+                })?;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     if *execution_runtime == SupervisorExecutionRuntime::Verified {
         let authenticated_claims = context
             .sync_store
@@ -1133,6 +1149,7 @@ fn prepare_child_attempt<'a>(
             incoming_output_root,
             capture_output_root,
             budget_reservation,
+            pre_action_review_context,
         },
     ))
 }
@@ -1190,6 +1207,7 @@ fn dispatch_and_collect_child_attempt<'a>(
     let incoming_output_root = prepared.incoming_output_root;
     let capture_output_root = prepared.capture_output_root;
     let mut budget_reservation = prepared.budget_reservation;
+    let pre_action_review_context = prepared.pre_action_review_context;
 
     record_shared_orchestration_event(
         artifacts,
@@ -1241,27 +1259,8 @@ fn dispatch_and_collect_child_attempt<'a>(
 
     let external_run_result = match options.runtime {
         SupervisorRuntime::Codex => {
-            // Keep the bounded, canonical assignment context as a universal Codex
-            // pre-dispatch invariant even when a managed worktree uses native sandboxing
-            // instead of the optional hosted reviewer.
-            let bounded_review_context =
-                match pre_action_review_context(options, assignment, &worktree.path) {
-                    Ok(review_context) => review_context,
-                    Err(error) => {
-                        drop(incoming_output_root);
-                        drop(capture_output_root);
-                        with_supervisor_artifacts(artifacts, |writer, _| {
-                            discard_invocation_scratches(
-                                writer,
-                                &incoming_scratch,
-                                &capture_scratch,
-                            )
-                        })?;
-                        return Err(error);
-                    }
-                };
             let review_context = if requires_hosted_pre_action_review(&command) {
-                Some(bounded_review_context)
+                pre_action_review_context.as_ref()
             } else {
                 None
             };
