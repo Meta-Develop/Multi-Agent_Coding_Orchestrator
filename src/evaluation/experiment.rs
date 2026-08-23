@@ -11,6 +11,8 @@ use super::{
     ParetoPoint, PreciseMean, PreciseQualityScore, QualityScore, ReviewDimension, ReviewQuality,
     MAX_EVALUATION_HELD_OUT_VALIDATIONS, MAX_EVALUATION_PROFILES, MAX_EVALUATION_REPETITIONS,
 };
+#[cfg(not(test))]
+use crate::supervise::run_supervisor_plan_file;
 use crate::{
     artifacts::state_auth::sha256_hex,
     llm::provider::Usage,
@@ -18,10 +20,9 @@ use crate::{
     orchestrator::{RunId, SemanticCoordinationMode},
     review::ReviewAggregationPolicy,
     supervise::{
-        run_supervisor_plan_file, AgentRole, OrchestratorAssignment, RoleModelSelection,
-        RoleUsageReport, RunBudgetLimits, SupervisorAdmissionConfig, SupervisorFinalReport,
-        SupervisorPlan, SupervisorRunOptions, SupervisorRuntime, UnavailableModelFallback,
-        WorkerAssignment,
+        AgentRole, OrchestratorAssignment, RoleModelSelection, RoleUsageReport, RunBudgetLimits,
+        SupervisorAdmissionConfig, SupervisorFinalReport, SupervisorPlan, SupervisorRunOptions,
+        SupervisorRuntime, UnavailableModelFallback, WorkerAssignment,
     },
 };
 use git2::{IndexAddOption, Repository, Signature};
@@ -405,13 +406,16 @@ fn run_isolated_profile(
 ) -> Result<ExperimentRun, EvaluationError> {
     let isolated = IsolatedSuperviseState::create(manifest, profile, repetition)?;
     let started = Instant::now();
-    let report = run_supervisor_plan_file(isolated.options()).map_err(|error| {
-        EvaluationError::FakeSuperviseExperiment {
-            message: format!(
-                "profile '{}' repetition {repetition} Fake supervise failed: {error:#}",
-                profile.id
-            ),
-        }
+    #[cfg(test)]
+    let report_result =
+        crate::supervise::run_fake_supervisor_plan_file_for_test(isolated.options());
+    #[cfg(not(test))]
+    let report_result = run_supervisor_plan_file(isolated.options());
+    let report = report_result.map_err(|error| EvaluationError::FakeSuperviseExperiment {
+        message: format!(
+            "profile '{}' repetition {repetition} Fake supervise failed: {error:#}",
+            profile.id
+        ),
     })?;
     let wall_time_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     capture_experiment_run(

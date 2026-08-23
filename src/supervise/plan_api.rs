@@ -1624,6 +1624,39 @@ pub fn run_supervisor_plan_file(options: SupervisorRunOptions) -> Result<Supervi
     )
 }
 
+/// Runs a Fake plan-file experiment through the hermetic unit-test worktree path.
+///
+/// This helper is absent from production builds. Production plan-file execution
+/// continues to acquire the bounded repository-cleanliness capability and fails
+/// closed when its sandbox is unavailable.
+#[cfg(test)]
+pub(crate) fn run_fake_supervisor_plan_file_for_test(
+    options: SupervisorRunOptions,
+) -> Result<SupervisorFinalReport> {
+    if options.runtime != SupervisorRuntime::Fake {
+        bail!("hermetic test plan-file execution requires the Fake runtime");
+    }
+    validate_max_concurrent_children(1)?;
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    validate_execution_target_pre_dispatch(&loaded, false)?;
+    let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
+    let no_external_runner = |_command: &ExternalAgentCommand,
+                              _cancellation: &ProcessCancellation,
+                              _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>|
+     -> ExternalAgentRun {
+        panic!("hermetic Fake plan-file execution must not launch an external process")
+    };
+    run_supervisor_plan_with_runner_and_creation(
+        loaded,
+        options,
+        1,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        SupervisorWorktreeCreation::TestOnly,
+        Ok(runtime_model_catalog),
+        &no_external_runner,
+    )
+}
+
 pub fn run_supervisor_plan_file_with_concurrency_policy(
     options: SupervisorRunOptions,
     concurrency_policy: SupervisorConcurrencyPolicy,
