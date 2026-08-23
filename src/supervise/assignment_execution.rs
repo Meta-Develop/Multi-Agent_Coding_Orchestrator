@@ -2918,9 +2918,38 @@ fn publish_assignment_report(
 ) -> Result<()> {
     let assignment = &preflight.assignment;
     outcome.candidate_inspection = completed_candidate_inspection;
+    let subject_selection = effective_role_model_selection(context.plan, assignment.role);
+    let auditor_selection = effective_role_model_selection(context.plan, AgentRole::Auditor);
+    let subject_capability = model_capability_or_weak(subject_selection.model.as_deref());
+    let auditor_capability = model_capability_or_weak(
+        context
+            .plan
+            .review_lenses
+            .first()
+            .map(|lens| lens.backend.model())
+            .or(auditor_selection.model.as_deref()),
+    );
+    let role_transition = consider_assignment_role_transition(
+        assignment,
+        journal_parent_id,
+        &child_report,
+        subject_capability,
+        auditor_capability,
+    )?;
     with_supervisor_artifacts(context.artifacts, |writer, journal| {
         write_child_report(writer, final_report_relative, &child_report)?;
         record_final_report_decisions(journal, writer, journal_parent_id, &child_report);
+        if let Some(executed) = &role_transition {
+            record_orchestration_event(
+                journal,
+                writer,
+                &assignment.id,
+                Some(journal_parent_id),
+                OrchestrationRole::Orchestrator,
+                OrchestrationEventKind::Journal,
+                role_transition_payload(&executed.record)?,
+            );
+        }
         Ok(())
     })?;
     let failure_flags = final_report_failure_flags(

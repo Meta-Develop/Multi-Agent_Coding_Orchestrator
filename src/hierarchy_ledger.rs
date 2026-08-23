@@ -9,9 +9,10 @@
 //! #221 note: this module records the four authority *categories* as ledger
 //! labels mapped from the existing `AgentRole` / `OrchestrationRole` values.
 //! Observed coordination depth is derived from parent links (depth as output).
-//! Assignment-time role provenance and promotion/demotion stay in
-//! `supervise::role_authority`. This module does not select roles or drive
-//! the optimizer.
+//! Assignment-time role provenance stays in `supervise::role_authority`.
+//! Promotion and demotion are executed by `supervise::role_transition` and
+//! stored here as `RoleTransitionRecord` payloads. This module does not
+//! select roles or drive the optimizer.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -100,8 +101,7 @@ pub struct GateOwnershipRecord {
     pub reason: String,
 }
 
-/// Reserved #221 payload. Reconstructable, but supervise does not yet emit
-/// promotion or demotion events.
+/// Promotion or demotion decision emitted by `supervise::role_transition`.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoleTransitionDecision {
@@ -236,7 +236,8 @@ impl RoleTransitionRecord {
         require_identifier("requester_agent_id", &self.requester_agent_id)?;
         require_identifier("judge_agent_id", &self.judge_agent_id)?;
         require_reason(&self.reason)?;
-        if self.agent_id == self.judge_agent_id {
+        if self.agent_id == self.judge_agent_id && self.decision == RoleTransitionDecision::Granted
+        {
             bail!("role transition cannot be self-judged");
         }
         if self.from_category == self.to_category {
@@ -695,5 +696,47 @@ mod tests {
         }]);
         assert_eq!(orphan_worker.depths.get("worker-a").copied(), Some(1));
         assert_eq!(orphan_worker.coordination_depth, 2);
+    }
+
+    #[test]
+    fn refused_self_judge_transition_is_recorded() -> Result<()> {
+        let refused = RoleTransitionRecord {
+            agent_id: "child-a".to_string(),
+            from_category: RoleCategory::NonDelegatingTerminalWorker,
+            to_category: RoleCategory::DelegatingCoordinator,
+            requester_agent_id: "child-a".to_string(),
+            judge_agent_id: "child-a".to_string(),
+            decision: RoleTransitionDecision::Refused,
+            reason: "self_judged".to_string(),
+        };
+        refused.validate()?;
+        let snapshot = reconstruct_hierarchy_ledger(&[event(
+            "child-a",
+            Some("run-1"),
+            OrchestrationRole::Orchestrator,
+            OrchestrationEventKind::Journal,
+            role_transition_payload(&refused)?,
+        )])?;
+        assert_eq!(snapshot.role_transitions.len(), 1);
+        assert_eq!(
+            snapshot.role_transitions[0].decision,
+            RoleTransitionDecision::Refused
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn granted_self_judge_transition_fails_closed() {
+        let granted = RoleTransitionRecord {
+            agent_id: "child-a".to_string(),
+            from_category: RoleCategory::NonDelegatingTerminalWorker,
+            to_category: RoleCategory::DelegatingCoordinator,
+            requester_agent_id: "run-1".to_string(),
+            judge_agent_id: "child-a".to_string(),
+            decision: RoleTransitionDecision::Granted,
+            reason: "granted_promotion".to_string(),
+        };
+        let error = granted.validate().expect_err("self-judged grant must fail");
+        assert!(error.to_string().contains("self-judged"));
     }
 }
