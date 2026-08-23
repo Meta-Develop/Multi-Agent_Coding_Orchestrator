@@ -607,6 +607,25 @@ fn propose_task_decomposition_from_fragments(
     let mut diagnostics = TaskPathProposalDiagnostics::default();
     let files = collect_planning_files(repo, title, body, &mut diagnostics)?;
     let file_set = files.iter().cloned().collect::<BTreeSet<_>>();
+    if let Some(assignment) =
+        authoritative_single_file_assignment(repo, title, body, &fragments, &files, &file_set)
+    {
+        diagnostics.notes.push(
+            "an explicit single-file-only directive bounded the task before semantic inference"
+                .to_string(),
+        );
+        return Ok(TaskDecompositionProposal {
+            fragments,
+            assignments: vec![assignment],
+            coverage_gaps: Vec::new(),
+            diagnostics,
+            disjointness: TaskDisjointnessReport {
+                disjoint: true,
+                conflicts: Vec::new(),
+                conflicts_truncated: false,
+            },
+        });
+    }
     let semantic_map = match repo_semantic::scan_repository(repo) {
         Ok(map) => {
             if !map.errors.is_empty() {
@@ -704,6 +723,59 @@ fn propose_task_decomposition_from_fragments(
         diagnostics,
         disjointness,
     })
+}
+
+fn authoritative_single_file_assignment(
+    repo: &Path,
+    title: &str,
+    body: &str,
+    fragments: &[TaskSpecFragment],
+    files: &[PathBuf],
+    file_set: &BTreeSet<PathBuf>,
+) -> Option<TaskAssignmentProposal> {
+    let full_text = format!("{title}\n{body}");
+    let named = match_named_paths_in_text(repo, &full_text, files, file_set);
+    if named.resolved.len() != 1 || !named.unresolved.is_empty() {
+        return None;
+    }
+    let only_path = named.resolved.iter().next()?.clone();
+    let directive_is_tied_to_path = full_text.lines().any(|line| {
+        let line_named = match_named_paths_in_text(repo, line, files, file_set);
+        line_named.resolved.contains(&only_path) && is_single_file_only_directive(line)
+    });
+    if !directive_is_tied_to_path {
+        return None;
+    }
+
+    Some(TaskAssignmentProposal {
+        id: "assignment-001".to_string(),
+        task: fragments
+            .iter()
+            .map(|fragment| fragment.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        fragment_ids: fragments
+            .iter()
+            .map(|fragment| fragment.id.clone())
+            .collect(),
+        assigned_paths: vec![only_path],
+        semantic_symbols: Vec::new(),
+        semantic_modules: Vec::new(),
+    })
+}
+
+fn is_single_file_only_directive(line: &str) -> bool {
+    let normalized = normalize_text(line);
+    [
+        "edit only",
+        "modify only",
+        "change only",
+        "only edit",
+        "only modify",
+        "only change",
+    ]
+    .iter()
+    .any(|phrase| contains_phrase(&normalized, phrase))
 }
 
 pub fn propose_task_decomposition_with_optional_provider(
@@ -3565,6 +3637,94 @@ mod tests {
             assert!(reclaim_error
                 .to_string()
                 .contains("reclaims completed scope"));
+        });
+    }
+
+    #[test]
+    fn authoritative_single_file_goal_stays_single_and_has_no_semantic_leakage() {
+        skip_without_containment!();
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "RELEASE_NOTES.md", "# Releases\n");
+            write_file(
+                repo,
+                "src/lib.rs",
+                "pub fn write() {}\npub fn commit() {}\n",
+            );
+
+            let title = "Smoke goal — prove a managed-worktree child write";
+            let body = r#"## Goal
+
+Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other file.
+
+## Spec
+
+- Edit only `RELEASE_NOTES.md`.
+- Commit the change with message `docs: child write`.
+
+## Acceptance
+
+- `RELEASE_NOTES.md` ends with the new line and is committed."#;
+            let first = propose_task_decomposition(repo, title, body)
+                .expect("authoritative single-file proposal");
+            let second = propose_task_decomposition(repo, title, body)
+                .expect("deterministic authoritative single-file proposal");
+
+            assert_eq!(first, second);
+            assert_eq!(first.assignments.len(), 1);
+            assert_eq!(first.assignments[0].id, "assignment-001");
+            assert_eq!(
+                first.assignments[0].assigned_paths,
+                vec![PathBuf::from("RELEASE_NOTES.md")]
+            );
+            assert_eq!(
+                first.assignments[0].fragment_ids,
+                first
+                    .fragments
+                    .iter()
+                    .map(|fragment| fragment.id.clone())
+                    .collect::<Vec<_>>()
+            );
+            assert!(first.assignments[0].semantic_symbols.is_empty());
+            assert!(first.assignments[0].semantic_modules.is_empty());
+            assert!(first.coverage_gaps.is_empty());
+            assert!(first.disjointness.disjoint);
+            assert!(first
+                .diagnostics
+                .notes
+                .iter()
+                .any(|note| { note.contains("explicit single-file-only directive") }));
+        });
+    }
+
+    #[test]
+    fn one_named_file_without_a_tied_only_directive_uses_normal_decomposition() {
+        skip_without_containment!();
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "RELEASE_NOTES.md", "# Releases\n");
+            write_file(repo, "src/lib.rs", "pub fn write() {}\n");
+
+            let proposal = propose_task_decomposition(
+                repo,
+                "Update release notes",
+                "Add an entry to RELEASE_NOTES.md.\n\nExplain the write behavior.",
+            )
+            .expect("ordinary heuristic proposal");
+
+            assert!(!proposal
+                .diagnostics
+                .notes
+                .iter()
+                .any(|note| { note.contains("explicit single-file-only directive") }));
+            assert!(proposal
+                .assignments
+                .iter()
+                .any(|assignment| !assignment.semantic_symbols.is_empty()));
         });
     }
 

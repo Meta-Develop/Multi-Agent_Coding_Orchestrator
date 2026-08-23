@@ -387,7 +387,7 @@ fn consult_custom_codex_is_confined_but_never_publishable() -> Result<()> {
                 "-c",
                 "<redacted:local-path>",
                 "-c",
-                "shell_environment_policy.inherit=\"none\"",
+                "shell_environment_policy.inherit=\"core\"",
             ],
         ),
         "unexpected public confinement command: {command:?}"

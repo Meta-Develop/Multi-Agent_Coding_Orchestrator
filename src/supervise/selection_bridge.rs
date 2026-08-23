@@ -15,11 +15,30 @@ use std::path::Path;
 
 const AUTOMATIC_SELECTION_TASK_CLASS: &str = "localized_code_change";
 const JUDGMENT_SELECTION_TASK_CLASS: &str = "review_gate";
+const CURSOR_CATALOG_EVIDENCE_GAP_MAX_BYTES: usize = 4 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CursorCatalogEvidenceGap {
+    message: String,
+    observed_at_unix_millis: u64,
+}
+
+impl CursorCatalogEvidenceGap {
+    fn from_error(error: &anyhow::Error, observed_at_unix_millis: u64) -> Self {
+        let detail = format!("{error:#}");
+        let detail = bounded_cursor_catalog_gap_detail(&detail);
+        Self {
+            message: format!("optional Cursor runtime model catalog observation failed: {detail}"),
+            observed_at_unix_millis,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct AdvertisedCatalogSet {
     pub cursor: Option<crate::runtime_adapter::cursor::CursorAdvertisedCatalogObservation>,
     pub grok: Option<crate::runtime_adapter::grok::GrokAdvertisedCatalogObservation>,
+    cursor_evidence_gap: Option<CursorCatalogEvidenceGap>,
 }
 
 impl AdvertisedCatalogSet {
@@ -28,8 +47,30 @@ impl AdvertisedCatalogSet {
         Self {
             cursor: None,
             grok: None,
+            cursor_evidence_gap: None,
         }
     }
+}
+
+fn bounded_cursor_catalog_gap_detail(detail: &str) -> &str {
+    if detail.len() <= CURSOR_CATALOG_EVIDENCE_GAP_MAX_BYTES {
+        return detail;
+    }
+    let mut end = CURSOR_CATALOG_EVIDENCE_GAP_MAX_BYTES;
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    &detail[..end]
+}
+
+fn cursor_catalog_optional_unavailability(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    text.contains("is missing")
+        || text.contains("not found")
+        || text.contains("no such file")
+        || text.contains("timed out")
+        || text.contains("cannot find")
+        || text.contains("command failed with exit status")
 }
 
 #[cfg(test)]
@@ -41,7 +82,8 @@ const TEST_CURSOR_CATALOG_OBSERVED_AT_ENV: &str = "MACO_TEST_CURSOR_CATALOG_OBSE
 ///
 /// Under `cargo test` this stays hermetic: it never resolves or starts a
 /// third-party CLI. Production binaries screen a live `cursor-agent models`
-/// observation and omit Cursor when the binary is unavailable.
+/// observation and retain a private evidence gap when that optional catalog
+/// cannot be observed.
 pub(super) fn advertised_catalogs_for_launch(repo: &Path) -> Result<AdvertisedCatalogSet> {
     #[cfg(test)]
     {
@@ -89,49 +131,70 @@ fn observe_cursor_catalog_from_fixture(path: &Path) -> Result<AdvertisedCatalogS
     Ok(AdvertisedCatalogSet {
         cursor: Some(observation),
         grok: None,
+        cursor_evidence_gap: None,
     })
 }
 
 #[cfg(not(test))]
 fn advertised_catalogs_from_live_runtimes(repo: &Path) -> Result<AdvertisedCatalogSet> {
-    let cursor = match observe_live_cursor_catalog(repo) {
-        Ok(observation) => Some(observation),
-        Err(error) if cursor_catalog_unavailable(&error) => None,
-        Err(error) => {
-            return Err(error).context("live Cursor catalog observation failed closed");
-        }
-    };
-    Ok(AdvertisedCatalogSet { cursor, grok: None })
+    let observed_at_unix_millis = cursor_catalog_observation_time()?;
+    let (cursor, cursor_evidence_gap) =
+        match observe_live_cursor_catalog(repo, observed_at_unix_millis) {
+            Ok(observation) => (Some(observation), None),
+            Err(error) if cursor_catalog_optional_unavailability(&error) => (
+                None,
+                Some(CursorCatalogEvidenceGap::from_error(
+                    &error,
+                    observed_at_unix_millis,
+                )),
+            ),
+            Err(error) => {
+                return Err(error).context("live Cursor catalog observation failed closed");
+            }
+        };
+    Ok(AdvertisedCatalogSet {
+        cursor,
+        grok: None,
+        cursor_evidence_gap,
+    })
 }
 
 #[cfg(not(test))]
 fn observe_live_cursor_catalog(
     repo: &Path,
+    observed_at_unix_millis: u64,
 ) -> Result<crate::runtime_adapter::cursor::CursorAdvertisedCatalogObservation> {
     let mut spec = crate::runtime_adapter::cursor::CursorCatalogCommandSpec::new(repo);
     if let Some(program) = std::env::var_os("MACO_CURSOR_BIN") {
         spec = spec.with_program(program);
     }
+    spec = apply_cursor_catalog_env_setting(spec, std::env::var("MACO_CURSOR_ENV"))?;
+    crate::runtime_adapter::cursor::discover_cursor_model_catalog(
+        &ScreenedCursorCatalogRunner { repo },
+        &spec,
+        Some(observed_at_unix_millis),
+    )
+}
+
+fn apply_cursor_catalog_env_setting(
+    spec: crate::runtime_adapter::cursor::CursorCatalogCommandSpec,
+    setting: std::result::Result<String, std::env::VarError>,
+) -> Result<crate::runtime_adapter::cursor::CursorCatalogCommandSpec> {
+    match setting {
+        Ok(raw_names) => spec.with_screened_env_passthrough(&raw_names),
+        Err(std::env::VarError::NotPresent | std::env::VarError::NotUnicode(_)) => Ok(spec),
+    }
+}
+
+#[cfg(not(test))]
+fn cursor_catalog_observation_time() -> Result<u64> {
     let observed_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("Cursor catalog observation time is before UNIX_EPOCH")?
         .as_millis();
     let observed_at = u64::try_from(observed_at)
         .context("Cursor catalog observation time does not fit u64 millis")?;
-    crate::runtime_adapter::cursor::discover_cursor_model_catalog(
-        &ScreenedCursorCatalogRunner { repo },
-        &spec,
-        Some(observed_at.max(1)),
-    )
-}
-
-fn cursor_catalog_unavailable(error: &anyhow::Error) -> bool {
-    let text = format!("{error:#}").to_ascii_lowercase();
-    text.contains("is missing")
-        || text.contains("not found")
-        || text.contains("no such file")
-        || text.contains("timed out")
-        || text.contains("cannot find")
+    Ok(observed_at.max(1))
 }
 
 #[cfg(test)]
@@ -184,22 +247,15 @@ impl crate::runtime_adapter::cursor::CursorCatalogCommandRunner
         &self,
         spec: &crate::runtime_adapter::cursor::CursorCatalogCommandSpec,
     ) -> Result<crate::runtime_adapter::cursor::CursorCatalogCommandOutput> {
-        let program = resolve_cursor_catalog_program(spec.program())?;
+        let search_path = std::env::var_os("PATH");
+        let program = resolve_cursor_catalog_program(spec.program(), search_path.as_deref())?;
         let program_parent = program.parent().with_context(|| {
             format!(
                 "Cursor catalog executable has no parent: {}",
                 program.display()
             )
         })?;
-        let environment = spec
-            .environment()
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .chain([(
-                "PATH".to_string(),
-                "/run/current-system/sw/bin:/usr/bin:/bin".to_string(),
-            )])
-            .collect();
+        let environment = cursor_catalog_process_environment(spec);
         let process_spec = ProcessSpec::direct(
             "Cursor runtime model catalog",
             &program,
@@ -230,24 +286,51 @@ impl crate::runtime_adapter::cursor::CursorCatalogCommandRunner
     }
 }
 
-#[cfg(not(test))]
-fn resolve_cursor_catalog_program(program: &Path) -> Result<PathBuf> {
+fn cursor_catalog_process_environment(
+    spec: &crate::runtime_adapter::cursor::CursorCatalogCommandSpec,
+) -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::from([(
+        "PATH".to_string(),
+        "/run/current-system/sw/bin:/usr/bin:/bin".to_string(),
+    )]);
+    environment.extend(spec.environment().clone());
+    environment
+}
+
+fn resolve_cursor_catalog_program(
+    program: &Path,
+    search_path: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
     if program.as_os_str().is_empty() {
         bail!("Cursor catalog binary is missing");
     }
-    if program.components().count() > 1 {
+    let candidate = if program.components().count() > 1 {
         if program.is_file() {
-            return Ok(program.to_path_buf());
+            Ok(program.to_path_buf())
+        } else {
+            bail!("Cursor catalog binary '{}' is missing", program.display());
         }
-        bail!("Cursor catalog binary '{}' is missing", program.display());
+    } else {
+        search_path
+            .into_iter()
+            .flat_map(std::env::split_paths)
+            .map(|dir| dir.join(program))
+            .find(|candidate| candidate.is_file())
+            .with_context(|| format!("Cursor catalog binary '{}' is missing", program.display()))
+    }?;
+    let canonical = std::fs::canonicalize(&candidate).with_context(|| {
+        format!(
+            "failed to canonicalize Cursor catalog binary '{}'",
+            candidate.display()
+        )
+    })?;
+    if !canonical.is_file() {
+        bail!(
+            "canonical Cursor catalog binary '{}' is not a file",
+            canonical.display()
+        );
     }
-    std::env::var_os("PATH")
-        .as_deref()
-        .into_iter()
-        .flat_map(std::env::split_paths)
-        .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
-        .with_context(|| format!("Cursor catalog binary '{}' is missing", program.display()))
+    Ok(canonical)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,6 +409,33 @@ pub(super) fn initialize_supervisor_selection(
     } else {
         plan.role_models.keys().copied().collect()
     };
+    if runtime == SupervisorRuntime::Cursor && advertised.cursor.is_none() {
+        let role = roles.first().copied().unwrap_or(AgentRole::Worker);
+        let detail = advertised
+            .cursor_evidence_gap
+            .as_ref()
+            .map(|gap| gap.message.as_str())
+            .unwrap_or(
+                "verified Cursor runtime model catalog observation is missing without recorded failure evidence",
+            );
+        return Ok(SupervisorSelectionResolution {
+            mode: if automatic {
+                SupervisorSelectionMode::Automatic
+            } else {
+                SupervisorSelectionMode::DebugOverride
+            },
+            decisions: Vec::new(),
+            automatic_state: None,
+            selection_preflight_failure: Some(SupervisorSelectionPreflightFailure {
+                role,
+                kind: SupervisorSelectionPreflightFailureKind::FailClosed,
+                message: format!(
+                    "selected Cursor runtime requires a verified runtime-advertised model catalog before role '{}': {detail}",
+                    role.as_str()
+                ),
+            }),
+        });
+    }
     let mut resolved = BTreeMap::new();
     let mut decisions = Vec::with_capacity(roles.len());
     for role in roles {
@@ -758,21 +868,38 @@ fn constructed_selection_catalogs(
     task: &TaskProfile,
     priors: &selection::PriorDataset,
 ) -> Result<Vec<RuntimeCatalog>> {
-    let mut catalogs = vec![runtime_catalog_from_priors(
-        runtime_name(runtime),
-        catalog,
-        task,
-        priors,
-    )?];
-    if let Some(observation) = &advertised.cursor {
-        catalogs.push(runtime_catalog_from_advertised_slugs(
-            "cursor",
-            observation.catalog().slugs(),
-            format!("cursor-advertised-sha256:{}", observation.source_sha256()),
-            observation.observed_at_unix_millis().to_string(),
-            task,
-            priors,
-        )?);
+    let primary = if runtime == SupervisorRuntime::Cursor {
+        if let Some(observation) = &advertised.cursor {
+            runtime_catalog_from_advertised_slugs(
+                "cursor",
+                observation.catalog().slugs(),
+                format!("cursor-advertised-sha256:{}", observation.source_sha256()),
+                observation.observed_at_unix_millis().to_string(),
+                task,
+                priors,
+            )?
+        } else {
+            runtime_catalog_from_priors(runtime_name(runtime), catalog, task, priors)?
+        }
+    } else {
+        runtime_catalog_from_priors(runtime_name(runtime), catalog, task, priors)?
+    };
+    let mut catalogs = vec![primary];
+    if runtime != SupervisorRuntime::Cursor {
+        if let Some(observation) = &advertised.cursor {
+            catalogs.push(runtime_catalog_from_advertised_slugs(
+                "cursor",
+                observation.catalog().slugs(),
+                format!("cursor-advertised-sha256:{}", observation.source_sha256()),
+                observation.observed_at_unix_millis().to_string(),
+                task,
+                priors,
+            )?);
+        } else if let Some(gap) = &advertised.cursor_evidence_gap {
+            catalogs.push(runtime_catalog_from_unavailable_priors(
+                "cursor", gap, task, priors,
+            ));
+        }
     }
     if let Some(observation) = &advertised.grok {
         catalogs.push(runtime_catalog_from_advertised_slugs(
@@ -785,6 +912,30 @@ fn constructed_selection_catalogs(
         )?);
     }
     Ok(catalogs)
+}
+
+fn runtime_catalog_from_unavailable_priors(
+    runtime_name: &str,
+    gap: &CursorCatalogEvidenceGap,
+    task: &TaskProfile,
+    priors: &selection::PriorDataset,
+) -> RuntimeCatalog {
+    let mut models = priors
+        .models
+        .iter()
+        .filter(|prior| prior.runtime == runtime_name)
+        .filter_map(|prior| catalog_model_from_prior(prior, task, false))
+        .collect::<Vec<_>>();
+    models.sort_by(|left, right| left.model.cmp(&right.model));
+    RuntimeCatalog {
+        runtime: runtime_name.to_string(),
+        revision: format!(
+            "cursor-unavailable-sha256:{}",
+            crate::artifacts::state_auth::sha256_hex(gap.message.as_bytes())
+        ),
+        advertised_at: gap.observed_at_unix_millis.to_string(),
+        models,
+    }
 }
 
 fn pools_for_constructed_catalogs(
@@ -1319,7 +1470,7 @@ fn ledger_entry_for_assignment(
     } else if choice.is_none() {
         Some("selector recorded no executable choice".to_string())
     } else {
-        None
+        cursor_catalog_evidence_gap_for_ledger(&event.provenance)
     };
 
     AssignmentSelectionLedgerEntry {
@@ -1343,6 +1494,16 @@ fn ledger_entry_for_assignment(
         rejected_candidates,
         evidence_gap,
     }
+}
+
+fn cursor_catalog_evidence_gap_for_ledger(provenance: &SelectionProvenance) -> Option<String> {
+    let unavailable_revision = provenance.catalog_revisions.iter().find(|revision| {
+        revision.runtime == "cursor" && revision.revision.starts_with("cursor-unavailable-sha256:")
+    })?;
+    Some(format!(
+        "optional Cursor runtime model catalog evidence was unavailable at observation {}; catalog gap is content-bound by revision '{}'",
+        unavailable_revision.advertised_at, unavailable_revision.revision
+    ))
 }
 
 fn selection_source_for(
@@ -2194,6 +2355,18 @@ mod tests {
         AdvertisedCatalogSet {
             cursor: Some(observation),
             grok: None,
+            cursor_evidence_gap: None,
+        }
+    }
+
+    fn advertised_with_cursor_gap(detail: &str) -> AdvertisedCatalogSet {
+        AdvertisedCatalogSet {
+            cursor: None,
+            grok: None,
+            cursor_evidence_gap: Some(CursorCatalogEvidenceGap::from_error(
+                &anyhow!(detail.to_string()),
+                CAPTURED_CURSOR_AT_UNIX_MILLIS,
+            )),
         }
     }
 
@@ -2258,6 +2431,7 @@ mod tests {
         AdvertisedCatalogSet {
             cursor: None,
             grok: Some(observation),
+            cursor_evidence_gap: None,
         }
     }
 
@@ -2400,12 +2574,261 @@ mod tests {
     fn supervisor_launch_catalogs_stay_empty_under_cargo_test() -> Result<()> {
         let catalogs = advertised_catalogs_for_launch(Path::new("/workspace"))?;
         assert_eq!(catalogs, AdvertisedCatalogSet::empty());
-        assert!(cursor_catalog_unavailable(&anyhow!(
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_optional_catalog_classifier_accepts_unavailability_not_integrity_failures() {
+        assert!(cursor_catalog_optional_unavailability(&anyhow!(
             "Cursor catalog binary 'cursor-agent' is missing"
         )));
-        assert!(!cursor_catalog_unavailable(&anyhow!(
+        assert!(cursor_catalog_optional_unavailability(&anyhow!(
+            "Cursor runtime model catalog command failed with exit status Some(7)"
+        )));
+        assert!(cursor_catalog_optional_unavailability(&anyhow!(
+            "Cursor runtime model catalog command timed out"
+        )));
+        assert!(!cursor_catalog_optional_unavailability(&anyhow!(
             "Cursor runtime model catalog has an invalid header"
         )));
+        assert!(!cursor_catalog_optional_unavailability(&anyhow!(
+            "Cursor runtime model catalog side-effect confinement was not verified"
+        )));
+    }
+
+    #[test]
+    fn optional_cursor_gap_becomes_unavailable_catalog_and_ledger_evidence() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let advertised = advertised_with_cursor_gap("cursor-agent was not found");
+        let mut plan = test_plan();
+        plan.assignments = vec![worker_assignment()];
+
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised,
+        )?;
+        let worker = resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Worker)
+            .context("worker decision")?;
+        let cursor_revision = worker
+            .provenance
+            .catalog_revisions
+            .iter()
+            .find(|revision| revision.runtime == "cursor")
+            .context("Cursor unavailable catalog revision")?;
+        assert!(cursor_revision
+            .revision
+            .starts_with("cursor-unavailable-sha256:"));
+        assert_eq!(
+            cursor_revision.advertised_at,
+            CAPTURED_CURSOR_AT_UNIX_MILLIS.to_string()
+        );
+        assert!(worker.provenance.candidate_set.iter().any(|candidate| {
+            candidate.candidate.runtime == "cursor"
+                && candidate
+                    .ineligibility_reasons
+                    .iter()
+                    .any(|reason| reason.code == selection::IneligibilityCode::CatalogUnavailable)
+        }));
+        for role in [AgentRole::GateClassifier, AgentRole::Auditor] {
+            let judgment = resolution
+                .decisions
+                .iter()
+                .find(|decision| decision.role == role)
+                .with_context(|| format!("{} decision", role.as_str()))?;
+            assert!(judgment
+                .provenance
+                .candidate_set
+                .iter()
+                .all(|candidate| candidate.candidate.runtime != "cursor"));
+        }
+
+        let ledger = build_assignment_selection_ledger(
+            &plan,
+            &resolution.decisions,
+            SupervisorRuntime::Codex,
+        );
+        let worker_entry = ledger
+            .iter()
+            .find(|entry| entry.role == AgentRole::Worker)
+            .context("worker ledger entry")?;
+        assert!(worker_entry
+            .evidence_gap
+            .as_deref()
+            .is_some_and(|gap| gap.contains(&cursor_revision.revision)));
+        for role in [AgentRole::GateClassifier, AgentRole::Auditor] {
+            let judgment_entry = ledger
+                .iter()
+                .find(|entry| entry.role == role)
+                .with_context(|| format!("{} ledger entry", role.as_str()))?;
+            assert!(judgment_entry
+                .evidence_gap
+                .as_deref()
+                .is_some_and(|gap| gap.contains(&cursor_revision.revision)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn selected_cursor_runtime_fails_preflight_on_catalog_gap() -> Result<()> {
+        let advertised = advertised_with_cursor_gap("catalog output was malformed");
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Cursor,
+            &RuntimeModelCatalog::OperatorDeclared,
+            &test_admission(),
+            &advertised,
+        )?;
+
+        assert!(resolution.decisions.is_empty());
+        assert!(plan.role_models.is_empty());
+        let failure = resolution
+            .selection_preflight_failure
+            .context("Cursor catalog preflight failure")?;
+        assert_eq!(
+            failure.kind,
+            SupervisorSelectionPreflightFailureKind::FailClosed
+        );
+        assert!(failure.message.contains(
+            "selected Cursor runtime requires a verified runtime-advertised model catalog"
+        ));
+        assert!(failure.message.contains("catalog output was malformed"));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_cursor_runtime_fails_preflight_when_catalog_is_missing_without_gap() -> Result<()> {
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Cursor,
+            &RuntimeModelCatalog::OperatorDeclared,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+        )?;
+
+        assert!(resolution.decisions.is_empty());
+        assert!(plan.role_models.is_empty());
+        let failure = resolution
+            .selection_preflight_failure
+            .context("missing Cursor catalog preflight failure")?;
+        assert_eq!(
+            failure.kind,
+            SupervisorSelectionPreflightFailureKind::FailClosed
+        );
+        assert!(failure.message.contains(
+            "verified Cursor runtime model catalog observation is missing without recorded failure evidence"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_cursor_uses_one_runtime_advertised_primary_catalog() -> Result<()> {
+        let advertised = advertised_with_cursor(captured_cursor_observation()?);
+        let priors = selection::built_in_prior_dataset()?;
+        let catalogs = constructed_selection_catalogs(
+            SupervisorRuntime::Cursor,
+            &RuntimeModelCatalog::OperatorDeclared,
+            &advertised,
+            &task_profile_for_role(AgentRole::Worker),
+            &priors,
+        )?;
+
+        assert_eq!(catalogs.len(), 1);
+        assert_eq!(catalogs[0].runtime, "cursor");
+        assert!(catalogs[0]
+            .revision
+            .starts_with("cursor-advertised-sha256:"));
+        assert!(catalogs[0]
+            .models
+            .iter()
+            .any(|model| model.model == "composer-2.5"));
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_catalog_gap_detail_is_utf8_safe_and_bounded() {
+        let detail = "界".repeat(CURSOR_CATALOG_EVIDENCE_GAP_MAX_BYTES);
+        let bounded = bounded_cursor_catalog_gap_detail(&detail);
+        assert!(bounded.len() <= CURSOR_CATALOG_EVIDENCE_GAP_MAX_BYTES);
+        assert!(bounded.chars().all(|character| character == '界'));
+    }
+
+    #[test]
+    fn cursor_catalog_program_resolution_returns_canonical_files() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let program = temp.path().join("cursor-agent");
+        std::fs::write(&program, b"test executable fixture")?;
+        let search_path = std::env::join_paths([temp.path()])?;
+        let expected = std::fs::canonicalize(&program)?;
+
+        assert_eq!(
+            resolve_cursor_catalog_program(Path::new("cursor-agent"), Some(&search_path))?,
+            expected
+        );
+        assert_eq!(
+            resolve_cursor_catalog_program(&program, None)?,
+            std::fs::canonicalize(&program)?
+        );
+        assert!(resolve_cursor_catalog_program(Path::new(""), Some(&search_path)).is_err());
+        assert!(
+            resolve_cursor_catalog_program(Path::new("missing-cursor"), Some(&search_path))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_catalog_environment_preserves_screened_path_passthrough() -> Result<()> {
+        let host_path = std::env::var("PATH").context("test PATH must be Unicode")?;
+        let spec = crate::runtime_adapter::cursor::CursorCatalogCommandSpec::new("/workspace")
+            .with_screened_env_passthrough("PATH")?;
+        let environment = cursor_catalog_process_environment(&spec);
+
+        assert_eq!(environment.get("PATH"), Some(&host_path));
+        assert_eq!(environment.get("NO_COLOR").map(String::as_str), Some("1"));
+        assert_eq!(environment.get("TERM").map(String::as_str), Some("dumb"));
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_catalog_env_loading_ignores_unconfigured_and_non_unicode_values() -> Result<()> {
+        let base = crate::runtime_adapter::cursor::CursorCatalogCommandSpec::new("/workspace");
+        assert_eq!(
+            apply_cursor_catalog_env_setting(base.clone(), Err(std::env::VarError::NotPresent),)?,
+            base
+        );
+        assert_eq!(
+            apply_cursor_catalog_env_setting(
+                base.clone(),
+                Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                    "opaque non-Unicode environment value",
+                ))),
+            )?,
+            base
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_catalog_program_resolution_canonicalizes_symlinks() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let target = temp.path().join("cursor-agent-real");
+        let link = temp.path().join("cursor-agent-link");
+        std::fs::write(&target, b"test executable fixture")?;
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        assert_eq!(
+            resolve_cursor_catalog_program(&link, None)?,
+            std::fs::canonicalize(&target)?
+        );
         Ok(())
     }
 
@@ -2457,6 +2880,7 @@ mod tests {
             &AdvertisedCatalogSet {
                 cursor: None,
                 grok: Some(observation),
+                cursor_evidence_gap: None,
             },
         )?;
         let worker = resolution
@@ -2487,6 +2911,7 @@ mod tests {
             &AdvertisedCatalogSet {
                 cursor: None,
                 grok: Some(withdrawn),
+                cursor_evidence_gap: None,
             },
         )?;
         let withdrawn_worker = withdrawn_resolution

@@ -1152,6 +1152,107 @@
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn bounded_status_honors_only_canonical_local_core_filemode() {
+        skip_without_containment!();
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let readme = repo_path.join("README.md");
+        fs::set_permissions(&readme, fs::Permissions::from_mode(0o755))
+            .expect("make tracked worktree file executable");
+        let mut config = repo.config().expect("open repository config");
+
+        config
+            .set_bool("core.filemode", false)
+            .expect("disable filemode tracking");
+        assert!(
+            bounded_worktree_is_clean(
+                &repo_path,
+                MAX_WORKTREE_STATUS_ENTRIES,
+                MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+                WORKTREE_STATUS_TIMEOUT,
+            )
+            .expect("bounded status with core.filemode=false"),
+            "100644 index versus 0755 worktree must be clean when local core.filemode=false"
+        );
+        fs::write(&readme, "content drift remains visible\n")
+            .expect("change content while filemode tracking is disabled");
+        assert!(
+            !bounded_worktree_is_clean(
+                &repo_path,
+                MAX_WORKTREE_STATUS_ENTRIES,
+                MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+                WORKTREE_STATUS_TIMEOUT,
+            )
+            .expect("bounded status content drift with core.filemode=false"),
+            "core.filemode=false must not hide content changes"
+        );
+        fs::write(&readme, "# Test\n").expect("restore tracked contents");
+
+        config
+            .set_bool("core.filemode", true)
+            .expect("enable filemode tracking");
+        assert!(
+            !bounded_worktree_is_clean(
+                &repo_path,
+                MAX_WORKTREE_STATUS_ENTRIES,
+                MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+                WORKTREE_STATUS_TIMEOUT,
+            )
+            .expect("bounded status with core.filemode=true"),
+            "explicit core.filemode=true must preserve executable-mode dirtiness"
+        );
+
+        config
+            .remove("core.filemode")
+            .expect("remove local core.filemode");
+        assert!(
+            !bounded_worktree_is_clean(
+                &repo_path,
+                MAX_WORKTREE_STATUS_ENTRIES,
+                MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+                WORKTREE_STATUS_TIMEOUT,
+            )
+            .expect("bounded status with default core.filemode"),
+            "absent core.filemode must fail closed to mode-sensitive status"
+        );
+    }
+
+    #[test]
+    fn bounded_local_git_config_policy_is_narrow_and_fail_closed() {
+        let disabled = parse_bounded_local_git_config(Some(
+            b"[core]\n\tfilemode = false\n[include]\n\tpath = /must/not/be/read\n",
+        ))
+        .expect("canonical local filemode");
+        assert!(!disabled.core_filemode);
+        assert!(!disabled.core_hooks_path_present);
+
+        let hooks = parse_bounded_local_git_config(Some(
+            b"[core]\n\tfilemode = true\n\thooksPath = private-hooks\n",
+        ))
+        .expect("detect local hooksPath without resolving it");
+        assert!(hooks.core_filemode);
+        assert!(hooks.core_hooks_path_present);
+
+        for malformed in [
+            b"[core]\nfilemode = yes\n".as_slice(),
+            b"[core]\nfilemode = false\nfilemode = true\n".as_slice(),
+            b"[core\nfilemode = false\n".as_slice(),
+        ] {
+            parse_bounded_local_git_config(Some(malformed))
+                .expect_err("malformed or duplicate local policy must fail closed");
+        }
+        assert!(parse_bounded_local_git_config(None)
+            .expect("absent local config")
+            .core_filemode);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn bounded_status_ignores_ambient_and_repository_process_helpers() {
         skip_without_containment!();
         use std::os::unix::fs::PermissionsExt;

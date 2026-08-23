@@ -678,6 +678,38 @@ impl SafeRoot {
         bail!("identity-bound directory reservations are unsupported on this platform")
     }
 
+    pub(crate) fn remove_empty_reserved_direct_child_directory(
+        &self,
+        reserved: ReservedDirectory,
+    ) -> Result<()> {
+        reserved.verify(self)?;
+        if !reserved.is_empty()? {
+            bail!("refusing to remove a non-empty reserved directory");
+        }
+        #[cfg(unix)]
+        {
+            let name = c_string(&reserved.name)?;
+            if unsafe {
+                libc::unlinkat(
+                    self.directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::AT_REMOVEDIR,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!(
+                        "failed to remove empty reserved directory {}",
+                        reserved.path.display()
+                    )
+                });
+            }
+            self.verify()
+        }
+        #[cfg(not(unix))]
+        bail!("identity-bound directory removal is unsupported on this platform")
+    }
+
     pub fn reserve_random_direct_child_directory(
         &self,
         prefix: impl AsRef<OsStr>,

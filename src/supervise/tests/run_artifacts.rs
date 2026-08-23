@@ -1238,6 +1238,7 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
         owner: "maco-supervise".to_string(),
         correction_correlation_id: options.run_id.as_str().to_string(),
     });
+    let run_id = options.run_id.clone();
     fs::write(
         &options.plan_file,
         serde_json::to_vec(&plan).expect("serialize verified supervisor plan"),
@@ -1247,6 +1248,16 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
     let mut launched = false;
     let mut runner = |command: &ExternalAgentCommand| {
         launched = true;
+        assert!(
+            command.output_schema.is_none(),
+            "external Codex child and auditor launches must rely on authoritative local report validation"
+        );
+        if command.workspace_access == WorkspaceAccess::ReadWrite {
+            assert!(
+                !command.hidden_roots.iter().any(|root| root == &repo_path),
+                "the linked worktree's owning primary/common checkout must remain visible read-only"
+            );
+        }
         assert_ne!(command.cwd, repo_path);
         assert_eq!(
             fs::read_to_string(command.cwd.join("README.md"))
@@ -1266,6 +1277,72 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
     assert!(launched, "runner was not launched; report: {report:#?}");
     assert!(report.success, "unexpected failed report: {report:#?}");
     assert_eq!(report.orchestrator_reports.len(), 1);
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+        .expect("open finalized verified-run artifacts");
+    let admission_path = "assignments/child-a.attempt-1.worktree-writable-admission.json";
+    let admission: crate::external_agent::WorktreeWritableAdmission = serde_json::from_slice(
+        &reader
+            .read(admission_path)
+            .expect("read persisted worktree writable admission"),
+    )
+    .expect("deserialize typed worktree writable admission");
+    assert_eq!(
+        admission.version,
+        crate::external_agent::WORKTREE_WRITABLE_ADMISSION_SCHEMA_VERSION
+    );
+    assert_eq!(admission.assignment_id, "child-a");
+    assert_eq!(admission.attempt, 1);
+    assert_eq!(
+        admission.target,
+        crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree
+    );
+    assert_eq!(
+        admission.worktree.kind,
+        crate::external_agent::ManagedWorktreeAdmissionKind::ManagedDisposable
+    );
+    assert_eq!(admission.worktree.worktree_id, "child-a");
+    assert_eq!(
+        admission.claims.state,
+        crate::external_agent::HeldPathClaimsAdmissionState::Held
+    );
+    assert_eq!(admission.claims.paths, vec![PathBuf::from("README.md")]);
+    assert_eq!(admission.native_sandbox.runtime, SupervisorRuntime::Codex);
+    assert_eq!(
+        admission.native_sandbox.workspace_access,
+        WorkspaceAccess::ReadWrite
+    );
+    assert_eq!(
+        admission.native_sandbox.side_effect_confinement,
+        crate::runtime_adapter::SideEffectConfinement::Verified
+    );
+    let schema_path = "schemas/child-a.attempt-1.worktree-writable-admission.schema.json";
+    let schema: serde_json::Value = serde_json::from_slice(
+        &reader
+            .read(schema_path)
+            .expect("read persisted worktree writable admission schema"),
+    )
+    .expect("deserialize worktree writable admission schema");
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["properties"]["version"]["const"], 1);
+    assert_eq!(
+        schema["properties"]["target"]["const"],
+        "managed_child_worktree"
+    );
+    assert_eq!(
+        schema["properties"]["native_sandbox"]["properties"]["side_effect_confinement"]["const"],
+        "verified"
+    );
+    for relative in [admission_path, schema_path] {
+        assert!(
+            reader
+                .finalization()
+                .files
+                .iter()
+                .any(|file| file.path == Path::new(relative)
+                    && file.disposition == ArtifactFileDisposition::PrivateEvidence),
+            "typed admission artifact must be finalized as private evidence: {relative}"
+        );
+    }
     let records = WorktreeManager::new(&repo_path)
         .list_managed_verified()
         .expect("list verified assignment worktree");

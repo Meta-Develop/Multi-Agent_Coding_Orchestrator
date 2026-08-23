@@ -743,6 +743,32 @@ fn resolve_external_program(program: &Path, cwd: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutableAncestorPermissionDecision {
+    Accept,
+    RejectWritable,
+    RejectOwnership,
+}
+
+#[cfg(unix)]
+fn executable_ancestor_permission_decision(
+    mode: u32,
+    uid: u32,
+    is_directory: bool,
+    require_root_owned: bool,
+) -> ExecutableAncestorPermissionDecision {
+    let root_sticky_directory =
+        uid == 0 && is_directory && mode & unsigned_to_u32(libc::S_ISVTX) != 0;
+    if mode & 0o022 != 0 && !root_sticky_directory {
+        ExecutableAncestorPermissionDecision::RejectWritable
+    } else if require_root_owned && uid != 0 {
+        ExecutableAncestorPermissionDecision::RejectOwnership
+    } else {
+        ExecutableAncestorPermissionDecision::Accept
+    }
+}
+
 fn validate_external_program_identity(path: &Path, require_root_owned: bool) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
@@ -781,21 +807,25 @@ fn validate_external_program_identity(path: &Path, require_root_owned: bool) -> 
                     ancestor.display()
                 );
             }
-            let mode = metadata.permissions().mode();
-            let root_sticky_directory = metadata.uid() == 0
-                && metadata.is_dir()
-                && mode & unsigned_to_u32(libc::S_ISVTX) != 0;
-            if (require_root_owned || !root_sticky_directory) && mode & 0o022 != 0 {
-                bail!(
-                    "external executable ancestor is group/world-writable: {}",
-                    ancestor.display()
-                );
-            }
-            if require_root_owned && metadata.uid() != 0 {
-                bail!(
-                    "default Codex executable ancestor is not root-owned: {}",
-                    ancestor.display()
-                );
+            match executable_ancestor_permission_decision(
+                metadata.permissions().mode(),
+                metadata.uid(),
+                metadata.is_dir(),
+                require_root_owned,
+            ) {
+                ExecutableAncestorPermissionDecision::Accept => {}
+                ExecutableAncestorPermissionDecision::RejectWritable => {
+                    bail!(
+                        "external executable ancestor is group/world-writable: {}",
+                        ancestor.display()
+                    );
+                }
+                ExecutableAncestorPermissionDecision::RejectOwnership => {
+                    bail!(
+                        "default Codex executable ancestor is not root-owned: {}",
+                        ancestor.display()
+                    );
+                }
             }
         }
     }
@@ -864,7 +894,16 @@ struct ProtectedWorktreeControls {
     read_only_files: Vec<ProtectedWorktreeControl>,
     read_write_roots: Vec<ProtectedWorktreeControl>,
     read_write_files: Vec<ProtectedWorktreeControl>,
+    managed_git: Option<ManagedWorktreeGitMetadata>,
+    exact_read_only_input_files: Vec<PathBuf>,
     writable_artifact_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedWorktreeGitMetadata {
+    worktree_git_dir: PathBuf,
+    common_read_only_roots: Vec<PathBuf>,
+    common_read_only_files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -955,8 +994,404 @@ impl ProtectedWorktreeControls {
 fn protected_worktree_controls(spec: &ExternalAgentCommand) -> Result<ProtectedWorktreeControls> {
     let mut controls =
         protected_worktree_controls_for(&spec.cwd, &spec.worktree_control_exceptions)?;
+    if spec.invocation == ExternalAgentInvocation::CodexSupervisor
+        && spec.writable_launch_target == WritableLaunchTarget::ManagedChildWorktree
+        && spec.agent_lifecycle.is_some()
+    {
+        controls.managed_git = managed_worktree_git_metadata(&spec.cwd)?;
+    }
+    controls.exact_read_only_input_files = validate_exact_read_only_input_files(spec, &controls)?;
     controls.writable_artifact_root = Some(validate_artifact_parent_disjoint(spec, &controls)?);
     Ok(controls)
+}
+
+fn validate_exact_read_only_input_files(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+) -> Result<Vec<PathBuf>> {
+    const MAX_EXACT_INPUT_FILES: usize = 16;
+    if spec.read_only_input_files.len() > MAX_EXACT_INPUT_FILES {
+        bail!("exact read-only input files exceed the fixed limit of {MAX_EXACT_INPUT_FILES}");
+    }
+    let workspace = fs::canonicalize(&spec.cwd)
+        .context("external-agent workspace could not be resolved")?;
+    let artifact_root = normalized_absolute_path(
+        required_parent(&spec.output_last_message)?,
+        "external-agent output parent",
+    )?;
+    let mut validated = BTreeSet::new();
+    for declared in &spec.read_only_input_files {
+        let normalized = normalized_absolute_path(declared, "exact read-only input file")?;
+        ensure_safe_read_target(&normalized)?;
+        let canonical = fs::canonicalize(&normalized)
+            .context("exact read-only input file could not be resolved")?;
+        if canonical != normalized {
+            bail!("exact read-only input file must already be canonical");
+        }
+        let metadata = fs::symlink_metadata(&canonical)
+            .context("failed to inspect exact read-only input file")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() != 1 {
+                bail!("exact read-only input file has a hard-link alias");
+            }
+        }
+        if (canonical.starts_with(&workspace) || workspace.starts_with(&canonical))
+            && spec.workspace_access == WorkspaceAccess::ReadWrite
+        {
+            bail!("exact read-only input file overlaps the writable external-agent workspace");
+        }
+        if canonical.starts_with(&artifact_root) || artifact_root.starts_with(&canonical) {
+            bail!("exact read-only input file overlaps writable artifact staging");
+        }
+        for control in controls.iter() {
+            if canonical.starts_with(&control.absolute)
+                || control.absolute.starts_with(&canonical)
+            {
+                bail!("exact read-only input file overlaps a protected worktree control");
+            }
+        }
+        if let Some(git) = &controls.managed_git {
+            for protected in std::iter::once(&git.worktree_git_dir)
+                .chain(&git.common_read_only_roots)
+                .chain(&git.common_read_only_files)
+            {
+                if canonical.starts_with(protected) || protected.starts_with(&canonical) {
+                    bail!("exact read-only input file overlaps managed Git metadata");
+                }
+            }
+        }
+        for hidden in &spec.hidden_roots {
+            let hidden = normalized_absolute_path(hidden, "hidden root")?;
+            if canonical.starts_with(&hidden) || hidden.starts_with(&canonical) {
+                bail!("exact read-only input file overlaps a hidden root");
+            }
+        }
+        if !validated.insert(canonical) {
+            bail!("exact read-only input file is declared more than once");
+        }
+    }
+    Ok(validated.into_iter().collect())
+}
+
+fn managed_worktree_git_metadata(workspace: &Path) -> Result<Option<ManagedWorktreeGitMetadata>> {
+    let marker = workspace.join(".git");
+    let marker_metadata = fs::symlink_metadata(&marker)
+        .context("managed child worktree is missing its .git marker")?;
+    if marker_metadata.file_type().is_symlink() {
+        bail!("managed child worktree .git marker may not be a symlink");
+    }
+    if marker_metadata.is_dir() {
+        return Ok(None);
+    }
+    if !marker_metadata.is_file() {
+        bail!("managed child worktree .git marker is not a regular file");
+    }
+    #[cfg(unix)]
+    let marker_has_hard_link_alias = {
+        use std::os::unix::fs::MetadataExt;
+        marker_metadata.nlink() != 1
+    };
+    #[cfg(unix)]
+    if marker_has_hard_link_alias {
+        bail!("managed child worktree .git marker has a hard-link alias");
+    }
+
+    let canonical_workspace = fs::canonicalize(workspace)
+        .context("managed child worktree root could not be resolved")?;
+    let marker_target = parse_git_path_file(&marker, Some("gitdir: "), "worktree .git marker")?;
+    let worktree_git_dir = canonicalize_git_path(&canonical_workspace, &marker_target)
+        .context("managed child worktree .git marker target could not be resolved")?;
+    let repository = crate::git_repository::open(&canonical_workspace)
+        .map_err(|_| anyhow::anyhow!("managed child worktree could not be opened by libgit2"))?;
+    let repository_workdir = repository
+        .workdir()
+        .context("managed child Git repository has no worktree")?;
+    let repository_workdir = fs::canonicalize(repository_workdir)
+        .context("managed child Git worktree could not be resolved")?;
+    let repository_git_dir = fs::canonicalize(repository.path())
+        .context("managed child Git directory could not be resolved")?;
+    let common_dir = fs::canonicalize(repository.commondir())
+        .context("managed child Git common directory could not be resolved")?;
+    if repository_workdir != canonical_workspace || repository_git_dir != worktree_git_dir {
+        bail!("managed child .git marker does not match the libgit2 repository binding");
+    }
+
+    let commondir_target = parse_git_path_file(
+        &worktree_git_dir.join("commondir"),
+        None,
+        "linked-worktree commondir",
+    )?;
+    let marker_common_dir = canonicalize_git_path(&worktree_git_dir, &commondir_target)
+        .context("linked-worktree commondir target could not be resolved")?;
+    if marker_common_dir != common_dir {
+        bail!("linked-worktree commondir does not match the libgit2 common directory");
+    }
+    let expected_worktrees_root = common_dir.join("worktrees");
+    if worktree_git_dir.parent() != Some(expected_worktrees_root.as_path()) {
+        bail!("managed child Git directory is not an exact child of the common worktrees directory");
+    }
+
+    let backlink_target = parse_git_path_file(
+        &worktree_git_dir.join("gitdir"),
+        None,
+        "linked-worktree backlink",
+    )?;
+    let backlink = canonicalize_git_path(&worktree_git_dir, &backlink_target)
+        .context("linked-worktree backlink target could not be resolved")?;
+    let canonical_marker = fs::canonicalize(&marker)
+        .context("managed child worktree .git marker could not be rebound")?;
+    if backlink != canonical_marker {
+        bail!("linked-worktree backlink does not name the managed child .git marker");
+    }
+
+    let objects = canonical_git_directory(&common_dir.join("objects"), "Git object directory")?;
+    reject_git_object_aliases(&objects)?;
+    let refs = canonical_git_directory(&common_dir.join("refs"), "Git refs directory")?;
+    reject_git_read_only_tree_aliases(&refs, "Git refs")?;
+    let config = canonical_git_file(&common_dir.join("config"), "Git common config")?;
+    reject_managed_git_hooks_path(&config, "Git common config")?;
+    if let Some(worktree_config) = canonical_optional_git_file(
+        &worktree_git_dir.join("config.worktree"),
+        "Git worktree config",
+    )? {
+        reject_managed_git_hooks_path(&worktree_config, "Git worktree config")?;
+    }
+    let mut common_read_only_files = vec![config];
+    if let Some(commit_msg_hook) = canonical_optional_active_git_hook(
+        &common_dir.join("hooks/commit-msg"),
+        "Git commit-msg hook",
+    )? {
+        common_read_only_files.push(commit_msg_hook);
+    }
+    for (relative, label) in [
+        ("packed-refs", "Git packed refs"),
+        ("info/exclude", "Git exclude file"),
+        ("shallow", "Git shallow boundary"),
+    ] {
+        if let Some(file) = canonical_optional_git_file(&common_dir.join(relative), label)? {
+            common_read_only_files.push(file);
+        }
+    }
+    common_read_only_files.sort();
+    common_read_only_files.dedup();
+    let mut common_read_only_roots = vec![objects, refs];
+    common_read_only_roots.sort();
+    common_read_only_roots.dedup();
+
+    for read_only in common_read_only_roots
+        .iter()
+        .chain(common_read_only_files.iter())
+    {
+        if read_only.starts_with(&worktree_git_dir) || worktree_git_dir.starts_with(read_only) {
+            bail!("managed child writable Git metadata overlaps common read-only metadata");
+        }
+    }
+    for forbidden in [
+        common_dir.join("HEAD"),
+        common_dir.join("index"),
+        common_dir.join("maco"),
+        expected_worktrees_root,
+    ] {
+        if common_read_only_roots
+            .iter()
+            .chain(common_read_only_files.iter())
+            .any(|allowed| allowed == &forbidden || allowed.starts_with(&forbidden))
+        {
+            bail!("managed child Git metadata allowlist includes private common metadata");
+        }
+    }
+
+    Ok(Some(ManagedWorktreeGitMetadata {
+        worktree_git_dir,
+        common_read_only_roots,
+        common_read_only_files,
+    }))
+}
+
+fn parse_git_path_file(path: &Path, prefix: Option<&str>, label: &str) -> Result<PathBuf> {
+    const MAX_GIT_PATH_FILE_BYTES: u64 = 16 * 1024;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("{label} is missing"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_GIT_PATH_FILE_BYTES
+    {
+        bail!("{label} is not a bounded regular file");
+    }
+    #[cfg(unix)]
+    let path_file_has_hard_link_alias = {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() != 1
+    };
+    #[cfg(unix)]
+    if path_file_has_hard_link_alias {
+        bail!("{label} has a hard-link alias");
+    }
+    let bytes = fs::read(path).with_context(|| format!("failed to read {label}"))?;
+    let text = std::str::from_utf8(&bytes).with_context(|| format!("{label} is not UTF-8"))?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    let text = text.strip_suffix('\r').unwrap_or(text);
+    let value = match prefix {
+        Some(prefix) => text
+            .strip_prefix(prefix)
+            .with_context(|| format!("{label} has an invalid prefix"))?,
+        None => text,
+    };
+    if value.is_empty() || value.chars().any(char::is_control) {
+        bail!("{label} contains an invalid path");
+    }
+    Ok(PathBuf::from(value))
+}
+
+fn canonicalize_git_path(base: &Path, value: &Path) -> std::io::Result<PathBuf> {
+    if value.is_absolute() {
+        fs::canonicalize(value)
+    } else {
+        fs::canonicalize(base.join(value))
+    }
+}
+
+fn canonical_git_directory(path: &Path, label: &str) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(path).with_context(|| format!("{label} is missing"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("{label} is not a non-symlink directory");
+    }
+    fs::canonicalize(path).with_context(|| format!("{label} could not be resolved"))
+}
+
+fn canonical_git_file(path: &Path, label: &str) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(path).with_context(|| format!("{label} is missing"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("{label} is not a non-symlink regular file");
+    }
+    #[cfg(unix)]
+    let common_file_has_hard_link_alias = {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() != 1
+    };
+    #[cfg(unix)]
+    if common_file_has_hard_link_alias {
+        bail!(
+            "{label} has a hard-link alias; recreate the launch repository with --no-hardlinks before retrying"
+        );
+    }
+    fs::canonicalize(path).with_context(|| format!("{label} could not be resolved"))
+}
+
+fn canonical_optional_git_file(path: &Path, label: &str) -> Result<Option<PathBuf>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {label}")),
+        Ok(_) => canonical_git_file(path, label).map(Some),
+    }
+}
+
+fn reject_managed_git_hooks_path(config: &Path, label: &str) -> Result<()> {
+    const MAX_MANAGED_GIT_CONFIG_BYTES: usize = 1024 * 1024;
+    let bytes = read_bounded_regular_file_nofollow(config, MAX_MANAGED_GIT_CONFIG_BYTES)
+        .with_context(|| format!("failed to read bounded {label}"))?;
+    let policy = crate::worktree::parse_bounded_local_git_config(Some(&bytes))?;
+    if policy.core_hooks_path_present {
+        bail!(
+            "managed child Git commits require repository-local core.hooksPath to be absent; remove the custom hook path and install the commit-msg hook in the default Git hooks directory"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn canonical_optional_active_git_hook(path: &Path, label: &str) -> Result<Option<PathBuf>> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("failed to inspect {label}")),
+        Ok(metadata) => metadata,
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("{label} is not a non-symlink regular file");
+    }
+    if metadata.nlink() != 1 {
+        bail!(
+            "{label} has a hard-link alias; reinstall the repository hook before retrying"
+        );
+    }
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Ok(None);
+    }
+    fs::canonicalize(path)
+        .map(Some)
+        .with_context(|| format!("{label} could not be resolved"))
+}
+
+#[cfg(not(unix))]
+fn canonical_optional_active_git_hook(_path: &Path, _label: &str) -> Result<Option<PathBuf>> {
+    bail!("managed child Git hook validation is unsupported on this platform")
+}
+
+#[cfg(unix)]
+fn reject_git_object_aliases(objects: &Path) -> Result<()> {
+    for alternate in ["info/alternates", "info/http-alternates"] {
+        match fs::symlink_metadata(objects.join(alternate)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("failed to inspect Git object alternates"),
+            Ok(_) => bail!(
+                "managed child Git object alternates are unsupported; recreate the launch repository without --reference before retrying"
+            ),
+        }
+    }
+
+    reject_git_read_only_tree_aliases(objects, "Git object storage")
+}
+
+#[cfg(unix)]
+fn reject_git_read_only_tree_aliases(root: &Path, label: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    const MAX_GIT_METADATA_ENTRIES: usize = 200_000;
+    let mut remaining = MAX_GIT_METADATA_ENTRIES;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = fs::read_dir(&directory).with_context(|| format!("failed to inspect {label}"))?;
+        for entry in entries {
+            if remaining == 0 {
+                bail!(
+                    "managed child {label} alias inspection exceeded its {MAX_GIT_METADATA_ENTRIES}-entry safety bound"
+                );
+            }
+            remaining -= 1;
+            let entry = entry.with_context(|| format!("failed to inspect {label} entry"))?;
+            let metadata = fs::symlink_metadata(entry.path())
+                .with_context(|| format!("failed to inspect {label} entry type"))?;
+            if metadata.file_type().is_symlink() {
+                bail!("managed child {label} contains a symlink alias");
+            }
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                if metadata.nlink() != 1 {
+                    bail!(
+                        "managed child {label} contains hard-link aliases; recreate the launch repository with --no-hardlinks and without --reference before retrying"
+                    );
+                }
+            } else {
+                bail!("managed child {label} contains a special file");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reject_git_object_aliases(_objects: &Path) -> Result<()> {
+    bail!("managed child Git object alias validation is unsupported on this platform")
+}
+
+#[cfg(not(unix))]
+fn reject_git_read_only_tree_aliases(_root: &Path, _label: &str) -> Result<()> {
+    bail!("managed child Git metadata alias validation is unsupported on this platform")
 }
 
 fn protected_worktree_controls_for(
@@ -1125,6 +1560,17 @@ fn validate_artifact_parent_disjoint(
             continue;
         }
         bail!("external-agent output parent overlaps a protected worktree control");
+    }
+    if let Some(git) = &controls.managed_git {
+        for protected in std::iter::once(&git.worktree_git_dir)
+            .chain(&git.common_read_only_roots)
+            .chain(&git.common_read_only_files)
+        {
+            let protected = normalized_absolute_path(protected, "managed Git metadata")?;
+            if parent.starts_with(&protected) || protected.starts_with(&parent) {
+                bail!("external-agent output parent overlaps managed Git metadata");
+            }
+        }
     }
     Ok(parent)
 }
@@ -1805,12 +2251,31 @@ fn external_side_effect_profile(
                 }
                 profile = profile.with_visible_read_write_file(&control.absolute);
             }
+            if let Some(git) = &protected_controls.managed_git {
+                for root in &git.common_read_only_roots {
+                    profile = profile.with_visible_read_only_root(root);
+                }
+                for file in &git.common_read_only_files {
+                    profile = profile.with_visible_read_only_file(file);
+                }
+                profile = match spec.workspace_access {
+                    WorkspaceAccess::ReadOnly => {
+                        profile.with_visible_read_only_root(&git.worktree_git_dir)
+                    }
+                    WorkspaceAccess::ReadWrite => {
+                        profile.with_visible_read_write_root(&git.worktree_git_dir)
+                    }
+                };
+            }
             let canonical_workspace = fs::canonicalize(&spec.cwd)?;
             if !program.starts_with(&canonical_workspace) {
                 profile = profile.with_visible_read_only_root(program_parent);
             }
             if let Some(schema) = &spec.output_schema {
                 profile = profile.with_visible_read_only_file(schema);
+            }
+            for input in &protected_controls.exact_read_only_input_files {
+                profile = profile.with_visible_read_only_file(input);
             }
             profile = profile.with_writable_artifact_root(artifact_root);
             for root in &spec.hidden_roots {
@@ -1823,9 +2288,7 @@ fn external_side_effect_profile(
                 .capabilities()
                 .read_only_inner_contract_refusal()
                 .unwrap_or("side_effect_confinement != verified");
-            bail!(
-                "Claude consultant has no enforceable fixed-network capability ({capability})"
-            )
+            bail!("Claude consultant has no enforceable fixed-network capability ({capability})")
         }
     }
 }
@@ -1975,7 +2438,16 @@ impl ValidatedCodexAuth {
         if !home.is_absolute() {
             bail!("Codex auth home must be absolute: {}", home.display());
         }
-        match fs::symlink_metadata(home) {
+        let home = match fs::canonicalize(home) {
+            Ok(home) => home,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to canonicalize Codex auth home {}", home.display())
+                });
+            }
+        };
+        match fs::symlink_metadata(&home) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 bail!(
                     "Codex auth home must be a non-symlink directory: {}",
@@ -1986,7 +2458,7 @@ impl ValidatedCodexAuth {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).context("failed to inspect Codex auth home"),
         }
-        ensure_existing_directory_without_symlinks(home)?;
+        ensure_existing_directory_without_symlinks(&home)?;
         let path = home.join("auth.json");
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -2368,11 +2840,11 @@ fn codex_hardened_argv(
         OsString::from("-c"),
         OsString::from(filesystem_permissions),
         OsString::from("-c"),
-        OsString::from("shell_environment_policy.inherit=\"none\""),
+        OsString::from("shell_environment_policy.inherit=\"core\""),
         OsString::from("-c"),
-        OsString::from(
-            "shell_environment_policy.set={PATH=\"/run/current-system/sw/bin:/usr/bin:/bin\"}",
-        ),
+        OsString::from("shell_environment_policy.ignore_default_excludes=false"),
+        OsString::from("-c"),
+        OsString::from("shell_environment_policy.include_only=[\"PATH\"]"),
         OsString::from("-c"),
         OsString::from("web_search=\"disabled\""),
     ];
@@ -2432,11 +2904,11 @@ fn codex_app_server_argv(
         OsString::from("-c"),
         OsString::from(filesystem_permissions),
         OsString::from("-c"),
-        OsString::from("shell_environment_policy.inherit=\"none\""),
+        OsString::from("shell_environment_policy.inherit=\"core\""),
         OsString::from("-c"),
-        OsString::from(
-            "shell_environment_policy.set={PATH=\"/run/current-system/sw/bin:/usr/bin:/bin\"}",
-        ),
+        OsString::from("shell_environment_policy.ignore_default_excludes=false"),
+        OsString::from("-c"),
+        OsString::from("shell_environment_policy.include_only=[\"PATH\"]"),
         OsString::from("-c"),
         OsString::from("web_search=\"disabled\""),
         // app-server has no --ignore-rules flag. A private CODEX_HOME prevents ambient user config,
@@ -2492,8 +2964,33 @@ fn codex_filesystem_permissions(
         .iter()
         .chain(&controls.read_only_files)
     {
-        if let Some(relative) = control.relative().to_str() {
-            path_permissions.insert(relative.to_string(), "read");
+        if let Some(absolute) = control.absolute.to_str() {
+            path_permissions.insert(absolute.to_string(), "read");
+        }
+    }
+    if let Some(git) = &controls.managed_git {
+        for path in git
+            .common_read_only_roots
+            .iter()
+            .chain(&git.common_read_only_files)
+        {
+            if let Some(path) = path.to_str() {
+                path_permissions.insert(path.to_string(), "read");
+            }
+        }
+        if let Some(path) = git.worktree_git_dir.to_str() {
+            path_permissions.insert(
+                path.to_string(),
+                match spec.workspace_access {
+                    WorkspaceAccess::ReadOnly => "read",
+                    WorkspaceAccess::ReadWrite => "write",
+                },
+            );
+        }
+    }
+    for path in &controls.exact_read_only_input_files {
+        if let Some(path) = path.to_str() {
+            path_permissions.insert(path.to_string(), "read");
         }
     }
     for control in controls
@@ -2501,17 +2998,12 @@ fn codex_filesystem_permissions(
         .iter()
         .chain(&controls.read_write_files)
     {
-        if let Some(relative) = control.relative().to_str() {
-            path_permissions.insert(relative.to_string(), "write");
+        if let Some(absolute) = control.absolute.to_str() {
+            path_permissions.insert(absolute.to_string(), "write");
         }
     }
     if let Some(parent) = &controls.writable_artifact_root {
-        let permission_path = parent
-            .strip_prefix(&spec.cwd)
-            .ok()
-            .filter(|relative| !relative.as_os_str().is_empty())
-            .unwrap_or(parent);
-        if let Some(path) = permission_path.to_str() {
+        if let Some(path) = parent.to_str() {
             path_permissions.insert(path.to_string(), "write");
         }
     }
@@ -2765,5 +3257,127 @@ fn duration_millis(duration: Duration) -> u64 {
         u64::MAX
     } else {
         millis as u64
+    }
+}
+
+#[cfg(test)]
+mod nixos_identity_regression_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_ancestor_permission_decision_allows_only_root_owned_sticky_writable_directories() {
+        use ExecutableAncestorPermissionDecision::{Accept, RejectOwnership, RejectWritable};
+
+        assert_eq!(
+            executable_ancestor_permission_decision(0o1775, 0, true, true),
+            Accept
+        );
+        assert_eq!(
+            executable_ancestor_permission_decision(0o0775, 0, true, true),
+            RejectWritable
+        );
+        assert_eq!(
+            executable_ancestor_permission_decision(0o0757, 0, true, true),
+            RejectWritable
+        );
+        assert_eq!(
+            executable_ancestor_permission_decision(0o1775, 1000, true, true),
+            RejectWritable
+        );
+        assert_eq!(
+            executable_ancestor_permission_decision(0o1775, 0, false, true),
+            RejectWritable
+        );
+        assert_eq!(
+            executable_ancestor_permission_decision(0o0755, 1000, true, true),
+            RejectOwnership
+        );
+        assert_eq!(
+            executable_ancestor_permission_decision(0o0755, 0, true, true),
+            Accept
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_auth_home_symlink_is_canonicalized_before_auth_validation() -> Result<()> {
+        use std::os::unix::{fs::symlink, fs::PermissionsExt};
+
+        let temp = tempfile::tempdir()?;
+        let target = temp.path().join("codex-home-target");
+        fs::create_dir(&target)?;
+        let auth_path = target.join("auth.json");
+        fs::write(&auth_path, br#"{"token":"redacted"}"#)?;
+        fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+        let selected = temp.path().join("selected-codex-home");
+        symlink(&target, &selected)?;
+
+        let validated = ValidatedCodexAuth::load_from_home(&selected)?
+            .context("canonical Codex auth source")?;
+        assert_eq!(validated.path, fs::canonicalize(&target)?.join("auth.json"));
+        assert_eq!(validated.bytes, br#"{"token":"redacted"}"#);
+
+        let replacement = temp.path().join("replacement-codex-home");
+        fs::create_dir(&replacement)?;
+        fs::remove_file(&selected)?;
+        symlink(&replacement, &selected)?;
+        validated.verify_source_unchanged()?;
+        Ok(())
+    }
+
+    #[test]
+    fn codex_exec_and_app_server_argv_use_exact_path_only_legacy_shell_policy() {
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            "/workspace",
+            "/run/prompt.md",
+            "/run/events.jsonl",
+            "/run/report.json",
+            Duration::from_secs(1),
+        );
+        let controls = ProtectedWorktreeControls::default();
+        let expected = vec![
+            OsString::from("-c"),
+            OsString::from("shell_environment_policy.inherit=\"core\""),
+            OsString::from("-c"),
+            OsString::from("shell_environment_policy.ignore_default_excludes=false"),
+            OsString::from("-c"),
+            OsString::from("shell_environment_policy.include_only=[\"PATH\"]"),
+        ];
+
+        for (label, argv) in [
+            ("exec", codex_hardened_argv(&command, &controls)),
+            ("app-server", codex_app_server_argv(&command, &controls)),
+        ] {
+            let inherit_index = argv
+                .iter()
+                .position(|argument| argument == "shell_environment_policy.inherit=\"core\"")
+                .expect("path-only shell policy inherit override");
+            let policy_start = inherit_index
+                .checked_sub(1)
+                .expect("shell policy inherit override must follow -c");
+            assert_eq!(
+                argv.get(policy_start..policy_start + expected.len()),
+                Some(expected.as_slice()),
+                "unexpected {label} shell policy argv"
+            );
+            assert_eq!(
+                argv.iter()
+                    .filter(|argument| {
+                        argument
+                            .to_string_lossy()
+                            .starts_with("shell_environment_policy.")
+                    })
+                    .count(),
+                3,
+                "unexpected additional {label} shell policy override"
+            );
+            assert!(!argv.iter().any(|argument| {
+                argument
+                    .to_string_lossy()
+                    .starts_with("shell_environment_policy.set=")
+            }));
+        }
     }
 }
