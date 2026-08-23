@@ -435,6 +435,58 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
 }
 
 #[test]
+fn authoritative_single_file_goal_lowers_to_one_planning_execution_pair() {
+    skip_without_containment!();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    Repository::init(repo).expect("initialize repository");
+    fs::write(repo.join("RELEASE_NOTES.md"), "# Releases\n").expect("write release notes");
+    fs::write(
+        repo.join("src.rs"),
+        "pub fn write() {}\npub fn commit() {}\n",
+    )
+    .expect("write semantic decoys");
+
+    let document = supervisor_plan_document_from_goal_spec(
+        repo,
+        "Smoke goal — prove a managed-worktree child write",
+        r#"## Goal
+
+Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other file.
+
+## Spec
+
+- Edit only `RELEASE_NOTES.md`.
+- Commit the change with message `docs: child write`.
+
+## Acceptance
+
+- `RELEASE_NOTES.md` ends with the new line and is committed."#,
+    )
+    .expect("plan authoritative single-file goal");
+
+    let assignments = document["assignments"]
+        .as_array()
+        .expect("assignments array");
+    assert_eq!(assignments.len(), 2);
+    assert_eq!(assignments[0]["id"], "assignment-001-planning");
+    assert_eq!(assignments[1]["id"], "assignment-001");
+    for assignment in assignments {
+        assert_eq!(assignment["assigned_paths"], json!(["RELEASE_NOTES.md"]));
+        assert_eq!(assignment["semantic_symbols"], json!([]));
+        assert_eq!(assignment["semantic_modules"], json!([]));
+    }
+    assert_eq!(
+        document["assignment_schedule"]
+            .as_array()
+            .expect("assignment schedule")
+            .len(),
+        2
+    );
+    assert!(document.get("coverage_gaps").is_none());
+}
+
+#[test]
 fn plain_text_task_without_actionable_scope_returns_guidance() {
     skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");

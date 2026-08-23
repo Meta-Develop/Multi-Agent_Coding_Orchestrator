@@ -84,7 +84,10 @@ The current implementation covers a local-first command-line slice:
   directory is created beneath that exact reviewed runtime root, not an
   independently discovered per-user runtime directory. It still acquires the repository-cleanliness
   capability and creates capability-bound managed child worktrees before that
-  safety gate. The in-process Fake runtime executes the same depth, claim,
+  safety gate. External child sessions receive the three report contracts as
+  individually validated read-only files in both sandbox layers; their schema
+  directory and run-artifact parent are not exposed. Parent review-lens
+  sessions receive only the auditor contract. The in-process Fake runtime executes the same depth, claim,
   journal, review-lens, economics, KPI, and final primary-integrity gates
   without launching an external executable; its successful output is always
   non-publishable. `maco supervise plan/status/collect` remain available. The

@@ -24,7 +24,7 @@ use crate::runtime_adapter::{
     AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId, SideEffectConfinement,
     WritableLaunchTarget,
 };
-use crate::safe_state::unsigned_to_u32;
+use crate::safe_state::{unsigned_to_u32, ReservedDirectory};
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -189,6 +189,8 @@ pub struct ExternalAgentCommand {
     pub json_log: PathBuf,
     pub output_last_message: PathBuf,
     pub output_schema: Option<PathBuf>,
+    /// Exact bounded regular files exposed read-only without exposing their parent directories.
+    pub read_only_input_files: Vec<PathBuf>,
     pub timeout: Duration,
     pub workspace_access: WorkspaceAccess,
     pub hidden_roots: Vec<PathBuf>,
@@ -688,6 +690,7 @@ impl ExternalAgentCommand {
             json_log: json_log.into(),
             output_last_message: output_last_message.into(),
             output_schema: None,
+            read_only_input_files: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadWrite,
             hidden_roots: Vec::new(),
@@ -719,6 +722,7 @@ impl ExternalAgentCommand {
             json_log: json_log.into(),
             output_last_message: output_last_message.into(),
             output_schema: None,
+            read_only_input_files: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
             hidden_roots: Vec::new(),
@@ -750,6 +754,7 @@ impl ExternalAgentCommand {
             json_log: json_log.into(),
             output_last_message: output_last_message.into(),
             output_schema: None,
+            read_only_input_files: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
             hidden_roots: Vec::new(),
@@ -767,6 +772,11 @@ impl ExternalAgentCommand {
 
     pub fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.hidden_roots.push(root.into());
+        self
+    }
+
+    pub fn with_read_only_input_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.read_only_input_files.push(path.into());
         self
     }
 
@@ -1737,6 +1747,11 @@ fn run_external_agent_runtime(
         .and_then(|_| match &spec.output_schema {
             Some(path) => ensure_safe_read_target(path),
             None => Ok(()),
+        })
+        .and_then(|_| {
+            spec.read_only_input_files
+                .iter()
+                .try_for_each(|path| ensure_safe_read_target(path))
         })
         .and_then(|_| ensure_safe_read_target(&spec.prompt))
     {
@@ -3017,6 +3032,8 @@ struct ExternalOutputStaging {
     root_path: PathBuf,
     reservation: Option<ReservedOutputFile>,
     machine_global_retention: Option<ExternalMachineGlobalRetentionBinding>,
+    bound_store: Option<MachineGlobalStore>,
+    bound_root_reservation: Option<ReservedDirectory>,
     cleanup_completed: bool,
 }
 
@@ -3033,18 +3050,57 @@ impl ExternalOutputStaging {
     ) -> Result<Self> {
         #[cfg(target_os = "linux")]
         {
+            if let Some(binding) = machine_global_retention {
+                return Self::create_bound(writable_workspace, binding);
+            }
             let runtime_root = crate::process_runner::trusted_linux_runtime_root()
                 .context("owner-private runtime root is unavailable for output staging")?;
-            Self::create_under_with_retention(
-                &runtime_root,
-                writable_workspace,
-                machine_global_retention,
-            )
+            Self::create_under_with_retention(&runtime_root, writable_workspace, None)
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (writable_workspace, machine_global_retention);
             bail!("private external-agent output staging requires the strict Linux runtime")
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_bound(
+        writable_workspace: &Path,
+        binding: ExternalMachineGlobalRetentionBinding,
+    ) -> Result<Self> {
+        let store = MachineGlobalStore::open_config(&binding.config)
+            .context("failed to open machine-global config before output staging")?;
+        let root_reservation = store
+            .reserve_random_direct_child_directory(
+                &binding.root_id,
+                OsStr::new("maco-external-output-"),
+            )
+            .context("failed to reserve output staging under the reviewed machine-global root")?;
+        let root_path = root_reservation.path().to_path_buf();
+        let prepared = (|| -> Result<ReservedOutputFile> {
+            let root = SecureOutputRoot::open_private(&root_path)?;
+            root.reject_inside(writable_workspace)?;
+            root.reserve(OsStr::new("last-message.raw"))
+        })();
+        match prepared {
+            Ok(reservation) => Ok(Self {
+                root_path,
+                reservation: Some(reservation),
+                machine_global_retention: Some(binding),
+                bound_store: Some(store),
+                bound_root_reservation: Some(root_reservation),
+                cleanup_completed: false,
+            }),
+            Err(error) => {
+                store
+                    .remove_empty_reserved_direct_child_directory(
+                        &binding.root_id,
+                        root_reservation,
+                    )
+                    .context("failed to roll back empty reviewed-root output staging")?;
+                Err(error)
+            }
         }
     }
 
@@ -3060,6 +3116,10 @@ impl ExternalOutputStaging {
         machine_global_retention: Option<ExternalMachineGlobalRetentionBinding>,
     ) -> Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
+
+        if let Some(binding) = machine_global_retention {
+            return Self::create_bound(writable_workspace, binding);
+        }
 
         let mut root_path = None;
         for _ in 0..16 {
@@ -3097,7 +3157,9 @@ impl ExternalOutputStaging {
             Ok(reservation) => Ok(Self {
                 root_path,
                 reservation: Some(reservation),
-                machine_global_retention,
+                machine_global_retention: None,
+                bound_store: None,
+                bound_root_reservation: None,
                 cleanup_completed: false,
             }),
             Err(error) => {
@@ -3157,7 +3219,17 @@ impl ExternalOutputStaging {
             return Ok(ExternalOutputCleanup::Bypassed(attribution));
         };
 
+        let bound_store = self
+            .bound_store
+            .as_ref()
+            .context("bound output staging lost its reviewed-root capability")?;
+        bound_store
+            .revalidate_root(&binding.root_id)
+            .context("reviewed output-staging root changed before cleanup")?;
         let store = MachineGlobalStore::open_config(&binding.config)?;
+        if !bound_store.matches_config_binding(&store) {
+            bail!("machine-global config binding changed before output-staging cleanup");
+        }
         let coordinate =
             store.coordinate_for_existing_directory(&binding.root_id, &self.root_path)?;
         let outcome = store.quarantine(
@@ -3168,6 +3240,8 @@ impl ExternalOutputStaging {
         match outcome {
             GateOutcome::Allowed(operation) => {
                 self.reservation.take();
+                self.bound_root_reservation.take();
+                self.bound_store.take();
                 self.cleanup_completed = true;
                 Ok(ExternalOutputCleanup::Quarantined(operation))
             }

@@ -44,6 +44,19 @@ fn bind_runtime_output_schema(
     command
 }
 
+fn bind_runtime_read_only_schema_files(
+    mut command: ExternalAgentCommand,
+    runtime: SupervisorRuntime,
+    schema_paths: &[&Path],
+) -> ExternalAgentCommand {
+    if runtime != SupervisorRuntime::Fake {
+        for schema_path in schema_paths {
+            command = command.with_read_only_input_file((*schema_path).to_path_buf());
+        }
+    }
+    command
+}
+
 fn requires_hosted_pre_action_review(command: &ExternalAgentCommand) -> bool {
     command.workspace_access == WorkspaceAccess::ReadOnly
         || command.writable_launch_target
@@ -973,6 +986,11 @@ fn prepare_child_attempt<'a>(
         runtime_model_catalog,
     )?;
     command = bind_runtime_output_schema(command, launch_runtime, schema_path);
+    command = bind_runtime_read_only_schema_files(
+        command,
+        launch_runtime,
+        &[schema_path, worker_schema_path, auditor_schema_path],
+    );
     // Agent lifecycle records and binds repository metadata. Child-visible Git paths are
     // derived separately from `command.cwd` as an exact linked-worktree allowlist; the
     // owning primary/common checkout is not made visible.
@@ -2110,6 +2128,9 @@ fn prepare_parent_auditor<'a>(
     })?;
 
     let scope_workspace = create_review_lens_scope_workspace()?;
+    let auditor_schema_input = scope_workspace.path().join("auditor-report.schema.json");
+    fs::copy(&auditor_schema_path, &auditor_schema_input)
+        .context("failed to materialize the isolated auditor schema input")?;
     let mut auditor_command = ExternalAgentCommand::codex(
         &options.codex_bin,
         scope_workspace.path(),
@@ -2133,6 +2154,11 @@ fn prepare_parent_auditor<'a>(
     )?;
     auditor_command =
         bind_runtime_output_schema(auditor_command, options.runtime, &auditor_schema_path);
+    auditor_command = bind_runtime_read_only_schema_files(
+        auditor_command,
+        options.runtime,
+        &[&auditor_schema_input],
+    );
     auditor_command =
         configure_review_lens_execution_boundary(auditor_command, repo, &worktree.path)?
             .with_agent_lifecycle(
@@ -3414,6 +3440,7 @@ mod decomposition_tests {
         const CHILD_ENV: &str = "MACO_TEST_REVIEW_LENS_BOUNDARY_CHILD";
         const PRIMARY_SECRET_ENV: &str = "MACO_TEST_REVIEW_LENS_PRIMARY_SECRET";
         const CHILD_SECRET_ENV: &str = "MACO_TEST_REVIEW_LENS_CHILD_SECRET";
+        const SCHEMA_ENV: &str = "MACO_TEST_REVIEW_LENS_SCHEMA";
 
         if std::env::var_os(CHILD_ENV).is_some() {
             for environment_name in [PRIMARY_SECRET_ENV, CHILD_SECRET_ENV] {
@@ -3427,6 +3454,10 @@ mod decomposition_tests {
                     secret.display()
                 );
             }
+            let schema = PathBuf::from(
+                std::env::var_os(SCHEMA_ENV).context("missing hostile probe schema path")?,
+            );
+            assert_eq!(fs::read_to_string(schema)?, "{\"type\":\"object\"}\n");
             return Ok(());
         }
 
@@ -3447,6 +3478,8 @@ mod decomposition_tests {
         fs::write(&child_secret, "CHILD_SECRET_MUST_BE_HIDDEN\n")?;
 
         let scope_workspace = create_review_lens_scope_workspace()?;
+        let schema = scope_workspace.path().join("auditor-report.schema.json");
+        fs::write(&schema, "{\"type\":\"object\"}\n")?;
         let prompt = scope_workspace.path().join("prompt.md");
         fs::write(&prompt, "Attempt hostile access to omitted lens inputs.\n")?;
         let command = ExternalAgentCommand::codex(
@@ -3457,10 +3490,16 @@ mod decomposition_tests {
             scope_workspace.path().join("report.json"),
             Duration::from_secs(10),
         );
-        let command =
-            configure_review_lens_execution_boundary(command, &primary_root, &child_root)?;
+        let command = configure_review_lens_execution_boundary(
+            command.with_read_only_input_file(&schema),
+            &primary_root,
+            &child_root,
+        )?;
 
         let mut profile = crate::process_runner::ExternalCodexProfile::read_only(&command.cwd);
+        for input in &command.read_only_input_files {
+            profile = profile.with_visible_read_only_file(input);
+        }
         for hidden_root in &command.hidden_roots {
             profile = profile.with_hidden_root(hidden_root);
         }
@@ -3474,6 +3513,7 @@ mod decomposition_tests {
                 CHILD_SECRET_ENV.to_string(),
                 child_secret.display().to_string(),
             ),
+            (SCHEMA_ENV.to_string(), schema.display().to_string()),
         ]);
         let output = match run_process(
             ProcessSpec::direct(
@@ -3669,6 +3709,9 @@ mod decomposition_tests {
         let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
         let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
         let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+        fs::create_dir_all(&dirs.schemas).expect("create direct phase schema directory");
+        fs::write(&auditor_schema_path, "{\"type\":\"object\"}\n")
+            .expect("materialize direct phase auditor schema");
         let prepared = match prepare_child_attempt(
             &context,
             &mut outcome,
@@ -3695,6 +3738,7 @@ mod decomposition_tests {
             prepared.command.machine_global_retention,
             options.machine_global_retention
         );
+        assert!(prepared.command.read_only_input_files.is_empty());
         let collected = dispatch_and_collect_child_attempt(
             &context,
             &mut outcome,
@@ -4411,9 +4455,22 @@ done
     #[test]
     fn external_providers_omit_incompatible_output_schema_paths() {
         let schema = Path::new("/hidden-primary/schemas/report.json");
-        let codex =
-            bind_runtime_output_schema(launch_fixture_command(), SupervisorRuntime::Codex, schema);
+        let worker_schema = Path::new("/hidden-primary/schemas/worker.json");
+        let auditor_schema = Path::new("/hidden-primary/schemas/auditor.json");
+        let schemas = [schema, worker_schema, auditor_schema];
+        let codex = bind_runtime_read_only_schema_files(
+            bind_runtime_output_schema(launch_fixture_command(), SupervisorRuntime::Codex, schema),
+            SupervisorRuntime::Codex,
+            &schemas,
+        );
         assert!(codex.output_schema.is_none());
+        assert_eq!(
+            codex.read_only_input_files,
+            schemas
+                .iter()
+                .map(|path| path.to_path_buf())
+                .collect::<Vec<_>>()
+        );
 
         for runtime in [
             SupervisorRuntime::Grok,
@@ -4421,16 +4478,31 @@ done
             SupervisorRuntime::ClaudeCode,
             SupervisorRuntime::GeminiCli,
         ] {
-            let adapter = bind_runtime_output_schema(launch_fixture_command(), runtime, schema);
+            let adapter = bind_runtime_read_only_schema_files(
+                bind_runtime_output_schema(launch_fixture_command(), runtime, schema),
+                runtime,
+                &schemas,
+            );
             assert!(
                 adapter.output_schema.is_none(),
                 "{runtime:?} must not inherit Codex-only output schema staging"
             );
+            assert_eq!(
+                adapter.read_only_input_files,
+                schemas
+                    .iter()
+                    .map(|path| path.to_path_buf())
+                    .collect::<Vec<_>>()
+            );
         }
 
-        let fake =
-            bind_runtime_output_schema(launch_fixture_command(), SupervisorRuntime::Fake, schema);
+        let fake = bind_runtime_read_only_schema_files(
+            bind_runtime_output_schema(launch_fixture_command(), SupervisorRuntime::Fake, schema),
+            SupervisorRuntime::Fake,
+            &schemas,
+        );
         assert_eq!(fake.output_schema.as_deref(), Some(schema));
+        assert!(fake.read_only_input_files.is_empty());
     }
 
     #[test]

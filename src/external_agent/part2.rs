@@ -895,6 +895,7 @@ struct ProtectedWorktreeControls {
     read_write_roots: Vec<ProtectedWorktreeControl>,
     read_write_files: Vec<ProtectedWorktreeControl>,
     managed_git: Option<ManagedWorktreeGitMetadata>,
+    exact_read_only_input_files: Vec<PathBuf>,
     writable_artifact_root: Option<PathBuf>,
 }
 
@@ -999,8 +1000,79 @@ fn protected_worktree_controls(spec: &ExternalAgentCommand) -> Result<ProtectedW
     {
         controls.managed_git = managed_worktree_git_metadata(&spec.cwd)?;
     }
+    controls.exact_read_only_input_files = validate_exact_read_only_input_files(spec, &controls)?;
     controls.writable_artifact_root = Some(validate_artifact_parent_disjoint(spec, &controls)?);
     Ok(controls)
+}
+
+fn validate_exact_read_only_input_files(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+) -> Result<Vec<PathBuf>> {
+    const MAX_EXACT_INPUT_FILES: usize = 16;
+    if spec.read_only_input_files.len() > MAX_EXACT_INPUT_FILES {
+        bail!("exact read-only input files exceed the fixed limit of {MAX_EXACT_INPUT_FILES}");
+    }
+    let workspace = fs::canonicalize(&spec.cwd)
+        .context("external-agent workspace could not be resolved")?;
+    let artifact_root = normalized_absolute_path(
+        required_parent(&spec.output_last_message)?,
+        "external-agent output parent",
+    )?;
+    let mut validated = BTreeSet::new();
+    for declared in &spec.read_only_input_files {
+        let normalized = normalized_absolute_path(declared, "exact read-only input file")?;
+        ensure_safe_read_target(&normalized)?;
+        let canonical = fs::canonicalize(&normalized)
+            .context("exact read-only input file could not be resolved")?;
+        if canonical != normalized {
+            bail!("exact read-only input file must already be canonical");
+        }
+        let metadata = fs::symlink_metadata(&canonical)
+            .context("failed to inspect exact read-only input file")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() != 1 {
+                bail!("exact read-only input file has a hard-link alias");
+            }
+        }
+        if (canonical.starts_with(&workspace) || workspace.starts_with(&canonical))
+            && spec.workspace_access == WorkspaceAccess::ReadWrite
+        {
+            bail!("exact read-only input file overlaps the writable external-agent workspace");
+        }
+        if canonical.starts_with(&artifact_root) || artifact_root.starts_with(&canonical) {
+            bail!("exact read-only input file overlaps writable artifact staging");
+        }
+        for control in controls.iter() {
+            if canonical.starts_with(&control.absolute)
+                || control.absolute.starts_with(&canonical)
+            {
+                bail!("exact read-only input file overlaps a protected worktree control");
+            }
+        }
+        if let Some(git) = &controls.managed_git {
+            for protected in std::iter::once(&git.worktree_git_dir)
+                .chain(&git.common_read_only_roots)
+                .chain(&git.common_read_only_files)
+            {
+                if canonical.starts_with(protected) || protected.starts_with(&canonical) {
+                    bail!("exact read-only input file overlaps managed Git metadata");
+                }
+            }
+        }
+        for hidden in &spec.hidden_roots {
+            let hidden = normalized_absolute_path(hidden, "hidden root")?;
+            if canonical.starts_with(&hidden) || hidden.starts_with(&canonical) {
+                bail!("exact read-only input file overlaps a hidden root");
+            }
+        }
+        if !validated.insert(canonical) {
+            bail!("exact read-only input file is declared more than once");
+        }
+    }
+    Ok(validated.into_iter().collect())
 }
 
 fn managed_worktree_git_metadata(workspace: &Path) -> Result<Option<ManagedWorktreeGitMetadata>> {
@@ -2146,6 +2218,9 @@ fn external_side_effect_profile(
             if let Some(schema) = &spec.output_schema {
                 profile = profile.with_visible_read_only_file(schema);
             }
+            for input in &protected_controls.exact_read_only_input_files {
+                profile = profile.with_visible_read_only_file(input);
+            }
             profile = profile.with_writable_artifact_root(artifact_root);
             for root in &spec.hidden_roots {
                 profile = profile.with_hidden_root(root);
@@ -2855,6 +2930,11 @@ fn codex_filesystem_permissions(
                     WorkspaceAccess::ReadWrite => "write",
                 },
             );
+        }
+    }
+    for path in &controls.exact_read_only_input_files {
+        if let Some(path) = path.to_str() {
+            path_permissions.insert(path.to_string(), "read");
         }
     }
     for control in controls

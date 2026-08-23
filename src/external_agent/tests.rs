@@ -1383,6 +1383,87 @@ fn managed_git_metadata_cannot_overlap_writable_artifact_staging() -> Result<()>
 
 #[cfg(unix)]
 #[test]
+fn exact_read_only_inputs_are_files_in_both_layers_without_parent_visibility() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, _common, _child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    let incoming = temp.path().join("incoming");
+    let schemas = temp.path().join("private-schemas");
+    fs::create_dir(&incoming)?;
+    fs::create_dir(&schemas)?;
+    let schema_paths = [
+        schemas.join("orchestrator.json"),
+        schemas.join("worker.json"),
+        schemas.join("auditor.json"),
+    ];
+    for schema in &schema_paths {
+        fs::write(schema, "{}\n")?;
+    }
+    let mut command = managed_git_command(&child, &incoming);
+    for schema in &schema_paths {
+        command = command.with_read_only_input_file(schema);
+    }
+    let controls = protected_worktree_controls(&command)?;
+    let permissions = codex_filesystem_permissions(&command, &controls);
+    let profile = external_side_effect_profile(
+        &command,
+        &child.join("fixture-codex"),
+        ExternalProgramTrust::TrustedSystemCodex,
+        &controls,
+    )?;
+    let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+        bail!("expected ExternalCodex profile");
+    };
+
+    for schema in &schema_paths {
+        let canonical = fs::canonicalize(schema)?;
+        assert!(profile.visible_read_only_files().contains(&canonical));
+        assert!(permissions.contains(&format!(
+            "{}=\"read\"",
+            toml_basic_string(canonical.to_str().context("UTF-8 schema path")?)
+        )));
+    }
+    assert!(!profile.visible_read_only_roots().contains(&schemas));
+    assert!(!permissions.contains(&toml_basic_string(
+        schemas.to_str().context("UTF-8 schema parent")?
+    )));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_read_only_inputs_reject_alias_and_writable_overlap() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, _common, _child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    let incoming = temp.path().join("incoming");
+    let schemas = temp.path().join("private-schemas");
+    fs::create_dir(&incoming)?;
+    fs::create_dir(&schemas)?;
+    let schema = schemas.join("worker.json");
+    fs::write(&schema, "{}\n")?;
+    fs::hard_link(&schema, schemas.join("worker-alias.json"))?;
+    let alias_error = protected_worktree_controls(
+        &managed_git_command(&child, &incoming).with_read_only_input_file(&schema),
+    )
+    .expect_err("hard-link alias must fail closed");
+    assert!(alias_error.to_string().contains("hard-link alias"));
+
+    let overlap = incoming.join("schema.json");
+    fs::write(&overlap, "{}\n")?;
+    let overlap_error = protected_worktree_controls(
+        &managed_git_command(&child, &incoming).with_read_only_input_file(&overlap),
+    )
+    .expect_err("writable artifact overlap must fail closed");
+    assert!(overlap_error
+        .to_string()
+        .contains("overlaps writable artifact staging"));
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn managed_git_hardlink_alias_fails_as_typed_actionable_sandbox_error() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let (_primary, child, common, _child_git_dir) =
@@ -1938,6 +2019,79 @@ fn private_output_staging_redacts_atomic_publication_and_cleans_up() -> Result<(
         staging.root_path().to_path_buf()
     };
     assert!(!dropped_root.exists());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bound_output_staging_is_created_under_the_reviewed_root() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    let runtime_root = temp.path().join("reviewed-runtime");
+    let state_root = temp.path().join("machine-global-state");
+    for path in [&workspace, &runtime_root, &state_root] {
+        fs::create_dir(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    let config = temp.path().join("machine-global.json");
+    fs::write(
+        &config,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "state_root": state_root,
+            "roots": [{
+                "id": "runtime",
+                "path": runtime_root,
+                "protected_paths": [],
+                "quarantine_grace_seconds": 60
+            }]
+        }))?,
+    )?;
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
+    let binding = ExternalMachineGlobalRetentionBinding {
+        config: config.clone(),
+        root_id: "runtime".to_string(),
+        owner: "cleanup-agent".to_string(),
+        correction_correlation_id: "cleanup-correlation".to_string(),
+    };
+
+    let mut staging = ExternalOutputStaging::create(&workspace, Some(binding.clone()))?;
+    let staging_root = staging.root_path().to_path_buf();
+    assert!(staging_root.starts_with(&runtime_root));
+    assert_eq!(staging_root.parent(), Some(runtime_root.as_path()));
+    assert!(matches!(
+        staging.cleanup()?,
+        ExternalOutputCleanup::Quarantined(_)
+    ));
+
+    let mut drifted = ExternalOutputStaging::create(&workspace, Some(binding.clone()))?;
+    let drifted_root = drifted.root_path().to_path_buf();
+    let replacement = temp.path().join("machine-global.replacement.json");
+    fs::copy(&config, &replacement)?;
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&replacement, &config)?;
+    let drift_error = match drifted.cleanup() {
+        Ok(_) => bail!("replaced machine-global config authorized staging cleanup"),
+        Err(error) => error,
+    };
+    assert!(drift_error.to_string().contains("config binding changed"));
+    assert!(drifted_root.exists());
+    drop(drifted);
+    assert!(drifted_root.exists());
+
+    let before = fs::read_dir(&runtime_root)?.count();
+    let unknown = ExternalMachineGlobalRetentionBinding {
+        root_id: "unknown".to_string(),
+        ..binding
+    };
+    let error = match ExternalOutputStaging::create(&workspace, Some(unknown)) {
+        Ok(_) => bail!("unknown reviewed root created output staging"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("reviewed machine-global root"));
+    assert_eq!(fs::read_dir(&runtime_root)?.count(), before);
     Ok(())
 }
 

@@ -1129,6 +1129,11 @@ impl ExternalCodexProfile {
     }
 
     #[cfg(test)]
+    pub(crate) fn visible_read_only_files(&self) -> &[PathBuf] {
+        &self.config.visible_read_only_files
+    }
+
+    #[cfg(test)]
     pub(crate) fn visible_read_write_roots(&self) -> &[PathBuf] {
         &self.config.visible_read_write_roots
     }
