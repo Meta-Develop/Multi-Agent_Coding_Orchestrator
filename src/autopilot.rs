@@ -12,6 +12,9 @@ use crate::{
         CandidateValidationBinding, SafetyCheckStatus, ValidationEvidenceBundle, ValidationReport,
         ValidationStatus,
     },
+    mutation_taxonomy::{
+        autonomous_decision_for_supervisor_child_dispatch, is_reviewed_taxonomy_gate_id,
+    },
     orchestrator::{RunId, SemanticCoordinationMode},
     planning,
     process_runner::{
@@ -1126,6 +1129,27 @@ fn cancelled_pre_dispatch_cleanup_completed(
     Ok(primary_worktree_untouched && WorktreeManager::new(repo).pending_operations()?.is_empty())
 }
 
+fn find_generated_follow_up_taxonomy_gate_id(
+    cascade_denials: &[GateDenial],
+    dispatched_subordinate_denials: &[&GateDenial],
+) -> Option<String> {
+    cascade_denials.iter().find_map(|denial| {
+        // Finalized subordinate denials are folded into the cascade vector.
+        // Exclude those exact records before interpreting a queue-local
+        // pre-dispatch refusal as the generated plan's taxonomy outcome.
+        let originated_in_dispatched_subordinate = dispatched_subordinate_denials.contains(&denial);
+        (matches!(
+            denial.reason,
+            GateDenialReason::ApprovalReview {
+                denial: ApprovalReviewDenial::HumanReviewRequired
+            }
+        ) && denial.context.source == GateCheckSource::FutureApprovalReview
+            && is_reviewed_taxonomy_gate_id(&denial.context.owner)
+            && !originated_in_dispatched_subordinate)
+            .then(|| denial.context.owner.clone())
+    })
+}
+
 #[cfg(test)]
 fn run_autopilot_plan_file_with_injected_supervisor_and_runner(
     options: AutopilotRunOptions,
@@ -1445,6 +1469,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     };
     let mut follow_up_profile_refusal = None;
     let mut before_dispatch_denial = None;
+    let mut taxonomy_gate_id = None::<String>;
     let mut admitted_child_dispatches = 0_usize;
     let error_evidence_source_plan_sha256 =
         supervise::normalized_supervisor_plan_file_sha256(&supervisor_options.plan_file)?;
@@ -1461,6 +1486,23 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 .iter()
                 .flat_map(|assignment| assignment.assigned_paths.iter().cloned())
                 .collect::<Vec<_>>();
+            // Generated plans are checked at the central queue boundary after
+            // authenticated reload. Only the initial source reaches this
+            // admission check, so one dispatch consumes one decision.
+            if !source_dispatch_started.load(Ordering::SeqCst) {
+                let taxonomy_decision = autonomous_decision_for_supervisor_child_dispatch();
+                if let Some(gate_id) = taxonomy_decision.gate_id() {
+                    taxonomy_gate_id = Some(gate_id.to_string());
+                    let denial = GateDenial::from_approval_review(
+                        options.run_id.as_str(),
+                        gate_id,
+                        ApprovalReviewDenial::HumanReviewRequired,
+                        effective_paths.clone(),
+                    )?;
+                    before_dispatch_denial = Some(denial.clone());
+                    return Ok(Some(denial));
+                }
+            }
             let binding = AutopilotProfileBindingReport::from_effective(
                 follow_up_requested_profile.clone(),
                 effective,
@@ -1547,6 +1589,13 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 && before_dispatch_denial.as_ref().is_some_and(|denial| {
                     matches!(denial.reason, GateDenialReason::BudgetAdmission { .. })
                 });
+            let taxonomy_refused_before_source_dispatch =
+                !source_dispatch_started && taxonomy_gate_id.is_some();
+            let taxonomy_refusal_next_action = taxonomy_gate_id.as_deref().map(|gate_id| {
+                format!(
+                    "the mutation taxonomy requires gate `{gate_id}`; the named gate, including taxonomy review for `taxonomy-review-required`, is required before retrying; no supervisor or generated follow-up dispatch occurred"
+                )
+            });
             let generated_follow_up_dispatch_performed = if !source_dispatch_started {
                 false
             } else {
@@ -1609,7 +1658,9 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 run_id: &options.run_id,
                 status: if cancellation_cleanup_completed {
                     AutopilotRunStatus::Cancelled
-                } else if admission_refused_before_source_dispatch {
+                } else if taxonomy_refused_before_source_dispatch
+                    || admission_refused_before_source_dispatch
+                {
                     AutopilotRunStatus::Refused
                 } else {
                     AutopilotRunStatus::Failed
@@ -1637,6 +1688,8 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                     "caller cancellation was observed before supervisor dispatch; start a new run only if the work is still required"
                 } else if cancellation_was_observed {
                     "caller cancellation was observed before supervisor dispatch, but pending-worktree or primary-integrity cleanup evidence is incomplete; reconcile durable worktree operations before retrying"
+                } else if let Some(next_action) = taxonomy_refusal_next_action.as_deref() {
+                    next_action
                 } else if admission_refused_before_source_dispatch {
                     "review the configured child-dispatch maximum and start a new run with an adequate bound; no supervisor dispatch was attempted"
                 } else if profile_refused_before_source_dispatch {
@@ -1653,6 +1706,15 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             return Ok(report);
         }
     };
+    let dispatched_subordinate_denials = cascade
+        .follow_up_reports
+        .iter()
+        .flat_map(|report| report.gate_denials.iter())
+        .collect::<Vec<_>>();
+    let generated_follow_up_taxonomy_gate_id = find_generated_follow_up_taxonomy_gate_id(
+        &cascade.follow_up_gate_denials,
+        &dispatched_subordinate_denials,
+    );
     let generated_follow_up_dispatch_performed = cascade.generated_follow_up_dispatch_performed();
     let follow_up_cascade_success = cascade.follow_up_cascade_success;
     let follow_up_gate_denials = cascade.follow_up_gate_denials.clone();
@@ -1685,6 +1747,12 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     )?;
     let execution_profile_mismatch =
         profile_binding.status == AutopilotProfileBindingStatus::Mismatch;
+    let taxonomy_refusal_gate_id = taxonomy_gate_id.or(generated_follow_up_taxonomy_gate_id);
+    let taxonomy_refusal_next_action = taxonomy_refusal_gate_id.as_deref().map(|gate_id| {
+        format!(
+            "the mutation taxonomy requires gate `{gate_id}`; the named gate, including taxonomy review for `taxonomy-review-required`, is required before retrying; the taxonomy-refused generated follow-up was not dispatched"
+        )
+    });
     let child_dispatch_admission_refused = before_dispatch_denial
         .as_ref()
         .is_some_and(|denial| matches!(denial.reason, GateDenialReason::BudgetAdmission { .. }));
@@ -1692,7 +1760,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         AutopilotRunStatus::Cancelled
     } else if cancellation_was_observed {
         AutopilotRunStatus::Failed
-    } else if child_dispatch_admission_refused {
+    } else if taxonomy_refusal_gate_id.is_some() || child_dispatch_admission_refused {
         AutopilotRunStatus::Refused
     } else if supervisor.success && follow_up_cascade_success && !execution_profile_mismatch {
         AutopilotRunStatus::Succeeded
@@ -1708,6 +1776,8 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         "caller cancellation was observed and the supervised cleanup path completed; inspect the durable supervisor and queue evidence before starting a new run"
     } else if cancellation_was_observed {
         "caller cancellation was observed but terminal cleanup evidence is incomplete; reconcile supervisor claims, semantic intents, worktrees, and the authenticated follow-up queue before retrying"
+    } else if let Some(next_action) = taxonomy_refusal_next_action.as_deref() {
+        next_action
     } else if child_dispatch_admission_refused {
         "review the configured child-dispatch maximum and start a new run with an adequate bound; the refused generated follow-up was not dispatched"
     } else if execution_profile_mismatch {
