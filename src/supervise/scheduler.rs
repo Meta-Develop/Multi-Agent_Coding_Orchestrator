@@ -365,6 +365,7 @@ pub(super) struct AssignmentBudgetPolicy {
     assignment_reasoning_effort: Option<ReasoningEffort>,
     selector_state: Option<SupervisorAutomaticSelectionState>,
     selector_overrides: BTreeMap<AgentRole, RoleModelSelection>,
+    selector_runtime_overrides: BTreeMap<AgentRole, SupervisorRuntime>,
     pub(super) selector_decisions: Vec<SupervisorSelectionEvent>,
 }
 
@@ -453,6 +454,8 @@ impl AssignmentBudgetPolicy {
             environment_rejections,
         )?;
         self.selector_overrides.extend(reselection.overrides);
+        self.selector_runtime_overrides
+            .extend(reselection.runtime_overrides);
         Ok(reselection
             .decisions
             .into_iter()
@@ -477,9 +480,26 @@ impl AssignmentBudgetPolicy {
             }
             bail!("completed automatic-selection events have no manager replay state");
         };
-        let overrides = state.commit_completed_selection_events(runtime, events)?;
-        self.selector_overrides.extend(overrides);
+        let bindings = state.commit_completed_selection_events(runtime, events)?;
+        self.selector_overrides.extend(bindings.model_overrides);
+        self.selector_runtime_overrides
+            .extend(bindings.runtime_overrides);
         Ok(())
+    }
+
+    pub(super) fn launch_runtime(&self, role: AgentRole) -> Option<SupervisorRuntime> {
+        self.selector_runtime_overrides.get(&role).copied()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_selector_binding_for_test(
+        &mut self,
+        role: AgentRole,
+        runtime: SupervisorRuntime,
+        selection: RoleModelSelection,
+    ) {
+        self.selector_overrides.insert(role, selection);
+        self.selector_runtime_overrides.insert(role, runtime);
     }
 }
 
@@ -525,16 +545,17 @@ impl BudgetDegradationController {
         automatic_selection_state: Option<SupervisorAutomaticSelectionState>,
         runtime: SupervisorRuntime,
     ) -> Result<Self> {
-        let selector_overrides = automatic_selection_state
+        let selector_bindings = automatic_selection_state
             .as_ref()
-            .map(|state| state.executable_overrides(runtime))
+            .map(|state| state.executable_bindings(runtime))
             .transpose()?
             .unwrap_or_default();
         Ok(Self {
             rung: BudgetDegradationRung::Effort,
             policy: AssignmentBudgetPolicy {
                 selector_state: automatic_selection_state,
-                selector_overrides,
+                selector_overrides: selector_bindings.model_overrides,
+                selector_runtime_overrides: selector_bindings.runtime_overrides,
                 ..AssignmentBudgetPolicy::default()
             },
             effective_fan_out: max_concurrent_children.max(1),
@@ -3667,6 +3688,12 @@ mod selection_policy_tests {
             .get(&AgentRole::Worker)
             .context("retry selected executable worker override")?
             .clone();
+        assert_eq!(
+            retry_policy
+                .launch_runtime(AgentRole::Worker)
+                .map(SupervisorRuntime::as_str),
+            Some(retry_choice.runtime.as_str())
+        );
 
         let indexed_outcomes = vec![Some(AssignmentExecutionOutcome {
             selection_decisions: retry_events.clone(),
@@ -3679,6 +3706,13 @@ mod selection_policy_tests {
         assert_eq!(
             continue_plan.role_models.get(&AgentRole::Worker),
             Some(&retry_selection)
+        );
+        assert_eq!(
+            controller
+                .policy
+                .launch_runtime(AgentRole::Worker)
+                .map(SupervisorRuntime::as_str),
+            Some(retry_choice.runtime.as_str())
         );
 
         let mut later_policy = controller.policy.clone();
@@ -3816,6 +3850,13 @@ mod selection_policy_tests {
         controller
             .commit_completed_selection_prefix(&indexed_outcomes, SupervisorRuntime::Codex)?;
         assert_eq!(controller.next_selection_commit_index, 2);
+        assert_eq!(
+            controller
+                .policy
+                .launch_runtime(AgentRole::Worker)
+                .map(SupervisorRuntime::as_str),
+            Some(schedule_one_choice.candidate.runtime.as_str())
+        );
         assert_eq!(
             controller
                 .policy
