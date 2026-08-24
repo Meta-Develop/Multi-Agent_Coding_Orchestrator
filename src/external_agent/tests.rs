@@ -1239,6 +1239,12 @@ fn exact_worker_journal_controls(
     fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
     fs::create_dir(&journal_parent)?;
     fs::set_permissions(&journal_parent, fs::Permissions::from_mode(0o700))?;
+    #[cfg(target_os = "linux")]
+    for name in CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS {
+        let path = journal_parent.join(name);
+        fs::create_dir(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    }
     let journal = journal_parent.join(format!("{worker_id}.jsonl"));
     fs::write(&journal, b"trusted journal\n")?;
     fs::set_permissions(&journal, fs::Permissions::from_mode(0o600))?;
@@ -1759,7 +1765,7 @@ fn exact_read_only_inputs_reject_alias_and_writable_overlap() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
-fn exact_writable_journal_is_file_only_in_outer_and_inner_boundaries() -> Result<()> {
+fn exact_writable_journal_uses_outer_file_and_inner_private_carrier_boundaries() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir()?;
@@ -1772,6 +1778,12 @@ fn exact_writable_journal_is_file_only_in_outer_and_inner_boundaries() -> Result
     fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
     fs::create_dir(&journal_parent)?;
     fs::set_permissions(&journal_parent, fs::Permissions::from_mode(0o700))?;
+    #[cfg(target_os = "linux")]
+    for name in CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS {
+        let path = journal_parent.join(name);
+        fs::create_dir(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    }
     fs::create_dir(&output_staging)?;
     fs::set_permissions(&output_staging, fs::Permissions::from_mode(0o700))?;
     let journal = journal_parent.join("assignment-001-worker.jsonl");
@@ -1797,13 +1809,20 @@ fn exact_writable_journal_is_file_only_in_outer_and_inner_boundaries() -> Result
         vec![canonical_journal.as_path()]
     );
     let inner_permissions = codex_filesystem_permissions(&target_command, &controls);
-    assert!(inner_permissions.contains(&format!(
+    #[cfg(target_os = "linux")]
+    assert!(!inner_permissions.contains(&format!(
         "{}=\"write\"",
         toml_basic_string(canonical_journal.to_str().context("UTF-8 journal path")?)
     )));
-    assert!(!inner_permissions.contains(&format!(
+    #[cfg(target_os = "linux")]
+    assert!(inner_permissions.contains(&format!(
         "{}=\"write\"",
         toml_basic_string(journal_parent.to_str().context("UTF-8 journal parent")?)
+    )));
+    #[cfg(not(target_os = "linux"))]
+    assert!(inner_permissions.contains(&format!(
+        "{}=\"write\"",
+        toml_basic_string(canonical_journal.to_str().context("UTF-8 journal path")?)
     )));
 
     let profile = external_side_effect_profile(
@@ -1835,6 +1854,12 @@ fn exact_writable_journal_rejects_alias_symlink_and_out_of_contract_paths() -> R
     fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
     fs::create_dir(&journal_parent)?;
     fs::set_permissions(&journal_parent, fs::Permissions::from_mode(0o700))?;
+    #[cfg(target_os = "linux")]
+    for name in CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS {
+        let path = journal_parent.join(name);
+        fs::create_dir(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    }
 
     let aliased = journal_parent.join("worker-a.jsonl");
     fs::write(&aliased, [])?;
@@ -1853,6 +1878,12 @@ fn exact_writable_journal_rejects_alias_symlink_and_out_of_contract_paths() -> R
     fs::set_permissions(&symlink_incoming, fs::Permissions::from_mode(0o700))?;
     fs::create_dir(&symlink_parent)?;
     fs::set_permissions(&symlink_parent, fs::Permissions::from_mode(0o700))?;
+    #[cfg(target_os = "linux")]
+    for name in CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS {
+        let path = symlink_parent.join(name);
+        fs::create_dir(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    }
     let target = symlink_parent.join("target.jsonl");
     fs::write(&target, [])?;
     fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
@@ -4628,6 +4659,12 @@ fn external_profile_exposes_only_incoming_output_root_as_writable() -> Result<()
     {
         fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
         fs::set_permissions(&journal_parent, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(target_os = "linux")]
+    for name in CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS {
+        let path = journal_parent.join(name);
+        fs::create_dir(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
     }
     let journal = journal_parent.join("worker-a.jsonl");
     fs::write(&journal, [])?;

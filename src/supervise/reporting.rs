@@ -473,6 +473,22 @@ pub(super) fn precreate_worker_execution_journals(
     if journal_root.parent() != Some(incoming_scratch.path()) {
         bail!("worker journal directory escaped the incoming scratch root");
     }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        for name in CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS {
+            let path = journal_root.join(name);
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(&path).with_context(|| {
+                format!(
+                    "failed to precreate private Codex protected mount target {}",
+                    path.display()
+                )
+            })?;
+        }
+    }
     let mut paths = Vec::with_capacity(assignment.worker_assignments.len());
     for worker in &assignment.worker_assignments {
         let file_name = worker_execution_journal_file_name(&worker.id);

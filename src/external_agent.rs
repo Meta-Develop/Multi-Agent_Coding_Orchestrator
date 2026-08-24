@@ -66,6 +66,9 @@ const CODEX_DUPLEX_AUDITED_VERSION: (u64, u64, u64) = (0, 144, 4);
 const TRUSTED_PATH: &str = "/run/current-system/sw/bin:/usr/bin:/bin";
 const OUTER_SYSTEMD_POLICY_ID: &str = "maco_external_codex_outer_systemd_v1";
 const INNER_CODEX_POLICY_ID: &str = "maco_external_codex_inner_v1";
+#[cfg(target_os = "linux")]
+pub(crate) const CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS: &[&str] =
+    &[".git", ".agents", ".codex"];
 const WORKTREE_DECLARED_ROOT_ID: &str = "worktree";
 const PERMANENT_CONTROL_ROOTS: &[&str] = &[".maco", ".maco-cache", ".codex"];
 const POLICY_CONTROL_ROOTS: &[&str] = &[".agents"];

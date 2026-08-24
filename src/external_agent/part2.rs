@@ -1278,7 +1278,88 @@ fn validate_exact_writable_artifact_files(
         });
     }
     validated.sort_by(|left, right| left.path.cmp(&right.path));
+    #[cfg(target_os = "linux")]
+    if !validated.is_empty() {
+        validate_codex_writable_artifact_carrier(&incoming_root, &validated)?;
+    }
     Ok(validated)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_codex_writable_artifact_carrier(
+    incoming_root: &Path,
+    artifacts: &[ExactWritableArtifactFile],
+) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let carrier = incoming_root.join("worker-journals");
+    let expected_files = artifacts
+        .iter()
+        .map(|artifact| {
+            artifact
+                .path
+                .file_name()
+                .map(OsStr::to_os_string)
+                .context("exact writable artifact has no file name")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let expected_mount_targets = CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS
+        .iter()
+        .map(OsString::from)
+        .collect::<BTreeSet<_>>();
+    let mut seen_files = BTreeSet::new();
+    let mut seen_mount_targets = BTreeSet::new();
+    // SAFETY: `geteuid` has no preconditions and does not access Rust memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    for entry in fs::read_dir(&carrier)
+        .context("failed to inspect the private Codex worker-journal carrier")?
+    {
+        let entry = entry.context("failed to enumerate the private worker-journal carrier")?;
+        let name = entry.file_name();
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .context("failed to inspect a private worker-journal carrier entry")?;
+        if expected_files.contains(&name) {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("worker-journal carrier contains a non-regular journal entry");
+            }
+            seen_files.insert(name);
+            continue;
+        }
+        if expected_mount_targets.contains(&name) {
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.uid() != effective_uid
+                || metadata.permissions().mode() & 0o777 != 0o700
+            {
+                bail!(
+                    "Codex protected mount target must be a current-user-owned non-symlink 0700 directory"
+                );
+            }
+            if fs::read_dir(&path)
+                .with_context(|| {
+                    format!("failed to inspect protected mount target {}", path.display())
+                })?
+                .next()
+                .is_some()
+            {
+                bail!("Codex protected mount target must be empty before launch");
+            }
+            seen_mount_targets.insert(name);
+            continue;
+        }
+        bail!(
+            "worker-journal carrier contains an undeclared entry: {}",
+            path.display()
+        );
+    }
+    if seen_files != expected_files {
+        bail!("worker-journal carrier is missing a declared exact journal file");
+    }
+    if seen_mount_targets != expected_mount_targets {
+        bail!("worker-journal carrier is missing a required Codex protected mount target");
+    }
+    Ok(())
 }
 
 fn capture_worker_journal_artifacts(
@@ -3335,6 +3416,16 @@ fn codex_filesystem_permissions(
         }
     }
     for artifact in &controls.exact_writable_artifact_files {
+        #[cfg(target_os = "linux")]
+        if let Some(path) = artifact.path.parent().and_then(Path::to_str) {
+            // Codex's Linux bwrap backend currently treats every direct write rule as a
+            // writable root and probes protected descendants below it. A regular-file rule
+            // therefore cannot become an executable inner capability. Use the validated private
+            // carrier directory for Codex while the independently verified outer systemd layer
+            // keeps the carrier read-only and bind-mounts only these held files read-write.
+            path_permissions.insert(path.to_string(), "write");
+        }
+        #[cfg(not(target_os = "linux"))]
         if let Some(path) = artifact.path.to_str() {
             path_permissions.insert(path.to_string(), "write");
         }

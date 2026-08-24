@@ -24,6 +24,17 @@ fn worker_journals_are_precreated_as_private_exact_files() {
     let parent_metadata = fs::symlink_metadata(&journal_parent).expect("journal parent metadata");
     assert!(parent_metadata.is_dir());
     assert_eq!(parent_metadata.permissions().mode() & 0o777, 0o700);
+    #[cfg(target_os = "linux")]
+    for name in CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS {
+        let path = journal_parent.join(name);
+        let metadata = fs::symlink_metadata(&path).expect("protected mount target metadata");
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert!(fs::read_dir(path)
+            .expect("protected mount target entries")
+            .next()
+            .is_none());
+    }
     for journal in &journals {
         assert_eq!(journal.parent(), Some(journal_parent.as_path()));
         let metadata = fs::symlink_metadata(journal).expect("journal metadata");

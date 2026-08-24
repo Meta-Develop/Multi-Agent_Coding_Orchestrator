@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use crate::external_agent::CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS;
 #[cfg(test)]
 use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
 pub use crate::supervise_budget::{
