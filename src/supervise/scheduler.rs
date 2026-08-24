@@ -3249,7 +3249,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     if nested_workers_present {
         collected.findings.push(Finding {
             severity: FindingSeverity::Warning,
-            message: "worker usage is not process-observable because nested workers execute inside child Codex sessions; child-orchestrator and auditor process usage remains reportable, while runtime-side role-tagged usage reporting is required before worker usage or cost can be reported"
+            message: "worker usage is not process-observable because nested-worker delegation is requested through the child-orchestrator contract without a separately MACO-observed worker process or runtime identity; child-orchestrator and auditor process usage remains reportable, while runtime-side role-tagged usage reporting is required before worker usage or cost can be reported"
                 .to_string(),
             paths: Vec::new(),
         });

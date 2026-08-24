@@ -1605,7 +1605,7 @@ pub(super) fn role_usage_report(
             cost_usd: None,
             observation: RoleUsageObservation::NotProcessObservable,
             unavailable_reason: Some(
-                "nested workers execute inside child Codex sessions and are not separate MACO-launched processes; runtime-side role-tagged usage reporting is required before worker usage or cost can be reported"
+                "nested-worker delegation is requested through the child-orchestrator contract, but MACO does not separately observe a worker process or runtime identity; runtime-side role-tagged usage reporting is required before worker usage or cost can be reported"
                     .to_string(),
             ),
         },

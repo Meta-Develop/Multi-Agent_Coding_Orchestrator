@@ -2048,6 +2048,22 @@ fn bind_supervisor_machine_global_staging_cleanup(
     Ok(command.with_machine_global_retention(binding.clone()))
 }
 
+fn bind_active_review_lens_command(
+    command: ExternalAgentCommand,
+    lens: &ReviewLensConfig,
+    assignment_reasoning_effort: Option<ReasoningEffort>,
+    launch_runtime: SupervisorRuntime,
+    runtime_model_catalog: &RuntimeModelCatalog,
+) -> Result<ExternalAgentCommand> {
+    apply_review_lens_model_selection(
+        command,
+        lens,
+        assignment_reasoning_effort,
+        launch_runtime,
+        runtime_model_catalog,
+    )
+}
+
 fn prepare_parent_auditor<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
     outcome: &mut AssignmentExecutionOutcome,
@@ -2177,21 +2193,16 @@ fn prepare_parent_auditor<'a>(
             crate::runtime_adapter::RuntimeAdapterConfig::from_environment(launch_runtime),
         );
     }
-    auditor_command = if budget_policy.launch_runtime(AgentRole::Auditor).is_some() {
-        let effective_plan = budget_policy.apply(plan);
-        let selection = effective_role_model_selection(&effective_plan, AgentRole::Auditor);
-        auditor_command
-            .with_model_provider(Some(lens.backend.backend_id().to_string()))
-            .with_model_selection(selection.model, selection.reasoning_effort)
-    } else {
-        apply_review_lens_model_selection(
-            auditor_command,
-            lens,
-            assignment_reasoning_effort,
-            launch_runtime,
-            runtime_model_catalog,
-        )?
-    };
+    // `lens` already comes from the active budget-policy plan. Keep its per-lens model and
+    // effort authoritative even when the selector overrides the auditor runtime: heterogeneous
+    // custom lenses are not aliases for the global Auditor role selection.
+    auditor_command = bind_active_review_lens_command(
+        auditor_command,
+        lens,
+        assignment_reasoning_effort,
+        launch_runtime,
+        runtime_model_catalog,
+    )?;
     auditor_command =
         bind_runtime_output_schema(auditor_command, launch_runtime, &auditor_schema_path);
     auditor_command = bind_runtime_read_only_schema_files(
@@ -3343,18 +3354,11 @@ fn execute_supervisor_assignment_inner(
             let mut verdicts = Vec::with_capacity(active_plan.review_lenses.len());
             for (lens_index, lens) in active_plan.review_lenses.iter().enumerate() {
                 let expected_request = build_review_lens_request(lens, sources)?;
-                let runtime_validation = if active_budget_policy
-                    .launch_runtime(AgentRole::Auditor)
-                    .is_none()
-                {
-                    validate_review_lens_runtime_selection(
-                        lens,
-                        auditor_launch_runtime,
-                        runtime_model_catalog,
-                    )
-                } else {
-                    Ok(())
-                };
+                let runtime_validation = validate_review_lens_runtime_selection(
+                    lens,
+                    auditor_launch_runtime,
+                    runtime_model_catalog,
+                );
                 if let Err(error) = runtime_validation {
                     child_report.findings.push(Finding {
                         severity: FindingSeverity::Error,
@@ -4744,69 +4748,218 @@ done
     }
 
     #[test]
-    fn auditor_retry_aggregates_requests_against_the_active_lens_selection() -> Result<()> {
-        let plan = valid_child_plan_with_nested_worker()?;
+    fn auditor_runtime_override_preserves_active_heterogeneous_lens_contract() -> Result<()> {
+        let mut plan = valid_child_plan_with_nested_worker()?;
+        let (initial_model, initial_effort) = match &plan.review_lenses[0].backend {
+            ReviewLensBackendConfig::Model {
+                model,
+                reasoning_effort,
+                ..
+            } => (model.clone(), reasoning_effort.clone()),
+            ReviewLensBackendConfig::Precomputed { .. } => {
+                bail!("default review lens must be model-backed")
+            }
+        };
+        plan.role_models.insert(
+            AgentRole::Auditor,
+            RoleModelSelection {
+                model: Some(initial_model),
+                reasoning_effort: initial_effort,
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        plan.review_lenses.push(ReviewLensConfig {
+            id: "custom-heterogeneous-lens".to_string(),
+            backend: ReviewLensBackendConfig::Model {
+                backend_id: "custom-provider".to_string(),
+                model: "custom-auditor-model".to_string(),
+                reasoning_effort: Some("ultra".to_string()),
+            },
+            information_scope: ReviewInformationScope::OutputReportOnly,
+        });
+        let metadata = SupervisorPlanMetadata {
+            assignment_schedule: vec![AssignmentScheduleEntry {
+                assignment_id: "child-with-worker".to_string(),
+                parent_assignment_id: None,
+                depth: MIN_SUPERVISOR_DEPTH,
+                flattened_index: 0,
+            }],
+            ..SupervisorPlanMetadata::default()
+        };
+        let _capability = install_test_fixture_models(&[
+            (
+                "selected-auditor-model",
+                ModelCapabilityClass::CriticalJudgment,
+            ),
+            (
+                "custom-auditor-model",
+                ModelCapabilityClass::CriticalJudgment,
+            ),
+        ])?;
+        let (plan, _) = validate_supervisor_plan(plan, metadata)?;
         let mut active_policy = AssignmentBudgetPolicy::default();
         active_policy.set_selector_binding_for_test(
             AgentRole::Auditor,
             SupervisorRuntime::Codex,
             RoleModelSelection {
-                model: Some("gpt-5.6-auditor-retry".to_string()),
+                model: Some("selected-auditor-model".to_string()),
                 reasoning_effort: Some("xhigh".to_string()),
                 unavailable_model_fallback: UnavailableModelFallback::FailClosed,
             },
         );
         let active_plan = active_policy.apply(&plan);
         assert_ne!(active_plan.review_lenses, plan.review_lenses);
+        assert_eq!(active_plan.review_lenses.len(), 2);
+        assert_eq!(
+            active_plan.review_lenses[0].backend.model(),
+            "selected-auditor-model"
+        );
+        assert_eq!(
+            active_plan.review_lenses[0].backend.reasoning_effort(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            active_plan.review_lenses[1].backend.model(),
+            "custom-auditor-model"
+        );
+        assert_eq!(
+            active_plan.review_lenses[1].backend.reasoning_effort(),
+            Some("ultra")
+        );
+        assert_eq!(
+            active_policy.launch_runtime(AgentRole::Auditor),
+            Some(SupervisorRuntime::Codex)
+        );
+        let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([
+            "selected-auditor-model",
+            "custom-auditor-model",
+        ])?);
+        let incomplete_catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([
+                "selected-auditor-model",
+            ])?);
+        let unavailable_error = validate_review_lens_runtime_selection(
+            &active_plan.review_lenses[1],
+            SupervisorRuntime::Codex,
+            &incomplete_catalog,
+        )
+        .expect_err("runtime override must not bypass custom-lens catalog validation");
+        assert!(unavailable_error
+            .to_string()
+            .contains("lens dispatch fails closed"));
 
         let sources = ReviewLensRequestSources {
             child_transcript: "retry transcript",
             diff: "retry diff",
             output_report: "retry output report",
         };
-        let requests = active_plan
-            .review_lenses
-            .iter()
-            .map(|lens| build_review_lens_request(lens, sources))
-            .collect::<Result<Vec<_>>>()?;
-        let verdicts = active_plan
-            .review_lenses
-            .iter()
-            .zip(&requests)
-            .map(|(lens, request)| {
-                ReviewLensVerdict::for_lens(
+        let assignment = &active_plan.assignments[0];
+        let required_coverage = ReviewCoverageRequirement {
+            worker_ids: vec!["nested-worker".to_string()],
+            paths: vec![PathBuf::from("README.md")],
+        };
+        let mut requests = Vec::new();
+        let mut verdicts = Vec::new();
+        let mut usage_samples = Vec::new();
+        for (lens_index, lens) in active_plan.review_lenses.iter().enumerate() {
+            validate_review_lens_runtime_selection(lens, SupervisorRuntime::Codex, &catalog)?;
+            let request = build_review_lens_request(lens, sources)?;
+            let resolved_effort = resolve_reasoning_effort(
+                AgentRole::Auditor,
+                None,
+                lens.backend.reasoning_effort(),
+                0,
+            );
+            let rendered = render_review_lens_auditor_prompt(
+                ReviewLensAuditorPromptContext {
+                    assignment,
                     lens,
-                    request.request_binding.clone(),
-                    ReviewLensVerdictStatus::Accept,
-                    ReviewLensCoverage::default(),
-                    vec![(
-                        ReviewLensEvidenceKind::ModelReview,
-                        "active retry selection reviewed".to_string(),
-                    )],
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+                    resolved_reasoning_effort: Some(&resolved_effort.resolved),
+                    request: &request,
+                    required_coverage: &required_coverage,
+                },
+                lens_index,
+            )?;
+            let command = bind_active_review_lens_command(
+                launch_fixture_command(),
+                lens,
+                None,
+                active_policy
+                    .launch_runtime(AgentRole::Auditor)
+                    .context("active auditor runtime override")?,
+                &catalog,
+            )?;
+            assert!(rendered
+                .prompt
+                .contains(&format!("- Model: {}", lens.backend.model())));
+            assert!(rendered
+                .prompt
+                .contains(&format!("- Reasoning effort: {}", resolved_effort.resolved)));
+            assert_eq!(request.backend_id, lens.backend.backend_id());
+            assert_eq!(request.model, lens.backend.model());
+            assert_eq!(
+                command.model_provider.as_deref(),
+                Some(lens.backend.backend_id())
+            );
+            assert_eq!(command.model.as_deref(), Some(lens.backend.model()));
+            assert_eq!(
+                command.reasoning_effort.as_deref(),
+                Some(resolved_effort.resolved.as_str())
+            );
+            usage_samples.push(RoleUsageSample {
+                role: AgentRole::Auditor,
+                lens_id: Some(lens.id.clone()),
+                model: command.model.clone(),
+                usage: Usage {
+                    input_tokens: (lens_index + 1) * 10,
+                    output_tokens: lens_index + 1,
+                    total_tokens: (lens_index + 1) * 11,
+                },
+            });
+            verdicts.push(ReviewLensVerdict::for_lens(
+                lens,
+                request.request_binding.clone(),
+                ReviewLensVerdictStatus::Accept,
+                ReviewLensCoverage {
+                    worker_ids: required_coverage.worker_ids.clone(),
+                    paths: required_coverage.paths.clone(),
+                },
+                vec![(
+                    ReviewLensEvidenceKind::ModelReview,
+                    format!("active heterogeneous lens {lens_index} reviewed"),
+                )],
+            )?);
+            requests.push(request);
+        }
 
         let aggregate = aggregate_active_parent_review_lenses(
             &active_plan,
             &requests,
-            ReviewCoverageRequirement::default(),
-            verdicts.clone(),
+            required_coverage,
+            verdicts,
         )?;
         assert_eq!(aggregate.decision, ReviewAggregationDecision::Accept);
         assert_eq!(aggregate.policy, active_plan.review_aggregation_policy);
-
-        let error = aggregate_review_lenses_against_requests(
-            &plan.review_lenses,
-            &requests,
-            plan.review_aggregation_policy,
-            ReviewCoverageRequirement::default(),
-            verdicts,
-        )
-        .expect_err("the original lens set must reject active-selection requests");
-        assert!(error
-            .to_string()
-            .contains("does not match its parent configuration"));
+        assert_eq!(aggregate.lens_verdicts.len(), 2);
+        assert_eq!(
+            aggregate.lens_verdicts[0].lens.model,
+            "selected-auditor-model"
+        );
+        assert_eq!(
+            aggregate.lens_verdicts[1].lens.model,
+            "custom-auditor-model"
+        );
+        let usage = role_usage_report(&active_plan, usage_samples)?;
+        for lens in &active_plan.review_lenses {
+            let report = usage
+                .lens_reports
+                .iter()
+                .find(|report| report.lens_id == lens.id)
+                .with_context(|| format!("final usage for lens '{}'", lens.id))?;
+            assert_eq!(report.backend_id, lens.backend.backend_id());
+            assert_eq!(report.model, lens.backend.model());
+            assert_eq!(report.observation, RoleUsageObservation::ProcessObserved);
+        }
         Ok(())
     }
 

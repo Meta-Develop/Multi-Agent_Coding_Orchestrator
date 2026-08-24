@@ -2466,10 +2466,14 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
         RoleUsageObservation::NotProcessObservable
     );
     assert!(by_role[&AgentRole::Worker].usage.is_none());
-    assert!(by_role[&AgentRole::Worker]
+    let worker_unavailable_reason = by_role[&AgentRole::Worker]
         .unavailable_reason
         .as_deref()
-        .is_some_and(|reason| reason.contains("runtime-side role-tagged usage reporting")));
+        .expect("worker usage unavailability reason");
+    assert!(worker_unavailable_reason.contains("runtime-side role-tagged usage reporting"));
+    assert!(worker_unavailable_reason.contains("separately observe a worker process"));
+    assert!(worker_unavailable_reason.contains("runtime identity"));
+    assert!(!worker_unavailable_reason.contains("child Codex sessions"));
     assert_eq!(
         by_role[&AgentRole::GateClassifier].observation,
         RoleUsageObservation::NotProcessObservable
