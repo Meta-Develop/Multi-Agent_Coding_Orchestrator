@@ -82,7 +82,10 @@ fn denial_fixture(
     SandboxDenialEvidence {
         boundary,
         policy_id: policy_id.to_string(),
-        operation: SandboxDeniedOperation::Write,
+        operation: match boundary {
+            SandboxDenialBoundary::OuterSystemd => SandboxDeniedOperation::EstablishBoundary,
+            SandboxDenialBoundary::InnerCodex => SandboxDeniedOperation::Write,
+        },
         path: path.map(PathBuf::from),
         retryability,
     }
