@@ -2001,7 +2001,7 @@ mod tests {
             (
                 GateDenialReason::Sandbox {
                     evidence: sandbox_evidence(
-                        SandboxDenialRetryability::RequiresDeclaredException,
+                        SandboxDenialRetryability::NotRetryable,
                         Some(".git"),
                     ),
                 },
