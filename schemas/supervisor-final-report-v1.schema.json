@@ -853,6 +853,7 @@
                   "plan_role_models",
                   "operator_override",
                   "budget_degrade",
+                  "low_difficulty_mechanical",
                   "retry",
                   "legacy_fake",
                   "legacy_nonpublishable_simulation"
@@ -3321,6 +3322,22 @@
               "type": "boolean"
             }
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "role"
+          ],
+          "properties": {
+            "kind": {
+              "const": "role_binding_applied"
+            },
+            "role": {
+              "const": "worker"
+            }
+          }
         }
       ]
     },
@@ -3330,6 +3347,7 @@
       "required": [
         "sequence",
         "assignment_id",
+        "trigger",
         "budget_action",
         "budget_reasons",
         "change",
@@ -3346,6 +3364,13 @@
         "assignment_id": {
           "type": "string",
           "minLength": 1
+        },
+        "trigger": {
+          "type": "string",
+          "enum": [
+            "budget_pressure",
+            "low_difficulty_mechanical"
+          ]
         },
         "budget_action": {
           "type": "string",
@@ -3364,6 +3389,64 @@
         },
         "change": {
           "$ref": "#/$defs/budgetDegradationChange"
+        },
+        "role_binding_transition": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "role",
+            "before",
+            "after"
+          ],
+          "properties": {
+            "role": {
+              "const": "worker"
+            },
+            "before": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "model",
+                "reasoning_effort"
+              ],
+              "properties": {
+                "model": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "reasoning_effort": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "after": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "model",
+                "reasoning_effort"
+              ],
+              "properties": {
+                "model": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "reasoning_effort": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
         },
         "effective_child_model": {
           "type": [

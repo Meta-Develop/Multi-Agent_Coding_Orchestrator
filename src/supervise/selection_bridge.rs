@@ -1309,6 +1309,41 @@ pub(super) fn build_assignment_selection_ledger(
         .collect()
 }
 
+pub(super) fn apply_budget_degradations_to_selection_ledger(
+    entries: &mut [AssignmentSelectionLedgerEntry],
+    records: &[BudgetDegradationRecord],
+) {
+    for record in records {
+        let Some(transition) = record.role_binding_transition.as_ref() else {
+            continue;
+        };
+        let Some(entry) = entries.iter_mut().find(|entry| {
+            entry.assignment_id == record.assignment_id && entry.role == transition.role
+        }) else {
+            continue;
+        };
+        if entry.selection_source == AssignmentSelectionSource::Retry {
+            continue;
+        }
+        entry.selection_source = match record.trigger {
+            BudgetDegradationTrigger::BudgetPressure => AssignmentSelectionSource::BudgetDegrade,
+            BudgetDegradationTrigger::LowDifficultyMechanical => {
+                AssignmentSelectionSource::LowDifficultyMechanical
+            }
+        };
+        entry.selected_model = transition.after.model.clone();
+        entry.selected_reasoning_effort = transition.after.reasoning_effort.clone();
+        entry.catalog_source = AssignmentCatalogSource::RuntimeAdvertised;
+        entry.catalog_snapshot_digest = None;
+        entry.catalog_revisions.clear();
+        entry.rejected_candidates.clear();
+        entry.evidence_gap = Some(
+            "the budget-degradation record is authoritative for the final Worker binding; selector candidate provenance described the superseded binding and was discarded, and the degradation decision retained no catalog snapshot digest or revisions"
+                .to_string(),
+        );
+    }
+}
+
 pub(super) fn write_selection_ledger_from_report(
     writer: &mut crate::artifacts::ArtifactRunWriter,
     report: &SupervisorFinalReport,
@@ -1780,6 +1815,44 @@ mod tests {
         }
     }
 
+    fn mechanical_degradation_record(assignment_id: &str) -> BudgetDegradationRecord {
+        mechanical_degradation_record_to(assignment_id, ECONOMY_PROFILE_MODEL)
+    }
+
+    fn mechanical_degradation_record_to(
+        assignment_id: &str,
+        after_model: &str,
+    ) -> BudgetDegradationRecord {
+        BudgetDegradationRecord {
+            sequence: 1,
+            assignment_id: assignment_id.to_string(),
+            trigger: BudgetDegradationTrigger::LowDifficultyMechanical,
+            budget_action: BudgetAction::Continue,
+            budget_reasons: Vec::new(),
+            change: BudgetDegradationChange::ModelTier {
+                role: AgentRole::Worker,
+                before: FRONTIER_PROFILE_MODEL.to_string(),
+                after: after_model.to_string(),
+                resolved_candidate_index: 0,
+            },
+            role_binding_transition: Some(BudgetDegradationRoleBindingTransition {
+                role: AgentRole::Worker,
+                before: BudgetDegradationRoleBinding {
+                    model: Some(FRONTIER_PROFILE_MODEL.to_string()),
+                    reasoning_effort: Some("xhigh".to_string()),
+                },
+                after: BudgetDegradationRoleBinding {
+                    model: Some(after_model.to_string()),
+                    reasoning_effort: Some("xhigh".to_string()),
+                },
+            }),
+            effective_child_model: Some(FRONTIER_PROFILE_MODEL.to_string()),
+            effective_child_reasoning_effort: Some("xhigh".to_string()),
+            effective_fan_out: 1,
+            observation: BudgetDegradationObservation::AdmissionPolicyResolved,
+        }
+    }
+
     #[test]
     fn assignment_selection_ledger_projects_role_decisions_onto_each_assignment() -> Result<()> {
         let catalog = codex_catalog()?;
@@ -1899,6 +1972,157 @@ mod tests {
             worker.catalog_source,
             AssignmentCatalogSource::RuntimeAdvertised
         );
+        Ok(())
+    }
+
+    #[test]
+    fn assignment_selection_ledger_records_typed_mechanical_degradation_evidence() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        plan.assignments = vec![child_assignment("assignment-a")];
+        plan.assignments[0].worker_assignments = vec![WorkerAssignment {
+            id: "worker-a".to_string(),
+            role: AgentRole::Worker,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            environment_requirements: Vec::new(),
+            report_path: None,
+        }];
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+        )?;
+        let mut ledger = build_assignment_selection_ledger(
+            &plan,
+            &resolution.decisions,
+            SupervisorRuntime::Codex,
+        );
+        let child_before = ledger
+            .iter()
+            .find(|entry| {
+                entry.assignment_id == "assignment-a" && entry.role == AgentRole::ChildOrchestrator
+            })
+            .context("ChildOrchestrator ledger row")?
+            .clone();
+        let worker_before = ledger
+            .iter()
+            .find(|entry| entry.assignment_id == "assignment-a" && entry.role == AgentRole::Worker)
+            .context("initial Worker ledger row")?
+            .clone();
+        let budget_target = worker_before
+            .rejected_candidates
+            .iter()
+            .find(|candidate| candidate.model != "unselected-alternate")
+            .map(|candidate| candidate.model.clone())
+            .context("selector-rejected model for budget target")?;
+        assert!(worker_before.catalog_snapshot_digest.is_some());
+        assert!(!worker_before.catalog_revisions.is_empty());
+        let records = vec![mechanical_degradation_record_to(
+            "assignment-a",
+            &budget_target,
+        )];
+
+        apply_budget_degradations_to_selection_ledger(&mut ledger, &records);
+
+        let worker = ledger
+            .iter()
+            .find(|entry| entry.assignment_id == "assignment-a" && entry.role == AgentRole::Worker)
+            .context("Worker ledger row")?;
+        assert_eq!(
+            worker.selection_source,
+            AssignmentSelectionSource::LowDifficultyMechanical
+        );
+        assert_eq!(worker.assignment_id, worker_before.assignment_id);
+        assert_eq!(worker.attempt, worker_before.attempt);
+        assert_eq!(worker.role, worker_before.role);
+        assert_eq!(worker.role_assignment, worker_before.role_assignment);
+        assert_eq!(worker.selected_runtime, worker_before.selected_runtime);
+        assert_eq!(
+            worker.selected_model.as_deref(),
+            Some(budget_target.as_str())
+        );
+        assert_eq!(worker.selected_reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            worker.catalog_source,
+            AssignmentCatalogSource::RuntimeAdvertised
+        );
+        assert!(worker.catalog_snapshot_digest.is_none());
+        assert!(worker.catalog_revisions.is_empty());
+        assert!(!worker
+            .rejected_candidates
+            .iter()
+            .any(|candidate| candidate.model == budget_target));
+        assert!(worker.rejected_candidates.is_empty());
+        assert!(worker.evidence_gap.as_ref().is_some_and(|gap| gap.contains(
+            "selector candidate provenance described the superseded binding and was discarded"
+        )));
+        let child_after = ledger
+            .iter()
+            .find(|entry| {
+                entry.assignment_id == "assignment-a" && entry.role == AgentRole::ChildOrchestrator
+            })
+            .context("ChildOrchestrator ledger row after overlay")?;
+        assert_eq!(child_after, &child_before);
+        Ok(())
+    }
+
+    #[test]
+    fn assignment_selection_ledger_preserves_later_worker_retry_provenance() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        plan.assignments = vec![child_assignment("assignment-a")];
+        plan.assignments[0].worker_assignments = vec![WorkerAssignment {
+            id: "worker-a".to_string(),
+            role: AgentRole::Worker,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            environment_requirements: Vec::new(),
+            report_path: None,
+        }];
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+        )?;
+        let mut decisions = resolution.decisions;
+        let mut retry = decisions
+            .iter()
+            .find(|event| event.role == AgentRole::Worker)
+            .context("initial Worker selector event")?
+            .clone();
+        retry.assignment_id = Some("assignment-a".to_string());
+        retry.attempt = 2;
+        retry.primary_cause = SupervisorSelectionEventCause::Retry;
+        decisions.push(retry);
+        let mut ledger =
+            build_assignment_selection_ledger(&plan, &decisions, SupervisorRuntime::Codex);
+        let before = ledger
+            .iter()
+            .find(|entry| entry.assignment_id == "assignment-a" && entry.role == AgentRole::Worker)
+            .context("retry Worker ledger row")?
+            .clone();
+        assert_eq!(before.selection_source, AssignmentSelectionSource::Retry);
+        assert_eq!(before.attempt, 2);
+
+        apply_budget_degradations_to_selection_ledger(
+            &mut ledger,
+            &[mechanical_degradation_record("assignment-a")],
+        );
+
+        let after = ledger
+            .iter()
+            .find(|entry| entry.assignment_id == "assignment-a" && entry.role == AgentRole::Worker)
+            .context("Worker ledger row after degradation overlay")?;
+        assert_eq!(after, &before);
         Ok(())
     }
 

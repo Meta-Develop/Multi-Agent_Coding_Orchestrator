@@ -418,6 +418,7 @@ fn typed_decomposition_prompt_report_and_final_evidence_remain_gated() {
     let metadata = WorkerAssignmentMetadata {
         kind: AssignmentKind::MegafileDecomposition,
         target_path: Some(PathBuf::from("README.md")),
+        mechanical_duty: None,
     };
     let assignment_metadata: AssignmentMetadata =
         BTreeMap::from([((assignment.id.clone(), worker.id.clone()), metadata.clone())]).into();
@@ -552,6 +553,7 @@ fn typed_decomposition_rejects_missing_target_replacements_and_ordinary_pseudo_e
     let metadata = WorkerAssignmentMetadata {
         kind: AssignmentKind::MegafileDecomposition,
         target_path: Some(PathBuf::from("README.md")),
+        mechanical_duty: None,
     };
     let assignment_metadata: AssignmentMetadata =
         BTreeMap::from([((assignment.id.clone(), worker.id.clone()), metadata)]).into();
@@ -749,6 +751,7 @@ fn supervisor_injects_binding_from_stable_candidate_and_detects_later_bytes() {
     let metadata = WorkerAssignmentMetadata {
         kind: AssignmentKind::MegafileDecomposition,
         target_path: Some(PathBuf::from("README.md")),
+        mechanical_duty: None,
     };
     let assignment_metadata: AssignmentMetadata = BTreeMap::from([(
         (

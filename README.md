@@ -1315,9 +1315,9 @@ gate and review-auditor hard floors remain enforced.
 Each default role selection retains the ordered-catalog data shape and typed
 resolution observations. Its ordinary availability `models` list is empty, so
 the default path never silently substitutes a cheaper slug. The separately
-named `budget_degrade_models` list remains available only to the Issue #78
-budget-pressure ladder. MACO consults the authenticated runtime catalog once;
-when `gpt-5.6-sol` is present, every default role resolves to it.
+named `budget_degrade_models` list remains available only to the typed
+mechanical-Worker degradation ladder. MACO consults the authenticated runtime
+catalog once; when `gpt-5.6-sol` is present, every default role resolves to it.
 
 The chain is ordinary plan/profile data and round-trips without a code-shape
 change:
@@ -1351,30 +1351,45 @@ authored request.
 
 The availability fallback order and the economics downgrade order are distinct
 data. `models` answers which advertised model may substitute when the primary
-is absent. `budget_degrade_models` is a monotone cheaper-tier list consulted
-only after a run crosses a soft budget ceiling; an arbitrary plan fallback is
-never assumed to be cheaper.
+is absent. `budget_degrade_models` is a monotone cheaper-tier list consulted for
+an explicitly mechanical Worker assignment after a run crosses a soft budget
+ceiling or when the scheduler observes the low-difficulty mechanical trigger;
+an arbitrary plan fallback is never assumed to be cheaper.
 
 ### Budget-pressure degradation
 
-The scheduler consumes `BudgetAction::Degrade` before admitting new work. On
-successive admissions while a soft token or cost ceiling remains reached it
-lowers the assignment-resolved child-orchestrator reasoning effort, selects the first
-runtime-advertised entry from that role's `budget_degrade_models`, and halves
-the remaining fan-out bound (never below one). A hard ceiling still halts new
-dispatch and drains already-started assignments. Concurrent admission waits
-until each newly spawned assignment has either committed its child budget
-reservation or completed without one, so the next policy decision cannot race
-past an invisible reservation.
+The scheduler consumes `BudgetAction::Degrade` before admitting new work, but
+never lowers a child-orchestrator, gate, or auditor judgment binding. Worker
+degradation is available only when every Worker in that assignment declares a
+typed `mechanical_duty`. The scheduler first selects a distinct,
+runtime-advertised, authority-eligible model from the requested plan's Worker
+`budget_degrade_models`, then lowers Worker effort on the next applicable rung,
+and only then halves the remaining fan-out bound (never below one). If the
+Worker ladder has no eligible target, the model rung refuses explicitly and
+does not advance to fan-out. A hard ceiling still halts new dispatch and drains
+already-started assignments. Concurrent admission waits until each newly
+spawned assignment has either committed its child budget reservation or
+completed without one, so the next policy decision cannot race past an
+invisible reservation.
+
+`mechanical_duty` accepts `apply_explicit_text_replacement`,
+`run_preselected_command`, `format_preselected_files`,
+`enumerate_declared_artifacts`, or `validate_against_fixed_schema`. Omission is
+fail-closed for Worker model and effort degradation; mixed marked/unmarked
+Worker assignments retain their ordinary role bindings.
 
 Every applied rung is retained in
 `role_economics_profile.execution.budget_degradations` with the assignment ID,
-budget reasons, typed before/after change, and the full effective child model,
-effort, and fan-out. `observation=admission_policy_resolved` deliberately says
-that this is scheduler admission evidence; `commands_run` remains the process
-evidence for a dispatch that actually started. When assignments use different
-bindings, the aggregate child role binding is marked `assignment_specific`
-instead of claiming one model or effort for the whole run.
+typed trigger (`budget_pressure` or `low_difficulty_mechanical`), budget reasons,
+the Worker binding before and after the change, and the full effective child
+model, effort, and fan-out. The assignment selection ledger projects the
+resulting Worker model and effort without rewriting judgment-role rows.
+`observation=admission_policy_resolved` deliberately says that this is
+scheduler admission evidence; `commands_run` remains the process evidence for
+a dispatch that actually started. When assignments use different mechanical
+Worker bindings, the aggregate Worker role binding is marked
+`assignment_specific` instead of claiming one model or effort for the whole
+run.
 
 ### CLI run ceilings
 
