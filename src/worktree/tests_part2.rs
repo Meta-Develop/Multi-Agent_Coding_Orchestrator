@@ -1150,6 +1150,63 @@
         .expect_err("zero time budget must fail before unbounded traversal");
     }
 
+    #[test]
+    fn bounded_status_accepts_reuc_without_hiding_dirtiness_or_mutating_the_index() {
+        skip_without_containment!();
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+
+        let readme_blob = repo
+            .index()
+            .expect("open index")
+            .get_path(Path::new("README.md"), 0)
+            .expect("README index entry")
+            .id;
+        let mut resolve_undo = b"README.md\x00100644\x000\x000\x00".to_vec();
+        resolve_undo.extend_from_slice(readme_blob.as_bytes());
+        let index_path = repo.path().join("index");
+        let original = fs::read(&index_path).expect("read ordinary index");
+        let index_with_reuc = append_bounded_index_extension(&original, b"REUC", &resolve_undo);
+        fs::write(&index_path, &index_with_reuc).expect("write faithful REUC index");
+
+        assert!(
+            bounded_worktree_is_clean(
+                &repo_path,
+                MAX_WORKTREE_STATUS_ENTRIES,
+                MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+                WORKTREE_STATUS_TIMEOUT,
+            )
+            .expect("clean bounded status with REUC"),
+            "resolve-undo metadata must not make an otherwise clean repository dirty"
+        );
+        assert_eq!(
+            fs::read(&index_path).expect("read source index after clean status"),
+            index_with_reuc,
+            "bounded status mutated the source REUC index"
+        );
+
+        fs::write(repo_path.join("README.md"), "tracked drift\n")
+            .expect("change tracked contents");
+        assert!(
+            !bounded_worktree_is_clean(
+                &repo_path,
+                MAX_WORKTREE_STATUS_ENTRIES,
+                MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+                WORKTREE_STATUS_TIMEOUT,
+            )
+            .expect("dirty bounded status with REUC"),
+            "resolve-undo metadata must not hide tracked worktree dirtiness"
+        );
+        assert_eq!(
+            fs::read(&index_path).expect("read source index after dirty status"),
+            index_with_reuc,
+            "bounded status mutated the source REUC index"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn bounded_status_honors_only_canonical_local_core_filemode() {
