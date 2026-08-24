@@ -423,6 +423,20 @@ impl AssignmentBudgetPolicy {
                 }
             }
         }
+        for lens in &mut effective.review_lenses {
+            if let ReviewLensBackendConfig::Model {
+                reasoning_effort, ..
+            } = &mut lens.backend
+            {
+                let resolved = resolve_reasoning_effort(
+                    AgentRole::Auditor,
+                    self.assignment_reasoning_effort,
+                    reasoning_effort.as_deref(),
+                    0,
+                );
+                *reasoning_effort = Some(resolved.resolved);
+            }
+        }
         effective
     }
 
@@ -500,6 +514,14 @@ impl AssignmentBudgetPolicy {
     ) {
         self.selector_overrides.insert(role, selection);
         self.selector_runtime_overrides.insert(role, runtime);
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_assignment_reasoning_effort_for_test(
+        &mut self,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) {
+        self.assignment_reasoning_effort = reasoning_effort;
     }
 }
 
@@ -907,7 +929,7 @@ impl BudgetDegradationController {
                 0,
                 ProcessObservation::NotProcessObservable,
                 Some(
-                    "admission-only nested-worker effort binding; retry-time active effort is recorded in selection_decisions and prompt evidence, and no separate worker process is launched"
+                    "admission-only nested-worker effort binding; retry-time active effort is recorded in selection_decisions and prompt evidence, and MACO does not separately observe a worker process or runtime identity"
                         .to_string(),
                 ),
             );
@@ -930,10 +952,6 @@ impl BudgetDegradationController {
                     .to_string(),
             ),
         );
-        let auditor_fallback =
-            configured_role_model_selection(plan, AgentRole::Auditor).reasoning_effort;
-        let active_auditor_effort =
-            configured_role_model_selection(&effective_plan, AgentRole::Auditor).reasoning_effort;
         for (lens_index, lens) in effective_plan.review_lenses.iter().enumerate() {
             let requested = requested_reasoning_effort.or_else(|| {
                 lens.backend
@@ -944,8 +962,8 @@ impl BudgetDegradationController {
                 review_lens_auditor_id(assignment, lens_index),
                 AgentRole::Auditor,
                 requested,
-                auditor_fallback.as_deref(),
-                active_auditor_effort.as_deref(),
+                lens.backend.reasoning_effort(),
+                None,
                 0,
                 ProcessObservation::NotRetained,
                 Some(
@@ -3730,7 +3748,17 @@ mod selection_policy_tests {
             AgentRole::Auditor,
             role_selection(&initial_auditor_model, &initial_auditor_effort),
         );
+        plan.review_lenses.push(ReviewLensConfig {
+            id: "active-effort-custom-lens".to_string(),
+            backend: ReviewLensBackendConfig::Model {
+                backend_id: "custom-provider".to_string(),
+                model: "custom-auditor".to_string(),
+                reasoning_effort: Some("ultra".to_string()),
+            },
+            information_scope: ReviewInformationScope::OutputReportOnly,
+        });
         let mut policy = AssignmentBudgetPolicy::default();
+        policy.set_assignment_reasoning_effort_for_test(Some(ReasoningEffort::Low));
         policy.set_selector_binding_for_test(
             AgentRole::Worker,
             SupervisorRuntime::Codex,
@@ -3754,9 +3782,19 @@ mod selection_policy_tests {
                 .as_deref(),
             Some("ultra")
         );
+        assert_eq!(active_plan.review_lenses.len(), 2);
+        assert!(active_plan
+            .review_lenses
+            .iter()
+            .all(|lens| { lens.backend.reasoning_effort() == Some("xhigh") }));
 
         let mut controller = BudgetDegradationController::new(1);
-        controller.record_assignment_effort_bindings(&assignment, None, &plan, &policy);
+        controller.record_assignment_effort_bindings(
+            &assignment,
+            Some(ReasoningEffort::Low),
+            &plan,
+            &policy,
+        );
         let worker = controller
             .assignment_effort_bindings
             .iter()
@@ -3771,20 +3809,32 @@ mod selection_policy_tests {
             .unavailable_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("admission-only")));
-        let auditor = controller
+        let auditors = controller
             .assignment_effort_bindings
             .iter()
-            .find(|binding| binding.role == AgentRole::Auditor)
-            .expect("review-auditor admission binding");
-        assert_eq!(auditor.resolved_reasoning_effort, "ultra");
-        assert_eq!(
-            auditor.resolution_observation,
-            EffortResolutionObservation::AssignmentOverride
-        );
-        assert!(auditor
-            .unavailable_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("retry-time active effort")));
+            .filter(|binding| binding.role == AgentRole::Auditor)
+            .collect::<Vec<_>>();
+        assert_eq!(auditors.len(), 2);
+        for (lens_index, auditor) in auditors.into_iter().enumerate() {
+            assert_eq!(
+                auditor.duty_id,
+                review_lens_auditor_id(&assignment, lens_index)
+            );
+            assert_eq!(
+                auditor.requested_reasoning_effort,
+                Some(ReasoningEffort::Low)
+            );
+            assert_eq!(auditor.fallback_reasoning_effort, "xhigh");
+            assert_eq!(auditor.resolved_reasoning_effort, "xhigh");
+            assert_eq!(
+                auditor.resolution_observation,
+                EffortResolutionObservation::HardFloorClamped
+            );
+            assert!(auditor
+                .unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("retry-time active effort")));
+        }
     }
 
     #[test]
