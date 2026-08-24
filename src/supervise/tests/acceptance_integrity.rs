@@ -1424,6 +1424,7 @@ fn supervisor_required_optional_and_vector_paths_share_reversible_serialization(
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
             id: "child-a".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![path.clone()],

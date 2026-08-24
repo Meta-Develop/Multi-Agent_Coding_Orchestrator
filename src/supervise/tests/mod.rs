@@ -98,6 +98,7 @@ fn bounded_loader_plan_json() -> Vec<u8> {
         "child_timeout_seconds": 60,
         "assignments": [{
             "id": "child-a",
+            "phase": "execution",
             "assigned_paths": ["README.md"],
             "worker_assignments": []
         }]
@@ -324,6 +325,7 @@ fn run_injected_git(repo: &Path, args: &[&str]) {
 fn injected_assignment(with_worker: bool) -> OrchestratorAssignment {
     OrchestratorAssignment {
         id: "child-a".to_string(),
+        phase: AssignmentPhase::Execution,
         runtime: None,
         role: AgentRole::ChildOrchestrator,
         assigned_paths: vec![PathBuf::from("README.md")],
@@ -352,6 +354,7 @@ fn injected_assignment(with_worker: bool) -> OrchestratorAssignment {
 fn injected_named_assignment(id: &str, path: &str) -> OrchestratorAssignment {
     OrchestratorAssignment {
         id: id.to_string(),
+        phase: AssignmentPhase::Execution,
         runtime: None,
         role: AgentRole::ChildOrchestrator,
         assigned_paths: vec![PathBuf::from(path)],

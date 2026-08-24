@@ -8,6 +8,8 @@
 
 #![allow(dead_code)]
 
+#[cfg(test)]
+use crate::supervise::AssignmentPhase;
 use crate::{
     artifacts::state_auth::{sha256_hex, AuthenticationDomain, RepositoryAuthenticator},
     external_agent::EnvironmentFailure,
@@ -1862,6 +1864,7 @@ mod tests {
         };
         let assignments = vec![OrchestratorAssignment {
             id: assignment_id.clone(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![std::path::PathBuf::from(format!("src/{suffix}.rs"))],
@@ -1958,6 +1961,7 @@ mod tests {
             review_aggregation_policy: template.review_aggregation_policy,
             assignments: vec![OrchestratorAssignment {
                 id: "child-a".to_string(),
+                phase: AssignmentPhase::Execution,
                 runtime: None,
                 role: AgentRole::ChildOrchestrator,
                 assigned_paths: vec![std::path::PathBuf::from("src/breaking.rs")],

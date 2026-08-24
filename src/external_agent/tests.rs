@@ -1363,6 +1363,118 @@ fn managed_git_metadata_is_own_gitdir_write_and_common_components_read_in_both_l
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn planning_and_execution_profiles_reach_actual_inner_argv_and_outer_systemd_properties(
+) -> Result<()> {
+    fn property_paths(arguments: &[String], name: &str) -> Vec<PathBuf> {
+        let prefix = format!("--property={name}");
+        let mut paths = arguments
+            .iter()
+            .filter_map(|argument| argument.strip_prefix(&prefix))
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, common, child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    let incoming = temp.path().join("final-message-staging");
+    fs::create_dir(&incoming)?;
+    let canonical_incoming = fs::canonicalize(&incoming)?;
+    let program = child.join("fixture-codex");
+
+    for (phase, access, expected_git_access) in [
+        (
+            crate::supervise::AssignmentPhase::Planning,
+            WorkspaceAccess::ReadOnly,
+            "read",
+        ),
+        (
+            crate::supervise::AssignmentPhase::Execution,
+            WorkspaceAccess::ReadWrite,
+            "write",
+        ),
+    ] {
+        let command = crate::supervise::configure_assignment_phase_command_for_test(
+            managed_git_command(&child, &incoming),
+            phase,
+            &[PathBuf::from("RELEASE_NOTES.md")],
+        )?;
+        assert_eq!(command.workspace_access, access);
+        let controls = protected_worktree_controls(&command)?;
+        let profile = external_side_effect_profile(
+            &command,
+            &program,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &controls,
+        )?;
+        let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+            bail!("expected ExternalCodex profile");
+        };
+        assert_eq!(profile.workspace_access(), access);
+        assert_eq!(
+            profile.writable_artifact_roots(),
+            std::slice::from_ref(&canonical_incoming)
+        );
+
+        let argv = command_argv(&command)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(argv
+            .iter()
+            .any(|argument| argument == "default_permissions=\"maco_external_codex\""));
+        assert!(argv.iter().any(|argument| {
+            argument == "permissions.maco_external_codex.network={enabled=false}"
+        }));
+        let filesystem = argv
+            .iter()
+            .find(|argument| argument.starts_with("permissions.maco_external_codex.filesystem="))
+            .context("actual Codex argv filesystem profile")?;
+        assert_eq!(
+            filesystem.contains("\":workspace_roots\"={\".\"=\"write\"}"),
+            access == WorkspaceAccess::ReadWrite
+        );
+        assert!(filesystem.contains(&format!(
+            "{}=\"{expected_git_access}\"",
+            toml_basic_string(child_git_dir.to_str().context("UTF-8 child gitdir")?)
+        )));
+        assert!(filesystem.contains(&format!(
+            "{}=\"write\"",
+            toml_basic_string(canonical_incoming.to_str().context("UTF-8 staging root")?)
+        )));
+
+        let properties = crate::process_runner::external_codex_systemd_properties_for_test(
+            profile, &program, &child,
+        )?;
+        let bind_read_only = property_paths(&properties, "BindReadOnlyPaths=");
+        let read_only = property_paths(&properties, "ReadOnlyPaths=");
+        let bind_writable = property_paths(&properties, "BindPaths=");
+        let writable = property_paths(&properties, "ReadWritePaths=");
+        assert_eq!(bind_read_only, read_only);
+        assert_eq!(bind_writable, writable);
+        assert!(bind_read_only.contains(&fs::canonicalize(common.join("objects"))?));
+        if access == WorkspaceAccess::ReadOnly {
+            assert!(bind_read_only.contains(&child));
+            assert!(bind_read_only.contains(&child_git_dir));
+            assert_eq!(bind_writable, vec![canonical_incoming.clone()]);
+        } else {
+            assert!(!bind_read_only.contains(&child));
+            assert!(!bind_read_only.contains(&child_git_dir));
+            let mut expected_writable = vec![
+                child.clone(),
+                child_git_dir.clone(),
+                canonical_incoming.clone(),
+            ];
+            expected_writable.sort();
+            assert_eq!(bind_writable, expected_writable);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn managed_git_hooks_path_and_unsafe_commit_hooks_fail_closed() -> Result<()> {

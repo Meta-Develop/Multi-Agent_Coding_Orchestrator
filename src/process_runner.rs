@@ -1124,6 +1124,11 @@ impl ExternalCodexProfile {
     }
 
     #[cfg(test)]
+    pub(crate) fn workspace_access(&self) -> WorkspaceAccess {
+        self.config.workspace_access
+    }
+
+    #[cfg(test)]
     pub(crate) fn visible_read_only_roots(&self) -> &[PathBuf] {
         &self.config.visible_read_only_roots
     }
@@ -3518,6 +3523,31 @@ impl PreparedTee {
 
 include!("process_runner/part2.rs");
 include!("process_runner/part3.rs");
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn external_codex_systemd_properties_for_test(
+    profile: ExternalCodexProfile,
+    program: &Path,
+    current_dir: &Path,
+) -> io::Result<Vec<String>> {
+    let spec = ProcessSpec::direct(
+        "external Codex systemd profile projection",
+        program,
+        std::iter::empty::<OsString>(),
+        current_dir,
+        8 * 1024,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile));
+    let sandbox = resolve_systemd_sandbox(&spec)?.ok_or_else(|| {
+        io::Error::other("external Codex test profile did not resolve a systemd sandbox")
+    })?;
+    let mut command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(&mut command, &sandbox);
+    Ok(command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect())
+}
 
 #[cfg(test)]
 mod tests;

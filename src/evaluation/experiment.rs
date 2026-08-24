@@ -20,9 +20,9 @@ use crate::{
     orchestrator::{RunId, SemanticCoordinationMode},
     review::ReviewAggregationPolicy,
     supervise::{
-        AgentRole, OrchestratorAssignment, RoleModelSelection, RoleUsageReport, RunBudgetLimits,
-        SupervisorAdmissionConfig, SupervisorFinalReport, SupervisorPlan, SupervisorRunOptions,
-        SupervisorRuntime, UnavailableModelFallback, WorkerAssignment,
+        AgentRole, AssignmentPhase, OrchestratorAssignment, RoleModelSelection, RoleUsageReport,
+        RunBudgetLimits, SupervisorAdmissionConfig, SupervisorFinalReport, SupervisorPlan,
+        SupervisorRunOptions, SupervisorRuntime, UnavailableModelFallback, WorkerAssignment,
     },
 };
 use git2::{IndexAddOption, Repository, Signature};
@@ -829,6 +829,7 @@ fn experiment_plan(manifest: &ExperimentManifest, profile: &EvaluationProfile) -
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
             id: "child-a".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("README.md")],

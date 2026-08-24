@@ -3689,6 +3689,7 @@ mod selection_policy_tests {
         let mut plan = test_plan();
         plan.assignments = vec![OrchestratorAssignment {
             id: "assignment-a".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("README.md")],
@@ -3736,6 +3737,7 @@ mod selection_policy_tests {
         let mut plan = test_plan();
         plan.assignments = vec![OrchestratorAssignment {
             id: "assignment-a".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("README.md")],
