@@ -2560,6 +2560,7 @@ Run an opt-in supervisor-of-orchestrators plan:
   "assignments": [
     {
       "id": "docs-child",
+      "phase": "execution",
       "assigned_paths": ["README.md"],
       "worker_assignments": [
         {
@@ -2570,6 +2571,7 @@ Run an opt-in supervisor-of-orchestrators plan:
     },
     {
       "id": "rust-child",
+      "phase": "execution",
       "assigned_paths": ["src/lib.rs"],
       "semantic_symbols": ["WorktreeManager"],
       "worker_assignments": [
@@ -2645,6 +2647,7 @@ scope and the operator separately passing `--allow-primary-worktree`:
   },
   "assignments": [{
     "id": "local-deploy",
+    "phase": "execution",
     "assigned_paths": ["local/deploy.txt"],
     "worker_assignments": []
   }]
