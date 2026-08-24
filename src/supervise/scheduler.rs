@@ -2349,6 +2349,10 @@ fn initialize_scheduler_evidence(
         initialization.artifact_writer,
         Path::new("schemas/orchestrator-review-report.schema.json"),
     )?;
+    write_codex_orchestrator_schema(
+        initialization.artifact_writer,
+        Path::new("schemas/orchestrator-review-report.codex-output.schema.json"),
+    )?;
     write_worker_schema(
         initialization.artifact_writer,
         Path::new("schemas/worker-report.schema.json"),
@@ -2356,6 +2360,10 @@ fn initialize_scheduler_evidence(
     write_auditor_schema(
         initialization.artifact_writer,
         Path::new("schemas/auditor-report.schema.json"),
+    )?;
+    write_codex_auditor_schema(
+        initialization.artifact_writer,
+        Path::new("schemas/auditor-report.codex-output.schema.json"),
     )?;
     write_supervisor_final_schema(
         initialization.artifact_writer,

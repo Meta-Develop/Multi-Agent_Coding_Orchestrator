@@ -810,7 +810,23 @@ fn injected_target_attempted(run: ExternalAgentRun) -> ExternalAgentRun {
 
 pub(crate) fn injected_verified_run(command: &ExternalAgentCommand) -> ExternalAgentRun {
     write_injected_worker_journals_from_report(command);
-    injected_verified_run_without_journals(command)
+    let mut run = injected_verified_run_without_journals(command);
+    let captures = command
+        .worker_journal_artifacts
+        .iter()
+        .map(|artifact| WorkerJournalArtifactCapture {
+            worker_id: artifact.worker_id.clone(),
+            path: artifact.path.clone(),
+            status: match fs::read(&artifact.path) {
+                Ok(bytes) => WorkerJournalArtifactCaptureStatus::Loaded(bytes),
+                Err(error) => WorkerJournalArtifactCaptureStatus::Invalid(format!(
+                    "injected trusted journal capture failed: {error}"
+                )),
+            },
+        })
+        .collect();
+    run.replace_worker_journal_artifacts(captures);
+    run
 }
 
 fn injected_verified_nonzero_run(

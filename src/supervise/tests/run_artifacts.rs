@@ -1,6 +1,42 @@
 use super::*;
 
 #[test]
+#[cfg(unix)]
+fn worker_journals_are_precreated_as_private_exact_files() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("artifact-precreated-worker-journal").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id,
+        "supervise-test",
+    )
+    .expect("reserve supervise artifact run");
+    let (incoming, capture) =
+        create_invocation_scratches(&mut writer).expect("reserve invocation scratches");
+    let assignment = injected_assignment(true);
+    let journals = precreate_worker_execution_journals(&assignment, &incoming)
+        .expect("precreate exact worker journals");
+    assert_eq!(journals.len(), assignment.worker_assignments.len());
+    let journal_parent = incoming.path().join("worker-journals");
+    let parent_metadata = fs::symlink_metadata(&journal_parent).expect("journal parent metadata");
+    assert!(parent_metadata.is_dir());
+    assert_eq!(parent_metadata.permissions().mode() & 0o777, 0o700);
+    for journal in &journals {
+        assert_eq!(journal.parent(), Some(journal_parent.as_path()));
+        let metadata = fs::symlink_metadata(journal).expect("journal metadata");
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.len(), 0);
+    }
+    discard_invocation_scratches(&mut writer, &incoming, &capture)
+        .expect("discard journal scratch fixture");
+}
+
+#[test]
 fn supervise_writer_discards_reusable_invocation_scratches_and_finalizes_private_evidence() {
     let (_temp, repo_path) = injected_repository();
     let run_id = RunId::new("artifact-scratch-finalized").expect("valid run id");
@@ -1248,10 +1284,15 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
     let mut launched = false;
     let mut runner = |command: &ExternalAgentCommand| {
         launched = true;
-        assert!(
-            command.output_schema.is_none(),
-            "external Codex child and auditor launches must rely on authoritative local report validation"
-        );
+        let output_schema = command
+            .output_schema
+            .as_ref()
+            .expect("external Codex launch must bind a compatible output schema");
+        assert!(output_schema
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.ends_with(".codex-output.schema.json")));
+        assert!(output_schema.is_file());
         if command.workspace_access == WorkspaceAccess::ReadWrite {
             assert!(
                 !command.hidden_roots.iter().any(|root| root == &repo_path),

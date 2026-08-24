@@ -180,35 +180,95 @@ pub(super) fn import_worker_execution_journals(
     writer: &mut ArtifactRunWriter,
     assignment: &OrchestratorAssignment,
     incoming_scratch: &ArtifactScratchDirectory,
+    external_run: &ExternalAgentRun,
 ) -> Result<WorkerExecutionJournalEvidenceSet> {
     let mut journals = WorkerExecutionJournalEvidenceSet::new();
+    let process_quiescent = external_run.scratch_quiescence_verified();
+    let mut capture_contract_error = None;
+    let mut seen_capture_ids = BTreeSet::new();
+    for capture in external_run.worker_journal_artifacts() {
+        let expected_path = assignment
+            .worker_assignments
+            .iter()
+            .find(|worker| worker.id == capture.worker_id)
+            .map(|worker| {
+                incoming_scratch
+                    .path()
+                    .join(worker_execution_journal_incoming_relative(worker))
+            });
+        if !seen_capture_ids.insert(capture.worker_id.clone()) {
+            capture_contract_error = Some(format!(
+                "trusted runner returned duplicate worker journal capture '{}'",
+                capture.worker_id
+            ));
+            break;
+        }
+        match expected_path {
+            Some(expected_path) if expected_path == capture.path => {}
+            Some(expected_path) => {
+                capture_contract_error = Some(format!(
+                    "trusted runner returned out-of-contract worker journal path {} for '{}'; expected {}",
+                    capture.path.display(),
+                    capture.worker_id,
+                    expected_path.display()
+                ));
+                break;
+            }
+            None => {
+                capture_contract_error = Some(format!(
+                    "trusted runner returned unexpected worker journal capture '{}' at {}",
+                    capture.worker_id,
+                    capture.path.display()
+                ));
+                break;
+            }
+        }
+    }
+    if let Some(error) = capture_contract_error {
+        bail!("trusted worker journal capture set violates the assignment contract: {error}");
+    }
     for worker in &assignment.worker_assignments {
         let incoming_relative_path = worker_execution_journal_incoming_relative(worker);
         let scratch_path = incoming_scratch.path().join(&incoming_relative_path);
         let evidence_relative_path =
             worker_execution_journal_evidence_relative(&assignment.id, &worker.id);
-        let status = match read_bounded_regular_file_nofollow(
-            &scratch_path,
-            MAX_WORKER_EXECUTION_JOURNAL_BYTES,
-        ) {
-            Ok(bytes) => {
-                writer.write_bytes(
-                    &evidence_relative_path,
-                    &bytes,
-                    ArtifactFileDisposition::PrivateEvidence,
-                )?;
-                match parse_worker_execution_journal(&bytes, &evidence_relative_path) {
-                    Ok(entries) => WorkerExecutionJournalStatus::Loaded(entries),
-                    Err(error) => WorkerExecutionJournalStatus::Invalid(error.to_string()),
+        let matching_capture = external_run
+            .worker_journal_artifacts()
+            .iter()
+            .find(|capture| capture.worker_id == worker.id);
+        let status = if !process_quiescent {
+            WorkerExecutionJournalStatus::Invalid(
+                "worker journal evidence was not imported because external process quiescence was not verified"
+                    .to_string(),
+            )
+        } else if let Some(capture) = matching_capture {
+            if capture.path != scratch_path {
+                WorkerExecutionJournalStatus::Invalid(format!(
+                    "trusted worker journal capture for '{}' had unexpected contract path {}; expected {}",
+                    worker.id,
+                    capture.path.display(),
+                    scratch_path.display()
+                ))
+            } else {
+                match &capture.status {
+                    WorkerJournalArtifactCaptureStatus::Loaded(bytes) => {
+                        writer.write_bytes(
+                            &evidence_relative_path,
+                            bytes,
+                            ArtifactFileDisposition::PrivateEvidence,
+                        )?;
+                        match parse_worker_execution_journal(bytes, &evidence_relative_path) {
+                            Ok(entries) => WorkerExecutionJournalStatus::Loaded(entries),
+                            Err(error) => WorkerExecutionJournalStatus::Invalid(error.to_string()),
+                        }
+                    }
+                    WorkerJournalArtifactCaptureStatus::Invalid(error) => {
+                        WorkerExecutionJournalStatus::Invalid(error.clone())
+                    }
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                WorkerExecutionJournalStatus::Missing
-            }
-            Err(error) => WorkerExecutionJournalStatus::Invalid(format!(
-                "failed to read incoming worker execution journal {}: {error}",
-                incoming_relative_path.display()
-            )),
+        } else {
+            WorkerExecutionJournalStatus::Missing
         };
         journals.insert(
             worker.id.clone(),
@@ -382,6 +442,87 @@ pub(super) fn create_named_invocation_scratches(
     }
 }
 
+pub(super) fn precreate_worker_execution_journals(
+    assignment: &OrchestratorAssignment,
+    incoming_scratch: &ArtifactScratchDirectory,
+) -> Result<Vec<PathBuf>> {
+    if assignment.worker_assignments.is_empty() {
+        return Ok(Vec::new());
+    }
+    let journal_root = incoming_scratch.path().join("worker-journals");
+    fs::create_dir(&journal_root).with_context(|| {
+        format!(
+            "failed to create private worker journal directory {}",
+            journal_root.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&journal_root, fs::Permissions::from_mode(0o700)).with_context(
+            || {
+                format!(
+                    "failed to restrict worker journal directory {}",
+                    journal_root.display()
+                )
+            },
+        )?;
+    }
+    let journal_root = fs::canonicalize(&journal_root)
+        .context("failed to resolve private worker journal directory")?;
+    if journal_root.parent() != Some(incoming_scratch.path()) {
+        bail!("worker journal directory escaped the incoming scratch root");
+    }
+    let mut paths = Vec::with_capacity(assignment.worker_assignments.len());
+    for worker in &assignment.worker_assignments {
+        let file_name = worker_execution_journal_file_name(&worker.id);
+        let path = journal_root.join(&file_name);
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(&path).with_context(|| {
+            format!(
+                "failed to precreate worker journal artifact {}",
+                path.display()
+            )
+        })?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            bail!("precreated worker journal artifact is not a regular file");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            // SAFETY: `geteuid` has no preconditions and does not access Rust memory.
+            let effective_uid = unsafe { libc::geteuid() };
+            if metadata.uid() != effective_uid
+                || metadata.permissions().mode() & 0o777 != 0o600
+                || metadata.nlink() != 1
+            {
+                bail!(
+                    "precreated worker journal artifact must be current-user-owned, mode 0600, and single-link"
+                );
+            }
+        }
+        file.sync_all().with_context(|| {
+            format!("failed to flush worker journal artifact {}", path.display())
+        })?;
+        let canonical = fs::canonicalize(&path)
+            .context("failed to resolve precreated worker journal artifact")?;
+        if canonical != path {
+            bail!("precreated worker journal artifact changed identity before launch");
+        }
+        paths.push(canonical);
+    }
+    Ok(paths)
+}
+
 pub(super) fn invocation_scratch_names(
     assignment_index: usize,
     attempt: usize,
@@ -437,12 +578,15 @@ pub(super) fn parse_report_json<T>(contents: &str) -> Result<ParsedReport<T>>
 where
     T: DeserializeOwned,
 {
-    if let Ok(report) = serde_json::from_str(contents) {
-        return Ok(ParsedReport {
-            report,
-            recovered: false,
-        });
-    }
+    let direct_error = match serde_json::from_str(contents) {
+        Ok(report) => {
+            return Ok(ParsedReport {
+                report,
+                recovered: false,
+            });
+        }
+        Err(error) => error,
+    };
 
     if let Some(stripped) = strip_surrounding_markdown_fence(contents) {
         if let Ok(report) = serde_json::from_str(stripped) {
@@ -474,7 +618,7 @@ where
     }
 
     Err(anyhow!(
-        "report is not valid JSON and lenient JSON extraction failed"
+        "report JSON/contract parse failed: {direct_error}; lenient JSON extraction did not produce a contract-valid report"
     ))
 }
 
@@ -912,11 +1056,21 @@ pub(super) fn missing_child_report(
         ),
         files_changed: Vec::new(),
         validation_results: Vec::new(),
-        findings: vec![Finding {
-            severity: FindingSeverity::Error,
-            message: format!("required child report is missing or invalid: {error}"),
-            paths: vec![report_path.to_path_buf()],
-        }],
+        findings: vec![
+            Finding {
+                severity: FindingSeverity::Error,
+                message: format!("required child report is missing or invalid: {error}"),
+                paths: vec![report_path.to_path_buf()],
+            },
+            Finding {
+                severity: FindingSeverity::Error,
+                message: format!(
+                    "child report contract failure at '{}': {error}. Corrective action: return exactly one OrchestratorReviewReport JSON object matching the supplied output schema, with every accepted terminal WorkerReport embedded and at least one read-only AuditorReport covering every worker id; do not add a prose or Markdown wrapper",
+                    report_path.display()
+                ),
+                paths: vec![report_path.to_path_buf()],
+            },
+        ],
         field_guide_entries: Vec::new(),
         worker_reports: Vec::new(),
         audit_reports: Vec::new(),
@@ -1224,7 +1378,7 @@ pub(super) fn deterministic_fake_child_run(
     if command.model.is_some() {
         bail!("deterministic fake child command retained a provider model slug");
     }
-    write_deterministic_fake_worker_journals(command, assignment)?;
+    let worker_journal_artifacts = write_deterministic_fake_worker_journals(command, assignment)?;
     let worker_reports = assignment
         .worker_assignments
         .iter()
@@ -1307,13 +1461,15 @@ pub(super) fn deterministic_fake_child_run(
     };
     let mut output = serde_json::to_vec_pretty(&report)?;
     output.push(b'\n');
-    Ok(deterministic_fake_run(command, output))
+    let mut run = deterministic_fake_run(command, output);
+    run.replace_worker_journal_artifacts(worker_journal_artifacts);
+    Ok(run)
 }
 
 fn write_deterministic_fake_worker_journals(
     command: &ExternalAgentCommand,
     assignment: &OrchestratorAssignment,
-) -> Result<()> {
+) -> Result<Vec<WorkerJournalArtifactCapture>> {
     let incoming_path = command
         .output_last_message
         .parent()
@@ -1325,16 +1481,39 @@ fn write_deterministic_fake_worker_journals(
             journal_root.display()
         )
     })?;
+    let mut captures = Vec::with_capacity(assignment.worker_assignments.len());
     for worker in &assignment.worker_assignments {
         let journal_path = journal_root.join(worker_execution_journal_file_name(&worker.id));
+        let matching_specs = command
+            .worker_journal_artifacts
+            .iter()
+            .filter(|artifact| artifact.worker_id == worker.id)
+            .collect::<Vec<_>>();
+        if matching_specs.len() != 1
+            || matching_specs[0].incoming_root != incoming_path
+            || matching_specs[0].path != journal_path
+        {
+            bail!(
+                "deterministic fake worker journal capability does not exactly match worker '{}'",
+                worker.id
+            );
+        }
         fs::write(&journal_path, b"").with_context(|| {
             format!(
                 "failed to write deterministic fake worker execution journal {}",
                 journal_path.display()
             )
         })?;
+        captures.push(WorkerJournalArtifactCapture {
+            worker_id: worker.id.clone(),
+            path: journal_path,
+            status: WorkerJournalArtifactCaptureStatus::Loaded(Vec::new()),
+        });
     }
-    Ok(())
+    if command.worker_journal_artifacts.len() != captures.len() {
+        bail!("deterministic fake worker journal capability set contains unexpected entries");
+    }
+    Ok(captures)
 }
 
 pub(super) fn deterministic_fake_auditor_run(

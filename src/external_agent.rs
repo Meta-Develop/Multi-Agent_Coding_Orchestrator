@@ -26,6 +26,7 @@ use crate::runtime_adapter::{
 };
 use crate::safe_state::{unsigned_to_u32, ReservedDirectory};
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
+use crate::worktree::normalize_agent_id;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
@@ -51,6 +52,7 @@ pub use crate::protected_path::SandboxDenialRetryability;
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
 const OUTPUT_TEE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+const MAX_WORKER_JOURNAL_ARTIFACT_BYTES: usize = 1024 * 1024;
 const CODEX_MODEL_CATALOG_MAX_BYTES: usize = 8 * 1024 * 1024;
 const CODEX_MODEL_CATALOG_MAX_MODELS: usize = 512;
 const CODEX_MODEL_SLUG_MAX_BYTES: usize = 256;
@@ -191,6 +193,8 @@ pub struct ExternalAgentCommand {
     pub output_schema: Option<PathBuf>,
     /// Exact bounded regular files exposed read-only without exposing their parent directories.
     pub read_only_input_files: Vec<PathBuf>,
+    /// Typed precreated worker journals bound to the original incoming report root.
+    pub worker_journal_artifacts: Vec<WorkerJournalArtifactSpec>,
     pub timeout: Duration,
     pub workspace_access: WorkspaceAccess,
     pub hidden_roots: Vec<PathBuf>,
@@ -220,6 +224,13 @@ pub struct ExternalAgentCommand {
     /// Isolated child worktree vs primary checkout. Default constructors use a
     /// managed child worktree; primary-target launch stays fail-closed.
     pub writable_launch_target: WritableLaunchTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerJournalArtifactSpec {
+    pub worker_id: String,
+    pub incoming_root: PathBuf,
+    pub path: PathBuf,
 }
 
 pub type ExternalMachineGlobalRetentionBinding = MachineGlobalRetentionBinding;
@@ -691,6 +702,7 @@ impl ExternalAgentCommand {
             output_last_message: output_last_message.into(),
             output_schema: None,
             read_only_input_files: Vec::new(),
+            worker_journal_artifacts: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadWrite,
             hidden_roots: Vec::new(),
@@ -723,6 +735,7 @@ impl ExternalAgentCommand {
             output_last_message: output_last_message.into(),
             output_schema: None,
             read_only_input_files: Vec::new(),
+            worker_journal_artifacts: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
             hidden_roots: Vec::new(),
@@ -755,6 +768,7 @@ impl ExternalAgentCommand {
             output_last_message: output_last_message.into(),
             output_schema: None,
             read_only_input_files: Vec::new(),
+            worker_journal_artifacts: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
             hidden_roots: Vec::new(),
@@ -777,6 +791,21 @@ impl ExternalAgentCommand {
 
     pub fn with_read_only_input_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.read_only_input_files.push(path.into());
+        self
+    }
+
+    pub fn with_worker_journal_artifact(
+        mut self,
+        worker_id: impl Into<String>,
+        incoming_root: impl Into<PathBuf>,
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        self.worker_journal_artifacts
+            .push(WorkerJournalArtifactSpec {
+                worker_id: worker_id.into(),
+                incoming_root: incoming_root.into(),
+                path: path.into(),
+            });
         self
     }
 
@@ -940,6 +969,7 @@ impl std::fmt::Debug for ExternalAgentRun {
                     .environment_preflight_process_started,
             )
             .field("sandbox_denials", &self.sandbox_denials())
+            .field("worker_journal_artifacts", &self.worker_journal_artifacts())
             .field("stdout", &self.stdout)
             .field("stderr", &self.stderr)
             .field("error", &self.error)
@@ -995,6 +1025,17 @@ impl ExternalAgentRun {
 
     pub fn gate_denials(&self) -> &[GateDenial] {
         &self.stdout.run_metadata.gate_denials
+    }
+
+    pub(crate) fn worker_journal_artifacts(&self) -> &[WorkerJournalArtifactCapture] {
+        &self.stdout.run_metadata.worker_journal_artifacts
+    }
+
+    pub(crate) fn replace_worker_journal_artifacts(
+        &mut self,
+        captures: Vec<WorkerJournalArtifactCapture>,
+    ) {
+        self.stdout.run_metadata.worker_journal_artifacts = captures;
     }
 
     pub fn machine_global_bypasses(&self) -> &[MachineGlobalBypassAttribution] {
@@ -1243,6 +1284,43 @@ struct ExternalAgentRunMetadata {
     machine_global_retention_operation_id: Option<RetentionOperationId>,
     pre_action_review_metrics: Option<ReviewMetricSnapshot>,
     external_side_effect_state: Option<ExternalSideEffectState>,
+    worker_journal_artifacts: Vec<WorkerJournalArtifactCapture>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct WorkerJournalArtifactCapture {
+    pub(crate) worker_id: String,
+    pub(crate) path: PathBuf,
+    pub(crate) status: WorkerJournalArtifactCaptureStatus,
+}
+
+impl std::fmt::Debug for WorkerJournalArtifactCapture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkerJournalArtifactCapture")
+            .field("worker_id", &self.worker_id)
+            .field("path", &self.path)
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum WorkerJournalArtifactCaptureStatus {
+    Loaded(Vec<u8>),
+    Invalid(String),
+}
+
+impl std::fmt::Debug for WorkerJournalArtifactCaptureStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Loaded(bytes) => formatter
+                .debug_tuple("Loaded")
+                .field(&RedactedByteCount(bytes.len()))
+                .finish(),
+            Self::Invalid(error) => formatter.debug_tuple("Invalid").field(error).finish(),
+        }
+    }
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -2292,6 +2370,9 @@ fn run_external_agent_runtime(
             }
         }
     }
+    let worker_journal_artifacts =
+        capture_worker_journal_artifacts(&protected_controls, report.scratch_quiescence_verified());
+    report.replace_worker_journal_artifacts(worker_journal_artifacts);
     match output_staging.cleanup() {
         Ok(ExternalOutputCleanup::Quarantined(operation)) => {
             if let Err(error) = persist_machine_global_retention_receipt(&spec.json_log, &operation)

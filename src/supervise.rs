@@ -18,7 +18,7 @@ use crate::{
         EnvironmentRequirement, ExternalAgentCommand, ExternalAgentRun,
         ExternalPreActionReviewRuntime, ExternalProgramTrust, PreActionJournalPhase,
         PreActionJournalRationale, PreActionJournalRecord, PreActionJournalSink,
-        SandboxDenialEvidence,
+        SandboxDenialEvidence, WorkerJournalArtifactCapture, WorkerJournalArtifactCaptureStatus,
     },
     field_guide::{
         decode_canonical_prompt_entry_line, DecodedFieldGuidePromptEntry, FieldGuideDraft,

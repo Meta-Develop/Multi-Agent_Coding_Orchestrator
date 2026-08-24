@@ -26,6 +26,17 @@ pub(super) fn write_orchestrator_schema(
     write_schema(writer, relative, orchestrator_report_schema_value())
 }
 
+pub(super) fn write_codex_orchestrator_schema(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+) -> Result<()> {
+    write_schema(
+        writer,
+        relative,
+        codex_response_format_schema(orchestrator_report_schema_value())?,
+    )
+}
+
 pub(super) fn write_supervisor_final_schema(
     writer: &mut ArtifactRunWriter,
     relative: &Path,
@@ -1314,6 +1325,321 @@ pub(super) fn write_auditor_schema(writer: &mut ArtifactRunWriter, relative: &Pa
     write_schema(writer, relative, auditor_report_schema_value())
 }
 
+pub(super) fn write_codex_auditor_schema(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+) -> Result<()> {
+    write_schema(
+        writer,
+        relative,
+        codex_response_format_schema(auditor_report_schema_value())?,
+    )
+}
+
+pub(super) fn codex_response_format_schema(
+    mut authoritative: serde_json::Value,
+) -> Result<serde_json::Value> {
+    if authoritative
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        == Some("OrchestratorReviewReport")
+    {
+        let properties = authoritative
+            .get_mut("properties")
+            .and_then(serde_json::Value::as_object_mut)
+            .context("authoritative orchestrator schema omitted properties")?;
+        for supervisor_owned in [
+            "licensed_breakage_review",
+            "generated_follow_up_tasks",
+            "gate_denials",
+            "gate_correction_outcomes",
+        ] {
+            properties.remove(supervisor_owned);
+        }
+    }
+    make_codex_response_format_compatible(&mut authoritative)?;
+    validate_codex_response_format_schema(&authoritative)?;
+    Ok(authoritative)
+}
+
+fn make_codex_response_format_compatible(schema: &mut serde_json::Value) -> Result<()> {
+    if schema
+        .as_object()
+        .is_some_and(|object| object.len() == 1 && object.get("type") == Some(&json!("object")))
+    {
+        *schema = codex_environment_preflight_observation_schema_value();
+    }
+    let serde_json::Value::Object(object) = schema else {
+        return Ok(());
+    };
+    for unsupported in [
+        "$schema",
+        "allOf",
+        "if",
+        "then",
+        "else",
+        "not",
+        "contains",
+        "minContains",
+        "maxContains",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "format",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "minProperties",
+        "maxProperties",
+        "default",
+        "examples",
+        "readOnly",
+        "writeOnly",
+    ] {
+        object.remove(unsupported);
+    }
+
+    if object.contains_key("properties") {
+        let required = object
+            .get("required")
+            .map(|required| {
+                required
+                    .as_array()
+                    .context("Codex response required entry must be an array")?
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_string)
+                            .context("Codex response required entry must be a string")
+                    })
+                    .collect::<Result<BTreeSet<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let properties = object
+            .get_mut("properties")
+            .and_then(serde_json::Value::as_object_mut)
+            .context("Codex response properties must be an object")?;
+        for (name, property_schema) in properties.iter_mut() {
+            if !required.contains(name) {
+                make_codex_property_nullable(property_schema)?;
+            }
+        }
+        let retained_required = properties
+            .keys()
+            .cloned()
+            .map(serde_json::Value::String)
+            .collect::<Vec<_>>();
+        object.insert(
+            "required".to_string(),
+            serde_json::Value::Array(retained_required),
+        );
+        object.insert(
+            "additionalProperties".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        // These keywords express authoritative cross-field conditions. The local schema and
+        // acceptance gates retain and enforce them after provider-constrained decoding.
+        object.remove("oneOf");
+        object.remove("anyOf");
+    } else if let Some(one_of) = object.remove("oneOf") {
+        if object.insert("anyOf".to_string(), one_of).is_some() {
+            bail!("Codex response schema cannot combine oneOf and anyOf at one node");
+        }
+    }
+
+    for value in object.values_mut() {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    make_codex_response_format_compatible(value)?;
+                }
+            }
+            serde_json::Value::Object(_) => make_codex_response_format_compatible(value)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn make_codex_property_nullable(schema: &mut serde_json::Value) -> Result<()> {
+    if schema
+        .as_object()
+        .is_some_and(|object| object.len() == 1 && object.get("type") == Some(&json!("object")))
+    {
+        *schema = codex_environment_preflight_observation_schema_value();
+    }
+    let object = schema
+        .as_object_mut()
+        .context("Codex optional property schema must be an object")?;
+    if let Some(schema_type) = object.get_mut("type") {
+        match schema_type {
+            serde_json::Value::String(existing) if existing != "null" => {
+                *schema_type = json!([existing.clone(), "null"]);
+            }
+            serde_json::Value::Array(types) => {
+                if !types.iter().any(|value| value == "null") {
+                    types.push(json!("null"));
+                }
+            }
+            serde_json::Value::String(_) => {}
+            _ => bail!("Codex optional property type must be a string or string array"),
+        }
+        if let Some(enum_values) = object
+            .get_mut("enum")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            if !enum_values.iter().any(serde_json::Value::is_null) {
+                enum_values.push(serde_json::Value::Null);
+            }
+        }
+        return Ok(());
+    }
+    for union in ["oneOf", "anyOf"] {
+        if let Some(variants) = object
+            .get_mut(union)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            if !variants
+                .iter()
+                .any(|variant| variant == &json!({"type": "null"}))
+            {
+                variants.push(json!({"type": "null"}));
+            }
+            return Ok(());
+        }
+    }
+    bail!("Codex optional property schema has no nullable type or union representation")
+}
+
+fn codex_environment_preflight_observation_schema_value() -> serde_json::Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "executable", "version"],
+                "properties": {
+                    "kind": {"const": "executable_version"},
+                    "executable": {
+                        "type": "string",
+                        "enum": ["bash", "cargo", "cmake", "codex", "git", "nix", "node", "npm", "python3", "rustc"]
+                    },
+                    "version": environment_version_schema_value()
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "credential"],
+                "properties": {
+                    "kind": {"const": "credential_present"},
+                    "credential": {
+                        "type": "string",
+                        "enum": ["codex_access_token", "codex_api_key", "open_ai_api_key"]
+                    }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "configuration"],
+                "properties": {
+                    "kind": {"const": "configuration_present"},
+                    "configuration": {"const": "codex_auth_file"}
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "enabled"],
+                "properties": {
+                    "kind": {"const": "network"},
+                    "enabled": {"type": "boolean"}
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "profile"],
+                "properties": {
+                    "kind": {"const": "sandbox"},
+                    "profile": {
+                        "type": "string",
+                        "enum": ["strict_offline_workspace", "trusted_fixed_network", "external_codex", "trusted_compatibility"]
+                    }
+                }
+            }
+        ]
+    })
+}
+
+fn validate_codex_response_format_schema(schema: &serde_json::Value) -> Result<()> {
+    let serde_json::Value::Object(object) = schema else {
+        return Ok(());
+    };
+    for unsupported in [
+        "$schema",
+        "allOf",
+        "oneOf",
+        "if",
+        "then",
+        "else",
+        "not",
+        "contains",
+        "minContains",
+        "maxContains",
+    ] {
+        if object.contains_key(unsupported) {
+            bail!("Codex response schema retained unsupported keyword '{unsupported}'");
+        }
+    }
+    if let Some(properties) = object
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    {
+        let required = object
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .context("Codex response object schema omitted required")?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .context("Codex required entry is not a string")
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        if required.len() != properties.len()
+            || properties
+                .keys()
+                .any(|name| !required.contains(name.as_str()))
+            || object.get("additionalProperties") != Some(&serde_json::Value::Bool(false))
+        {
+            bail!(
+                "Codex response object schema must require every property and deny additional properties"
+            );
+        }
+    }
+    for value in object.values() {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    validate_codex_response_format_schema(value)?;
+                }
+            }
+            serde_json::Value::Object(_) => validate_codex_response_format_schema(value)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn auditor_report_schema_value() -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2006,6 +2332,201 @@ mod selection_schema_tests {
         schema["required"]
             .as_array()
             .is_some_and(|required| required.iter().any(|value| value == field))
+    }
+
+    fn schema_accepts_null(schema: &serde_json::Value) -> bool {
+        schema["type"] == "null"
+            || schema["type"]
+                .as_array()
+                .is_some_and(|types| types.iter().any(|value| value == "null"))
+            || schema["anyOf"]
+                .as_array()
+                .is_some_and(|variants| variants.iter().any(schema_accepts_null))
+    }
+
+    fn assert_serialized_keys_are_required(value: &serde_json::Value, schema: &serde_json::Value) {
+        let object = value.as_object().expect("representative report object");
+        let properties = schema["properties"]
+            .as_object()
+            .expect("compatible object properties");
+        for key in object.keys() {
+            assert!(
+                properties.contains_key(key),
+                "schema omitted serialized key {key}"
+            );
+            assert!(
+                required_contains(schema, key),
+                "schema did not require key {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_report_schemas_are_strict_shape_only_derivatives() -> Result<()> {
+        let authoritative = orchestrator_report_schema_value();
+        assert!(authoritative.get("allOf").is_some());
+        assert!(authoritative["properties"]
+            .get("licensed_breakage_review")
+            .is_some());
+
+        let codex = codex_response_format_schema(authoritative.clone())?;
+        assert_eq!(codex["title"], "OrchestratorReviewReport");
+        assert!(codex.get("$schema").is_none());
+        assert!(codex.get("allOf").is_none());
+        assert!(required_contains(&codex, "worker_reports"));
+        assert!(required_contains(&codex, "audit_reports"));
+        assert!(codex["properties"]
+            .get("licensed_breakage_review")
+            .is_none());
+        assert!(codex["properties"]
+            .get("generated_follow_up_tasks")
+            .is_none());
+        assert!(codex["properties"].get("gate_denials").is_none());
+        assert!(codex["properties"]
+            .get("gate_correction_outcomes")
+            .is_none());
+        let worker = &codex["properties"]["worker_reports"]["items"];
+        let command = &worker["properties"]["commands_run"]["items"];
+        for field in [
+            "sandbox_denials",
+            "environment_preflight_results",
+            "environment_failures",
+        ] {
+            assert!(required_contains(command, field));
+            assert!(command["properties"].get(field).is_some());
+        }
+        let denial = &command["properties"]["sandbox_denials"]["items"];
+        assert!(required_contains(denial, "path"));
+        assert!(schema_accepts_null(&denial["properties"]["path"]));
+        let preflight = &command["properties"]["environment_preflight_results"]["items"];
+        assert!(required_contains(preflight, "observation"));
+        assert!(schema_accepts_null(&preflight["properties"]["observation"]));
+        let failure = &command["properties"]["environment_failures"]["items"];
+        assert!(required_contains(failure, "requirement"));
+        assert!(schema_accepts_null(&failure["properties"]["requirement"]));
+        let validation = &worker["properties"]["validation_results"]["items"];
+        assert!(required_contains(validation, "message"));
+        assert!(schema_accepts_null(&validation["properties"]["message"]));
+        validate_codex_response_format_schema(&codex)?;
+
+        let auditor = codex_response_format_schema(auditor_report_schema_value())?;
+        assert_eq!(auditor["title"], "AuditorReport");
+        assert!(required_contains(&auditor, "reviewed_worker_ids"));
+        assert!(required_contains(&auditor, "read_only"));
+        validate_codex_response_format_schema(&auditor)?;
+
+        let requirement = crate::external_agent::EnvironmentRequirement::executable(
+            crate::external_agent::EnvironmentExecutable::Cargo,
+            Some(
+                crate::external_agent::EnvironmentVersionConstraint::bounded(
+                    crate::external_agent::EnvironmentVersion::new(1, 90, 0),
+                    crate::external_agent::EnvironmentVersion::new(2, 0, 0),
+                ),
+            ),
+        );
+        let failure = EnvironmentFailure {
+            category: EnvironmentFailureCategory::VersionMismatch,
+            requirement: Some(requirement.clone()),
+            summary: "representative version mismatch".to_string(),
+            remediation: vec![EnvironmentRemediation {
+                scope: EnvironmentRemediationScope::ProjectLocal,
+                guidance: "use the pinned toolchain".to_string(),
+            }],
+        };
+        let command_record = CommandRunRecord {
+            command: vec!["cargo".to_string(), "check".to_string()],
+            cwd: PathBuf::from("."),
+            exit_code: Some(1),
+            status: ReviewStatus::Failed,
+            timeout_seconds: 30,
+            duration_ms: 4,
+            timed_out: false,
+            stdout: String::new(),
+            stderr: "version mismatch".to_string(),
+            sandbox_denials: vec![SandboxDenialEvidence {
+                boundary: crate::external_agent::SandboxDenialBoundary::InnerCodex,
+                policy_id: "representative-policy".to_string(),
+                operation: crate::external_agent::SandboxDeniedOperation::Write,
+                path: Some(PathBuf::from("src/lib.rs")),
+                retryability: crate::external_agent::SandboxDenialRetryability::NotRetryable,
+            }],
+            environment_preflight_results: vec![EnvironmentPreflightResult {
+                requirement,
+                status: crate::external_agent::EnvironmentPreflightStatus::Blocked,
+                observation: Some(
+                    crate::external_agent::EnvironmentPreflightObservation::ExecutableVersion {
+                        executable: crate::external_agent::EnvironmentExecutable::Cargo,
+                        version: crate::external_agent::EnvironmentVersion::new(1, 89, 0),
+                    },
+                ),
+            }],
+            environment_failures: vec![failure.clone()],
+            error: Some("representative failure".to_string()),
+        };
+        let validation_result = ValidationResult {
+            name: "cargo check".to_string(),
+            status: ReviewStatus::Failed,
+            command: vec!["cargo".to_string(), "check".to_string()],
+            message: Some("representative failure".to_string()),
+        };
+        let worker_report = WorkerReport {
+            id: "worker-schema".to_string(),
+            role: AgentRole::Worker,
+            assignment_kind: AssignmentKind::Ordinary,
+            target_path: None,
+            assigned_paths: vec![PathBuf::from("src/lib.rs")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            claim_token: Some(1),
+            semantic_intent_token: Some(2),
+            commands_run: vec![command_record.clone()],
+            environment_failures: vec![failure.clone()],
+            files_changed: Vec::new(),
+            validation_results: vec![validation_result.clone()],
+            findings: Vec::new(),
+            field_guide_entries: Vec::new(),
+            bloated_file_flags: Vec::new(),
+            decomposition_completion: None,
+            no_further_delegation: Some(true),
+            accepted: false,
+            rejected: true,
+            status: ReviewStatus::Failed,
+            remaining_risk: "representative risk".to_string(),
+            next_safe_action: "correct the environment".to_string(),
+        };
+        let auditor_report = AuditorReport {
+            id: "auditor-schema".to_string(),
+            role: AgentRole::Auditor,
+            reviewed_worker_ids: vec![worker_report.id.clone()],
+            reviewed_paths: worker_report.assigned_paths.clone(),
+            commands_run: vec![command_record],
+            environment_failures: vec![failure],
+            validation_results: vec![validation_result],
+            findings: Vec::new(),
+            rejection_kind: Some(AuditorRejectionKind::EvidenceQuality),
+            no_further_delegation: Some(true),
+            read_only: true,
+            accepted: false,
+            rejected: true,
+            status: ReviewStatus::Failed,
+            remaining_risk: "representative risk".to_string(),
+            next_safe_action: "correct the evidence".to_string(),
+        };
+        let serialized_worker = serde_json::to_value(&worker_report)?;
+        let serialized_auditor = serde_json::to_value(&auditor_report)?;
+        assert_serialized_keys_are_required(&serialized_worker, worker);
+        assert_serialized_keys_are_required(&serialized_auditor, &auditor);
+        assert_serialized_keys_are_required(&serialized_worker["commands_run"][0], command);
+
+        let mut explicit_null_worker = serialized_worker;
+        explicit_null_worker["commands_run"][0]["sandbox_denials"][0]["path"] = json!(null);
+        explicit_null_worker["commands_run"][0]["environment_preflight_results"][0]
+            ["observation"] = json!(null);
+        explicit_null_worker["commands_run"][0]["environment_failures"][0]["requirement"] =
+            json!(null);
+        explicit_null_worker["validation_results"][0]["message"] = json!(null);
+        let _: WorkerReport = serde_json::from_value(explicit_null_worker)?;
+        Ok(())
     }
 
     #[test]
