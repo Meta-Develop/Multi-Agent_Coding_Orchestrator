@@ -2134,9 +2134,9 @@
   },
   "pareto_frontier": [],
   "objective_profile": {
-    "id": "maco-default-objective-v1",
-    "version": 1,
-    "content_hash": "64a1962f8f603c668ecb15713baf7541b3f33899a4f8159026dafa3004c092c8",
+    "id": "maco-default-objective-v2",
+    "version": 2,
+    "content_hash": "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9",
     "quality": {
       "held_out_percent": 50,
       "breadth_percent": 25,
@@ -2148,6 +2148,10 @@
       "latency_percent": 0,
       "retry_rework_percent": 0,
       "human_review_percent": 0
+    },
+    "switch_costs": {
+      "model_change_same_runtime_microunits": 10000,
+      "runtime_change_microunits": 25000
     }
   }
 }
