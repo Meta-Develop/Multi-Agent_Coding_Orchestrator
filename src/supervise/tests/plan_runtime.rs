@@ -1334,7 +1334,24 @@ fn admitted_nested_assignment_retains_ordinary_pipeline_and_acceptance_evidence(
     assert!(prompt.contains("Path claim token: 41"));
     assert!(prompt.contains("Semantic intent token: 43"));
     assert!(prompt.contains("/tmp/maco-run/incoming/worker-journals/execution-child-worker.jsonl"));
-    assert!(prompt.contains("Return your OrchestratorReviewReport JSON"));
+    let exact_report_contract = concat!(
+        "Collection contract:\n",
+        "- Incoming report root: /tmp/maco-run/incoming. It is artifact capability, not source-write authority.\n",
+        "- Exact OrchestratorReviewReport output path (written only by Codex CLI --output-last-message; do not write it with tools):\n",
+        "/tmp/maco-run/incoming/execution-child.json\n",
+        "- Return one unwrapped OrchestratorReviewReport JSON object. Embed each accepted terminal WorkerReport unchanged plus an accepted read-only AuditorReport covering every embedded worker id; missing or rejected worker or auditor evidence requires rejection.\n",
+        "- Source writes are limited to assigned worktree paths. Each worker journal path is a separate precreated exact-file capability and the only non-source write: append directly; its nonwritable parent forbids create, replace, rename, link, or swap.\n",
+        "- OrchestratorReviewReport schema:\n",
+        "/tmp/maco-run/schemas/orchestrator-review-report.schema.json\n",
+        "- WorkerReport schema:\n",
+        "/tmp/maco-run/schemas/worker-report.schema.json\n",
+        "- AuditorReport schema:\n",
+        "/tmp/maco-run/schemas/auditor-report.schema.json\n",
+    );
+    assert!(
+        prompt.contains(exact_report_contract),
+        "nested assignment must retain the exact report-root, output, schema, worker, auditor, and journal capability contract"
+    );
     assert!(prompt.contains("Review auditor prompt template:"));
 
     let mut accepted_report = injected_child_report(&execution);

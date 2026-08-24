@@ -210,11 +210,11 @@ Required behavior:
 - Workers must return WorkerReport JSON matching the worker report contract and include "no_further_delegation": true.
 - WorkerReport, AuditorReport, and OrchestratorReviewReport must include environment_failures. Use [] when no typed failure occurred. A nonempty environment_failures list requires accepted=false, rejected=true, and status=failed; never include credential or secret values.
 - Workers may propose bounded field_guide_entries containing finding and context only. They must never add date, source_run, or other provenance; the trusted parent stamps provenance only after acceptance and audit.
-- Each worker must also append its structured execution journal directly to the exact precreated path in its worker prompt; that file is the only allowed non-source artifact write for a terminal worker. Its parent directory is intentionally nonwritable: do not create, replace, rename, link, or atomically swap the file. The journal is JSONL with one object per command containing command, cwd, start_timestamp, end_timestamp, and changed_paths. The parent acceptance gate imports these journals from incoming/worker-journals/ and rejects missing, aliased, replaced, invalid, or unsupported evidence.
+- Each worker must append JSONL directly to its exact precreated journal path. That file is its only non-source write capability; its parent directory is nonwritable. Never create, replace, rename, link, or swap it. Each command record contains command, cwd, start_timestamp, end_timestamp, and changed_paths. The parent imports incoming/worker-journals/ and rejects missing, aliased, replaced, invalid, or unsupported evidence.
 - Review auditors must return AuditorReport JSON matching the auditor report contract and include "no_further_delegation": true.
 - Review auditors must include "read_only": true in AuditorReport JSON to attest they did not mutate files or repository state.
 - Acceptance-gate review auditors are parent-launched MACO/Codex CLI subprocess roles; a child-launched review auditor is advisory child-side evidence unless MACO/O2 collects it through the parent-enforced acceptance gate.
-- Review every terminal WorkerReport and embed every accepted report in OrchestratorReviewReport.worker_reports without losing or changing any reported evidence. The final response schema requires complete explicit fields: preserve reported values, use [] for genuinely empty evidence arrays, and represent absent optional evidence as null rather than omitting it. Missing or rejected worker evidence must make the child report reject.
+- Embed each accepted terminal WorkerReport in OrchestratorReviewReport.worker_reports without losing or changing any reported evidence, using [] for genuinely empty arrays; represent absent optional evidence as null. Reject the child report if worker evidence is missing or rejected.
 - OrchestratorReviewReport may also propose bounded field_guide_entries containing finding and context only. Do not copy unreviewed or rejected worker suggestions into this field.
 - Preserve each worker assignment_kind and target_path in WorkerReport. A successful megafile_decomposition worker must report the exact canonical target_path in files_changed and include decomposition_completion with that target plus at least one concrete canonical replacement_path also present in files_changed. OrchestratorReviewReport must aggregate the exact accepted worker evidence in decomposition_completions; this evidence does not bypass claims, journals, validation, audit, or later merge gates.
 - Include at least one accepted read-only AuditorReport in audit_reports whose reviewed_worker_ids covers every embedded worker id; MACO rejects child reports with worker assignments that omit terminal audit evidence.
@@ -225,7 +225,7 @@ Safety requirements:
 - Do not edit outside the assigned paths, symbols, or modules.
 - Do not mutate the primary worktree.
 - Run validation commands when feasible. If validation cannot run, explain why in validation_results and remaining_risk.
-- Return exactly one OrchestratorReviewReport JSON object as your final response, with every accepted terminal WorkerReport embedded and the required AuditorReport coverage. Do not wrap it in Markdown, a code fence, or prose.
+- Return exactly one OrchestratorReviewReport JSON object with all accepted WorkerReports and required read-only AuditorReport coverage; use no prose wrapper or Markdown fence.
 "#,
         tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE
     )
@@ -665,17 +665,17 @@ Declared role selections:
 - Launch each supplied terminal worker prompt through runtime-native SubAgent/delegated-worker support and preserve its declared role selection. MACO's parent scheduler does not launch those terminal sessions for you; runtime-side role-tagged usage reporting is required before worker usage or cost can be reported.
 {consultation_section}
 
-Collection targets:
-- Do not write the orchestrator report file yourself with tools; Codex CLI --output-last-message records your final response at this MACO collection target:
+Collection contract:
+- Incoming report root: {incoming_root}. It is artifact capability, not source-write authority.
+- Exact OrchestratorReviewReport output path (written only by Codex CLI --output-last-message; do not write it with tools):
 {report_path}
-- Return exactly one OrchestratorReviewReport JSON object to that target with no prose wrapper or Markdown fence.
-- Embed every accepted terminal WorkerReport unchanged in worker_reports. Include at least one accepted read-only AuditorReport whose reviewed_worker_ids covers every embedded worker id. Missing worker or auditor evidence must produce a rejected child report.
-- Source mutation remains limited to the assigned worktree paths above. Each worker journal path named in its prompt is a separately precreated exact-file capability and the only non-source write authority; its parent directory is nonwritable and the file must only be directly appended, never created, replaced, renamed, linked, or swapped.
-- The orchestrator review report schema path is:
+- Return one unwrapped OrchestratorReviewReport JSON object. Embed each accepted terminal WorkerReport unchanged plus an accepted read-only AuditorReport covering every embedded worker id; missing or rejected worker or auditor evidence requires rejection.
+- Source writes are limited to assigned worktree paths. Each worker journal path is a separate precreated exact-file capability and the only non-source write: append directly; its nonwritable parent forbids create, replace, rename, link, or swap.
+- OrchestratorReviewReport schema:
 {schema_path}
-- Worker reports must use this schema path:
+- WorkerReport schema:
 {worker_schema_path}
-- Review auditor reports must use this schema path:
+- AuditorReport schema:
 {auditor_schema_path}
 
 Supervisor task:
@@ -697,6 +697,7 @@ Review auditor prompt template:
         worktree_path = worktree.path.display(),
         child_id = assignment.id,
         execution_target_context = execution_target_context,
+        incoming_root = incoming_root.display(),
         decomposition_targets = display_decomposition_targets(assignment, assignment_metadata),
         assigned_paths = display_paths(&assignment.assigned_paths),
         semantic_symbols = assignment.semantic_symbols.join(", "),

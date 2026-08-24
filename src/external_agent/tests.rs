@@ -3799,7 +3799,7 @@ fn artifact_parent_allows_only_designated_maco_incoming_layouts() -> Result<()> 
     let incoming = workspace.join("incoming");
     fs::create_dir(&incoming)?;
 
-    for output in [
+    let rejected_outputs = [
         workspace.join(".git/report.json"),
         workspace.join(".git/nested/report.json"),
         workspace.join(".maco/report.json"),
@@ -3826,7 +3826,15 @@ fn artifact_parent_allows_only_designated_maco_incoming_layouts() -> Result<()> 
         workspace.join(".agents/docs/report.json"),
         workspace.join(".cursorignore/report.json"),
         workspace.join("report.json"),
-    ] {
+    ];
+    for output in &rejected_outputs {
+        let parent = output.parent().context("rejected output parent")?;
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    for output in rejected_outputs {
         let command = ExternalAgentCommand::codex_read_only_consultant(
             "codex",
             &workspace,
@@ -3943,6 +3951,7 @@ fn protected_worktree_controls_use_exact_descendant_exceptions() -> Result<()> {
         Duration::from_secs(1),
     )
     .with_worktree_control_exception(".agents/docs/worker.md");
+    fs::create_dir(workspace.join("incoming"))?;
 
     let controls = protected_worktree_controls(&command)?;
     let roots = controls
@@ -4371,6 +4380,7 @@ fn structured_failed_command_denials_are_typed_deduplicated_and_redacted() -> Re
     let workspace = temp.path().join("workspace");
     create_mandatory_control_roots(&workspace)?;
     fs::write(workspace.join("AGENTS.md"), "policy\n")?;
+    fs::create_dir(workspace.join("incoming"))?;
     let command = ExternalAgentCommand::codex(
         "codex",
         &workspace,
@@ -4603,12 +4613,27 @@ fn outer_denial_evidence_uses_only_typed_process_errors() {
 
 #[test]
 fn external_profile_exposes_only_incoming_output_root_as_writable() -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     let temp = tempfile::tempdir()?;
     let workspace = temp.path().join("workspace");
     create_mandatory_control_roots(&workspace)?;
     let container = temp.path().join("run");
     let trusted = container.join("trusted");
     let incoming = container.join("incoming");
+    let journal_parent = incoming.join("worker-journals");
+    fs::create_dir_all(&journal_parent)?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&journal_parent, fs::Permissions::from_mode(0o700))?;
+    }
+    let journal = journal_parent.join("worker-a.jsonl");
+    fs::write(&journal, [])?;
+    #[cfg(unix)]
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o600))?;
+    let canonical_journal = fs::canonicalize(&journal)?;
     let spec = ExternalAgentCommand::codex(
         workspace.join("codex"),
         &workspace,
@@ -4616,7 +4641,8 @@ fn external_profile_exposes_only_incoming_output_root_as_writable() -> Result<()
         trusted.join("events.jsonl"),
         incoming.join("report.json"),
         Duration::from_secs(1),
-    );
+    )
+    .with_worker_journal_artifact("worker-a", &incoming, &journal);
     let profile = external_side_effect_profile(
         &spec,
         &workspace.join("codex"),
@@ -4626,7 +4652,12 @@ fn external_profile_exposes_only_incoming_output_root_as_writable() -> Result<()
     let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
         bail!("expected external Codex profile");
     };
-    assert_eq!(profile.writable_artifact_roots(), &[incoming]);
+    assert_eq!(
+        profile.writable_artifact_roots(),
+        std::slice::from_ref(&incoming)
+    );
+    assert_eq!(profile.visible_read_write_files(), &[canonical_journal]);
+    assert!(!profile.visible_read_write_roots().contains(&journal_parent));
     assert!(profile
         .writable_artifact_roots()
         .iter()
