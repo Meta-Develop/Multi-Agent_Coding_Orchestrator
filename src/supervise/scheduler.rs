@@ -871,6 +871,20 @@ impl BudgetDegradationController {
     }
 }
 
+#[cfg(test)]
+pub(super) fn assignment_policy_after_completed_settlement_for_test(
+    automatic_selection_state: SupervisorAutomaticSelectionState,
+    assignment: &OrchestratorAssignment,
+    report: &RunBudgetReport,
+    plan: &SupervisorPlan,
+    catalog: &RuntimeModelCatalog,
+    runtime: SupervisorRuntime,
+) -> Result<AssignmentBudgetPolicy> {
+    BudgetDegradationController::new_with_selection_state(1, Some(automatic_selection_state))
+        .assignment_policy(assignment, None, report, plan, catalog, runtime)?
+        .context("completed settlement unexpectedly stopped the next assignment admission")
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct AchievedConcurrency {
     started_assignment_count: usize,

@@ -206,6 +206,29 @@ fn bind_selected_runtime_launch(
     apply_role_model_selection(command, plan, assignment.role, launch_runtime, catalog)
 }
 
+#[cfg(test)]
+pub(super) fn bind_selected_assignment_launch_for_test(
+    command: ExternalAgentCommand,
+    assignment: &OrchestratorAssignment,
+    budget_policy: &AssignmentBudgetPolicy,
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    catalog: &RuntimeModelCatalog,
+) -> Result<(SupervisorRuntime, ExternalAgentCommand)> {
+    let launch_runtime = assignment_launch_runtime(assignment, budget_policy, options);
+    let launch_catalog =
+        runtime_model_catalog_for_launch(catalog, options.runtime, launch_runtime)?;
+    let command = bind_selected_runtime_launch(
+        command,
+        assignment,
+        plan,
+        options,
+        launch_runtime,
+        &launch_catalog,
+    )?;
+    Ok((launch_runtime, command))
+}
+
 pub(super) fn prerender_selected_runtime_adapter_command(
     command: &ExternalAgentCommand,
     launch_runtime: SupervisorRuntime,

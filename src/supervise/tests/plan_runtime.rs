@@ -156,12 +156,79 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
     first.role = AgentRole::Worker;
     let mut second = injected_named_assignment("quota-second", "SECOND.md");
     second.role = AgentRole::Worker;
-    let plan = injected_multi_plan(vec![first.clone(), second.clone()], 0);
+    let mut plan = injected_multi_plan(vec![first.clone(), second.clone()], 0);
     let options = injected_options(&repo_path, temp.path(), "quota-live-sequential");
     let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
         .expect("construct Codex test catalog");
+    let advertised = advertised_catalogs_for_launch(&repo_path)
+        .expect("load hermetic advertised runtime catalogs");
+    let quota_context = LiveQuotaSelectionContext {
+        repo: repo_path.clone(),
+        relative_path: PathBuf::from("config/quota.json"),
+        config: quota_config.clone(),
+    };
+    let admission = SupervisorAdmissionPolicyInput::resolve_with_quota(
+        &repo_path,
+        1,
+        SupervisorAdmissionConfig::default(),
+        SupervisorAdmissionConfig::default(),
+        Some(&quota_context),
+    )
+    .expect("resolve quota-aware admission input");
+    let mut budget_ledger =
+        RunBudgetLedger::new(RunBudgetLimits::default()).expect("create run budget ledger");
+    budget_ledger
+        .attach_quota_config(&repo_path, options.run_id.as_str(), &quota_config)
+        .expect("attach quota config to shared run budget ledger");
+    let selection = initialize_supervisor_selection_with_quota(
+        &mut plan,
+        SupervisorRuntime::Codex,
+        &catalog,
+        &admission,
+        &advertised,
+        Some(&quota_context),
+        Some(&budget_ledger),
+    )
+    .expect("initialize automatic live quota selection");
+    assert!(selection.selection_preflight_failure.is_none());
+    let initial_worker = selection
+        .decisions
+        .iter()
+        .find(|event| event.role == AgentRole::Worker)
+        .expect("initial Worker selection");
+    assert_eq!(
+        initial_worker
+            .provenance
+            .choice
+            .as_ref()
+            .expect("initial Worker choice")
+            .candidate
+            .runtime,
+        "codex"
+    );
+    let automatic_state = selection
+        .automatic_state
+        .expect("automatic live quota replay state");
+    let selected_models = plan
+        .role_models
+        .values()
+        .filter_map(|selection| selection.model.clone())
+        .collect::<Vec<_>>();
+    for model in selected_models {
+        plan.model_pricing.insert(
+            model,
+            ModelPricing {
+                input_usd_per_million_tokens: 1.0,
+                output_usd_per_million_tokens: 1.0,
+            },
+        );
+    }
+    let budget_config = SupervisorBudgetConfig {
+        limits: RunBudgetLimits::default(),
+        role_token_reservations: BTreeMap::from([(AgentRole::Worker, 10)]),
+    };
     let launches = Mutex::new(Vec::<(String, SupervisorRuntime, Option<String>)>::new());
-    let mut runner = |command: &ExternalAgentCommand| {
+    let runner = |command: &ExternalAgentCommand| {
         let name = command
             .output_last_message
             .file_name()
@@ -210,43 +277,89 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
             run
         }
     };
-    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        SupervisorExecutionRuntime::Verified,
-        Ok(catalog),
-        &mut runner,
+
+    let first_command = ExternalAgentCommand::codex(
+        &options.codex_bin,
+        &repo_path,
+        temp.path().join("quota-first-prompt.md"),
+        temp.path().join("quota-first-log.jsonl"),
+        temp.path().join("quota-first-output.json"),
+        Duration::from_secs(10),
+    );
+    let first_policy = AssignmentBudgetPolicy::default();
+    let (first_launch_runtime, first_command) = bind_selected_assignment_launch_for_test(
+        first_command,
+        &first,
+        &first_policy,
+        &plan,
+        &options,
+        &catalog,
     )
-    .expect("run sequential live quota supervisor path");
-    assert!(report.success, "unexpected supervisor failure: {report:#?}");
-    let observed_launches = launches.lock().expect("launch observations").clone();
-    assert_eq!(observed_launches.len(), 2);
-    assert_eq!(observed_launches[0].1, SupervisorRuntime::Codex);
-    assert_eq!(observed_launches[1].1, SupervisorRuntime::Cursor);
-    let execution = report
-        .role_economics_profile
-        .as_ref()
-        .and_then(|profile| profile.execution.as_ref())
-        .expect("selection execution evidence");
-    let second_decision = execution
-        .selection_decisions
+    .expect("bind initial Codex launch");
+    assert_eq!(first_launch_runtime, SupervisorRuntime::Codex);
+    let mut first_budget = match reserve_dispatch_budget(
+        &plan,
+        &budget_config,
+        &budget_ledger,
+        AgentRole::Worker,
+        &first_command,
+    )
+    .expect("reserve first assignment budget")
+    {
+        DispatchBudgetAdmission::Admitted(reservation) => reservation,
+        DispatchBudgetAdmission::Refused(refusal) => {
+            panic!("first assignment budget was refused: {refusal:?}")
+        }
+    };
+    first_budget
+        .mark_invoked_for_runtime(first_launch_runtime)
+        .expect("mark first Codex dispatch invoked");
+    let first_run = runner(&first_command);
+    let first_settlement = first_budget
+        .settle(&first_run, first_launch_runtime, &first_command)
+        .expect("settle completed first Codex assignment");
+    assert_eq!(
+        first_settlement.reliability,
+        DispatchUsageReliability::Reliable
+    );
+    assert_eq!(
+        first_settlement
+            .observed_usage
+            .expect("first completed usage")
+            .total_tokens,
+        10
+    );
+
+    let completed_report = budget_ledger
+        .report()
+        .expect("completed first-assignment budget report");
+    let second_policy = assignment_policy_after_completed_settlement_for_test(
+        automatic_state,
+        &second,
+        &completed_report,
+        &plan,
+        &catalog,
+        SupervisorRuntime::Codex,
+    )
+    .expect("refresh live quota selection through scheduler admission policy");
+    assert_eq!(
+        second_policy.selected_runtime_for(AgentRole::Worker),
+        Some(SupervisorRuntime::Cursor)
+    );
+    let second_decision = second_policy
+        .selector_decisions
         .iter()
         .find(|event| {
             event.assignment_id.as_deref() == Some("quota-second")
                 && event.role == AgentRole::Worker
         })
         .expect("second assignment live selection");
-    assert_eq!(
-        second_decision
-            .provenance
-            .choice
-            .as_ref()
-            .expect("second assignment choice")
-            .candidate
-            .runtime,
-        "cursor"
-    );
+    let second_choice = second_decision
+        .provenance
+        .choice
+        .as_ref()
+        .expect("second assignment choice");
+    assert_eq!(second_choice.candidate.runtime, "cursor");
     assert_eq!(
         second_decision
             .provenance
@@ -256,6 +369,86 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
             .disposition,
         crate::selection::QuotaDecisionDisposition::Degraded
     );
+    let cursor_model = second_choice.candidate.model.clone();
+    let mut second_plan = second_policy.apply(&plan);
+    assert_eq!(
+        second_plan
+            .role_models
+            .get(&AgentRole::Worker)
+            .and_then(|selection| selection.model.clone())
+            .as_deref(),
+        Some(cursor_model.as_str())
+    );
+    second_plan.model_pricing.insert(
+        cursor_model.clone(),
+        ModelPricing {
+            input_usd_per_million_tokens: 1.0,
+            output_usd_per_million_tokens: 1.0,
+        },
+    );
+    let second_command = ExternalAgentCommand::codex(
+        &options.codex_bin,
+        &repo_path,
+        temp.path().join("quota-second-prompt.md"),
+        temp.path().join("quota-second-log.jsonl"),
+        temp.path().join("quota-second-output.json"),
+        Duration::from_secs(10),
+    );
+    let (second_launch_runtime, second_command) = bind_selected_assignment_launch_for_test(
+        second_command,
+        &second,
+        &second_policy,
+        &second_plan,
+        &options,
+        &catalog,
+    )
+    .expect("bind degraded Cursor launch");
+    assert_eq!(second_launch_runtime, SupervisorRuntime::Cursor);
+    let mut second_budget = match reserve_dispatch_budget(
+        &second_plan,
+        &budget_config,
+        &budget_ledger,
+        AgentRole::Worker,
+        &second_command,
+    )
+    .expect("reserve second assignment budget")
+    {
+        DispatchBudgetAdmission::Admitted(reservation) => reservation,
+        DispatchBudgetAdmission::Refused(refusal) => {
+            panic!("second assignment budget was refused: {refusal:?}")
+        }
+    };
+    second_budget
+        .mark_invoked_for_runtime(second_launch_runtime)
+        .expect("mark second Cursor dispatch invoked");
+    let second_run = runner(&second_command);
+    let second_settlement = second_budget
+        .settle(&second_run, second_launch_runtime, &second_command)
+        .expect("settle completed second Cursor assignment");
+    assert_eq!(
+        second_settlement.reliability,
+        DispatchUsageReliability::Reliable
+    );
+    assert_eq!(
+        second_settlement
+            .observed_usage
+            .expect("second completed usage")
+            .total_tokens,
+        3
+    );
+
+    let observed_launches = launches.lock().expect("launch observations").clone();
+    assert_eq!(observed_launches.len(), 2);
+    assert_eq!(observed_launches[0].1, SupervisorRuntime::Codex);
+    assert_eq!(observed_launches[1].1, SupervisorRuntime::Cursor);
+    assert_eq!(
+        observed_launches[1].2.as_deref(),
+        Some(cursor_model.as_str())
+    );
+    drop(second_budget);
+    drop(first_budget);
+    drop(second_policy);
+    drop(budget_ledger);
     let workspace =
         WorkspaceBudgetLedger::open_or_create(&repo_path).expect("reopen completed quota ledger");
     let now = crate::budget_ledger::unix_now().expect("ledger observation time");
