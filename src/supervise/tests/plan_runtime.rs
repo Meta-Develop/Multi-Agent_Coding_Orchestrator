@@ -2536,6 +2536,127 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
 }
 
 #[test]
+fn final_usage_evidence_preserves_rejected_and_active_auditor_models() {
+    let assignment = injected_assignment(true);
+    assert_eq!(assignment.role, AgentRole::ChildOrchestrator);
+    assert_eq!(assignment.worker_assignments.len(), 1);
+    assert_eq!(assignment.worker_assignments[0].role, AgentRole::Worker);
+    let mut plan = injected_plan(assignment, 1);
+    let lens_id = plan.review_lenses[0].id.clone();
+    let backend_id = plan.review_lenses[0].backend.backend_id().to_string();
+    let ReviewLensBackendConfig::Model { model, .. } = &mut plan.review_lenses[0].backend else {
+        panic!("default supervisor lens must be model-backed");
+    };
+    *model = "auditor-initial".to_string();
+    plan.model_pricing = BTreeMap::from([
+        (
+            "auditor-initial".to_string(),
+            ModelPricing {
+                input_usd_per_million_tokens: 1.0,
+                output_usd_per_million_tokens: 2.0,
+            },
+        ),
+        (
+            "auditor-active".to_string(),
+            ModelPricing {
+                input_usd_per_million_tokens: 3.0,
+                output_usd_per_million_tokens: 4.0,
+            },
+        ),
+    ]);
+    let rejected_usage = Usage {
+        input_tokens: 100,
+        output_tokens: 20,
+        total_tokens: 120,
+    };
+    let accepted_usage = Usage {
+        input_tokens: 200,
+        output_tokens: 40,
+        total_tokens: 240,
+    };
+    let aggregation = role_usage_report(
+        &plan,
+        vec![
+            RoleUsageSample {
+                role: AgentRole::Auditor,
+                lens_id: Some(lens_id.clone()),
+                model: Some("auditor-initial".to_string()),
+                usage: rejected_usage,
+            },
+            RoleUsageSample {
+                role: AgentRole::Auditor,
+                lens_id: Some(lens_id.clone()),
+                model: Some("auditor-active".to_string()),
+                usage: accepted_usage,
+            },
+        ],
+    )
+    .expect("aggregate final scheduler usage across an auditor retry switch");
+
+    assert_eq!(aggregation.lens_reports.len(), 2);
+    assert_eq!(aggregation.lens_reports[0].lens_id, lens_id);
+    assert_eq!(aggregation.lens_reports[0].backend_id, backend_id);
+    assert_eq!(aggregation.lens_reports[0].model, "auditor-active");
+    assert_eq!(aggregation.lens_reports[0].usage, Some(accepted_usage));
+    assert_eq!(aggregation.lens_reports[1].model, "auditor-initial");
+    assert_eq!(aggregation.lens_reports[1].usage, Some(rejected_usage));
+    let expected_total = rejected_usage.saturating_add(accepted_usage);
+    assert_eq!(aggregation.lens_total_usage, Some(expected_total));
+    assert_eq!(aggregation.total_usage, Some(expected_total));
+    let rejected_cost = 0.00014;
+    let accepted_cost = 0.00076;
+    assert!(aggregation
+        .lens_reports
+        .iter()
+        .find(|usage| usage.model == "auditor-initial")
+        .and_then(|usage| usage.cost_usd)
+        .is_some_and(|cost| (cost - rejected_cost).abs() < 1e-12));
+    assert!(aggregation
+        .lens_reports
+        .iter()
+        .find(|usage| usage.model == "auditor-active")
+        .and_then(|usage| usage.cost_usd)
+        .is_some_and(|cost| (cost - accepted_cost).abs() < 1e-12));
+    assert!(aggregation.lens_total_cost_usd.is_some_and(|cost| (cost
+        - rejected_cost
+        - accepted_cost)
+        .abs()
+        < 1e-12));
+
+    let run_id = RunId::new("active-auditor-final-usage").expect("valid run id");
+    let mut final_report = artifact_test_final_report(&run_id);
+    final_report.role_usage = aggregation.reports;
+    final_report.review_lens_usage = aggregation.lens_reports;
+    final_report.review_lens_total_usage = aggregation.lens_total_usage;
+    final_report.review_lens_total_cost_usd = aggregation.lens_total_cost_usd;
+    final_report.total_usage = aggregation.total_usage;
+    final_report.total_cost_usd = aggregation.total_cost_usd;
+    let persisted: SupervisorFinalReport = serde_json::from_value(
+        serde_json::to_value(&final_report).expect("serialize active auditor final evidence"),
+    )
+    .expect("deserialize active auditor final evidence");
+    assert_eq!(persisted.review_lens_usage[0].model, "auditor-active");
+    assert_eq!(persisted.review_lens_usage[1].model, "auditor-initial");
+    assert_eq!(persisted.review_lens_total_usage, Some(expected_total));
+
+    let missing_model_error = match role_usage_report(
+        &plan,
+        vec![RoleUsageSample {
+            role: AgentRole::Auditor,
+            lens_id: Some(plan.review_lenses[0].id.clone()),
+            model: None,
+            usage: Usage::default(),
+        }],
+    ) {
+        Ok(_) => panic!("lens usage without model attribution must fail closed"),
+        Err(error) => error,
+    };
+    assert!(missing_model_error
+        .to_string()
+        .contains("omitted the dispatched model attribution"));
+}
+
+#[test]
 fn empty_process_usage_has_no_synthetic_supervisor_or_worker_totals() {
     let plan = parse_supervisor_plan_with_consultant(
         std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),

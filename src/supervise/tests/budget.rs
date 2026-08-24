@@ -617,6 +617,24 @@ fn budget_integration_scheduler_applies_and_persists_degrade_ladder_before_halt(
             ("degrade-child-2", "high"),
         ]
     );
+    let degraded_child_binding = execution
+        .assignment_effort_bindings
+        .iter()
+        .find(|binding| {
+            binding.role == AgentRole::ChildOrchestrator
+                && binding.assignment_id == "degrade-child-1"
+        })
+        .expect("first budget-degraded child admission binding");
+    assert_eq!(
+        degraded_child_binding.resolution_observation,
+        EffortResolutionObservation::BudgetDegraded
+    );
+    assert!(degraded_child_binding
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| {
+            reason.contains("admission-only") && reason.contains("selection_decisions")
+        }));
 
     let persisted: serde_json::Value = serde_json::from_slice(
         &fs::read(

@@ -1472,26 +1472,41 @@ pub(super) fn role_usage_report(
     plan: &SupervisorPlan,
     samples: Vec<RoleUsageSample>,
 ) -> Result<RoleUsageAggregation> {
+    #[derive(Debug)]
+    struct LensModelUsage {
+        usage: Usage,
+        cost_usd: Option<f64>,
+        last_observed_sequence: usize,
+    }
+
+    #[derive(Debug)]
+    struct LensUsage {
+        backend_id: String,
+        configured_model: String,
+        models: BTreeMap<String, LensModelUsage>,
+    }
+
     let mut aggregates = BTreeMap::<AgentRole, (Usage, BTreeSet<String>, Option<f64>)>::new();
-    let mut lens_aggregates = plan
-        .review_lenses
-        .iter()
-        .map(|lens| {
-            (
-                lens.id.clone(),
-                (
-                    lens.backend.backend_id().to_string(),
-                    lens.backend.model().to_string(),
-                    Usage::default(),
-                    Some(0.0),
-                    false,
-                ),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut lens_aggregates = BTreeMap::new();
+    for lens in &plan.review_lenses {
+        let prior = lens_aggregates.insert(
+            lens.id.clone(),
+            LensUsage {
+                backend_id: lens.backend.backend_id().to_string(),
+                configured_model: lens.backend.model().to_string(),
+                models: BTreeMap::new(),
+            },
+        );
+        if prior.is_some() {
+            bail!(
+                "cannot attribute review usage because configured lens id '{}' is duplicated",
+                lens.id
+            );
+        }
+    }
     let mut total_usage = Usage::default();
     let mut total_cost_usd = Some(0.0);
-    for sample in samples {
+    for (sample_sequence, sample) in samples.into_iter().enumerate() {
         if !matches!(
             sample.role,
             AgentRole::ChildOrchestrator | AgentRole::GateClassifier | AgentRole::Auditor
@@ -1519,22 +1534,29 @@ pub(super) fn role_usage_report(
             let lens_aggregate = lens_aggregates.get_mut(lens_id).with_context(|| {
                 format!("usage referenced unknown configured review lens '{lens_id}'")
             })?;
-            if sample.model.as_deref() != Some(lens_aggregate.1.as_str()) {
-                bail!(
-                    "review lens '{}' usage model does not match configured model '{}'",
-                    lens_id,
-                    lens_aggregate.1
-                );
-            }
-            lens_aggregate.2 = lens_aggregate.2.saturating_add(sample.usage);
-            lens_aggregate.3 = match (lens_aggregate.3, sample_cost_usd) {
+            let sample_model = sample.model.as_deref().with_context(|| {
+                format!(
+                    "review lens '{}' usage omitted the dispatched model attribution",
+                    lens_id
+                )
+            })?;
+            let model_aggregate = lens_aggregate
+                .models
+                .entry(sample_model.to_string())
+                .or_insert(LensModelUsage {
+                    usage: Usage::default(),
+                    cost_usd: Some(0.0),
+                    last_observed_sequence: sample_sequence,
+                });
+            model_aggregate.usage = model_aggregate.usage.saturating_add(sample.usage);
+            model_aggregate.cost_usd = match (model_aggregate.cost_usd, sample_cost_usd) {
                 (Some(total), Some(cost)) => {
                     let total = total + cost;
                     total.is_finite().then_some(total)
                 }
                 _ => None,
             };
-            lens_aggregate.4 = true;
+            model_aggregate.last_observed_sequence = sample_sequence;
         }
         total_cost_usd = match (total_cost_usd, sample_cost_usd) {
             (Some(total), Some(cost)) => {
@@ -1605,20 +1627,22 @@ pub(super) fn role_usage_report(
     let all_lenses_observed = !lens_aggregates.is_empty()
         && lens_aggregates
             .values()
-            .all(|(_, _, _, _, observed)| *observed);
+            .all(|aggregate| !aggregate.models.is_empty());
     let lens_total_usage = all_lenses_observed.then(|| {
         lens_aggregates
             .values()
-            .fold(Usage::default(), |total, (_, _, usage, _, _)| {
-                total.saturating_add(*usage)
+            .flat_map(|aggregate| aggregate.models.values())
+            .fold(Usage::default(), |total, model| {
+                total.saturating_add(model.usage)
             })
     });
     let lens_total_cost_usd = all_lenses_observed
         .then(|| {
             lens_aggregates
                 .values()
-                .try_fold(0.0, |total, (_, _, _, cost, _)| {
-                    cost.and_then(|cost| {
+                .flat_map(|aggregate| aggregate.models.values())
+                .try_fold(0.0, |total, model| {
+                    model.cost_usd.and_then(|cost| {
                         let total = total + cost;
                         total.is_finite().then_some(total)
                     })
@@ -1627,26 +1651,45 @@ pub(super) fn role_usage_report(
         .flatten();
     let lens_reports = lens_aggregates
         .into_iter()
-        .map(
-            |(lens_id, (backend_id, model, usage, cost_usd, observed))| {
-                ReviewLensUsageReport {
+        .flat_map(|(lens_id, aggregate)| {
+            if aggregate.models.is_empty() {
+                return vec![ReviewLensUsageReport {
                     lens_id,
-                    backend_id,
-                    model,
-                    usage: observed.then_some(usage),
-                    cost_usd: observed.then_some(cost_usd).flatten(),
-                    observation: if observed {
-                        RoleUsageObservation::ProcessObserved
-                    } else {
-                        RoleUsageObservation::NotProcessObservable
-                    },
-                    unavailable_reason: (!observed).then(|| {
+                    backend_id: aggregate.backend_id,
+                    model: aggregate.configured_model,
+                    usage: None,
+                    cost_usd: None,
+                    observation: RoleUsageObservation::NotProcessObservable,
+                    unavailable_reason: Some(
                         "no reliable process-observable usage sample was attributed to this configured review lens; usage and cost are not heuristically allocated"
-                            .to_string()
-                    }),
-                }
-            },
-        )
+                            .to_string(),
+                    ),
+                }];
+            }
+            let mut models = aggregate.models.into_iter().collect::<Vec<_>>();
+            // Keep the most recently observed (therefore currently active) model first so
+            // consumers that bind one entry per lens do not mistake an earlier rejected attempt
+            // for the final active selection. Every attempted model remains a distinct entry.
+            models.sort_by(|left, right| {
+                right
+                    .1
+                    .last_observed_sequence
+                    .cmp(&left.1.last_observed_sequence)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            models
+                .into_iter()
+                .map(|(model, model_usage)| ReviewLensUsageReport {
+                    lens_id: lens_id.clone(),
+                    backend_id: aggregate.backend_id.clone(),
+                    model,
+                    usage: Some(model_usage.usage),
+                    cost_usd: model_usage.cost_usd,
+                    observation: RoleUsageObservation::ProcessObserved,
+                    unavailable_reason: None,
+                })
+                .collect::<Vec<_>>()
+        })
         .collect();
     if !has_observed_samples {
         total_cost_usd = None;

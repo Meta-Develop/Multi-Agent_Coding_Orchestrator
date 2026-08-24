@@ -842,14 +842,26 @@ impl BudgetDegradationController {
         plan: &SupervisorPlan,
         policy: &AssignmentBudgetPolicy,
     ) {
+        // These bindings describe the assignment admission policy only. Retry-time selector
+        // decisions remain attempt-aware in `selection_decisions` and command evidence; do not
+        // overwrite this admission record and misrepresent a later retry as the initial binding.
+        let effective_plan = policy.apply(plan);
         let mut push = |duty_id: String,
                         role: AgentRole,
                         requested: Option<ReasoningEffort>,
                         fallback: Option<&str>,
+                        active_effort: Option<&str>,
                         budget_steps: usize,
                         process_observation: ProcessObservation,
                         unavailable_reason: Option<String>| {
-            let resolved = resolve_reasoning_effort(role, requested, fallback, budget_steps);
+            let mut resolved = resolve_reasoning_effort(role, requested, fallback, budget_steps);
+            if let Some(active_effort) = active_effort {
+                if resolved.resolved != active_effort {
+                    resolved.fallback = active_effort.to_string();
+                    resolved.resolved = active_effort.to_string();
+                    resolved.observation = EffortResolutionObservation::BudgetDegraded;
+                }
+            }
             self.assignment_effort_bindings
                 .push(AssignmentEffortBinding {
                     assignment_id: assignment.id.clone(),
@@ -865,48 +877,64 @@ impl BudgetDegradationController {
         };
         let child_fallback =
             configured_role_model_selection(plan, AgentRole::ChildOrchestrator).reasoning_effort;
+        let active_child_effort =
+            configured_role_model_selection(&effective_plan, AgentRole::ChildOrchestrator)
+                .reasoning_effort;
         push(
             assignment.id.clone(),
             AgentRole::ChildOrchestrator,
             requested_reasoning_effort,
             child_fallback.as_deref(),
+            active_child_effort.as_deref(),
             policy.child_effort_degradation_steps,
             ProcessObservation::SchedulerObserved,
-            None,
+            Some(
+                "admission-only effort binding; retry-time active effort is recorded in selection_decisions and process command evidence"
+                    .to_string(),
+            ),
         );
         let worker_fallback =
             configured_role_model_selection(plan, AgentRole::Worker).reasoning_effort;
+        let active_worker_effort =
+            configured_role_model_selection(&effective_plan, AgentRole::Worker).reasoning_effort;
         for worker in &assignment.worker_assignments {
             push(
                 worker.id.clone(),
                 AgentRole::Worker,
                 requested_reasoning_effort,
                 worker_fallback.as_deref(),
+                active_worker_effort.as_deref(),
                 0,
                 ProcessObservation::NotProcessObservable,
                 Some(
-                    "nested worker effort is resolved in prompt context; no separate worker process is launched"
+                    "admission-only nested-worker effort binding; retry-time active effort is recorded in selection_decisions and prompt evidence, and no separate worker process is launched"
                         .to_string(),
                 ),
             );
         }
         let gate_fallback =
             configured_role_model_selection(plan, AgentRole::GateClassifier).reasoning_effort;
+        let active_gate_effort =
+            configured_role_model_selection(&effective_plan, AgentRole::GateClassifier)
+                .reasoning_effort;
         push(
             format!("{}-acceptance-gate", assignment.id),
             AgentRole::GateClassifier,
             requested_reasoning_effort,
             gate_fallback.as_deref(),
+            active_gate_effort.as_deref(),
             0,
             ProcessObservation::NotProcessObservable,
             Some(
-                "the current acceptance-gate classifier is a deterministic local broker without provider reasoning-effort telemetry"
+                "admission-only effort binding; the current acceptance-gate classifier is a deterministic local broker without provider reasoning-effort telemetry"
                     .to_string(),
             ),
         );
         let auditor_fallback =
             configured_role_model_selection(plan, AgentRole::Auditor).reasoning_effort;
-        for (lens_index, lens) in plan.review_lenses.iter().enumerate() {
+        let active_auditor_effort =
+            configured_role_model_selection(&effective_plan, AgentRole::Auditor).reasoning_effort;
+        for (lens_index, lens) in effective_plan.review_lenses.iter().enumerate() {
             let requested = requested_reasoning_effort.or_else(|| {
                 lens.backend
                     .reasoning_effort()
@@ -917,10 +945,11 @@ impl BudgetDegradationController {
                 AgentRole::Auditor,
                 requested,
                 auditor_fallback.as_deref(),
+                active_auditor_effort.as_deref(),
                 0,
                 ProcessObservation::NotRetained,
                 Some(
-                    "the scheduler resolved this review-auditor duty; inspect commands_run for launch evidence"
+                    "admission-only review-auditor effort binding; retry-time active effort is recorded in selection_decisions, and commands_run contains launch evidence"
                         .to_string(),
                 ),
             );
@@ -3327,6 +3356,9 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         total_cost_usd: observed_total_cost_usd,
         lens_total_usage: review_lens_total_usage,
         lens_total_cost_usd: observed_review_lens_total_cost_usd,
+        // The validated plan remains the immutable authority for lens/backend identity and
+        // pricing. Each usage sample carries its actual active-attempt model; aggregation must
+        // retain that model rather than re-impose the original configured selection.
     } = role_usage_report(&plan, std::mem::take(&mut collected.usage_samples))?;
     let total_cost_usd =
         finalize_supervisor_cost(usage_complete, &mut role_usage, observed_total_cost_usd);
@@ -3651,6 +3683,108 @@ mod selection_policy_tests {
                 panic!("selector-bound lens changed backend")
             }
         }
+    }
+
+    #[test]
+    fn admission_effort_bindings_use_the_active_budget_selection() {
+        let mut plan = test_plan();
+        let assignment = OrchestratorAssignment {
+            id: "active-effort-assignment".to_string(),
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: vec![WorkerAssignment {
+                id: "active-effort-worker".to_string(),
+                role: AgentRole::Worker,
+                assigned_paths: vec![PathBuf::from("README.md")],
+                semantic_symbols: Vec::new(),
+                semantic_modules: Vec::new(),
+                task: None,
+                environment_requirements: Vec::new(),
+                report_path: None,
+            }],
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        plan.assignments = vec![assignment.clone()];
+        plan.role_models
+            .insert(AgentRole::Worker, role_selection("initial-worker", "low"));
+        let (initial_auditor_model, initial_auditor_effort) = match &plan.review_lenses[0].backend {
+            ReviewLensBackendConfig::Model {
+                model,
+                reasoning_effort,
+                ..
+            } => (
+                model.clone(),
+                reasoning_effort.clone().expect("default auditor effort"),
+            ),
+            ReviewLensBackendConfig::Precomputed { .. } => {
+                panic!("default lens must be model-backed")
+            }
+        };
+        plan.role_models.insert(
+            AgentRole::Auditor,
+            role_selection(&initial_auditor_model, &initial_auditor_effort),
+        );
+        let mut policy = AssignmentBudgetPolicy::default();
+        policy.set_selector_binding_for_test(
+            AgentRole::Worker,
+            SupervisorRuntime::Codex,
+            role_selection("active-worker", "high"),
+        );
+        policy.set_selector_binding_for_test(
+            AgentRole::Auditor,
+            SupervisorRuntime::Codex,
+            role_selection("active-auditor", "ultra"),
+        );
+        let active_plan = policy.apply(&plan);
+        assert_eq!(
+            active_plan.role_models[&AgentRole::Worker]
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            active_plan.role_models[&AgentRole::Auditor]
+                .reasoning_effort
+                .as_deref(),
+            Some("ultra")
+        );
+
+        let mut controller = BudgetDegradationController::new(1);
+        controller.record_assignment_effort_bindings(&assignment, None, &plan, &policy);
+        let worker = controller
+            .assignment_effort_bindings
+            .iter()
+            .find(|binding| binding.role == AgentRole::Worker)
+            .expect("nested-worker admission binding");
+        assert_eq!(worker.resolved_reasoning_effort, "high");
+        assert_eq!(
+            worker.resolution_observation,
+            EffortResolutionObservation::BudgetDegraded
+        );
+        assert!(worker
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("admission-only")));
+        let auditor = controller
+            .assignment_effort_bindings
+            .iter()
+            .find(|binding| binding.role == AgentRole::Auditor)
+            .expect("review-auditor admission binding");
+        assert_eq!(auditor.resolved_reasoning_effort, "ultra");
+        assert_eq!(
+            auditor.resolution_observation,
+            EffortResolutionObservation::AssignmentOverride
+        );
+        assert!(auditor
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("retry-time active effort")));
     }
 
     #[test]
