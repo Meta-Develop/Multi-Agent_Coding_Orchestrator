@@ -249,7 +249,7 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
         "required": [
             "schema_version", "name", "evidence", "evidence_notice", "production_eligible",
             "model_availability", "overridden_roles", "role_models",
-            "model_catalog_observation", "execution"
+            "model_catalog_observation", "execution", "resolved_objective_profile"
         ],
         "properties": {
             "schema_version": {
@@ -274,6 +274,7 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                 "type": "string",
                 "enum": ["consulted", "consultation_failed", "not_consulted"]
             },
+            "resolved_objective_profile": resolved_objective_profile_schema_value(),
             "execution": {
                 "type": "object",
                 "additionalProperties": false,
@@ -293,6 +294,55 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                     "assignment_selection_ledger": assignment_selection_ledger_schema_value(),
                     "selection_decisions": selection_decisions_schema_value(),
                     "usage": execution_usage_schema_value()
+                }
+            }
+        }
+    })
+}
+
+fn resolved_objective_profile_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["profile", "source"],
+        "properties": {
+            "source": {
+                "type": "string",
+                "enum": ["built_in", "repository_override"]
+            },
+            "profile": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id", "version", "content_hash", "quality", "tradeoffs"],
+                "properties": {
+                    "id": {"type": "string", "minLength": 1},
+                    "version": {"type": "integer", "minimum": 1},
+                    "content_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "quality": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["held_out_percent", "breadth_percent", "anti_shortcut_percent"],
+                        "properties": {
+                            "held_out_percent": {"type": "integer", "minimum": 0, "maximum": 100},
+                            "breadth_percent": {"type": "integer", "minimum": 0, "maximum": 100},
+                            "anti_shortcut_percent": {"type": "integer", "minimum": 0, "maximum": 100}
+                        }
+                    },
+                    "tradeoffs": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                            "monetary_cost_percent", "quota_consumption_percent", "latency_percent",
+                            "retry_rework_percent", "human_review_percent"
+                        ],
+                        "properties": {
+                            "monetary_cost_percent": {"type": "integer", "minimum": 0, "maximum": 100},
+                            "quota_consumption_percent": {"type": "integer", "minimum": 0, "maximum": 100},
+                            "latency_percent": {"type": "integer", "minimum": 0, "maximum": 100},
+                            "retry_rework_percent": {"type": "integer", "minimum": 0, "maximum": 100},
+                            "human_review_percent": {"type": "integer", "minimum": 0, "maximum": 100}
+                        }
+                    }
                 }
             }
         }

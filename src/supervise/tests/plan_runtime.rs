@@ -1,6 +1,207 @@
 use super::*;
 
 #[test]
+fn objective_profile_request_round_trips_outside_the_public_plan_struct() {
+    let default_document = serde_json::from_slice::<Value>(&bounded_loader_plan_json())
+        .expect("parse default plan fixture");
+    let default_loaded = parse_supervisor_plan_with_consultant(&default_document.to_string())
+        .expect("load omitted objective profile");
+    assert!(default_loaded.plan_metadata.objective_profile.is_none());
+    let default_normalized = supervisor_plan_value(
+        &default_loaded.plan,
+        &default_loaded.consultant,
+        &default_loaded.assignment_metadata,
+        &default_loaded.plan_metadata,
+    )
+    .expect("normalize omitted objective profile");
+    assert!(default_normalized.get("objective_profile").is_none());
+
+    let mut named_document = default_document;
+    named_document["objective_profile"] = json!("review-balanced-v2");
+    let named_loaded = parse_supervisor_plan_with_consultant(&named_document.to_string())
+        .expect("load named objective profile");
+    assert_eq!(
+        named_loaded.plan_metadata.objective_profile.as_deref(),
+        Some("review-balanced-v2")
+    );
+    assert!(named_loaded
+        .plan_metadata
+        .resolved_objective_profile
+        .is_none());
+    let named_normalized = supervisor_plan_value(
+        &named_loaded.plan,
+        &named_loaded.consultant,
+        &named_loaded.assignment_metadata,
+        &named_loaded.plan_metadata,
+    )
+    .expect("normalize named objective profile");
+    assert_eq!(named_normalized["objective_profile"], "review-balanced-v2");
+    let reparsed = parse_supervisor_plan_with_consultant(&named_normalized.to_string())
+        .expect("reparse named objective profile");
+    assert_eq!(reparsed, named_loaded);
+
+    named_document["objective_profile"] = json!({"id": "not-a-string"});
+    let error = parse_supervisor_plan_with_consultant(&named_document.to_string())
+        .expect_err("non-string objective profile request must fail");
+    assert!(format!("{error:#}").contains("objective_profile must be a string"));
+}
+
+#[test]
+fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidence() {
+    let (temp, repo_path) = injected_repository();
+    let profile_id = "review-sensitive-routing-v1";
+    fs::write(
+        repo_path.join(crate::objective_profile::OBJECTIVE_PROFILE_OVERRIDE_FILE),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "profiles": [{
+                "id": profile_id,
+                "version": 1,
+                "quality": {
+                    "held_out_percent": 50,
+                    "breadth_percent": 25,
+                    "anti_shortcut_percent": 25
+                },
+                "tradeoffs": {
+                    "monetary_cost_percent": 25,
+                    "quota_consumption_percent": 0,
+                    "latency_percent": 0,
+                    "retry_rework_percent": 0,
+                    "human_review_percent": 75
+                }
+            }]
+        }))
+        .expect("serialize objective profile override"),
+    )
+    .expect("write objective profile override");
+
+    let plan_document = serde_json::to_value(injected_plan(injected_assignment(false), 0))
+        .expect("serialize injected plan");
+    let mut authored_document = plan_document.clone();
+    authored_document["objective_profile"] = json!(profile_id);
+    let mut default_loaded =
+        parse_supervisor_plan_with_consultant(&plan_document.to_string()).expect("default plan");
+    let mut authored_loaded = parse_supervisor_plan_with_consultant(&authored_document.to_string())
+        .expect("authored objective-profile plan");
+    assert_eq!(
+        authored_loaded.plan_metadata.objective_profile.as_deref(),
+        Some(profile_id)
+    );
+
+    let catalog = RuntimeModelCatalog::Codex(
+        CodexRuntimeModelCatalog::from_slugs(
+            crate::selection::built_in_prior_dataset()
+                .expect("built-in selector priors")
+                .models
+                .into_iter()
+                .filter(|prior| prior.runtime == "codex")
+                .map(|prior| prior.model),
+        )
+        .expect("Codex selector catalog"),
+    );
+    let catalog = Ok(catalog);
+    let admission = SupervisorAdmissionPolicyInput::resolve(
+        &repo_path,
+        1,
+        SupervisorAdmissionConfig::default(),
+        SupervisorAdmissionConfig::default(),
+    )
+    .expect("resolve selector admission");
+
+    let default = initialize_supervisor_selection_from_prepared_metadata(
+        &repo_path,
+        SupervisorRuntime::Codex,
+        SupervisorExecutionRuntime::Verified,
+        &mut default_loaded.plan,
+        &mut default_loaded.plan_metadata,
+        &catalog,
+        &admission,
+    )
+    .expect("default verified scheduler selection");
+    let adjusted = initialize_supervisor_selection_from_prepared_metadata(
+        &repo_path,
+        SupervisorRuntime::Codex,
+        SupervisorExecutionRuntime::Verified,
+        &mut authored_loaded.plan,
+        &mut authored_loaded.plan_metadata,
+        &catalog,
+        &admission,
+    )
+    .expect("authored verified scheduler selection");
+
+    fn worker_decision(resolution: &SupervisorSelectionResolution) -> &SupervisorSelectionEvent {
+        resolution
+            .decisions
+            .iter()
+            .find(|event| event.role == AgentRole::Worker)
+            .expect("worker selector decision")
+    }
+    let default_worker = worker_decision(&default);
+    let adjusted_worker = worker_decision(&adjusted);
+    let default_choice = default_worker
+        .provenance
+        .choice
+        .as_ref()
+        .expect("default worker choice");
+    let adjusted_choice = adjusted_worker
+        .provenance
+        .choice
+        .as_ref()
+        .expect("adjusted worker choice");
+    assert_ne!(default_choice.candidate, adjusted_choice.candidate);
+    assert_eq!(
+        adjusted_choice.reason,
+        crate::selection::ChoiceReason::LowestLegacyBaselinePlusCostProxyAdjustments
+    );
+
+    let resolved = &adjusted_worker.provenance.resolved_objective_profile;
+    assert_eq!(resolved.profile.id, profile_id);
+    assert_eq!(
+        resolved.source,
+        crate::objective_profile::ObjectiveProfileSource::RepositoryOverride
+    );
+    assert_eq!(resolved.profile.tradeoffs.monetary_cost_percent, 25);
+    assert_eq!(resolved.profile.tradeoffs.human_review_percent, 75);
+    assert_eq!(resolved.profile.tradeoffs.quota_consumption_percent, 0);
+    assert_eq!(resolved.profile.tradeoffs.latency_percent, 0);
+    assert_eq!(resolved.profile.tradeoffs.retry_rework_percent, 0);
+    let selected_score = adjusted_worker
+        .provenance
+        .candidate_set
+        .iter()
+        .find(|candidate| candidate.candidate == adjusted_choice.candidate)
+        .and_then(|candidate| candidate.score.as_ref())
+        .expect("selected candidate score evidence");
+    assert_eq!(
+        selected_score.routing_score_semantics,
+        crate::selection::RoutingScoreSemantics::LegacyBaselinePlusCostProxyAdjustmentsV1
+    );
+    assert_eq!(
+        selected_score.routing_tradeoff_weights,
+        resolved.profile.tradeoffs
+    );
+    assert_eq!(selected_score.retry_rework_adjustment_microunits, 0);
+    assert_eq!(
+        selected_score.human_review_adjustment_microunits,
+        selected_score.human_review_cost_proxy_microunits * 75 / 25
+    );
+    assert_eq!(
+        selected_score.total_adjustment_microunits,
+        selected_score.human_review_adjustment_microunits
+    );
+    assert_eq!(
+        selected_score.total_score_microunits,
+        selected_score.legacy_baseline_score_microunits
+            + selected_score.total_adjustment_microunits
+    );
+    assert_eq!(
+        authored_loaded.plan_metadata.resolved_objective_profile,
+        Some(resolved.clone())
+    );
+    drop(temp);
+}
+
+#[test]
 fn authored_serial_plan_reports_independent_scope_width_warning() {
     let mut assignment = injected_assignment(false);
     assignment.assigned_paths = vec![PathBuf::from("README.md"), PathBuf::from("src/planning.rs")];
@@ -1149,6 +1350,8 @@ fn supervisor_traceability_reports_missing_changes_and_diff_binding() {
         0,
     );
     let metadata = SupervisorPlanMetadata {
+        objective_profile: None,
+        resolved_objective_profile: None,
         execution_target: None,
         spec_fragment_ids: vec!["SPEC-a".to_string(), "SPEC-b".to_string()],
         spec_fragment_ids_by_assignment: BTreeMap::from([
@@ -1208,6 +1411,8 @@ fn supervisor_traceability_reports_missing_changes_and_diff_binding() {
 fn supervisor_traceability_binds_ordinary_success_to_observed_paths_and_diff() {
     let plan = injected_multi_plan(vec![injected_named_assignment("child-a", "src/a.rs")], 0);
     let metadata = SupervisorPlanMetadata {
+        objective_profile: None,
+        resolved_objective_profile: None,
         execution_target: None,
         spec_fragment_ids: vec!["SPEC-a".to_string()],
         spec_fragment_ids_by_assignment: BTreeMap::from([(
@@ -1350,6 +1555,8 @@ fn admitted_nested_assignment_retains_ordinary_pipeline_and_acceptance_evidence(
         diff_oid: "3333333333333333333333333333333333333333".to_string(),
     };
     let metadata = SupervisorPlanMetadata {
+        objective_profile: None,
+        resolved_objective_profile: None,
         execution_target: None,
         spec_fragment_ids: vec!["SPEC-execution".to_string()],
         spec_fragment_ids_by_assignment: BTreeMap::from([(
@@ -2004,6 +2211,73 @@ fn known_unavailable_child_runtime_default_is_refused_as_capability_evidence() {
                 .contains("runtime-default model selection is not capability evidence")
         }),
         "expected capability refusal, got {report:#?}"
+    );
+    let resolved = report
+        .role_economics_profile
+        .as_ref()
+        .and_then(|profile| profile.resolved_objective_profile.as_ref())
+        .expect("new final report freezes the effective objective profile");
+    assert_eq!(
+        resolved.source,
+        crate::objective_profile::ObjectiveProfileSource::BuiltIn
+    );
+    assert_eq!(
+        resolved.profile,
+        crate::objective_profile::default_objective_profile()
+            .binding()
+            .expect("default objective binding")
+    );
+    assert_eq!(resolved.profile.quality.held_out_percent, 50);
+    assert_eq!(resolved.profile.quality.breadth_percent, 25);
+    assert_eq!(resolved.profile.quality.anti_shortcut_percent, 25);
+    assert_eq!(resolved.profile.tradeoffs.monetary_cost_percent, 100);
+    let round_trip: SupervisorFinalReport = serde_json::from_value(
+        serde_json::to_value(&report).expect("serialize objective profile evidence"),
+    )
+    .expect("round-trip objective profile evidence");
+    assert_eq!(
+        round_trip
+            .role_economics_profile
+            .and_then(|profile| profile.resolved_objective_profile),
+        Some(resolved.clone())
+    );
+}
+
+#[test]
+fn invalid_objective_profile_file_fails_before_external_dispatch() {
+    let (temp, repo_path) = injected_repository();
+    fs::write(
+        repo_path.join(crate::objective_profile::OBJECTIVE_PROFILE_OVERRIDE_FILE),
+        br#"{
+          "schema_version": 1,
+          "profiles": [],
+          "unexpected": true
+        }"#,
+    )
+    .expect("write invalid objective profile override");
+    let plan = injected_plan(injected_assignment(false), 0);
+    let options = injected_options(&repo_path, temp.path(), "invalid-objective-profile-file");
+    let catalog = injected_codex_runtime_catalog(&[DEFAULT_PROFILE_MODEL]);
+    let mut invocations = 0usize;
+    let mut runner = |_command: &ExternalAgentCommand| {
+        invocations = invocations.saturating_add(1);
+        panic!("invalid objective profile configuration must prevent dispatch")
+    };
+
+    let error = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        Ok(catalog),
+        &mut runner,
+    )
+    .expect_err("invalid objective profile file must fail closed");
+
+    assert_eq!(invocations, 0);
+    assert!(
+        format!("{error:#}").contains("unknown field"),
+        "unexpected objective-profile error: {error:#}"
     );
 }
 

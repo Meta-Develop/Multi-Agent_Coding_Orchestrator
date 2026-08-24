@@ -1,6 +1,15 @@
 use super::*;
 use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
 
+fn apply_objective_profile_override(
+    loaded: &mut LoadedSupervisorPlan,
+    objective_profile_override: Option<&str>,
+) {
+    if let Some(objective_profile_override) = objective_profile_override {
+        loaded.plan_metadata.objective_profile = Some(objective_profile_override.to_string());
+    }
+}
+
 fn validate_execution_target_pre_dispatch(
     loaded: &LoadedSupervisorPlan,
     allow_primary_worktree: bool,
@@ -283,6 +292,8 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         assignments,
     };
     let metadata = SupervisorPlanMetadata {
+        objective_profile: None,
+        resolved_objective_profile: None,
         execution_target: None,
         spec_fragment_ids,
         spec_fragment_ids_by_assignment,
@@ -355,6 +366,8 @@ fn supervisor_plan_and_consultant_from_provider_session(
         assignments,
     };
     let metadata = SupervisorPlanMetadata {
+        objective_profile: None,
+        resolved_objective_profile: None,
         execution_target: None,
         spec_fragment_ids: current_fragment_ids.into_iter().collect(),
         spec_fragment_ids_by_assignment,
@@ -1034,6 +1047,15 @@ fn supervisor_plan_metadata_from_value(
     value: &Value,
     max_depth: u8,
 ) -> Result<SupervisorPlanMetadata> {
+    let objective_profile = value
+        .get("objective_profile")
+        .map(|profile| {
+            profile
+                .as_str()
+                .context("objective_profile must be a string")
+                .map(str::to_string)
+        })
+        .transpose()?;
     let spec_fragment_ids = optional_string_array(value, "spec_fragment_ids")?;
     let (run_budget, run_budget_max_duration_seconds) = value
         .get("run_budget")
@@ -1095,6 +1117,7 @@ fn supervisor_plan_metadata_from_value(
         .and_then(Value::as_array)
         .context("supervisor plan assignments must be an array")?;
     let mut metadata = SupervisorPlanMetadata {
+        objective_profile,
         spec_fragment_ids,
         run_budget,
         run_budget_max_duration_seconds,
@@ -1517,6 +1540,12 @@ pub(super) fn supervisor_plan_value(
     let object = value
         .as_object_mut()
         .context("normalized supervisor plan did not serialize to an object")?;
+    if let Some(objective_profile) = &plan_metadata.objective_profile {
+        object.insert(
+            "objective_profile".to_string(),
+            Value::String(objective_profile.clone()),
+        );
+    }
     if !plan_metadata.spec_fragment_ids.is_empty() || plan_metadata.generated_follow_up.is_some() {
         object.insert(
             "spec_fragment_ids".to_string(),
@@ -1696,6 +1725,20 @@ pub fn run_supervisor_plan_file_cascade_with_concurrency_policy_and_primary_work
     concurrency_policy: SupervisorConcurrencyPolicy,
     allow_primary_worktree: bool,
 ) -> Result<SupervisorCascadeOutcome> {
+    run_supervisor_plan_file_cascade_with_concurrency_policy_and_primary_worktree_opt_in_and_objective_profile_override(
+        options,
+        concurrency_policy,
+        allow_primary_worktree,
+        None,
+    )
+}
+
+pub fn run_supervisor_plan_file_cascade_with_concurrency_policy_and_primary_worktree_opt_in_and_objective_profile_override(
+    options: SupervisorRunOptions,
+    concurrency_policy: SupervisorConcurrencyPolicy,
+    allow_primary_worktree: bool,
+    objective_profile_override: Option<String>,
+) -> Result<SupervisorCascadeOutcome> {
     let outer_run_id = options.run_id.clone();
     let mut permit = |_plan: &SupervisorPlan| Ok(None);
     let cancellation_observed = AtomicBool::new(false);
@@ -1708,6 +1751,7 @@ pub fn run_supervisor_plan_file_cascade_with_concurrency_policy_and_primary_work
         &cancellation_observed,
         None,
         allow_primary_worktree,
+        objective_profile_override.as_deref(),
         &mut permit,
         &run_external_agent_cancellable_reviewed,
     )
@@ -1735,11 +1779,30 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_work
     concurrency_policy: SupervisorConcurrencyPolicy,
     allow_primary_worktree: bool,
 ) -> Result<SupervisorCascadeOutcome> {
+    run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_worktree_opt_in_and_objective_profile_override(
+        options,
+        goal,
+        spec,
+        concurrency_policy,
+        allow_primary_worktree,
+        None,
+    )
+}
+
+pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_worktree_opt_in_and_objective_profile_override(
+    options: SupervisorRunOptions,
+    goal: &str,
+    spec: &str,
+    concurrency_policy: SupervisorConcurrencyPolicy,
+    allow_primary_worktree: bool,
+    objective_profile_override: Option<String>,
+) -> Result<SupervisorCascadeOutcome> {
     let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
     validate_max_concurrent_children(max_concurrent_children)?;
     let outer_run_id = options.run_id.clone();
     let repo = discover_repo_root(&options.repo)?;
-    let loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
+    let mut loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
+    apply_objective_profile_override(&mut loaded, objective_profile_override.as_deref());
     validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
@@ -1889,6 +1952,7 @@ pub(crate) fn run_supervisor_plan_file_cascade_for_autopilot(
                 cancellation_observed,
                 Some(source_dispatch_started),
                 false,
+                None,
                 before_dispatch,
                 &external_runner,
             )
@@ -1902,6 +1966,7 @@ pub(crate) fn run_supervisor_plan_file_cascade_for_autopilot(
             cancellation_observed,
             Some(source_dispatch_started),
             false,
+            None,
             before_dispatch,
             &run_external_agent_cancellable_reviewed,
         ),
@@ -1918,13 +1983,15 @@ fn run_supervisor_plan_file_cascade_with_gate(
     cancellation_observed: &AtomicBool,
     source_dispatch_started: Option<&AtomicBool>,
     allow_primary_worktree: bool,
+    objective_profile_override: Option<&str>,
     before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorCascadeOutcome> {
     let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
     validate_max_concurrent_children(max_concurrent_children)?;
     let repo = discover_repo_root(&options.repo)?;
-    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    apply_objective_profile_override(&mut loaded, objective_profile_override);
     validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
     if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
         bail!("autopilot caller cancelled before exact loaded-plan dispatch");
@@ -2197,6 +2264,11 @@ pub(super) fn evidence_only_reaudit_plan_from_source(
     let mut fragments_by_assignment = BTreeMap::new();
     fragments_by_assignment.insert(assignment_id.clone(), fragments.clone());
     let plan_metadata = SupervisorPlanMetadata {
+        objective_profile: source_loaded.plan_metadata.objective_profile,
+        resolved_objective_profile: source_report
+            .role_economics_profile
+            .as_ref()
+            .and_then(|profile| profile.resolved_objective_profile.clone()),
         spec_fragment_ids: fragments,
         spec_fragment_ids_by_assignment: fragments_by_assignment,
         assignment_schedule: vec![AssignmentScheduleEntry {

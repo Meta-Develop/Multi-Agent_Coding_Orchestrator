@@ -43,6 +43,7 @@ use crate::{
         FieldGuideEventKind, OrchestrationEventJournal, OrchestrationEventKind, OrchestrationRole,
     },
     orchestrator::{RunId, SemanticCoordinationMode},
+    objective_profile::{resolve_objective_profile, ResolvedObjectiveProfile},
     planning,
     pre_action_review::{RatioMetric, RepoPathRule, ReviewContext, ReviewMetricSnapshot},
     process_runner::{
@@ -1021,7 +1022,7 @@ impl RuntimeModelCatalog {
     }
 }
 
-const SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION: u32 = 5;
+const SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct RoleEconomicsProfile {
@@ -1040,6 +1041,10 @@ pub struct RoleEconomicsProfile {
     pub model_catalog_observation: RuntimeModelCatalogObservation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<SupervisorExecutionMetadata>,
+    /// Frozen objective-profile evidence for this run. Older reports omit it;
+    /// the generated schema requires it for newly finalized reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_objective_profile: Option<ResolvedObjectiveProfile>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -1461,6 +1466,8 @@ impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMe
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct SupervisorPlanMetadata {
+    objective_profile: Option<String>,
+    resolved_objective_profile: Option<ResolvedObjectiveProfile>,
     spec_fragment_ids: Vec<String>,
     spec_fragment_ids_by_assignment: BTreeMap<String, Vec<String>>,
     assignment_schedule: Vec<AssignmentScheduleEntry>,
@@ -3330,6 +3337,7 @@ impl SupervisorPlan {
             role_models,
             model_catalog_observation: RuntimeModelCatalogObservation::NotConsulted,
             execution: None,
+            resolved_objective_profile: None,
         }
     }
 

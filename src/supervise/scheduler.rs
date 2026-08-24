@@ -2530,36 +2530,15 @@ fn prepare_supervisor_run(
     )?;
     let max_concurrent_children = admission_policy_input.resolved_bound;
     let requested_plan = plan.clone();
-    let legacy_nonpublishable_explicit_selection =
-        uses_legacy_nonpublishable_explicit_selection(execution_runtime, &plan);
-    let selection = match runtime_model_catalog.as_ref() {
-        Ok(_) if legacy_nonpublishable_explicit_selection => SupervisorSelectionResolution {
-            mode: SupervisorSelectionMode::LegacyNonpublishableSimulation,
-            decisions: Vec::new(),
-            automatic_state: None,
-            selection_preflight_failure: None,
-        },
-        Ok(catalog) => {
-            let advertised = advertised_catalogs_for_launch(&repo)?;
-            let resolution = initialize_supervisor_selection(
-                &mut plan,
-                runtime,
-                catalog,
-                &admission_policy_input,
-                &advertised,
-            )?;
-            if resolution.selection_preflight_failure.is_none() {
-                bind_selected_assignment_runtimes(&mut plan, &resolution.decisions)?;
-            }
-            resolution
-        }
-        Err(_) => SupervisorSelectionResolution {
-            mode: SupervisorSelectionMode::LegacyFake,
-            decisions: Vec::new(),
-            automatic_state: None,
-            selection_preflight_failure: None,
-        },
-    };
+    let selection = initialize_supervisor_selection_from_prepared_metadata(
+        &repo,
+        runtime,
+        execution_runtime,
+        &mut plan,
+        &mut plan_metadata,
+        &runtime_model_catalog,
+        &admission_policy_input,
+    )?;
     let evidence_only_reaudit = plan_metadata
         .evidence_only_reaudit
         .as_ref()
@@ -2658,6 +2637,55 @@ fn prepare_supervisor_run(
         manager,
         _process_registration: process_registration,
     })
+}
+
+pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
+    repo: &Path,
+    runtime: SupervisorRuntime,
+    execution_runtime: SupervisorExecutionRuntime,
+    plan: &mut SupervisorPlan,
+    plan_metadata: &mut SupervisorPlanMetadata,
+    runtime_model_catalog: &RuntimeModelCatalogAcquisition,
+    admission_policy_input: &SupervisorAdmissionPolicyInput,
+) -> Result<SupervisorSelectionResolution> {
+    if plan_metadata.resolved_objective_profile.is_none() {
+        let requested_objective_profile = plan_metadata.objective_profile.clone();
+        plan_metadata.resolved_objective_profile = Some(
+            resolve_objective_profile(repo, requested_objective_profile.as_deref())
+                .context("failed to resolve the supervisor objective profile")?,
+        );
+    }
+    let legacy_nonpublishable_explicit_selection =
+        uses_legacy_nonpublishable_explicit_selection(execution_runtime, plan);
+    match runtime_model_catalog.as_ref() {
+        Ok(_) if legacy_nonpublishable_explicit_selection => Ok(SupervisorSelectionResolution {
+            mode: SupervisorSelectionMode::LegacyNonpublishableSimulation,
+            decisions: Vec::new(),
+            automatic_state: None,
+            selection_preflight_failure: None,
+        }),
+        Ok(catalog) => {
+            let advertised = advertised_catalogs_for_launch(repo)?;
+            let resolution = initialize_supervisor_selection(
+                plan,
+                runtime,
+                catalog,
+                admission_policy_input,
+                &advertised,
+                plan_metadata.resolved_objective_profile.as_ref(),
+            )?;
+            if resolution.selection_preflight_failure.is_none() {
+                bind_selected_assignment_runtimes(plan, &resolution.decisions)?;
+            }
+            Ok(resolution)
+        }
+        Err(_) => Ok(SupervisorSelectionResolution {
+            mode: SupervisorSelectionMode::LegacyFake,
+            decisions: Vec::new(),
+            automatic_state: None,
+            selection_preflight_failure: None,
+        }),
+    }
 }
 
 struct PredispatchFailureFinalization<'context, 'checkpoint> {
@@ -2770,6 +2798,9 @@ fn persist_supervisor_predispatch_failure(
         breaker_tripped: false,
         field_guide_mutation_failed: false,
     });
+    if let Some(profile) = final_report.role_economics_profile.as_mut() {
+        profile.resolved_objective_profile = plan_metadata.resolved_objective_profile.clone();
+    }
     apply_execution_target_reporting(&mut final_report, plan_metadata.execution_target.as_ref());
     let binding = artifact_writer
         .resume_binding()
@@ -3300,6 +3331,9 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         breaker_tripped,
         field_guide_mutation_failed,
     });
+    if let Some(profile) = final_report.role_economics_profile.as_mut() {
+        profile.resolved_objective_profile = plan_metadata.resolved_objective_profile.clone();
+    }
     apply_execution_target_reporting(&mut final_report, plan_metadata.execution_target.as_ref());
     let resume_binding = artifact_writer.resume_binding();
     #[cfg(test)]
@@ -3390,6 +3424,13 @@ mod selection_policy_tests {
         }
     }
 
+    fn default_resolved_objective_profile() -> Result<ResolvedObjectiveProfile> {
+        Ok(ResolvedObjectiveProfile {
+            profile: crate::objective_profile::default_objective_profile().binding()?,
+            source: crate::objective_profile::ObjectiveProfileSource::BuiltIn,
+        })
+    }
+
     fn automatic_provenance() -> Result<crate::selection::SelectionProvenance> {
         let priors = crate::selection::built_in_prior_dataset()?;
         let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(
@@ -3425,12 +3466,14 @@ mod selection_policy_tests {
             resolved_bound: 1,
         };
         let mut plan = test_plan();
+        let resolved_objective_profile = default_resolved_objective_profile()?;
         initialize_supervisor_selection(
             &mut plan,
             SupervisorRuntime::Codex,
             &catalog,
             &admission,
             &AdvertisedCatalogSet::empty(),
+            Some(&resolved_objective_profile),
         )?
         .decisions
         .into_iter()
@@ -3667,12 +3710,14 @@ mod selection_policy_tests {
             SupervisorAdmissionConfig::default(),
         )?;
 
+        let resolved_objective_profile = default_resolved_objective_profile()?;
         let resolution = initialize_supervisor_selection(
             &mut plan,
             SupervisorRuntime::Codex,
             &catalog,
             &admission,
             &AdvertisedCatalogSet::empty(),
+            Some(&resolved_objective_profile),
         )?;
 
         assert_eq!(resolution.mode, SupervisorSelectionMode::Automatic);
@@ -3777,12 +3822,14 @@ mod selection_policy_tests {
             SupervisorAdmissionConfig::default(),
         )?;
         let mut bridge_plan = plan.clone();
+        let resolved_objective_profile = default_resolved_objective_profile()?;
         let bridge_resolution = initialize_supervisor_selection(
             &mut bridge_plan,
             SupervisorRuntime::Codex,
             &catalog,
             &admission,
             &AdvertisedCatalogSet::empty(),
+            Some(&resolved_objective_profile),
         )?;
         assert_eq!(bridge_plan.role_models, original_role_models);
         assert!(bridge_resolution.selection_preflight_failure.is_some());

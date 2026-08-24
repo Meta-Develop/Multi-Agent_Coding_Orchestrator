@@ -3047,6 +3047,34 @@ fn ensure_regular_single_link_metadata(path: &Path, metadata: &fs::Metadata) -> 
     Ok(())
 }
 
+fn ensure_regular_single_link_open_file(
+    path: &Path,
+    file: &File,
+    metadata: &fs::Metadata,
+) -> Result<()> {
+    ensure_regular_single_link_metadata(path, metadata)?;
+    #[cfg(windows)]
+    {
+        let link_count =
+            crate::file_identity::windows_file_link_count(file).with_context(|| {
+                format!(
+                    "failed to inspect open Windows hard-link count for {}",
+                    path.display()
+                )
+            })?;
+        if link_count != 1 {
+            bail!(
+                "state input must have exactly one hard link (observed {}): {}",
+                link_count,
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = file;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn identity_from_metadata(metadata: &fs::Metadata) -> FileIdentity {
     FileIdentity {
@@ -3074,7 +3102,7 @@ fn identity_from_file(file: &File, path: &Path) -> Result<FileIdentity> {
     let metadata = file
         .metadata()
         .with_context(|| format!("failed to inspect opened file {}", path.display()))?;
-    ensure_regular_single_link_metadata(path, &metadata)?;
+    ensure_regular_single_link_open_file(path, file, &metadata)?;
     #[cfg(windows)]
     {
         identity_from_open_handle(file, path)
@@ -3187,7 +3215,7 @@ fn read_bounded_file_with_validator_and_hook(
     let before = file
         .metadata()
         .with_context(|| format!("failed to inspect opened file {}", path.display()))?;
-    ensure_regular_single_link_metadata(path, &before)?;
+    ensure_regular_single_link_open_file(path, file, &before)?;
     validate(&before)
         .with_context(|| format!("opened file metadata policy rejected {}", path.display()))?;
     if before.len() > max_bytes {
@@ -3224,7 +3252,7 @@ fn read_bounded_file_with_validator_and_hook(
     let after = file
         .metadata()
         .with_context(|| format!("failed to revalidate opened file {}", path.display()))?;
-    ensure_regular_single_link_metadata(path, &after)?;
+    ensure_regular_single_link_open_file(path, file, &after)?;
     validate(&after)
         .with_context(|| format!("opened file metadata policy changed for {}", path.display()))?;
     #[cfg(windows)]
