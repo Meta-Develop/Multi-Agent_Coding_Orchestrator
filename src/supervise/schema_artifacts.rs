@@ -1490,6 +1490,18 @@ fn schema_object_matches(
     }
 }
 
+fn codex_const_json_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 fn make_codex_response_format_compatible(schema: &mut serde_json::Value) -> Result<()> {
     if schema
         .as_object()
@@ -1500,6 +1512,11 @@ fn make_codex_response_format_compatible(schema: &mut serde_json::Value) -> Resu
     let serde_json::Value::Object(object) = schema else {
         return Ok(());
     };
+    if !object.contains_key("type") {
+        if let Some(schema_type) = object.get("const").map(codex_const_json_type) {
+            object.insert("type".to_string(), json!(schema_type));
+        }
+    }
     for unsupported in [
         "$schema",
         "allOf",
@@ -1730,6 +1747,9 @@ fn validate_codex_response_format_schema(schema: &serde_json::Value) -> Result<(
     let serde_json::Value::Object(object) = schema else {
         return Ok(());
     };
+    if object.contains_key("const") && !object.contains_key("type") {
+        bail!("Codex response const schema omitted its JSON type");
+    }
     for unsupported in [
         "$schema",
         "allOf",
@@ -2640,12 +2660,20 @@ mod selection_schema_tests {
         let failure = &command["properties"]["environment_failures"]["items"];
         assert!(required_contains(failure, "requirement"));
         assert!(schema_accepts_null(&failure["properties"]["requirement"]));
+        let requirement_kind =
+            &failure["properties"]["requirement"]["anyOf"][0]["properties"]["kind"];
+        assert_eq!(requirement_kind["const"], "executable");
+        assert_eq!(requirement_kind["type"], "string");
         let validation = &worker["properties"]["validation_results"]["items"];
         assert!(required_contains(validation, "command"));
         assert!(!schema_accepts_null(&validation["properties"]["command"]));
         assert!(required_contains(validation, "message"));
         assert!(schema_accepts_null(&validation["properties"]["message"]));
         validate_codex_response_format_schema(&codex)?;
+        assert!(validate_codex_response_format_schema(&json!({
+            "const": "missing-type"
+        }))
+        .is_err());
 
         let auditor = codex_response_format_schema(auditor_report_schema_value())?;
         assert_eq!(auditor["title"], "AuditorReport");
