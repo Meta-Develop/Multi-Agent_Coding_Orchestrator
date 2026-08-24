@@ -1,6 +1,11 @@
 use super::*;
 
 #[test]
+fn default_child_timeout_covers_nested_worker_and_auditor_turns() {
+    assert_eq!(default_child_timeout_seconds(), 1_200);
+}
+
+#[test]
 fn authored_serial_plan_reports_independent_scope_width_warning() {
     let mut assignment = injected_assignment(false);
     assignment.assigned_paths = vec![PathBuf::from("README.md"), PathBuf::from("src/planning.rs")];
