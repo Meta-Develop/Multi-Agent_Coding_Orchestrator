@@ -454,12 +454,15 @@ pub(super) fn child_orchestrator_prompt_with_incoming_root_and_field_guide(
     assignment_metadata: &AssignmentMetadata,
     field_guide: &SupervisorFieldGuidePrompt,
 ) -> Result<String> {
+    let preview_runtime = context.assignment.runtime.unwrap_or_default();
     Ok(
         render_child_orchestrator_prompt_with_incoming_root_and_field_guide(
             context,
             incoming_root,
             assignment_metadata,
             field_guide,
+            preview_runtime,
+            preview_runtime,
         )?
         .prompt,
     )
@@ -549,6 +552,8 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
     incoming_root: &Path,
     assignment_metadata: &AssignmentMetadata,
     field_guide: &SupervisorFieldGuidePrompt,
+    child_launch_runtime: SupervisorRuntime,
+    worker_launch_runtime: SupervisorRuntime,
 ) -> Result<RenderedPromptWithMeasurements> {
     let ChildOrchestratorPromptContext {
         plan,
@@ -563,6 +568,14 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
         consultant,
         claim_context,
     } = context;
+    if !assignment.worker_assignments.is_empty() && child_launch_runtime != worker_launch_runtime {
+        bail!(
+            "assignment '{}' selected nested worker runtime '{}' but its enclosing child runtime-native bridge is '{}'; select the same runtime for the worker or provide a verified cross-runtime child bridge before retrying",
+            assignment.id,
+            worker_launch_runtime.as_str(),
+            child_launch_runtime.as_str(),
+        );
+    }
     let assignment_json = serde_json::to_string_pretty(&orchestrator_assignment_value(
         assignment,
         assignment_metadata,
@@ -573,7 +586,7 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
         .iter()
         .map(|worker| -> Result<(String, PromptByteMeasurement)> {
             let metadata = worker_assignment_metadata(assignment_metadata, assignment, worker);
-            let rendered = worker_prompt_with_field_guide(
+            let rendered = worker_prompt_with_field_guide_for_runtime(
                 WorkerPromptRenderContext {
                     plan,
                     execution_target,
@@ -585,6 +598,7 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
                     schema_path: worker_schema_path,
                 },
                 field_guide,
+                Some(worker_launch_runtime),
             )?;
             let invariant_prefix = worker_cacheable_prefix_for_target(execution_target);
             let measurement = PromptByteMeasurement::new(
@@ -658,11 +672,13 @@ Assignment-specific context:
 - Semantic intent token: {semantic_intent_token}
 
 Declared role selections:
+- Enclosing child launch runtime: {child_launch_runtime}
 - Child orchestrator model: {child_model}
 - Child orchestrator reasoning effort: {child_reasoning_effort}
+- Nested worker runtime: {worker_launch_runtime}
 - Nested worker model: {worker_model}
 - Nested worker reasoning effort: {worker_reasoning_effort}
-- Launch each supplied terminal worker prompt through runtime-native SubAgent/delegated-worker support and preserve its declared role selection. MACO's parent scheduler does not launch those terminal sessions for you; runtime-side role-tagged usage reporting is required before worker usage or cost can be reported.
+- Launch each supplied terminal worker prompt through runtime-native SubAgent/delegated-worker support on this enclosing bridge and preserve its declared runtime, model, and effort. Prompt rendering fails closed when that bridge cannot honor the selected worker runtime. MACO's parent scheduler does not launch those terminal sessions for you; runtime-side role-tagged usage reporting is required before worker execution, usage, or cost can be reported.
 {consultation_section}
 
 Collection targets:
@@ -703,10 +719,16 @@ Review auditor prompt template:
             .semantic_intent_token
             .map(|token| token.to_string())
             .unwrap_or_else(|| "<none>".to_string()),
+        child_launch_runtime = child_launch_runtime.as_str(),
         child_model = child_model.as_deref().unwrap_or("<runtime default>"),
         child_reasoning_effort = child_reasoning_effort
             .as_deref()
             .unwrap_or("<runtime default>"),
+        worker_launch_runtime = if assignment.worker_assignments.is_empty() {
+            "<not applicable: no nested workers>"
+        } else {
+            worker_launch_runtime.as_str()
+        },
         worker_model = worker_model.as_deref().unwrap_or("<runtime default>"),
         worker_reasoning_effort = worker_reasoning_effort
             .as_deref()
@@ -811,6 +833,15 @@ pub(super) fn worker_prompt_with_field_guide(
     context: WorkerPromptRenderContext<'_>,
     field_guide: &SupervisorFieldGuidePrompt,
 ) -> Result<String> {
+    let preview_runtime = context.orchestrator.runtime;
+    worker_prompt_with_field_guide_for_runtime(context, field_guide, preview_runtime)
+}
+
+fn worker_prompt_with_field_guide_for_runtime(
+    context: WorkerPromptRenderContext<'_>,
+    field_guide: &SupervisorFieldGuidePrompt,
+    worker_launch_runtime: Option<SupervisorRuntime>,
+) -> Result<String> {
     let WorkerPromptRenderContext {
         plan,
         execution_target,
@@ -848,9 +879,10 @@ Assignment-specific context:
 - Explicit report path: {report_path}
 
 Declared role selection:
+- Worker runtime: {worker_launch_runtime}
 - Worker model: {worker_model}
 - Worker reasoning effort: {worker_reasoning_effort}
-- The O1 must launch this supplied terminal worker template through runtime-native SubAgent. MACO's parent scheduler does not launch the worker automatically; runtime-side role-tagged usage reporting is required before worker usage or cost can be reported.
+- The O1 must launch this supplied terminal worker template through runtime-native SubAgent on its enclosing bridge and preserve the runtime, model, and effort above. MACO's parent scheduler does not launch the worker automatically; runtime-side role-tagged usage reporting is required before worker execution, usage, or cost can be reported.
 
 - Use the worker report schema path: {schema_path}
 
@@ -882,6 +914,9 @@ Worker assignment JSON:
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "<none>".to_string()),
+        worker_launch_runtime = worker_launch_runtime
+            .map(SupervisorRuntime::as_str)
+            .unwrap_or("<runtime-native child bridge>"),
         worker_model = worker_model.as_deref().unwrap_or("<runtime default>"),
         worker_reasoning_effort = worker_reasoning_effort
             .as_deref()
@@ -1550,6 +1585,109 @@ mod regression_tests {
         ))
     }
 
+    fn render_valid_nested_runtime_fixture(
+        child_runtime: SupervisorRuntime,
+        worker_runtime: SupervisorRuntime,
+        include_worker: bool,
+    ) -> Result<String> {
+        let worker_assignments = include_worker
+            .then(|| WorkerAssignment {
+                id: "worker-runtime".to_string(),
+                role: AgentRole::Worker,
+                assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
+                semantic_symbols: Vec::new(),
+                semantic_modules: Vec::new(),
+                task: Some("implement the bounded runtime handoff".to_string()),
+                environment_requirements: Vec::new(),
+                report_path: None,
+            })
+            .into_iter()
+            .collect();
+        let assignment = OrchestratorAssignment {
+            id: "child-runtime".to_string(),
+            runtime: Some(child_runtime),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: Some("complete the valid nested-worker runtime handoff".to_string()),
+            worker_assignments,
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "valid child-orchestrator nested-runtime fixture".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 60,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment],
+        };
+        let (plan, _) = validate_supervisor_plan(
+            plan,
+            SupervisorPlanMetadata {
+                assignment_schedule: vec![AssignmentScheduleEntry {
+                    assignment_id: "child-runtime".to_string(),
+                    parent_assignment_id: None,
+                    depth: MIN_SUPERVISOR_DEPTH,
+                    flattened_index: 0,
+                }],
+                ..SupervisorPlanMetadata::default()
+            },
+        )?;
+        let assignment = plan
+            .assignments
+            .first()
+            .context("validated nested-runtime fixture lost its assignment")?;
+        let run_dir = Path::new("/tmp/maco-nested-runtime-regression");
+        let incoming_root = run_dir.join("incoming");
+        let worktree = WorktreeRecord {
+            name: assignment.id.clone(),
+            path: run_dir.join("worktree"),
+            branch: "maco/nested-runtime-regression".to_string(),
+        };
+        let claim = PathClaim {
+            token: ClaimToken::from_u64(1),
+            agent_id: assignment.id.clone(),
+            paths: assignment.assigned_paths.clone(),
+        };
+        Ok(
+            render_child_orchestrator_prompt_with_incoming_root_and_field_guide(
+                ChildOrchestratorPromptContext {
+                    plan: &plan,
+                    execution_target: None,
+                    assignment,
+                    run_dir,
+                    worktree: &worktree,
+                    report_path: &incoming_root.join("child-runtime.json"),
+                    schema_path: &run_dir.join("schemas/orchestrator-review-report.schema.json"),
+                    worker_schema_path: &run_dir.join("schemas/worker-report.schema.json"),
+                    auditor_schema_path: &run_dir.join("schemas/auditor-report.schema.json"),
+                    consultant: &SupervisorConsultantPlan::default(),
+                    claim_context: ChildPromptClaimContext {
+                        claim: &claim,
+                        semantic_intent_token: None,
+                    },
+                },
+                &incoming_root,
+                &AssignmentMetadata::new(),
+                &SupervisorFieldGuidePrompt::empty()?,
+                child_runtime,
+                worker_runtime,
+            )?
+            .prompt,
+        )
+    }
+
     fn common_prefix_bytes(left: &str, right: &str) -> usize {
         left.bytes()
             .zip(right.bytes())
@@ -1632,6 +1770,54 @@ mod regression_tests {
         assert!(child.contains(
             "Launch each supplied terminal worker prompt through runtime-native SubAgent/delegated-worker support"
         ));
+    }
+
+    #[test]
+    fn valid_child_orchestrator_carries_matching_nested_worker_runtime_contract() -> Result<()> {
+        let prompt = render_valid_nested_runtime_fixture(
+            SupervisorRuntime::Codex,
+            SupervisorRuntime::Codex,
+            true,
+        )?;
+
+        assert!(prompt.contains("ROLE: O1_CHILD_ORCHESTRATOR"));
+        assert!(prompt.contains("- Enclosing child launch runtime: codex"));
+        assert!(prompt.contains("- Nested worker runtime: codex"));
+        assert!(prompt.contains("Worker prompt templates:"));
+        assert!(prompt.contains("ROLE: TERMINAL_WORKER"));
+        assert!(prompt.contains("- Worker runtime: codex"));
+        assert!(prompt.contains("runtime-side role-tagged usage reporting is required before worker execution, usage, or cost can be reported"));
+        Ok(())
+    }
+
+    #[test]
+    fn nested_worker_runtime_mismatch_fails_closed_during_prompt_rendering() {
+        let error = render_valid_nested_runtime_fixture(
+            SupervisorRuntime::Codex,
+            SupervisorRuntime::Cursor,
+            true,
+        )
+        .expect_err("an enclosing Codex bridge cannot claim a Cursor nested-worker launch");
+
+        let message = error.to_string();
+        assert!(message.contains("selected nested worker runtime 'cursor'"));
+        assert!(message.contains("enclosing child runtime-native bridge is 'codex'"));
+        assert!(message.contains("select the same runtime for the worker"));
+        assert!(message.contains("verified cross-runtime child bridge"));
+    }
+
+    #[test]
+    fn workerless_child_does_not_refuse_an_unused_runtime_mismatch() -> Result<()> {
+        let prompt = render_valid_nested_runtime_fixture(
+            SupervisorRuntime::Codex,
+            SupervisorRuntime::Cursor,
+            false,
+        )?;
+
+        assert!(prompt.contains("- Enclosing child launch runtime: codex"));
+        assert!(prompt.contains("- Nested worker runtime: <not applicable: no nested workers>"));
+        assert!(!prompt.contains("ROLE: TERMINAL_WORKER"));
+        Ok(())
     }
 
     #[test]
