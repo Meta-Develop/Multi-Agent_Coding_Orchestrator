@@ -923,11 +923,35 @@ pub(crate) struct ManagedChildGitBoundary {
     metadata: ManagedWorktreeGitMetadata,
 }
 
-impl ManagedChildGitBoundary {
-    pub(crate) fn worktree_git_dir(&self) -> &Path {
-        &self.metadata.worktree_git_dir
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedChildGitImport {
+    pub(crate) base_oid: Oid,
+    pub(crate) head_oid: Oid,
+    pub(crate) head_tree_oid: Oid,
+    pub(crate) touched_paths: Vec<PathBuf>,
+    pub(crate) final_changed_paths: Vec<PathBuf>,
+    pub(crate) closure_object_count: usize,
+    pub(crate) closure_bytes: u64,
+    pub(crate) imported_object_count: usize,
+    pub(crate) imported_bytes: u64,
+}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedChildGitClosureSeal {
+    base_oid: Oid,
+    head_oid: Oid,
+    object_kinds: BTreeMap<Oid, git2::ObjectType>,
+    object_bytes: BTreeMap<Oid, u64>,
+    touched_paths: BTreeSet<PathBuf>,
+    final_changed_paths: BTreeSet<PathBuf>,
+}
+
+const MAX_MANAGED_CHILD_IMPORT_COMMITS: usize = 256;
+const MAX_MANAGED_CHILD_IMPORT_OBJECTS: usize = 262_144;
+const MAX_MANAGED_CHILD_IMPORT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_MANAGED_CHILD_IMPORT_TREE_DEPTH: usize = 256;
+
+impl ManagedChildGitBoundary {
     pub(crate) fn private_git_dir(&self) -> &Path {
         &self.metadata.private_git_dir
     }
@@ -938,10 +962,6 @@ impl ManagedChildGitBoundary {
 
     pub(crate) fn shared_object_dir(&self) -> &Path {
         &self.metadata.shared_object_dir
-    }
-
-    pub(crate) fn private_ref_path(&self) -> PathBuf {
-        self.metadata.private_git_dir.join(MANAGED_CHILD_PRIVATE_REF)
     }
 
     pub(crate) fn revalidate(&self) -> Result<Oid> {
@@ -967,6 +987,421 @@ pub(crate) fn bind_existing_managed_child_git_boundary(
         workspace,
         metadata,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_managed_child_git_boundary_for_test(workspace: &Path) -> Result<()> {
+    managed_worktree_git_metadata(workspace)?
+        .context("test fixture expected a managed linked-worktree Git boundary")?;
+    Ok(())
+}
+
+/// Validates and imports one managed child's private commit closure.
+///
+/// The complete private chain and reachable commit/tree/blob graph are checked
+/// before the primary object database is mutated. Only missing, content-addressed
+/// objects from that verified closure are written; refs, HEAD, indexes, reflogs,
+/// and other Git metadata are never import targets.
+pub(crate) fn collect_and_import_managed_child_git_commit(
+    primary_repo: &Path,
+    workspace: &Path,
+    captured_base: Oid,
+    claimed_paths: &[PathBuf],
+) -> Result<ManagedChildGitImport> {
+    let boundary = bind_existing_managed_child_git_boundary(workspace)?;
+    let initial_head = boundary.revalidate()?;
+    let primary_repo = fs::canonicalize(primary_repo)
+        .context("managed child import primary repository could not be resolved")?;
+    let primary = crate::git_repository::open(&primary_repo)
+        .context("managed child import could not open the primary repository")?;
+    let primary_head = primary
+        .head()
+        .context("managed child import primary repository has no HEAD")?
+        .peel_to_commit()
+        .context("managed child import primary HEAD is not a commit")?
+        .id();
+    if primary_head != captured_base {
+        bail!(
+            "managed child import captured base changed: expected {captured_base}, observed {primary_head}"
+        );
+    }
+    let linked = crate::git_repository::open(workspace)
+        .context("managed child import could not reopen the linked worktree")?;
+    let linked_head = linked
+        .head()
+        .context("managed child import linked worktree has no shared HEAD")?
+        .peel_to_commit()
+        .context("managed child import linked worktree HEAD is not a commit")?
+        .id();
+    if linked_head != captured_base {
+        bail!(
+            "managed child import linked worktree base changed: expected {captured_base}, observed {linked_head}"
+        );
+    }
+    let primary_objects = canonical_git_directory(
+        &primary.commondir().join("objects"),
+        "managed child import primary object directory",
+    )?;
+    if primary_objects != boundary.shared_object_dir() {
+        bail!("managed child import shared object directory does not belong to the primary repository");
+    }
+
+    let claimed_paths = claimed_paths
+        .iter()
+        .map(crate::sync::normalize_repo_relative_path)
+        .collect::<std::result::Result<BTreeSet<_>, _>>()
+        .context("managed child import claims are invalid")?;
+    if claimed_paths.is_empty() {
+        bail!("managed child import requires at least one exact claimed path");
+    }
+
+    let source = open_managed_child_private_repository(&boundary)?;
+    let private_only = private_only_managed_child_odb(&boundary)?;
+    let destination = primary
+        .odb()
+        .context("managed child import could not open the primary object database")?;
+    let seal = fsck_managed_child_private_closure(
+        &source,
+        &private_only,
+        &destination,
+        captured_base,
+        initial_head,
+        &claimed_paths,
+    )?;
+    if boundary.revalidate()? != seal.head_oid {
+        bail!("managed child private ref changed after fsck and before object import");
+    }
+
+    let mut imported_object_count = 0usize;
+    let mut imported_bytes = 0u64;
+    let source_odb = source
+        .odb()
+        .context("managed child import could not reopen the private object database")?;
+    for (oid, expected_kind) in &seal.object_kinds {
+        let object = source_odb
+            .read(*oid)
+            .with_context(|| format!("managed child import source object {oid} disappeared"))?;
+        if object.kind() != *expected_kind {
+            bail!("managed child import source object {oid} changed kind after fsck");
+        }
+        if destination.exists(*oid) {
+            let existing = destination
+                .read(*oid)
+                .with_context(|| format!("managed child import could not re-read existing object {oid}"))?;
+            if existing.kind() != object.kind() || existing.data() != object.data() {
+                bail!("managed child import existing object {oid} did not preserve its bytes");
+            }
+            continue;
+        }
+        let written = destination
+            .write(*expected_kind, object.data())
+            .with_context(|| format!("managed child import failed to write verified object {oid}"))?;
+        if written != *oid {
+            bail!("managed child import changed the object id for {oid}");
+        }
+        imported_object_count = imported_object_count
+            .checked_add(1)
+            .context("managed child imported object count overflow")?;
+        imported_bytes = imported_bytes
+            .checked_add(u64::try_from(object.data().len()).context(
+                "managed child imported object size did not fit its byte counter",
+            )?)
+            .context("managed child imported object byte count overflow")?;
+    }
+
+    if boundary.revalidate()? != seal.head_oid {
+        bail!("managed child private ref changed during object import");
+    }
+    let observed = fsck_managed_child_private_closure(
+        &source,
+        &private_only,
+        &destination,
+        captured_base,
+        seal.head_oid,
+        &claimed_paths,
+    )?;
+    if observed != seal {
+        bail!("managed child private closure changed after object import");
+    }
+    let final_primary_head = primary
+        .head()
+        .context("managed child import primary repository lost HEAD during import")?
+        .peel_to_commit()
+        .context("managed child import primary HEAD stopped resolving to a commit")?
+        .id();
+    if final_primary_head != captured_base {
+        bail!(
+            "managed child import primary HEAD changed during import: expected {captured_base}, observed {final_primary_head}"
+        );
+    }
+    primary
+        .find_commit(seal.head_oid)
+        .context("managed child imported head is not resolvable from the primary object store")?;
+
+    let closure_bytes = seal.object_bytes.values().try_fold(0u64, |total, bytes| {
+        total
+            .checked_add(*bytes)
+            .context("managed child closure byte count overflow")
+    })?;
+    let head_tree_oid = source
+        .find_commit(seal.head_oid)
+        .context("managed child imported head could not be reparsed")?
+        .tree_id();
+    Ok(ManagedChildGitImport {
+        base_oid: seal.base_oid,
+        head_oid: seal.head_oid,
+        head_tree_oid,
+        touched_paths: seal.touched_paths.into_iter().collect(),
+        final_changed_paths: seal.final_changed_paths.into_iter().collect(),
+        closure_object_count: seal.object_kinds.len(),
+        closure_bytes,
+        imported_object_count,
+        imported_bytes,
+    })
+}
+
+fn open_managed_child_private_repository(
+    boundary: &ManagedChildGitBoundary,
+) -> Result<git2::Repository> {
+    let repository = git2::Repository::open_bare(boundary.private_git_dir())
+        .context("managed child import could not open the private Git directory")?;
+    let shared_objects = boundary
+        .shared_object_dir()
+        .to_str()
+        .context("managed child shared object directory is not UTF-8")?;
+    repository
+        .odb()
+        .context("managed child import could not open the private object database")?
+        .add_disk_alternate(shared_objects)
+        .context("managed child import could not attach the verified shared object alternate")?;
+    Ok(repository)
+}
+
+fn private_only_managed_child_odb(
+    boundary: &ManagedChildGitBoundary,
+) -> Result<git2::Odb<'static>> {
+    let private_objects = boundary
+        .private_object_dir()
+        .to_str()
+        .context("managed child private object directory is not UTF-8")?;
+    let odb = git2::Odb::new().context("managed child import could not create a private-only ODB")?;
+    odb.add_disk_alternate(private_objects)
+        .context("managed child import could not attach the private-only object backend")?;
+    Ok(odb)
+}
+
+fn fsck_managed_child_private_closure(
+    source: &git2::Repository,
+    private_only: &git2::Odb<'_>,
+    destination: &git2::Odb<'_>,
+    base_oid: Oid,
+    head_oid: Oid,
+    claimed_paths: &BTreeSet<PathBuf>,
+) -> Result<ManagedChildGitClosureSeal> {
+    let base = source
+        .find_commit(base_oid)
+        .with_context(|| format!("managed child private closure omitted captured base {base_oid}"))?;
+    let head = source
+        .find_commit(head_oid)
+        .with_context(|| format!("managed child private ref does not resolve to commit {head_oid}"))?;
+    let mut chain = Vec::new();
+    let mut touched_paths = BTreeSet::new();
+    let mut visited_commits = BTreeSet::new();
+    let mut current = head;
+    while current.id() != base_oid {
+        if chain.len() >= MAX_MANAGED_CHILD_IMPORT_COMMITS {
+            bail!(
+                "managed child commit chain exceeded its {MAX_MANAGED_CHILD_IMPORT_COMMITS}-commit bound"
+            );
+        }
+        if !visited_commits.insert(current.id()) {
+            bail!("managed child commit chain contains a cycle");
+        }
+        if !private_only.exists(current.id()) {
+            bail!(
+                "managed child commit {} is not stored in the private object directory",
+                current.id()
+            );
+        }
+        if current.parent_count() != 1 {
+            bail!(
+                "managed child commit {} must have exactly one parent before the captured base",
+                current.id()
+            );
+        }
+        let parent = current
+            .parent(0)
+            .with_context(|| format!("managed child commit {} omitted its parent", current.id()))?;
+        if parent.id() == current.id() {
+            bail!("managed child commit chain contains a self parent");
+        }
+        let edge_paths = managed_child_commit_edge_paths(source, &parent, &current)?;
+        for path in edge_paths {
+            if !claimed_paths
+                .iter()
+                .any(|claimed| path == *claimed || path.starts_with(claimed))
+            {
+                bail!(
+                    "managed child commit {} changed unclaimed path '{}'",
+                    current.id(),
+                    path.display()
+                );
+            }
+            touched_paths.insert(path);
+        }
+        chain.push(current.id());
+        current = parent;
+    }
+    if current.id() != base_oid {
+        bail!("managed child private ref does not descend linearly from the captured base");
+    }
+
+    let final_changed_paths = managed_child_commit_edge_paths(source, &base, &source.find_commit(head_oid)?)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for path in &final_changed_paths {
+        if !claimed_paths
+            .iter()
+            .any(|claimed| path == claimed || path.starts_with(claimed))
+        {
+            bail!("managed child final tree changed unclaimed path '{}'", path.display());
+        }
+    }
+
+    let source_odb = source
+        .odb()
+        .context("managed child fsck could not open its source object database")?;
+    let mut object_kinds = BTreeMap::new();
+    let mut object_bytes = BTreeMap::new();
+    let mut pending = chain
+        .iter()
+        .copied()
+        .map(|oid| (oid, git2::ObjectType::Commit, 0usize))
+        .collect::<Vec<_>>();
+    let mut traversal_steps = 0usize;
+    let mut aggregate_bytes = 0u64;
+    while let Some((oid, expected_kind, depth)) = pending.pop() {
+        traversal_steps = traversal_steps
+            .checked_add(1)
+            .context("managed child closure traversal count overflow")?;
+        if traversal_steps > MAX_MANAGED_CHILD_IMPORT_OBJECTS.saturating_mul(4) {
+            bail!("managed child closure exceeded its traversal safety bound");
+        }
+        if let Some(previous_kind) = object_kinds.get(&oid) {
+            if *previous_kind != expected_kind {
+                bail!("managed child closure reused object {oid} with contradictory kinds");
+            }
+            continue;
+        }
+        if object_kinds.len() >= MAX_MANAGED_CHILD_IMPORT_OBJECTS {
+            bail!(
+                "managed child closure exceeded its {MAX_MANAGED_CHILD_IMPORT_OBJECTS}-object bound"
+            );
+        }
+        let (declared_size, declared_kind) = source_odb
+            .read_header(oid)
+            .with_context(|| format!("managed child closure omitted object header {oid}"))?;
+        if declared_kind != expected_kind {
+            bail!("managed child closure object {oid} had an unexpected kind");
+        }
+        let declared_size = u64::try_from(declared_size)
+            .context("managed child closure object size did not fit its byte bound")?;
+        aggregate_bytes = aggregate_bytes
+            .checked_add(declared_size)
+            .context("managed child closure byte count overflow")?;
+        if aggregate_bytes > MAX_MANAGED_CHILD_IMPORT_BYTES {
+            bail!(
+                "managed child closure exceeded its {MAX_MANAGED_CHILD_IMPORT_BYTES}-byte bound"
+            );
+        }
+        let object = source_odb
+            .read(oid)
+            .with_context(|| format!("managed child closure omitted object {oid}"))?;
+        if object.kind() != expected_kind
+            || u64::try_from(object.data().len())
+                .context("managed child closure object length did not fit its byte bound")?
+                != declared_size
+        {
+            bail!("managed child closure object {oid} changed during fsck");
+        }
+        if !destination.exists(oid) && !private_only.exists(oid) {
+            bail!("managed child closure object {oid} exists outside both verified object stores");
+        }
+        object_kinds.insert(oid, expected_kind);
+        object_bytes.insert(oid, declared_size);
+
+        match expected_kind {
+            git2::ObjectType::Commit => {
+                let commit = source
+                    .find_commit(oid)
+                    .with_context(|| format!("managed child closure commit {oid} is malformed"))?;
+                pending.push((commit.tree_id(), git2::ObjectType::Tree, 0));
+            }
+            git2::ObjectType::Tree => {
+                if depth > MAX_MANAGED_CHILD_IMPORT_TREE_DEPTH {
+                    bail!(
+                        "managed child closure exceeded its {MAX_MANAGED_CHILD_IMPORT_TREE_DEPTH}-level tree bound"
+                    );
+                }
+                let tree = source
+                    .find_tree(oid)
+                    .with_context(|| format!("managed child closure tree {oid} is malformed"))?;
+                for entry in tree.iter() {
+                    match entry.filemode() {
+                        0o160000 => {}
+                        0o040000 => pending.push((
+                            entry.id(),
+                            git2::ObjectType::Tree,
+                            depth.saturating_add(1),
+                        )),
+                        _ => pending.push((entry.id(), git2::ObjectType::Blob, depth)),
+                    }
+                }
+            }
+            git2::ObjectType::Blob => {}
+            _ => bail!("managed child closure contains an unsupported object kind"),
+        }
+    }
+
+    Ok(ManagedChildGitClosureSeal {
+        base_oid,
+        head_oid,
+        object_kinds,
+        object_bytes,
+        touched_paths,
+        final_changed_paths,
+    })
+}
+
+fn managed_child_commit_edge_paths(
+    source: &git2::Repository,
+    parent: &git2::Commit<'_>,
+    child: &git2::Commit<'_>,
+) -> Result<Vec<PathBuf>> {
+    let parent_tree = parent
+        .tree()
+        .with_context(|| format!("managed child parent tree {} is missing", parent.tree_id()))?;
+    let child_tree = child
+        .tree()
+        .with_context(|| format!("managed child commit tree {} is missing", child.tree_id()))?;
+    let mut options = git2::DiffOptions::new();
+    options.include_typechange(true).include_typechange_trees(true);
+    let diff = source
+        .diff_tree_to_tree(Some(&parent_tree), Some(&child_tree), Some(&mut options))
+        .context("managed child commit edge diff could not be computed")?;
+    let mut paths = BTreeSet::new();
+    for delta in diff.deltas() {
+        for path in [delta.old_file().path(), delta.new_file().path()]
+            .into_iter()
+            .flatten()
+        {
+            paths.insert(
+                crate::sync::normalize_repo_relative_path(path)
+                    .context("managed child commit edge contains an invalid path")?,
+            );
+        }
+    }
+    Ok(paths.into_iter().collect())
 }
 
 const MANAGED_CHILD_PRIVATE_GIT_DIR: &str = "maco-private-git-v1";

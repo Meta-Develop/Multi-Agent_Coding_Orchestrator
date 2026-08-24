@@ -1195,6 +1195,50 @@ struct CollectedChildAttempt<'a> {
     _command: ExternalAgentCommand,
 }
 
+fn verify_imported_managed_child_candidate(
+    repo: &Path,
+    assignment: &OrchestratorAssignment,
+    write_lease: &ManagedWorktreeWriteLease,
+    imported: &ManagedChildGitImport,
+) -> Result<()> {
+    let candidate = collect_agent_result_with_evidence_and_write_lease(
+        MergeCollectOptions {
+            repo: repo.to_path_buf(),
+            agent_id: assignment.id.clone(),
+            claimed_paths: assignment.assigned_paths.clone(),
+            include_full_diff: false,
+            diff_summary_char_limit: 1,
+            validations: Vec::new(),
+        },
+        ValidationEvidenceBundle::default(),
+        write_lease,
+    )
+    .context("failed to capture the imported managed child candidate")?;
+    if !candidate.unclaimed_changed_paths.is_empty() {
+        bail!(
+            "imported managed child candidate contains unclaimed paths: {}",
+            display_paths(&candidate.unclaimed_changed_paths)
+        );
+    }
+    let candidate_paths = normalize_paths(candidate.changed_paths)
+        .context("imported managed child candidate paths are invalid")?;
+    if candidate_paths != imported.final_changed_paths {
+        bail!(
+            "imported managed child commit paths differ from the collected worktree candidate: commit [{}], worktree [{}]",
+            display_paths(&imported.final_changed_paths),
+            display_paths(&candidate_paths)
+        );
+    }
+    if candidate.snapshot_tree != imported.head_tree_oid {
+        bail!(
+            "imported managed child commit tree {} differs from collected worktree tree {}",
+            imported.head_tree_oid,
+            candidate.snapshot_tree
+        );
+    }
+    Ok(())
+}
+
 fn dispatch_and_collect_child_attempt<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
     outcome: &mut AssignmentExecutionOutcome,
@@ -1443,6 +1487,33 @@ fn dispatch_and_collect_child_attempt<'a>(
             },
         )
     })?;
+    let managed_child_git_import = if options.runtime == SupervisorRuntime::Codex
+        && *execution_runtime == SupervisorExecutionRuntime::Verified
+        && external_process_completed(&external_run)
+        && attempt_containment_verified
+        && external_run.publishable
+        && raw_report_validated
+        && preflight.primary_scope_baseline.is_none()
+    {
+        let write_lease = preflight
+            .worktree_write_lease
+            .as_ref()
+            .context("verified managed child Git collection has no write lease")?;
+        Some(
+            collect_and_import_managed_child_git_commit(
+                repo,
+                &worktree.path,
+                preflight.child_base_head,
+                &assignment.assigned_paths,
+            )
+            .and_then(|imported| {
+                verify_imported_managed_child_candidate(repo, assignment, write_lease, &imported)?;
+                Ok(imported)
+            }),
+        )
+    } else {
+        None
+    };
     let primary_after = primary_worktree_snapshot(repo, *execution_runtime)?;
     let primary_changes = primary_integrity_changes(&primary_before, &primary_after);
     let primary_scope_after = primary_scope_before
@@ -1489,6 +1560,40 @@ fn dispatch_and_collect_child_attempt<'a>(
             evidence_only_source: context.evidence_only_reaudit.map(|source| &source.report),
             observed_changed_paths: observed_primary_scope_changes.as_deref(),
         });
+    if let Some(import) = managed_child_git_import {
+        match import {
+            Ok(imported) => attempt_report.findings.push(Finding {
+                severity: FindingSeverity::Info,
+                message: format!(
+                    "verified managed child commit {} from base {} and imported {}/{} reachable objects ({} / {} bytes)",
+                    imported.head_oid,
+                    imported.base_oid,
+                    imported.imported_object_count,
+                    imported.closure_object_count,
+                    imported.imported_bytes,
+                    imported.closure_bytes,
+                ),
+                paths: imported.touched_paths,
+            }),
+            Err(error) => {
+                attempt_report.status = ReviewStatus::Failed;
+                attempt_report.accepted = false;
+                attempt_report.rejected = true;
+                attempt_report.findings.push(Finding {
+                    severity: FindingSeverity::Error,
+                    message: format!(
+                        "managed child private Git collection/import was rejected: {error:#}"
+                    ),
+                    paths: assignment.assigned_paths.clone(),
+                });
+                attempt_report.remaining_risk =
+                    "managed child commit provenance or object import is unverified".to_string();
+                attempt_report.next_safe_action =
+                    "inspect the preserved private Git boundary and start a fixed-cause run"
+                        .to_string();
+            }
+        }
+    }
     if preflight.primary_scope_baseline.is_some() {
         attempt_report.findings.push(Finding {
             severity: FindingSeverity::Info,

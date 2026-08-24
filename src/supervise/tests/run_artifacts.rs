@@ -1257,6 +1257,8 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
                 !command.hidden_roots.iter().any(|root| root == &repo_path),
                 "the linked worktree's owning primary/common checkout must remain visible read-only"
             );
+            crate::external_agent::prepare_managed_child_git_boundary_for_test(&command.cwd)
+                .expect("prepare injected managed-child private Git boundary");
         }
         assert_ne!(command.cwd, repo_path);
         assert_eq!(
