@@ -2,9 +2,31 @@ use super::*;
 
 fn assignment_launch_runtime(
     assignment: &OrchestratorAssignment,
+    budget_policy: &AssignmentBudgetPolicy,
     options: &SupervisorRunOptions,
 ) -> SupervisorRuntime {
-    assignment.runtime.unwrap_or(options.runtime)
+    budget_policy
+        .selected_runtime_for(assignment.role)
+        .or(assignment.runtime)
+        .unwrap_or(options.runtime)
+}
+
+fn runtime_model_catalog_for_launch(
+    catalog: &RuntimeModelCatalog,
+    run_runtime: SupervisorRuntime,
+    launch_runtime: SupervisorRuntime,
+) -> Result<RuntimeModelCatalog> {
+    if launch_runtime == run_runtime {
+        return Ok(catalog.clone());
+    }
+    if launch_runtime.is_adapter_subprocess() {
+        return Ok(RuntimeModelCatalog::OperatorDeclared);
+    }
+    bail!(
+        "selected runtime '{}' has no authenticated model catalog in a '{}' supervisor run",
+        runtime_name(launch_runtime),
+        runtime_name(run_runtime)
+    )
 }
 
 fn selected_runtime_program(
@@ -533,7 +555,9 @@ fn prepare_assignment_execution<'a>(
                 bail!("primary-worktree execution does not create a managed child worktree")
             }
             #[cfg(test)]
-            SupervisorWorktreeCreation::TestOnly => manager.create_for_test(create_options),
+            SupervisorWorktreeCreation::TestOnly | SupervisorWorktreeCreation::VerifiedTestOnly => {
+                manager.create_for_test(create_options)
+            }
         };
         if let Err(error) = create_result {
             record_isolated_assignment_failure(
@@ -797,6 +821,7 @@ struct PreparedChildAttempt<'a> {
     capture_scratch: ArtifactScratchDirectory,
     incoming_output_root: SecureOutputRoot,
     capture_output_root: SecureOutputRoot,
+    launch_runtime: SupervisorRuntime,
     budget_reservation: DispatchBudgetReservation<'a>,
     pre_action_review_context: Option<ReviewContext>,
 }
@@ -836,6 +861,12 @@ fn prepare_child_attempt<'a>(
         ..
     } = context;
     let assignment = &preflight.assignment;
+    let launch_runtime = assignment_launch_runtime(assignment, budget_policy, options);
+    let launch_catalog =
+        runtime_model_catalog_for_launch(runtime_model_catalog, options.runtime, launch_runtime)?;
+    let mut runtime_assignment = assignment.clone();
+    runtime_assignment.runtime = Some(launch_runtime);
+    let assignment = &runtime_assignment;
     let worktree = &preflight.worktree;
     if let Err(error) = preflight.mandatory_worktree_controls.revalidate() {
         record_isolated_assignment_failure(
@@ -862,7 +893,7 @@ fn prepare_child_attempt<'a>(
     let budget_plan = budget_policy.apply(plan);
     let resolved_prompt_plan = evidence_only_reaudit
         .is_none()
-        .then(|| runtime_resolved_prompt_plan(&budget_plan, options.runtime, runtime_model_catalog))
+        .then(|| runtime_resolved_prompt_plan(&budget_plan, launch_runtime, &launch_catalog))
         .transpose()?;
     let RenderedPromptWithMeasurements {
         prompt,
@@ -968,7 +999,6 @@ fn prepare_child_attempt<'a>(
         )
     })?;
 
-    let launch_runtime = assignment_launch_runtime(assignment, options);
     let mut command = ExternalAgentCommand::codex(
         &options.codex_bin,
         &worktree.path,
@@ -983,7 +1013,7 @@ fn prepare_child_attempt<'a>(
         &budget_plan,
         options,
         launch_runtime,
-        runtime_model_catalog,
+        &launch_catalog,
     )?;
     command = bind_runtime_output_schema(command, launch_runtime, schema_path);
     command = bind_runtime_read_only_schema_files(
@@ -1096,7 +1126,7 @@ fn prepare_child_attempt<'a>(
             return Ok(AssignmentExecutionDisposition::Complete);
         }
     };
-    let pre_action_review_context = if options.runtime == SupervisorRuntime::Codex {
+    let pre_action_review_context = if launch_runtime == SupervisorRuntime::Codex {
         match pre_action_review_context(options, assignment, &worktree.path) {
             Ok(review_context) => Some(review_context),
             Err(error) => {
@@ -1111,7 +1141,11 @@ fn prepare_child_attempt<'a>(
     } else {
         None
     };
-    if *execution_runtime == SupervisorExecutionRuntime::Verified {
+    if *execution_runtime == SupervisorExecutionRuntime::Verified
+        && !context
+            .worktree_creation
+            .bypass_verified_admission_for_test()
+    {
         let authenticated_claims = context
             .sync_store
             .snapshot()
@@ -1166,6 +1200,7 @@ fn prepare_child_attempt<'a>(
             capture_scratch,
             incoming_output_root,
             capture_output_root,
+            launch_runtime,
             budget_reservation,
             pre_action_review_context,
         },
@@ -1224,6 +1259,7 @@ fn dispatch_and_collect_child_attempt<'a>(
     let capture_scratch = prepared.capture_scratch;
     let incoming_output_root = prepared.incoming_output_root;
     let capture_output_root = prepared.capture_output_root;
+    let launch_runtime = prepared.launch_runtime;
     let mut budget_reservation = prepared.budget_reservation;
     let pre_action_review_context = prepared.pre_action_review_context;
 
@@ -1275,7 +1311,7 @@ fn dispatch_and_collect_child_attempt<'a>(
         lifecycle_event_payload("running", Some(attempt), None),
     )?;
 
-    let external_run_result = match options.runtime {
+    let external_run_result = match launch_runtime {
         SupervisorRuntime::Codex => {
             let review_context = if requires_hosted_pre_action_review(&command) {
                 pre_action_review_context.as_ref()
@@ -1284,7 +1320,7 @@ fn dispatch_and_collect_child_attempt<'a>(
             };
             // All fallible pre-dispatch preparation is complete. Mark
             // invocation only at the external-runner call boundary.
-            if let Err(error) = budget_reservation.mark_invoked() {
+            if let Err(error) = budget_reservation.mark_invoked_for_runtime(launch_runtime) {
                 drop(incoming_output_root);
                 drop(capture_output_root);
                 with_supervisor_artifacts(artifacts, |writer, _| {
@@ -1327,7 +1363,7 @@ fn dispatch_and_collect_child_attempt<'a>(
         | SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli => {
-            if let Err(error) = budget_reservation.mark_invoked() {
+            if let Err(error) = budget_reservation.mark_invoked_for_runtime(launch_runtime) {
                 drop(incoming_output_root);
                 drop(capture_output_root);
                 with_supervisor_artifacts(artifacts, |writer, _| {
@@ -1339,7 +1375,7 @@ fn dispatch_and_collect_child_attempt<'a>(
             Ok(external_runner(&command, cancellation, None))
         }
         SupervisorRuntime::Fake => {
-            if let Err(error) = budget_reservation.mark_invoked() {
+            if let Err(error) = budget_reservation.mark_invoked_for_runtime(launch_runtime) {
                 drop(incoming_output_root);
                 drop(capture_output_root);
                 with_supervisor_artifacts(artifacts, |writer, _| {
@@ -1371,10 +1407,10 @@ fn dispatch_and_collect_child_attempt<'a>(
         }
     };
     let environment_blocked = external_run.environment_blocked();
-    let usage_settlement = budget_reservation.settle(&external_run, options.runtime, &command)?;
+    let usage_settlement = budget_reservation.settle_bound_runtime(&external_run, &command)?;
     match usage_settlement.reliable_usage() {
         Some(usage) => outcome.usage_samples.push(RoleUsageSample {
-            role: assignment.role,
+            role: AgentRole::ChildOrchestrator,
             lens_id: None,
             model: command.model.clone(),
             usage,
@@ -1401,8 +1437,7 @@ fn dispatch_and_collect_child_attempt<'a>(
             child_thread_id.as_deref(),
         ),
     )?;
-    let attempt_containment_verified =
-        external_containment_verified(&external_run, options.runtime);
+    let attempt_containment_verified = external_containment_verified(&external_run, launch_runtime);
     if !attempt_containment_verified {
         outcome.external_containment_failed = true;
         outcome.findings.push(Finding {
@@ -1439,7 +1474,7 @@ fn dispatch_and_collect_child_attempt<'a>(
                 external_run: &external_run,
                 external_command: &command,
                 raw_report_validated,
-                runtime: options.runtime,
+                runtime: launch_runtime,
             },
         )
     })?;
@@ -2386,7 +2421,8 @@ fn dispatch_and_collect_parent_auditor(
         SupervisorRuntime::Codex => {
             // All fallible pre-dispatch preparation is complete. Mark
             // invocation only at the external-runner call boundary.
-            if let Err(error) = auditor_budget_reservation.mark_invoked() {
+            if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(options.runtime)
+            {
                 drop(auditor_incoming_root);
                 drop(auditor_capture_root);
                 with_supervisor_artifacts(artifacts, |writer, _| {
@@ -2421,7 +2457,8 @@ fn dispatch_and_collect_parent_auditor(
         | SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli => {
-            if let Err(error) = auditor_budget_reservation.mark_invoked() {
+            if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(options.runtime)
+            {
                 drop(auditor_incoming_root);
                 drop(auditor_capture_root);
                 with_supervisor_artifacts(artifacts, |writer, _| {
@@ -2437,7 +2474,8 @@ fn dispatch_and_collect_parent_auditor(
             Ok(external_runner(&auditor_command, cancellation, None))
         }
         SupervisorRuntime::Fake => {
-            if let Err(error) = auditor_budget_reservation.mark_invoked() {
+            if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(options.runtime)
+            {
                 drop(auditor_incoming_root);
                 drop(auditor_capture_root);
                 with_supervisor_artifacts(artifacts, |writer, _| {
@@ -2475,7 +2513,7 @@ fn dispatch_and_collect_parent_auditor(
         .gate_denials
         .extend(auditor_run.gate_denials().iter().cloned());
     let usage_settlement =
-        auditor_budget_reservation.settle(&auditor_run, options.runtime, &auditor_command)?;
+        auditor_budget_reservation.settle_bound_runtime(&auditor_run, &auditor_command)?;
     match usage_settlement.reliable_usage() {
         Some(usage) => outcome.usage_samples.push(RoleUsageSample {
             role: AgentRole::Auditor,
@@ -3045,11 +3083,7 @@ fn execute_supervisor_assignment_inner(
                     options.runtime,
                     runtime_model_catalog,
                     SelectorReselectionRequest {
-                        roles: &[
-                            AgentRole::ChildOrchestrator,
-                            AgentRole::Worker,
-                            AgentRole::Auditor,
-                        ],
+                        roles: &[assignment.role],
                         assignment_id: Some(&assignment.id),
                         attempt,
                         primary_cause: SupervisorSelectionEventCause::Retry,
@@ -4255,6 +4289,43 @@ done
         )
     }
 
+    fn quota_runtime_config(runtimes: &[&str]) -> crate::optimizer::quota_pools::QuotaConfig {
+        use crate::optimizer::quota_pools::{
+            AccountId, EntitlementDescriptor, ExhaustionBehavior, NominalCapacity, PoolKind,
+            QuotaConfig, RateLimits, ResetWindow, QUOTA_CONFIG_VERSION,
+        };
+        QuotaConfig {
+            version: QUOTA_CONFIG_VERSION,
+            pools: runtimes
+                .iter()
+                .map(|runtime| EntitlementDescriptor {
+                    runtime: crate::optimizer::ids::RuntimeSlug::new(*runtime)
+                        .expect("quota runtime"),
+                    account: AccountId::new(format!("{runtime}-account")).expect("quota account"),
+                    pool_kind: PoolKind::Metered,
+                    window: ResetWindow::None,
+                    nominal_capacity: NominalCapacity::Unknown,
+                    rate_limits: RateLimits::default(),
+                    priority_tier: None,
+                    exhaustion_behavior: ExhaustionBehavior::FailClosed,
+                    authorized_alternatives: Vec::new(),
+                    declared_list_price_microunits: Some(1),
+                })
+                .collect(),
+        }
+    }
+
+    fn quota_usage_command(root: &Path) -> ExternalAgentCommand {
+        ExternalAgentCommand::codex(
+            Path::new("unused-codex"),
+            root,
+            root.join("prompt.txt"),
+            root.join("usage.jsonl"),
+            root.join("output.json"),
+            Duration::from_secs(1),
+        )
+    }
+
     fn launch_fixture_options(runtime: SupervisorRuntime) -> SupervisorRunOptions {
         SupervisorRunOptions {
             repo: PathBuf::from("."),
@@ -4612,8 +4683,9 @@ done
             notes: None,
         };
         let options = launch_fixture_options(SupervisorRuntime::Codex);
+        let budget_policy = AssignmentBudgetPolicy::default();
         assert_eq!(
-            assignment_launch_runtime(&assignment, &options),
+            assignment_launch_runtime(&assignment, &budget_policy, &options),
             SupervisorRuntime::Cursor
         );
         let command = bind_selected_runtime_launch(
@@ -4635,7 +4707,7 @@ done
         assignment.runtime = Some(SupervisorRuntime::ClaudeCode);
         assignment.role = AgentRole::Worker;
         assert_eq!(
-            assignment_launch_runtime(&assignment, &options),
+            assignment_launch_runtime(&assignment, &budget_policy, &options),
             SupervisorRuntime::ClaudeCode
         );
         let command = bind_selected_runtime_launch(
@@ -4672,6 +4744,146 @@ done
         assert!(error
             .to_string()
             .contains("cannot launch judgment or delegating role"));
+        Ok(())
+    }
+
+    #[test]
+    fn retry_selected_runtime_supersedes_the_assignment_initial_runtime() {
+        let assignment = OrchestratorAssignment {
+            id: "worker-retry".to_string(),
+            runtime: Some(SupervisorRuntime::Codex),
+            role: AgentRole::Worker,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let options = launch_fixture_options(SupervisorRuntime::Codex);
+        let mut retry_policy = AssignmentBudgetPolicy::default();
+        retry_policy.set_selected_runtime_for_test(AgentRole::Worker, SupervisorRuntime::Cursor);
+
+        assert_eq!(
+            assignment_launch_runtime(&assignment, &retry_policy, &options),
+            SupervisorRuntime::Cursor
+        );
+    }
+
+    #[test]
+    fn selected_cross_runtime_settlement_persists_only_the_actual_launch_pool() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("repo");
+        Repository::init(&repo)?;
+        let config = quota_runtime_config(&["codex", "cursor"]);
+        let mut ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
+        ledger.attach_quota_config(&repo, "cross-runtime", &config)?;
+        let plan = worker_plan("composer-2.5");
+        let budget = SupervisorBudgetConfig::default();
+        let command = quota_usage_command(temp.path());
+        let mut reservation =
+            match reserve_dispatch_budget(&plan, &budget, &ledger, AgentRole::Worker, &command)? {
+                DispatchBudgetAdmission::Admitted(reservation) => reservation,
+                DispatchBudgetAdmission::Refused(refusal) => {
+                    bail!("unexpected cross-runtime budget refusal: {refusal:?}")
+                }
+            };
+        reservation.mark_invoked_for_runtime(SupervisorRuntime::Cursor)?;
+        write_injected_usage(&command, 7, 3);
+        let run = injected_verified_run(&command);
+        let settlement = reservation.settle_bound_runtime(&run, &command)?;
+        assert_eq!(
+            settlement.reliable_usage().map(|usage| usage.total_tokens),
+            Some(10)
+        );
+        drop(reservation);
+        drop(ledger);
+
+        let workspace = crate::budget_ledger::WorkspaceBudgetLedger::open_or_create(&repo)?;
+        let now = crate::budget_ledger::unix_now()?;
+        let codex = workspace.pool_usage(&config.pools[0].key(), now)?;
+        let cursor = workspace.pool_usage(&config.pools[1].key(), now)?;
+        assert_eq!(codex.tokens, 0);
+        assert_eq!(codex.requests, 0);
+        assert_eq!(cursor.tokens, 10);
+        assert_eq!(cursor.requests, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn invoked_drop_persists_missing_usage_to_retained_runtime_for_next_run() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("repo");
+        Repository::init(&repo)?;
+        let config = quota_runtime_config(&["cursor"]);
+        let mut first = RunBudgetLedger::new(RunBudgetLimits::default())?;
+        first.attach_quota_config(&repo, "drop-first", &config)?;
+        let plan = worker_plan("composer-2.5");
+        let budget = SupervisorBudgetConfig::default();
+        let command = quota_usage_command(temp.path());
+        let expected_tokens = budget
+            .reservation_tokens(AgentRole::Worker)
+            .context("worker reservation tokens")?;
+        let mut reservation =
+            match reserve_dispatch_budget(&plan, &budget, &first, AgentRole::Worker, &command)? {
+                DispatchBudgetAdmission::Admitted(reservation) => reservation,
+                DispatchBudgetAdmission::Refused(refusal) => {
+                    bail!("unexpected dropped-dispatch budget refusal: {refusal:?}")
+                }
+            };
+        reservation.mark_invoked_for_runtime(SupervisorRuntime::Cursor)?;
+        drop(reservation);
+        assert_eq!(first.report()?.active_reservations, 0);
+        drop(first);
+
+        let mut next = RunBudgetLedger::new(RunBudgetLimits::default())?;
+        next.attach_quota_config(&repo, "drop-next", &config)?;
+        let projected =
+            next.quota_consumption_ledger(&config, crate::budget_ledger::unix_now()?)?;
+        let entry = projected
+            .entries
+            .get(&config.pools[0].key())
+            .context("next run must observe dropped invocation consumption")?;
+        assert_eq!(entry.tokens, u64::try_from(expected_tokens)?);
+        assert_eq!(entry.requests, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_durable_settlement_keeps_invoked_state_until_cleanup_succeeds() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("repo");
+        Repository::init(&repo)?;
+        let config = quota_runtime_config(&["codex"]);
+        let mut ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
+        ledger.attach_quota_config(&repo, "settlement-failure", &config)?;
+        let plan = worker_plan("composer-2.5");
+        let budget = SupervisorBudgetConfig::default();
+        let command = quota_usage_command(temp.path());
+        let mut reservation =
+            match reserve_dispatch_budget(&plan, &budget, &ledger, AgentRole::Worker, &command)? {
+                DispatchBudgetAdmission::Admitted(reservation) => reservation,
+                DispatchBudgetAdmission::Refused(refusal) => {
+                    bail!("unexpected settlement fixture refusal: {refusal:?}")
+                }
+            };
+        reservation.mark_invoked_for_runtime(SupervisorRuntime::Cursor)?;
+        write_injected_usage(&command, 1, 1);
+        let run = injected_verified_run(&command);
+        assert!(matches!(
+            reservation.settle_bound_runtime(&run, &command),
+            Err(error) if format!("{error:#}").contains("cursor")
+        ));
+        assert_eq!(
+            reservation.state,
+            DispatchBudgetReservationState::Invoked(SupervisorRuntime::Cursor)
+        );
+
+        ledger.release(reservation.reservation.id)?;
+        reservation.state = DispatchBudgetReservationState::Settled;
+        assert_eq!(ledger.report()?.active_reservations, 0);
         Ok(())
     }
 

@@ -1397,11 +1397,68 @@ values under `run_budget.sources` so the override is visible independently of
 the composed `limits`.
 
 Autopilot propagates these limits to its source and generated follow-up
-supervise dispatches. Each supervise run still owns an independent in-memory
-ledger. A durable workspace/machine ledger across runs and integration with
-provider rate-limit signals remain deliberately deferred behind the real
-provider boundary (#77); the attachment seams are supervisor ledger creation
-and the autopilot/inbox dispatch boundary.
+supervise dispatches. Completed run-budget results also update MACO's
+authenticated rolling workspace ledger; in-flight reservations remain local to
+the run.
+
+### Repository-local quota pools
+
+`maco supervise run` and `maco autopilot run` accept an optional
+`--quota-config REPO_RELATIVE_FILE`. The path is resolved inside `--repo` with
+no symlink traversal, and the bounded JSON file is parsed with unknown fields
+denied. When the flag is omitted, admission and selection retain their existing
+behavior.
+
+The file declares operator-known entitlements. MACO does not call provider
+billing, quota, rate-limit, or pricing endpoints: availability and marginal
+cost come only from this config plus completed results in the authenticated
+workspace ledger. For example, this source pool may degrade only to the exact
+declared alternative. Prices are operator-declared config evidence, never live
+quotes:
+
+```json
+{
+  "version": 1,
+  "pools": [
+    {
+      "runtime": "codex",
+      "account": "operator-primary",
+      "pool_kind": "subscription_included",
+      "window": "calendar_month",
+      "nominal_capacity": { "units": 1000000 },
+      "rate_limits": { "max_concurrent_sessions": 2 },
+      "exhaustion_behavior": "degrade",
+      "declared_list_price_microunits": 1000,
+      "authorized_alternatives": [
+        {
+          "runtime": "cursor",
+          "account": "operator-backup",
+          "window": "calendar_month"
+        }
+      ]
+    },
+    {
+      "runtime": "cursor",
+      "account": "operator-backup",
+      "pool_kind": "metered",
+      "window": "calendar_month",
+      "nominal_capacity": "unknown",
+      "rate_limits": { "max_concurrent_sessions": 1 },
+      "exhaustion_behavior": "fail_closed",
+      "declared_list_price_microunits": 5000
+    }
+  ]
+}
+```
+
+A bounded source at zero remaining capacity obeys its configured behavior.
+`fail_closed` refuses dispatch. `degrade` considers only exact
+`authorized_alternatives`, and each alternative must still pass catalog,
+runtime, authority, policy, and publication gates; if none remains eligible,
+selection refuses. Debug overrides cannot bypass quota exhaustion. The selected
+pool state and exhaustion decision are retained as typed selection provenance
+and assignment-ledger evidence. `max_concurrent_sessions` also tightens the
+resolved scheduler fan-out.
 
 On the production Codex path, the no-override child-orchestrator and auditor
 commands are constructed with the profile's explicit model and resolved
@@ -2587,6 +2644,7 @@ cargo run -- supervise plan supervisor-plan.json --repo . --json
 # Selects the default Codex runtime and uses native workspace-write in managed worktrees:
 cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-demo \
   --codex-bin codex \
+  --quota-config config/operator-quota.json \
   --machine-global-config /exact/path/to/machine-global.json \
   --machine-global-runtime-root-id runtime --json
 # Decompose the goal and execute that same validated plan through the live gates:
@@ -3048,6 +3106,8 @@ preview/apply remain separate commands.
 ```bash
 cargo run -- autopilot plan autopilot-plan.json --repo . --json
 cargo run -- autopilot run autopilot-plan.json --repo . --run-id readme-demo \
+  --codex-bin codex \
+  --quota-config config/operator-quota.json \
   --machine-global-config /etc/maco/machine-global.json \
   --machine-global-runtime-root-id runtime --json
 cargo run -- autopilot run --from-goal goal.md --repo . \

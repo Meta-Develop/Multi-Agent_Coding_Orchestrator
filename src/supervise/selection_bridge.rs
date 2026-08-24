@@ -78,6 +78,39 @@ const TEST_CURSOR_CATALOG_FIXTURE_ENV: &str = "MACO_TEST_CURSOR_CATALOG_FIXTURE"
 #[cfg(test)]
 const TEST_CURSOR_CATALOG_OBSERVED_AT_ENV: &str = "MACO_TEST_CURSOR_CATALOG_OBSERVED_AT";
 
+#[cfg(test)]
+thread_local! {
+    static TEST_ADVERTISED_CATALOGS: RefCell<Option<AdvertisedCatalogSet>> = const {
+        RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) struct TestAdvertisedCatalogBindGuard {
+    previous: Option<AdvertisedCatalogSet>,
+}
+
+#[cfg(test)]
+impl Drop for TestAdvertisedCatalogBindGuard {
+    fn drop(&mut self) {
+        TEST_ADVERTISED_CATALOGS.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(test)]
+pub(super) fn bind_test_cursor_catalog_fixture(
+    path: &Path,
+) -> Result<TestAdvertisedCatalogBindGuard> {
+    let advertised = observe_cursor_catalog_from_fixture(path)?;
+    Ok(
+        TEST_ADVERTISED_CATALOGS.with(|slot| TestAdvertisedCatalogBindGuard {
+            previous: slot.borrow_mut().replace(advertised),
+        }),
+    )
+}
+
 /// Observe advertised runtime catalogs for supervisor launch.
 ///
 /// Under `cargo test` this stays hermetic: it never resolves or starts a
@@ -98,6 +131,9 @@ pub(super) fn advertised_catalogs_for_launch(repo: &Path) -> Result<AdvertisedCa
 
 #[cfg(test)]
 fn advertised_catalogs_from_test_fixtures() -> Result<AdvertisedCatalogSet> {
+    if let Some(advertised) = TEST_ADVERTISED_CATALOGS.with(|slot| slot.borrow().clone()) {
+        return Ok(advertised);
+    }
     let Some(path) = std::env::var_os(TEST_CURSOR_CATALOG_FIXTURE_ENV) else {
         return Ok(AdvertisedCatalogSet::empty());
     };
@@ -369,11 +405,23 @@ pub(super) struct SupervisorSelectionPreflightFailure {
     pub(super) message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(super) struct SupervisorAutomaticSelectionState {
     decisions: BTreeMap<AgentRole, SelectionProvenance>,
     advertised: AdvertisedCatalogSet,
+    quota_context: Option<LiveQuotaSelectionContext>,
+    quota_ledger: Option<RunBudgetLedger>,
 }
+
+impl PartialEq for SupervisorAutomaticSelectionState {
+    fn eq(&self, other: &Self) -> bool {
+        self.decisions == other.decisions
+            && self.advertised == other.advertised
+            && self.quota_context == other.quota_context
+    }
+}
+
+impl Eq for SupervisorAutomaticSelectionState {}
 
 #[derive(Debug, Clone)]
 pub(super) struct TypedSelectorEnvironmentRejection {
@@ -384,15 +432,31 @@ pub(super) struct TypedSelectorEnvironmentRejection {
 #[derive(Debug, Clone)]
 pub(super) struct SupervisorReselection {
     pub(super) overrides: BTreeMap<AgentRole, RoleModelSelection>,
+    pub(super) runtime_overrides: BTreeMap<AgentRole, SupervisorRuntime>,
     pub(super) decisions: Vec<(AgentRole, SelectionProvenance)>,
 }
 
+#[cfg(test)]
 pub(super) fn initialize_supervisor_selection(
     plan: &mut SupervisorPlan,
     runtime: SupervisorRuntime,
     catalog: &RuntimeModelCatalog,
     admission: &SupervisorAdmissionPolicyInput,
     advertised: &AdvertisedCatalogSet,
+) -> Result<SupervisorSelectionResolution> {
+    initialize_supervisor_selection_with_quota(
+        plan, runtime, catalog, admission, advertised, None, None,
+    )
+}
+
+pub(super) fn initialize_supervisor_selection_with_quota(
+    plan: &mut SupervisorPlan,
+    runtime: SupervisorRuntime,
+    catalog: &RuntimeModelCatalog,
+    admission: &SupervisorAdmissionPolicyInput,
+    advertised: &AdvertisedCatalogSet,
+    quota_context: Option<&LiveQuotaSelectionContext>,
+    quota_ledger: Option<&RunBudgetLedger>,
 ) -> Result<SupervisorSelectionResolution> {
     if runtime == SupervisorRuntime::Fake {
         return Ok(SupervisorSelectionResolution {
@@ -438,6 +502,14 @@ pub(super) fn initialize_supervisor_selection(
     }
     let mut resolved = BTreeMap::new();
     let mut decisions = Vec::with_capacity(roles.len());
+    let input_context = SupervisorSelectionInputContext {
+        runtime,
+        catalog,
+        advertised,
+        admission,
+        quota_context,
+        quota_ledger,
+    };
     for role in roles {
         let configured = plan.role_models.get(&role);
         let debug_override = configured
@@ -445,10 +517,7 @@ pub(super) fn initialize_supervisor_selection(
             .transpose()?;
         let input = selection_input_for_role(
             role,
-            runtime,
-            catalog,
-            advertised,
-            admission,
+            &input_context,
             DynamicSignals {
                 retry_count: 0,
                 budget_signal: BudgetSignal::Continue,
@@ -535,6 +604,8 @@ pub(super) fn initialize_supervisor_selection(
             SupervisorAutomaticSelectionState::from_initial_decisions(
                 &decisions,
                 advertised.clone(),
+                quota_context.cloned(),
+                quota_ledger.cloned(),
             )
         })
         .transpose()?;
@@ -554,6 +625,8 @@ impl SupervisorAutomaticSelectionState {
     fn from_initial_decisions(
         decisions: &[SupervisorSelectionEvent],
         advertised: AdvertisedCatalogSet,
+        quota_context: Option<LiveQuotaSelectionContext>,
+        quota_ledger: Option<RunBudgetLedger>,
     ) -> Result<Self> {
         let mut by_role = BTreeMap::new();
         for decision in decisions {
@@ -586,6 +659,8 @@ impl SupervisorAutomaticSelectionState {
         Ok(Self {
             decisions: by_role,
             advertised,
+            quota_context,
+            quota_ledger,
         })
     }
 }
@@ -604,6 +679,7 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
     ordered_roles.sort();
     ordered_roles.dedup();
     let mut overrides = BTreeMap::new();
+    let mut runtime_overrides = BTreeMap::new();
     let mut decisions = Vec::with_capacity(ordered_roles.len());
     for role in ordered_roles {
         let previous = state.decisions.get(&role).with_context(|| {
@@ -639,6 +715,20 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
             .filter(|rejection| rejection.role == role)
             .map(|rejection| rejection.rejection.clone())
             .collect();
+        if let Some(quota_context) = &state.quota_context {
+            let source_runtime = input
+                .signals
+                .previous_choice
+                .as_ref()
+                .map(|choice| choice.runtime.clone())
+                .unwrap_or_else(|| runtime_name(runtime).to_string());
+            apply_live_quota_selection_input(
+                &mut input,
+                quota_context,
+                state.quota_ledger.as_ref(),
+                &source_runtime,
+            )?;
+        }
 
         let decision = selection::select(&input).map_err(|error| {
             anyhow!(
@@ -656,11 +746,22 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
             }
         };
         overrides.insert(role, role_selection_from_choice(choice));
+        runtime_overrides.insert(
+            role,
+            runtime_from_name(&choice.candidate.runtime).with_context(|| {
+                format!(
+                    "selector replay chose unsupported runtime '{}' for role '{}'",
+                    choice.candidate.runtime,
+                    role.as_str()
+                )
+            })?,
+        );
         state.decisions.insert(role, decision.clone());
         decisions.push((role, decision));
     }
     Ok(SupervisorReselection {
         overrides,
+        runtime_overrides,
         decisions,
     })
 }
@@ -790,41 +891,60 @@ fn debug_override_for_role(
     })
 }
 
+struct SupervisorSelectionInputContext<'a> {
+    runtime: SupervisorRuntime,
+    catalog: &'a RuntimeModelCatalog,
+    advertised: &'a AdvertisedCatalogSet,
+    admission: &'a SupervisorAdmissionPolicyInput,
+    quota_context: Option<&'a LiveQuotaSelectionContext>,
+    quota_ledger: Option<&'a RunBudgetLedger>,
+}
+
 fn selection_input_for_role(
     role: AgentRole,
-    runtime: SupervisorRuntime,
-    catalog: &RuntimeModelCatalog,
-    advertised: &AdvertisedCatalogSet,
-    admission: &SupervisorAdmissionPolicyInput,
+    context: &SupervisorSelectionInputContext<'_>,
     signals: DynamicSignals,
     debug_override: Option<DebugOverride>,
 ) -> Result<SelectionInput> {
     let priors = selection::built_in_prior_dataset()?;
     let task = task_profile_for_role(role);
-    let runtime_name = runtime_name(runtime);
-    let catalogs = constructed_selection_catalogs(runtime, catalog, advertised, &task, &priors)?;
+    let runtime_name = runtime_name(context.runtime);
+    let catalogs = constructed_selection_catalogs(
+        context.runtime,
+        context.catalog,
+        context.advertised,
+        &task,
+        &priors,
+    )?;
     let profile = priors
         .objective_profiles
         .first()
         .context("built-in selector data has no objective profile")?;
     let profile_name = profile.name.clone();
     let profile_version = profile.version;
-    let capacity = u64::try_from(admission.provider_inflight_bound)
+    let capacity = u64::try_from(context.admission.provider_inflight_bound)
         .context("provider inflight bound does not fit selector pool units")?;
-    let admission_bytes = serde_json::to_vec(admission)
+    let admission_bytes = serde_json::to_vec(context.admission)
         .context("failed to normalize supervisor admission input for selection")?;
     let primary_pool = RuntimePoolState {
         runtime: runtime_name.to_string(),
-        admission_open: admission.resolved_bound > 0,
+        admission_open: context.admission.resolved_bound > 0,
+        pool_reference: None,
+        pool_kind: None,
+        entitlement_bounded: true,
         entitlement_capacity_units: capacity,
         entitlement_remaining_units: capacity,
         pool_pressure_basis_points: 0,
         observed_consumption_units: 0,
         marginal_cost_microunits: 0,
+        exhausted: false,
+        exhaustion_behavior: None,
+        authorized_alternatives: Vec::new(),
         observation_revision: format!(
             "supervisor-admission-sha256:{}",
             crate::artifacts::state_auth::sha256_hex(&admission_bytes)
         ),
+        observation_source: None,
         admission_provenance: "supervisor admission supplies a bounded active-runtime inflight pool; external account quota and marginal-price observations were unavailable"
             .to_string(),
         failover_provenance: Some(
@@ -837,10 +957,11 @@ fn selection_input_for_role(
         .iter()
         .map(|runtime_catalog| runtime_catalog.runtime.clone())
         .collect();
-    Ok(SelectionInput {
+    let mut input = SelectionInput {
         task,
         catalogs,
         pools,
+        quota_source: None,
         constraints: OperatorConstraints {
             allowed_runtimes,
             allowed_models: BTreeSet::new(),
@@ -858,7 +979,43 @@ fn selection_input_for_role(
         outcomes: Vec::new(),
         signals,
         debug_override,
-    })
+    };
+    if let Some(quota_context) = context.quota_context {
+        apply_live_quota_selection_input(
+            &mut input,
+            quota_context,
+            context.quota_ledger,
+            runtime_name,
+        )?;
+    }
+    Ok(input)
+}
+
+fn apply_live_quota_selection_input(
+    input: &mut SelectionInput,
+    quota_context: &LiveQuotaSelectionContext,
+    quota_ledger: Option<&RunBudgetLedger>,
+    source_runtime: &str,
+) -> Result<()> {
+    let source = live_quota_pool_for_runtime(quota_context, source_runtime)?;
+    input.quota_source = Some(crate::optimizer::quota_pools::PoolReference {
+        runtime: source.runtime.clone(),
+        account: source.account.clone(),
+        window: source.window,
+    });
+    let ledger = match quota_ledger {
+        Some(quota_ledger) => quota_ledger
+            .quota_consumption_ledger(&quota_context.config, crate::budget_ledger::unix_now()?)
+            .map_err(|error| {
+                anyhow!("failed to project attached operator quota ledger: {error}")
+            })?,
+        None => {
+            bail!("operator quota selection requires the scheduler's attached run budget ledger")
+        }
+    };
+    selection::apply_fail_closed_quota_pools(input, &quota_context.config.pools, &ledger)
+        .map_err(|error| anyhow!("live operator quota selection input failed closed: {error}"))?;
+    Ok(())
 }
 
 fn constructed_selection_catalogs(
@@ -1395,6 +1552,7 @@ fn ledger_entry_for_assignment(
             catalog_snapshot_digest: None,
             catalog_revisions: Vec::new(),
             rejected_candidates: Vec::new(),
+            quota_evidence: None,
             evidence_gap: Some(
                 "legacy fake runtime does not consult a catalog or record eligibility evidence"
                     .to_string(),
@@ -1416,6 +1574,7 @@ fn ledger_entry_for_assignment(
             catalog_snapshot_digest: None,
             catalog_revisions: Vec::new(),
             rejected_candidates: Vec::new(),
+            quota_evidence: None,
             evidence_gap: Some(
                 "no selector decision was recorded for this assignment role".to_string(),
             ),
@@ -1472,6 +1631,25 @@ fn ledger_entry_for_assignment(
     } else {
         cursor_catalog_evidence_gap_for_ledger(&event.provenance)
     };
+    let quota_evidence = match choice {
+        Some(choice) => event
+            .provenance
+            .normalized_input
+            .pools
+            .iter()
+            .find(|pool| pool.runtime == choice.candidate.runtime)
+            .filter(|pool| pool.pool_reference.is_some())
+            .cloned(),
+        None => event.provenance.quota.as_ref().and_then(|quota| {
+            event
+                .provenance
+                .normalized_input
+                .pools
+                .iter()
+                .find(|pool| pool.pool_reference.as_ref() == Some(&quota.source_pool))
+                .cloned()
+        }),
+    };
 
     AssignmentSelectionLedgerEntry {
         assignment_id: assignment_id.to_string(),
@@ -1492,6 +1670,7 @@ fn ledger_entry_for_assignment(
             .filter(|digest| !digest.is_empty()),
         catalog_revisions: event.provenance.catalog_revisions.clone(),
         rejected_candidates,
+        quota_evidence,
         evidence_gap,
     }
 }
@@ -1558,6 +1737,10 @@ fn ineligibility_code_as_str(code: selection::IneligibilityCode) -> &'static str
         selection::IneligibilityCode::OperatorConstraint => "operator_constraint",
         selection::IneligibilityCode::RuntimeAdmissionClosed => "runtime_admission_closed",
         selection::IneligibilityCode::EntitlementExhausted => "entitlement_exhausted",
+        selection::IneligibilityCode::QuotaFailClosed => "quota_fail_closed",
+        selection::IneligibilityCode::QuotaAlternativeNotAuthorized => {
+            "quota_alternative_not_authorized"
+        }
         selection::IneligibilityCode::TaskClassNotAdvertised => "task_class_not_advertised",
         selection::IneligibilityCode::TaskShapeNotAdvertised => "task_shape_not_advertised",
         selection::IneligibilityCode::AuthorityNotAdvertised => "authority_not_advertised",
@@ -1593,7 +1776,7 @@ impl IfEmptyThen for String {
     }
 }
 
-fn runtime_name(runtime: SupervisorRuntime) -> &'static str {
+pub(super) fn runtime_name(runtime: SupervisorRuntime) -> &'static str {
     runtime.as_str()
 }
 
@@ -1676,6 +1859,9 @@ mod tests {
             effective: SupervisorAdmissionConfig::default(),
             provider_inflight_bound: 1,
             provider_inflight_source: AdmissionInputSource::ConservativeDefault,
+            quota_inflight_bound: None,
+            quota_inflight_source: None,
+            quota_config_path: None,
             host: SupervisorHostResourcePolicyInput {
                 memory_available_mib: None,
                 memory_available_source: AdmissionInputSource::ConservativeDefault,
@@ -1761,6 +1947,348 @@ mod tests {
                 && decision.provenance.status == DecisionStatus::Selected
                 && decision.provenance.choice.is_some()
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn authenticated_exhausted_quota_projects_into_supervisor_refusal_and_evidence() -> Result<()> {
+        use crate::{
+            budget_ledger::{CompletedPoolConsumption, WorkspaceBudgetLedger},
+            optimizer::{
+                ids::RuntimeSlug,
+                quota_pools::{
+                    AccountId, EntitlementDescriptor, ExhaustionBehavior, NominalCapacity,
+                    PoolKind, QuotaConfig, RateLimits, ResetWindow, QUOTA_CONFIG_VERSION,
+                },
+            },
+        };
+
+        let temp = tempfile::TempDir::new()?;
+        let repo = temp.path().join("repo");
+        git2::Repository::init(&repo)?;
+        let config = QuotaConfig {
+            version: QUOTA_CONFIG_VERSION,
+            pools: vec![EntitlementDescriptor {
+                runtime: RuntimeSlug::new("codex")?,
+                account: AccountId::new("operator-primary")?,
+                pool_kind: PoolKind::SubscriptionIncluded,
+                window: ResetWindow::None,
+                nominal_capacity: NominalCapacity::Units(10),
+                rate_limits: RateLimits {
+                    max_concurrent_sessions: Some(1),
+                    ..RateLimits::default()
+                },
+                priority_tier: None,
+                exhaustion_behavior: ExhaustionBehavior::FailClosed,
+                authorized_alternatives: Vec::new(),
+                declared_list_price_microunits: None,
+            }],
+        };
+        config.validate()?;
+        let now = crate::budget_ledger::unix_now()?;
+        {
+            let mut workspace = WorkspaceBudgetLedger::open_or_create(&repo)?;
+            workspace.record_completed_pool_consumption(CompletedPoolConsumption {
+                completion_id: "prior-run/session/1/reservation/1".to_string(),
+                pool: config.pools[0].key(),
+                tokens: 10,
+                requests: 1,
+                cost_usd: None,
+                unix_seconds: now,
+            })?;
+        }
+
+        let mut quota_ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
+        quota_ledger.attach_quota_config(&repo, "live-input-test", &config)?;
+        let context = LiveQuotaSelectionContext {
+            repo,
+            relative_path: PathBuf::from("config/operator-quota.json"),
+            config,
+        };
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection_with_quota(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+            Some(&context),
+            Some(&quota_ledger),
+        )?;
+
+        let failure = resolution
+            .selection_preflight_failure
+            .as_ref()
+            .context("exhausted quota must fail supervisor preflight")?;
+        assert_eq!(
+            failure.kind,
+            SupervisorSelectionPreflightFailureKind::FailClosed
+        );
+        let event = resolution.decisions.first().context("quota decision")?;
+        let quota = event
+            .provenance
+            .quota
+            .as_ref()
+            .context("typed quota decision provenance")?;
+        assert!(quota.source_exhausted);
+        assert_eq!(quota.configured_behavior, ExhaustionBehavior::FailClosed);
+        assert_eq!(
+            quota.disposition,
+            selection::QuotaDecisionDisposition::FailClosed
+        );
+        assert_eq!(
+            quota.local_observation_revision,
+            event.provenance.runtime_operations[0].observation_revision
+        );
+        let source = event
+            .provenance
+            .normalized_input
+            .pools
+            .iter()
+            .find(|pool| pool.pool_reference.as_ref() == Some(&quota.source_pool))
+            .context("typed source pool")?;
+        assert!(source.exhausted);
+        assert_eq!(source.observed_consumption_units, 10);
+
+        let evidence = ledger_entry_for_assignment(
+            "supervisor-gate",
+            AgentRole::Supervisor,
+            &resolution.decisions,
+            SupervisorRuntime::Codex,
+            &plan,
+        )
+        .quota_evidence
+        .context("assignment ledger quota evidence")?;
+        assert_eq!(evidence.pool_reference, Some(quota.source_pool.clone()));
+        assert!(evidence.exhausted);
+        Ok(())
+    }
+
+    #[test]
+    fn available_source_pressure_and_marginal_cost_reach_assignment_evidence() -> Result<()> {
+        use crate::{
+            budget_ledger::{CompletedPoolConsumption, WorkspaceBudgetLedger},
+            optimizer::{
+                ids::RuntimeSlug,
+                quota_pools::{
+                    AccountId, EntitlementDescriptor, ExhaustionBehavior, NominalCapacity,
+                    PoolKind, QuotaConfig, RateLimits, ResetWindow, QUOTA_CONFIG_VERSION,
+                },
+            },
+        };
+
+        let temp = tempfile::TempDir::new()?;
+        let repo = temp.path().join("repo");
+        git2::Repository::init(&repo)?;
+        let config = QuotaConfig {
+            version: QUOTA_CONFIG_VERSION,
+            pools: vec![EntitlementDescriptor {
+                runtime: RuntimeSlug::new("codex")?,
+                account: AccountId::new("metered-primary")?,
+                pool_kind: PoolKind::Metered,
+                window: ResetWindow::None,
+                nominal_capacity: NominalCapacity::Units(10),
+                rate_limits: RateLimits::default(),
+                priority_tier: None,
+                exhaustion_behavior: ExhaustionBehavior::FailClosed,
+                authorized_alternatives: Vec::new(),
+                declared_list_price_microunits: Some(700),
+            }],
+        };
+        let now = crate::budget_ledger::unix_now()?;
+        {
+            let mut workspace = WorkspaceBudgetLedger::open_or_create(&repo)?;
+            workspace.record_completed_pool_consumption(CompletedPoolConsumption {
+                completion_id: "available-prior/session/1/reservation/1".to_string(),
+                pool: config.pools[0].key(),
+                tokens: 4,
+                requests: 1,
+                cost_usd: None,
+                unix_seconds: now,
+            })?;
+        }
+        let mut quota_ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
+        quota_ledger.attach_quota_config(&repo, "available-input", &config)?;
+        let context = LiveQuotaSelectionContext {
+            repo,
+            relative_path: PathBuf::from("config/operator-quota.json"),
+            config,
+        };
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection_with_quota(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+            Some(&context),
+            Some(&quota_ledger),
+        )?;
+        assert!(resolution.selection_preflight_failure.is_none());
+        let worker = resolution
+            .decisions
+            .iter()
+            .find(|event| event.role == AgentRole::Worker)
+            .context("worker quota decision")?;
+        assert_eq!(
+            worker
+                .provenance
+                .choice
+                .as_ref()
+                .context("available source choice")?
+                .candidate
+                .runtime,
+            "codex"
+        );
+        assert_eq!(
+            worker
+                .provenance
+                .quota
+                .as_ref()
+                .context("available quota provenance")?
+                .disposition,
+            selection::QuotaDecisionDisposition::SourceAvailable
+        );
+        let evidence = ledger_entry_for_assignment(
+            "available-worker",
+            AgentRole::Worker,
+            &resolution.decisions,
+            SupervisorRuntime::Codex,
+            &plan,
+        )
+        .quota_evidence
+        .context("available assignment quota evidence")?;
+        assert_eq!(evidence.runtime, "codex");
+        assert_eq!(evidence.observed_consumption_units, 4);
+        assert_eq!(evidence.pool_pressure_basis_points, 4_000);
+        assert_eq!(evidence.marginal_cost_microunits, 700);
+        Ok(())
+    }
+
+    #[test]
+    fn degraded_choice_records_the_selected_runtime_pool_in_assignment_evidence() -> Result<()> {
+        use crate::{
+            budget_ledger::{CompletedPoolConsumption, WorkspaceBudgetLedger},
+            optimizer::{
+                ids::RuntimeSlug,
+                quota_pools::{
+                    AccountId, EntitlementDescriptor, ExhaustionBehavior, NominalCapacity,
+                    PoolKind, PoolReference, QuotaConfig, RateLimits, ResetWindow,
+                    QUOTA_CONFIG_VERSION,
+                },
+            },
+        };
+
+        let temp = tempfile::TempDir::new()?;
+        let repo = temp.path().join("repo");
+        git2::Repository::init(&repo)?;
+        let cursor_reference = PoolReference {
+            runtime: RuntimeSlug::new("cursor")?,
+            account: AccountId::new("cursor-metered")?,
+            window: ResetWindow::None,
+        };
+        let config = QuotaConfig {
+            version: QUOTA_CONFIG_VERSION,
+            pools: vec![
+                EntitlementDescriptor {
+                    runtime: RuntimeSlug::new("codex")?,
+                    account: AccountId::new("codex-included")?,
+                    pool_kind: PoolKind::SubscriptionIncluded,
+                    window: ResetWindow::None,
+                    nominal_capacity: NominalCapacity::Units(10),
+                    rate_limits: RateLimits::default(),
+                    priority_tier: None,
+                    exhaustion_behavior: ExhaustionBehavior::Degrade,
+                    authorized_alternatives: vec![cursor_reference.clone()],
+                    declared_list_price_microunits: None,
+                },
+                EntitlementDescriptor {
+                    runtime: cursor_reference.runtime.clone(),
+                    account: cursor_reference.account.clone(),
+                    pool_kind: PoolKind::Metered,
+                    window: cursor_reference.window,
+                    nominal_capacity: NominalCapacity::Unknown,
+                    rate_limits: RateLimits::default(),
+                    priority_tier: None,
+                    exhaustion_behavior: ExhaustionBehavior::FailClosed,
+                    authorized_alternatives: Vec::new(),
+                    declared_list_price_microunits: Some(500),
+                },
+            ],
+        };
+        config.validate()?;
+        {
+            let mut workspace = WorkspaceBudgetLedger::open_or_create(&repo)?;
+            workspace.record_completed_pool_consumption(CompletedPoolConsumption {
+                completion_id: "degraded-prior/session/1/reservation/1".to_string(),
+                pool: config.pools[0].key(),
+                tokens: 10,
+                requests: 1,
+                cost_usd: None,
+                unix_seconds: crate::budget_ledger::unix_now()?,
+            })?;
+        }
+        let mut quota_ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
+        quota_ledger.attach_quota_config(&repo, "degraded-evidence", &config)?;
+        let quota_context = LiveQuotaSelectionContext {
+            repo,
+            relative_path: PathBuf::from("config/operator-quota.json"),
+            config,
+        };
+        let catalog = codex_catalog()?;
+        let advertised = advertised_with_cursor(captured_cursor_observation()?);
+        let admission = test_admission();
+        let context = SupervisorSelectionInputContext {
+            runtime: SupervisorRuntime::Codex,
+            catalog: &catalog,
+            advertised: &advertised,
+            admission: &admission,
+            quota_context: Some(&quota_context),
+            quota_ledger: Some(&quota_ledger),
+        };
+        let decision = selection::select(&selection_input_for_role(
+            AgentRole::Worker,
+            &context,
+            DynamicSignals {
+                retry_count: 0,
+                budget_signal: BudgetSignal::Continue,
+                previous_choice: None,
+                previous_catalog_digest: None,
+                environment_rejections: Vec::new(),
+            },
+            None,
+        )?)?;
+        let selected = decision.choice.as_ref().context("degraded choice")?;
+        assert_eq!(selected.candidate.runtime, "cursor");
+        assert_eq!(
+            decision
+                .quota
+                .as_ref()
+                .context("degraded quota provenance")?
+                .disposition,
+            selection::QuotaDecisionDisposition::Degraded
+        );
+        let event = SupervisorSelectionEvent {
+            assignment_id: None,
+            attempt: 0,
+            role: AgentRole::Worker,
+            primary_cause: SupervisorSelectionEventCause::Initial,
+            provenance: decision,
+        };
+        let evidence = ledger_entry_for_assignment(
+            "degraded-worker",
+            AgentRole::Worker,
+            &[event],
+            SupervisorRuntime::Codex,
+            &test_plan(),
+        )
+        .quota_evidence
+        .context("selected runtime quota evidence")?;
+        assert_eq!(evidence.runtime, "cursor");
+        assert_eq!(evidence.pool_reference, Some(cursor_reference));
+        assert_eq!(evidence.marginal_cost_microunits, 500);
         Ok(())
     }
 

@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 
 use crate::optimizer::quota_pools::{
     build_quota_selector_input, ConsumptionLedger, EntitlementDescriptor, NominalCapacity,
-    QuotaSelectorInput,
+    PoolReference, QuotaSelectorInput,
 };
 
 use super::{RuntimePoolState, SelectionError, SelectionInput};
@@ -26,41 +26,59 @@ pub fn fail_closed_quota_selector_input(
 
 /// Project validated quota rows onto the current selector wire type.
 ///
-/// Unknown capacity cannot be represented: remaining must not exceed
-/// capacity, and remaining `0` is treated as entitlement exhaustion. Those
-/// pools stay on [`QuotaSelectorInput`] until a later wire revision.
+/// Bounded and unbounded capacity remain distinct, and all exhaustion/routing
+/// authority is copied from the validated operator configuration.
 pub fn runtime_pool_states(
     input: &QuotaSelectorInput,
 ) -> Result<Vec<RuntimePoolState>, SelectionError> {
     let mut pools = Vec::with_capacity(input.pools.len());
     for pool in &input.pools {
-        let NominalCapacity::Units(capacity) = pool.capacity else {
-            return Err(SelectionError::InvalidInput(format!(
-                "runtime pool '{}' has unknown capacity and cannot be projected without fabricating units",
-                pool.runtime
-            )));
+        let (entitlement_bounded, capacity, remaining) = match pool.capacity {
+            NominalCapacity::Units(capacity) => {
+                let remaining = pool.remaining_units.ok_or_else(|| {
+                    SelectionError::InvalidInput(format!(
+                        "runtime pool '{}' is missing remaining units for a known capacity",
+                        pool.runtime
+                    ))
+                })?;
+                if remaining > capacity {
+                    return Err(SelectionError::InvalidInput(format!(
+                        "runtime pool '{}' remaining entitlement exceeds capacity",
+                        pool.runtime
+                    )));
+                }
+                (true, capacity, remaining)
+            }
+            NominalCapacity::Unknown => {
+                if pool.remaining_units.is_some() {
+                    return Err(SelectionError::InvalidInput(format!(
+                        "runtime pool '{}' supplies remaining units for unknown capacity",
+                        pool.runtime
+                    )));
+                }
+                (false, 0, 0)
+            }
         };
-        let remaining = pool.remaining_units.ok_or_else(|| {
-            SelectionError::InvalidInput(format!(
-                "runtime pool '{}' is missing remaining units for a known capacity",
-                pool.runtime
-            ))
-        })?;
-        if remaining > capacity {
-            return Err(SelectionError::InvalidInput(format!(
-                "runtime pool '{}' remaining entitlement exceeds capacity",
-                pool.runtime
-            )));
-        }
         pools.push(RuntimePoolState {
             runtime: pool.runtime.to_string(),
             admission_open: pool.admission_open,
+            pool_reference: Some(PoolReference {
+                runtime: pool.runtime.clone(),
+                account: pool.account.clone(),
+                window: pool.window,
+            }),
+            pool_kind: Some(pool.pool_kind),
+            entitlement_bounded,
             entitlement_capacity_units: capacity,
             entitlement_remaining_units: remaining,
             pool_pressure_basis_points: pool.pool_pressure_basis_points,
             observed_consumption_units: pool.observed_consumption_units,
             marginal_cost_microunits: pool.marginal_cost_microunits,
+            exhausted: pool.exhausted,
+            exhaustion_behavior: Some(pool.exhaustion_behavior),
+            authorized_alternatives: pool.authorized_alternatives.clone(),
             observation_revision: pool.observation_revision.clone(),
+            observation_source: Some(pool.observation_source),
             admission_provenance: pool.admission_provenance.clone(),
             failover_provenance: None,
         });
@@ -104,6 +122,25 @@ pub fn apply_fail_closed_quota_pools(
             })?;
         ordered.push(pool.clone());
     }
+    let requested_source = input.quota_source.clone();
+    input.quota_source = match requested_source.as_ref() {
+        Some(source) => ordered
+            .iter()
+            .find(|pool| pool.pool_reference.as_ref() == Some(source))
+            .and_then(|pool| pool.pool_reference.clone())
+            .map(Some)
+            .ok_or_else(|| {
+                SelectionError::InvalidInput(
+                    "declared quota_source does not match the projected quota pools".to_string(),
+                )
+            })?,
+        None if ordered.len() == 1 => ordered[0].pool_reference.clone(),
+        None => {
+            return Err(SelectionError::InvalidInput(
+                "multiple projected quota pools require an exact quota_source".to_string(),
+            ));
+        }
+    };
     input.pools = ordered;
     Ok(quota)
 }
@@ -113,7 +150,8 @@ mod tests {
     use super::*;
     use crate::optimizer::ids::RuntimeSlug;
     use crate::optimizer::quota_pools::{
-        AccountId, LedgerEntry, NominalCapacity, PoolKind, RateLimits, ResetWindow, SpillPolicy,
+        AccountId, ExhaustionBehavior, LedgerEntry, NominalCapacity, PoolKind, RateLimits,
+        ResetWindow,
     };
     use crate::selection::{
         AuthorityRole, Boundedness, CandidateCapabilities, CatalogModel, ContextSize,
@@ -137,7 +175,8 @@ mod tests {
             nominal_capacity: NominalCapacity::Units(capacity),
             rate_limits: RateLimits::default(),
             priority_tier: None,
-            spill: SpillPolicy::Stop,
+            exhaustion_behavior: ExhaustionBehavior::FailClosed,
+            authorized_alternatives: Vec::new(),
             declared_list_price_microunits: None,
         }
     }
@@ -151,7 +190,8 @@ mod tests {
             nominal_capacity: NominalCapacity::Unknown,
             rate_limits: RateLimits::default(),
             priority_tier: None,
-            spill: SpillPolicy::Stop,
+            exhaustion_behavior: ExhaustionBehavior::FailClosed,
+            authorized_alternatives: Vec::new(),
             declared_list_price_microunits: Some(9_000),
         }
     }
@@ -196,12 +236,19 @@ mod tests {
         RuntimePoolState {
             runtime: runtime.to_string(),
             admission_open: true,
+            pool_reference: None,
+            pool_kind: None,
+            entitlement_bounded: true,
             entitlement_capacity_units: 1,
             entitlement_remaining_units: 1,
             pool_pressure_basis_points: 0,
             observed_consumption_units: 0,
             marginal_cost_microunits: 0,
+            exhausted: false,
+            exhaustion_behavior: None,
+            authorized_alternatives: Vec::new(),
             observation_revision: format!("{runtime}-dummy"),
+            observation_source: None,
             admission_provenance: "placeholder before quota overlay".to_string(),
             failover_provenance: None,
         }
@@ -221,6 +268,7 @@ mod tests {
             },
             catalogs: runtimes.iter().copied().map(catalog).collect(),
             pools: runtimes.iter().copied().map(dummy_pool).collect(),
+            quota_source: None,
             constraints: OperatorConstraints {
                 allowed_runtimes: runtimes
                     .iter()
@@ -275,12 +323,15 @@ mod tests {
     }
 
     #[test]
-    fn unknown_metered_capacity_fails_closed_on_wire_projection() {
+    fn unknown_metered_capacity_remains_explicitly_unbounded() {
         let (entitlement, ledger) = snapshot(&metered("grok"), 3);
         let quota = fail_closed_quota_selector_input(&[entitlement], &ledger).expect("quota");
         assert_eq!(quota.pools[0].marginal_cost_microunits, 9_000);
-        let error = runtime_pool_states(&quota).expect_err("unknown capacity");
-        assert!(error.to_string().contains("unknown capacity"), "{error}");
+        let pools = runtime_pool_states(&quota).expect("unbounded metered pool");
+        assert!(!pools[0].entitlement_bounded);
+        assert!(!pools[0].exhausted);
+        assert_eq!(pools[0].entitlement_capacity_units, 0);
+        assert_eq!(pools[0].entitlement_remaining_units, 0);
     }
 
     #[test]
@@ -314,6 +365,25 @@ mod tests {
         let error = apply_fail_closed_quota_pools(&mut input, &[entitlement], &ledger)
             .expect_err("unobserved catalog");
         assert!(error.to_string().contains("advertised catalogs"), "{error}");
+        assert_eq!(input.pools[0].observation_revision, "codex-dummy");
+    }
+
+    #[test]
+    fn multiple_configured_pools_require_an_exact_source() {
+        let entitlements = vec![included("codex", 50), included("grok", 50)];
+        let mut ledger = ConsumptionLedger::new();
+        for entitlement in &entitlements {
+            ledger
+                .insert_snapshot(
+                    entitlement.key(),
+                    LedgerEntry::local(0, 0, format!("{}-obs", entitlement.runtime.as_str())),
+                )
+                .expect("snapshot");
+        }
+        let mut input = selection_shell(&["codex", "grok"]);
+        let error = apply_fail_closed_quota_pools(&mut input, &entitlements, &ledger)
+            .expect_err("ambiguous source");
+        assert!(error.to_string().contains("quota_source"), "{error}");
         assert_eq!(input.pools[0].observation_revision, "codex-dummy");
     }
 }

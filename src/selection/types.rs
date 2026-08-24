@@ -2,6 +2,10 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::optimizer::quota_pools::{
+    ConsumptionSource, ExhaustionBehavior, PoolKind, PoolReference,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskLevel {
@@ -152,14 +156,39 @@ pub struct RuntimeCatalog {
 pub struct RuntimePoolState {
     pub runtime: String,
     pub admission_open: bool,
+    /// Exact configured pool identity. `None` is the legacy/no-quota-config path.
+    #[serde(default)]
+    pub pool_reference: Option<PoolReference>,
+    /// Contract kind for a configured pool. `None` is legacy admission data.
+    #[serde(default)]
+    pub pool_kind: Option<PoolKind>,
+    /// Whether capacity and remaining units are meaningful bounded values.
+    #[serde(default = "default_true")]
+    pub entitlement_bounded: bool,
     pub entitlement_capacity_units: u64,
     pub entitlement_remaining_units: u64,
     pub pool_pressure_basis_points: u16,
     pub observed_consumption_units: u64,
     pub marginal_cost_microunits: u64,
+    /// Explicit exhaustion observation. Unbounded metered pools remain false.
+    #[serde(default)]
+    pub exhausted: bool,
+    /// Operator-declared behavior for a configured pool.
+    #[serde(default)]
+    pub exhaustion_behavior: Option<ExhaustionBehavior>,
+    /// Exact configured alternatives; an empty set authorizes no degradation.
+    #[serde(default)]
+    pub authorized_alternatives: Vec<PoolReference>,
     pub observation_revision: String,
+    /// Typed local observation source. `None` is legacy caller provenance.
+    #[serde(default)]
+    pub observation_source: Option<ConsumptionSource>,
     pub admission_provenance: String,
     pub failover_provenance: Option<String>,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -424,6 +453,12 @@ pub struct SelectionInput {
     pub task: TaskProfile,
     pub catalogs: Vec<RuntimeCatalog>,
     pub pools: Vec<RuntimePoolState>,
+    /// Exact primary pool whose exhaustion policy governs this decision.
+    ///
+    /// `None` preserves the pre-quota selector behavior. Configured live quota
+    /// selection must name a source rather than inferring one from catalog order.
+    #[serde(default)]
+    pub quota_source: Option<PoolReference>,
     pub constraints: OperatorConstraints,
     pub priors: PriorDataset,
     pub objective_profile: ObjectiveProfileRef,
@@ -488,6 +523,8 @@ pub enum IneligibilityCode {
     OperatorConstraint,
     RuntimeAdmissionClosed,
     EntitlementExhausted,
+    QuotaFailClosed,
+    QuotaAlternativeNotAuthorized,
     TaskClassNotAdvertised,
     TaskShapeNotAdvertised,
     AuthorityNotAdvertised,
@@ -537,6 +574,8 @@ pub struct CandidateEvaluation {
     pub strong_gate_fallback: bool,
     pub eligible: bool,
     pub ineligibility_reasons: Vec<IneligibilityReason>,
+    #[serde(default)]
+    pub quota: QuotaCandidateProvenance,
     pub ledger: LedgerSummary,
     pub score: Option<ScoreBreakdown>,
 }
@@ -558,6 +597,7 @@ pub enum SelectionTrigger {
     CatalogChange,
     EnvironmentFallback,
     DebugOverride,
+    QuotaExhaustion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -567,6 +607,86 @@ pub enum ChoiceReason {
     StrongestNoEvidenceJudgmentFallback,
     DebugOverride,
     OneShotEnvironmentFallback,
+    AuthorizedQuotaDegrade,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaCandidateDisposition {
+    #[default]
+    LegacyUnconfigured,
+    SourceAvailable,
+    SourceExhausted,
+    AuthorizedAlternative,
+    RejectedUnauthorizedAlternative,
+    FailClosed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaCandidateProvenance {
+    pub source_pool: Option<PoolReference>,
+    pub target_pool: Option<PoolReference>,
+    pub source_exhausted: bool,
+    pub configured_behavior: Option<ExhaustionBehavior>,
+    pub authorized_alternative: bool,
+    pub disposition: QuotaCandidateDisposition,
+    pub source_observation_revision: Option<String>,
+    pub source_observation: Option<ConsumptionSource>,
+    pub target_marginal_cost_microunits: Option<u64>,
+    pub reason: String,
+}
+
+impl Default for QuotaCandidateProvenance {
+    fn default() -> Self {
+        Self {
+            source_pool: None,
+            target_pool: None,
+            source_exhausted: false,
+            configured_behavior: None,
+            authorized_alternative: false,
+            disposition: QuotaCandidateDisposition::LegacyUnconfigured,
+            source_observation_revision: None,
+            source_observation: None,
+            target_marginal_cost_microunits: None,
+            reason: "legacy schema-v1 selector event did not carry typed quota provenance"
+                .to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaDecisionDisposition {
+    SourceAvailable,
+    FailClosed,
+    Degraded,
+    RefusedByExplicitOverride,
+    RefusedNoEligibleAlternative,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RejectedQuotaAlternative {
+    pub candidate: CandidateKey,
+    pub reasons: Vec<IneligibilityReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaDecisionProvenance {
+    pub source_pool: PoolReference,
+    pub configured_behavior: ExhaustionBehavior,
+    pub source_exhausted: bool,
+    pub local_observation_revision: String,
+    pub observation_source: ConsumptionSource,
+    pub marginal_cost_assumption_microunits: u64,
+    pub authorized_alternatives: Vec<PoolReference>,
+    pub eligible_alternatives: Vec<CandidateKey>,
+    pub rejected_alternatives: Vec<RejectedQuotaAlternative>,
+    pub selected_alternative: Option<CandidateKey>,
+    pub disposition: QuotaDecisionDisposition,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -636,4 +756,6 @@ pub struct SelectionProvenance {
     pub decision_reason: String,
     pub debug_override: Option<DebugOverrideProvenance>,
     pub environment_fallback: Option<EnvironmentFallbackTransition>,
+    #[serde(default)]
+    pub quota: Option<QuotaDecisionProvenance>,
 }

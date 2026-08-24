@@ -10,12 +10,14 @@
 use crate::{
     artifacts::{repository_auth_writer, state_auth::AuthenticationDomain},
     llm::ProviderError,
+    optimizer::quota_pools::{ConsumptionLedger, LedgerEntry, PoolKey, QuotaConfig, ResetWindow},
     state_journal::{AuthenticatedStateJournal, JournalRecord, JournalSpec},
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
+    collections::BTreeSet,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -166,6 +168,16 @@ enum BudgetLedgerEvent {
         cost_usd: Option<f64>,
         unix_seconds: u64,
     },
+    PoolConsume {
+        version: u32,
+        completion_id: String,
+        pool: PoolKey,
+        tokens: u64,
+        requests: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+        unix_seconds: u64,
+    },
     RateLimited {
         version: u32,
         pool: String,
@@ -179,6 +191,7 @@ impl BudgetLedgerEvent {
     fn phase(&self) -> &'static str {
         match self {
             Self::Consume { .. } => "consume",
+            Self::PoolConsume { .. } => "pool_consume",
             Self::RateLimited { .. } => "rate_limited",
         }
     }
@@ -186,6 +199,9 @@ impl BudgetLedgerEvent {
     fn subject(&self) -> Option<&str> {
         match self {
             Self::Consume { run_id, .. } if journal_subject_ok(run_id) => Some(run_id.as_str()),
+            Self::PoolConsume { completion_id, .. } if journal_subject_ok(completion_id) => {
+                Some(completion_id.as_str())
+            }
             Self::RateLimited { pool, .. } if journal_subject_ok(pool) => Some(pool.as_str()),
             _ => None,
         }
@@ -193,9 +209,9 @@ impl BudgetLedgerEvent {
 
     fn unix_seconds(&self) -> u64 {
         match self {
-            Self::Consume { unix_seconds, .. } | Self::RateLimited { unix_seconds, .. } => {
-                *unix_seconds
-            }
+            Self::Consume { unix_seconds, .. }
+            | Self::PoolConsume { unix_seconds, .. }
+            | Self::RateLimited { unix_seconds, .. } => *unix_seconds,
         }
     }
 }
@@ -212,6 +228,34 @@ pub struct RateLimitLatch {
     pub pool: String,
     pub detail: String,
     pub until_unix_seconds: u64,
+}
+
+/// One completed local run-budget reconciliation attributed to a quota pool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletedPoolConsumption {
+    pub completion_id: String,
+    pub pool: PoolKey,
+    pub tokens: u64,
+    pub requests: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    pub unix_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolConsumptionRecordOutcome {
+    Recorded,
+    AlreadyRecorded,
+}
+
+/// Authenticated local consumption projected for one pool's declared window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PoolConsumptionUsage {
+    pub tokens: u64,
+    pub requests: u64,
+    pub cost_usd: Option<f64>,
+    pub observation_revision: String,
 }
 
 pub struct WorkspaceBudgetLedger {
@@ -260,6 +304,54 @@ impl WorkspaceBudgetLedger {
             unix_seconds: now_unix_seconds,
         };
         self.publish(event)
+    }
+
+    /// Persist one completed run-budget reconciliation for a quota pool.
+    ///
+    /// Repeating the exact completion is a no-op. Reusing its stable ID with
+    /// different pool or usage data fails closed instead of double-counting.
+    pub fn record_completed_pool_consumption(
+        &mut self,
+        completion: CompletedPoolConsumption,
+    ) -> Result<PoolConsumptionRecordOutcome> {
+        validate_completed_pool_consumption(&completion)?;
+        for event in &self.events {
+            let BudgetLedgerEvent::PoolConsume {
+                completion_id,
+                pool,
+                tokens,
+                requests,
+                cost_usd,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            if completion_id != &completion.completion_id {
+                continue;
+            }
+            if pool == &completion.pool
+                && *tokens == completion.tokens
+                && *requests == completion.requests
+                && *cost_usd == completion.cost_usd
+            {
+                return Ok(PoolConsumptionRecordOutcome::AlreadyRecorded);
+            }
+            bail!(
+                "workspace quota completion id '{}' was already recorded with different data",
+                completion.completion_id
+            );
+        }
+        self.publish(BudgetLedgerEvent::PoolConsume {
+            version: LEDGER_FORMAT_VERSION,
+            completion_id: completion.completion_id,
+            pool: completion.pool,
+            tokens: completion.tokens,
+            requests: completion.requests,
+            cost_usd: completion.cost_usd,
+            unix_seconds: completion.unix_seconds,
+        })?;
+        Ok(PoolConsumptionRecordOutcome::Recorded)
     }
 
     pub fn record_rate_limited(
@@ -323,6 +415,24 @@ impl WorkspaceBudgetLedger {
                         None => {}
                     }
                 }
+                BudgetLedgerEvent::PoolConsume {
+                    tokens: consumed,
+                    cost_usd: observed,
+                    ..
+                } => {
+                    let consumed = usize::try_from(*consumed)
+                        .context("pool token consumption does not fit this platform")?;
+                    tokens = tokens
+                        .checked_add(consumed)
+                        .context("rolling token consumption overflowed")?;
+                    match observed {
+                        Some(cost) => {
+                            cost_usd = checked_cost_add(cost_usd, *cost)?;
+                        }
+                        None if consumed > 0 => cost_complete = false,
+                        None => {}
+                    }
+                }
                 BudgetLedgerEvent::RateLimited {
                     pool,
                     until_unix_seconds,
@@ -340,6 +450,80 @@ impl WorkspaceBudgetLedger {
             cost_usd: cost_complete.then_some(cost_usd),
             rate_limited_pools,
         })
+    }
+
+    /// Project authenticated completed usage for one exact quota-pool window.
+    pub fn pool_usage(
+        &self,
+        pool: &PoolKey,
+        now_unix_seconds: u64,
+    ) -> Result<PoolConsumptionUsage> {
+        let window_start = pool_window_start(pool.window, now_unix_seconds)?;
+        let mut tokens = 0_u64;
+        let mut requests = 0_u64;
+        let mut cost_usd = 0.0_f64;
+        let mut cost_complete = true;
+        let mut observation_revision = "authenticated-workspace-ledger-empty".to_string();
+        for event in &self.events {
+            let BudgetLedgerEvent::PoolConsume {
+                completion_id,
+                pool: event_pool,
+                tokens: event_tokens,
+                requests: event_requests,
+                cost_usd: event_cost,
+                unix_seconds,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            if event_pool != pool || window_start.is_some_and(|start| *unix_seconds < start) {
+                continue;
+            }
+            tokens = tokens
+                .checked_add(*event_tokens)
+                .context("quota pool token consumption overflowed")?;
+            requests = requests
+                .checked_add(*event_requests)
+                .context("quota pool request consumption overflowed")?;
+            match event_cost {
+                Some(cost) => cost_usd = checked_cost_add(cost_usd, *cost)?,
+                None if *event_tokens > 0 || *event_requests > 0 => cost_complete = false,
+                None => {}
+            }
+            observation_revision.clone_from(completion_id);
+        }
+        Ok(PoolConsumptionUsage {
+            tokens,
+            requests,
+            cost_usd: cost_complete.then_some(cost_usd),
+            observation_revision,
+        })
+    }
+
+    /// Build the selector's local observation snapshot directly from this
+    /// authenticated journal. No provider data or network operation is used.
+    pub fn quota_consumption_ledger(
+        &self,
+        config: &QuotaConfig,
+        now_unix_seconds: u64,
+    ) -> Result<ConsumptionLedger> {
+        config
+            .validate()
+            .map_err(|error| anyhow::anyhow!("operator quota config is invalid: {error}"))?;
+        let mut projection = ConsumptionLedger::new();
+        for entitlement in &config.pools {
+            let usage = self.pool_usage(&entitlement.key(), now_unix_seconds)?;
+            projection
+                .insert_snapshot(
+                    entitlement.key(),
+                    LedgerEntry::local(usage.tokens, usage.requests, usage.observation_revision),
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to project authenticated quota consumption: {error}")
+                })?;
+        }
+        Ok(projection)
     }
 
     pub fn active_rate_limit(&self, pool: &str, now_unix_seconds: u64) -> Option<RateLimitLatch> {
@@ -387,6 +571,7 @@ impl WorkspaceBudgetLedger {
 
 fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
     let mut events = Vec::with_capacity(records.len());
+    let mut pool_completion_ids = BTreeSet::new();
     for record in records {
         let event = serde_json::from_value::<BudgetLedgerEvent>(record.payload.clone())
             .context("workspace rolling budget journal contains an unknown or corrupt event")?;
@@ -410,6 +595,34 @@ fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
                     bail!("rolling budget consume event has an invalid cost");
                 }
             }
+            BudgetLedgerEvent::PoolConsume {
+                version,
+                completion_id,
+                pool,
+                tokens,
+                requests,
+                cost_usd,
+                unix_seconds,
+            } => {
+                let completion = CompletedPoolConsumption {
+                    completion_id: completion_id.clone(),
+                    pool: pool.clone(),
+                    tokens: *tokens,
+                    requests: *requests,
+                    cost_usd: *cost_usd,
+                    unix_seconds: *unix_seconds,
+                };
+                if *version != LEDGER_FORMAT_VERSION {
+                    bail!("unsupported workspace quota pool consumption version {version}");
+                }
+                validate_completed_pool_consumption(&completion)?;
+                if !pool_completion_ids.insert(completion_id.clone()) {
+                    bail!(
+                        "workspace quota pool ledger contains duplicate completion id '{}'",
+                        completion_id
+                    );
+                }
+            }
             BudgetLedgerEvent::RateLimited {
                 version,
                 pool,
@@ -431,6 +644,90 @@ fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
         events.push(event);
     }
     Ok(events)
+}
+
+fn validate_completed_pool_consumption(completion: &CompletedPoolConsumption) -> Result<()> {
+    if completion.completion_id.is_empty()
+        || completion.completion_id.len() > 512
+        || completion.completion_id.chars().any(char::is_control)
+    {
+        bail!("workspace quota completion id is invalid");
+    }
+    completion
+        .pool
+        .validate()
+        .map_err(|error| anyhow::anyhow!("workspace quota pool key is invalid: {error}"))?;
+    if completion.tokens == 0 && completion.requests == 0 && completion.cost_usd.is_none() {
+        bail!("workspace quota completion must record tokens, requests, or cost");
+    }
+    if completion
+        .cost_usd
+        .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
+    {
+        bail!("workspace quota completion cost must be finite and non-negative");
+    }
+    Ok(())
+}
+
+fn pool_window_start(window: ResetWindow, now_unix_seconds: u64) -> Result<Option<u64>> {
+    match window {
+        ResetWindow::None => Ok(None),
+        ResetWindow::RollingHours { hours: 0 } => {
+            bail!("rolling quota window hours must be greater than zero")
+        }
+        ResetWindow::RollingHours { hours } => {
+            let seconds = u64::from(hours)
+                .checked_mul(60 * 60)
+                .context("rolling quota window overflowed")?;
+            Ok(Some(now_unix_seconds.saturating_sub(seconds)))
+        }
+        ResetWindow::CalendarMonth => Ok(Some(calendar_month_start(now_unix_seconds)?)),
+    }
+}
+
+fn calendar_month_start(now_unix_seconds: u64) -> Result<u64> {
+    let days = i64::try_from(now_unix_seconds / 86_400)
+        .context("calendar quota timestamp is outside the supported range")?;
+    let (year, month) = civil_year_month_from_days(days);
+    let first_day = days_from_civil(year, month, 1);
+    u64::try_from(first_day)
+        .context("calendar quota month starts before the unix epoch")?
+        .checked_mul(86_400)
+        .context("calendar quota month start overflowed")
+}
+
+// Gregorian civil-date conversions adapted from the public-domain algorithms
+// by Howard Hinnant. Inputs and outputs are whole days relative to 1970-01-01.
+fn civil_year_month_from_days(days: i64) -> (i64, i64) {
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month)
+}
+
+fn days_from_civil(mut year: i64, month: i64, day: i64) -> i64 {
+    if month <= 2 {
+        year -= 1;
+    }
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 fn journal_subject_ok(value: &str) -> bool {
@@ -480,6 +777,25 @@ mod tests {
             max_tokens: Some(max_tokens),
             max_cost_usd: None,
             window_seconds: DEFAULT_ROLLING_WINDOW_SECONDS,
+        }
+    }
+
+    fn pool(runtime: &str, window: ResetWindow) -> PoolKey {
+        PoolKey {
+            runtime: crate::optimizer::ids::RuntimeSlug::new(runtime).expect("runtime"),
+            account: crate::optimizer::quota_pools::AccountId::new("operator").expect("account"),
+            window,
+        }
+    }
+
+    fn completion(id: &str, pool: PoolKey, tokens: u64, now: u64) -> CompletedPoolConsumption {
+        CompletedPoolConsumption {
+            completion_id: id.to_string(),
+            pool,
+            tokens,
+            requests: 1,
+            cost_usd: Some(tokens as f64 / 100.0),
+            unix_seconds: now,
         }
     }
 
@@ -539,6 +855,123 @@ mod tests {
     }
 
     #[test]
+    fn completed_pool_consumption_is_idempotent_and_feeds_legacy_aggregate() {
+        let (_temp, repo) = repository();
+        let key = pool("gpt-5.6-sol", ResetWindow::RollingHours { hours: 1 });
+        {
+            let mut ledger = WorkspaceBudgetLedger::open_or_create(&repo).expect("create");
+            assert_eq!(
+                ledger
+                    .record_completed_pool_consumption(completion(
+                        "run-a/reservation/1",
+                        key.clone(),
+                        25,
+                        10_000,
+                    ))
+                    .expect("record"),
+                PoolConsumptionRecordOutcome::Recorded
+            );
+            let mut retried = completion("run-a/reservation/1", key.clone(), 25, 10_010);
+            retried.unix_seconds = 10_010;
+            assert_eq!(
+                ledger
+                    .record_completed_pool_consumption(retried)
+                    .expect("idempotent retry"),
+                PoolConsumptionRecordOutcome::AlreadyRecorded
+            );
+            let mismatch = completion("run-a/reservation/1", key.clone(), 26, 10_000);
+            assert!(ledger
+                .record_completed_pool_consumption(mismatch)
+                .expect_err("mismatched retry")
+                .to_string()
+                .contains("different data"));
+        }
+
+        let reopened = WorkspaceBudgetLedger::open_or_create(&repo).expect("reopen");
+        let usage = reopened.pool_usage(&key, 10_100).expect("pool usage");
+        assert_eq!(usage.tokens, 25);
+        assert_eq!(usage.requests, 1);
+        assert_eq!(usage.cost_usd, Some(0.25));
+        assert_eq!(usage.observation_revision, "run-a/reservation/1");
+        let aggregate = reopened.usage_in_window(3_600, 10_100).expect("aggregate");
+        assert_eq!(aggregate.tokens, 25);
+        assert_eq!(aggregate.cost_usd, Some(0.25));
+    }
+
+    #[test]
+    fn pool_windows_and_selector_projection_use_only_matching_completed_events() {
+        let (_temp, repo) = repository();
+        let rolling = pool("rolling", ResetWindow::RollingHours { hours: 1 });
+        let monthly = pool("monthly", ResetWindow::CalendarMonth);
+        let mut ledger = WorkspaceBudgetLedger::open_or_create(&repo).expect("create");
+        ledger
+            .record_completed_pool_consumption(completion(
+                "old/reservation/1",
+                rolling.clone(),
+                40,
+                1_000,
+            ))
+            .expect("old rolling");
+        ledger
+            .record_completed_pool_consumption(completion(
+                "new/reservation/1",
+                rolling.clone(),
+                12,
+                10_000,
+            ))
+            .expect("new rolling");
+        ledger
+            .record_completed_pool_consumption(completion(
+                "month/reservation/1",
+                monthly.clone(),
+                9,
+                2_700_000,
+            ))
+            .expect("monthly");
+        assert_eq!(
+            ledger.pool_usage(&rolling, 10_000).expect("rolling").tokens,
+            12
+        );
+        assert_eq!(
+            ledger
+                .pool_usage(&monthly, 3_000_000)
+                .expect("monthly")
+                .tokens,
+            9
+        );
+        assert_eq!(
+            calendar_month_start(3_000_000).expect("February 1970"),
+            2_678_400
+        );
+
+        let config = QuotaConfig {
+            version: crate::optimizer::quota_pools::QUOTA_CONFIG_VERSION,
+            pools: vec![crate::optimizer::quota_pools::EntitlementDescriptor {
+                runtime: rolling.runtime.clone(),
+                account: rolling.account.clone(),
+                pool_kind: crate::optimizer::quota_pools::PoolKind::Metered,
+                window: rolling.window,
+                nominal_capacity: crate::optimizer::quota_pools::NominalCapacity::Unknown,
+                rate_limits: crate::optimizer::quota_pools::RateLimits::default(),
+                priority_tier: None,
+                exhaustion_behavior: crate::optimizer::quota_pools::ExhaustionBehavior::FailClosed,
+                authorized_alternatives: Vec::new(),
+                declared_list_price_microunits: Some(1),
+            }],
+        };
+        let projection = ledger
+            .quota_consumption_ledger(&config, 10_000)
+            .expect("authenticated projection");
+        let entry = projection.entries.get(&rolling).expect("rolling entry");
+        assert_eq!(entry.tokens, 12);
+        assert_eq!(entry.requests, 1);
+        assert_eq!(
+            entry.source,
+            crate::optimizer::quota_pools::ConsumptionSource::LocalObserved
+        );
+    }
+
+    #[test]
     fn window_excludes_consumption_outside_the_rolling_horizon() {
         let (_temp, repo) = repository();
         let mut ledger = WorkspaceBudgetLedger::open_or_create(&repo).expect("ledger");
@@ -555,12 +988,17 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_journal_fails_closed_on_replay() {
+    fn corrupt_pool_journal_fails_closed_on_replay() {
         let (_temp, repo) = repository();
         {
             let mut ledger = WorkspaceBudgetLedger::open_or_create(&repo).expect("create");
             ledger
-                .record_consumption("run-a", 10, None, 50)
+                .record_completed_pool_consumption(completion(
+                    "run-a/reservation/1",
+                    pool("codex", ResetWindow::None),
+                    10,
+                    50,
+                ))
                 .expect("persist");
         }
         let record = journal_record_paths(&repo)
