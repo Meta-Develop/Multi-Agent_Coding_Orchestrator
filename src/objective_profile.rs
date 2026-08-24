@@ -7,8 +7,8 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const DEFAULT_OBJECTIVE_PROFILE_ID: &str = "maco-default-objective-v1";
-pub const DEFAULT_OBJECTIVE_PROFILE_VERSION: u32 = 1;
+pub const DEFAULT_OBJECTIVE_PROFILE_ID: &str = "maco-default-objective-v2";
+pub const DEFAULT_OBJECTIVE_PROFILE_VERSION: u32 = 2;
 pub const HELD_OUT_WEIGHT_PERCENT: u32 = 50;
 pub const BREADTH_WEIGHT_PERCENT: u32 = 25;
 pub const ANTI_SHORTCUT_WEIGHT_PERCENT: u32 = 25;
@@ -285,6 +285,8 @@ mod tests {
         let second = profile.content_hash().expect("hash");
         assert_eq!(first, second);
         assert_eq!(first.len(), 64);
+        assert_eq!(profile.id, "maco-default-objective-v2");
+        assert_eq!(profile.version, 2);
         assert_eq!(
             profile.switch_costs,
             ContextSwitchCosts {
@@ -350,6 +352,8 @@ mod tests {
             br#"{"id":"legacy","version":1,"quality":{"held_out_percent":50,"breadth_percent":25,"anti_shortcut_percent":25}}"#,
         )
         .expect("historical profile");
+        assert_eq!(profile.id, "legacy");
+        assert_eq!(profile.version, 1);
         assert_eq!(profile.switch_costs, ContextSwitchCosts::zero());
 
         let binding: ObjectiveProfileBinding = serde_json::from_value(serde_json::json!({

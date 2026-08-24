@@ -118,7 +118,7 @@ fn base_input() -> SelectionInput {
         priors: built_in_prior_dataset().expect("built-in priors"),
         objective_profile: ObjectiveProfileRef {
             name: "accepted-task-total-cost".to_string(),
-            version: 1,
+            version: 2,
             expected_digest: None,
         },
         outcomes: Vec::new(),
@@ -159,7 +159,10 @@ fn codex_model_switch_input(model_switch_cost_microunits: u64) -> SelectionInput
 #[test]
 fn built_in_data_is_dated_and_keeps_policy_in_data() {
     let priors = built_in_prior_dataset().expect("built-in priors");
-    assert_eq!(priors.published_on, "2026-08-21");
+    assert_eq!(priors.revision, "2026-08-25.1");
+    assert_eq!(priors.published_on, "2026-08-25");
+    assert_eq!(priors.objective_profiles[0].version, 2);
+    assert_eq!(priors.objective_profiles[0].effective_date, "2026-08-25");
     assert!(priors.models.iter().any(|prior| prior.prohibited));
     assert!(priors
         .models
@@ -268,7 +271,16 @@ fn initial_stay_effort_model_and_runtime_transitions_are_typed_and_charged() {
         ContextSwitchTransition::ModelChangeSameRuntime
     );
     assert_eq!(model.configured_switch_cost_microunits, 10_000);
-    assert!(model.switch_cost_microunits >= 10_000);
+    let model_quality = u128::from(model.posterior_quality_basis_points);
+    let expected_model_switch_cost = u128::from(model.configured_switch_cost_microunits)
+        .checked_mul(10_000)
+        .and_then(|scaled| scaled.checked_add(model_quality.checked_sub(1)?))
+        .expect("model switch normalization arithmetic")
+        / model_quality;
+    assert_eq!(
+        u128::from(model.switch_cost_microunits),
+        expected_model_switch_cost
+    );
 
     let runtime = score_for(&CandidateKey {
         runtime: "grok".to_string(),
@@ -280,7 +292,49 @@ fn initial_stay_effort_model_and_runtime_transitions_are_typed_and_charged() {
         ContextSwitchTransition::RuntimeChange
     );
     assert_eq!(runtime.configured_switch_cost_microunits, 25_000);
-    assert!(runtime.switch_cost_microunits >= 25_000);
+    let runtime_quality = u128::from(runtime.posterior_quality_basis_points);
+    let expected_runtime_switch_cost = u128::from(runtime.configured_switch_cost_microunits)
+        .checked_mul(10_000)
+        .and_then(|scaled| scaled.checked_add(runtime_quality.checked_sub(1)?))
+        .expect("runtime switch normalization arithmetic")
+        / runtime_quality;
+    assert_eq!(
+        u128::from(runtime.switch_cost_microunits),
+        expected_runtime_switch_cost
+    );
+}
+
+#[test]
+fn zero_switch_cost_preserves_candidate_keyed_initial_total_scores_exactly() {
+    let previous_choice = codex_model_switch_input(0);
+    let mut initial = previous_choice.clone();
+    initial.signals.previous_choice = None;
+
+    let initial = select(&initial).expect("equivalent initial selection");
+    let previous_choice = select(&previous_choice).expect("zero-cost previous-choice selection");
+    assert_eq!(
+        initial.candidate_set.len(),
+        previous_choice.candidate_set.len()
+    );
+
+    for evaluation in &previous_choice.candidate_set {
+        let previous_score = evaluation.score.as_ref().expect("previous-choice score");
+        let initial_score = initial
+            .candidate_set
+            .iter()
+            .find(|candidate| candidate.candidate == evaluation.candidate)
+            .and_then(|candidate| candidate.score.as_ref())
+            .expect("candidate-keyed initial score");
+        assert_eq!(previous_score.configured_switch_cost_microunits, 0);
+        assert_eq!(previous_score.switch_cost_microunits, 0);
+        assert_eq!(initial_score.configured_switch_cost_microunits, 0);
+        assert_eq!(initial_score.switch_cost_microunits, 0);
+        assert_eq!(
+            previous_score.total_score_microunits, initial_score.total_score_microunits,
+            "candidate total changed despite a zero switch term: {:?}",
+            evaluation.candidate
+        );
+    }
 }
 
 #[test]

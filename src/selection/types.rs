@@ -565,20 +565,15 @@ pub struct RankedScore {
     pub total_score_microunits: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextSwitchTransition {
+    #[default]
     Initial,
     Stay,
     EffortChangeSameRuntimeModel,
     ModelChangeSameRuntime,
     RuntimeChange,
-}
-
-impl Default for ContextSwitchTransition {
-    fn default() -> Self {
-        Self::Initial
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]

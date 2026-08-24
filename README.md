@@ -1452,19 +1452,23 @@ or revised on empirical grounds.
 
 Automatic routing includes a conservative objective-profile cost when a role
 changes model or runtime after an earlier assignment in the same supervisor
-run. The built-in profile charges 10,000 microunits for a model change on the
-same runtime and 25,000 microunits for a runtime change. Initial selection,
+run. The built-in profile configures 10,000 microunits for a model change on
+the same runtime and 25,000 microunits for a runtime change. Initial selection,
 staying on the exact runtime/model pair, and changing only reasoning effort on
-that same pair charge zero. The effort-only case is deliberately zero because
-this contract models runtime/model re-priming rather than every assignment
-parameter change.
+that same pair configure and charge zero. The effort-only case is deliberately
+zero because this contract models runtime/model re-priming rather than every
+assignment parameter change.
 
 These defaults are inferred operating policy, not measured transition
 telemetry. Operators can tune them through the existing versioned objective
-profile. Every term is added with checked microunit arithmetic; malformed
-values or overflow fail closed. The state boundary is the previous assignment
-for the same role in the current supervisor run, not process-global or
-cross-run mutable state.
+profile. The charged term is normalized inside the existing checked
+cost-per-accepted-task objective as
+`ceil(configured switch cost × 10,000 / candidate posterior-quality basis points)`.
+It therefore generally differs from the configured value unless candidate
+quality is 10,000 basis points. Malformed values, zero-quality normalization,
+intermediate or result overflow, and total-score overflow fail closed. The state
+boundary is the previous assignment for the same role in the current supervisor
+run, not process-global or cross-run mutable state.
 
 Serialized selection evidence records the previous choice in the normalized
 input and records each candidate's typed transition, configured switch cost,

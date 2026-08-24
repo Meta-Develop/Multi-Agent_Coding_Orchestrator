@@ -322,15 +322,22 @@ struct SchedulerProgress {
 impl SchedulerProgress {
     #[cfg(test)]
     fn new(assignment_count: usize, max_concurrent_children: usize) -> Self {
-        Self::new_with_selection_state(assignment_count, max_concurrent_children, None)
+        Self::new_with_selection_state(
+            assignment_count,
+            max_concurrent_children,
+            None,
+            SupervisorRuntime::Fake,
+        )
+        .expect("scheduler progress without automatic selection is valid")
     }
 
     fn new_with_selection_state(
         assignment_count: usize,
         max_concurrent_children: usize,
         automatic_selection_state: Option<SupervisorAutomaticSelectionState>,
-    ) -> Self {
-        Self {
+        runtime: SupervisorRuntime,
+    ) -> Result<Self> {
+        Ok(Self {
             indexed_outcomes: (0..assignment_count).map(|_| None).collect(),
             health_breaker: SwarmHealthCircuitBreaker::default(),
             budget_prevented_dispatch: false,
@@ -340,17 +347,23 @@ impl SchedulerProgress {
             budget_degradation: BudgetDegradationController::new_with_selection_state(
                 max_concurrent_children,
                 automatic_selection_state,
-            ),
-        }
+                runtime,
+            )?,
+        })
+    }
+
+    fn commit_completed_selection_prefix(&mut self, runtime: SupervisorRuntime) -> Result<()> {
+        self.budget_degradation
+            .commit_completed_selection_prefix(&self.indexed_outcomes, runtime)
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct AssignmentBudgetPolicy {
     model_overrides: BTreeMap<AgentRole, RoleModelSelection>,
     child_effort_degradation_steps: usize,
     assignment_reasoning_effort: Option<ReasoningEffort>,
-    selector_state: Option<Arc<Mutex<SupervisorAutomaticSelectionState>>>,
+    selector_state: Option<SupervisorAutomaticSelectionState>,
     selector_overrides: BTreeMap<AgentRole, RoleModelSelection>,
     pub(super) selector_decisions: Vec<SupervisorSelectionEvent>,
 }
@@ -427,14 +440,11 @@ impl AssignmentBudgetPolicy {
             budget_signal,
             environment_rejections,
         } = request;
-        let Some(state) = self.selector_state.as_ref() else {
+        let Some(state) = self.selector_state.as_mut() else {
             return Ok(Vec::new());
         };
-        let mut state = state
-            .lock()
-            .map_err(|_| anyhow!("automatic selector same-run state mutex was poisoned"))?;
         let reselection = reselect_roles_from_supplied_catalog_snapshot(
-            &mut state,
+            state,
             runtime,
             catalog,
             roles,
@@ -454,6 +464,22 @@ impl AssignmentBudgetPolicy {
                 provenance,
             })
             .collect())
+    }
+
+    fn commit_completed_selection_events(
+        &mut self,
+        runtime: SupervisorRuntime,
+        events: &[SupervisorSelectionEvent],
+    ) -> Result<()> {
+        let Some(state) = self.selector_state.as_mut() else {
+            if events.is_empty() {
+                return Ok(());
+            }
+            bail!("completed automatic-selection events have no manager replay state");
+        };
+        let overrides = state.commit_completed_selection_events(runtime, events)?;
+        self.selector_overrides.extend(overrides);
+        Ok(())
     }
 }
 
@@ -484,29 +510,61 @@ struct BudgetDegradationController {
     records: Vec<BudgetDegradationRecord>,
     assignment_effort_bindings: Vec<AssignmentEffortBinding>,
     last_new_dispatch_allowed: bool,
+    next_selection_commit_index: usize,
 }
 
 impl BudgetDegradationController {
     #[cfg(test)]
     fn new(max_concurrent_children: usize) -> Self {
-        Self::new_with_selection_state(max_concurrent_children, None)
+        Self::new_with_selection_state(max_concurrent_children, None, SupervisorRuntime::Fake)
+            .expect("budget controller without automatic selection is valid")
     }
 
     fn new_with_selection_state(
         max_concurrent_children: usize,
         automatic_selection_state: Option<SupervisorAutomaticSelectionState>,
-    ) -> Self {
-        Self {
+        runtime: SupervisorRuntime,
+    ) -> Result<Self> {
+        let selector_overrides = automatic_selection_state
+            .as_ref()
+            .map(|state| state.executable_overrides(runtime))
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Self {
             rung: BudgetDegradationRung::Effort,
             policy: AssignmentBudgetPolicy {
-                selector_state: automatic_selection_state.map(|state| Arc::new(Mutex::new(state))),
+                selector_state: automatic_selection_state,
+                selector_overrides,
                 ..AssignmentBudgetPolicy::default()
             },
             effective_fan_out: max_concurrent_children.max(1),
             records: Vec::new(),
             assignment_effort_bindings: Vec::new(),
             last_new_dispatch_allowed: true,
+            next_selection_commit_index: 0,
+        })
+    }
+
+    fn commit_completed_selection_prefix(
+        &mut self,
+        indexed_outcomes: &[Option<AssignmentExecutionOutcome>],
+        runtime: SupervisorRuntime,
+    ) -> Result<()> {
+        while let Some(Some(outcome)) = indexed_outcomes.get(self.next_selection_commit_index) {
+            self.policy
+                .commit_completed_selection_events(runtime, &outcome.selection_decisions)
+                .with_context(|| {
+                    format!(
+                        "failed to commit automatic-selection events for schedule index {}",
+                        self.next_selection_commit_index
+                    )
+                })?;
+            self.next_selection_commit_index = self
+                .next_selection_commit_index
+                .checked_add(1)
+                .context("automatic-selection schedule commit index overflowed")?;
         }
+        Ok(())
     }
 
     fn assignment_policy(
@@ -539,8 +597,9 @@ impl BudgetDegradationController {
                 runtime,
             )?;
         }
+        let mut policy = self.policy.clone();
         let selector_decisions = if report.action == BudgetAction::Degrade {
-            self.policy.reselect(
+            policy.reselect(
                 runtime,
                 catalog,
                 SelectorReselectionRequest {
@@ -561,7 +620,6 @@ impl BudgetDegradationController {
             Vec::new()
         };
         self.last_new_dispatch_allowed = report.new_dispatch_allowed;
-        let mut policy = self.policy.clone();
         policy.assignment_reasoning_effort = requested_reasoning_effort;
         policy.selector_decisions = selector_decisions;
         self.record_assignment_effort_bindings(
@@ -1076,6 +1134,7 @@ fn run_serial_assignment_schedule(
             context.assignment_schedule,
             context.artifacts,
         )?;
+        progress.commit_completed_selection_prefix(context.options.runtime)?;
         if pending.is_empty() {
             break;
         }
@@ -1135,6 +1194,7 @@ fn run_serial_assignment_schedule(
         if !preclaim.allows_path_claim() {
             pending.remove(&index);
             progress.indexed_outcomes[index] = Some(parked_preclaim_outcome(assignment, &preclaim));
+            progress.commit_completed_selection_prefix(context.options.runtime)?;
             continue;
         }
         pending.remove(&index);
@@ -1199,6 +1259,7 @@ fn run_serial_assignment_schedule(
         let abort = outcome.requires_scheduler_abort();
         let budget_stopped = outcome.budget_dispatch_stopped;
         progress.indexed_outcomes[index] = Some(outcome);
+        progress.commit_completed_selection_prefix(context.options.runtime)?;
         if abort || budget_stopped {
             progress.budget_prevented_dispatch |= budget_stopped;
             if !pending.is_empty()
@@ -1264,6 +1325,7 @@ fn run_concurrent_assignment_schedule(
                     context.assignment_schedule,
                     context.artifacts,
                 )?;
+                progress.commit_completed_selection_prefix(context.options.runtime)?;
                 while active.len() < progress.budget_degradation.effective_fan_out {
                     if !progress.health_breaker.permits_admission() {
                         stop_scheduling = true;
@@ -1324,6 +1386,7 @@ fn run_concurrent_assignment_schedule(
                         pending.remove(&index);
                         progress.indexed_outcomes[index] =
                             Some(parked_preclaim_outcome(assignment, &preclaim));
+                        progress.commit_completed_selection_prefix(context.options.runtime)?;
                         continue;
                     }
                     pending.remove(&index);
@@ -1424,6 +1487,8 @@ fn run_concurrent_assignment_schedule(
                                     );
                                     progress.indexed_outcomes[active_index] = Some(outcome);
                                 }
+                                progress
+                                    .commit_completed_selection_prefix(context.options.runtime)?;
                                 return Err(error).context(format!(
                                     "supervisor assignment '{}' ended before committing or declining budget admission",
                                     assignment.id
@@ -1443,6 +1508,7 @@ fn run_concurrent_assignment_schedule(
                                 .as_ref()
                                 .context("spawn failure outcome disappeared")?;
                             record_completed_assignment_checkpoint(context, index, outcome)?;
+                            progress.commit_completed_selection_prefix(context.options.runtime)?;
                             break;
                         }
                     }
@@ -1512,6 +1578,7 @@ fn run_concurrent_assignment_schedule(
                 }
             }
             progress.indexed_outcomes[completed_index] = Some(outcome);
+            progress.commit_completed_selection_prefix(context.options.runtime)?;
         }
 
         for (index, handle) in active {
@@ -1525,6 +1592,7 @@ fn run_concurrent_assignment_schedule(
             record_completed_assignment_checkpoint(context, index, &outcome)?;
             release_concurrent_assignment(&mut outcome, context.sync_store, context.semantic_store);
             progress.indexed_outcomes[index] = Some(outcome);
+            progress.commit_completed_selection_prefix(context.options.runtime)?;
         }
         Ok(())
     })
@@ -2967,7 +3035,8 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 plan.assignments.len(),
                 max_concurrent_children,
                 automatic_selection_state,
-            );
+                options.runtime,
+            )?;
             let scheduler_context = AssignmentSchedulerContext {
                 plan: &plan,
                 requested_plan: &requested_plan,
@@ -3397,6 +3466,7 @@ mod selection_policy_tests {
         RuntimeModelCatalog,
         SupervisorAutomaticSelectionState,
         Vec<SupervisorSelectionEvent>,
+        SupervisorPlan,
     )> {
         let priors = crate::selection::built_in_prior_dataset()?;
         let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(
@@ -3445,6 +3515,7 @@ mod selection_policy_tests {
                 .automatic_state
                 .context("automatic selector same-run state")?,
             resolution.decisions,
+            plan,
         ))
     }
 
@@ -3562,11 +3633,14 @@ mod selection_policy_tests {
     }
 
     #[test]
-    fn cloned_assignment_policies_share_immediately_prior_same_run_choice() -> Result<()> {
-        let (catalog, state, _) = automatic_selection_fixture()?;
-        let controller = BudgetDegradationController::new_with_selection_state(2, Some(state));
+    fn completed_retry_promotes_matching_execution_override_and_reroute_state() -> Result<()> {
+        let (catalog, state, _, plan) = automatic_selection_fixture()?;
+        let mut controller = BudgetDegradationController::new_with_selection_state(
+            2,
+            Some(state),
+            SupervisorRuntime::Codex,
+        )?;
         let mut retry_policy = controller.policy.clone();
-        let mut later_budget_policy = controller.policy.clone();
 
         let retry_events = retry_policy.reselect(
             SupervisorRuntime::Codex,
@@ -3588,8 +3662,27 @@ mod selection_policy_tests {
             .context("retry selected worker choice")?
             .candidate
             .clone();
+        let retry_selection = retry_policy
+            .selector_overrides
+            .get(&AgentRole::Worker)
+            .context("retry selected executable worker override")?
+            .clone();
 
-        let budget_events = later_budget_policy.reselect(
+        let indexed_outcomes = vec![Some(AssignmentExecutionOutcome {
+            selection_decisions: retry_events.clone(),
+            ..AssignmentExecutionOutcome::default()
+        })];
+        controller
+            .commit_completed_selection_prefix(&indexed_outcomes, SupervisorRuntime::Codex)?;
+
+        let continue_plan = controller.policy.apply(&plan);
+        assert_eq!(
+            continue_plan.role_models.get(&AgentRole::Worker),
+            Some(&retry_selection)
+        );
+
+        let mut later_policy = controller.policy.clone();
+        let later_events = later_policy.reselect(
             SupervisorRuntime::Codex,
             &catalog,
             SelectorReselectionRequest {
@@ -3609,7 +3702,7 @@ mod selection_policy_tests {
         );
         assert_eq!(retry_events[0].attempt, 2);
         assert_eq!(
-            budget_events[0]
+            later_events[0]
                 .provenance
                 .normalized_input
                 .signals
@@ -3618,8 +3711,142 @@ mod selection_policy_tests {
             Some(&retry_choice)
         );
         assert_eq!(
-            budget_events[0].primary_cause,
+            later_events[0].primary_cause,
             SupervisorSelectionEventCause::BudgetDegrade
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_retries_share_predispatch_state_and_commit_in_schedule_order() -> Result<()> {
+        let (catalog, state, initial_events, plan) = automatic_selection_fixture()?;
+        let initial_worker = initial_events
+            .iter()
+            .find(|event| event.role == AgentRole::Worker)
+            .and_then(|event| event.provenance.choice.as_ref())
+            .context("initial worker selection")?
+            .candidate
+            .clone();
+        let mut controller = BudgetDegradationController::new_with_selection_state(
+            2,
+            Some(state),
+            SupervisorRuntime::Codex,
+        )?;
+        let policies = [controller.policy.clone(), controller.policy.clone()];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut completed = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (index, mut policy) in policies.into_iter().enumerate() {
+                let barrier = barrier.clone();
+                let catalog = &catalog;
+                handles.push(scope.spawn(
+                    move || -> Result<(usize, SupervisorSelectionEvent, RoleModelSelection)> {
+                        barrier.wait();
+                        let events = policy.reselect(
+                            SupervisorRuntime::Codex,
+                            catalog,
+                            SelectorReselectionRequest {
+                                roles: &[AgentRole::Worker],
+                                assignment_id: Some(if index == 0 {
+                                    "schedule-0"
+                                } else {
+                                    "schedule-1"
+                                }),
+                                attempt: index + 1,
+                                primary_cause: SupervisorSelectionEventCause::Retry,
+                                retry_count: u32::try_from(index + 1)
+                                    .context("test retry count fits u32")?,
+                                budget_signal: crate::selection::BudgetSignal::Continue,
+                                environment_rejections: &[],
+                            },
+                        )?;
+                        let selection = policy
+                            .selector_overrides
+                            .get(&AgentRole::Worker)
+                            .context("retry worker override")?
+                            .clone();
+                        Ok((
+                            index,
+                            events.into_iter().next().context("retry event")?,
+                            selection,
+                        ))
+                    },
+                ));
+            }
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .expect("concurrent retry thread did not panic")
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        completed.sort_by_key(|(index, _, _)| *index);
+        assert!(completed.iter().all(|(_, event, _)| {
+            event
+                .provenance
+                .normalized_input
+                .signals
+                .previous_choice
+                .as_ref()
+                == Some(&initial_worker)
+        }));
+
+        let schedule_one_choice = completed[1]
+            .1
+            .provenance
+            .choice
+            .as_ref()
+            .context("schedule-one retry choice")?
+            .clone();
+        let mut indexed_outcomes = vec![None, None];
+        indexed_outcomes[1] = Some(AssignmentExecutionOutcome {
+            selection_decisions: vec![completed[1].1.clone()],
+            ..AssignmentExecutionOutcome::default()
+        });
+        controller
+            .commit_completed_selection_prefix(&indexed_outcomes, SupervisorRuntime::Codex)?;
+        assert_eq!(controller.next_selection_commit_index, 0);
+
+        indexed_outcomes[0] = Some(AssignmentExecutionOutcome {
+            selection_decisions: vec![completed[0].1.clone()],
+            ..AssignmentExecutionOutcome::default()
+        });
+        controller
+            .commit_completed_selection_prefix(&indexed_outcomes, SupervisorRuntime::Codex)?;
+        assert_eq!(controller.next_selection_commit_index, 2);
+        assert_eq!(
+            controller
+                .policy
+                .apply(&plan)
+                .role_models
+                .get(&AgentRole::Worker),
+            Some(&completed[1].2)
+        );
+
+        let mut later_policy = controller.policy.clone();
+        let later_events = later_policy.reselect(
+            SupervisorRuntime::Codex,
+            &catalog,
+            SelectorReselectionRequest {
+                roles: &[AgentRole::Worker],
+                assignment_id: Some("schedule-2"),
+                attempt: 1,
+                primary_cause: SupervisorSelectionEventCause::Retry,
+                retry_count: 1,
+                budget_signal: crate::selection::BudgetSignal::Continue,
+                environment_rejections: &[],
+            },
+        )?;
+        assert_eq!(
+            later_events[0]
+                .provenance
+                .normalized_input
+                .signals
+                .previous_choice
+                .as_ref(),
+            Some(&schedule_one_choice.candidate)
         );
         Ok(())
     }

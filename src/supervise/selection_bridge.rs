@@ -588,6 +588,124 @@ impl SupervisorAutomaticSelectionState {
             advertised,
         })
     }
+
+    pub(super) fn executable_overrides(
+        &self,
+        runtime: SupervisorRuntime,
+    ) -> Result<BTreeMap<AgentRole, RoleModelSelection>> {
+        let mut overrides = BTreeMap::new();
+        for (role, provenance) in &self.decisions {
+            let choice = match executable_choice(provenance, runtime, *role)? {
+                ExecutableChoiceResolution::Executable(choice) => choice,
+                ExecutableChoiceResolution::PreflightFailure(failure) => {
+                    bail!(
+                        "automatic selector replay state failed executable preflight: {}",
+                        failure.message
+                    )
+                }
+            };
+            overrides.insert(*role, role_selection_from_choice(choice));
+        }
+        Ok(overrides)
+    }
+
+    /// Commit one completed assignment's automatic-selection events atomically.
+    ///
+    /// Concurrent assignments intentionally start from independent clones of the
+    /// last manager-committed state. Their completion events are replayed by the
+    /// scheduler in stable schedule-index order, so the first event for a role can
+    /// branch from a choice other than the manager's state at commit time. Events
+    /// within one assignment must still form an exact previous-choice chain.
+    pub(super) fn commit_completed_selection_events(
+        &mut self,
+        runtime: SupervisorRuntime,
+        events: &[SupervisorSelectionEvent],
+    ) -> Result<BTreeMap<AgentRole, RoleModelSelection>> {
+        if events.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let assignment_id = events[0]
+            .assignment_id
+            .as_deref()
+            .filter(|assignment_id| !assignment_id.is_empty())
+            .context("completed automatic-selection event has no assignment identity")?;
+        let mut ordered = events.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|event| (event.attempt, event.role));
+
+        let mut next_decisions = self.decisions.clone();
+        let mut assignment_previous = BTreeMap::<AgentRole, CandidateKey>::new();
+        let mut overrides = BTreeMap::new();
+        let mut previous_key = None;
+        for event in ordered {
+            if event.assignment_id.as_deref() != Some(assignment_id) {
+                bail!(
+                    "completed automatic-selection events mix assignment identities '{}' and '{}'",
+                    assignment_id,
+                    event.assignment_id.as_deref().unwrap_or("<missing>")
+                );
+            }
+            let key = (event.attempt, event.role);
+            if previous_key == Some(key) {
+                bail!(
+                    "completed automatic-selection events duplicate attempt {} for role '{}'",
+                    event.attempt,
+                    event.role.as_str()
+                );
+            }
+            previous_key = Some(key);
+
+            let normalized_role = role_for_task_profile(&event.provenance.normalized_task)?;
+            if normalized_role != event.role {
+                bail!(
+                    "completed automatic-selection event role '{}' disagrees with normalized task role '{}'",
+                    event.role.as_str(),
+                    normalized_role.as_str()
+                );
+            }
+            let supplied_previous = event
+                .provenance
+                .normalized_input
+                .signals
+                .previous_choice
+                .as_ref()
+                .with_context(|| {
+                    format!(
+                        "completed automatic-selection event for role '{}' has no same-run previous choice",
+                        event.role.as_str()
+                    )
+                })?;
+            if let Some(expected_previous) = assignment_previous.get(&event.role) {
+                if supplied_previous != expected_previous {
+                    bail!(
+                        "completed automatic-selection event chain for role '{}' expected previous choice '{}:{}:{:?}' but recorded '{}:{}:{:?}'",
+                        event.role.as_str(),
+                        expected_previous.runtime,
+                        expected_previous.model,
+                        expected_previous.effort,
+                        supplied_previous.runtime,
+                        supplied_previous.model,
+                        supplied_previous.effort,
+                    );
+                }
+            }
+            let choice = match executable_choice(&event.provenance, runtime, event.role)? {
+                ExecutableChoiceResolution::Executable(choice) => choice,
+                ExecutableChoiceResolution::PreflightFailure(failure) => {
+                    bail!(
+                        "completed automatic-selection event failed executable preflight: {}",
+                        failure.message
+                    )
+                }
+            };
+            assignment_previous.insert(event.role, choice.candidate.clone());
+            overrides.insert(event.role, role_selection_from_choice(choice));
+            next_decisions.insert(event.role, event.provenance.clone());
+        }
+
+        self.decisions = next_decisions;
+        Ok(overrides)
+    }
 }
 
 pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
@@ -1734,6 +1852,64 @@ mod tests {
                 .automatic_state
                 .context("automatic selection replay state")?,
         ))
+    }
+
+    #[test]
+    fn completed_event_commit_is_atomic_when_assignment_chain_is_malformed() -> Result<()> {
+        let (catalog, mut manager_state) = automatic_state()?;
+        let before = manager_state.clone();
+        let mut assignment_state = manager_state.clone();
+        let first = reselect_roles_from_supplied_catalog_snapshot(
+            &mut assignment_state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        let second = reselect_roles_from_supplied_catalog_snapshot(
+            &mut assignment_state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            2,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        let mut events = vec![
+            SupervisorSelectionEvent {
+                assignment_id: Some("assignment-a".to_string()),
+                attempt: 1,
+                role: AgentRole::Worker,
+                primary_cause: SupervisorSelectionEventCause::Retry,
+                provenance: first.decisions[0].1.clone(),
+            },
+            SupervisorSelectionEvent {
+                assignment_id: Some("assignment-a".to_string()),
+                attempt: 2,
+                role: AgentRole::Worker,
+                primary_cause: SupervisorSelectionEventCause::Retry,
+                provenance: second.decisions[0].1.clone(),
+            },
+        ];
+        events[1]
+            .provenance
+            .normalized_input
+            .signals
+            .previous_choice = Some(CandidateKey {
+            runtime: "codex".to_string(),
+            model: "tampered-chain".to_string(),
+            effort: SelectorEffort::Low,
+        });
+
+        let error = manager_state
+            .commit_completed_selection_events(SupervisorRuntime::Codex, &events)
+            .expect_err("malformed assignment event chain must fail closed");
+
+        assert!(error.to_string().contains("expected previous choice"));
+        assert_eq!(manager_state, before);
+        Ok(())
     }
 
     #[test]
