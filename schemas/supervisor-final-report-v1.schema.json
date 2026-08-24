@@ -1164,6 +1164,10 @@
                                   "minimum": 0,
                                   "type": "integer"
                                 },
+                                "configured_switch_cost_microunits": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
                                 "entitlement_scarcity_cost_microunits": {
                                   "minimum": 0,
                                   "type": "integer"
@@ -1193,6 +1197,20 @@
                                   "minimum": 0,
                                   "type": "integer"
                                 },
+                                "switch_cost_microunits": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "switch_transition": {
+                                  "enum": [
+                                    "initial",
+                                    "stay",
+                                    "effort_change_same_runtime_model",
+                                    "model_change_same_runtime",
+                                    "runtime_change"
+                                  ],
+                                  "type": "string"
+                                },
                                 "total_score_microunits": {
                                   "minimum": 0,
                                   "type": "integer"
@@ -1208,6 +1226,9 @@
                                 "marginal_cost_microunits",
                                 "retry_cost_microunits",
                                 "degrade_cost_microunits",
+                                "switch_transition",
+                                "configured_switch_cost_microunits",
+                                "switch_cost_microunits",
                                 "total_score_microunits"
                               ],
                               "type": "object"
@@ -1298,12 +1319,30 @@
                             ],
                             "type": "object"
                           },
+                          "configured_switch_cost_microunits": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
                           "reason": {
                             "enum": [
                               "lowest_expected_total_cost_per_accepted_task",
                               "strongest_no_evidence_judgment_fallback",
                               "debug_override",
                               "one_shot_environment_fallback"
+                            ],
+                            "type": "string"
+                          },
+                          "switch_cost_microunits": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "switch_transition": {
+                            "enum": [
+                              "initial",
+                              "stay",
+                              "effort_change_same_runtime_model",
+                              "model_change_same_runtime",
+                              "runtime_change"
                             ],
                             "type": "string"
                           },
@@ -1314,6 +1353,9 @@
                         },
                         "required": [
                           "candidate",
+                          "switch_transition",
+                          "configured_switch_cost_microunits",
+                          "switch_cost_microunits",
                           "total_score_microunits",
                           "reason"
                         ],
@@ -2578,6 +2620,24 @@
                                   "minimum": 0,
                                   "type": "integer"
                                 },
+                                "switch_costs": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "model_change_same_runtime_microunits": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "runtime_change_microunits": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "model_change_same_runtime_microunits",
+                                    "runtime_change_microunits"
+                                  ],
+                                  "type": "object"
+                                },
                                 "version": {
                                   "minimum": 1,
                                   "type": "integer"
@@ -2594,7 +2654,8 @@
                                 "observed_consumption_unit_cost_microunits",
                                 "entitlement_scarcity_full_cost_microunits",
                                 "retry_penalty_microunits",
-                                "degrade_effort_rank_penalty_microunits"
+                                "degrade_effort_rank_penalty_microunits",
+                                "switch_costs"
                               ],
                               "type": "object"
                             },
@@ -2992,6 +3053,24 @@
                           "minimum": 2,
                           "type": "integer"
                         },
+                        "configured_switch_cost_microunits": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "switch_cost_microunits": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "switch_transition": {
+                          "enum": [
+                            "initial",
+                            "stay",
+                            "effort_change_same_runtime_model",
+                            "model_change_same_runtime",
+                            "runtime_change"
+                          ],
+                          "type": "string"
+                        },
                         "total_score_microunits": {
                           "minimum": 0,
                           "type": "integer"
@@ -3000,6 +3079,9 @@
                       "required": [
                         "rank",
                         "candidate",
+                        "switch_transition",
+                        "configured_switch_cost_microunits",
+                        "switch_cost_microunits",
                         "total_score_microunits"
                       ],
                       "type": "object"
@@ -3075,7 +3157,7 @@
                     "type": "array"
                   },
                   "schema_version": {
-                    "const": 1,
+                    "const": 2,
                     "type": "integer"
                   },
                   "status": {

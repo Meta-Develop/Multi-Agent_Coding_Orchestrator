@@ -1448,6 +1448,35 @@ combined profile remains `production_eligible=false`. Genuine Issue #26
 evidence is required before its effort policy can be qualified for production
 or revised on empirical grounds.
 
+### Same-run context-switch cost
+
+Automatic routing includes a conservative objective-profile cost when a role
+changes model or runtime after an earlier assignment in the same supervisor
+run. The built-in profile charges 10,000 microunits for a model change on the
+same runtime and 25,000 microunits for a runtime change. Initial selection,
+staying on the exact runtime/model pair, and changing only reasoning effort on
+that same pair charge zero. The effort-only case is deliberately zero because
+this contract models runtime/model re-priming rather than every assignment
+parameter change.
+
+These defaults are inferred operating policy, not measured transition
+telemetry. Operators can tune them through the existing versioned objective
+profile. Every term is added with checked microunit arithmetic; malformed
+values or overflow fail closed. The state boundary is the previous assignment
+for the same role in the current supervisor run, not process-global or
+cross-run mutable state.
+
+Serialized selection evidence records the previous choice in the normalized
+input and records each candidate's typed transition, configured switch cost,
+charged switch term, and checked total score. The selected choice and runner-up
+scores repeat the transition and charged term, so the finalized supervisor
+artifact can reconstruct why staying or switching won.
+
+This bounded Issue #201 increment does not implement measured transition
+fitting, replay correction, oscillation telemetry or alarms, or safe-set policy
+promotion. It also does not recreate Issue #150's profile loader, repository
+override, or command-line override surface.
+
 ### Platform boundary
 
 Linux is the fully supported security-sensitive runtime path. macOS and Windows

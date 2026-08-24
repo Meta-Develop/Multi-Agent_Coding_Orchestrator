@@ -186,6 +186,13 @@ fn objective_profile_ref() -> Value {
     )
 }
 
+fn context_switch_costs() -> Value {
+    strict_object!(
+        "model_change_same_runtime_microunits" => nonnegative_integer(),
+        "runtime_change_microunits" => nonnegative_integer(),
+    )
+}
+
 fn objective_profile() -> Value {
     strict_object!(
         "name" => nonempty_string(),
@@ -199,6 +206,7 @@ fn objective_profile() -> Value {
         "entitlement_scarcity_full_cost_microunits" => nonnegative_integer(),
         "retry_penalty_microunits" => nonnegative_integer(),
         "degrade_effort_rank_penalty_microunits" => nonnegative_integer(),
+        "switch_costs" => context_switch_costs(),
     )
 }
 
@@ -402,6 +410,16 @@ fn ineligibility_reason() -> Value {
     )
 }
 
+fn context_switch_transition() -> Value {
+    enum_schema(&[
+        "initial",
+        "stay",
+        "effort_change_same_runtime_model",
+        "model_change_same_runtime",
+        "runtime_change",
+    ])
+}
+
 fn score_breakdown() -> Value {
     strict_object!(
         "posterior_quality_basis_points" => basis_points(),
@@ -413,6 +431,9 @@ fn score_breakdown() -> Value {
         "marginal_cost_microunits" => nonnegative_integer(),
         "retry_cost_microunits" => nonnegative_integer(),
         "degrade_cost_microunits" => nonnegative_integer(),
+        "switch_transition" => context_switch_transition(),
+        "configured_switch_cost_microunits" => nonnegative_integer(),
+        "switch_cost_microunits" => nonnegative_integer(),
         "total_score_microunits" => nonnegative_integer(),
     )
 }
@@ -435,6 +456,9 @@ fn candidate_evaluation() -> Value {
 fn selected_choice() -> Value {
     strict_object!(
         "candidate" => candidate_key(),
+        "switch_transition" => context_switch_transition(),
+        "configured_switch_cost_microunits" => nonnegative_integer(),
+        "switch_cost_microunits" => nonnegative_integer(),
         "total_score_microunits" => nonnegative_integer(),
         "reason" => enum_schema(&[
             "lowest_expected_total_cost_per_accepted_task",
@@ -476,13 +500,16 @@ fn ranked_score() -> Value {
     strict_object!(
         "rank" => json!({"type": "integer", "minimum": 2}),
         "candidate" => candidate_key(),
+        "switch_transition" => context_switch_transition(),
+        "configured_switch_cost_microunits" => nonnegative_integer(),
+        "switch_cost_microunits" => nonnegative_integer(),
         "total_score_microunits" => nonnegative_integer(),
     )
 }
 
 pub(crate) fn selection_provenance_schema_value() -> Value {
     strict_object!(
-        "schema_version" => json!({"type": "integer", "const": 1}),
+        "schema_version" => json!({"type": "integer", "const": 2}),
         "status" => enum_schema(&["selected", "fail_closed"]),
         "normalized_input" => selection_input(),
         "normalized_task" => task_profile(false),
@@ -549,6 +576,27 @@ mod tests {
 
     #[test]
     fn event_and_every_nested_selector_object_are_closed_and_exhaustively_required() {
-        assert_every_object_is_closed(&selection_event_schema_value());
+        let event = selection_event_schema_value();
+        assert_every_object_is_closed(&event);
+
+        let provenance = &event["properties"]["provenance"];
+        assert_eq!(provenance["properties"]["schema_version"]["const"], 2);
+        let profile = &provenance["properties"]["normalized_input"]["properties"]["priors"]
+            ["properties"]["objective_profiles"]["items"];
+        assert!(profile["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|field| field == "switch_costs")));
+        let score =
+            &provenance["properties"]["candidate_set"]["items"]["properties"]["score"]["oneOf"][0];
+        for field in [
+            "switch_transition",
+            "configured_switch_cost_microunits",
+            "switch_cost_microunits",
+            "total_score_microunits",
+        ] {
+            assert!(score["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|value| value == field)));
+        }
     }
 }

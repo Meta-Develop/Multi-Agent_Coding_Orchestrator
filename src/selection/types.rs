@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::objective_profile::ContextSwitchCosts;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskLevel {
@@ -195,6 +197,8 @@ pub struct ObjectiveProfile {
     pub entitlement_scarcity_full_cost_microunits: u64,
     pub retry_penalty_microunits: u64,
     pub degrade_effort_rank_penalty_microunits: u64,
+    #[serde(default = "crate::objective_profile::historical_zero_switch_costs")]
+    pub switch_costs: ContextSwitchCosts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -523,6 +527,12 @@ pub struct ScoreBreakdown {
     pub marginal_cost_microunits: u64,
     pub retry_cost_microunits: u64,
     pub degrade_cost_microunits: u64,
+    #[serde(default)]
+    pub switch_transition: ContextSwitchTransition,
+    #[serde(default)]
+    pub configured_switch_cost_microunits: u64,
+    #[serde(default)]
+    pub switch_cost_microunits: u64,
     pub total_score_microunits: u64,
 }
 
@@ -546,7 +556,29 @@ pub struct CandidateEvaluation {
 pub struct RankedScore {
     pub rank: u32,
     pub candidate: CandidateKey,
+    #[serde(default)]
+    pub switch_transition: ContextSwitchTransition,
+    #[serde(default)]
+    pub configured_switch_cost_microunits: u64,
+    #[serde(default)]
+    pub switch_cost_microunits: u64,
     pub total_score_microunits: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSwitchTransition {
+    Initial,
+    Stay,
+    EffortChangeSameRuntimeModel,
+    ModelChangeSameRuntime,
+    RuntimeChange,
+}
+
+impl Default for ContextSwitchTransition {
+    fn default() -> Self {
+        Self::Initial
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -573,6 +605,12 @@ pub enum ChoiceReason {
 #[serde(deny_unknown_fields)]
 pub struct SelectedChoice {
     pub candidate: CandidateKey,
+    #[serde(default)]
+    pub switch_transition: ContextSwitchTransition,
+    #[serde(default)]
+    pub configured_switch_cost_microunits: u64,
+    #[serde(default)]
+    pub switch_cost_microunits: u64,
     pub total_score_microunits: u64,
     pub reason: ChoiceReason,
 }

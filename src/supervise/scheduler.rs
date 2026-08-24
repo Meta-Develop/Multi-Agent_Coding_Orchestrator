@@ -345,12 +345,12 @@ impl SchedulerProgress {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct AssignmentBudgetPolicy {
     model_overrides: BTreeMap<AgentRole, RoleModelSelection>,
     child_effort_degradation_steps: usize,
     assignment_reasoning_effort: Option<ReasoningEffort>,
-    selector_state: Option<SupervisorAutomaticSelectionState>,
+    selector_state: Option<Arc<Mutex<SupervisorAutomaticSelectionState>>>,
     selector_overrides: BTreeMap<AgentRole, RoleModelSelection>,
     pub(super) selector_decisions: Vec<SupervisorSelectionEvent>,
 }
@@ -427,11 +427,14 @@ impl AssignmentBudgetPolicy {
             budget_signal,
             environment_rejections,
         } = request;
-        let Some(state) = self.selector_state.as_mut() else {
+        let Some(state) = self.selector_state.as_ref() else {
             return Ok(Vec::new());
         };
+        let mut state = state
+            .lock()
+            .map_err(|_| anyhow!("automatic selector same-run state mutex was poisoned"))?;
         let reselection = reselect_roles_from_supplied_catalog_snapshot(
-            state,
+            &mut state,
             runtime,
             catalog,
             roles,
@@ -496,7 +499,7 @@ impl BudgetDegradationController {
         Self {
             rung: BudgetDegradationRung::Effort,
             policy: AssignmentBudgetPolicy {
-                selector_state: automatic_selection_state,
+                selector_state: automatic_selection_state.map(|state| Arc::new(Mutex::new(state))),
                 ..AssignmentBudgetPolicy::default()
             },
             effective_fan_out: max_concurrent_children.max(1),
@@ -3390,7 +3393,11 @@ mod selection_policy_tests {
         }
     }
 
-    fn automatic_provenance() -> Result<crate::selection::SelectionProvenance> {
+    fn automatic_selection_fixture() -> Result<(
+        RuntimeModelCatalog,
+        SupervisorAutomaticSelectionState,
+        Vec<SupervisorSelectionEvent>,
+    )> {
         let priors = crate::selection::built_in_prior_dataset()?;
         let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(
             priors
@@ -3425,18 +3432,29 @@ mod selection_policy_tests {
             resolved_bound: 1,
         };
         let mut plan = test_plan();
-        initialize_supervisor_selection(
+        let resolution = initialize_supervisor_selection(
             &mut plan,
             SupervisorRuntime::Codex,
             &catalog,
             &admission,
             &AdvertisedCatalogSet::empty(),
-        )?
-        .decisions
-        .into_iter()
-        .next()
-        .map(|event| event.provenance)
-        .context("initial selector provenance")
+        )?;
+        Ok((
+            catalog,
+            resolution
+                .automatic_state
+                .context("automatic selector same-run state")?,
+            resolution.decisions,
+        ))
+    }
+
+    fn automatic_provenance() -> Result<crate::selection::SelectionProvenance> {
+        automatic_selection_fixture()?
+            .2
+            .into_iter()
+            .next()
+            .map(|event| event.provenance)
+            .context("initial selector provenance")
     }
 
     fn initialized_repository() -> (tempfile::TempDir, PathBuf) {
@@ -3541,6 +3559,69 @@ mod selection_policy_tests {
                 panic!("selector-bound lens changed backend")
             }
         }
+    }
+
+    #[test]
+    fn cloned_assignment_policies_share_immediately_prior_same_run_choice() -> Result<()> {
+        let (catalog, state, _) = automatic_selection_fixture()?;
+        let controller = BudgetDegradationController::new_with_selection_state(2, Some(state));
+        let mut retry_policy = controller.policy.clone();
+        let mut later_budget_policy = controller.policy.clone();
+
+        let retry_events = retry_policy.reselect(
+            SupervisorRuntime::Codex,
+            &catalog,
+            SelectorReselectionRequest {
+                roles: &[AgentRole::Worker],
+                assignment_id: Some("retry-assignment"),
+                attempt: 2,
+                primary_cause: SupervisorSelectionEventCause::Retry,
+                retry_count: 1,
+                budget_signal: crate::selection::BudgetSignal::Continue,
+                environment_rejections: &[],
+            },
+        )?;
+        let retry_choice = retry_events[0]
+            .provenance
+            .choice
+            .as_ref()
+            .context("retry selected worker choice")?
+            .candidate
+            .clone();
+
+        let budget_events = later_budget_policy.reselect(
+            SupervisorRuntime::Codex,
+            &catalog,
+            SelectorReselectionRequest {
+                roles: &[AgentRole::Worker],
+                assignment_id: Some("later-budget-assignment"),
+                attempt: 0,
+                primary_cause: SupervisorSelectionEventCause::BudgetDegrade,
+                retry_count: 0,
+                budget_signal: crate::selection::BudgetSignal::Degrade,
+                environment_rejections: &[],
+            },
+        )?;
+
+        assert_eq!(
+            retry_events[0].assignment_id.as_deref(),
+            Some("retry-assignment")
+        );
+        assert_eq!(retry_events[0].attempt, 2);
+        assert_eq!(
+            budget_events[0]
+                .provenance
+                .normalized_input
+                .signals
+                .previous_choice
+                .as_ref(),
+            Some(&retry_choice)
+        );
+        assert_eq!(
+            budget_events[0].primary_cause,
+            SupervisorSelectionEventCause::BudgetDegrade
+        );
+        Ok(())
     }
 
     #[test]
