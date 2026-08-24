@@ -406,6 +406,54 @@ fn injected_schema_and_evidence_matrix_rejects_missing_fields_and_extra_workers(
 }
 
 #[test]
+fn worker_report_identity_rejects_declared_assignment_scope_mismatches() {
+    let mut assignment = injected_assignment(true);
+    assignment.worker_assignments[0].semantic_symbols = vec!["crate::expected_symbol".to_string()];
+    assignment.worker_assignments[0].semantic_modules = vec!["crate::expected_module".to_string()];
+
+    for field in ["assigned_paths", "semantic_symbols", "semantic_modules"] {
+        let mut report = injected_child_report(&assignment);
+        match field {
+            "assigned_paths" => {
+                report.worker_reports[0].assigned_paths = vec![PathBuf::from("src/other.rs")];
+            }
+            "semantic_symbols" => {
+                report.worker_reports[0].semantic_symbols = vec!["crate::other_symbol".to_string()];
+            }
+            "semantic_modules" => {
+                report.worker_reports[0].semantic_modules = vec!["crate::other_module".to_string()];
+            }
+            _ => unreachable!(),
+        }
+
+        validate_worker_report_evidence(
+            &assignment,
+            &AssignmentMetadata::new(),
+            Path::new("worker-assignment-identity.json"),
+            &mut report,
+        );
+
+        assert_eq!(
+            report.status,
+            ReviewStatus::Failed,
+            "mismatched {field} was accepted"
+        );
+        assert!(!report.accepted, "mismatched {field} retained acceptance");
+        assert!(report.rejected, "mismatched {field} was not rejected");
+        assert_eq!(report.worker_reports[0].status, ReviewStatus::Failed);
+        assert!(!report.worker_reports[0].accepted);
+        assert!(report.worker_reports[0].rejected);
+        assert!(
+            finding_messages(&report).contains(&format!(
+                "{field} do not exactly match the declared worker assignment"
+            )),
+            "missing assignment-identity finding for {field}: {}",
+            finding_messages(&report)
+        );
+    }
+}
+
+#[test]
 fn typed_decomposition_prompt_report_and_final_evidence_remain_gated() {
     let mut assignment = injected_assignment(true);
     assignment

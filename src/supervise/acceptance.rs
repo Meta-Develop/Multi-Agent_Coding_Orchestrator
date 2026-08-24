@@ -1509,6 +1509,15 @@ fn normalize_worker_report_plumbing(
     let worker = workers_by_id
         .get(report.id.as_str())
         .context("worker is not declared in the assignment")?;
+    if report.assigned_paths != worker.assigned_paths {
+        bail!("assigned_paths do not exactly match the declared worker assignment");
+    }
+    if report.semantic_symbols != worker.semantic_symbols {
+        bail!("semantic_symbols do not exactly match the declared worker assignment");
+    }
+    if report.semantic_modules != worker.semantic_modules {
+        bail!("semantic_modules do not exactly match the declared worker assignment");
+    }
     let metadata = worker_assignment_metadata(assignment_metadata, assignment, worker);
     if report.assignment_kind != metadata.kind {
         bail!(
