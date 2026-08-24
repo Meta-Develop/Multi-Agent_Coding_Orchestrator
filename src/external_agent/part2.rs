@@ -1407,6 +1407,118 @@ fn managed_child_commit_edge_paths(
 const MANAGED_CHILD_PRIVATE_GIT_DIR: &str = "maco-private-git-v1";
 const MANAGED_CHILD_PRIVATE_REF: &str = "refs/heads/maco-managed-child";
 
+#[cfg(unix)]
+fn validate_managed_child_private_ref_surface(private_git_dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    fn validate_exact_directory(path: &Path, label: &str, expected: &[&str]) -> Result<()> {
+        let metadata = fs::symlink_metadata(path).with_context(|| format!("{label} is missing"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("{label} is not a non-symlink directory");
+        }
+        let mut observed = BTreeSet::new();
+        for entry in fs::read_dir(path).with_context(|| format!("failed to inspect {label}"))? {
+            let entry = entry.with_context(|| format!("failed to inspect {label} entry"))?;
+            let name = entry.file_name();
+            if !expected.iter().any(|expected| name == OsStr::new(expected)) {
+                bail!("{label} contains an unexpected private ref entry");
+            }
+            if !observed.insert(name) {
+                bail!("{label} contains a duplicate private ref entry");
+            }
+        }
+        if observed.len() != expected.len() {
+            bail!("{label} omitted an expected private ref entry");
+        }
+        Ok(())
+    }
+
+    fn validate_regular_file(path: &Path, label: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        let metadata = fs::symlink_metadata(path).with_context(|| format!("{label} is missing"))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.len() > max_bytes
+        {
+            bail!("{label} is not a bounded single-link regular file");
+        }
+        fs::read(path).with_context(|| format!("failed to read {label}"))
+    }
+
+    for forbidden in ["packed-refs", "packed-refs.lock", "packed-refs.new", "HEAD.lock"] {
+        match fs::symlink_metadata(private_git_dir.join(forbidden)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("failed to inspect managed child private ref surface")
+            }
+            Ok(_) => bail!("managed child private ref surface contains forbidden packed or lock state"),
+        }
+    }
+
+    let refs = private_git_dir.join("refs");
+    validate_exact_directory(&refs, "managed child private refs directory", &["heads", "tags"])?;
+    validate_exact_directory(
+        &refs.join("heads"),
+        "managed child private heads directory",
+        &["maco-managed-child"],
+    )?;
+    validate_exact_directory(
+        &refs.join("tags"),
+        "managed child private tags directory",
+        &[],
+    )?;
+    let ref_bytes = validate_regular_file(
+        &private_git_dir.join(MANAGED_CHILD_PRIVATE_REF),
+        "managed child private Git ref",
+        1024,
+    )?;
+    let ref_text = std::str::from_utf8(&ref_bytes)
+        .context("managed child private Git ref is not UTF-8")?
+        .trim_end_matches(['\r', '\n']);
+    Oid::from_str(ref_text).context("managed child private Git ref is not an object id")?;
+
+    let logs = private_git_dir.join("logs");
+    match fs::symlink_metadata(&logs) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).context("failed to inspect managed child private reflog surface")
+        }
+        Ok(_) => {
+            validate_exact_directory(
+                &logs,
+                "managed child private logs directory",
+                &["HEAD", "refs"],
+            )?;
+            validate_regular_file(
+                &logs.join("HEAD"),
+                "managed child private HEAD reflog",
+                4 * 1024 * 1024,
+            )?;
+            validate_exact_directory(
+                &logs.join("refs"),
+                "managed child private ref logs directory",
+                &["heads"],
+            )?;
+            validate_exact_directory(
+                &logs.join("refs/heads"),
+                "managed child private head logs directory",
+                &["maco-managed-child"],
+            )?;
+            validate_regular_file(
+                &logs.join(MANAGED_CHILD_PRIVATE_REF),
+                "managed child private branch reflog",
+                4 * 1024 * 1024,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_managed_child_private_ref_surface(_private_git_dir: &Path) -> Result<()> {
+    bail!("managed child private ref validation is unsupported on this platform")
+}
+
 fn read_managed_child_private_ref_oid(private_git_dir: &Path) -> Result<Oid> {
     let ref_bytes = read_bounded_regular_file_nofollow(
         &private_git_dir.join(MANAGED_CHILD_PRIVATE_REF),
@@ -2070,6 +2182,7 @@ fn prepare_managed_child_private_git_dir(
             bail!("managed child private Git storage contains a persistent object alternate");
         }
     }
+    validate_managed_child_private_ref_surface(&private_git_dir)?;
     let expected_head = format!("ref: {MANAGED_CHILD_PRIVATE_REF}\n").into_bytes();
     if validate_private_regular_file(
         &private_git_dir.join("HEAD"),
@@ -2204,6 +2317,7 @@ fn verify_managed_git_boundary_after_launch(git: &ManagedWorktreeGitMetadata) ->
             bail!("managed child private Git storage gained a persistent object alternate");
         }
     }
+    validate_managed_child_private_ref_surface(&private_git_dir)?;
     let head = read_bounded_regular_file_nofollow(&private_git_dir.join("HEAD"), 1024)
         .context("failed to revalidate managed child private Git HEAD")?;
     if head != format!("ref: {MANAGED_CHILD_PRIVATE_REF}\n").as_bytes() {

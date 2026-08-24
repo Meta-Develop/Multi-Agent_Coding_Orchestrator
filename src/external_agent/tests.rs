@@ -1883,6 +1883,87 @@ fn managed_child_import_rejects_merge_commit_without_import() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
+fn managed_child_import_rejects_extra_private_ref_surface_without_import() -> Result<()> {
+    #[derive(Clone, Copy)]
+    enum RefMutation {
+        ExtraTag,
+        PackedRefs,
+        RefLock,
+    }
+
+    for mutation in [
+        RefMutation::ExtraTag,
+        RefMutation::PackedRefs,
+        RefMutation::RefLock,
+    ] {
+        let temp = tempfile::tempdir()?;
+        let (primary, child, common, child_git_dir) =
+            create_linked_git_metadata_fixture(temp.path())?;
+        let git = managed_worktree_git_metadata(&child)?.context("managed Git metadata")?;
+        let linked = crate::git_repository::open(&child)?;
+        let base = linked.head()?.target().context("linked base")?;
+        let private_head = create_private_root_commit(
+            &git,
+            base,
+            &[base],
+            "RELEASE_NOTES.md",
+            b"initial\nprivate ref surface change\n",
+            "private change before ref-surface tamper",
+        )?;
+        let objects_before = snapshot_managed_git_tree(&common.join("objects"))?;
+        let refs_before = snapshot_managed_git_tree(&common.join("refs"))?;
+        let head_before = fs::read(common.join("HEAD"))?;
+        let primary_index_before = fs::read(primary.join(".git/index"))?;
+        let child_index_before = fs::read(child_git_dir.join("index"))?;
+        match mutation {
+            RefMutation::ExtraTag => fs::write(
+                git.private_git_dir.join("refs/tags/unexpected-tag"),
+                format!("{private_head}\n"),
+            )?,
+            RefMutation::PackedRefs => fs::write(
+                git.private_git_dir.join("packed-refs"),
+                format!("# pack-refs with: sorted\n{private_head} refs/tags/unexpected-tag\n"),
+            )?,
+            RefMutation::RefLock => fs::write(
+                git.private_git_dir
+                    .join("refs/heads/maco-managed-child.lock"),
+                format!("{private_head}\n"),
+            )?,
+        }
+
+        let error = collect_and_import_managed_child_git_commit(
+            &primary,
+            &child,
+            base,
+            &[PathBuf::from("RELEASE_NOTES.md")],
+        )
+        .expect_err("unexpected private ref surface must fail closed");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("private ref")
+                || error.contains("private tags")
+                || error.contains("private heads"),
+            "unexpected private ref-surface error: {error}"
+        );
+        assert!(linked.find_commit(private_head).is_err());
+        assert_eq!(
+            snapshot_managed_git_tree(&common.join("objects"))?,
+            objects_before
+        );
+        assert_eq!(
+            snapshot_managed_git_tree(&common.join("refs"))?,
+            refs_before
+        );
+        assert_eq!(fs::read(common.join("HEAD"))?, head_before);
+        assert_eq!(fs::read(primary.join(".git/index"))?, primary_index_before);
+        assert_eq!(fs::read(child_git_dir.join("index"))?, child_index_before);
+        assert_eq!(linked.head()?.target(), Some(base));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn managed_child_import_fsck_rejects_corrupt_reachable_object_without_import() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
