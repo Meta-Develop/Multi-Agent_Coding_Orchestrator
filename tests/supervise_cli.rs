@@ -357,10 +357,7 @@ fn supervise_plan_normalizes_aliases_and_rejects_top_level_scope_conflicts() -> 
         "review-balanced-v2",
         "--json",
     ])?;
-    assert_eq!(
-        profile_override["objective_profile"],
-        "review-balanced-v2"
-    );
+    assert_eq!(profile_override["objective_profile"], "review-balanced-v2");
 
     let overlap = temp.path().join("overlap.json");
     fs::write(

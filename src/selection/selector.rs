@@ -819,18 +819,18 @@ fn evaluate_candidate(
 
     let score = if reasons.is_empty() {
         pool.map(|pool| {
-            score_candidate(
+            score_candidate(CandidateScoringInput {
                 profile,
-                &input.resolved_objective_profile.profile.tradeoffs,
+                routing_weights: &input.resolved_objective_profile.profile.tradeoffs,
                 pool,
-                &candidate,
-                &input.signals,
-                posterior_quality,
-                authority_quality,
-                expected_cost,
-                expected_retry_rework_cost,
-                expected_human_review_cost,
-            )
+                candidate: &candidate,
+                signals: &input.signals,
+                posterior_quality_basis_points: posterior_quality,
+                authority_quality_basis_points: authority_quality,
+                expected_total_cost_per_accepted_task_microunits: expected_cost,
+                expected_retry_rework_cost_per_accepted_task_microunits: expected_retry_rework_cost,
+                expected_human_review_cost_per_accepted_task_microunits: expected_human_review_cost,
+            })
         })
         .transpose()?
     } else {
@@ -853,18 +853,32 @@ fn evaluate_candidate(
     })
 }
 
-fn score_candidate(
-    profile: &ObjectiveProfile,
-    routing_weights: &crate::objective_profile::TradeoffWeights,
-    pool: &RuntimePoolState,
-    candidate: &CandidateKey,
-    signals: &DynamicSignals,
+struct CandidateScoringInput<'a> {
+    profile: &'a ObjectiveProfile,
+    routing_weights: &'a crate::objective_profile::TradeoffWeights,
+    pool: &'a RuntimePoolState,
+    candidate: &'a CandidateKey,
+    signals: &'a DynamicSignals,
     posterior_quality_basis_points: u16,
     authority_quality_basis_points: Option<u16>,
     expected_total_cost_per_accepted_task_microunits: u64,
     expected_retry_rework_cost_per_accepted_task_microunits: u64,
     expected_human_review_cost_per_accepted_task_microunits: u64,
-) -> Result<ScoreBreakdown, SelectionError> {
+}
+
+fn score_candidate(input: CandidateScoringInput<'_>) -> Result<ScoreBreakdown, SelectionError> {
+    let CandidateScoringInput {
+        profile,
+        routing_weights,
+        pool,
+        candidate,
+        signals,
+        posterior_quality_basis_points,
+        authority_quality_basis_points,
+        expected_total_cost_per_accepted_task_microunits,
+        expected_retry_rework_cost_per_accepted_task_microunits,
+        expected_human_review_cost_per_accepted_task_microunits,
+    } = input;
     let pool_pressure_cost_microunits = normalize_cost_per_accepted(
         scale_basis_points(
             profile.pool_pressure_full_cost_microunits,

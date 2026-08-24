@@ -39,11 +39,11 @@ use crate::{
         ApplyBlockerDetail, CandidateValidationBinding, MergeCollectOptions,
         ValidationEvidenceBundle, WorktreeMergeMetadata, VALIDATION_BINDING_VERSION,
     },
+    objective_profile::{resolve_objective_profile, ResolvedObjectiveProfile},
     orchestration_event::{
         FieldGuideEventKind, OrchestrationEventJournal, OrchestrationEventKind, OrchestrationRole,
     },
     orchestrator::{RunId, SemanticCoordinationMode},
-    objective_profile::{resolve_objective_profile, ResolvedObjectiveProfile},
     planning,
     pre_action_review::{RatioMetric, RepoPathRule, ReviewContext, ReviewMetricSnapshot},
     process_runner::{

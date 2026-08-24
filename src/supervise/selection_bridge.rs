@@ -450,14 +450,14 @@ pub(super) fn initialize_supervisor_selection(
         let debug_override = configured
             .map(|selection| debug_override_for_role(role, runtime, selection))
             .transpose()?;
-        let input = selection_input_for_role(
+        let input = selection_input_for_role(SelectionInputForRoleArgs {
             role,
             runtime,
             catalog,
             advertised,
             admission,
-            &resolved_objective_profile,
-            DynamicSignals {
+            resolved_objective_profile: &resolved_objective_profile,
+            signals: DynamicSignals {
                 retry_count: 0,
                 budget_signal: BudgetSignal::Continue,
                 previous_choice: None,
@@ -465,7 +465,7 @@ pub(super) fn initialize_supervisor_selection(
                 environment_rejections: Vec::new(),
             },
             debug_override,
-        )?;
+        })?;
         let decision = selection::select(&input).map_err(|error| {
             anyhow!(
                 "automatic selector rejected role '{}': {error}",
@@ -798,16 +798,28 @@ fn debug_override_for_role(
     })
 }
 
-fn selection_input_for_role(
+struct SelectionInputForRoleArgs<'a> {
     role: AgentRole,
     runtime: SupervisorRuntime,
-    catalog: &RuntimeModelCatalog,
-    advertised: &AdvertisedCatalogSet,
-    admission: &SupervisorAdmissionPolicyInput,
-    resolved_objective_profile: &ResolvedObjectiveProfile,
+    catalog: &'a RuntimeModelCatalog,
+    advertised: &'a AdvertisedCatalogSet,
+    admission: &'a SupervisorAdmissionPolicyInput,
+    resolved_objective_profile: &'a ResolvedObjectiveProfile,
     signals: DynamicSignals,
     debug_override: Option<DebugOverride>,
-) -> Result<SelectionInput> {
+}
+
+fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<SelectionInput> {
+    let SelectionInputForRoleArgs {
+        role,
+        runtime,
+        catalog,
+        advertised,
+        admission,
+        resolved_objective_profile,
+        signals,
+        debug_override,
+    } = args;
     let priors = selection::built_in_prior_dataset()?;
     let task = task_profile_for_role(role);
     let runtime_name = runtime_name(runtime);
