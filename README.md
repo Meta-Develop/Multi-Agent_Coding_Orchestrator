@@ -1101,12 +1101,11 @@ and wait for both the `macos-latest` and `windows-latest` `portable-build` jobs;
 a draft pull request is the cheapest honest way to close that residual gap.
 
 GitHub-hosted Linux runners do not provide the delegated systemd user manager
-required by strict containment. On such a runner, CI prints one `SKIP <test>:
-<reason>` line and job notice for every exact containment-dependent test listed
-in the workflow. Containment-dependent CLI integration tests use the same
-cgroup gate and print their own `SKIP <test>: <reason>` lines. CI exposes those
-successful-test reports and runs every other test normally. A Linux runner
-inside a delegated user manager receives no filters and runs the complete suite.
+required by strict containment. Containment-dependent lib tests and CLI
+integration tests share the same cgroup probe and print one `SKIP <test>:
+<reason>` line when that manager is absent. CI runs plain
+`cargo test --locked --all-targets`; tests decide at runtime whether to execute.
+A Linux runner inside a delegated user manager runs the complete suite.
 
 The Nix development shell also pins the supply-chain tools through
 `flake.lock`. Audit the exact Cargo lockfile and enforce the repository policy
