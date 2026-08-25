@@ -560,6 +560,7 @@ fn validate_bounded_index_bytes(bytes: &[u8]) -> Result<()> {
         }
     }
     let mut saw_tree = false;
+    let mut saw_resolve_undo = false;
     while cursor < payload_end {
         let header_end = cursor
             .checked_add(8)
@@ -576,10 +577,26 @@ fn validate_bounded_index_bytes(bytes: &[u8]) -> Result<()> {
         if extension_end > payload_end {
             bail!("bounded-status index extension payload is truncated");
         }
-        if signature != b"TREE" || saw_tree {
-            bail!("bounded-status rejects unsupported, duplicate, or stateful index extensions");
+        if !signature[0].is_ascii_uppercase() {
+            bail!("bounded-status rejects required or stateful index extensions");
         }
-        saw_tree = true;
+        let already_seen = match signature {
+            b"TREE" => &mut saw_tree,
+            b"REUC" => &mut saw_resolve_undo,
+            _ => bail!("bounded-status rejects unsupported or stateful optional index extensions"),
+        };
+        if *already_seen {
+            bail!("bounded-status rejects duplicate index extensions");
+        }
+        *already_seen = true;
+
+        // TREE and REUC are optional derived caches, not sources of stage-0
+        // tracked state. The checksum-bound index is copied byte-for-byte into
+        // the private runtime, where ordinary Git commands derive status from
+        // the entries above. In particular, REUC only retains removed conflict
+        // stages for an explicit future `checkout -m`; bounded status neither
+        // consumes nor trusts that payload. A malformed payload therefore
+        // makes private Git fail closed without changing the captured index.
         cursor = extension_end;
     }
     Ok(())

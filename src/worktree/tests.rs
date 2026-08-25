@@ -212,35 +212,82 @@ fn bounded_status_runtime_root_test_default_stays_isolated_from_shared_tmp() {
     );
 }
 
+fn empty_bounded_index(extensions: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+    let mut bytes = b"DIRC\0\0\0\x02\0\0\0\0".to_vec();
+    for (signature, payload) in extensions {
+        bytes.extend_from_slice(*signature);
+        bytes.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("extension length")
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(payload);
+    }
+    let checksum = sha1_digest(&bytes).expect("index checksum");
+    bytes.extend_from_slice(&checksum);
+    bytes
+}
+
+fn refresh_bounded_index_checksum(bytes: &mut Vec<u8>) {
+    bytes.truncate(bytes.len() - 20);
+    let checksum = sha1_digest(bytes).expect("refresh index checksum");
+    bytes.extend_from_slice(&checksum);
+}
+
+fn append_bounded_index_extension(index: &[u8], signature: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let checksum_start = index.len().checked_sub(20).expect("index checksum");
+    let mut extended = index[..checksum_start].to_vec();
+    extended.extend_from_slice(signature);
+    extended.extend_from_slice(
+        &u32::try_from(payload.len())
+            .expect("extension length")
+            .to_be_bytes(),
+    );
+    extended.extend_from_slice(payload);
+    let checksum = sha1_digest(&extended).expect("extended index checksum");
+    extended.extend_from_slice(&checksum);
+    extended
+}
+
 #[test]
-fn bounded_index_accepts_only_plain_sha1_entries_and_tree_cache() {
-    fn empty_index(extension: Option<(&[u8; 4], &[u8])>) -> Vec<u8> {
-        let mut bytes = b"DIRC\0\0\0\x02\0\0\0\0".to_vec();
-        if let Some((signature, payload)) = extension {
-            bytes.extend_from_slice(signature);
-            bytes.extend_from_slice(
-                &u32::try_from(payload.len())
-                    .expect("extension length")
-                    .to_be_bytes(),
-            );
-            bytes.extend_from_slice(payload);
-        }
-        let checksum = sha1_digest(&bytes).expect("index checksum");
-        bytes.extend_from_slice(&checksum);
-        bytes
-    }
+fn bounded_index_accepts_only_plain_entries_and_safe_optional_caches() {
+    let resolve_undo = b"README.md\x00100644\x000\x000\x00\
+        \x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\
+        \x11\x11\x11\x11\x11\x11\x11\x11\x11\x11";
 
-    fn refresh_checksum(bytes: &mut Vec<u8>) {
-        bytes.truncate(bytes.len() - 20);
-        let checksum = sha1_digest(bytes).expect("refresh index checksum");
-        bytes.extend_from_slice(&checksum);
-    }
-
-    validate_bounded_index_bytes(&empty_index(None)).expect("plain empty index");
-    validate_bounded_index_bytes(&empty_index(Some((b"TREE", b""))))
+    validate_bounded_index_bytes(&empty_bounded_index(&[])).expect("plain empty index");
+    validate_bounded_index_bytes(&empty_bounded_index(&[(b"TREE", b"")]))
         .expect("ordinary TREE cache extension");
-    assert!(validate_bounded_index_bytes(&empty_index(Some((b"FSMN", b"")))).is_err());
-    assert!(validate_bounded_index_bytes(&empty_index(Some((b"link", b"")))).is_err());
+    validate_bounded_index_bytes(&empty_bounded_index(&[(b"REUC", resolve_undo)]))
+        .expect("resolve-undo cache extension");
+    validate_bounded_index_bytes(&empty_bounded_index(&[
+        (b"TREE", b""),
+        (b"REUC", resolve_undo),
+    ]))
+    .expect("unique safe optional extensions");
+
+    let duplicate = empty_bounded_index(&[(b"REUC", resolve_undo), (b"REUC", b"")]);
+    let duplicate_error =
+        validate_bounded_index_bytes(&duplicate).expect_err("duplicate REUC must fail closed");
+    assert!(duplicate_error.to_string().contains("duplicate"));
+
+    let mut truncated = empty_bounded_index(&[(b"REUC", resolve_undo)]);
+    truncated[16..20].copy_from_slice(
+        &u32::try_from(resolve_undo.len() + 1)
+            .expect("malformed extension length")
+            .to_be_bytes(),
+    );
+    refresh_bounded_index_checksum(&mut truncated);
+    let truncated_error = validate_bounded_index_bytes(&truncated)
+        .expect_err("truncated REUC payload must fail closed");
+    assert!(truncated_error.to_string().contains("payload is truncated"));
+
+    let stateful_error = validate_bounded_index_bytes(&empty_bounded_index(&[(b"FSMN", b"")]))
+        .expect_err("stateful optional extension must fail closed");
+    assert!(stateful_error.to_string().contains("stateful optional"));
+    let required_error = validate_bounded_index_bytes(&empty_bounded_index(&[(b"link", b"")]))
+        .expect_err("required extension must fail closed");
+    assert!(required_error.to_string().contains("required or stateful"));
 
     let mut entry = b"DIRC\0\0\0\x02\0\0\0\x01".to_vec();
     entry.extend_from_slice(&[0; 62]);
@@ -263,12 +310,12 @@ fn bounded_index_accepts_only_plain_sha1_entries_and_tree_cache() {
 
     let mut assume_unchanged = entry.clone();
     assume_unchanged[12 + 60..12 + 62].copy_from_slice(&(0x8000_u16 | 1).to_be_bytes());
-    refresh_checksum(&mut assume_unchanged);
+    refresh_bounded_index_checksum(&mut assume_unchanged);
     assert!(validate_bounded_index_bytes(&assume_unchanged).is_err());
 
     let mut extended = entry;
     extended[12 + 60..12 + 62].copy_from_slice(&(0x4000_u16 | 1).to_be_bytes());
-    refresh_checksum(&mut extended);
+    refresh_bounded_index_checksum(&mut extended);
     assert!(validate_bounded_index_bytes(&extended).is_err());
 }
 
