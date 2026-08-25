@@ -3297,7 +3297,7 @@ fn publish_assignment_report(
     outcome.candidate_inspection = completed_candidate_inspection;
     let subject_selection = effective_role_model_selection(context.plan, assignment.role);
     let auditor_selection = effective_role_model_selection(context.plan, AgentRole::Auditor);
-    let subject_capability = model_capability_or_weak(subject_selection.model.as_deref());
+    let subject_authority = model_capability_or_weak(subject_selection.model.as_deref());
     let auditor_capability = model_capability_or_weak(
         context
             .plan
@@ -3305,12 +3305,13 @@ fn publish_assignment_report(
             .first()
             .map(|lens| lens.backend.model())
             .or(auditor_selection.model.as_deref()),
-    );
+    )
+    .capability;
     let role_transition = consider_assignment_role_transition(
         assignment,
         journal_parent_id,
         &child_report,
-        subject_capability,
+        subject_authority,
         auditor_capability,
     )?;
     with_supervisor_artifacts(context.artifacts, |writer, journal| {

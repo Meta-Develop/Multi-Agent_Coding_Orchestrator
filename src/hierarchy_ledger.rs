@@ -109,6 +109,15 @@ pub enum RoleTransitionDecision {
     Refused,
 }
 
+/// Typed gate evidence retained with a promotion or demotion decision.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleTransitionEvidenceRecord {
+    pub acceptance_grade: bool,
+    pub recorded: bool,
+    pub uncertain: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleTransitionRecord {
@@ -117,6 +126,8 @@ pub struct RoleTransitionRecord {
     pub to_category: RoleCategory,
     pub requester_agent_id: String,
     pub judge_agent_id: String,
+    #[serde(default)]
+    pub evidence: RoleTransitionEvidenceRecord,
     pub decision: RoleTransitionDecision,
     pub reason: String,
 }
@@ -537,6 +548,11 @@ mod tests {
             to_category: RoleCategory::NonDelegatingTerminalWorker,
             requester_agent_id: "run-1".to_string(),
             judge_agent_id: "third-party-judge".to_string(),
+            evidence: RoleTransitionEvidenceRecord {
+                acceptance_grade: false,
+                recorded: true,
+                uncertain: false,
+            },
             decision: RoleTransitionDecision::Refused,
             reason: "insufficient_gate_evidence".to_string(),
         };
@@ -706,6 +722,11 @@ mod tests {
             to_category: RoleCategory::DelegatingCoordinator,
             requester_agent_id: "child-a".to_string(),
             judge_agent_id: "child-a".to_string(),
+            evidence: RoleTransitionEvidenceRecord {
+                acceptance_grade: true,
+                recorded: true,
+                uncertain: false,
+            },
             decision: RoleTransitionDecision::Refused,
             reason: "self_judged".to_string(),
         };
@@ -733,10 +754,31 @@ mod tests {
             to_category: RoleCategory::DelegatingCoordinator,
             requester_agent_id: "run-1".to_string(),
             judge_agent_id: "child-a".to_string(),
+            evidence: RoleTransitionEvidenceRecord {
+                acceptance_grade: true,
+                recorded: true,
+                uncertain: false,
+            },
             decision: RoleTransitionDecision::Granted,
             reason: "granted_promotion".to_string(),
         };
         let error = granted.validate().expect_err("self-judged grant must fail");
         assert!(error.to_string().contains("self-judged"));
+    }
+
+    #[test]
+    fn legacy_role_transition_without_evidence_uses_safe_default() -> Result<()> {
+        let legacy = serde_json::json!({
+            "agent_id": "child-a",
+            "from_category": "non_delegating_terminal_worker",
+            "to_category": "delegating_coordinator",
+            "requester_agent_id": "run-1",
+            "judge_agent_id": "third-party-judge",
+            "decision": "refused",
+            "reason": "insufficient_gate_evidence"
+        });
+        let record: RoleTransitionRecord = serde_json::from_value(legacy)?;
+        assert_eq!(record.evidence, RoleTransitionEvidenceRecord::default());
+        record.validate()
     }
 }
