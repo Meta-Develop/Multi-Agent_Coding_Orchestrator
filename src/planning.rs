@@ -4101,7 +4101,7 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
     #[test]
     fn collect_repo_files_never_follows_links_or_accepts_unsafe_files() {
         skip_without_containment!();
-        use std::os::unix::{fs::symlink, net::UnixListener};
+        use std::os::unix::fs::{symlink, FileTypeExt};
 
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
@@ -4114,10 +4114,19 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
         fs::write(outside.join("secret.rs"), "pub fn secret() {}\n").expect("secret");
         symlink(&outside, repo.join("outside-link")).expect("outside link");
         fs::hard_link(repo.join("src/lib.rs"), repo.join("hardlink.rs")).expect("hardlink");
-        let _socket = UnixListener::bind(repo.join("socket")).expect("socket");
+        let socket_path = repo.join("socket");
+        let _socket = crate::test_support::bind_test_unix_socket(&socket_path).expect("socket");
+        assert!(
+            fs::symlink_metadata(&socket_path)
+                .expect("socket metadata")
+                .file_type()
+                .is_socket(),
+            "fixture socket must remain a socket entry"
+        );
 
         let files = collect_repo_files(&repo).expect("collect files");
         assert_eq!(files, vec![PathBuf::from("README.md")]);
+        assert!(!files.contains(&PathBuf::from("socket")));
     }
 
     #[test]
