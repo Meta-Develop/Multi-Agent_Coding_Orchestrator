@@ -3286,6 +3286,7 @@ fn publish_assignment_report(
     context: &AssignmentExecutionContext<'_, '_>,
     outcome: &mut AssignmentExecutionOutcome,
     preflight: &AssignmentExecutionPreflight<'_>,
+    subject_model: Option<&str>,
     journal_parent_id: &str,
     final_report_relative: &Path,
     final_report_path: &Path,
@@ -3295,9 +3296,8 @@ fn publish_assignment_report(
 ) -> Result<()> {
     let assignment = &preflight.assignment;
     outcome.candidate_inspection = completed_candidate_inspection;
-    let subject_selection = effective_role_model_selection(context.plan, assignment.role);
     let auditor_selection = effective_role_model_selection(context.plan, AgentRole::Auditor);
-    let subject_authority = model_capability_or_weak(subject_selection.model.as_deref());
+    let subject_authority = model_capability_or_weak(subject_model);
     let auditor_capability = model_capability_or_weak(
         context
             .plan
@@ -3409,8 +3409,13 @@ fn execute_supervisor_assignment_inner(
         .saturating_add(1);
     let mut next_attempt = 1usize;
     let mut auditor_attempt = 0usize;
-    let (child_report, completed_candidate_inspection, completed_assignment_containment) = 'gate_controller: loop {
-        let mut child_report = None;
+    let (
+        child_report,
+        completed_candidate_inspection,
+        completed_assignment_containment,
+        completed_subject_model,
+    ) = 'gate_controller: loop {
+        let mut child_result = None;
         let mut child_containment_verified = false;
         let mut child_gate_terminal = false;
         let first_attempt = next_attempt;
@@ -3458,6 +3463,7 @@ fn execute_supervisor_assignment_inner(
                 attempt,
                 prepared,
             )?;
+            let attempted_subject_model = collected._command.model.clone();
             match decide_child_attempt(
                 context,
                 outcome,
@@ -3475,7 +3481,7 @@ fn execute_supervisor_assignment_inner(
                     containment_verified,
                     gate_terminal,
                 } => {
-                    child_report = Some(report);
+                    child_result = Some((report, attempted_subject_model));
                     child_containment_verified = containment_verified;
                     child_gate_terminal = gate_terminal;
                     break;
@@ -3483,7 +3489,7 @@ fn execute_supervisor_assignment_inner(
             }
         }
 
-        let Some(mut child_report) = child_report else {
+        let Some((mut child_report, child_subject_model)) = child_result else {
             let error = anyhow!(
                 "child orchestrator '{}' did not produce a collected report after retries",
                 assignment.id
@@ -3788,7 +3794,12 @@ fn execute_supervisor_assignment_inner(
                 candidate,
                 containment_verified,
             } => {
-                break 'gate_controller (report, candidate, containment_verified);
+                break 'gate_controller (
+                    report,
+                    candidate,
+                    containment_verified,
+                    child_subject_model,
+                );
             }
         }
     };
@@ -3796,6 +3807,7 @@ fn execute_supervisor_assignment_inner(
         context,
         outcome,
         &preflight,
+        completed_subject_model.as_deref(),
         journal_parent_id,
         &final_report_relative,
         &final_report_path,
@@ -4312,6 +4324,7 @@ mod decomposition_tests {
             &context,
             &mut outcome,
             &preflight,
+            None,
             options.run_id.as_str(),
             &final_report_relative,
             &final_report_path,
@@ -4323,6 +4336,347 @@ mod decomposition_tests {
         assert!(outcome.report.is_some());
         assert_eq!(outcome.command_records.len(), 2);
         assert!(!outcome.external_containment_failed);
+    }
+
+    #[test]
+    fn publication_uses_final_launch_bound_subject_model_for_transition() {
+        let temp = tempfile::tempdir().expect("temporary phase fixture");
+        let repo = temp.path().join("repo");
+        Repository::init(&repo).expect("initialize phase fixture repository");
+        fs::write(repo.join("README.md"), "baseline\n").expect("write fixture file");
+        commit_fixture_repository(&repo);
+
+        let assignment = OrchestratorAssignment {
+            id: "phase-child".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let mut plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "direct phase exercise".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 10,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+        plan.role_models.insert(
+            AgentRole::ChildOrchestrator,
+            RoleModelSelection {
+                model: Some("gpt-5.6-luna".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let budget_config = SupervisorBudgetConfig::default();
+        let consultant = SupervisorConsultantPlan::default();
+        let assignment_metadata = AssignmentMetadata::new();
+        let options = SupervisorRunOptions {
+            repo: repo.clone(),
+            plan_file: temp.path().join("plan.json"),
+            run_id: RunId::new("direct-assignment-phases").expect("valid fixture run id"),
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+                config: temp.path().join("unused-machine-global.json"),
+                root_id: "runtime".to_string(),
+                owner: "maco-supervise".to_string(),
+                correction_correlation_id: "direct-assignment-phases".to_string(),
+            }),
+        };
+        let mut artifact_writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            options.run_id.clone(),
+            "assignment-phase-test",
+        )
+        .expect("reserve phase artifacts");
+        let run_dir = artifact_writer.run_dir().to_path_buf();
+        let dirs = RunDirs::for_writer(&artifact_writer);
+        let manager = WorktreeManager::new(&repo);
+        let sync_store = SyncStore::open(&repo).expect("open fixture sync store");
+        let semantic_store = SemanticIntentStore::open(&repo).expect("open fixture semantic store");
+        let assignment_schedule = vec![AssignmentScheduleEntry {
+            assignment_id: assignment.id.clone(),
+            parent_assignment_id: None,
+            depth: 1,
+            flattened_index: 0,
+        }];
+        let field_guide = SupervisorFieldGuidePrompt::empty().expect("empty fixture field guide");
+        let budget_ledger =
+            RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
+        let runtime_model_catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-luna", "gpt-5.6-sol"])
+                .expect("fixture runtime model catalog"),
+        );
+        let cancellation = ProcessCancellation::new();
+        let mut journal = initialize_orchestration_event_journal(
+            &repo,
+            &options.run_id,
+            options.parent_node.as_deref(),
+        );
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut artifact_writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let runner = |command: &ExternalAgentCommand,
+                      _cancellation: &ProcessCancellation,
+                      _review: Option<ExternalPreActionReviewRuntime<'_>>| {
+            let mut report_command = command.clone();
+            report_command.model = None;
+            let mut run = deterministic_fake_child_run(
+                &report_command,
+                &assignment,
+                &assignment_metadata,
+                1,
+                None,
+            )
+            .expect("fixture child report");
+            run.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+                crate::process_runner::ContainmentBackend::SystemdUserService,
+            ));
+            run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+                crate::process_runner::SideEffectConfinementProfileKind::ExternalCodex,
+            ));
+            run.publishable = true;
+            run.program_trust = ExternalProgramTrust::TrustedSystemCodex;
+            run.codex_permissions = Some(crate::external_agent::CodexPermissionEvidence {
+                codex_version: "0.142.3".to_string(),
+                minimum_version: "0.138.0".to_string(),
+                permission_profile: "maco_external_codex".to_string(),
+                workspace_access: command.workspace_access,
+                network_enabled: false,
+                argv_digest: "fixture-digest".to_string(),
+                executable_identity: "fixture-identity".to_string(),
+            });
+            run
+        };
+        let mut launch_budget_policy = AssignmentBudgetPolicy::default();
+        launch_budget_policy.set_selector_binding_for_test(
+            AgentRole::ChildOrchestrator,
+            SupervisorRuntime::Codex,
+            RoleModelSelection {
+                model: Some("gpt-5.6-sol".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        assert_eq!(
+            effective_role_model_selection(&plan, AgentRole::ChildOrchestrator)
+                .model
+                .as_deref(),
+            Some("gpt-5.6-luna")
+        );
+        let context = AssignmentExecutionContext {
+            index: 0,
+            concurrent_mode: false,
+            plan: &plan,
+            requested_plan: &plan,
+            execution_target: None,
+            budget_config: &budget_config,
+            consultant: &consultant,
+            assignment_metadata: &assignment_metadata,
+            assignment: &assignment,
+            evidence_only_reaudit: None,
+            options: &options,
+            repo: &repo,
+            run_dir: &run_dir,
+            dirs: &dirs,
+            execution_runtime: SupervisorExecutionRuntime::NonpublishableSimulation,
+            worktree_creation: SupervisorWorktreeCreation::TestOnly,
+            manager: &manager,
+            reused: false,
+            sync_store: &sync_store,
+            semantic_store: &semantic_store,
+            prepared_semantic_token: None,
+            prepared_semantic_findings: &[],
+            prepared_semantic_signals: &[],
+            prepared_semantic_failed: false,
+            assignment_schedule: &assignment_schedule,
+            field_guide: &field_guide,
+            serial_semantic_warn_intents: None,
+            semantic_block_order: None,
+            semantic_block_gate: None,
+            artifacts: &artifacts,
+            budget_ledger: &budget_ledger,
+            budget_policy: launch_budget_policy,
+            admission_commit: None,
+            runtime_model_catalog: &runtime_model_catalog,
+            cancellation,
+            external_runner: &runner,
+        };
+        let mut outcome = AssignmentExecutionOutcome {
+            gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
+            ..AssignmentExecutionOutcome::default()
+        };
+        let preflight = match prepare_assignment_execution(&context, &mut outcome)
+            .expect("direct preflight invocation")
+        {
+            AssignmentExecutionDisposition::Continue(preflight) => preflight,
+            AssignmentExecutionDisposition::Complete => panic!("preflight unexpectedly completed"),
+        };
+        assert_eq!(preflight.claim.agent_id, assignment.id);
+        assert_eq!(outcome.claim_tokens, vec![preflight.claim.token]);
+
+        let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
+        let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
+        let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+        fs::create_dir_all(&dirs.schemas).expect("create direct phase schema directory");
+        fs::write(&auditor_schema_path, "{\"type\":\"object\"}\n")
+            .expect("materialize direct phase auditor schema");
+        let prepared = match prepare_child_attempt(
+            &context,
+            &mut outcome,
+            &context.budget_policy,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            1,
+            &None,
+            &schema_path,
+            &worker_schema_path,
+            &auditor_schema_path,
+        )
+        .expect("direct child preparation invocation")
+        {
+            AssignmentExecutionDisposition::Continue(prepared) => prepared,
+            AssignmentExecutionDisposition::Complete => {
+                panic!("child preparation unexpectedly completed")
+            }
+        };
+        assert!(prepared.attempt_artifacts.prompt_path.exists());
+        assert!(!prepared.corrective_retry_used);
+        assert_eq!(
+            prepared.command.machine_global_retention,
+            options.machine_global_retention
+        );
+        assert_eq!(prepared.command.model.as_deref(), Some("gpt-5.6-sol"));
+        let launched_subject_model = prepared.command.model.clone();
+        let collected = dispatch_and_collect_child_attempt(
+            &context,
+            &mut outcome,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            prepared,
+        )
+        .expect("direct child dispatch invocation");
+        assert!(collected.attempt_containment_verified);
+        assert_eq!(outcome.command_records.len(), 1);
+
+        let mut structural_attempt = 1;
+        let mut retry_feedback = None;
+        let mut attempt_history = Vec::new();
+        let mut child_report = match decide_child_attempt(
+            &context,
+            &mut outcome,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            &mut structural_attempt,
+            &mut retry_feedback,
+            &mut attempt_history,
+            collected,
+        )
+        .expect("direct child gate invocation")
+        {
+            ChildAttemptDisposition::Finish {
+                report,
+                containment_verified,
+                gate_terminal,
+            } => {
+                assert!(containment_verified);
+                assert!(!gate_terminal);
+                report
+            }
+            ChildAttemptDisposition::Retry => panic!("child gate unexpectedly retried"),
+        };
+        assert_eq!(attempt_history.len(), 1);
+
+        let final_report_relative = PathBuf::from("reports").join("phase-child.json");
+        let final_report_path = dirs.reports.join("phase-child.json");
+        child_report.audit_reports.push(AuditorReport {
+            id: review_lens_auditor_id(&assignment, 0),
+            role: AgentRole::Auditor,
+            reviewed_worker_ids: Vec::new(),
+            reviewed_paths: assignment.assigned_paths.clone(),
+            commands_run: Vec::new(),
+            environment_failures: Vec::new(),
+            validation_results: vec![ValidationResult {
+                name: "fixture auditor validation".to_string(),
+                status: ReviewStatus::Succeeded,
+                command: Vec::new(),
+                message: None,
+            }],
+            findings: Vec::new(),
+            rejection_kind: None,
+            no_further_delegation: Some(true),
+            read_only: true,
+            accepted: true,
+            rejected: false,
+            status: ReviewStatus::Succeeded,
+            remaining_risk: "none".to_string(),
+            next_safe_action: "publish".to_string(),
+        });
+        publish_assignment_report(
+            &context,
+            &mut outcome,
+            &preflight,
+            launched_subject_model.as_deref(),
+            options.run_id.as_str(),
+            &final_report_relative,
+            &final_report_path,
+            child_report,
+            None,
+            true,
+        )
+        .expect("direct final publication invocation");
+        assert!(outcome.report.is_some());
+        assert_eq!(outcome.command_records.len(), 1);
+        assert!(!outcome.external_containment_failed);
+        let journal_contents =
+            fs::read_to_string(run_dir.join(crate::orchestration_event::ORCHESTRATION_EVENT_PATH))
+                .expect("read direct phase orchestration journal");
+        let transition = journal_contents
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<crate::orchestration_event::OrchestrationEvent>(line)
+                    .expect("parse direct phase orchestration event")
+            })
+            .find_map(|event| {
+                event
+                    .payload
+                    .get(crate::hierarchy_ledger::ROLE_TRANSITION_FIELD)
+                    .cloned()
+            })
+            .expect("publication must record a role transition");
+        assert_eq!(transition["decision"], "granted");
+        assert_eq!(transition["reason"], "granted_promotion");
     }
 
     #[test]
