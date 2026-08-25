@@ -247,6 +247,13 @@ impl RoleTransitionRecord {
         require_identifier("requester_agent_id", &self.requester_agent_id)?;
         require_identifier("judge_agent_id", &self.judge_agent_id)?;
         require_reason(&self.reason)?;
+        if self.decision == RoleTransitionDecision::Granted
+            && (!self.evidence.recorded
+                || !self.evidence.acceptance_grade
+                || self.evidence.uncertain)
+        {
+            bail!("granted role transition requires recorded acceptance-grade certain evidence");
+        }
         if self.agent_id == self.judge_agent_id && self.decision == RoleTransitionDecision::Granted
         {
             bail!("role transition cannot be self-judged");
@@ -764,6 +771,61 @@ mod tests {
         };
         let error = granted.validate().expect_err("self-judged grant must fail");
         assert!(error.to_string().contains("self-judged"));
+    }
+
+    #[test]
+    fn legacy_granted_transition_without_evidence_fails_closed() -> Result<()> {
+        let legacy = serde_json::json!({
+            "agent_id": "child-a",
+            "from_category": "non_delegating_terminal_worker",
+            "to_category": "delegating_coordinator",
+            "requester_agent_id": "run-1",
+            "judge_agent_id": "third-party-judge",
+            "decision": "granted",
+            "reason": "granted_promotion"
+        });
+        let record: RoleTransitionRecord = serde_json::from_value(legacy)?;
+        let error = record
+            .validate()
+            .expect_err("legacy grant without evidence must fail closed");
+        assert!(error.to_string().contains("evidence"));
+        Ok(())
+    }
+
+    #[test]
+    fn granted_transition_rejects_inconsistent_evidence() {
+        for evidence in [
+            RoleTransitionEvidenceRecord {
+                acceptance_grade: true,
+                recorded: false,
+                uncertain: false,
+            },
+            RoleTransitionEvidenceRecord {
+                acceptance_grade: false,
+                recorded: true,
+                uncertain: false,
+            },
+            RoleTransitionEvidenceRecord {
+                acceptance_grade: true,
+                recorded: true,
+                uncertain: true,
+            },
+        ] {
+            let granted = RoleTransitionRecord {
+                agent_id: "child-a".to_string(),
+                from_category: RoleCategory::NonDelegatingTerminalWorker,
+                to_category: RoleCategory::DelegatingCoordinator,
+                requester_agent_id: "run-1".to_string(),
+                judge_agent_id: "third-party-judge".to_string(),
+                evidence,
+                decision: RoleTransitionDecision::Granted,
+                reason: "granted_promotion".to_string(),
+            };
+            let error = granted
+                .validate()
+                .expect_err("grant with inconsistent evidence must fail closed");
+            assert!(error.to_string().contains("evidence"));
+        }
     }
 
     #[test]
