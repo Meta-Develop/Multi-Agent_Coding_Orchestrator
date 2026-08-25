@@ -282,7 +282,7 @@ pub(super) fn import_worker_execution_journals(
     Ok(journals)
 }
 
-fn parse_worker_execution_journal(
+pub(super) fn parse_worker_execution_journal(
     bytes: &[u8],
     display_path: &Path,
 ) -> Result<Vec<WorkerExecutionJournalEntry>> {
@@ -314,34 +314,6 @@ fn parse_worker_execution_journal(
                     line_number
                 )
             })?;
-        if entry.command.is_empty() {
-            bail!(
-                "worker execution journal {} line {} omitted command",
-                display_path.display(),
-                line_number
-            );
-        }
-        if entry.cwd.as_os_str().is_empty() {
-            bail!(
-                "worker execution journal {} line {} omitted cwd",
-                display_path.display(),
-                line_number
-            );
-        }
-        if entry.start_timestamp.trim().is_empty() {
-            bail!(
-                "worker execution journal {} line {} omitted start_timestamp",
-                display_path.display(),
-                line_number
-            );
-        }
-        if entry.end_timestamp.trim().is_empty() {
-            bail!(
-                "worker execution journal {} line {} omitted end_timestamp",
-                display_path.display(),
-                line_number
-            );
-        }
         entry.changed_paths = normalize_paths(std::mem::take(&mut entry.changed_paths))
             .with_context(|| {
                 format!(
@@ -350,9 +322,124 @@ fn parse_worker_execution_journal(
                     line_number
                 )
             })?;
+        validate_worker_execution_journal_record(&entry).with_context(|| {
+            format!(
+                "worker execution journal {} line {} failed semantic validation",
+                display_path.display(),
+                line_number
+            )
+        })?;
         entries.push(entry);
     }
     Ok(entries)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum WorkerExecutionJournalRecordError {
+    #[error(
+        "worker execution journal record omitted command; corrective action: provide a nonempty command array before retrying the append"
+    )]
+    MissingCommand,
+    #[error(
+        "worker execution journal apply_patch record omitted the patch payload; corrective action: preserve the complete nonempty patch as command[1] before retrying the append"
+    )]
+    MissingApplyPatchPayload,
+    #[error(
+        "worker execution journal record omitted cwd; corrective action: provide the absolute assigned-worktree cwd before retrying the append"
+    )]
+    MissingCwd,
+    #[error(
+        "worker execution journal record omitted start_timestamp; corrective action: provide the command's nonempty RFC3339 start timestamp before retrying the append"
+    )]
+    MissingStartTimestamp,
+    #[error(
+        "worker execution journal record omitted end_timestamp; corrective action: provide the command's nonempty RFC3339 end timestamp before retrying the append"
+    )]
+    MissingEndTimestamp,
+    #[error(
+        "worker execution journal record has invalid changed_paths: {detail}; corrective action: provide canonical repository-relative changed paths before retrying the append"
+    )]
+    InvalidChangedPaths { detail: String },
+    #[error(
+        "worker execution journal record could not be serialized before append: {detail}; corrective action: provide UTF-8 JSON field values before retrying the append"
+    )]
+    Serialization { detail: String },
+    #[error(
+        "validated worker execution journal record could not be appended: {source}; corrective action: stop and report the exact journal write failure without replacing the precreated file"
+    )]
+    Append {
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+fn validate_worker_execution_journal_record(
+    entry: &WorkerExecutionJournalEntry,
+) -> std::result::Result<(), WorkerExecutionJournalRecordError> {
+    if entry.command.is_empty() {
+        return Err(WorkerExecutionJournalRecordError::MissingCommand);
+    }
+    if entry.command.first().map(String::as_str) == Some("apply_patch") {
+        match entry.command.get(1) {
+            Some(payload) if !payload.trim().is_empty() => {}
+            _ => return Err(WorkerExecutionJournalRecordError::MissingApplyPatchPayload),
+        }
+    }
+    let cwd_is_blank = match entry.cwd.to_str() {
+        Some(cwd) => cwd.trim().is_empty(),
+        None => entry.cwd.as_os_str().is_empty(),
+    };
+    if cwd_is_blank {
+        return Err(WorkerExecutionJournalRecordError::MissingCwd);
+    }
+    if entry.start_timestamp.trim().is_empty() {
+        return Err(WorkerExecutionJournalRecordError::MissingStartTimestamp);
+    }
+    if entry.end_timestamp.trim().is_empty() {
+        return Err(WorkerExecutionJournalRecordError::MissingEndTimestamp);
+    }
+    Ok(())
+}
+
+pub(super) fn append_worker_execution_journal_record(
+    journal: &mut impl std::io::Write,
+    entry: &WorkerExecutionJournalEntry,
+) -> std::result::Result<(), WorkerExecutionJournalRecordError> {
+    validate_worker_execution_journal_record(entry)?;
+    let mut normalized = entry.clone();
+    normalized.changed_paths = normalize_paths(normalized.changed_paths).map_err(|error| {
+        WorkerExecutionJournalRecordError::InvalidChangedPaths {
+            detail: error.to_string(),
+        }
+    })?;
+    let mut record = serde_json::to_vec(&normalized).map_err(|error| {
+        WorkerExecutionJournalRecordError::Serialization {
+            detail: error.to_string(),
+        }
+    })?;
+    record.push(b'\n');
+    journal
+        .write_all(&record)
+        .map_err(|source| WorkerExecutionJournalRecordError::Append { source })
+}
+
+pub(super) fn worker_execution_journal_apply_patch_example() -> Result<String> {
+    let entry = WorkerExecutionJournalEntry {
+        command: vec![
+            "apply_patch".to_string(),
+            "*** Begin Patch\n*** Add File: p\n+x\n*** End Patch".to_string(),
+        ],
+        cwd: PathBuf::from("/worktree"),
+        start_timestamp: "2026-08-25T00:00:00Z".to_string(),
+        end_timestamp: "2026-08-25T00:00:01Z".to_string(),
+        changed_paths: vec![PathBuf::from("p")],
+    };
+    let mut encoded = Vec::new();
+    append_worker_execution_journal_record(&mut encoded, &entry)
+        .context("failed to render the validated apply_patch journal example")?;
+    let rendered = String::from_utf8(encoded)
+        .context("validated apply_patch journal example was not UTF-8")?;
+    Ok(rendered.trim_end().to_string())
 }
 
 pub(super) fn import_external_attempt_evidence(

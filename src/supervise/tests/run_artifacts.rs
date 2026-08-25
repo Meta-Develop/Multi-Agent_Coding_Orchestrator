@@ -48,6 +48,95 @@ fn worker_journals_are_precreated_as_private_exact_files() {
 }
 
 #[test]
+fn worker_journal_append_writes_a_complete_apply_patch_record() {
+    let record = WorkerExecutionJournalEntry {
+        command: vec![
+            "apply_patch".to_string(),
+            "*** Begin Patch\n*** Update File: src/supervise.rs\n@@\n-old\n+new\n*** End Patch"
+                .to_string(),
+        ],
+        cwd: PathBuf::from("/native/local/worktree"),
+        start_timestamp: "2026-08-25T00:00:00Z".to_string(),
+        end_timestamp: "2026-08-25T00:00:01Z".to_string(),
+        changed_paths: vec![PathBuf::from("src/supervise.rs")],
+    };
+    let mut journal = Vec::new();
+
+    append_worker_execution_journal_record(&mut journal, &record)
+        .expect("append semantically complete apply_patch record");
+
+    let parsed = parse_worker_execution_journal(&journal, Path::new("worker.jsonl"))
+        .expect("parse appended apply_patch record");
+    assert_eq!(parsed, vec![record]);
+    assert!(!parsed[0].cwd.as_os_str().is_empty());
+    assert!(!parsed[0].start_timestamp.is_empty());
+    assert!(!parsed[0].end_timestamp.is_empty());
+    assert!(!parsed[0].command[1].is_empty());
+}
+
+#[test]
+fn worker_journal_append_rejects_blank_mandatory_fields_before_writing() {
+    let valid = WorkerExecutionJournalEntry {
+        command: vec!["apply_patch".to_string(), "nonempty patch".to_string()],
+        cwd: PathBuf::from("/native/local/worktree"),
+        start_timestamp: "2026-08-25T00:00:00Z".to_string(),
+        end_timestamp: "2026-08-25T00:00:01Z".to_string(),
+        changed_paths: vec![PathBuf::from("src/supervise.rs")],
+    };
+    let existing = b"existing immutable record\n".to_vec();
+
+    let mut blank_payload = valid.clone();
+    blank_payload.command[1].clear();
+    let mut journal = existing.clone();
+    let error = append_worker_execution_journal_record(&mut journal, &blank_payload)
+        .expect_err("blank apply_patch payload must be refused");
+    assert!(error
+        .to_string()
+        .contains("preserve the complete nonempty patch as command[1] before retrying the append"));
+    assert!(matches!(
+        error,
+        WorkerExecutionJournalRecordError::MissingApplyPatchPayload
+    ));
+    assert_eq!(journal, existing);
+
+    let mut blank_cwd = valid.clone();
+    blank_cwd.cwd = PathBuf::from("   ");
+    let mut journal = existing.clone();
+    let error = append_worker_execution_journal_record(&mut journal, &blank_cwd)
+        .expect_err("blank cwd must be refused");
+    assert!(error
+        .to_string()
+        .contains("provide the absolute assigned-worktree cwd before retrying the append"));
+    assert!(matches!(
+        error,
+        WorkerExecutionJournalRecordError::MissingCwd
+    ));
+    assert_eq!(journal, existing);
+
+    let mut blank_start = valid.clone();
+    blank_start.start_timestamp = " \t".to_string();
+    let mut journal = existing.clone();
+    let error = append_worker_execution_journal_record(&mut journal, &blank_start)
+        .expect_err("blank start_timestamp must be refused");
+    assert!(matches!(
+        error,
+        WorkerExecutionJournalRecordError::MissingStartTimestamp
+    ));
+    assert_eq!(journal, existing);
+
+    let mut blank_end = valid;
+    blank_end.end_timestamp = "\n".to_string();
+    let mut journal = existing.clone();
+    let error = append_worker_execution_journal_record(&mut journal, &blank_end)
+        .expect_err("blank end_timestamp must be refused");
+    assert!(matches!(
+        error,
+        WorkerExecutionJournalRecordError::MissingEndTimestamp
+    ));
+    assert_eq!(journal, existing);
+}
+
+#[test]
 fn supervise_writer_discards_reusable_invocation_scratches_and_finalizes_private_evidence() {
     let (_temp, repo_path) = injected_repository();
     let run_id = RunId::new("artifact-scratch-finalized").expect("valid run id");
@@ -1746,7 +1835,9 @@ fn fake_supervise_run_finalizes_manifested_report_tree_events() {
     assert_eq!(child_measurements.prompts[1].agent_label, "worker-a");
     assert_eq!(
         child_measurements.prompts[1].invariant_bytes,
-        worker_cacheable_prefix().len()
+        worker_cacheable_prefix()
+            .expect("render worker cacheable prefix")
+            .len()
     );
     assert_eq!(
         child_measurements.prompts[2].role,
@@ -2044,7 +2135,7 @@ fn accepted_audited_suggestions_append_with_trusted_provenance_and_redacted_jour
     let role_prefix = supervise_role_prefix(SupervisePromptRole::TerminalWorker, &worker.id, None);
     assert!(worker_prompt.starts_with(&format!(
         "{}{role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n",
-        worker_cacheable_prefix()
+        worker_cacheable_prefix().expect("render worker cacheable prefix")
     )));
     let (opening_token, closing_token) = single_field_guide_frame_tokens(&worker_prompt);
     let final_nonce = opening_token

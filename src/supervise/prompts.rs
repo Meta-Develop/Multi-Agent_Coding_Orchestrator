@@ -232,8 +232,9 @@ Safety requirements:
     )
 }
 
-pub(super) fn worker_cacheable_prefix() -> String {
-    format!(
+pub(super) fn worker_cacheable_prefix() -> Result<String> {
+    let apply_patch_journal_example = worker_execution_journal_apply_patch_example()?;
+    Ok(format!(
         r#"You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
 Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
 You are not the supervisor. Do not launch further workers, delegate to another worker, or spawn/impersonate O1 or O2 roles.
@@ -243,7 +244,10 @@ You are not the supervisor. Do not launch further workers, delegate to another w
 Rules:
 - Edit only inside your assigned worktree and only inside claimed paths.
 - Do not mutate the primary worktree.
-- Before returning your WorkerReport, append a structured execution journal directly to the exact precreated execution journal path in the assignment-specific context below; this file is the only allowed non-source artifact write for this worker. The parent directory is intentionally nonwritable. Do not create, replace, rename, link, or atomically swap the journal. Use JSONL: one JSON object per command, with fields "command" (array of strings), "cwd" (string), "start_timestamp" (string), "end_timestamp" (string), and "changed_paths" (array of repo-relative paths changed by that command, or [] when none). Do not write prose or Markdown to the journal.
+- After each action, immediately build and validate {{command,cwd,start_timestamp,end_timestamp,changed_paths}}: cwd absolute, timestamps nonempty RFC3339, paths canonical repo-relative. Append one JSON line directly to the exact precreated journal before the next action. Never reconstruct at the end; append bookkeeping is not journaled.
+- The journal is the only non-source write and its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. Before append, refuse empty command, blank apply_patch command[1]/cwd/timestamps, or invalid paths. Report a typed actionable WorkerExecutionJournalRecordError and stop. No prose/Markdown there.
+- apply_patch record example; preserve the full patch:
+{apply_patch_journal_example}
 - Run validation or record why validation was not run.
 - Return exactly one WorkerReport JSON object in your final response with assignment_kind, target_path, changed files, commands run, validation results, findings, bloated_file_flags, decomposition_completion, remaining risk, and next safe action. Do not wrap it in Markdown, a code fence, or prose.
 - Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
@@ -257,7 +261,8 @@ Rules:
 "#,
         tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE,
         max_bloated_file_flags = MAX_BLOATED_FILE_FLAGS_PER_WORKER,
-    )
+        apply_patch_journal_example = apply_patch_journal_example,
+    ))
 }
 
 fn child_cacheable_prefix_for_target(
@@ -281,10 +286,10 @@ fn child_cacheable_prefix_for_target(
 
 fn worker_cacheable_prefix_for_target(
     execution_target: Option<&SupervisorExecutionTarget>,
-) -> String {
-    let prefix = worker_cacheable_prefix();
+) -> Result<String> {
+    let prefix = worker_cacheable_prefix()?;
     if execution_target.is_some() {
-        prefix
+        Ok(prefix
             .replace(
                 "- Edit only inside your assigned worktree and only inside claimed paths.\n- Do not mutate the primary worktree.",
                 "- The assigned worktree is the existing primary checkout. Edit only the exact declared primary-worktree claim paths; do not stage, commit, or change Git metadata.",
@@ -292,9 +297,9 @@ fn worker_cacheable_prefix_for_target(
             .replace(
                 "This typed evidence does not bypass the isolated worktree, hard claim, execution journal, validation, terminal audit, or later merge gates.",
                 "This typed evidence does not bypass the hard claim, exact primary-worktree scope, execution journal, validation, or terminal audit gates.",
-            )
+            ))
     } else {
-        prefix
+        Ok(prefix)
     }
 }
 
@@ -587,7 +592,7 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
                 },
                 field_guide,
             )?;
-            let invariant_prefix = worker_cacheable_prefix_for_target(execution_target);
+            let invariant_prefix = worker_cacheable_prefix_for_target(execution_target)?;
             let measurement = PromptByteMeasurement::new(
                 PromptMeasurementRole::TerminalWorker,
                 &worker.id,
@@ -865,7 +870,7 @@ Supervisor task:
 Worker assignment JSON:
 {worker_json}
 "#,
-        cacheable_prefix = worker_cacheable_prefix_for_target(execution_target),
+        cacheable_prefix = worker_cacheable_prefix_for_target(execution_target)?,
         role_prefix = role_prefix,
         field_guide_section = field_guide.section,
         instruction_profile_section = instruction_profile_section,
@@ -1707,7 +1712,8 @@ mod regression_tests {
         )
         .expect("render low-tier worker prompt");
 
-        assert!(rendered.starts_with(&worker_cacheable_prefix()));
+        assert!(rendered
+            .starts_with(&worker_cacheable_prefix().expect("render worker cacheable prefix")));
         assert!(rendered.contains("INSTRUCTION_PROFILE: maco-weak-mechanical-lite-v1"));
         assert!(rendered.contains("Reason: low_tier_capability"));
         assert!(rendered.contains("Execute only the assigned mechanical steps"));
@@ -1721,7 +1727,10 @@ mod regression_tests {
             .find("Assignment-specific context:")
             .expect("assignment context");
         assert!(
-            profile_offset > worker_cacheable_prefix().len(),
+            profile_offset
+                > worker_cacheable_prefix()
+                    .expect("render worker cacheable prefix")
+                    .len(),
             "named profile must stay out of the cacheable prefix"
         );
         assert!(
@@ -1975,7 +1984,7 @@ mod regression_tests {
         let (worker_b, child_b, auditor_b, parent_auditor_b) =
             fixed_prompt_fixture_with_ids("child-b", "worker-b", "src/supervise/prompts-b.rs")
                 .expect("render prompt fixture b");
-        let worker_prefix = worker_cacheable_prefix();
+        let worker_prefix = worker_cacheable_prefix().expect("render worker cacheable prefix");
         let child_prefix = child_orchestrator_cacheable_prefix();
         let auditor_prefix = review_auditor_cacheable_prefix();
         let parent_auditor_prefix = parent_review_auditor_cacheable_prefix();

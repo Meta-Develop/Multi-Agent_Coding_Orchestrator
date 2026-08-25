@@ -234,7 +234,7 @@ fn o1_worker_and_auditor_production_prompts_place_the_nonce_frame_after_role_met
         supervise_role_prefix(SupervisePromptRole::TerminalWorker, &worker.id, None);
     assert!(worker_prompt.starts_with(&format!(
         "{}{worker_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n",
-        worker_cacheable_prefix()
+        worker_cacheable_prefix().expect("render worker cacheable prefix")
     )));
     assert_eq!(worker_prompt.matches(guide_finding).count(), 1);
     assert_eq!(worker_prompt.matches(guide_context).count(), 1);
@@ -338,10 +338,16 @@ fn worker_prompt_includes_execution_journal_contract() {
 
     assert!(prompt
         .contains("Execution journal path: /tmp/maco-run/incoming/worker-journals/worker-a.jsonl"));
-    assert!(prompt.contains("append a structured execution journal directly"));
-    assert!(prompt.contains("exact precreated execution journal path"));
-    assert!(prompt.contains("parent directory is intentionally nonwritable"));
-    assert!(prompt.contains("Do not create, replace, rename, link, or atomically swap"));
+    assert!(prompt.contains("Append one JSON line directly"));
+    assert!(prompt.contains("exact precreated journal"));
+    assert!(prompt.contains("parent is nonwritable"));
+    assert!(prompt.contains("Never create, replace, rename, link, truncate, or swap"));
+    assert!(prompt.contains("Never reconstruct at the end"));
+    assert!(prompt.contains("WorkerExecutionJournalRecordError"));
+    assert!(prompt.contains("\"command\":[\"apply_patch\","));
+    assert!(prompt.contains("\"cwd\":\"/worktree\""));
+    assert!(prompt.contains("\"start_timestamp\":\"2026-08-25T00:00:00Z\""));
+    assert!(prompt.contains("\"end_timestamp\":\"2026-08-25T00:00:01Z\""));
     assert!(prompt.contains("\"start_timestamp\""));
     assert!(prompt.contains("\"changed_paths\""));
     assert!(prompt.contains("exactly one WorkerReport JSON object"));
