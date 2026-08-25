@@ -4332,6 +4332,334 @@ fn stored_denial_evidence_round_trips_and_old_json_defaults_empty() -> Result<()
 }
 
 #[test]
+fn sandbox_denial_deserialization_rejects_unsafe_or_unprotected_paths() {
+    let oversized = format!(".agents/{}", "a".repeat(MAX_SANDBOX_DENIAL_PATH_BYTES));
+    for path in [
+        "/home/private/AGENTS.md",
+        "",
+        ".",
+        "../AGENTS.md",
+        "./AGENTS.md",
+        ".agents/../AGENTS.md",
+        ".agents/./policy.md",
+        ".agents//policy.md",
+        ".agents/policy.md/",
+        ".agents\\policy.md",
+        ".agents:policy.md",
+        ".agents/\npolicy.md",
+        "src/lib.rs",
+        &oversized,
+    ] {
+        let value = serde_json::json!({
+            "boundary": "inner_codex",
+            "policy_id": INNER_CODEX_POLICY_ID,
+            "operation": "write",
+            "path": path,
+            "retryability": "requires_declared_exception",
+        });
+        let error = serde_json::from_value::<SandboxDenialEvidence>(value)
+            .expect_err("unsafe evidence path must be rejected");
+        if !path.is_empty() {
+            assert!(
+                !error.to_string().contains(path),
+                "rejection error leaked untrusted path {path:?}: {error}"
+            );
+        }
+    }
+
+    let boundary_path = format!(
+        ".agents/{}",
+        "a".repeat(MAX_SANDBOX_DENIAL_PATH_BYTES - ".agents/".len())
+    );
+    let boundary_value = serde_json::json!({
+        "boundary": "inner_codex",
+        "policy_id": INNER_CODEX_POLICY_ID,
+        "operation": "write",
+        "path": boundary_path,
+        "retryability": "requires_declared_exception",
+    });
+    assert!(serde_json::from_value::<SandboxDenialEvidence>(boundary_value).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn sandbox_denial_serialization_rejects_non_utf8_paths_without_leaking_them() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let evidence = SandboxDenialEvidence {
+        boundary: SandboxDenialBoundary::InnerCodex,
+        policy_id: INNER_CODEX_POLICY_ID.to_string(),
+        operation: SandboxDeniedOperation::Write,
+        path: Some(PathBuf::from(OsString::from_vec(vec![
+            b'.', b'a', b'g', b'e', b'n', b't', b's', b'/', 0xff,
+        ]))),
+        retryability: SandboxDenialRetryability::RequiresDeclaredException,
+    };
+    let error = serde_json::to_value(evidence).expect_err("non-UTF8 evidence path must fail");
+    assert!(!error.to_string().contains("/home/"));
+    assert!(error.to_string().contains("valid UTF-8"));
+}
+
+#[test]
+fn sandbox_denial_deserialization_enforces_stable_boundary_policy_shapes() {
+    let valid_outer = serde_json::json!({
+        "boundary": "outer_systemd",
+        "policy_id": OUTER_SYSTEMD_POLICY_ID,
+        "operation": "establish_boundary",
+        "retryability": "not_retryable",
+    });
+    let valid_inner = serde_json::json!({
+        "boundary": "inner_codex",
+        "policy_id": INNER_CODEX_POLICY_ID,
+        "operation": "write",
+        "path": "AGENTS.md",
+        "retryability": "requires_declared_exception",
+    });
+    assert!(serde_json::from_value::<SandboxDenialEvidence>(valid_outer.clone()).is_ok());
+    assert!(serde_json::from_value::<SandboxDenialEvidence>(valid_inner.clone()).is_ok());
+
+    let valid_inner_not_retryable = serde_json::json!({
+        "boundary": "inner_codex",
+        "policy_id": INNER_CODEX_POLICY_ID,
+        "operation": "write",
+        "path": ".git",
+        "retryability": "not_retryable",
+    });
+    assert!(
+        serde_json::from_value::<SandboxDenialEvidence>(valid_inner_not_retryable.clone()).is_ok()
+    );
+
+    for invalid in [
+        {
+            let mut value = valid_outer.clone();
+            value["policy_id"] = serde_json::json!(INNER_CODEX_POLICY_ID);
+            value
+        },
+        {
+            let mut value = valid_outer.clone();
+            value["operation"] = serde_json::json!("write");
+            value
+        },
+        {
+            let mut value = valid_outer.clone();
+            value["path"] = serde_json::json!(".git");
+            value
+        },
+        {
+            let mut value = valid_outer.clone();
+            value["retryability"] = serde_json::json!("requires_declared_exception");
+            value
+        },
+        {
+            let mut value = valid_inner.clone();
+            value["policy_id"] = serde_json::json!(OUTER_SYSTEMD_POLICY_ID);
+            value
+        },
+        {
+            let mut value = valid_inner.clone();
+            value["operation"] = serde_json::json!("establish_boundary");
+            value
+        },
+        {
+            let mut value = valid_inner.clone();
+            value["retryability"] = serde_json::json!("sometimes_retryable");
+            value
+        },
+        {
+            let mut value = valid_inner.clone();
+            value["retryability"] = serde_json::json!("not_retryable");
+            value
+        },
+        {
+            let mut value = valid_inner_not_retryable;
+            value["retryability"] = serde_json::json!("requires_declared_exception");
+            value
+        },
+        {
+            let mut value = valid_outer.clone();
+            value["unexpected"] = serde_json::json!(true);
+            value
+        },
+        {
+            let mut value = valid_inner.clone();
+            value["unexpected"] = serde_json::json!(true);
+            value
+        },
+        {
+            let mut value = valid_inner;
+            value
+                .as_object_mut()
+                .expect("evidence object")
+                .remove("path");
+            value
+        },
+    ] {
+        assert!(
+            serde_json::from_value::<SandboxDenialEvidence>(invalid).is_err(),
+            "invalid boundary/policy evidence shape was accepted"
+        );
+    }
+}
+
+#[test]
+fn sandbox_denial_serialization_rejects_retryability_mismatches_without_path_leaks() {
+    for (path, retryability) in [
+        (".git", SandboxDenialRetryability::RequiresDeclaredException),
+        ("AGENTS.md", SandboxDenialRetryability::NotRetryable),
+    ] {
+        let evidence = SandboxDenialEvidence {
+            boundary: SandboxDenialBoundary::InnerCodex,
+            policy_id: INNER_CODEX_POLICY_ID.to_string(),
+            operation: SandboxDeniedOperation::Write,
+            path: Some(PathBuf::from(path)),
+            retryability,
+        };
+        let error = serde_json::to_value(evidence)
+            .expect_err("mismatched sandbox-denial retryability must not serialize");
+        assert!(!error.to_string().contains(path));
+    }
+}
+
+#[test]
+fn sandbox_denial_run_wire_rejects_duplicates_and_bounds_then_sorts() -> Result<()> {
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    );
+    let report = failed_external_run(
+        &command,
+        Instant::now(),
+        vec!["codex".to_string()],
+        false,
+        "external agent exited with status 1".to_string(),
+    );
+    let base = serde_json::to_value(&report)?;
+    let agents = serde_json::json!({
+        "boundary": "inner_codex",
+        "policy_id": INNER_CODEX_POLICY_ID,
+        "operation": "write",
+        "path": "AGENTS.md",
+        "retryability": "requires_declared_exception",
+    });
+    let git = serde_json::json!({
+        "boundary": "inner_codex",
+        "policy_id": INNER_CODEX_POLICY_ID,
+        "operation": "write",
+        "path": ".git",
+        "retryability": "not_retryable",
+    });
+
+    let mut duplicate = base.clone();
+    duplicate["sandbox_denials"] = serde_json::json!([agents.clone(), agents.clone()]);
+    assert!(
+        serde_json::from_value::<ExternalAgentRun>(duplicate).is_err(),
+        "duplicate evidence must not be silently collapsed"
+    );
+
+    let unique = (0..=MAX_SANDBOX_DENIAL_EVIDENCE)
+        .map(|index| {
+            serde_json::json!({
+                "boundary": "inner_codex",
+                "policy_id": INNER_CODEX_POLICY_ID,
+                "operation": "write",
+                "path": format!(".agents/policy-{index:03}.md"),
+                "retryability": "requires_declared_exception",
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut oversized = base.clone();
+    oversized["sandbox_denials"] = serde_json::Value::Array(unique.clone());
+    assert!(
+        serde_json::from_value::<ExternalAgentRun>(oversized).is_err(),
+        "oversized evidence must be rejected"
+    );
+
+    let mut unordered = base;
+    unordered["sandbox_denials"] = serde_json::json!([agents, git]);
+    let decoded: ExternalAgentRun = serde_json::from_value(unordered)?;
+    assert_eq!(
+        decoded.sandbox_denials(),
+        [
+            SandboxDenialEvidence {
+                boundary: SandboxDenialBoundary::InnerCodex,
+                policy_id: INNER_CODEX_POLICY_ID.to_string(),
+                operation: SandboxDeniedOperation::Write,
+                path: Some(PathBuf::from(".git")),
+                retryability: SandboxDenialRetryability::NotRetryable,
+            },
+            SandboxDenialEvidence {
+                boundary: SandboxDenialBoundary::InnerCodex,
+                policy_id: INNER_CODEX_POLICY_ID.to_string(),
+                operation: SandboxDeniedOperation::Write,
+                path: Some(PathBuf::from("AGENTS.md")),
+                retryability: SandboxDenialRetryability::RequiresDeclaredException,
+            },
+        ]
+    );
+
+    let mut exact_bound = report.clone();
+    exact_bound.stdout.run_metadata.sandbox_denials = (0..MAX_SANDBOX_DENIAL_EVIDENCE)
+        .rev()
+        .map(|index| SandboxDenialEvidence {
+            boundary: SandboxDenialBoundary::InnerCodex,
+            policy_id: INNER_CODEX_POLICY_ID.to_string(),
+            operation: SandboxDeniedOperation::Write,
+            path: Some(PathBuf::from(format!(".agents/policy-{index:03}.md"))),
+            retryability: SandboxDenialRetryability::RequiresDeclaredException,
+        })
+        .collect();
+    let exact_value = serde_json::to_value(&exact_bound)?;
+    let exact_wire = exact_value["sandbox_denials"]
+        .as_array()
+        .context("sandbox denials must serialize as an array")?;
+    assert_eq!(exact_wire.len(), MAX_SANDBOX_DENIAL_EVIDENCE);
+    assert_eq!(exact_wire[0]["path"], ".agents/policy-000.md");
+    assert_eq!(
+        exact_wire[MAX_SANDBOX_DENIAL_EVIDENCE - 1]["path"],
+        ".agents/policy-127.md"
+    );
+
+    let mut duplicate_report = report.clone();
+    let duplicate_item = SandboxDenialEvidence {
+        boundary: SandboxDenialBoundary::InnerCodex,
+        policy_id: INNER_CODEX_POLICY_ID.to_string(),
+        operation: SandboxDeniedOperation::Write,
+        path: Some(PathBuf::from("AGENTS.md")),
+        retryability: SandboxDenialRetryability::RequiresDeclaredException,
+    };
+    duplicate_report.stdout.run_metadata.sandbox_denials =
+        vec![duplicate_item.clone(), duplicate_item];
+    assert!(serde_json::to_value(&duplicate_report).is_err());
+
+    let mut invalid_report = report.clone();
+    invalid_report.stdout.run_metadata.sandbox_denials = vec![SandboxDenialEvidence {
+        boundary: SandboxDenialBoundary::InnerCodex,
+        policy_id: INNER_CODEX_POLICY_ID.to_string(),
+        operation: SandboxDeniedOperation::Write,
+        path: Some(PathBuf::from("src/lib.rs")),
+        retryability: SandboxDenialRetryability::NotRetryable,
+    }];
+    assert!(serde_json::to_value(&invalid_report).is_err());
+
+    let mut oversized_report = report;
+    oversized_report.stdout.run_metadata.sandbox_denials = (0..=MAX_SANDBOX_DENIAL_EVIDENCE)
+        .map(|index| SandboxDenialEvidence {
+            boundary: SandboxDenialBoundary::InnerCodex,
+            policy_id: INNER_CODEX_POLICY_ID.to_string(),
+            operation: SandboxDeniedOperation::Write,
+            path: Some(PathBuf::from(format!(".agents/policy-{index:03}.md"))),
+            retryability: SandboxDenialRetryability::RequiresDeclaredException,
+        })
+        .collect();
+    assert!(serde_json::to_value(&oversized_report).is_err());
+    Ok(())
+}
+
+#[test]
 fn outer_denial_evidence_uses_only_typed_process_errors() {
     let typed = ProcessRunError::ContainmentUnavailable {
         label: "external agent".to_string(),
