@@ -1504,12 +1504,23 @@ where
     fn walk(&mut self, directory_fd: RawFd, relative_directory: &Path, depth: usize) -> Result<()> {
         self.budget
             .ensure_before_deadline("before directory enumeration")?;
-        let names = inventory_directory_entries(directory_fd, self.budget)?;
-        if is_nested_repository_boundary(&names, depth, self.options) {
+        if nested_repository_boundary_enabled(depth, self.options)
+            && inventory_nested_repository_marker_exists(directory_fd)?
+        {
+            self.budget
+                .ensure_before_deadline("after nested repository marker probe")?;
             self.nested_repository_boundaries
                 .push(relative_directory.to_path_buf());
             return Ok(());
         }
+        if depth >= self.limits.max_depth {
+            bail!(
+                "repository inventory refused to descend beyond depth {} at {}",
+                self.limits.max_depth,
+                relative_directory.display()
+            );
+        }
+        let names = inventory_directory_entries(directory_fd, self.budget)?;
         for name in names {
             self.budget
                 .ensure_before_deadline("during entry inspection")?;
@@ -1581,13 +1592,6 @@ where
                         relative.display()
                     );
                 }
-                if entry_depth >= self.limits.max_depth {
-                    bail!(
-                        "repository inventory refused to descend beyond depth {} at {}",
-                        self.limits.max_depth,
-                        relative.display()
-                    );
-                }
                 let child = openat_directory(directory_fd, &name_c).with_context(|| {
                     format!(
                         "failed to open repository directory without following links: {}",
@@ -1642,6 +1646,20 @@ where
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn inventory_nested_repository_marker_exists(fd: RawFd) -> Result<bool> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatat(fd, c".git".as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(false)
+    } else {
+        Err(error).context("failed to probe nested repository marker without following links")
     }
 }
 

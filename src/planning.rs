@@ -21,8 +21,6 @@ const REPOSITORY_INVENTORY_MAX_ENTRIES: usize = 100_000;
 const REPOSITORY_INVENTORY_MAX_PATH_BYTES: usize = 4096;
 const REPOSITORY_INVENTORY_MAX_TOTAL_PATH_BYTES: usize = 64 * 1024 * 1024;
 const REPOSITORY_INVENTORY_MAX_REPORTED_NESTED_BOUNDARIES: usize = 3;
-const EMITTED_REPOSITORY_INVENTORY_DIAGNOSTIC_MAX_BYTES: usize = 16 * 1024;
-const REPOSITORY_INVENTORY_DIAGNOSTIC_PREFIX: &str = "repository inventory ";
 const TASK_SPEC_MAX_FRAGMENTS: usize = 128;
 const TASK_SPEC_MAX_FRAGMENT_BYTES: usize = 16 * 1024;
 const TASK_SPEC_MAX_TOTAL_BYTES: usize = 256 * 1024;
@@ -617,11 +615,9 @@ fn propose_task_decomposition_from_fragments(
             "an explicit single-file-only directive bounded the task before semantic inference"
                 .to_string(),
         );
-        let mut assignments = vec![assignment];
-        surface_inventory_diagnostics_in_assignment_tasks(&mut assignments, &diagnostics);
         return Ok(TaskDecompositionProposal {
             fragments,
-            assignments,
+            assignments: vec![assignment],
             coverage_gaps: Vec::new(),
             diagnostics,
             disjointness: TaskDisjointnessReport {
@@ -633,11 +629,16 @@ fn propose_task_decomposition_from_fragments(
     }
     let semantic_map = match repo_semantic::scan_repository(repo) {
         Ok(map) => {
-            if !map.errors.is_empty() {
+            let allowed_error_count = map
+                .errors
+                .iter()
+                .filter(|error| file_set.contains(&error.file))
+                .count();
+            if allowed_error_count > 0 {
                 diagnostics.degraded = true;
                 diagnostics.notes.push(format!(
                     "semantic scan reported {} source error(s); affected fragments may have incomplete semantic intents",
-                    map.errors.len()
+                    allowed_error_count
                 ));
             }
             Some(map)
@@ -720,8 +721,6 @@ fn propose_task_decomposition_from_fragments(
             );
         }
     }
-    surface_inventory_diagnostics_in_assignment_tasks(&mut assignments, &diagnostics);
-
     Ok(TaskDecompositionProposal {
         fragments,
         assignments,
@@ -818,12 +817,16 @@ pub fn propose_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
 ) -> Result<TaskPlanningSession> {
     validate_provider_planning_config(config)?;
     let fragments = task_spec_fragments(title, body)?;
-    let files = collect_repo_files(repo)?;
+    let RepositoryFileInventory {
+        files,
+        nested_repository_boundaries,
+    } = collect_repo_file_inventory(repo)
+        .context("repository inventory failed while preparing provider task decomposition")?;
     let allowed_fragment_ids = fragments
         .iter()
         .map(|fragment| fragment.id.clone())
         .collect::<BTreeSet<_>>();
-    let semantic_inventory = collect_provider_semantic_inventory(repo);
+    let semantic_inventory = collect_provider_semantic_inventory(repo, &files);
     let payload = serde_json::json!({
         "operation": "propose",
         "response_schema": {
@@ -874,6 +877,7 @@ pub fn propose_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
         config,
         "provider task decomposition",
     )?;
+    record_nested_repository_boundaries(&mut proposal.diagnostics, &nested_repository_boundaries);
     append_provider_diagnostics(&mut proposal.diagnostics, &response, "initial proposal");
 
     Ok(TaskPlanningSession {
@@ -942,8 +946,12 @@ pub fn replan_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
         anyhow::bail!("provider re-planning has no remaining incomplete fragments");
     }
 
-    let files = collect_repo_files(repo)?;
-    let semantic_inventory = collect_provider_semantic_inventory(repo);
+    let RepositoryFileInventory {
+        files,
+        nested_repository_boundaries,
+    } = collect_repo_file_inventory(repo)
+        .context("repository inventory failed while preparing provider task re-planning")?;
+    let semantic_inventory = collect_provider_semantic_inventory(repo, &files);
     let next_attempt = session.replans_used.saturating_add(1);
     let request_id = format!(
         "{}-replan-{next_attempt:02}",
@@ -997,6 +1005,7 @@ pub fn replan_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
         config,
         "provider task re-planning",
     )?;
+    record_nested_repository_boundaries(&mut proposal.diagnostics, &nested_repository_boundaries);
     append_provider_diagnostics(
         &mut proposal.diagnostics,
         &response,
@@ -1253,18 +1262,26 @@ struct ProviderSemanticInventory {
     symbols: BTreeSet<String>,
 }
 
-fn collect_provider_semantic_inventory(repo: &Path) -> ProviderSemanticInventory {
+fn collect_provider_semantic_inventory(
+    repo: &Path,
+    allowed_files: &[PathBuf],
+) -> ProviderSemanticInventory {
     let Ok(map) = repo_semantic::scan_repository(repo) else {
         return ProviderSemanticInventory::default();
     };
+    let allowed_files = allowed_files.iter().collect::<BTreeSet<_>>();
     let modules = map
         .files
         .iter()
+        .filter(|file| allowed_files.contains(&file.path))
         .map(|file| file.module_path.join("::"))
         .chain(
             map.symbols
                 .iter()
-                .filter(|symbol| symbol.kind == repo_semantic::SemanticSymbolKind::Module)
+                .filter(|symbol| {
+                    allowed_files.contains(&symbol.file)
+                        && symbol.kind == repo_semantic::SemanticSymbolKind::Module
+                })
                 .map(|symbol| symbol.qualified_path.join("::")),
         )
         .filter(|module| !module.is_empty())
@@ -1272,6 +1289,7 @@ fn collect_provider_semantic_inventory(repo: &Path) -> ProviderSemanticInventory
     let symbols = map
         .symbols
         .iter()
+        .filter(|symbol| allowed_files.contains(&symbol.file))
         .map(|symbol| symbol.qualified_path.join("::"))
         .filter(|symbol| !symbol.is_empty())
         .collect();
@@ -2183,8 +2201,10 @@ fn propose_rust_paths(
     match repo_semantic::scan_repository(repo) {
         Ok(map) => {
             for file in &map.files {
-                if file_set.contains(&file.path) && identifier_matches(normalized_text, &file.path)
-                {
+                if !file_set.contains(&file.path) {
+                    continue;
+                }
+                if identifier_matches(normalized_text, &file.path) {
                     proposed.insert(file.path.clone());
                 }
                 if let Some(module) = file.module_path.last() {
@@ -2195,8 +2215,9 @@ fn propose_rust_paths(
             }
 
             for symbol in &map.symbols {
-                if identifier_matches_text(normalized_text, &symbol.name)
-                    || qualified_path_matches(normalized_text, &symbol.qualified_path)
+                if file_set.contains(&symbol.file)
+                    && (identifier_matches_text(normalized_text, &symbol.name)
+                        || qualified_path_matches(normalized_text, &symbol.qualified_path))
                 {
                     proposed.insert(symbol.file.clone());
                 }
@@ -2311,46 +2332,30 @@ fn collect_planning_files(
     body: &str,
     diagnostics: &mut TaskPathProposalDiagnostics,
 ) -> Result<Vec<PathBuf>> {
-    let named_on_disk = named_paths_present_on_disk(repo, &format!("{title}\n{body}"));
-    match collect_repo_file_inventory(repo) {
-        Ok(inventory) => {
-            record_nested_repository_boundaries(
-                diagnostics,
-                &inventory.nested_repository_boundaries,
-            );
-            let mut files = inventory.files;
-            let mut file_set = files.iter().cloned().collect::<BTreeSet<_>>();
-            for path in named_on_disk {
-                if file_set.insert(path.clone()) {
-                    diagnostics.notes.push(format!(
-                        "included explicitly named path '{}' that was not in the Git-visible inventory",
-                        path.display()
-                    ));
-                    files.push(path);
-                }
-            }
-            files.sort();
-            Ok(files)
+    let RepositoryFileInventory {
+        mut files,
+        nested_repository_boundaries,
+    } = collect_repo_file_inventory(repo).context("repository inventory failed")?;
+    record_nested_repository_boundaries(diagnostics, &nested_repository_boundaries);
+
+    let mut file_set = files.iter().cloned().collect::<BTreeSet<_>>();
+    for path in named_paths_present_on_disk(repo, &format!("{title}\n{body}")) {
+        if nested_repository_boundaries
+            .iter()
+            .any(|boundary| path.starts_with(boundary))
+        {
+            continue;
         }
-        Err(error) => {
-            if let Some(path) = unresolved_explicit_named_file(repo, &format!("{title}\n{body}")) {
-                anyhow::bail!(
-                    "named repository path '{path}' is not a readable regular file in the repository"
-                );
-            }
-            if named_on_disk.is_empty() {
-                return Err(error).context(
-                    "repository inventory failed and the spec named no resolvable repository paths",
-                );
-            }
-            diagnostics.degraded = true;
+        if file_set.insert(path.clone()) {
             diagnostics.notes.push(format!(
-                "repository inventory failed ({error:#}); using {} explicitly named repository path(s)",
-                named_on_disk.len()
+                "included explicitly named path '{}' that was not in the Git-visible inventory",
+                path.display()
             ));
-            Ok(named_on_disk)
+            files.push(path);
         }
     }
+    files.sort();
+    Ok(files)
 }
 
 fn record_nested_repository_boundaries(
@@ -2360,9 +2365,9 @@ fn record_nested_repository_boundaries(
     if boundaries.is_empty() {
         return;
     }
-    diagnostics.degraded = true;
-    let total = boundaries.len();
-    let listed = boundaries
+    let sorted = boundaries.iter().collect::<BTreeSet<_>>();
+    let total = sorted.len();
+    let listed = sorted
         .iter()
         .take(REPOSITORY_INVENTORY_MAX_REPORTED_NESTED_BOUNDARIES)
         .map(|path| path.display().to_string())
@@ -2379,64 +2384,11 @@ fn record_nested_repository_boundaries(
     }
 }
 
-fn surface_inventory_diagnostics_in_assignment_tasks(
-    assignments: &mut [TaskAssignmentProposal],
-    diagnostics: &TaskPathProposalDiagnostics,
-) {
-    let notes = diagnostics
-        .notes
-        .iter()
-        .filter(|note| note.starts_with(REPOSITORY_INVENTORY_DIAGNOSTIC_PREFIX))
-        .map(|note| bounded_inventory_diagnostic(note))
-        .collect::<Vec<_>>();
-    let Some(first_assignment) = assignments.first_mut() else {
-        return;
-    };
-    if notes.is_empty() {
-        return;
-    }
-    first_assignment
-        .task
-        .push_str("\n\nPlanning inventory diagnostics:\n");
-    for note in notes {
-        first_assignment.task.push_str("- ");
-        first_assignment.task.push_str(&note);
-        first_assignment.task.push('\n');
-    }
-}
-
-fn bounded_inventory_diagnostic(note: &str) -> String {
-    if note.len() <= EMITTED_REPOSITORY_INVENTORY_DIAGNOSTIC_MAX_BYTES {
-        return note.to_string();
-    }
-    const TRUNCATED_SUFFIX: &str = " [truncated]";
-    let mut end = EMITTED_REPOSITORY_INVENTORY_DIAGNOSTIC_MAX_BYTES
-        .saturating_sub(TRUNCATED_SUFFIX.len());
-    while !note.is_char_boundary(end) {
-        end = end.saturating_sub(1);
-    }
-    format!("{}{TRUNCATED_SUFFIX}", &note[..end])
-}
-
 fn named_paths_present_on_disk(repo: &Path, text: &str) -> Vec<PathBuf> {
     extract_path_like_tokens(text)
         .into_iter()
         .filter_map(|token| resolve_named_repo_file(repo, Path::new(&token)))
         .collect()
-}
-
-fn unresolved_explicit_named_file(repo: &Path, text: &str) -> Option<String> {
-    extract_path_like_tokens(text).into_iter().find(|token| {
-        let Ok(normalized) = normalize_repo_relative_path(token) else {
-            return false;
-        };
-        normalized.components().count() > 1
-            && normalized
-                .extension()
-                .is_some_and(|extension| !extension.is_empty())
-            && !is_excluded_planning_path(&normalized)
-            && resolve_named_repo_file(repo, &normalized).is_none()
-    })
 }
 
 struct NamedPathMatch {
@@ -2446,7 +2398,7 @@ struct NamedPathMatch {
 }
 
 fn match_named_paths_in_text(
-    repo: &Path,
+    _repo: &Path,
     text: &str,
     files: &[PathBuf],
     file_set: &BTreeSet<PathBuf>,
@@ -2455,7 +2407,7 @@ fn match_named_paths_in_text(
     let mut unresolved = Vec::new();
     let mut notes = Vec::new();
     for token in extract_path_like_tokens(text) {
-        let matches = resolve_path_token(repo, &token, files, file_set, &mut notes);
+        let matches = resolve_path_token(&token, files, file_set, &mut notes);
         if matches.is_empty() {
             unresolved.push(token);
         } else {
@@ -2470,7 +2422,6 @@ fn match_named_paths_in_text(
 }
 
 fn resolve_path_token(
-    repo: &Path,
     token: &str,
     files: &[PathBuf],
     file_set: &BTreeSet<PathBuf>,
@@ -2498,11 +2449,6 @@ fn resolve_path_token(
             ));
             resolved.clear();
         }
-        if resolved.is_empty() {
-            if let Some(on_disk) = resolve_named_repo_file(repo, &normalized) {
-                resolved.insert(on_disk);
-            }
-        }
         return resolved;
     }
 
@@ -2522,11 +2468,6 @@ fn resolve_path_token(
                 resolved.len()
             ));
             resolved.clear();
-        }
-    }
-    if resolved.is_empty() {
-        if let Some(on_disk) = resolve_named_repo_file(repo, &normalized) {
-            resolved.insert(on_disk);
         }
     }
     resolved
@@ -2760,6 +2701,7 @@ struct GitInventorySnapshot {
     nested_repository_boundaries: Vec<PathBuf>,
 }
 
+#[cfg(test)]
 fn collect_repo_files(repo: &Path) -> Result<Vec<PathBuf>> {
     Ok(collect_repo_file_inventory(repo)?.files)
 }
@@ -4137,28 +4079,23 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
     }
 
     #[test]
-    fn propose_task_decomposition_uses_named_paths_when_inventory_fails() {
+    fn propose_task_decomposition_fails_closed_when_inventory_fails() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path();
         git2::Repository::init(repo).expect("init repo");
         write_file(repo, ".agents/skills/demo/SKILL.md", "# Skill\n");
         let _override = RepositoryInventoryDurationOverride::set(Duration::from_nanos(1));
 
-        let proposal =
+        let error =
             propose_task_decomposition(repo, "", "- Update `.agents/skills/demo/SKILL.md`.")
-                .expect("named path survives inventory failure");
+                .expect_err("inventory failure must not fall back to prose-named paths");
 
-        assert_eq!(proposal.assignments.len(), 1);
-        assert_eq!(
-            proposal.assignments[0].assigned_paths,
-            vec![PathBuf::from(".agents/skills/demo/SKILL.md")]
+        let message = format!("{error:#}");
+        assert!(message.contains("repository inventory failed"), "{message}");
+        assert!(
+            message.contains("repository inventory exceeded its total time limit"),
+            "{message}"
         );
-        assert!(proposal.assignments[0]
-            .task
-            .contains("Planning inventory diagnostics:"));
-        assert!(proposal.assignments[0]
-            .task
-            .contains("repository inventory failed"));
     }
 
     #[test]
@@ -4180,6 +4117,7 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
                     "pub fn nested() {}\n",
                 );
             }
+            write_file(&repo, "vendor/beta/invalid.rs", "pub fn invalid_nested(");
 
             let linked_admin = temp.path().join("linked-admin");
             git2::Repository::init(&linked_admin).expect("init linked admin repo");
@@ -4219,7 +4157,7 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
             .expect("collect planning files");
             assert!(files.contains(&PathBuf::from("README.md")));
             assert!(files.contains(&PathBuf::from("src/lib.rs")));
-            assert!(diagnostics.degraded);
+            assert!(!diagnostics.degraded);
             assert_eq!(
                 diagnostics.notes,
                 vec![
@@ -4227,6 +4165,62 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
                         .to_string()
                 ]
             );
+
+            let nested_named = propose_task_path_proposal(
+                &repo,
+                "Update nested implementation",
+                "Repair `vendor/alpha/excluded.rs` and nested().",
+            )
+            .expect("nested boundary is a successful inventory exclusion");
+            assert_eq!(nested_named.paths, vec![PathBuf::from("README.md")]);
+            assert!(!nested_named.diagnostics.degraded);
+            assert!(nested_named
+                .paths
+                .iter()
+                .all(|path| !path.starts_with("vendor/alpha")));
+
+            let decomposition =
+                propose_task_decomposition(&repo, "Update README.md", "Keep src/lib.rs working.")
+                    .expect("outer repository remains the planning source");
+            assert!(!decomposition.diagnostics.degraded);
+            assert!(decomposition
+                .diagnostics
+                .notes
+                .iter()
+                .any(|note| note.contains("showing first 3 sorted paths")));
+            assert!(decomposition
+                .diagnostics
+                .notes
+                .iter()
+                .all(|note| !note.contains("semantic scan reported")));
+            assert!(decomposition
+                .assignments
+                .iter()
+                .all(|assignment| !assignment.task.contains("Planning inventory diagnostics:")));
+            assert!(decomposition.assignments.iter().all(|assignment| {
+                assignment
+                    .assigned_paths
+                    .iter()
+                    .all(|path| !path.starts_with("vendor/beta"))
+                    && assignment
+                        .semantic_symbols
+                        .iter()
+                        .all(|symbol| !symbol.contains("invalid_nested"))
+            }));
+
+            write_file(&repo, "src/invalid.rs", "pub fn invalid_outer(");
+            let outer_error = propose_task_decomposition(
+                &repo,
+                "Repair invalid outer source",
+                "Update src/invalid.rs.",
+            )
+            .expect("outer semantic parse errors remain a degraded proposal");
+            assert!(outer_error.diagnostics.degraded);
+            assert!(outer_error
+                .diagnostics
+                .notes
+                .iter()
+                .any(|note| note.contains("semantic scan reported 1 source error")));
         });
     }
 
@@ -4303,6 +4297,45 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
                 .notes
                 .iter()
                 .any(|note| { note.contains("(total 1): vendor/sdk") }));
+            assert!(!proposal.diagnostics.degraded);
+
+            let config = ProviderPlanningConfig::new("nested-provider", "planner-model");
+            let provider_plan = ProviderTaskPlan {
+                assignments: vec![provider_assignment(
+                    "outer-readme",
+                    "Update outer README",
+                    "fragment-001",
+                    "README.md",
+                )],
+            };
+            let mut provider = FakeProvider::new("fake-planner", "planner-model");
+            provider
+                .push_json_response("nested-provider-proposal", &provider_plan)
+                .expect("script nested-aware provider plan");
+            let session = propose_task_decomposition_with_provider(
+                &repo,
+                "Update README.md",
+                "",
+                &mut provider,
+                &config,
+            )
+            .expect("provider plan excludes gitlink contents without an opt-in flag");
+            let prompt = provider.calls()[0].prompt.render();
+            assert!(prompt.contains(".gitmodules"));
+            assert!(!prompt.contains("vendor/sdk"));
+            assert!(!prompt.contains("excluded.rs"));
+            assert!(!session.proposal().diagnostics.degraded);
+            assert!(session
+                .proposal()
+                .diagnostics
+                .notes
+                .iter()
+                .any(|note| note.contains("(total 1): vendor/sdk")));
+            assert!(session
+                .proposal()
+                .assignments
+                .iter()
+                .all(|assignment| !assignment.task.contains("Planning inventory diagnostics:")));
         });
     }
 

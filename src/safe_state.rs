@@ -1354,6 +1354,19 @@ where
     } else {
         root_binding.path.join(relative_directory)
     };
+    if nested_repository_boundary_enabled(depth, options)
+        && windows_nested_repository_marker_exists(&current_path, budget)?
+    {
+        nested_repository_boundaries.push(relative_directory.to_path_buf());
+        return Ok(());
+    }
+    if depth >= limits.max_depth {
+        bail!(
+            "repository inventory refused to descend beyond depth {} at {}",
+            limits.max_depth,
+            relative_directory.display()
+        );
+    }
     let mut names = Vec::new();
     for entry in fs::read_dir(&current_path).with_context(|| {
         format!(
@@ -1366,10 +1379,6 @@ where
         names.push(entry?.file_name());
     }
     names.sort();
-    if is_nested_repository_boundary(&names, depth, options) {
-        nested_repository_boundaries.push(relative_directory.to_path_buf());
-        return Ok(());
-    }
     for name in names {
         budget.ensure_before_deadline("during entry inspection")?;
         let relative = relative_directory.join(&name);
@@ -1443,13 +1452,6 @@ where
                     relative.display()
                 );
             }
-            if entry_depth >= limits.max_depth {
-                bail!(
-                    "repository inventory refused to descend beyond depth {} at {}",
-                    limits.max_depth,
-                    relative.display()
-                );
-            }
             walk_bound_windows_dir(
                 root_binding,
                 &relative,
@@ -1484,16 +1486,28 @@ where
     Ok(())
 }
 
-fn is_nested_repository_boundary(
-    names: &[OsString],
-    depth: usize,
-    options: BoundedTreeWalkOptions,
-) -> bool {
-    options.stop_at_nested_repositories
-        && depth > 0
-        && names
-            .iter()
-            .any(|name| name.as_os_str() == OsStr::new(".git"))
+fn nested_repository_boundary_enabled(depth: usize, options: BoundedTreeWalkOptions) -> bool {
+    options.stop_at_nested_repositories && depth > 0
+}
+
+#[cfg(windows)]
+fn windows_nested_repository_marker_exists(
+    directory: &Path,
+    budget: &InventoryBudget,
+) -> Result<bool> {
+    for entry in fs::read_dir(directory).with_context(|| {
+        format!(
+            "failed to probe nested repository directory {}",
+            directory.display()
+        )
+    })? {
+        budget.ensure_before_deadline("during nested repository marker probe")?;
+        if entry?.file_name().as_os_str() == OsStr::new(".git") {
+            return Ok(true);
+        }
+    }
+    budget.ensure_before_deadline("after nested repository marker probe")?;
+    Ok(false)
 }
 
 #[cfg(windows)]

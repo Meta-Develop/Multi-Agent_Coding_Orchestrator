@@ -718,9 +718,6 @@ fn validate_bounded_git_index_records(bytes: &[u8], max_entries: usize) -> Resul
             bail!("bounded-status index validation returned a malformed header");
         }
         let tag = header[0];
-        if tag == b'S' || tag.is_ascii_lowercase() {
-            bail!("bounded-status rejects hidden index-entry state");
-        }
         let header = std::str::from_utf8(&header[2..])
             .context("bounded-status index validation header is not ASCII")?;
         let mode = header
@@ -729,6 +726,9 @@ fn validate_bounded_git_index_records(bytes: &[u8], max_entries: usize) -> Resul
             .context("bounded-status index validation omitted an entry mode")?;
         if mode == "040000" {
             bail!("bounded-status rejects sparse-directory index entries");
+        }
+        if tag == b'S' || tag.is_ascii_lowercase() {
+            bail!("bounded-status rejects hidden index-entry state");
         }
     }
     Ok(())

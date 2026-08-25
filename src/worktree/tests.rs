@@ -345,19 +345,31 @@ fn bounded_index_accepts_only_plain_entries_and_safe_optional_caches() {
 }
 
 #[test]
-fn bounded_git_index_records_accept_gitlinks_but_reject_sparse_directories() {
+fn bounded_git_index_records_accept_gitlinks_but_reject_sparse_directories_and_hidden_state() {
     let oid = "0000000000000000000000000000000000000000";
     let gitlink = format!("H 160000 {oid} 0\tvendor/sdk\0");
     validate_bounded_git_index_records(gitlink.as_bytes(), 1)
         .expect("gitlink record is an opaque index path");
 
-    let sparse_directory = format!("H 040000 {oid} 0\tsparse-directory\0");
+    let sparse_directory = format!("S 040000 {oid} 0\tsparse-directory\0");
     let error = validate_bounded_git_index_records(sparse_directory.as_bytes(), 1)
         .expect_err("sparse-directory record must fail closed");
     assert_eq!(
         error.to_string(),
         "bounded-status rejects sparse-directory index entries"
     );
+
+    for hidden in [
+        format!("S 100644 {oid} 0\tskip-worktree\0"),
+        format!("h 100644 {oid} 0\tassume-unchanged\0"),
+    ] {
+        let error = validate_bounded_git_index_records(hidden.as_bytes(), 1)
+            .expect_err("hidden index state must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "bounded-status rejects hidden index-entry state"
+        );
+    }
 }
 
 #[test]
@@ -368,6 +380,18 @@ fn internal_sha1_matches_nist_abc_vector() {
             0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78, 0x50,
             0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d,
         ]
+    );
+}
+
+#[test]
+fn bounded_head_rejects_sha256_shaped_direct_object_ids() {
+    let sha256_head = format!("{}\n", "a".repeat(64));
+    let error = validate_bounded_head(sha256_head.as_bytes())
+        .expect_err("SHA-256-shaped direct HEAD must fail closed");
+
+    assert_eq!(
+        error.to_string(),
+        "bounded-status supports only SHA-1 repositories"
     );
 }
 
@@ -1071,7 +1095,7 @@ fn linked_worktree_rejects_shadow_branch_and_exclude_authority() {
 
 #[cfg(unix)]
 #[test]
-fn bounded_git_input_preflight_rejects_oversized_and_linked_ignore_files() {
+fn bounded_git_input_preflight_rejects_unsafe_ignore_and_gitmodules_files() {
     use std::os::unix::fs::symlink;
 
     let temp = TempDir::new().expect("tempdir");
@@ -1094,12 +1118,8 @@ fn bounded_git_input_preflight_rejects_oversized_and_linked_ignore_files() {
     fs::write(&outside, "target/\n").expect("write outside ignore");
     symlink(&outside, &ignore).expect("link ignore");
     let deadline = Instant::now() + Duration::from_secs(2);
-    let linked_ignore_error = validate_bounded_git_text_inputs(
-        &repo_path,
-        repo.path(),
-        repo.commondir(),
-        deadline,
-    );
+    let linked_ignore_error =
+        validate_bounded_git_text_inputs(&repo_path, repo.path(), repo.commondir(), deadline);
     assert_eq!(
         linked_ignore_error
             .err()
@@ -1135,8 +1155,49 @@ fn bounded_git_input_preflight_rejects_oversized_and_linked_ignore_files() {
     )
     .err()
     .expect("oversized gitmodules must retain the bounded text-input cap");
-    fs::write(&gitmodules, b"[submodule \"vendor/sdk\"]\n")
-        .expect("restore bounded gitmodules");
+
+    fs::remove_file(&gitmodules).expect("remove oversized gitmodules");
+    let outside_gitmodules = temp.path().join("outside-gitmodules");
+    fs::write(&outside_gitmodules, b"[submodule \"vendor/sdk\"]\n")
+        .expect("write outside gitmodules");
+    symlink(&outside_gitmodules, &gitmodules).expect("link gitmodules");
+    let linked_gitmodules_error = validate_bounded_git_text_inputs(
+        &repo_path,
+        repo.path(),
+        repo.commondir(),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .err()
+    .expect("symlinked gitmodules must fail closed");
+    assert_eq!(
+        linked_gitmodules_error.to_string(),
+        "Git submodule metadata is not a safe single-link regular file"
+    );
+
+    fs::remove_file(&gitmodules).expect("remove linked gitmodules");
+    fs::hard_link(&outside_gitmodules, &gitmodules).expect("hard-link gitmodules");
+    let hard_linked_gitmodules_error = validate_bounded_git_text_inputs(
+        &repo_path,
+        repo.path(),
+        repo.commondir(),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .err()
+    .expect("multi-link gitmodules must fail closed");
+    assert_eq!(
+        hard_linked_gitmodules_error.to_string(),
+        "Git submodule metadata is not a safe single-link regular file"
+    );
+
+    fs::remove_file(&gitmodules).expect("remove hard-linked gitmodules");
+    fs::write(&gitmodules, b"[submodule \"vendor/sdk\"]\n").expect("restore safe gitmodules");
+    validate_bounded_git_text_inputs(
+        &repo_path,
+        repo.path(),
+        repo.commondir(),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .expect("restored safe root gitmodules must pass prevalidation");
 
     let alternates = repo.commondir().join("objects/info/alternates");
     fs::create_dir_all(alternates.parent().expect("alternates parent"))
@@ -1256,16 +1317,13 @@ fn bounded_status_tolerates_nested_repository_gitfiles() {
     WorktreeManager::init_repository(&nested_source, "main").expect("init nested source");
     let nested = crate::git_repository::open(&nested_source).expect("open nested source");
     let nested_head = commit_readme(&nested).expect("commit nested README");
-    let nested_commit = nested
-        .find_commit(nested_head)
-        .expect("find nested commit");
+    let nested_commit = nested.find_commit(nested_head).expect("find nested commit");
     let nested_branch = nested
         .branch("linked", &nested_commit, false)
         .expect("create nested linked branch")
         .into_reference();
     let linked_path = repo_path.join("vendor/linked-sdk");
-    fs::create_dir_all(linked_path.parent().expect("linked parent"))
-        .expect("create linked parent");
+    fs::create_dir_all(linked_path.parent().expect("linked parent")).expect("create linked parent");
     let mut options = WorktreeAddOptions::new();
     options.reference(Some(&nested_branch));
     nested
@@ -1299,8 +1357,7 @@ fn bounded_status_accepts_real_gitlink_and_root_gitmodules_as_opaque_paths() {
     commit_readme(&outer).expect("commit outer README");
 
     let nested_path = repo_path.join("vendor/sdk");
-    fs::create_dir_all(nested_path.parent().expect("nested parent"))
-        .expect("create nested parent");
+    fs::create_dir_all(nested_path.parent().expect("nested parent")).expect("create nested parent");
     let nested = Repository::init(&nested_path).expect("init nested repository");
     let nested_oid = commit_readme(&nested).expect("commit nested README");
     fs::write(
