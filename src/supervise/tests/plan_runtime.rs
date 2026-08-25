@@ -534,6 +534,11 @@ fn fake_runtime_refuses_operator_quota_before_dispatch_and_no_config_stays_legac
 }
 
 #[test]
+fn default_child_timeout_covers_nested_worker_and_auditor_turns() {
+    assert_eq!(default_child_timeout_seconds(), 1_200);
+}
+
+#[test]
 fn objective_profile_request_round_trips_outside_the_public_plan_struct() {
     let default_document = serde_json::from_slice::<Value>(&bounded_loader_plan_json())
         .expect("parse default plan fixture");
@@ -2192,7 +2197,17 @@ fn admitted_nested_assignment_retains_ordinary_pipeline_and_acceptance_evidence(
     assert!(prompt.contains("Path claim token: 41"));
     assert!(prompt.contains("Semantic intent token: 43"));
     assert!(prompt.contains("/tmp/maco-run/incoming/worker-journals/execution-child-worker.jsonl"));
-    assert!(prompt.contains("Return your OrchestratorReviewReport JSON"));
+    let exact_report_contract = concat!(
+        "Collection:\n",
+        "- Artifact-only incoming root: /tmp/maco-run/incoming\n",
+        "- Exact report path for Codex CLI --output-last-message only (never tools): /tmp/maco-run/incoming/execution-child.json\n",
+        "- Source writes only in assigned worktree paths; each worker journal is a separate exact precreated append-only file and the sole non-source write under a nonwritable parent (never create, replace, rename, link, or swap).\n",
+        "- Schemas: OrchestratorReviewReport=/tmp/maco-run/schemas/orchestrator-review-report.schema.json; WorkerReport=/tmp/maco-run/schemas/worker-report.schema.json; AuditorReport=/tmp/maco-run/schemas/auditor-report.schema.json\n",
+    );
+    assert!(
+        prompt.contains(exact_report_contract),
+        "nested assignment must retain the exact report-root, output, schema, worker, auditor, and journal capability contract"
+    );
     assert!(prompt.contains("Review auditor prompt template:"));
 
     let mut accepted_report = injected_child_report(&execution);

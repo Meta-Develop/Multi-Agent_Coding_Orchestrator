@@ -815,8 +815,103 @@ fn injected_target_attempted(run: ExternalAgentRun) -> ExternalAgentRun {
 }
 
 pub(crate) fn injected_verified_run(command: &ExternalAgentCommand) -> ExternalAgentRun {
+    commit_injected_managed_child_result(command);
     write_injected_worker_journals_from_report(command);
-    injected_verified_run_without_journals(command)
+    let mut run = injected_verified_run_without_journals(command);
+    let captures = command
+        .worker_journal_artifacts
+        .iter()
+        .map(|artifact| WorkerJournalArtifactCapture {
+            worker_id: artifact.worker_id.clone(),
+            path: artifact.path.clone(),
+            status: match fs::read(&artifact.path) {
+                Ok(bytes) => WorkerJournalArtifactCaptureStatus::Loaded(bytes),
+                Err(error) => WorkerJournalArtifactCaptureStatus::Invalid(format!(
+                    "injected trusted journal capture failed: {error}"
+                )),
+            },
+        })
+        .collect();
+    run.replace_worker_journal_artifacts(captures);
+    run
+}
+
+fn commit_injected_managed_child_result(command: &ExternalAgentCommand) {
+    if command.workspace_access != WorkspaceAccess::ReadWrite
+        || command.writable_launch_target
+            != crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree
+    {
+        return;
+    }
+    if !command.cwd.join(".git").is_file() {
+        // Fixtures without a linked-worktree gitdir pointer (no .git, or a
+        // plain repository .git directory) exercise paths before or beside
+        // the child Git boundary; there is nothing to commit on their behalf.
+        return;
+    }
+
+    crate::external_agent::prepare_managed_child_git_boundary_for_test(&command.cwd)
+        .expect("prepare injected managed-child private Git boundary");
+    let boundary = crate::external_agent::bind_existing_managed_child_git_boundary(&command.cwd)
+        .expect("bind injected managed-child private Git boundary");
+    let git = || {
+        let mut process = std::process::Command::new("git");
+        process
+            .current_dir(&command.cwd)
+            .env("GIT_DIR", boundary.private_git_dir())
+            .env("GIT_WORK_TREE", &command.cwd)
+            .env("GIT_OBJECT_DIRECTORY", boundary.private_object_dir())
+            .env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                boundary.shared_object_dir(),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "maco test")
+            .env("GIT_AUTHOR_EMAIL", "maco-test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "maco test")
+            .env("GIT_COMMITTER_EMAIL", "maco-test@example.invalid");
+        process
+    };
+
+    let add = git()
+        .args(["add", "--all", "--", "."])
+        .output()
+        .expect("stage injected managed-child result");
+    assert!(
+        add.status.success(),
+        "staging injected managed-child result failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let diff = git()
+        .args(["diff", "--cached", "--quiet", "--exit-code"])
+        .output()
+        .expect("inspect injected managed-child result");
+    if diff.status.success() {
+        return;
+    }
+    assert_eq!(
+        diff.status.code(),
+        Some(1),
+        "inspecting injected managed-child result failed: {}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
+
+    let commit = git()
+        .args([
+            "commit",
+            "--no-gpg-sign",
+            "-m",
+            "injected managed child result",
+        ])
+        .output()
+        .expect("commit injected managed-child result");
+    assert!(
+        commit.status.success(),
+        "committing injected managed-child result failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
 }
 
 fn injected_verified_nonzero_run(

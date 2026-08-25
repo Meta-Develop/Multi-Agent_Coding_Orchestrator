@@ -19,6 +19,7 @@ Tool-call batching:
 - Batch independent, side-effect-free inspections in one tool call when the runtime supports it.
 - Keep dependent steps, approval-sensitive actions, and mutations ordered. Batching never relaxes ownership, journaling, validation, or audit requirements.";
 
+#[cfg(test)]
 fn enforce_rendered_prompt_ceiling(role: &str, rendered: &str, ceiling: usize) -> Result<()> {
     if rendered.len() > ceiling {
         bail!(
@@ -210,14 +211,14 @@ Required behavior:
 - Workers must return WorkerReport JSON matching the worker report contract and include "no_further_delegation": true.
 - WorkerReport, AuditorReport, and OrchestratorReviewReport must include environment_failures. Use [] when no typed failure occurred. A nonempty environment_failures list requires accepted=false, rejected=true, and status=failed; never include credential or secret values.
 - Workers may propose bounded field_guide_entries containing finding and context only. They must never add date, source_run, or other provenance; the trusted parent stamps provenance only after acceptance and audit.
-- Each worker must also write its structured execution journal to the exact path in its worker prompt; that path is the only allowed non-source artifact write for a terminal worker. The journal is JSONL with one object per command containing command, cwd, start_timestamp, end_timestamp, and changed_paths. The parent acceptance gate imports these journals from incoming/worker-journals/ and rejects worker evidence that the journal or Git diff does not support.
+- Each worker must append JSONL directly to its exact precreated journal path. That file is its only non-source write capability; its parent directory is nonwritable. Never create, replace, rename, link, or swap it. Each command record contains command, cwd, start_timestamp, end_timestamp, and changed_paths. The parent imports incoming/worker-journals/ and rejects missing, aliased, replaced, invalid, or unsupported evidence.
 - Review auditors must return AuditorReport JSON matching the auditor report contract and include "no_further_delegation": true.
 - Review auditors must include "read_only": true in AuditorReport JSON to attest they did not mutate files or repository state.
 - Acceptance-gate review auditors are parent-launched MACO/Codex CLI subprocess roles; a child-launched review auditor is advisory child-side evidence unless MACO/O2 collects it through the parent-enforced acceptance gate.
-- Review every WorkerReport before writing your own OrchestratorReviewReport.
+- Embed each accepted terminal WorkerReport in OrchestratorReviewReport.worker_reports without losing or changing any reported evidence, using [] for genuinely empty arrays; represent absent optional evidence as null. Reject the child report if worker evidence is missing or rejected.
 - OrchestratorReviewReport may also propose bounded field_guide_entries containing finding and context only. Do not copy unreviewed or rejected worker suggestions into this field.
 - Preserve each worker assignment_kind and target_path in WorkerReport. A successful megafile_decomposition worker must report the exact canonical target_path in files_changed and include decomposition_completion with that target plus at least one concrete canonical replacement_path also present in files_changed. OrchestratorReviewReport must aggregate the exact accepted worker evidence in decomposition_completions; this evidence does not bypass claims, journals, validation, audit, or later merge gates.
-- Include at least one accepted review-auditor report in audit_reports that covers all assigned worker ids; MACO rejects child reports with worker assignments that omit terminal audit evidence.
+- Include at least one accepted read-only AuditorReport in audit_reports whose reviewed_worker_ids covers every embedded worker id; MACO rejects child reports with worker assignments that omit terminal audit evidence.
 - A licensed_breakage declaration in the assignment is immutable plan authority, not permission you may create or widen. For each dependent validation failure, use the exact declared dependent_id as ValidationResult.name, preserve the exact bounded compiler/build signature in message (including the declared interface name), and add an Error finding with the identical message and exact affected dependent paths. Unmatched failures remain ordinary assignment failures.
 - Never emit licensed_breakage_review or generated_follow_up_tasks. They are supervisor-owned gate and journal records; attempting to self-assert them fails the assignment.
 
@@ -225,14 +226,15 @@ Safety requirements:
 - Do not edit outside the assigned paths, symbols, or modules.
 - Do not mutate the primary worktree.
 - Run validation commands when feasible. If validation cannot run, explain why in validation_results and remaining_risk.
-- Return your OrchestratorReviewReport JSON as your final response.
+- Return exactly one OrchestratorReviewReport JSON object with all accepted WorkerReports and required read-only AuditorReport coverage; use no prose wrapper or Markdown fence.
 "#,
         tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE
     )
 }
 
-pub(super) fn worker_cacheable_prefix() -> String {
-    format!(
+pub(super) fn worker_cacheable_prefix() -> Result<String> {
+    let apply_patch_journal_example = worker_execution_journal_apply_patch_example()?;
+    Ok(format!(
         r#"You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
 Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
 You are not the supervisor. Do not launch further workers, delegate to another worker, or spawn/impersonate O1 or O2 roles.
@@ -246,12 +248,16 @@ Rules:
 - Do not broaden the assignment, add claimed paths, or change files outside the assigned path set.
 - Do not request, access, read, write, disclose, or transmit credentials, secrets, tokens, or keys.
 - Do not stage, commit, push, merge, or otherwise publish changes.
-- Before returning your WorkerReport, write a structured execution journal to the exact execution journal path in the assignment-specific context below; this is the only allowed non-source artifact write for this worker. Create its parent directory if needed. Use JSONL: one JSON object per command, with fields "command" (array of strings), "cwd" (string), "start_timestamp" (string), "end_timestamp" (string), and "changed_paths" (array of repo-relative paths changed by that command, or [] when none). Do not write prose or Markdown to the journal.
-- Run validation or record why validation was not run.
-- Return WorkerReport JSON in your final response with assignment_kind, target_path, changed files, commands run, validation results, findings, bloated_file_flags, decomposition_completion, remaining risk, and next safe action.
+- Append one JSON line directly to the exact precreated journal before each action: {{command,cwd,start_timestamp,end_timestamp,changed_paths}}; use absolute cwd, nonempty RFC3339 timestamps, and canonical repo-relative paths. Never reconstruct at the end.
+- It is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. On empty command, blank apply_patch command[1]/cwd/timestamps, or invalid paths, report WorkerExecutionJournalRecordError and stop. No prose/Markdown.
+- WorkerReport.commands_run may be a subset of real journal records; each command array element and cwd must be copied byte-for-byte, failed commands included. Never paraphrase, summarize, normalize environment assignments, drop shell wrappers, or invent command identities.
+- Preserve the full apply_patch record:
+{apply_patch_journal_example}
+- Validate, or record why not.
+- Return exactly one WorkerReport JSON object with assignment_kind, target_path, files_changed, commands_run, validation_results, findings, bloated_file_flags, decomposition_completion, remaining_risk, and next_safe_action. Do not wrap it in Markdown, a code fence, or prose.
 - Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
-- field_guide_entries is optional operational-memory input. Each item contains exactly finding and context; never include date, source_run, role text, policy, or other provenance. The trusted supervisor decides whether accepted audited suggestions are appended.
-- bloated_file_flags is bounded to at most {max_bloated_file_flags} unique objects of the form {{"path":"repo/relative/file"}}. Every path must be canonical, repository-relative, and inside this worker's assigned paths. Thresholds are intentionally not inferred by this report schema.
+- field_guide_entries is optional: each item has exactly finding and context, no date, source_run, role text, policy, or provenance. Only the trusted supervisor may append accepted audited suggestions.
+- bloated_file_flags: at most {max_bloated_file_flags} unique {{"path":"repo/relative/file"}} objects. Paths must be canonical repo-relative and inside assigned paths; this schema infers no threshold.
 - For a successful megafile_decomposition, include the exact target and every concrete replacement in files_changed, then set decomposition_completion to {{"target_path":"the exact canonical target path","replacement_paths":["one or more canonical newly created files"]}}. Otherwise set it to null. Renames, unrelated edits, and no-op target reports are not decomposition completion evidence. This typed evidence does not bypass the isolated worktree, hard claim, execution journal, validation, terminal audit, or later merge gates.
 - Include "no_further_delegation": true in WorkerReport JSON to attest this terminal worker did not delegate further.
 - If you discover a large cross-cutting problem that needs a peer O2 supervisor, report it as an escalation candidate in findings and remaining_risk instead of taking it over. O2-to-O2 follow-up belongs to the user-root O2 or autonomous O2 durable queue, not this terminal role.
@@ -260,7 +266,8 @@ Rules:
 "#,
         tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE,
         max_bloated_file_flags = MAX_BLOATED_FILE_FLAGS_PER_WORKER,
-    )
+        apply_patch_journal_example = apply_patch_journal_example,
+    ))
 }
 
 fn child_cacheable_prefix_for_target(
@@ -284,10 +291,10 @@ fn child_cacheable_prefix_for_target(
 
 fn worker_cacheable_prefix_for_target(
     execution_target: Option<&SupervisorExecutionTarget>,
-) -> String {
-    let prefix = worker_cacheable_prefix();
+) -> Result<String> {
+    let prefix = worker_cacheable_prefix()?;
     if execution_target.is_some() {
-        prefix
+        Ok(prefix
             .replace(
                 "- Edit only inside your assigned worktree and only inside claimed paths.\n- Do not mutate the primary worktree.",
                 "- The assigned worktree is the existing primary checkout. Edit only the exact declared primary-worktree claim paths; do not stage, commit, or change Git metadata.",
@@ -295,9 +302,9 @@ fn worker_cacheable_prefix_for_target(
             .replace(
                 "This typed evidence does not bypass the isolated worktree, hard claim, execution journal, validation, terminal audit, or later merge gates.",
                 "This typed evidence does not bypass the hard claim, exact primary-worktree scope, execution journal, validation, or terminal audit gates.",
-            )
+            ))
     } else {
-        prefix
+        Ok(prefix)
     }
 }
 
@@ -314,7 +321,7 @@ Rules:
 - Stay read-only. Inspect worker reports, child diffs, validation evidence, findings, remaining risk, and claimed path boundaries.
 - For megafile_decomposition, verify the worker and child completion evidence names the exact target_path and is supported by the normal claim, journal, validation, and diff evidence.
 - Do not edit files, create durable artifacts, apply patches, claim paths, or change Git state.
-- Produce structured AuditorReport JSON in your final response with reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining risk, and next safe action.
+- Produce exactly one AuditorReport JSON object in your final response with reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining risk, and next safe action. Do not wrap it in Markdown, a code fence, or prose.
 - Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
 - reviewed_paths coverage is computed over repository-relative entries only. Absolute out-of-repo evidence paths are allowed and retained verbatim as evidence, but excluded from coverage computation.
 - Include "no_further_delegation": true in AuditorReport JSON to attest this terminal auditor did not delegate further.
@@ -339,7 +346,7 @@ Runtime boundary:
 - MACO launched this Codex CLI with the read-only maco_external_codex permission profile, model-generated network disabled, and strict/ephemeral configuration.
 - An outer MACO systemd boundary independently verifies the exact read-only workspace mount, writable report/log destinations, blocked host IPC sockets, resource limits, and empty owned cgroup.
 - Never request danger-full-access or launch a raw nested Codex subprocess. Stay read-only and fail closed if either verified boundary is unavailable.
-- Return AuditorReport JSON as your final response. Codex CLI --output-last-message records that final response at the auditor report path.
+- Return exactly one AuditorReport JSON object as your final response. Do not wrap it in Markdown, a code fence, or prose. Codex CLI --output-last-message records that final response at the auditor report path.
 
 Review requirements:
 - Review the child report, worker_reports, child worktree diff/changed paths, validation_results, findings, remaining_risk, assigned worker IDs, and assigned paths.
@@ -507,7 +514,7 @@ Evidence-only operation:
 - Required candidate binding: {binding}
 
 Report contract:
-- Preserve assigned_paths, semantic_symbols, semantic_modules, files_changed, field_guide_entries, worker_reports, and decomposition_completions exactly from the authenticated source report. The immutable assignment JSON still carries any licensed_breakage declaration into this re-audit.
+- Preserve every reported value and all evidence in assigned_paths, semantic_symbols, semantic_modules, files_changed, field_guide_entries, worker_reports, and decomposition_completions from the authenticated source report. When the response schema requires a property absent from the authenticated report, represent optional evidence as null and genuinely empty evidence arrays as []; do not invent or discard evidence. The immutable assignment JSON still carries any licensed_breakage declaration into this re-audit.
 - Set audit_reports=[], review_lens_aggregate=null, gate_denials=[], and gate_correction_outcomes=[]; these are supervisor-owned.
 - Do not emit licensed_breakage_review or generated_follow_up_tasks; the supervisor reconstructs those fields from the immutable declaration and current evidence.
 - Update only commands_run, validation_results, findings, environment_failures, accepted/rejected/status, remaining_risk, next_safe_action, and current claim/semantic tokens as supported by evidence you actually observe.
@@ -590,7 +597,7 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
                 },
                 field_guide,
             )?;
-            let invariant_prefix = worker_cacheable_prefix_for_target(execution_target);
+            let invariant_prefix = worker_cacheable_prefix_for_target(execution_target)?;
             let measurement = PromptByteMeasurement::new(
                 PromptMeasurementRole::TerminalWorker,
                 &worker.id,
@@ -669,15 +676,11 @@ Declared role selections:
 - Launch each supplied terminal worker prompt through runtime-native SubAgent/delegated-worker support and preserve its declared role selection. MACO's parent scheduler does not launch those terminal sessions for you; runtime-side role-tagged usage reporting is required before worker usage or cost can be reported.
 {consultation_section}
 
-Collection targets:
-- Do not write the orchestrator report file yourself with tools; Codex CLI --output-last-message records your final response at this MACO collection target:
-{report_path}
-- The orchestrator review report schema path is:
-{schema_path}
-- Worker reports must use this schema path:
-{worker_schema_path}
-- Review auditor reports must use this schema path:
-{auditor_schema_path}
+Collection:
+- Artifact-only incoming root: {incoming_root}
+- Exact report path for Codex CLI --output-last-message only (never tools): {report_path}
+- Source writes only in assigned worktree paths; each worker journal is a separate exact precreated append-only file and the sole non-source write under a nonwritable parent (never create, replace, rename, link, or swap).
+- Schemas: OrchestratorReviewReport={schema_path}; WorkerReport={worker_schema_path}; AuditorReport={auditor_schema_path}
 
 Supervisor task:
 {task}
@@ -698,6 +701,7 @@ Review auditor prompt template:
         worktree_path = worktree.path.display(),
         child_id = assignment.id,
         execution_target_context = execution_target_context,
+        incoming_root = incoming_root.display(),
         decomposition_targets = display_decomposition_targets(assignment, assignment_metadata),
         assigned_paths = display_paths(&assignment.assigned_paths),
         semantic_symbols = assignment.semantic_symbols.join(", "),
@@ -864,7 +868,7 @@ Supervisor task:
 Worker assignment JSON:
 {worker_json}
 "#,
-        cacheable_prefix = worker_cacheable_prefix_for_target(execution_target),
+        cacheable_prefix = worker_cacheable_prefix_for_target(execution_target)?,
         role_prefix = role_prefix,
         field_guide_section = field_guide.section,
         instruction_profile_section = instruction_profile_section,
@@ -1149,11 +1153,12 @@ REVIEW_LENS_REQUEST_JSON:
         model = lens.backend.model(),
         reasoning_effort = reasoning_effort,
     );
-    enforce_rendered_prompt_ceiling(
-        "parent acceptance auditor review lens",
-        &prompt,
-        PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES,
-    )?;
+    if prompt.len() > MAX_SUPERVISOR_PROMPT_BYTES {
+        bail!(
+            "review lens prompt exceeds its {} byte launch limit",
+            MAX_SUPERVISOR_PROMPT_BYTES
+        );
+    }
     let measurement = PromptByteMeasurement::new(
         PromptMeasurementRole::ParentAcceptanceAuditor,
         auditor_id,
@@ -1400,12 +1405,12 @@ mod regression_tests {
     }
 
     #[test]
-    fn terminal_worker_prefix_preserves_execution_only_authority() {
-        let prefix = worker_cacheable_prefix();
+    fn terminal_worker_prefix_preserves_execution_only_authority() -> Result<()> {
+        let prefix = worker_cacheable_prefix()?;
         let primary_target = SupervisorExecutionTarget::PrimaryWorktree {
             claim_paths: vec![PathBuf::from("local/deploy.txt")],
         };
-        let primary_prefix = worker_cacheable_prefix_for_target(Some(&primary_target));
+        let primary_prefix = worker_cacheable_prefix_for_target(Some(&primary_target))?;
 
         assert!(prefix.contains(
             "Do not plan, make judgments, review, act as an acceptance gate, merge, or publish"
@@ -1422,6 +1427,7 @@ mod regression_tests {
         ));
         assert!(primary_prefix.contains("The assigned worktree is the existing primary checkout"));
         assert!(!primary_prefix.contains("Do not mutate the primary worktree."));
+        Ok(())
     }
 
     fn fixed_prompt_fixture_with_ids(
@@ -1733,7 +1739,8 @@ mod regression_tests {
         )
         .expect("render low-tier worker prompt");
 
-        assert!(rendered.starts_with(&worker_cacheable_prefix()));
+        assert!(rendered
+            .starts_with(&worker_cacheable_prefix().expect("render worker cacheable prefix")));
         assert!(rendered.contains("INSTRUCTION_PROFILE: maco-weak-mechanical-lite-v1"));
         assert!(rendered.contains("Reason: low_tier_capability"));
         assert!(rendered.contains("Execute only the assigned mechanical steps"));
@@ -1747,7 +1754,10 @@ mod regression_tests {
             .find("Assignment-specific context:")
             .expect("assignment context");
         assert!(
-            profile_offset > worker_cacheable_prefix().len(),
+            profile_offset
+                > worker_cacheable_prefix()
+                    .expect("render worker cacheable prefix")
+                    .len(),
             "named profile must stay out of the cacheable prefix"
         );
         assert!(
@@ -2002,7 +2012,7 @@ mod regression_tests {
         let (worker_b, child_b, auditor_b, parent_auditor_b) =
             fixed_prompt_fixture_with_ids("child-b", "worker-b", "src/supervise/prompts-b.rs")
                 .expect("render prompt fixture b");
-        let worker_prefix = worker_cacheable_prefix();
+        let worker_prefix = worker_cacheable_prefix().expect("render worker cacheable prefix");
         let child_prefix = child_orchestrator_cacheable_prefix();
         let auditor_prefix = review_auditor_cacheable_prefix();
         let parent_auditor_prefix = parent_review_auditor_cacheable_prefix();
@@ -2296,7 +2306,7 @@ mod regression_tests {
     }
 
     #[test]
-    fn review_lens_prompt_rejects_parent_auditor_ceiling_overrun() -> Result<()> {
+    fn review_lens_prompt_accepts_bounded_full_transcript_above_fixture_ceiling() -> Result<()> {
         let assignment = OrchestratorAssignment {
             id: "child-bounded-lens".to_string(),
             phase: AssignmentPhase::Execution,
@@ -2318,18 +2328,19 @@ mod regression_tests {
                 model: "gpt-5".to_string(),
                 reasoning_effort: Some("high".to_string()),
             },
-            information_scope: ReviewInformationScope::OutputReportOnly,
+            information_scope: ReviewInformationScope::FullChildTranscript,
         };
-        let oversized_report = "x".repeat(PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES);
+        let child_transcript = "t".repeat(96 * 1024);
+        let output_report = "r".repeat(32 * 1024);
         let request = build_review_lens_request(
             &lens,
             ReviewLensRequestSources {
-                child_transcript: "",
-                diff: "",
-                output_report: &oversized_report,
+                child_transcript: &child_transcript,
+                diff: "+bounded live diff",
+                output_report: &output_report,
             },
         )?;
-        let error = match render_review_lens_auditor_prompt(
+        let rendered = render_review_lens_auditor_prompt(
             ReviewLensAuditorPromptContext {
                 assignment: &assignment,
                 lens: &lens,
@@ -2338,20 +2349,27 @@ mod regression_tests {
                 required_coverage: &ReviewCoverageRequirement::default(),
             },
             0,
-        ) {
-            Ok(_) => panic!("an oversized real lens prompt must fail before launch"),
-            Err(error) => error,
-        };
+        )?;
 
         assert!(
-            error
-                .to_string()
-                .contains("parent acceptance auditor review lens"),
-            "unexpected rejection: {error}"
+            rendered.prompt.len() > PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES,
+            "bounded live evidence should exceed only the fixed-fixture budget"
         );
-        assert!(error
-            .to_string()
-            .contains(&PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES.to_string()));
+        assert!(
+            rendered.prompt.len() <= MAX_SUPERVISOR_PROMPT_BYTES,
+            "bounded live evidence must stay within the trusted launch limit"
+        );
+        assert!(rendered.prompt.contains(&child_transcript));
+        assert!(rendered.prompt.contains(&output_report));
+        assert_eq!(rendered.measurements.prompts.len(), 1);
+        assert_eq!(
+            rendered.measurements.prompts[0].full_bytes,
+            rendered.prompt.len()
+        );
+        assert_eq!(
+            rendered.measurements.prompts[0].fixture_ceiling_bytes,
+            PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES
+        );
         Ok(())
     }
 }

@@ -896,8 +896,47 @@ struct ProtectedWorktreeControls {
     read_write_files: Vec<ProtectedWorktreeControl>,
     managed_git: Option<ManagedWorktreeGitMetadata>,
     exact_read_only_input_files: Vec<PathBuf>,
+    exact_writable_artifact_files: Vec<ExactWritableArtifactFile>,
     writable_artifact_root: Option<PathBuf>,
 }
+
+#[derive(Clone)]
+struct ExactWritableArtifactFile {
+    worker_id: String,
+    path: PathBuf,
+    #[cfg(target_os = "linux")]
+    held_file: std::sync::Arc<fs::File>,
+    #[cfg(target_os = "linux")]
+    identity: ExactWritableArtifactIdentity,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExactWritableArtifactIdentity {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    mode: u32,
+    links: u64,
+}
+
+impl std::fmt::Debug for ExactWritableArtifactFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExactWritableArtifactFile")
+            .field("worker_id", &self.worker_id)
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ExactWritableArtifactFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.worker_id == other.worker_id && self.path == other.path
+    }
+}
+
+impl Eq for ExactWritableArtifactFile {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ManagedWorktreeGitMetadata {
@@ -1626,6 +1665,8 @@ fn protected_worktree_controls(spec: &ExternalAgentCommand) -> Result<ProtectedW
         controls.managed_git = managed_worktree_git_metadata(&spec.cwd)?;
     }
     controls.exact_read_only_input_files = validate_exact_read_only_input_files(spec, &controls)?;
+    controls.exact_writable_artifact_files =
+        validate_exact_writable_artifact_files(spec, &controls)?;
     controls.writable_artifact_root = Some(validate_artifact_parent_disjoint(spec, &controls)?);
     Ok(controls)
 }
@@ -1698,6 +1739,367 @@ fn validate_exact_read_only_input_files(
         }
     }
     Ok(validated.into_iter().collect())
+}
+
+fn validate_exact_writable_artifact_files(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+) -> Result<Vec<ExactWritableArtifactFile>> {
+    // Match the process runner's fixed per-class sandbox path bound.
+    const MAX_EXACT_WRITABLE_ARTIFACT_FILES: usize = 128;
+    if spec.worker_journal_artifacts.len() > MAX_EXACT_WRITABLE_ARTIFACT_FILES {
+        bail!(
+            "exact writable artifact files exceed the fixed limit of {MAX_EXACT_WRITABLE_ARTIFACT_FILES}"
+        );
+    }
+    let workspace = fs::canonicalize(&spec.cwd)
+        .context("external-agent workspace could not be resolved")?;
+    let incoming_root = normalized_absolute_path(
+        required_parent(&spec.output_last_message)?,
+        "external-agent incoming report root",
+    )?;
+    let incoming_root = fs::canonicalize(&incoming_root)
+        .context("external-agent incoming report root could not be resolved")?;
+    let read_only_inputs = controls
+        .exact_read_only_input_files
+        .iter()
+        .collect::<BTreeSet<_>>();
+    let mut paths = BTreeSet::new();
+    let mut worker_ids = BTreeSet::new();
+    let mut validated = Vec::with_capacity(spec.worker_journal_artifacts.len());
+    for declared in &spec.worker_journal_artifacts {
+        let worker_id = normalize_agent_id(&declared.worker_id)
+            .context("worker journal artifact has an invalid worker id")?;
+        if worker_id != declared.worker_id || !worker_ids.insert(worker_id.clone()) {
+            bail!("worker journal artifact has a noncanonical or duplicate worker id");
+        }
+        let declared_root = normalized_absolute_path(
+            &declared.incoming_root,
+            "worker journal incoming root",
+        )?;
+        let declared_root = fs::canonicalize(&declared_root)
+            .context("worker journal incoming root could not be resolved")?;
+        if declared_root != incoming_root {
+            bail!("worker journal artifact is outside the configured incoming report root");
+        }
+        let expected_parent = incoming_root.join("worker-journals");
+        let expected_path = expected_parent.join(format!("{worker_id}.jsonl"));
+        let normalized = normalized_absolute_path(&declared.path, "worker journal artifact file")?;
+        if normalized != expected_path {
+            bail!(
+                "worker journal artifact must be the exact worker-journals/<worker-id>.jsonl contract path"
+            );
+        }
+        let canonical = fs::canonicalize(&normalized)
+            .context("exact writable artifact file could not be resolved")?;
+        if canonical != normalized {
+            bail!("exact writable artifact file must already be canonical");
+        }
+        if !paths.insert(canonical.clone()) {
+            bail!("exact writable artifact file is declared more than once");
+        }
+        let metadata = fs::symlink_metadata(&canonical)
+            .context("failed to inspect exact writable artifact file")?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("exact writable artifact file must be a non-symlink regular file");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            // SAFETY: `geteuid` has no preconditions and does not access Rust memory.
+            let effective_uid = unsafe { libc::geteuid() };
+            if metadata.uid() != effective_uid
+                || metadata.permissions().mode() & 0o777 != 0o600
+                || metadata.nlink() != 1
+            {
+                bail!(
+                    "exact writable artifact file must be current-user-owned, mode 0600, and single-link"
+                );
+            }
+            let parent = canonical
+                .parent()
+                .context("exact writable artifact file has no parent")?;
+            let parent_metadata = fs::symlink_metadata(parent)
+                .context("failed to inspect exact writable artifact parent")?;
+            if parent_metadata.file_type().is_symlink()
+                || !parent_metadata.is_dir()
+                || parent_metadata.uid() != effective_uid
+                || parent_metadata.permissions().mode() & 0o777 != 0o700
+            {
+                bail!(
+                    "exact writable artifact parent must be a current-user-owned non-symlink 0700 directory"
+                );
+            }
+        }
+        if canonical.starts_with(&workspace) || workspace.starts_with(&canonical) {
+            bail!("exact writable artifact file overlaps the external-agent workspace");
+        }
+        if read_only_inputs.contains(&canonical) {
+            bail!("exact writable artifact file is also declared read-only");
+        }
+        for control in controls.iter() {
+            if canonical.starts_with(&control.absolute)
+                || control.absolute.starts_with(&canonical)
+            {
+                bail!("exact writable artifact file overlaps a protected worktree control");
+            }
+        }
+        if let Some(git) = &controls.managed_git {
+            for protected in std::iter::once(&git.worktree_git_dir)
+                .chain(&git.common_read_only_roots)
+                .chain(&git.common_read_only_files)
+            {
+                if canonical.starts_with(protected) || protected.starts_with(&canonical) {
+                    bail!("exact writable artifact file overlaps managed Git metadata");
+                }
+            }
+        }
+        for hidden in &spec.hidden_roots {
+            let hidden = normalized_absolute_path(hidden, "hidden root")?;
+            if canonical.starts_with(&hidden) || hidden.starts_with(&canonical) {
+                bail!("exact writable artifact file overlaps a hidden root");
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        let (held_file, identity) = {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            let file = options
+                .open(&canonical)
+                .context("failed to hold exact writable artifact file")?;
+            let held_metadata = file.metadata()?;
+            let identity = ExactWritableArtifactIdentity {
+                device: held_metadata.dev(),
+                inode: held_metadata.ino(),
+                owner: held_metadata.uid(),
+                mode: held_metadata.mode() & 0o7777,
+                links: held_metadata.nlink(),
+            };
+            let inspected_identity = ExactWritableArtifactIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                owner: metadata.uid(),
+                mode: metadata.mode() & 0o7777,
+                links: metadata.nlink(),
+            };
+            validate_exact_writable_artifact_identity(identity)?;
+            if identity != inspected_identity {
+                bail!("exact writable artifact file identity changed during validation");
+            }
+            (std::sync::Arc::new(file), identity)
+        };
+        validated.push(ExactWritableArtifactFile {
+            worker_id,
+            path: canonical,
+            #[cfg(target_os = "linux")]
+            held_file,
+            #[cfg(target_os = "linux")]
+            identity,
+        });
+    }
+    validated.sort_by(|left, right| left.path.cmp(&right.path));
+    #[cfg(target_os = "linux")]
+    if !validated.is_empty() {
+        validate_codex_writable_artifact_carrier(&incoming_root, &validated)?;
+    }
+    Ok(validated)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_codex_writable_artifact_carrier(
+    incoming_root: &Path,
+    artifacts: &[ExactWritableArtifactFile],
+) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let carrier = incoming_root.join("worker-journals");
+    let expected_files = artifacts
+        .iter()
+        .map(|artifact| {
+            artifact
+                .path
+                .file_name()
+                .map(OsStr::to_os_string)
+                .context("exact writable artifact has no file name")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let expected_mount_targets = CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS
+        .iter()
+        .map(OsString::from)
+        .collect::<BTreeSet<_>>();
+    let mut seen_files = BTreeSet::new();
+    let mut seen_mount_targets = BTreeSet::new();
+    // SAFETY: `geteuid` has no preconditions and does not access Rust memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    for entry in fs::read_dir(&carrier)
+        .context("failed to inspect the private Codex worker-journal carrier")?
+    {
+        let entry = entry.context("failed to enumerate the private worker-journal carrier")?;
+        let name = entry.file_name();
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .context("failed to inspect a private worker-journal carrier entry")?;
+        if expected_files.contains(&name) {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("worker-journal carrier contains a non-regular journal entry");
+            }
+            seen_files.insert(name);
+            continue;
+        }
+        if expected_mount_targets.contains(&name) {
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.uid() != effective_uid
+                || metadata.permissions().mode() & 0o777 != 0o700
+            {
+                bail!(
+                    "Codex protected mount target must be a current-user-owned non-symlink 0700 directory"
+                );
+            }
+            if fs::read_dir(&path)
+                .with_context(|| {
+                    format!("failed to inspect protected mount target {}", path.display())
+                })?
+                .next()
+                .is_some()
+            {
+                bail!("Codex protected mount target must be empty before launch");
+            }
+            seen_mount_targets.insert(name);
+            continue;
+        }
+        bail!(
+            "worker-journal carrier contains an undeclared entry: {}",
+            path.display()
+        );
+    }
+    if seen_files != expected_files {
+        bail!("worker-journal carrier is missing a declared exact journal file");
+    }
+    if seen_mount_targets != expected_mount_targets {
+        bail!("worker-journal carrier is missing a required Codex protected mount target");
+    }
+    Ok(())
+}
+
+fn capture_worker_journal_artifacts(
+    controls: &ProtectedWorktreeControls,
+    process_quiescent: bool,
+) -> Vec<WorkerJournalArtifactCapture> {
+    controls
+        .exact_writable_artifact_files
+        .iter()
+        .map(|artifact| {
+            let status = if !process_quiescent {
+                WorkerJournalArtifactCaptureStatus::Invalid(
+                    "worker journal was not read because external process quiescence was not verified"
+                        .to_string(),
+                )
+            } else {
+                match capture_worker_journal_artifact(artifact) {
+                    Ok(bytes) => WorkerJournalArtifactCaptureStatus::Loaded(bytes),
+                    Err(error) => WorkerJournalArtifactCaptureStatus::Invalid(format!(
+                        "failed trusted worker journal capture after verified quiescence: {error:#}"
+                    )),
+                }
+            };
+            WorkerJournalArtifactCapture {
+                worker_id: artifact.worker_id.clone(),
+                path: artifact.path.clone(),
+                status,
+            }
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn capture_worker_journal_artifact(artifact: &ExactWritableArtifactFile) -> Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+
+    let held_before = exact_writable_artifact_identity(&artifact.held_file.metadata()?)?;
+    let path_before = exact_writable_artifact_identity(
+        &fs::symlink_metadata(&artifact.path)
+            .context("worker journal path could not be revalidated")?,
+    )?;
+    validate_exact_writable_artifact_identity(held_before)?;
+    if held_before != artifact.identity || path_before != artifact.identity {
+        bail!("worker journal path or held descriptor identity changed after launch");
+    }
+    let length = usize::try_from(artifact.held_file.metadata()?.len())
+        .context("worker journal length does not fit this platform")?;
+    if length > MAX_WORKER_JOURNAL_ARTIFACT_BYTES {
+        bail!(
+            "worker journal exceeds the bounded {} byte capture limit",
+            MAX_WORKER_JOURNAL_ARTIFACT_BYTES
+        );
+    }
+    let mut bytes = vec![0_u8; length];
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let read = artifact
+            .held_file
+            .read_at(&mut bytes[offset..], offset as u64)
+            .context("failed to read held worker journal descriptor")?;
+        if read == 0 {
+            bail!("held worker journal shrank during bounded capture");
+        }
+        offset = offset.saturating_add(read);
+    }
+    let held_after_metadata = artifact.held_file.metadata()?;
+    let held_after = exact_writable_artifact_identity(&held_after_metadata)?;
+    let path_after = exact_writable_artifact_identity(
+        &fs::symlink_metadata(&artifact.path)
+            .context("worker journal path disappeared during bounded capture")?,
+    )?;
+    if held_after != artifact.identity
+        || path_after != artifact.identity
+        || usize::try_from(held_after_metadata.len()).ok() != Some(length)
+    {
+        bail!("worker journal identity or length changed during bounded capture");
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn capture_worker_journal_artifact(_artifact: &ExactWritableArtifactFile) -> Result<Vec<u8>> {
+    bail!("trusted held worker journal capture is unavailable on this platform")
+}
+
+#[cfg(target_os = "linux")]
+fn exact_writable_artifact_identity(
+    metadata: &fs::Metadata,
+) -> Result<ExactWritableArtifactIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !metadata.is_file() {
+        bail!("worker journal artifact is not a regular file");
+    }
+    Ok(ExactWritableArtifactIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        owner: metadata.uid(),
+        mode: metadata.mode() & 0o7777,
+        links: metadata.nlink(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_exact_writable_artifact_identity(
+    identity: ExactWritableArtifactIdentity,
+) -> Result<()> {
+    // SAFETY: `geteuid` has no preconditions and does not access Rust memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    if identity.owner != effective_uid || identity.mode != 0o600 || identity.links != 1 {
+        bail!(
+            "worker journal held descriptor must remain current-user-owned, mode 0600, and single-link"
+        );
+    }
+    Ok(())
 }
 
 fn managed_worktree_git_metadata(workspace: &Path) -> Result<Option<ManagedWorktreeGitMetadata>> {
@@ -3451,6 +3853,26 @@ fn external_side_effect_profile(
             for input in &protected_controls.exact_read_only_input_files {
                 profile = profile.with_visible_read_only_file(input);
             }
+            for artifact in &protected_controls.exact_writable_artifact_files {
+                #[cfg(target_os = "linux")]
+                {
+                    profile = profile
+                        .with_visible_read_write_file_capability(
+                            &artifact.path,
+                            std::sync::Arc::clone(&artifact.held_file),
+                        )
+                        .with_context(|| {
+                            format!(
+                                "exact writable artifact capability is invalid: {}",
+                                artifact.path.display()
+                            )
+                        })?;
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    profile = profile.with_visible_read_write_file(&artifact.path);
+                }
+            }
             profile = profile.with_writable_artifact_root(artifact_root);
             for root in &spec.hidden_roots {
                 profile = profile.with_hidden_root(root);
@@ -4205,6 +4627,21 @@ fn codex_filesystem_permissions(
     for path in &controls.exact_read_only_input_files {
         if let Some(path) = path.to_str() {
             path_permissions.insert(path.to_string(), "read");
+        }
+    }
+    for artifact in &controls.exact_writable_artifact_files {
+        #[cfg(target_os = "linux")]
+        if let Some(path) = artifact.path.parent().and_then(Path::to_str) {
+            // Codex's Linux bwrap backend currently treats every direct write rule as a
+            // writable root and probes protected descendants below it. A regular-file rule
+            // therefore cannot become an executable inner capability. Use the validated private
+            // carrier directory for Codex while the independently verified outer systemd layer
+            // keeps the carrier read-only and bind-mounts only these held files read-write.
+            path_permissions.insert(path.to_string(), "write");
+        }
+        #[cfg(not(target_os = "linux"))]
+        if let Some(path) = artifact.path.to_str() {
+            path_permissions.insert(path.to_string(), "write");
         }
     }
     for control in controls

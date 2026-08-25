@@ -1289,6 +1289,36 @@ fn managed_git_command(child: &Path, incoming: &Path) -> ExternalAgentCommand {
 }
 
 #[cfg(unix)]
+fn exact_worker_journal_controls(
+    child: &Path,
+    root: &Path,
+    slot: &str,
+    worker_id: &str,
+) -> Result<(PathBuf, ProtectedWorktreeControls)> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let incoming = root.join(slot);
+    let journal_parent = incoming.join("worker-journals");
+    fs::create_dir(&incoming)?;
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+    fs::create_dir(&journal_parent)?;
+    fs::set_permissions(&journal_parent, fs::Permissions::from_mode(0o700))?;
+    #[cfg(target_os = "linux")]
+    for name in CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS {
+        let path = journal_parent.join(name);
+        fs::create_dir(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    }
+    let journal = journal_parent.join(format!("{worker_id}.jsonl"));
+    fs::write(&journal, b"trusted journal\n")?;
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o600))?;
+    let command = managed_git_command(child, &incoming)
+        .with_worker_journal_artifact(worker_id, &incoming, &journal);
+    let controls = protected_worktree_controls(&command)?;
+    Ok((journal, controls))
+}
+
+#[cfg(unix)]
 #[test]
 fn managed_linked_worktree_git_roots_are_exact_and_exclude_primary_metadata() -> Result<()> {
     let temp = tempfile::tempdir()?;
@@ -2276,6 +2306,233 @@ fn exact_read_only_inputs_reject_alias_and_writable_overlap() -> Result<()> {
         .to_string()
         .contains("overlaps writable artifact staging"));
 
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_writable_journal_uses_outer_file_and_inner_private_carrier_boundaries() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, _common, _child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    let incoming = temp.path().join("incoming");
+    let journal_parent = incoming.join("worker-journals");
+    let output_staging = temp.path().join("output-staging");
+    fs::create_dir(&incoming)?;
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+    fs::create_dir(&journal_parent)?;
+    fs::set_permissions(&journal_parent, fs::Permissions::from_mode(0o700))?;
+    #[cfg(target_os = "linux")]
+    for name in CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS {
+        let path = journal_parent.join(name);
+        fs::create_dir(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    }
+    fs::create_dir(&output_staging)?;
+    fs::set_permissions(&output_staging, fs::Permissions::from_mode(0o700))?;
+    let journal = journal_parent.join("assignment-001-worker.jsonl");
+    fs::write(&journal, [])?;
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o600))?;
+
+    let command = managed_git_command(&child, &incoming).with_worker_journal_artifact(
+        "assignment-001-worker",
+        &incoming,
+        &journal,
+    );
+    let mut controls = protected_worktree_controls(&command)?;
+    let mut target_command = command.clone();
+    target_command.output_last_message = output_staging.join("report.json");
+    controls.writable_artifact_root = Some(output_staging.clone());
+    let canonical_journal = fs::canonicalize(&journal)?;
+    assert_eq!(
+        controls
+            .exact_writable_artifact_files
+            .iter()
+            .map(|artifact| artifact.path.as_path())
+            .collect::<Vec<_>>(),
+        vec![canonical_journal.as_path()]
+    );
+    let inner_permissions = codex_filesystem_permissions(&target_command, &controls);
+    #[cfg(target_os = "linux")]
+    assert!(!inner_permissions.contains(&format!(
+        "{}=\"write\"",
+        toml_basic_string(canonical_journal.to_str().context("UTF-8 journal path")?)
+    )));
+    #[cfg(target_os = "linux")]
+    assert!(inner_permissions.contains(&format!(
+        "{}=\"write\"",
+        toml_basic_string(journal_parent.to_str().context("UTF-8 journal parent")?)
+    )));
+    #[cfg(not(target_os = "linux"))]
+    assert!(inner_permissions.contains(&format!(
+        "{}=\"write\"",
+        toml_basic_string(canonical_journal.to_str().context("UTF-8 journal path")?)
+    )));
+
+    let profile = external_side_effect_profile(
+        &target_command,
+        &child.join("fixture-codex"),
+        ExternalProgramTrust::TrustedSystemCodex,
+        &controls,
+    )?;
+    let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+        bail!("expected ExternalCodex profile");
+    };
+    assert_eq!(profile.visible_read_write_files(), &[canonical_journal]);
+    assert!(!profile.visible_read_write_roots().contains(&journal_parent));
+    assert_eq!(profile.writable_artifact_roots(), &[output_staging]);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_writable_journal_rejects_alias_symlink_and_out_of_contract_paths() -> Result<()> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, _common, _child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    let incoming = temp.path().join("incoming-alias");
+    let journal_parent = incoming.join("worker-journals");
+    fs::create_dir(&incoming)?;
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+    fs::create_dir(&journal_parent)?;
+    fs::set_permissions(&journal_parent, fs::Permissions::from_mode(0o700))?;
+    #[cfg(target_os = "linux")]
+    for name in CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS {
+        let path = journal_parent.join(name);
+        fs::create_dir(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    }
+
+    let aliased = journal_parent.join("worker-a.jsonl");
+    fs::write(&aliased, [])?;
+    fs::set_permissions(&aliased, fs::Permissions::from_mode(0o600))?;
+    fs::hard_link(&aliased, journal_parent.join("alias.jsonl"))?;
+    let alias_error = protected_worktree_controls(
+        &managed_git_command(&child, &incoming)
+            .with_worker_journal_artifact("worker-a", &incoming, &aliased),
+    )
+    .expect_err("hard-linked journal must fail closed");
+    assert!(alias_error.to_string().contains("single-link"));
+
+    let symlink_incoming = temp.path().join("incoming-symlink");
+    let symlink_parent = symlink_incoming.join("worker-journals");
+    fs::create_dir(&symlink_incoming)?;
+    fs::set_permissions(&symlink_incoming, fs::Permissions::from_mode(0o700))?;
+    fs::create_dir(&symlink_parent)?;
+    fs::set_permissions(&symlink_parent, fs::Permissions::from_mode(0o700))?;
+    #[cfg(target_os = "linux")]
+    for name in CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS {
+        let path = symlink_parent.join(name);
+        fs::create_dir(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    }
+    let target = symlink_parent.join("target.jsonl");
+    fs::write(&target, [])?;
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+    let link = symlink_parent.join("worker-b.jsonl");
+    symlink(&target, &link)?;
+    let symlink_error = protected_worktree_controls(
+        &managed_git_command(&child, &symlink_incoming).with_worker_journal_artifact(
+            "worker-b",
+            &symlink_incoming,
+            &link,
+        ),
+    )
+    .expect_err("symlinked journal must fail closed");
+    assert!(symlink_error
+        .to_string()
+        .contains("must already be canonical"));
+
+    let arbitrary = journal_parent.join("arbitrary.jsonl");
+    fs::write(&arbitrary, [])?;
+    fs::set_permissions(&arbitrary, fs::Permissions::from_mode(0o600))?;
+    let arbitrary_error = protected_worktree_controls(
+        &managed_git_command(&child, &incoming)
+            .with_worker_journal_artifact("worker-c", &incoming, &arbitrary),
+    )
+    .expect_err("journal must use the typed worker contract path");
+    assert!(arbitrary_error
+        .to_string()
+        .contains("exact worker-journals/<worker-id>.jsonl contract path"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn held_worker_journal_capture_rejects_post_launch_rebinding_links_modes_and_nonquiescence(
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, _common, _child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+
+    let (valid_path, valid_controls) =
+        exact_worker_journal_controls(&child, temp.path(), "incoming-valid", "worker-valid")?;
+    let valid = capture_worker_journal_artifacts(&valid_controls, true);
+    assert_eq!(valid.len(), 1);
+    assert!(matches!(
+        &valid[0].status,
+        WorkerJournalArtifactCaptureStatus::Loaded(bytes) if bytes == b"trusted journal\n"
+    ));
+    assert_eq!(valid[0].path, valid_path);
+
+    let (replacement_path, replacement_controls) = exact_worker_journal_controls(
+        &child,
+        temp.path(),
+        "incoming-replacement",
+        "worker-replacement",
+    )?;
+    fs::rename(
+        &replacement_path,
+        replacement_path.with_extension("held-original"),
+    )?;
+    fs::write(&replacement_path, b"replacement\n")?;
+    fs::set_permissions(&replacement_path, fs::Permissions::from_mode(0o600))?;
+    let replacement = capture_worker_journal_artifacts(&replacement_controls, true);
+    assert!(matches!(
+        &replacement[0].status,
+        WorkerJournalArtifactCaptureStatus::Invalid(error) if error.contains("identity changed")
+    ));
+
+    let (linked_path, linked_controls) =
+        exact_worker_journal_controls(&child, temp.path(), "incoming-linked", "worker-linked")?;
+    fs::hard_link(&linked_path, linked_path.with_extension("alias"))?;
+    let linked = capture_worker_journal_artifacts(&linked_controls, true);
+    assert!(matches!(
+        &linked[0].status,
+        WorkerJournalArtifactCaptureStatus::Invalid(error) if error.contains("single-link")
+    ));
+
+    let (mode_path, mode_controls) =
+        exact_worker_journal_controls(&child, temp.path(), "incoming-mode", "worker-mode")?;
+    fs::set_permissions(&mode_path, fs::Permissions::from_mode(0o640))?;
+    let wrong_mode = capture_worker_journal_artifacts(&mode_controls, true);
+    assert!(matches!(
+        &wrong_mode[0].status,
+        WorkerJournalArtifactCaptureStatus::Invalid(error) if error.contains("mode 0600")
+    ));
+
+    let (nonquiescent_path, nonquiescent_controls) = exact_worker_journal_controls(
+        &child,
+        temp.path(),
+        "incoming-nonquiescent",
+        "worker-nonquiescent",
+    )?;
+    fs::rename(
+        &nonquiescent_path,
+        nonquiescent_path.with_extension("rebound"),
+    )?;
+    let nonquiescent = capture_worker_journal_artifacts(&nonquiescent_controls, false);
+    assert!(matches!(
+        &nonquiescent[0].status,
+        WorkerJournalArtifactCaptureStatus::Invalid(error)
+            if error.contains("was not read") && error.contains("quiescence")
+    ));
     Ok(())
 }
 
@@ -4119,7 +4376,7 @@ fn artifact_parent_allows_only_designated_maco_incoming_layouts() -> Result<()> 
     let incoming = workspace.join("incoming");
     fs::create_dir(&incoming)?;
 
-    for output in [
+    let rejected_outputs = [
         workspace.join(".git/report.json"),
         workspace.join(".git/nested/report.json"),
         workspace.join(".maco/report.json"),
@@ -4146,7 +4403,15 @@ fn artifact_parent_allows_only_designated_maco_incoming_layouts() -> Result<()> 
         workspace.join(".agents/docs/report.json"),
         workspace.join(".cursorignore/report.json"),
         workspace.join("report.json"),
-    ] {
+    ];
+    for output in &rejected_outputs {
+        let parent = output.parent().context("rejected output parent")?;
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    for output in rejected_outputs {
         let command = ExternalAgentCommand::codex_read_only_consultant(
             "codex",
             &workspace,
@@ -4263,6 +4528,7 @@ fn protected_worktree_controls_use_exact_descendant_exceptions() -> Result<()> {
         Duration::from_secs(1),
     )
     .with_worktree_control_exception(".agents/docs/worker.md");
+    fs::create_dir(workspace.join("incoming"))?;
 
     let controls = protected_worktree_controls(&command)?;
     let roots = controls
@@ -4691,6 +4957,7 @@ fn structured_failed_command_denials_are_typed_deduplicated_and_redacted() -> Re
     let workspace = temp.path().join("workspace");
     create_mandatory_control_roots(&workspace)?;
     fs::write(workspace.join("AGENTS.md"), "policy\n")?;
+    fs::create_dir(workspace.join("incoming"))?;
     let command = ExternalAgentCommand::codex(
         "codex",
         &workspace,
@@ -5251,12 +5518,33 @@ fn outer_denial_evidence_uses_only_typed_process_errors() {
 
 #[test]
 fn external_profile_exposes_only_incoming_output_root_as_writable() -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     let temp = tempfile::tempdir()?;
     let workspace = temp.path().join("workspace");
     create_mandatory_control_roots(&workspace)?;
     let container = temp.path().join("run");
     let trusted = container.join("trusted");
     let incoming = container.join("incoming");
+    let journal_parent = incoming.join("worker-journals");
+    fs::create_dir_all(&journal_parent)?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&journal_parent, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(target_os = "linux")]
+    for name in CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS {
+        let path = journal_parent.join(name);
+        fs::create_dir(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    }
+    let journal = journal_parent.join("worker-a.jsonl");
+    fs::write(&journal, [])?;
+    #[cfg(unix)]
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o600))?;
+    let canonical_journal = fs::canonicalize(&journal)?;
     let spec = ExternalAgentCommand::codex(
         workspace.join("codex"),
         &workspace,
@@ -5264,7 +5552,8 @@ fn external_profile_exposes_only_incoming_output_root_as_writable() -> Result<()
         trusted.join("events.jsonl"),
         incoming.join("report.json"),
         Duration::from_secs(1),
-    );
+    )
+    .with_worker_journal_artifact("worker-a", &incoming, &journal);
     let profile = external_side_effect_profile(
         &spec,
         &workspace.join("codex"),
@@ -5274,7 +5563,12 @@ fn external_profile_exposes_only_incoming_output_root_as_writable() -> Result<()
     let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
         bail!("expected external Codex profile");
     };
-    assert_eq!(profile.writable_artifact_roots(), &[incoming]);
+    assert_eq!(
+        profile.writable_artifact_roots(),
+        std::slice::from_ref(&incoming)
+    );
+    assert_eq!(profile.visible_read_write_files(), &[canonical_journal]);
+    assert!(!profile.visible_read_write_roots().contains(&journal_parent));
     assert!(profile
         .writable_artifact_roots()
         .iter()
@@ -5374,6 +5668,9 @@ fn codex_argv_and_digest_preserve_non_utf8_paths_without_collision() -> Result<(
     assert!(raw_argv
         .iter()
         .any(|argument| argument.as_bytes() == raw_schema.as_os_str().as_bytes()));
+    assert!(raw_argv
+        .iter()
+        .any(|argument| argument.as_bytes() == b"--output-schema"));
     assert_ne!(argv_digest(&raw_argv)?, argv_digest(&replacement_argv)?);
     let rendered = command_display(Path::new("codex"), &raw_argv);
     assert!(rendered

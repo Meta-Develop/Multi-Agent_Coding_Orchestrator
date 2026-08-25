@@ -1183,6 +1183,143 @@ fn external_codex_held_file_capability_rejects_replacement_before_resolution() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn nested_codex_profile_appends_exact_journal_while_outer_keeps_parent_nonwritable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const CHILD_ENV: &str = "MACO_TEST_NESTED_CODEX_JOURNAL_CHILD";
+    const JOURNAL_ENV: &str = "MACO_TEST_NESTED_CODEX_JOURNAL_PATH";
+    const JOURNAL_PARENT_ENV: &str = "MACO_TEST_NESTED_CODEX_JOURNAL_PARENT";
+    const TEST_NAME: &str = "process_runner::tests::nested_codex_profile_appends_exact_journal_while_outer_keeps_parent_nonwritable";
+
+    if env::var_os(CHILD_ENV).is_some() {
+        let journal = PathBuf::from(env::var_os(JOURNAL_ENV).expect("journal fixture"));
+        let journal_parent =
+            PathBuf::from(env::var_os(JOURNAL_PARENT_ENV).expect("journal parent fixture"));
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .expect("append exact journal through both sandboxes");
+        file.write_all(b"{\"command\":[\"probe\"],\"cwd\":\".\",\"start_timestamp\":\"s\",\"end_timestamp\":\"e\",\"changed_paths\":[]}\n")
+            .expect("write exact journal entry");
+        assert!(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(journal_parent.join("sibling"))
+                .is_err(),
+            "the journal carrier parent must remain nonwritable"
+        );
+        return;
+    }
+
+    skip_without_containment!();
+    if !strict_backend_available_for_tests() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("journal containment tempdir");
+    let workspace = temp.path().join("worktree");
+    let journal_parent = temp.path().join("incoming/worker-journals");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir_all(&journal_parent).expect("journal carrier");
+    fs::set_permissions(&journal_parent, fs::Permissions::from_mode(0o700))
+        .expect("journal carrier mode");
+    for name in [".git", ".agents", ".codex"] {
+        let path = journal_parent.join(name);
+        fs::create_dir(&path).expect("protected mount target");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("protected mount target mode");
+    }
+    let journal = journal_parent.join("worker-a.jsonl");
+    fs::write(&journal, []).expect("journal leaf");
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).expect("journal mode");
+    let held_journal = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&journal)
+            .expect("held journal capability"),
+    );
+
+    let codex = trusted_system_executable(
+        "codex",
+        &[
+            "/run/current-system/sw/bin/codex",
+            "/usr/bin/codex",
+            "/bin/codex",
+        ],
+    )
+    .expect("trusted Codex executable");
+    let test_binary = env::current_exe().expect("current test executable");
+    let filesystem_permissions = format!(
+        "permissions.maco_external_codex.filesystem={{\":minimal\"=\"read\",\":workspace_roots\"={{\".\"=\"write\"}},{}=\"write\",{}=\"read\"}}",
+        toml_test_string(&journal_parent),
+        toml_test_string(&test_binary)
+    );
+    let argv = vec![
+        OsString::from("-c"),
+        OsString::from("default_permissions=\"maco_external_codex\""),
+        OsString::from("-c"),
+        OsString::from("permissions.maco_external_codex.network={enabled=false}"),
+        OsString::from("-c"),
+        OsString::from(filesystem_permissions),
+        OsString::from("sandbox"),
+        OsString::from("-P"),
+        OsString::from("maco_external_codex"),
+        OsString::from("-C"),
+        workspace.as_os_str().to_os_string(),
+        OsString::from("--"),
+        test_binary.as_os_str().to_os_string(),
+        OsString::from("--exact"),
+        OsString::from(TEST_NAME),
+        OsString::from("--nocapture"),
+    ];
+    let environment = BTreeMap::from([
+        (CHILD_ENV.to_string(), "1".to_string()),
+        (JOURNAL_ENV.to_string(), journal.display().to_string()),
+        (
+            JOURNAL_PARENT_ENV.to_string(),
+            journal_parent.display().to_string(),
+        ),
+        ("TMPDIR".to_string(), "/tmp".to_string()),
+    ]);
+    let profile = ExternalCodexProfile::read_write(&workspace)
+        .with_visible_read_write_file_capability(&journal, held_journal)
+        .expect("outer exact-file capability");
+    let output = run_process(
+        ProcessSpec::direct(
+            "nested Codex exact worker-journal probe",
+            codex,
+            argv,
+            &workspace,
+            8 * 1024,
+        )
+        .with_environment(EnvironmentMode::InheritAndSet(environment))
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT))
+        .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile)),
+    )
+    .expect("run nested Codex journal probe");
+
+    assert!(
+        output.status.is_some_and(|status| status.success()),
+        "nested probe failed: {output:#?}"
+    );
+    assert!(output.safety_evidence_verified());
+    assert!(fs::read(&journal)
+        .expect("captured journal")
+        .starts_with(b"{\"command\":[\"probe\"]"));
+    assert!(!journal_parent.join("sibling").exists());
+}
+
+#[cfg(target_os = "linux")]
+fn toml_test_string(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn external_codex_outer_sandbox_enforces_control_and_report_write_boundaries() {
     skip_without_containment!();
     const CHILD_ENV: &str = "MACO_TEST_EXTERNAL_CODEX_WRITE_BOUNDARY_CHILD";

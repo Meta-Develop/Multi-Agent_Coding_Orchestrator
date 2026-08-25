@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use crate::external_agent::CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS;
 #[cfg(test)]
 use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
 pub use crate::supervise_budget::{
@@ -19,6 +21,7 @@ use crate::{
         ExternalAgentRun, ExternalPreActionReviewRuntime, ExternalProgramTrust,
         ManagedChildGitImport, PreActionJournalPhase, PreActionJournalRationale,
         PreActionJournalRecord, PreActionJournalSink, SandboxDenialEvidence,
+        WorkerJournalArtifactCapture, WorkerJournalArtifactCaptureStatus,
     },
     field_guide::{
         decode_canonical_prompt_entry_line, DecodedFieldGuidePromptEntry, FieldGuideDraft,
@@ -316,7 +319,10 @@ pub use prompts::*;
 mod util;
 pub use util::*;
 
-const DEFAULT_CHILD_TIMEOUT_SECONDS: u64 = 600;
+// A child-orchestrator turn may contain a terminal worker turn followed by the
+// mandatory read-only auditor turn. Keep the default large enough for that
+// complete evidence chain instead of timing out after only the worker finishes.
+const DEFAULT_CHILD_TIMEOUT_SECONDS: u64 = 1_200;
 const DEFAULT_MAX_CHILD_ASSIGNMENTS: usize = 4;
 const DEFAULT_MAX_CHILD_RETRIES: u8 = 0;
 const MAX_CHILD_RETRIES_LIMIT: u8 = 2;

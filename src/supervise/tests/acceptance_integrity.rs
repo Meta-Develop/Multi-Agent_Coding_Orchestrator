@@ -134,6 +134,24 @@ fn injected_missing_child_or_auditor_and_failed_child_propagate_final_failure() 
                 .unwrap_or_default()
                 .to_string();
             invocations.push(name.clone());
+            if with_worker && !name.contains("review-auditor") {
+                assert_eq!(command.worker_journal_artifacts.len(), 1);
+                let artifact = &command.worker_journal_artifacts[0];
+                let journal = &artifact.path;
+                assert_eq!(artifact.worker_id, "worker-a");
+                assert_eq!(
+                    artifact.incoming_root,
+                    command.output_last_message.parent().unwrap()
+                );
+                assert!(journal.is_file());
+                assert_eq!(
+                    journal.parent().and_then(Path::file_name),
+                    Some(OsStr::new("worker-journals"))
+                );
+                assert_eq!(journal.file_name(), Some(OsStr::new("worker-a.jsonl")));
+            } else {
+                assert!(command.worker_journal_artifacts.is_empty());
+            }
             match scenario {
                 "missing-child" => {}
                 "failed-child" => {
@@ -300,8 +318,134 @@ fn injected_runner_rejects_missing_worker_execution_journal() {
 }
 
 #[test]
+fn injected_runner_rejects_unexpected_worker_journal_capture() {
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let plan = injected_plan(assignment.clone(), 0);
+    let options = injected_options(&repo_path, temp.path(), "injected-extra-journal-capture");
+    let mut runner = |command: &ExternalAgentCommand| {
+        let name = command
+            .output_last_message
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default();
+        let child = injected_child_report(&assignment);
+        if name.contains("review-auditor") {
+            write_injected_json(
+                &command.output_last_message,
+                &injected_auditor_report(&assignment, &child),
+            );
+            return injected_verified_run(command);
+        }
+        write_injected_json(&command.output_last_message, &child);
+        let mut run = injected_verified_run(command);
+        let mut captures = run.worker_journal_artifacts().to_vec();
+        captures.push(WorkerJournalArtifactCapture {
+            worker_id: "worker-extra".to_string(),
+            path: command
+                .output_last_message
+                .parent()
+                .expect("incoming report root")
+                .join("worker-journals/worker-extra.jsonl"),
+            status: WorkerJournalArtifactCaptureStatus::Loaded(Vec::new()),
+        });
+        run.replace_worker_journal_artifacts(captures);
+        run
+    };
+
+    let report = run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut runner,
+    )
+    .expect("unexpected journal capture should produce a finalized rejection report");
+
+    assert!(!report.success);
+    assert!(report.rejected);
+    assert!(report.findings.iter().any(|finding| {
+        finding
+            .message
+            .contains("trusted worker journal capture set violates the assignment contract")
+            && finding
+                .message
+                .contains("unexpected worker journal capture 'worker-extra'")
+    }));
+}
+
+#[test]
+fn injected_zero_worker_assignment_rejects_nonempty_worker_journal_capture_set() {
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(false);
+    let plan = injected_plan(assignment.clone(), 0);
+    let options = injected_options(
+        &repo_path,
+        temp.path(),
+        "injected-zero-worker-extra-journal",
+    );
+    let mut runner = |command: &ExternalAgentCommand| {
+        write_injected_json(
+            &command.output_last_message,
+            &injected_child_report(&assignment),
+        );
+        let mut run = injected_verified_run(command);
+        assert!(run.worker_journal_artifacts().is_empty());
+        run.replace_worker_journal_artifacts(vec![WorkerJournalArtifactCapture {
+            worker_id: "worker-extra".to_string(),
+            path: command
+                .output_last_message
+                .parent()
+                .expect("incoming report root")
+                .join("worker-journals/worker-extra.jsonl"),
+            status: WorkerJournalArtifactCaptureStatus::Loaded(Vec::new()),
+        }]);
+        run
+    };
+
+    let report = run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut runner,
+    )
+    .expect("zero-worker unexpected capture should produce a finalized rejection report");
+
+    assert!(!report.success);
+    assert!(report.rejected);
+    assert!(report.orchestrator_reports.is_empty());
+    assert!(report.findings.iter().any(|finding| {
+        finding
+            .message
+            .contains("trusted worker journal capture set violates the assignment contract")
+            && finding
+                .message
+                .contains("unexpected worker journal capture 'worker-extra'")
+    }));
+}
+
+#[test]
 fn injected_schema_and_evidence_matrix_rejects_missing_fields_and_extra_workers() {
     let assignment = injected_assignment(true);
+    let mut missing_evidence = injected_child_report(&assignment);
+    missing_evidence.worker_reports.clear();
+    missing_evidence.audit_reports.clear();
+    validate_worker_report_delegation_attestations(
+        &assignment,
+        Path::new("missing-evidence.json"),
+        &mut missing_evidence,
+    );
+    validate_auditor_reports(
+        &assignment,
+        Path::new("missing-evidence.json"),
+        &mut missing_evidence,
+    );
+    assert_eq!(missing_evidence.status, ReviewStatus::Failed);
+    let missing_messages = finding_messages(&missing_evidence);
+    assert!(missing_messages.contains("omitted required worker reports"));
+    assert!(missing_messages.contains("omitted required review auditor report"));
+
     let mut extra_worker = injected_child_report(&assignment);
     let mut undeclared = extra_worker.worker_reports[0].clone();
     undeclared.id = "worker-extra".to_string();
@@ -1009,6 +1153,81 @@ fn injected_worker_execution_journals_reject_material_mismatches() {
 }
 
 #[test]
+fn worker_journal_reconciliation_accepts_exact_multiline_and_failed_command_identities() {
+    let assignment = injected_assignment(true);
+    let report_path = Path::new("worker-journal-exact-command-identities.json");
+    let cwd = PathBuf::from("/native/local/tmp/c6/a1/.maco/worktrees/r/assignment-001");
+    let multiline_command = vec![
+        "bash".to_string(),
+        "-lc".to_string(),
+        "set -euo pipefail\nprivate_git=/native/local/tmp/c6/a1/r/.git/worktrees/assignment-001/maco-private-git-v1\ncommon_objects=/native/local/tmp/c6/a1/r/.git/objects\nGIT_ALTERNATE_OBJECT_DIRECTORIES=\"$common_objects\" git --git-dir=\"$private_git\" --work-tree=/native/local/tmp/c6/a1/.maco/worktrees/r/assignment-001 status --short".to_string(),
+    ];
+    let failed_command = vec![
+        "bash".to_string(),
+        "-lc".to_string(),
+        "git add -- RELEASE_NOTES.md".to_string(),
+    ];
+
+    let mut multiline_record = injected_command_record();
+    multiline_record.command = multiline_command.clone();
+    multiline_record.cwd = cwd.clone();
+    let mut failed_record = injected_command_record();
+    failed_record.command = failed_command.clone();
+    failed_record.cwd = cwd.clone();
+    failed_record.exit_code = Some(128);
+    failed_record.status = ReviewStatus::Failed;
+    failed_record.error = Some("managed worktree index is read-only".to_string());
+
+    let journals = injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(vec![
+        WorkerExecutionJournalEntry {
+            command: multiline_command,
+            cwd: cwd.clone(),
+            start_timestamp: "2026-08-25T02:16:22Z".to_string(),
+            end_timestamp: "2026-08-25T02:16:22Z".to_string(),
+            changed_paths: Vec::new(),
+        },
+        WorkerExecutionJournalEntry {
+            command: failed_command,
+            cwd,
+            start_timestamp: "2026-08-25T02:15:49Z".to_string(),
+            end_timestamp: "2026-08-25T02:15:49Z".to_string(),
+            changed_paths: Vec::new(),
+        },
+    ]));
+
+    let mut exact = injected_child_report(&assignment);
+    exact.worker_reports[0].commands_run = vec![multiline_record, failed_record];
+    validate_worker_execution_journal_evidence(&assignment, report_path, &journals, &mut exact);
+
+    assert_eq!(exact.status, ReviewStatus::Succeeded);
+    assert!(exact.accepted);
+    assert!(!exact.rejected);
+    assert_eq!(
+        exact.worker_reports[0].commands_run[1].status,
+        ReviewStatus::Failed,
+        "a failed command remains reportable when its command and cwd identity are exact"
+    );
+    assert!(!finding_messages(&exact).contains("not supported by execution journal"));
+
+    let mut paraphrased = injected_child_report(&assignment);
+    paraphrased.worker_reports[0].commands_run = exact.worker_reports[0].commands_run.clone();
+    paraphrased.worker_reports[0].commands_run[0].command[2] =
+        "validate private Git status".to_string();
+    validate_worker_execution_journal_evidence(
+        &assignment,
+        report_path,
+        &journals,
+        &mut paraphrased,
+    );
+
+    assert_eq!(paraphrased.status, ReviewStatus::Failed);
+    assert!(!paraphrased.accepted);
+    assert!(paraphrased.rejected);
+    assert!(finding_messages(&paraphrased)
+        .contains("commands_run entries are not supported by execution journal"));
+}
+
+#[test]
 fn primary_integrity_matrix_covers_index_flags_split_sparse_submodule_non_utf8_and_runtime_roots() {
     let base = injected_primary_snapshot();
     let replacement = injected_oid("replacement");
@@ -1405,11 +1624,49 @@ fn extracts_last_top_level_child_report_json_with_recovery() {
 
 #[test]
 fn rejects_report_garbage_beyond_recovery() {
-    let error = parse_report_json::<OrchestratorReviewReport>(
-        "not json\n```text\nstill not json\n```\n{broken",
-    )
-    .expect_err("garbage should not parse");
-    assert!(error.to_string().contains("lenient JSON extraction failed"));
+    let error =
+        parse_report_json::<OrchestratorReviewReport>("{\n  \"role\": \"child_orchestrator\"\n}")
+            .expect_err("malformed contract should not parse");
+    let message = error.to_string();
+    assert!(message.contains("report JSON/contract parse failed"));
+    assert!(message.contains("missing field `id` at line 3 column 1"));
+    assert!(message.contains("lenient JSON extraction did not produce"));
+}
+
+#[test]
+fn missing_child_report_preserves_original_and_adds_actionable_contract_finding() {
+    let temp = tempfile::tempdir().expect("temporary report fixture");
+    let workspace = temp.path().join("workspace");
+    let artifacts = temp.path().join("artifacts");
+    fs::create_dir(&workspace).expect("create report fixture workspace");
+    fs::create_dir(&artifacts).expect("create report fixture artifacts");
+    let command = control_test_command(&workspace, &artifacts);
+    let external_run = injected_verified_run_without_journals(&command);
+    let assignment = injected_assignment(false);
+    let report_path = Path::new("assignments/child-a.raw.json");
+    let parse_error = "failed to parse child report assignments/child-a.raw.json: report JSON/contract parse failed: missing field `id` at line 3 column 1";
+    let report = missing_child_report(
+        &assignment,
+        report_path,
+        &external_run,
+        &command,
+        parse_error.to_string(),
+    );
+    assert_eq!(report.findings.len(), 2);
+    assert_eq!(
+        report.findings[0].message,
+        format!("required child report is missing or invalid: {parse_error}")
+    );
+    assert_eq!(report.findings[0].severity, FindingSeverity::Error);
+    assert_eq!(report.findings[1].severity, FindingSeverity::Error);
+    assert!(report.findings[1]
+        .message
+        .contains("assignments/child-a.raw.json"));
+    assert!(report.findings[1]
+        .message
+        .contains("missing field `id` at line 3 column 1"));
+    assert!(report.findings[1].message.contains("Corrective action"));
+    assert_eq!(report.findings[1].paths, vec![report_path.to_path_buf()]);
 }
 
 #[test]
