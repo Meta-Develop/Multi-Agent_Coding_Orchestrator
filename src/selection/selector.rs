@@ -1,5 +1,6 @@
 use std::{cmp::Ordering, collections::BTreeSet};
 
+use crate::objective_profile::ObjectiveProfile as RoutingObjectiveProfile;
 use serde::Serialize;
 
 use crate::optimizer::quota_pools::{ConsumptionSource, ExhaustionBehavior};
@@ -180,6 +181,9 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
             ChoiceReason::AuthorizedQuotaDegrade =>
                 "source quota pool is exhausted; selected the lowest-cost independently eligible operator-authorized alternative"
                     .to_string(),
+            ChoiceReason::LowestLegacyBaselinePlusCostProxyAdjustments =>
+                "selected the eligible runtime/model/effort candidate with the lowest legacy baseline plus explicit retry/rework and human-review cost-proxy adjustments"
+                    .to_string(),
             _ =>
                 "selected the eligible runtime/model/effort candidate with the lowest expected total cost per accepted task"
                     .to_string(),
@@ -231,6 +235,7 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
             profile_effective_date: profile.effective_date.clone(),
             profile_digest,
         },
+        resolved_objective_profile: normalized.resolved_objective_profile.clone(),
         catalog_revisions,
         runtime_operations: normalized.pools,
         triggers,
@@ -338,6 +343,7 @@ fn validate_input(input: &SelectionInput) -> Result<(), SelectionError> {
     if let Some(expected_digest) = &input.objective_profile.expected_digest {
         validate_sha256_digest("objective_profile.expected_digest", expected_digest)?;
     }
+    validate_resolved_objective_profile(&input.resolved_objective_profile)?;
     if input.catalogs.is_empty() {
         return invalid("at least one runtime catalog is required");
     }
@@ -867,6 +873,8 @@ fn evaluate_candidate(
     let mut posterior_quality = 0u16;
     let mut authority_quality = None;
     let mut expected_cost = 0u64;
+    let mut expected_retry_rework_cost = 0u64;
+    let mut expected_human_review_cost = 0u64;
     let mut strength_rank = 0u16;
     match prior {
         None => reject(
@@ -923,6 +931,34 @@ fn evaluate_candidate(
                         );
                     }
                     expected_cost = expected_cost_per_accepted(class_fit, &ledger)?;
+                    expected_retry_rework_cost = expected_cost_component_per_accepted(
+                        class_fit.rework_cost_microunits,
+                        ledger.rework_cost_microunits,
+                        class_fit,
+                        &ledger,
+                        "expected retry/rework cost per accepted task",
+                    )?;
+                    let prior_human_review_cost = checked_sum_costs(
+                        [
+                            class_fit.review_cost_microunits,
+                            class_fit.rereview_cost_microunits,
+                        ],
+                        "prior human-review cost",
+                    )?;
+                    let observed_human_review_cost = checked_sum_costs(
+                        [
+                            ledger.review_cost_microunits,
+                            ledger.rereview_cost_microunits,
+                        ],
+                        "observed human-review cost",
+                    )?;
+                    expected_human_review_cost = expected_cost_component_per_accepted(
+                        prior_human_review_cost,
+                        observed_human_review_cost,
+                        class_fit,
+                        &ledger,
+                        "expected human-review cost per accepted task",
+                    )?;
                 }
             }
             if input.task.authority_role.requires_exact_judgment_evidence()
@@ -975,15 +1011,18 @@ fn evaluate_candidate(
 
     let score = if reasons.is_empty() {
         pool.map(|pool| {
-            score_candidate(
+            score_candidate(CandidateScoringInput {
                 profile,
+                routing_weights: &input.resolved_objective_profile.profile.tradeoffs,
                 pool,
-                &candidate,
-                &input.signals,
-                posterior_quality,
-                authority_quality,
-                expected_cost,
-            )
+                candidate: &candidate,
+                signals: &input.signals,
+                posterior_quality_basis_points: posterior_quality,
+                authority_quality_basis_points: authority_quality,
+                expected_total_cost_per_accepted_task_microunits: expected_cost,
+                expected_retry_rework_cost_per_accepted_task_microunits: expected_retry_rework_cost,
+                expected_human_review_cost_per_accepted_task_microunits: expected_human_review_cost,
+            })
         })
         .transpose()?
     } else {
@@ -1217,15 +1256,32 @@ fn quota_decision_provenance(
     }))
 }
 
-fn score_candidate(
-    profile: &ObjectiveProfile,
-    pool: &RuntimePoolState,
-    candidate: &CandidateKey,
-    signals: &DynamicSignals,
+struct CandidateScoringInput<'a> {
+    profile: &'a ObjectiveProfile,
+    routing_weights: &'a crate::objective_profile::TradeoffWeights,
+    pool: &'a RuntimePoolState,
+    candidate: &'a CandidateKey,
+    signals: &'a DynamicSignals,
     posterior_quality_basis_points: u16,
     authority_quality_basis_points: Option<u16>,
     expected_total_cost_per_accepted_task_microunits: u64,
-) -> Result<ScoreBreakdown, SelectionError> {
+    expected_retry_rework_cost_per_accepted_task_microunits: u64,
+    expected_human_review_cost_per_accepted_task_microunits: u64,
+}
+
+fn score_candidate(input: CandidateScoringInput<'_>) -> Result<ScoreBreakdown, SelectionError> {
+    let CandidateScoringInput {
+        profile,
+        routing_weights,
+        pool,
+        candidate,
+        signals,
+        posterior_quality_basis_points,
+        authority_quality_basis_points,
+        expected_total_cost_per_accepted_task_microunits,
+        expected_retry_rework_cost_per_accepted_task_microunits,
+        expected_human_review_cost_per_accepted_task_microunits,
+    } = input;
     let pool_pressure_cost_microunits = normalize_cost_per_accepted(
         scale_basis_points(
             profile.pool_pressure_full_cost_microunits,
@@ -1299,7 +1355,7 @@ fn score_candidate(
     } else {
         0
     };
-    let total_score_microunits = checked_sum_costs(
+    let legacy_baseline_score_microunits = checked_sum_costs(
         [
             expected_total_cost_per_accepted_task_microunits,
             pool_pressure_cost_microunits,
@@ -1311,6 +1367,41 @@ fn score_candidate(
         ],
         "total candidate score",
     )?;
+    let retry_rework_cost_proxy_microunits = checked_sum_costs(
+        [
+            expected_retry_rework_cost_per_accepted_task_microunits,
+            retry_cost_microunits,
+        ],
+        "retry/rework cost proxy",
+    )?;
+    let human_review_cost_proxy_microunits =
+        expected_human_review_cost_per_accepted_task_microunits;
+    let retry_rework_adjustment_microunits = proportional_cost_proxy_adjustment(
+        retry_rework_cost_proxy_microunits,
+        routing_weights.retry_rework_percent,
+        routing_weights.monetary_cost_percent,
+        "retry/rework cost-proxy adjustment",
+    )?;
+    let human_review_adjustment_microunits = proportional_cost_proxy_adjustment(
+        human_review_cost_proxy_microunits,
+        routing_weights.human_review_percent,
+        routing_weights.monetary_cost_percent,
+        "human-review cost-proxy adjustment",
+    )?;
+    let total_adjustment_microunits = checked_sum_costs(
+        [
+            retry_rework_adjustment_microunits,
+            human_review_adjustment_microunits,
+        ],
+        "total cost-proxy adjustment",
+    )?;
+    let total_score_microunits = checked_sum_costs(
+        [
+            legacy_baseline_score_microunits,
+            total_adjustment_microunits,
+        ],
+        "legacy baseline plus cost-proxy adjustments",
+    )?;
     Ok(ScoreBreakdown {
         posterior_quality_basis_points,
         authority_quality_basis_points,
@@ -1321,6 +1412,14 @@ fn score_candidate(
         marginal_cost_microunits,
         retry_cost_microunits,
         degrade_cost_microunits,
+        routing_score_semantics: RoutingScoreSemantics::LegacyBaselinePlusCostProxyAdjustmentsV1,
+        routing_tradeoff_weights: routing_weights.clone(),
+        legacy_baseline_score_microunits,
+        retry_rework_cost_proxy_microunits,
+        human_review_cost_proxy_microunits,
+        retry_rework_adjustment_microunits,
+        human_review_adjustment_microunits,
+        total_adjustment_microunits,
         total_score_microunits,
     })
 }
@@ -1336,11 +1435,7 @@ fn automatic_choice(
             .filter(|candidate| !candidate.strong_gate_fallback)
             .min_by(candidate_score_order)
         {
-            return selected_choice(
-                candidate,
-                ChoiceReason::LowestExpectedTotalCostPerAcceptedTask,
-            )
-            .map(Some);
+            return selected_choice(candidate, automatic_score_choice_reason(input)).map(Some);
         }
         if let Some(candidate) = eligible
             .filter(|candidate| candidate.strong_gate_fallback)
@@ -1357,13 +1452,22 @@ fn automatic_choice(
     }
     eligible
         .min_by(candidate_score_order)
-        .map(|candidate| {
-            selected_choice(
-                candidate,
-                ChoiceReason::LowestExpectedTotalCostPerAcceptedTask,
-            )
-        })
+        .map(|candidate| selected_choice(candidate, automatic_score_choice_reason(input)))
         .transpose()
+}
+
+fn automatic_score_choice_reason(input: &SelectionInput) -> ChoiceReason {
+    let weights = &input.resolved_objective_profile.profile.tradeoffs;
+    if weights.monetary_cost_percent == 100
+        && weights.quota_consumption_percent == 0
+        && weights.latency_percent == 0
+        && weights.retry_rework_percent == 0
+        && weights.human_review_percent == 0
+    {
+        ChoiceReason::LowestExpectedTotalCostPerAcceptedTask
+    } else {
+        ChoiceReason::LowestLegacyBaselinePlusCostProxyAdjustments
+    }
 }
 
 fn environment_fallback_choice(
@@ -1624,6 +1728,58 @@ fn expected_cost_per_accepted(
     )
 }
 
+fn expected_cost_component_per_accepted(
+    prior_component_cost_microunits: u64,
+    observed_component_cost_microunits: u64,
+    class_fit: &ClassFitPrior,
+    ledger: &LedgerSummary,
+    context: &str,
+) -> Result<u64, SelectionError> {
+    let prior_samples = u128::from(class_fit.sample_size);
+    let total_cost = u128::from(prior_component_cost_microunits)
+        .checked_mul(prior_samples)
+        .and_then(|prior| prior.checked_add(u128::from(observed_component_cost_microunits)))
+        .ok_or_else(|| SelectionError::InvalidInput(format!("{context} numerator overflowed")))?;
+    let accepted_basis_units = u128::from(class_fit.quality_basis_points)
+        .checked_mul(prior_samples)
+        .and_then(|prior| {
+            u128::from(ledger.accepted)
+                .checked_mul(10_000)
+                .and_then(|local| prior.checked_add(local))
+        })
+        .ok_or_else(|| SelectionError::InvalidInput(format!("{context} denominator overflowed")))?;
+    if accepted_basis_units == 0 {
+        return Ok(u64::MAX);
+    }
+    let scaled = total_cost
+        .checked_mul(10_000)
+        .ok_or_else(|| SelectionError::InvalidInput(format!("{context} scaling overflowed")))?;
+    u128_to_u64(scaled / accepted_basis_units, context)
+}
+
+fn proportional_cost_proxy_adjustment(
+    cost_proxy_microunits: u64,
+    adjustment_weight_percent: u32,
+    monetary_baseline_weight_percent: u32,
+    context: &str,
+) -> Result<u64, SelectionError> {
+    if adjustment_weight_percent == 0 {
+        return Ok(0);
+    }
+    if monetary_baseline_weight_percent == 0 {
+        return invalid(format!(
+            "{context} requires a nonzero monetary baseline weight"
+        ));
+    }
+    let weighted = u128::from(cost_proxy_microunits)
+        .checked_mul(u128::from(adjustment_weight_percent))
+        .ok_or_else(|| SelectionError::InvalidInput(format!("{context} overflowed")))?;
+    u128_to_u64(
+        weighted / u128::from(monetary_baseline_weight_percent),
+        context,
+    )
+}
+
 fn sum_cost<F>(records: &[&OutcomeRecord], value: F) -> Result<u64, SelectionError>
 where
     F: Fn(&OutcomeRecord) -> u64,
@@ -1669,9 +1825,60 @@ fn input_digests(input: &SelectionInput) -> Result<InputDigests, SelectionError>
         pools: digest(&input.pools)?,
         constraints: digest(&input.constraints)?,
         priors: digest(&input.priors)?,
+        resolved_objective_profile: digest(&input.resolved_objective_profile)?,
         outcomes: digest(&input.outcomes)?,
         signals: digest(&input.signals)?,
     })
+}
+
+fn validate_resolved_objective_profile(
+    resolved: &crate::objective_profile::ResolvedObjectiveProfile,
+) -> Result<(), SelectionError> {
+    let binding = &resolved.profile;
+    validate_identifier("resolved_objective_profile.profile.id", &binding.id)?;
+    validate_positive(
+        "resolved_objective_profile.profile.version",
+        binding.version,
+    )?;
+    validate_sha256_digest(
+        "resolved_objective_profile.profile.content_hash",
+        &binding.content_hash,
+    )?;
+    let reconstructed = RoutingObjectiveProfile {
+        id: binding.id.clone(),
+        version: binding.version,
+        quality: binding.quality.clone(),
+        tradeoffs: binding.tradeoffs.clone(),
+    };
+    let expected = reconstructed.binding().map_err(|error| {
+        SelectionError::InvalidInput(format!(
+            "resolved objective profile binding is invalid: {error:#}"
+        ))
+    })?;
+    if expected != *binding {
+        return invalid(
+            "resolved_objective_profile.profile content_hash does not match its effective weights",
+        );
+    }
+    let weights = &binding.tradeoffs;
+    if weights.quota_consumption_percent != 0 {
+        return invalid(format!(
+            "resolved objective profile requests quota_consumption_percent={} but typed contract-backed per-runtime quota evidence is unavailable",
+            weights.quota_consumption_percent
+        ));
+    }
+    if weights.latency_percent != 0 {
+        return invalid(format!(
+            "resolved objective profile requests latency_percent={} but typed per-candidate observed or predicted latency evidence is unavailable",
+            weights.latency_percent
+        ));
+    }
+    if weights.monetary_cost_percent == 0 {
+        return invalid(
+            "resolved objective profile baseline-plus-adjustment scoring requires monetary_cost_percent greater than zero",
+        );
+    }
+    Ok(())
 }
 
 fn digest<T: Serialize>(value: &T) -> Result<DigestRecord, SelectionError> {

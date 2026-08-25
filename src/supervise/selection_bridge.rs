@@ -5,6 +5,7 @@
 //! cannot inspect the host, clock, catalog, or supervisor plan directly.
 
 use super::*;
+use crate::objective_profile::ResolvedObjectiveProfile;
 use crate::selection::{
     self, AuthorityRole, Boundedness, BudgetSignal, CandidateCapabilities, CandidateKey,
     CatalogModel, ContextSize, DebugOverride, DecisionStatus, DynamicSignals, ObjectiveProfileRef,
@@ -443,10 +444,23 @@ pub(super) fn initialize_supervisor_selection(
     catalog: &RuntimeModelCatalog,
     admission: &SupervisorAdmissionPolicyInput,
     advertised: &AdvertisedCatalogSet,
+    resolved_objective_profile: Option<&ResolvedObjectiveProfile>,
 ) -> Result<SupervisorSelectionResolution> {
     initialize_supervisor_selection_with_quota(
-        plan, runtime, catalog, admission, advertised, None, None,
+        plan,
+        runtime,
+        catalog,
+        admission,
+        advertised,
+        resolved_objective_profile,
+        SupervisorQuotaSelectionInput::default(),
     )
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct SupervisorQuotaSelectionInput<'a> {
+    pub(super) context: Option<&'a LiveQuotaSelectionContext>,
+    pub(super) ledger: Option<&'a RunBudgetLedger>,
 }
 
 pub(super) fn initialize_supervisor_selection_with_quota(
@@ -455,8 +469,8 @@ pub(super) fn initialize_supervisor_selection_with_quota(
     catalog: &RuntimeModelCatalog,
     admission: &SupervisorAdmissionPolicyInput,
     advertised: &AdvertisedCatalogSet,
-    quota_context: Option<&LiveQuotaSelectionContext>,
-    quota_ledger: Option<&RunBudgetLedger>,
+    resolved_objective_profile: Option<&ResolvedObjectiveProfile>,
+    quota: SupervisorQuotaSelectionInput<'_>,
 ) -> Result<SupervisorSelectionResolution> {
     if runtime == SupervisorRuntime::Fake {
         return Ok(SupervisorSelectionResolution {
@@ -466,6 +480,15 @@ pub(super) fn initialize_supervisor_selection_with_quota(
             selection_preflight_failure: None,
         });
     }
+    let resolved_objective_profile = resolved_objective_profile
+        .cloned()
+        .context(
+            "verified supervisor routing requires an objective profile resolved and frozen in the run context",
+        )?;
+    let SupervisorQuotaSelectionInput {
+        context: quota_context,
+        ledger: quota_ledger,
+    } = quota;
 
     let automatic = plan.role_models.is_empty();
     let roles = if automatic {
@@ -502,23 +525,21 @@ pub(super) fn initialize_supervisor_selection_with_quota(
     }
     let mut resolved = BTreeMap::new();
     let mut decisions = Vec::with_capacity(roles.len());
-    let input_context = SupervisorSelectionInputContext {
-        runtime,
-        catalog,
-        advertised,
-        admission,
-        quota_context,
-        quota_ledger,
-    };
     for role in roles {
         let configured = plan.role_models.get(&role);
         let debug_override = configured
             .map(|selection| debug_override_for_role(role, runtime, selection))
             .transpose()?;
-        let input = selection_input_for_role(
+        let input = selection_input_for_role(SelectionInputForRoleArgs {
             role,
-            &input_context,
-            DynamicSignals {
+            runtime,
+            catalog,
+            advertised,
+            admission,
+            resolved_objective_profile: &resolved_objective_profile,
+            quota_context,
+            quota_ledger,
+            signals: DynamicSignals {
                 retry_count: 0,
                 budget_signal: BudgetSignal::Continue,
                 previous_choice: None,
@@ -526,7 +547,7 @@ pub(super) fn initialize_supervisor_selection_with_quota(
                 environment_rejections: Vec::new(),
             },
             debug_override,
-        )?;
+        })?;
         let decision = selection::select(&input).map_err(|error| {
             anyhow!(
                 "automatic selector rejected role '{}': {error}",
@@ -891,44 +912,49 @@ fn debug_override_for_role(
     })
 }
 
-struct SupervisorSelectionInputContext<'a> {
+struct SelectionInputForRoleArgs<'a> {
+    role: AgentRole,
     runtime: SupervisorRuntime,
     catalog: &'a RuntimeModelCatalog,
     advertised: &'a AdvertisedCatalogSet,
     admission: &'a SupervisorAdmissionPolicyInput,
+    resolved_objective_profile: &'a ResolvedObjectiveProfile,
     quota_context: Option<&'a LiveQuotaSelectionContext>,
     quota_ledger: Option<&'a RunBudgetLedger>,
-}
-
-fn selection_input_for_role(
-    role: AgentRole,
-    context: &SupervisorSelectionInputContext<'_>,
     signals: DynamicSignals,
     debug_override: Option<DebugOverride>,
-) -> Result<SelectionInput> {
+}
+
+fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<SelectionInput> {
+    let SelectionInputForRoleArgs {
+        role,
+        runtime,
+        catalog,
+        advertised,
+        admission,
+        resolved_objective_profile,
+        quota_context,
+        quota_ledger,
+        signals,
+        debug_override,
+    } = args;
     let priors = selection::built_in_prior_dataset()?;
     let task = task_profile_for_role(role);
-    let runtime_name = runtime_name(context.runtime);
-    let catalogs = constructed_selection_catalogs(
-        context.runtime,
-        context.catalog,
-        context.advertised,
-        &task,
-        &priors,
-    )?;
+    let runtime_name = runtime_name(runtime);
+    let catalogs = constructed_selection_catalogs(runtime, catalog, advertised, &task, &priors)?;
     let profile = priors
         .objective_profiles
         .first()
         .context("built-in selector data has no objective profile")?;
     let profile_name = profile.name.clone();
     let profile_version = profile.version;
-    let capacity = u64::try_from(context.admission.provider_inflight_bound)
+    let capacity = u64::try_from(admission.provider_inflight_bound)
         .context("provider inflight bound does not fit selector pool units")?;
-    let admission_bytes = serde_json::to_vec(context.admission)
+    let admission_bytes = serde_json::to_vec(admission)
         .context("failed to normalize supervisor admission input for selection")?;
     let primary_pool = RuntimePoolState {
         runtime: runtime_name.to_string(),
-        admission_open: context.admission.resolved_bound > 0,
+        admission_open: admission.resolved_bound > 0,
         pool_reference: None,
         pool_kind: None,
         entitlement_bounded: true,
@@ -976,17 +1002,13 @@ fn selection_input_for_role(
             version: profile_version,
             expected_digest: None,
         },
+        resolved_objective_profile: resolved_objective_profile.clone(),
         outcomes: Vec::new(),
         signals,
         debug_override,
     };
-    if let Some(quota_context) = context.quota_context {
-        apply_live_quota_selection_input(
-            &mut input,
-            quota_context,
-            context.quota_ledger,
-            runtime_name,
-        )?;
+    if let Some(quota_context) = quota_context {
+        apply_live_quota_selection_input(&mut input, quota_context, quota_ledger, runtime_name)?;
     }
     Ok(input)
 }
@@ -1466,6 +1488,41 @@ pub(super) fn build_assignment_selection_ledger(
         .collect()
 }
 
+pub(super) fn apply_budget_degradations_to_selection_ledger(
+    entries: &mut [AssignmentSelectionLedgerEntry],
+    records: &[BudgetDegradationRecord],
+) {
+    for record in records {
+        let Some(transition) = record.role_binding_transition.as_ref() else {
+            continue;
+        };
+        let Some(entry) = entries.iter_mut().find(|entry| {
+            entry.assignment_id == record.assignment_id && entry.role == transition.role
+        }) else {
+            continue;
+        };
+        if entry.selection_source == AssignmentSelectionSource::Retry {
+            continue;
+        }
+        entry.selection_source = match record.trigger {
+            BudgetDegradationTrigger::BudgetPressure => AssignmentSelectionSource::BudgetDegrade,
+            BudgetDegradationTrigger::LowDifficultyMechanical => {
+                AssignmentSelectionSource::LowDifficultyMechanical
+            }
+        };
+        entry.selected_model = transition.after.model.clone();
+        entry.selected_reasoning_effort = transition.after.reasoning_effort.clone();
+        entry.catalog_source = AssignmentCatalogSource::RuntimeAdvertised;
+        entry.catalog_snapshot_digest = None;
+        entry.catalog_revisions.clear();
+        entry.rejected_candidates.clear();
+        entry.evidence_gap = Some(
+            "the budget-degradation record is authoritative for the final Worker binding; selector candidate provenance described the superseded binding and was discarded, and the degradation decision retained no catalog snapshot digest or revisions"
+                .to_string(),
+        );
+    }
+}
+
 pub(super) fn write_selection_ledger_from_report(
     writer: &mut crate::artifacts::ArtifactRunWriter,
     report: &SupervisorFinalReport,
@@ -1819,6 +1876,33 @@ fn selector_effort_as_str(effort: SelectorEffort) -> &'static str {
 mod tests {
     use super::*;
 
+    fn default_resolved_profile() -> ResolvedObjectiveProfile {
+        ResolvedObjectiveProfile {
+            profile: crate::objective_profile::default_objective_profile()
+                .binding()
+                .expect("default objective profile binding"),
+            source: crate::objective_profile::ObjectiveProfileSource::BuiltIn,
+        }
+    }
+
+    fn initialize_supervisor_selection(
+        plan: &mut SupervisorPlan,
+        runtime: SupervisorRuntime,
+        catalog: &RuntimeModelCatalog,
+        admission: &SupervisorAdmissionPolicyInput,
+        advertised: &AdvertisedCatalogSet,
+    ) -> Result<SupervisorSelectionResolution> {
+        let resolved = default_resolved_profile();
+        super::initialize_supervisor_selection(
+            plan,
+            runtime,
+            catalog,
+            admission,
+            advertised,
+            Some(&resolved),
+        )
+    }
+
     fn codex_catalog() -> Result<RuntimeModelCatalog> {
         let priors = selection::built_in_prior_dataset()?;
         Ok(RuntimeModelCatalog::Codex(
@@ -2013,8 +2097,11 @@ mod tests {
             &catalog,
             &test_admission(),
             &AdvertisedCatalogSet::empty(),
-            Some(&context),
-            Some(&quota_ledger),
+            Some(&default_resolved_profile()),
+            SupervisorQuotaSelectionInput {
+                context: Some(&context),
+                ledger: Some(&quota_ledger),
+            },
         )?;
 
         let failure = resolution
@@ -2062,6 +2149,36 @@ mod tests {
         .context("assignment ledger quota evidence")?;
         assert_eq!(evidence.pool_reference, Some(quota.source_pool.clone()));
         assert!(evidence.exhausted);
+        Ok(())
+    }
+
+    #[test]
+    fn verified_routing_requires_frozen_profile_while_fake_compatibility_remains_explicit(
+    ) -> Result<()> {
+        let catalog = codex_catalog()?;
+        let mut missing = test_plan();
+        let error = super::initialize_supervisor_selection(
+            &mut missing,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+            None,
+        )
+        .expect_err("verified routing without a frozen profile must fail closed");
+        assert!(error
+            .to_string()
+            .contains("objective profile resolved and frozen"));
+
+        let fake = super::initialize_supervisor_selection(
+            &mut missing,
+            SupervisorRuntime::Fake,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+            None,
+        )?;
+        assert_eq!(fake.mode, SupervisorSelectionMode::LegacyFake);
         Ok(())
     }
 
@@ -2123,8 +2240,11 @@ mod tests {
             &catalog,
             &test_admission(),
             &AdvertisedCatalogSet::empty(),
-            Some(&context),
-            Some(&quota_ledger),
+            Some(&default_resolved_profile()),
+            SupervisorQuotaSelectionInput {
+                context: Some(&context),
+                ledger: Some(&quota_ledger),
+            },
         )?;
         assert!(resolution.selection_preflight_failure.is_none());
         let worker = resolution
@@ -2240,26 +2360,25 @@ mod tests {
         let catalog = codex_catalog()?;
         let advertised = advertised_with_cursor(captured_cursor_observation()?);
         let admission = test_admission();
-        let context = SupervisorSelectionInputContext {
+        let resolved_profile = default_resolved_profile();
+        let decision = selection::select(&selection_input_for_role(SelectionInputForRoleArgs {
+            role: AgentRole::Worker,
             runtime: SupervisorRuntime::Codex,
             catalog: &catalog,
             advertised: &advertised,
             admission: &admission,
+            resolved_objective_profile: &resolved_profile,
             quota_context: Some(&quota_context),
             quota_ledger: Some(&quota_ledger),
-        };
-        let decision = selection::select(&selection_input_for_role(
-            AgentRole::Worker,
-            &context,
-            DynamicSignals {
+            signals: DynamicSignals {
                 retry_count: 0,
                 budget_signal: BudgetSignal::Continue,
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
             },
-            None,
-        )?)?;
+            debug_override: None,
+        })?)?;
         let selected = decision.choice.as_ref().context("degraded choice")?;
         assert_eq!(selected.candidate.runtime, "cursor");
         assert_eq!(
@@ -2292,9 +2411,152 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn initial_retry_and_budget_degrade_reuse_exact_frozen_profile_evidence() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        let mut profile = crate::objective_profile::default_objective_profile();
+        profile.id = "frozen-routing-profile-v1".to_string();
+        profile.tradeoffs.monetary_cost_percent = 75;
+        profile.tradeoffs.human_review_percent = 25;
+        let frozen = ResolvedObjectiveProfile {
+            profile: profile.binding()?,
+            source: crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+        };
+        let resolution = super::initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+            Some(&frozen),
+        )?;
+        assert!(resolution.decisions.iter().all(|event| {
+            event.provenance.resolved_objective_profile == frozen
+                && event.provenance.normalized_input.resolved_objective_profile == frozen
+        }));
+        let mut state = resolution
+            .automatic_state
+            .context("automatic selection state")?;
+        let retry = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        assert_eq!(retry.decisions[0].1.resolved_objective_profile, frozen);
+        let degrade = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::ChildOrchestrator, AgentRole::Auditor],
+            0,
+            BudgetSignal::Degrade,
+            &[],
+        )?;
+        assert!(degrade
+            .decisions
+            .iter()
+            .all(|(_, decision)| decision.resolved_objective_profile == frozen));
+        Ok(())
+    }
+
+    #[test]
+    fn verified_bridge_applies_supported_profile_to_score_arithmetic_and_choice() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let admission = test_admission();
+        let advertised = AdvertisedCatalogSet::empty();
+
+        let mut default_plan = test_plan();
+        let default = initialize_supervisor_selection(
+            &mut default_plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &admission,
+            &advertised,
+        )?;
+        let default_worker = default
+            .decisions
+            .iter()
+            .find(|event| event.role == AgentRole::Worker)
+            .context("default worker decision")?;
+        let default_choice = default_worker
+            .provenance
+            .choice
+            .as_ref()
+            .context("default worker choice")?;
+
+        let mut profile = crate::objective_profile::default_objective_profile();
+        profile.id = "review-sensitive-routing-v1".to_string();
+        profile.tradeoffs.monetary_cost_percent = 25;
+        profile.tradeoffs.human_review_percent = 75;
+        let frozen = ResolvedObjectiveProfile {
+            profile: profile.binding()?,
+            source: crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+        };
+        let mut adjusted_plan = test_plan();
+        let adjusted = super::initialize_supervisor_selection(
+            &mut adjusted_plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &admission,
+            &advertised,
+            Some(&frozen),
+        )?;
+        let adjusted_worker = adjusted
+            .decisions
+            .iter()
+            .find(|event| event.role == AgentRole::Worker)
+            .context("adjusted worker decision")?;
+        assert_eq!(
+            adjusted_worker.provenance.resolved_objective_profile,
+            frozen
+        );
+        let adjusted_choice = adjusted_worker
+            .provenance
+            .choice
+            .as_ref()
+            .context("adjusted worker choice")?;
+        assert_ne!(adjusted_choice.candidate, default_choice.candidate);
+        assert_eq!(
+            adjusted_choice.reason,
+            selection::ChoiceReason::LowestLegacyBaselinePlusCostProxyAdjustments
+        );
+        let score = adjusted_worker
+            .provenance
+            .candidate_set
+            .iter()
+            .find(|candidate| candidate.candidate == adjusted_choice.candidate)
+            .and_then(|candidate| candidate.score.as_ref())
+            .context("adjusted worker selected score")?;
+        assert_eq!(
+            score.routing_score_semantics,
+            selection::RoutingScoreSemantics::LegacyBaselinePlusCostProxyAdjustmentsV1
+        );
+        assert_eq!(score.routing_tradeoff_weights, frozen.profile.tradeoffs);
+        assert_eq!(score.retry_rework_adjustment_microunits, 0);
+        assert_eq!(
+            score.human_review_adjustment_microunits,
+            score.human_review_cost_proxy_microunits * 75 / 25
+        );
+        assert_eq!(
+            score.total_adjustment_microunits,
+            score.human_review_adjustment_microunits
+        );
+        assert_eq!(
+            score.total_score_microunits,
+            score.legacy_baseline_score_microunits + score.total_adjustment_microunits
+        );
+        Ok(())
+    }
+
     fn child_assignment(id: &str) -> OrchestratorAssignment {
         OrchestratorAssignment {
             id: id.to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("README.md")],
@@ -2305,6 +2567,44 @@ mod tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+        }
+    }
+
+    fn mechanical_degradation_record(assignment_id: &str) -> BudgetDegradationRecord {
+        mechanical_degradation_record_to(assignment_id, ECONOMY_PROFILE_MODEL)
+    }
+
+    fn mechanical_degradation_record_to(
+        assignment_id: &str,
+        after_model: &str,
+    ) -> BudgetDegradationRecord {
+        BudgetDegradationRecord {
+            sequence: 1,
+            assignment_id: assignment_id.to_string(),
+            trigger: BudgetDegradationTrigger::LowDifficultyMechanical,
+            budget_action: BudgetAction::Continue,
+            budget_reasons: Vec::new(),
+            change: BudgetDegradationChange::ModelTier {
+                role: AgentRole::Worker,
+                before: FRONTIER_PROFILE_MODEL.to_string(),
+                after: after_model.to_string(),
+                resolved_candidate_index: 0,
+            },
+            role_binding_transition: Some(BudgetDegradationRoleBindingTransition {
+                role: AgentRole::Worker,
+                before: BudgetDegradationRoleBinding {
+                    model: Some(FRONTIER_PROFILE_MODEL.to_string()),
+                    reasoning_effort: Some("xhigh".to_string()),
+                },
+                after: BudgetDegradationRoleBinding {
+                    model: Some(after_model.to_string()),
+                    reasoning_effort: Some("xhigh".to_string()),
+                },
+            }),
+            effective_child_model: Some(FRONTIER_PROFILE_MODEL.to_string()),
+            effective_child_reasoning_effort: Some("xhigh".to_string()),
+            effective_fan_out: 1,
+            observation: BudgetDegradationObservation::AdmissionPolicyResolved,
         }
     }
 
@@ -2427,6 +2727,157 @@ mod tests {
             worker.catalog_source,
             AssignmentCatalogSource::RuntimeAdvertised
         );
+        Ok(())
+    }
+
+    #[test]
+    fn assignment_selection_ledger_records_typed_mechanical_degradation_evidence() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        plan.assignments = vec![child_assignment("assignment-a")];
+        plan.assignments[0].worker_assignments = vec![WorkerAssignment {
+            id: "worker-a".to_string(),
+            role: AgentRole::Worker,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            environment_requirements: Vec::new(),
+            report_path: None,
+        }];
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+        )?;
+        let mut ledger = build_assignment_selection_ledger(
+            &plan,
+            &resolution.decisions,
+            SupervisorRuntime::Codex,
+        );
+        let child_before = ledger
+            .iter()
+            .find(|entry| {
+                entry.assignment_id == "assignment-a" && entry.role == AgentRole::ChildOrchestrator
+            })
+            .context("ChildOrchestrator ledger row")?
+            .clone();
+        let worker_before = ledger
+            .iter()
+            .find(|entry| entry.assignment_id == "assignment-a" && entry.role == AgentRole::Worker)
+            .context("initial Worker ledger row")?
+            .clone();
+        let budget_target = worker_before
+            .rejected_candidates
+            .iter()
+            .find(|candidate| candidate.model != "unselected-alternate")
+            .map(|candidate| candidate.model.clone())
+            .context("selector-rejected model for budget target")?;
+        assert!(worker_before.catalog_snapshot_digest.is_some());
+        assert!(!worker_before.catalog_revisions.is_empty());
+        let records = vec![mechanical_degradation_record_to(
+            "assignment-a",
+            &budget_target,
+        )];
+
+        apply_budget_degradations_to_selection_ledger(&mut ledger, &records);
+
+        let worker = ledger
+            .iter()
+            .find(|entry| entry.assignment_id == "assignment-a" && entry.role == AgentRole::Worker)
+            .context("Worker ledger row")?;
+        assert_eq!(
+            worker.selection_source,
+            AssignmentSelectionSource::LowDifficultyMechanical
+        );
+        assert_eq!(worker.assignment_id, worker_before.assignment_id);
+        assert_eq!(worker.attempt, worker_before.attempt);
+        assert_eq!(worker.role, worker_before.role);
+        assert_eq!(worker.role_assignment, worker_before.role_assignment);
+        assert_eq!(worker.selected_runtime, worker_before.selected_runtime);
+        assert_eq!(
+            worker.selected_model.as_deref(),
+            Some(budget_target.as_str())
+        );
+        assert_eq!(worker.selected_reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            worker.catalog_source,
+            AssignmentCatalogSource::RuntimeAdvertised
+        );
+        assert!(worker.catalog_snapshot_digest.is_none());
+        assert!(worker.catalog_revisions.is_empty());
+        assert!(!worker
+            .rejected_candidates
+            .iter()
+            .any(|candidate| candidate.model == budget_target));
+        assert!(worker.rejected_candidates.is_empty());
+        assert!(worker.evidence_gap.as_ref().is_some_and(|gap| gap.contains(
+            "selector candidate provenance described the superseded binding and was discarded"
+        )));
+        let child_after = ledger
+            .iter()
+            .find(|entry| {
+                entry.assignment_id == "assignment-a" && entry.role == AgentRole::ChildOrchestrator
+            })
+            .context("ChildOrchestrator ledger row after overlay")?;
+        assert_eq!(child_after, &child_before);
+        Ok(())
+    }
+
+    #[test]
+    fn assignment_selection_ledger_preserves_later_worker_retry_provenance() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        plan.assignments = vec![child_assignment("assignment-a")];
+        plan.assignments[0].worker_assignments = vec![WorkerAssignment {
+            id: "worker-a".to_string(),
+            role: AgentRole::Worker,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            environment_requirements: Vec::new(),
+            report_path: None,
+        }];
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+        )?;
+        let mut decisions = resolution.decisions;
+        let mut retry = decisions
+            .iter()
+            .find(|event| event.role == AgentRole::Worker)
+            .context("initial Worker selector event")?
+            .clone();
+        retry.assignment_id = Some("assignment-a".to_string());
+        retry.attempt = 2;
+        retry.primary_cause = SupervisorSelectionEventCause::Retry;
+        decisions.push(retry);
+        let mut ledger =
+            build_assignment_selection_ledger(&plan, &decisions, SupervisorRuntime::Codex);
+        let before = ledger
+            .iter()
+            .find(|entry| entry.assignment_id == "assignment-a" && entry.role == AgentRole::Worker)
+            .context("retry Worker ledger row")?
+            .clone();
+        assert_eq!(before.selection_source, AssignmentSelectionSource::Retry);
+        assert_eq!(before.attempt, 2);
+
+        apply_budget_degradations_to_selection_ledger(
+            &mut ledger,
+            &[mechanical_degradation_record("assignment-a")],
+        );
+
+        let after = ledger
+            .iter()
+            .find(|entry| entry.assignment_id == "assignment-a" && entry.role == AgentRole::Worker)
+            .context("Worker ledger row after degradation overlay")?;
+        assert_eq!(after, &before);
         Ok(())
     }
 
@@ -2966,6 +3417,7 @@ mod tests {
     fn worker_assignment() -> OrchestratorAssignment {
         OrchestratorAssignment {
             id: "worker-a".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::Worker,
             assigned_paths: vec![PathBuf::from("README.md")],

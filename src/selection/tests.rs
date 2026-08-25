@@ -177,6 +177,12 @@ fn base_input() -> SelectionInput {
             version: 1,
             expected_digest: None,
         },
+        resolved_objective_profile: crate::objective_profile::ResolvedObjectiveProfile {
+            profile: crate::objective_profile::default_objective_profile()
+                .binding()
+                .expect("default objective profile binding"),
+            source: crate::objective_profile::ObjectiveProfileSource::BuiltIn,
+        },
         outcomes: Vec::new(),
         signals: DynamicSignals {
             retry_count: 0,
@@ -187,6 +193,240 @@ fn base_input() -> SelectionInput {
         },
         debug_override: None,
     }
+}
+
+fn resolved_routing_profile(
+    profile: crate::objective_profile::ObjectiveProfile,
+    source: crate::objective_profile::ObjectiveProfileSource,
+) -> crate::objective_profile::ResolvedObjectiveProfile {
+    crate::objective_profile::ResolvedObjectiveProfile {
+        profile: profile.binding().expect("routing objective binding"),
+        source,
+    }
+}
+
+#[test]
+fn built_in_routing_objective_preserves_legacy_scores_choice_and_runner_order() {
+    let decision = select(&base_input()).expect("default objective selection");
+    assert_eq!(decision.schema_version, 2);
+    let mut legacy_ranked = decision
+        .candidate_set
+        .iter()
+        .filter(|candidate| candidate.eligible)
+        .map(|candidate| {
+            let score = candidate.score.as_ref().expect("eligible candidate score");
+            assert_eq!(
+                score.total_score_microunits,
+                score.legacy_baseline_score_microunits
+            );
+            assert_eq!(score.total_adjustment_microunits, 0);
+            assert_eq!(
+                score.routing_score_semantics,
+                RoutingScoreSemantics::LegacyBaselinePlusCostProxyAdjustmentsV1
+            );
+            assert_eq!(score.routing_tradeoff_weights.monetary_cost_percent, 100);
+            assert_eq!(score.routing_tradeoff_weights.quota_consumption_percent, 0);
+            (
+                candidate.candidate.clone(),
+                score.legacy_baseline_score_microunits,
+            )
+        })
+        .collect::<Vec<_>>();
+    legacy_ranked.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    let choice = decision.choice.as_ref().expect("default choice");
+    assert_eq!(
+        choice.reason,
+        ChoiceReason::LowestExpectedTotalCostPerAcceptedTask
+    );
+    assert_eq!(
+        Some(&choice.candidate),
+        legacy_ranked.first().map(|(candidate, _)| candidate)
+    );
+    assert_eq!(
+        decision
+            .runner_up_scores
+            .iter()
+            .map(|ranked| (&ranked.candidate, ranked.total_score_microunits))
+            .collect::<Vec<_>>(),
+        legacy_ranked
+            .iter()
+            .skip(1)
+            .map(|(candidate, score)| (candidate, *score))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn unsupported_quota_and_latency_weights_fail_closed_without_numeric_zero_evidence() {
+    let mut input = base_input();
+    let mut quota_profile = crate::objective_profile::default_objective_profile();
+    quota_profile.id = "quota-first-routing-v1".to_string();
+    quota_profile.tradeoffs.monetary_cost_percent = 75;
+    quota_profile.tradeoffs.quota_consumption_percent = 25;
+    input.resolved_objective_profile = resolved_routing_profile(
+        quota_profile,
+        crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+    );
+    assert!(matches!(
+        select(&input),
+        Err(SelectionError::InvalidInput(message))
+            if message == "resolved objective profile requests quota_consumption_percent=25 but typed contract-backed per-runtime quota evidence is unavailable"
+    ));
+
+    let mut latency_profile = crate::objective_profile::default_objective_profile();
+    latency_profile.id = "latency-first-routing-v1".to_string();
+    latency_profile.tradeoffs.monetary_cost_percent = 75;
+    latency_profile.tradeoffs.latency_percent = 25;
+    input.resolved_objective_profile = resolved_routing_profile(
+        latency_profile,
+        crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+    );
+    assert!(matches!(
+        select(&input),
+        Err(SelectionError::InvalidInput(message))
+            if message == "resolved objective profile requests latency_percent=25 but typed per-candidate observed or predicted latency evidence is unavailable"
+    ));
+}
+
+#[test]
+fn supported_cost_proxy_adjustments_use_exact_arithmetic_and_can_change_ranking() {
+    let input = base_input();
+    let default = select(&input).expect("default objective selection");
+    let default_choice = default
+        .choice
+        .as_ref()
+        .expect("default choice")
+        .candidate
+        .clone();
+
+    let mut profile = crate::objective_profile::default_objective_profile();
+    profile.id = "review-sensitive-routing-v1".to_string();
+    profile.tradeoffs.monetary_cost_percent = 25;
+    profile.tradeoffs.human_review_percent = 75;
+    let mut adjusted_input = input;
+    adjusted_input.resolved_objective_profile = resolved_routing_profile(
+        profile,
+        crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+    );
+    let adjusted = select(&adjusted_input).expect("supported adjusted selection");
+    let adjusted_choice = adjusted.choice.as_ref().expect("adjusted choice");
+    assert_eq!(
+        adjusted_choice.reason,
+        ChoiceReason::LowestLegacyBaselinePlusCostProxyAdjustments
+    );
+    assert_ne!(adjusted_choice.candidate, default_choice);
+
+    for candidate in adjusted
+        .candidate_set
+        .iter()
+        .filter(|candidate| candidate.eligible)
+    {
+        let score = candidate.score.as_ref().expect("eligible score");
+        assert_eq!(
+            score.routing_score_semantics,
+            RoutingScoreSemantics::LegacyBaselinePlusCostProxyAdjustmentsV1
+        );
+        assert_eq!(score.routing_tradeoff_weights.monetary_cost_percent, 25);
+        assert_eq!(score.routing_tradeoff_weights.human_review_percent, 75);
+        assert_eq!(score.retry_rework_adjustment_microunits, 0);
+        assert_eq!(
+            score.human_review_adjustment_microunits,
+            score.human_review_cost_proxy_microunits * 75 / 25
+        );
+        assert_eq!(
+            score.total_adjustment_microunits,
+            score.human_review_adjustment_microunits
+        );
+        assert_eq!(
+            score.total_score_microunits,
+            score.legacy_baseline_score_microunits + score.total_adjustment_microunits
+        );
+    }
+}
+
+#[test]
+fn retry_and_review_cost_proxy_adjustments_are_proportional_to_the_monetary_baseline() {
+    let mut profile = crate::objective_profile::default_objective_profile();
+    profile.id = "retry-and-review-sensitive-routing-v1".to_string();
+    profile.tradeoffs.monetary_cost_percent = 50;
+    profile.tradeoffs.retry_rework_percent = 25;
+    profile.tradeoffs.human_review_percent = 25;
+    let mut input = base_input();
+    input.resolved_objective_profile = resolved_routing_profile(
+        profile,
+        crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+    );
+
+    let decision = select(&input).expect("supported retry/review adjusted selection");
+    for candidate in decision
+        .candidate_set
+        .iter()
+        .filter(|candidate| candidate.eligible)
+    {
+        let score = candidate.score.as_ref().expect("eligible score");
+        assert_eq!(
+            score.retry_rework_adjustment_microunits,
+            score.retry_rework_cost_proxy_microunits * 25 / 50
+        );
+        assert_eq!(
+            score.human_review_adjustment_microunits,
+            score.human_review_cost_proxy_microunits * 25 / 50
+        );
+        assert_eq!(
+            score.total_adjustment_microunits,
+            score.retry_rework_adjustment_microunits + score.human_review_adjustment_microunits
+        );
+        assert_eq!(
+            score.total_score_microunits,
+            score.legacy_baseline_score_microunits + score.total_adjustment_microunits
+        );
+    }
+}
+
+#[test]
+fn resolved_routing_objective_round_trips_and_invalid_binding_fails_closed() {
+    let mut profile = crate::objective_profile::default_objective_profile();
+    profile.id = "review-aware-routing-v1".to_string();
+    profile.tradeoffs.monetary_cost_percent = 50;
+    profile.tradeoffs.human_review_percent = 50;
+    let mut input = base_input();
+    input.resolved_objective_profile = resolved_routing_profile(
+        profile,
+        crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+    );
+    let input_json = serde_json::to_value(&input).expect("serialize selection input");
+    let input_round_trip: SelectionInput =
+        serde_json::from_value(input_json.clone()).expect("deserialize selection input");
+    assert_eq!(input_round_trip, input);
+    let decision = select(&input_round_trip).expect("selection with resolved objective");
+    assert_eq!(
+        decision.resolved_objective_profile,
+        input.resolved_objective_profile
+    );
+    let decision_round_trip: SelectionProvenance = serde_json::from_value(
+        serde_json::to_value(&decision).expect("serialize selection provenance"),
+    )
+    .expect("deserialize selection provenance");
+    assert_eq!(decision_round_trip, decision);
+
+    let mut missing = input_json.clone();
+    missing
+        .as_object_mut()
+        .expect("selection input object")
+        .remove("resolved_objective_profile");
+    assert!(serde_json::from_value::<SelectionInput>(missing).is_err());
+
+    let mut invalid_source = input_json;
+    invalid_source["resolved_objective_profile"]["source"] =
+        serde_json::Value::String("unverified_external".to_string());
+    assert!(serde_json::from_value::<SelectionInput>(invalid_source).is_err());
+
+    let mut invalid = input;
+    invalid.resolved_objective_profile.profile.content_hash = "0".repeat(64);
+    assert!(matches!(
+        select(&invalid),
+        Err(SelectionError::InvalidInput(message)) if message.contains("content_hash")
+    ));
 }
 
 #[test]

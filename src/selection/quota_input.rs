@@ -286,6 +286,12 @@ mod tests {
                 version: profile.version,
                 expected_digest: None,
             },
+            resolved_objective_profile: crate::objective_profile::ResolvedObjectiveProfile {
+                profile: crate::objective_profile::default_objective_profile()
+                    .binding()
+                    .expect("default objective profile binding"),
+                source: crate::objective_profile::ObjectiveProfileSource::BuiltIn,
+            },
             outcomes: Vec::new(),
             signals: crate::selection::DynamicSignals {
                 retry_count: 0,

@@ -817,9 +817,10 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 task_file,
                 from_goal,
                 repo,
+                objective_profile,
                 json,
             } = args;
-            let plan = match (task_file, from_goal) {
+            let mut plan = match (task_file, from_goal) {
                 (Some(task_file), None) => {
                     supervise::supervisor_plan_document_from_task_file(repo, task_file)?
                 }
@@ -831,6 +832,14 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     "supervise plan requires exactly one positional TASK_FILE or --from-goal <FILE>"
                 ),
             };
+            if let Some(objective_profile) = objective_profile {
+                plan.as_object_mut()
+                    .context("normalized supervisor plan must be a JSON object")?
+                    .insert(
+                        "objective_profile".to_string(),
+                        serde_json::Value::String(objective_profile),
+                    );
+            }
             print_query_report(&plan, json)
         }
         SuperviseSubcommand::Run(args) => {
@@ -896,6 +905,12 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     .unwrap_or(supervise::SupervisorRuntime::Codex)
             });
             let json = args.json;
+            let objective_profile_override = args.objective_profile.clone();
+            if resume_existing && objective_profile_override.is_some() {
+                bail!(
+                    "--objective-profile cannot change an existing supervise run; resume uses its frozen objective profile"
+                );
+            }
             let reap_repo = resolved_repo.clone();
             let _rolling_guard = rolling_quota
                 .map(|quota| {
@@ -946,12 +961,13 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                         )?
                     }
                     (Some(goal_spec), false) => {
-                        supervise::run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_worktree_opt_in(
+                        supervise::run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_worktree_opt_in_and_objective_profile_override(
                             options,
                             "",
                             &goal_spec,
                             args.max_concurrent_children,
                             args.allow_primary_worktree,
+                            objective_profile_override,
                         )?
                     }
                     (None, true) => {
@@ -961,10 +977,11 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                         )?
                     }
                     (None, false) => {
-                        supervise::run_supervisor_plan_file_cascade_with_concurrency_policy_and_primary_worktree_opt_in(
+                        supervise::run_supervisor_plan_file_cascade_with_concurrency_policy_and_primary_worktree_opt_in_and_objective_profile_override(
                             options,
                             args.max_concurrent_children,
                             args.allow_primary_worktree,
+                            objective_profile_override,
                         )?
                     }
                 };
@@ -1077,6 +1094,9 @@ struct PlanSuperviseArgs {
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+    /// Named objective profile requested in the emitted supervisor plan.
+    #[arg(long, value_name = "NAME")]
+    objective_profile: Option<String>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -1195,6 +1215,9 @@ struct RunSuperviseArgs {
     /// Runtime. Fake is deterministic in-process simulation and never executes Codex or publishes.
     #[arg(long, value_enum)]
     runtime: Option<supervise::SupervisorRuntime>,
+    /// Named objective profile. Overrides the authored plan selection.
+    #[arg(long, value_name = "NAME")]
+    objective_profile: Option<String>,
     /// Allow supervise to run when the primary worktree is dirty.
     #[arg(long)]
     allow_dirty_primary: bool,

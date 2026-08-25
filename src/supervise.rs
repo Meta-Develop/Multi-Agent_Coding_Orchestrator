@@ -39,6 +39,7 @@ use crate::{
         ApplyBlockerDetail, CandidateValidationBinding, MergeCollectOptions,
         ValidationEvidenceBundle, WorktreeMergeMetadata, VALIDATION_BINDING_VERSION,
     },
+    objective_profile::{resolve_objective_profile, ResolvedObjectiveProfile},
     orchestration_event::{
         FieldGuideEventKind, OrchestrationEventJournal, OrchestrationEventKind, OrchestrationRole,
     },
@@ -272,6 +273,8 @@ mod selection_bridge;
 use selection_bridge::*;
 
 mod assignment_execution;
+#[cfg(test)]
+pub(crate) use assignment_execution::configure_assignment_phase_command_for_test;
 use assignment_execution::*;
 
 mod plan_validation;
@@ -1179,7 +1182,7 @@ impl RuntimeModelCatalog {
     }
 }
 
-const SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION: u32 = 5;
+const SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct RoleEconomicsProfile {
@@ -1198,6 +1201,10 @@ pub struct RoleEconomicsProfile {
     pub model_catalog_observation: RuntimeModelCatalogObservation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<SupervisorExecutionMetadata>,
+    /// Frozen objective-profile evidence for this run. Older reports omit it;
+    /// the generated schema requires it for newly finalized reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_objective_profile: Option<ResolvedObjectiveProfile>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -1241,6 +1248,7 @@ pub enum AssignmentSelectionSource {
     PlanRoleModels,
     OperatorOverride,
     BudgetDegrade,
+    LowDifficultyMechanical,
     Retry,
     LegacyFake,
     LegacyNonpublishableSimulation,
@@ -1353,14 +1361,41 @@ pub enum EffortResolutionObservation {
 pub struct BudgetDegradationRecord {
     pub sequence: usize,
     pub assignment_id: String,
+    #[serde(default)]
+    pub trigger: BudgetDegradationTrigger,
     pub budget_action: BudgetAction,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub budget_reasons: Vec<BudgetReason>,
     pub change: BudgetDegradationChange,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_binding_transition: Option<BudgetDegradationRoleBindingTransition>,
     pub effective_child_model: Option<String>,
     pub effective_child_reasoning_effort: Option<String>,
     pub effective_fan_out: usize,
     pub observation: BudgetDegradationObservation,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetDegradationTrigger {
+    #[default]
+    BudgetPressure,
+    LowDifficultyMechanical,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetDegradationRoleBindingTransition {
+    pub role: AgentRole,
+    pub before: BudgetDegradationRoleBinding,
+    pub after: BudgetDegradationRoleBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetDegradationRoleBinding {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1390,6 +1425,9 @@ pub enum BudgetDegradationChange {
     Halt {
         before_new_dispatch_allowed: bool,
         after_new_dispatch_allowed: bool,
+    },
+    RoleBindingApplied {
+        role: AgentRole,
     },
 }
 
@@ -1622,6 +1660,8 @@ impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMe
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct SupervisorPlanMetadata {
+    objective_profile: Option<String>,
+    resolved_objective_profile: Option<ResolvedObjectiveProfile>,
     spec_fragment_ids: Vec<String>,
     spec_fragment_ids_by_assignment: BTreeMap<String, Vec<String>>,
     assignment_schedule: Vec<AssignmentScheduleEntry>,
@@ -1644,6 +1684,8 @@ struct EvidenceOnlyReauditSource {
 struct WorkerAssignmentMetadata {
     #[serde(default)]
     kind: AssignmentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mechanical_duty: Option<MechanicalTerminalDuty>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -1652,9 +1694,26 @@ struct WorkerAssignmentMetadata {
     target_path: Option<PathBuf>,
 }
 
+/// Typed launch authority for one normalized supervisor assignment.
+///
+/// Every executable plan must declare this field for every recursive
+/// assignment. Omission never grants execution authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentPhase {
+    Planning,
+    Execution,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OrchestratorAssignment {
     pub id: String,
+    /// The sole planning-versus-execution capability selector for launch.
+    ///
+    /// Schedule lineage determines admission order only. The launcher binds
+    /// this typed phase to the validated schedule entry at the same flattened
+    /// index before constructing either confinement layer.
+    pub phase: AssignmentPhase,
     /// Optional per-assignment runtime. A CLI override remains authoritative; absent both,
     /// supervisor execution defaults to Codex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3491,6 +3550,7 @@ impl SupervisorPlan {
             role_models,
             model_catalog_observation: RuntimeModelCatalogObservation::NotConsulted,
             execution: None,
+            resolved_objective_profile: None,
         }
     }
 
