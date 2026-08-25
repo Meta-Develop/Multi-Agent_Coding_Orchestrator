@@ -1361,9 +1361,9 @@ fn sandbox_denial_evidence_is_carried_without_retry() {
         let mut encoded = serde_json::to_value(&run).expect("serialize injected run");
         encoded["sandbox_denials"] = serde_json::to_value(vec![denial_fixture(
             SandboxDenialBoundary::InnerCodex,
-            "maco-worktree-controls-v1",
-            Some("README.md"),
-            SandboxDenialRetryability::NotRetryable,
+            "maco_external_codex_inner_v1",
+            Some("AGENTS.md"),
+            SandboxDenialRetryability::RequiresDeclaredException,
         )])
         .expect("serialize sandbox denial");
         let mut denied: ExternalAgentRun =

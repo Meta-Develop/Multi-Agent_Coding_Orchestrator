@@ -28,6 +28,7 @@ fn supervise_plan_entrypoint_accepts_relative_linked_worktree() -> Result<()> {
             "task": "validate relative linked worktree",
             "assignments": [{
                 "id": "child-a",
+                "phase": "execution",
                 "assigned_paths": ["./src/lib.rs"],
                 "worker_assignments": []
             }]

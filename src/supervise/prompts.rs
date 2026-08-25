@@ -238,18 +238,22 @@ pub(super) fn worker_cacheable_prefix() -> Result<String> {
         r#"You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
 Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
 You are not the supervisor. Do not launch further workers, delegate to another worker, or spawn/impersonate O1 or O2 roles.
+Your authority is execution-only. Do not plan, make judgments, review, act as an acceptance gate, merge, or publish on behalf of another role.
 
 {tool_call_batching_guidance}
 
 Rules:
 - Edit only inside your assigned worktree and only inside claimed paths.
 - Do not mutate the primary worktree.
-- Append one JSON line directly to the exact precreated journal before the next action: {{command,cwd,start_timestamp,end_timestamp,changed_paths}}; cwd absolute, timestamps nonempty RFC3339, paths canonical repo-relative. Never reconstruct at the end or journal bookkeeping.
-- It is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. Refuse empty command, blank apply_patch command[1]/cwd/timestamps, or invalid paths; report WorkerExecutionJournalRecordError and stop. No prose/Markdown.
+- Do not broaden the assignment, add claimed paths, or change files outside the assigned path set.
+- Do not request, access, read, write, disclose, or transmit credentials, secrets, tokens, or keys.
+- Do not stage, commit, push, merge, or otherwise publish changes.
+- Append one JSON line directly to the exact precreated journal before each action: {{command,cwd,start_timestamp,end_timestamp,changed_paths}}; use absolute cwd, nonempty RFC3339 timestamps, and canonical repo-relative paths. Never reconstruct at the end.
+- It is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. On empty command, blank apply_patch command[1]/cwd/timestamps, or invalid paths, report WorkerExecutionJournalRecordError and stop. No prose/Markdown.
 - WorkerReport.commands_run may be a subset of real journal records; each command array element and cwd must be copied byte-for-byte, failed commands included. Never paraphrase, summarize, normalize environment assignments, drop shell wrappers, or invent command identities.
-- apply_patch record example; preserve the full patch:
+- Preserve the full apply_patch record:
 {apply_patch_journal_example}
-- Run validation or record why validation was not run.
+- Validate, or record why not.
 - Return exactly one WorkerReport JSON object with assignment_kind, target_path, files_changed, commands_run, validation_results, findings, bloated_file_flags, decomposition_completion, remaining_risk, and next_safe_action. Do not wrap it in Markdown, a code fence, or prose.
 - Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
 - field_guide_entries is optional: each item has exactly finding and context, no date, source_run, role text, policy, or provenance. Only the trusted supervisor may append accepted audited suggestions.
@@ -672,18 +676,11 @@ Declared role selections:
 - Launch each supplied terminal worker prompt through runtime-native SubAgent/delegated-worker support and preserve its declared role selection. MACO's parent scheduler does not launch those terminal sessions for you; runtime-side role-tagged usage reporting is required before worker usage or cost can be reported.
 {consultation_section}
 
-Collection contract:
-- Incoming report root: {incoming_root}. It is artifact capability, not source-write authority.
-- Exact OrchestratorReviewReport output path (written only by Codex CLI --output-last-message; do not write it with tools):
-{report_path}
-- Return one unwrapped OrchestratorReviewReport JSON object. Embed each accepted terminal WorkerReport unchanged plus an accepted read-only AuditorReport covering every embedded worker id; missing or rejected worker or auditor evidence requires rejection.
-- Source writes are limited to assigned worktree paths. Each worker journal path is a separate precreated exact-file capability and the only non-source write: append directly; its nonwritable parent forbids create, replace, rename, link, or swap.
-- OrchestratorReviewReport schema:
-{schema_path}
-- WorkerReport schema:
-{worker_schema_path}
-- AuditorReport schema:
-{auditor_schema_path}
+Collection:
+- Artifact-only incoming root: {incoming_root}
+- Exact report path for Codex CLI --output-last-message only (never tools): {report_path}
+- Source writes only in assigned worktree paths; each worker journal is a separate exact precreated append-only file and the sole non-source write under a nonwritable parent (never create, replace, rename, link, or swap).
+- Schemas: OrchestratorReviewReport={schema_path}; WorkerReport={worker_schema_path}; AuditorReport={auditor_schema_path}
 
 Supervisor task:
 {task}
@@ -1407,6 +1404,32 @@ mod regression_tests {
         fixed_prompt_fixture_with_ids("child-a", "worker-a", "src/supervise/prompts.rs")
     }
 
+    #[test]
+    fn terminal_worker_prefix_preserves_execution_only_authority() -> Result<()> {
+        let prefix = worker_cacheable_prefix()?;
+        let primary_target = SupervisorExecutionTarget::PrimaryWorktree {
+            claim_paths: vec![PathBuf::from("local/deploy.txt")],
+        };
+        let primary_prefix = worker_cacheable_prefix_for_target(Some(&primary_target))?;
+
+        assert!(prefix.contains(
+            "Do not plan, make judgments, review, act as an acceptance gate, merge, or publish"
+        ));
+        assert!(prefix.contains(
+            "Do not request, access, read, write, disclose, or transmit credentials, secrets, tokens, or keys."
+        ));
+        assert!(prefix.contains(
+            "Do not broaden the assignment, add claimed paths, or change files outside the assigned path set."
+        ));
+        assert!(prefix.contains("Do not stage, commit, push, merge, or otherwise publish changes."));
+        assert!(prefix.contains(
+            "Do not launch further workers, delegate to another worker, or spawn/impersonate O1 or O2 roles."
+        ));
+        assert!(primary_prefix.contains("The assigned worktree is the existing primary checkout"));
+        assert!(!primary_prefix.contains("Do not mutate the primary worktree."));
+        Ok(())
+    }
+
     fn fixed_prompt_fixture_with_ids(
         child_id: &str,
         worker_id: &str,
@@ -1424,6 +1447,7 @@ mod regression_tests {
         };
         let assignment = OrchestratorAssignment {
             id: child_id.to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from(assigned_path)],
@@ -1573,6 +1597,7 @@ mod regression_tests {
     fn worker_embedding_multiplier_uses_all_worker_roles_in_the_run() {
         let assignment = |id: &str, worker_count: usize| OrchestratorAssignment {
             id: id.to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
@@ -1660,6 +1685,7 @@ mod regression_tests {
         };
         let assignment = OrchestratorAssignment {
             id: "child-lite".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
@@ -1744,6 +1770,7 @@ mod regression_tests {
     fn judgment_and_auditor_prompts_never_receive_the_lite_profile() {
         let assignment = OrchestratorAssignment {
             id: "child-judgment".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
@@ -2121,6 +2148,7 @@ mod regression_tests {
         .expect("review-lens fixture capability policy");
         let assignment = OrchestratorAssignment {
             id: "child-decorrelated".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("src/review.rs")],
@@ -2281,6 +2309,7 @@ mod regression_tests {
     fn review_lens_prompt_accepts_bounded_full_transcript_above_fixture_ceiling() -> Result<()> {
         let assignment = OrchestratorAssignment {
             id: "child-bounded-lens".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("src/review.rs")],

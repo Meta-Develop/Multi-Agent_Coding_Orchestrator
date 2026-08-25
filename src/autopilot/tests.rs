@@ -2,6 +2,10 @@ use super::*;
 use crate::{
     external_agent::ExternalAgentCommand,
     gate_denial::GateDenialReason,
+    mutation_taxonomy::{
+        set_autopilot_dispatch_decisions_for_test, AutonomousMutationDecision,
+        TAXONOMY_REVIEW_REQUIRED_GATE_ID,
+    },
     supervise::{
         AuditorReport, Finding, LicensedBreakageDeclaration, LicensedBreakageDependentScope,
         OrchestratorReviewReport,
@@ -181,6 +185,7 @@ fn omitted_profile_preserves_legacy_supervisor_plan_bytes() {
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
             id: "agent-a".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: plan.assigned_paths.clone(),
@@ -814,6 +819,7 @@ fn licensed_autopilot_supervisor_plan() -> (Value, LicensedBreakageDeclaration, 
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
             id: "child-a".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("README.md")],
@@ -1266,6 +1272,62 @@ fn assert_pre_dispatch_autopilot_cleanup(
 
 #[cfg(target_os = "linux")]
 #[test]
+fn autopilot_taxonomy_refuses_source_before_any_dispatch_with_exact_gate() {
+    skip_without_containment!();
+    let fixture = IsolatedLicensedAutopilot::new("autopilot-taxonomy-source-refused");
+    let repo = &fixture.repo;
+    let run_name = fixture.run_name.as_str();
+    let source_run_id =
+        RunId::new(format!("{run_name}-supervise")).expect("taxonomy source run id");
+    let _taxonomy_override =
+        set_autopilot_dispatch_decisions_for_test([AutonomousMutationDecision::Refuse {
+            gate_id: TAXONOMY_REVIEW_REQUIRED_GATE_ID,
+        }]);
+
+    let (report, source_child_dispatches, follow_up_child_dispatches) =
+        run_injected_licensed_autopilot_cascade_result_with_bounds(
+            fixture.temp_path(),
+            repo,
+            run_name,
+            None,
+            None,
+        );
+    let report = report.expect("return taxonomy source refusal report");
+
+    assert_eq!(source_child_dispatches, 0);
+    assert_eq!(follow_up_child_dispatches, 0);
+    assert_eq!(report.status, AutopilotRunStatus::Refused, "{report:#?}");
+    assert!(!report.success, "{report:#?}");
+    assert_eq!(report.attempt_count, 0, "{report:#?}");
+    assert!(!report.generated_follow_up_dispatch_performed);
+    assert!(report.primary_worktree_untouched);
+    assert!(matches!(
+        report.gate_denials.as_slice(),
+        [GateDenial {
+            context: VerifiedGateContext {
+                source: GateCheckSource::FutureApprovalReview,
+                owner,
+                ..
+            },
+            reason: GateDenialReason::ApprovalReview {
+                denial: ApprovalReviewDenial::HumanReviewRequired
+            },
+            ..
+        }] if owner == TAXONOMY_REVIEW_REQUIRED_GATE_ID
+    ));
+    assert!(report
+        .next_action
+        .contains(TAXONOMY_REVIEW_REQUIRED_GATE_ID));
+    assert_pre_dispatch_autopilot_cleanup(repo, &report, &source_run_id);
+    assert_eq!(
+        collect_autopilot_run(repo, report.run_id.clone())
+            .expect("collect taxonomy-refused source run")["status"],
+        Value::String("refused".to_string())
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn autopilot_max_zero_refuses_source_before_any_dispatch_and_leaves_no_state() {
     skip_without_containment!();
     let fixture = IsolatedLicensedAutopilot::new("autopilot-max-zero-source-refused");
@@ -1674,6 +1736,79 @@ fn autopilot_max_child_dispatches_refuses_first_follow_up_before_dispatch_and_re
         primary_readme_before
     );
     assert!(!repo.join("src/client.rs").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn autopilot_taxonomy_refuses_generated_follow_up_as_typed_outcome() {
+    skip_without_containment!();
+    let fixture = IsolatedLicensedAutopilot::new("autopilot-taxonomy-follow-up-refused");
+    let repo = &fixture.repo;
+    let run_name = fixture.run_name.as_str();
+    let _taxonomy_override = set_autopilot_dispatch_decisions_for_test([
+        AutonomousMutationDecision::Allow,
+        AutonomousMutationDecision::Refuse {
+            gate_id: TAXONOMY_REVIEW_REQUIRED_GATE_ID,
+        },
+    ]);
+
+    let (report, source_child_dispatches, follow_up_child_dispatches) =
+        run_injected_licensed_autopilot_cascade_result(fixture.temp_path(), repo, run_name);
+    let report = report.expect("return taxonomy follow-up refusal report");
+
+    assert_eq!(source_child_dispatches, 1);
+    assert_eq!(follow_up_child_dispatches, 0);
+    assert_eq!(report.status, AutopilotRunStatus::Refused, "{report:#?}");
+    assert!(!report.success, "{report:#?}");
+    assert!(!report.generated_follow_up_dispatch_performed);
+    assert!(report.primary_worktree_untouched);
+    assert!(report.gate_denials.iter().any(|denial| {
+        denial.context.owner == TAXONOMY_REVIEW_REQUIRED_GATE_ID
+            && matches!(
+                denial.reason,
+                GateDenialReason::ApprovalReview {
+                    denial: ApprovalReviewDenial::HumanReviewRequired
+                }
+            )
+    }));
+    assert!(report
+        .next_action
+        .contains(TAXONOMY_REVIEW_REQUIRED_GATE_ID));
+
+    let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Autopilot, &report.run_id)
+        .expect("open taxonomy-refused Autopilot artifacts");
+    let cascade = serde_json::from_slice::<supervise::SupervisorCascadeOutcome>(
+        &reader
+            .read(Path::new("follow-up-cascade-report.json"))
+            .expect("read taxonomy-refused cascade report"),
+    )
+    .expect("decode taxonomy-refused cascade report");
+    assert!(!cascade.follow_up_cascade_success, "{cascade:#?}");
+    assert_undispatched_generated_follow_up_queue(
+        cascade
+            .follow_up_queue
+            .as_ref()
+            .expect("taxonomy-refused queue summary"),
+    );
+}
+
+#[test]
+fn dispatched_subordinate_denial_cannot_impersonate_taxonomy_refusal() {
+    let denial = GateDenial::from_approval_review(
+        "generated-item",
+        TAXONOMY_REVIEW_REQUIRED_GATE_ID,
+        ApprovalReviewDenial::HumanReviewRequired,
+        [PathBuf::from("src/lib.rs")],
+    )
+    .expect("construct taxonomy-shaped denial");
+    assert_eq!(
+        find_generated_follow_up_taxonomy_gate_id(std::slice::from_ref(&denial), &[]),
+        Some(TAXONOMY_REVIEW_REQUIRED_GATE_ID.to_string())
+    );
+    assert_eq!(
+        find_generated_follow_up_taxonomy_gate_id(std::slice::from_ref(&denial), &[&denial]),
+        None
+    );
 }
 
 #[cfg(target_os = "linux")]

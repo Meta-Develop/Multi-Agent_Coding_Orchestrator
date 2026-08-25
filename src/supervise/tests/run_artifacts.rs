@@ -2385,6 +2385,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
             id: assignment_id.to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("README.md")],
