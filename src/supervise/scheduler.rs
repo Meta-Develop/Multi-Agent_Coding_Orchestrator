@@ -322,15 +322,22 @@ struct SchedulerProgress {
 impl SchedulerProgress {
     #[cfg(test)]
     fn new(assignment_count: usize, max_concurrent_children: usize) -> Self {
-        Self::new_with_selection_state(assignment_count, max_concurrent_children, None)
+        Self::new_with_selection_state(
+            assignment_count,
+            max_concurrent_children,
+            None,
+            SupervisorRuntime::Fake,
+        )
+        .expect("scheduler progress without automatic selection is valid")
     }
 
     fn new_with_selection_state(
         assignment_count: usize,
         max_concurrent_children: usize,
         automatic_selection_state: Option<SupervisorAutomaticSelectionState>,
-    ) -> Self {
-        Self {
+        runtime: SupervisorRuntime,
+    ) -> Result<Self> {
+        Ok(Self {
             indexed_outcomes: (0..assignment_count).map(|_| None).collect(),
             health_breaker: SwarmHealthCircuitBreaker::default(),
             budget_prevented_dispatch: false,
@@ -340,8 +347,14 @@ impl SchedulerProgress {
             budget_degradation: BudgetDegradationController::new_with_selection_state(
                 max_concurrent_children,
                 automatic_selection_state,
-            ),
-        }
+                runtime,
+            )?,
+        })
+    }
+
+    fn commit_completed_selection_prefix(&mut self, runtime: SupervisorRuntime) -> Result<()> {
+        self.budget_degradation
+            .commit_completed_selection_prefix(&self.indexed_outcomes, runtime)
     }
 }
 
@@ -415,6 +428,20 @@ impl AssignmentBudgetPolicy {
                 }
             }
         }
+        for lens in &mut effective.review_lenses {
+            if let ReviewLensBackendConfig::Model {
+                reasoning_effort, ..
+            } = &mut lens.backend
+            {
+                let resolved = resolve_reasoning_effort(
+                    AgentRole::Auditor,
+                    self.assignment_reasoning_effort,
+                    reasoning_effort.as_deref(),
+                    0,
+                );
+                *reasoning_effort = Some(resolved.resolved);
+            }
+        }
         effective
     }
 
@@ -461,8 +488,45 @@ impl AssignmentBudgetPolicy {
             .collect())
     }
 
+    fn commit_completed_selection_events(
+        &mut self,
+        runtime: SupervisorRuntime,
+        events: &[SupervisorSelectionEvent],
+    ) -> Result<()> {
+        let Some(state) = self.selector_state.as_mut() else {
+            if events.is_empty() {
+                return Ok(());
+            }
+            bail!("completed automatic-selection events have no manager replay state");
+        };
+        let bindings = state.commit_completed_selection_events(runtime, events)?;
+        self.selector_overrides.extend(bindings.model_overrides);
+        self.selector_runtime_overrides
+            .extend(bindings.runtime_overrides);
+        Ok(())
+    }
+
     pub(super) fn selected_runtime_for(&self, role: AgentRole) -> Option<SupervisorRuntime> {
         self.selector_runtime_overrides.get(&role).copied()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_selector_binding_for_test(
+        &mut self,
+        role: AgentRole,
+        runtime: SupervisorRuntime,
+        selection: RoleModelSelection,
+    ) {
+        self.selector_overrides.insert(role, selection);
+        self.selector_runtime_overrides.insert(role, runtime);
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_assignment_reasoning_effort_for_test(
+        &mut self,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) {
+        self.assignment_reasoning_effort = reasoning_effort;
     }
 
     #[cfg(test)]
@@ -503,6 +567,7 @@ struct BudgetDegradationController {
     records: Vec<BudgetDegradationRecord>,
     assignment_effort_bindings: Vec<AssignmentEffortBinding>,
     last_new_dispatch_allowed: bool,
+    next_selection_commit_index: usize,
 }
 
 struct AssignmentBudgetPolicyRequest<'a> {
@@ -519,17 +584,26 @@ struct AssignmentBudgetPolicyRequest<'a> {
 impl BudgetDegradationController {
     #[cfg(test)]
     fn new(max_concurrent_children: usize) -> Self {
-        Self::new_with_selection_state(max_concurrent_children, None)
+        Self::new_with_selection_state(max_concurrent_children, None, SupervisorRuntime::Fake)
+            .expect("budget controller without automatic selection is valid")
     }
 
     fn new_with_selection_state(
         max_concurrent_children: usize,
         automatic_selection_state: Option<SupervisorAutomaticSelectionState>,
-    ) -> Self {
-        Self {
+        runtime: SupervisorRuntime,
+    ) -> Result<Self> {
+        let selector_bindings = automatic_selection_state
+            .as_ref()
+            .map(|state| state.executable_bindings(runtime))
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Self {
             rung: BudgetDegradationRung::ModelTier,
             policy: AssignmentBudgetPolicy {
                 selector_state: automatic_selection_state,
+                selector_overrides: selector_bindings.model_overrides,
+                selector_runtime_overrides: selector_bindings.runtime_overrides,
                 ..AssignmentBudgetPolicy::default()
             },
             worker_binding_trigger: None,
@@ -537,7 +611,30 @@ impl BudgetDegradationController {
             records: Vec::new(),
             assignment_effort_bindings: Vec::new(),
             last_new_dispatch_allowed: true,
+            next_selection_commit_index: 0,
+        })
+    }
+
+    fn commit_completed_selection_prefix(
+        &mut self,
+        indexed_outcomes: &[Option<AssignmentExecutionOutcome>],
+        runtime: SupervisorRuntime,
+    ) -> Result<()> {
+        while let Some(Some(outcome)) = indexed_outcomes.get(self.next_selection_commit_index) {
+            self.policy
+                .commit_completed_selection_events(runtime, &outcome.selection_decisions)
+                .with_context(|| {
+                    format!(
+                        "failed to commit automatic-selection events for schedule index {}",
+                        self.next_selection_commit_index
+                    )
+                })?;
+            self.next_selection_commit_index = self
+                .next_selection_commit_index
+                .checked_add(1)
+                .context("automatic-selection schedule commit index overflowed")?;
         }
+        Ok(())
     }
 
     fn assignment_policy(
@@ -928,14 +1025,26 @@ impl BudgetDegradationController {
         plan: &SupervisorPlan,
         policy: &AssignmentBudgetPolicy,
     ) {
+        // These bindings describe the assignment admission policy only. Retry-time selector
+        // decisions remain attempt-aware in `selection_decisions` and command evidence; do not
+        // overwrite this admission record and misrepresent a later retry as the initial binding.
+        let effective_plan = policy.apply(plan);
         let mut push = |duty_id: String,
                         role: AgentRole,
                         requested: Option<ReasoningEffort>,
                         fallback: Option<&str>,
+                        active_effort: Option<&str>,
                         budget_steps: usize,
                         process_observation: ProcessObservation,
                         unavailable_reason: Option<String>| {
-            let resolved = resolve_reasoning_effort(role, requested, fallback, budget_steps);
+            let mut resolved = resolve_reasoning_effort(role, requested, fallback, budget_steps);
+            if let Some(active_effort) = active_effort {
+                if resolved.resolved != active_effort {
+                    resolved.fallback = active_effort.to_string();
+                    resolved.resolved = active_effort.to_string();
+                    resolved.observation = EffortResolutionObservation::BudgetDegraded;
+                }
+            }
             self.assignment_effort_bindings
                 .push(AssignmentEffortBinding {
                     assignment_id: assignment.id.clone(),
@@ -951,48 +1060,60 @@ impl BudgetDegradationController {
         };
         let child_fallback =
             configured_role_model_selection(plan, AgentRole::ChildOrchestrator).reasoning_effort;
+        let active_child_effort =
+            configured_role_model_selection(&effective_plan, AgentRole::ChildOrchestrator)
+                .reasoning_effort;
         push(
             assignment.id.clone(),
             AgentRole::ChildOrchestrator,
             requested_reasoning_effort,
             child_fallback.as_deref(),
+            active_child_effort.as_deref(),
             0,
             ProcessObservation::SchedulerObserved,
-            None,
+            Some(
+                "admission-only effort binding; retry-time active effort is recorded in selection_decisions and process command evidence"
+                    .to_string(),
+            ),
         );
         let worker_fallback =
             configured_role_model_selection(plan, AgentRole::Worker).reasoning_effort;
+        let active_worker_effort =
+            configured_role_model_selection(&effective_plan, AgentRole::Worker).reasoning_effort;
         for worker in &assignment.worker_assignments {
             push(
                 worker.id.clone(),
                 AgentRole::Worker,
                 requested_reasoning_effort,
                 worker_fallback.as_deref(),
+                active_worker_effort.as_deref(),
                 policy.worker_effort_degradation_steps,
                 ProcessObservation::NotProcessObservable,
                 Some(
-                    "nested worker effort is resolved in prompt context; no separate worker process is launched"
+                    "admission-only nested-worker effort binding; retry-time active effort is recorded in selection_decisions and prompt evidence, and MACO does not separately observe a worker process or runtime identity"
                         .to_string(),
                 ),
             );
         }
         let gate_fallback =
             configured_role_model_selection(plan, AgentRole::GateClassifier).reasoning_effort;
+        let active_gate_effort =
+            configured_role_model_selection(&effective_plan, AgentRole::GateClassifier)
+                .reasoning_effort;
         push(
             format!("{}-acceptance-gate", assignment.id),
             AgentRole::GateClassifier,
             requested_reasoning_effort,
             gate_fallback.as_deref(),
+            active_gate_effort.as_deref(),
             0,
             ProcessObservation::NotProcessObservable,
             Some(
-                "the current acceptance-gate classifier is a deterministic local broker without provider reasoning-effort telemetry"
+                "admission-only effort binding; the current acceptance-gate classifier is a deterministic local broker without provider reasoning-effort telemetry"
                     .to_string(),
             ),
         );
-        let auditor_fallback =
-            configured_role_model_selection(plan, AgentRole::Auditor).reasoning_effort;
-        for (lens_index, lens) in plan.review_lenses.iter().enumerate() {
+        for (lens_index, lens) in effective_plan.review_lenses.iter().enumerate() {
             let requested = requested_reasoning_effort.or_else(|| {
                 lens.backend
                     .reasoning_effort()
@@ -1002,11 +1123,12 @@ impl BudgetDegradationController {
                 review_lens_auditor_id(assignment, lens_index),
                 AgentRole::Auditor,
                 requested,
-                auditor_fallback.as_deref(),
+                lens.backend.reasoning_effort(),
+                None,
                 0,
                 ProcessObservation::NotRetained,
                 Some(
-                    "the scheduler resolved this review-auditor duty; inspect commands_run for launch evidence"
+                    "admission-only review-auditor effort binding; retry-time active effort is recorded in selection_decisions, and commands_run contains launch evidence"
                         .to_string(),
                 ),
             );
@@ -1024,18 +1146,22 @@ pub(super) fn assignment_policy_after_completed_settlement_for_test(
     runtime: SupervisorRuntime,
 ) -> Result<AssignmentBudgetPolicy> {
     let assignment_metadata = AssignmentMetadata::new();
-    BudgetDegradationController::new_with_selection_state(1, Some(automatic_selection_state))
-        .assignment_policy(AssignmentBudgetPolicyRequest {
-            assignment,
-            requested_reasoning_effort: None,
-            report,
-            plan,
-            requested_plan: plan,
-            assignment_metadata: &assignment_metadata,
-            catalog,
-            runtime,
-        })?
-        .context("completed settlement unexpectedly stopped the next assignment admission")
+    BudgetDegradationController::new_with_selection_state(
+        1,
+        Some(automatic_selection_state),
+        runtime,
+    )?
+    .assignment_policy(AssignmentBudgetPolicyRequest {
+        assignment,
+        requested_reasoning_effort: None,
+        report,
+        plan,
+        requested_plan: plan,
+        assignment_metadata: &assignment_metadata,
+        catalog,
+        runtime,
+    })?
+    .context("completed settlement unexpectedly stopped the next assignment admission")
 }
 
 fn assignment_mechanical_duties(
@@ -1326,6 +1452,7 @@ fn run_serial_assignment_schedule(
             context.assignment_schedule,
             context.artifacts,
         )?;
+        progress.commit_completed_selection_prefix(context.options.runtime)?;
         if pending.is_empty() {
             break;
         }
@@ -1390,6 +1517,7 @@ fn run_serial_assignment_schedule(
         if !preclaim.allows_path_claim() {
             pending.remove(&index);
             progress.indexed_outcomes[index] = Some(parked_preclaim_outcome(assignment, &preclaim));
+            progress.commit_completed_selection_prefix(context.options.runtime)?;
             continue;
         }
         pending.remove(&index);
@@ -1454,6 +1582,7 @@ fn run_serial_assignment_schedule(
         let abort = outcome.requires_scheduler_abort();
         let budget_stopped = outcome.budget_dispatch_stopped;
         progress.indexed_outcomes[index] = Some(outcome);
+        progress.commit_completed_selection_prefix(context.options.runtime)?;
         if abort || budget_stopped {
             progress.budget_prevented_dispatch |= budget_stopped;
             if !pending.is_empty()
@@ -1519,6 +1648,7 @@ fn run_concurrent_assignment_schedule(
                     context.assignment_schedule,
                     context.artifacts,
                 )?;
+                progress.commit_completed_selection_prefix(context.options.runtime)?;
                 while active.len() < progress.budget_degradation.effective_fan_out {
                     if !progress.health_breaker.permits_admission() {
                         stop_scheduling = true;
@@ -1583,6 +1713,7 @@ fn run_concurrent_assignment_schedule(
                         pending.remove(&index);
                         progress.indexed_outcomes[index] =
                             Some(parked_preclaim_outcome(assignment, &preclaim));
+                        progress.commit_completed_selection_prefix(context.options.runtime)?;
                         continue;
                     }
                     pending.remove(&index);
@@ -1683,6 +1814,8 @@ fn run_concurrent_assignment_schedule(
                                     );
                                     progress.indexed_outcomes[active_index] = Some(outcome);
                                 }
+                                progress
+                                    .commit_completed_selection_prefix(context.options.runtime)?;
                                 return Err(error).context(format!(
                                     "supervisor assignment '{}' ended before committing or declining budget admission",
                                     assignment.id
@@ -1702,6 +1835,7 @@ fn run_concurrent_assignment_schedule(
                                 .as_ref()
                                 .context("spawn failure outcome disappeared")?;
                             record_completed_assignment_checkpoint(context, index, outcome)?;
+                            progress.commit_completed_selection_prefix(context.options.runtime)?;
                             break;
                         }
                     }
@@ -1771,6 +1905,7 @@ fn run_concurrent_assignment_schedule(
                 }
             }
             progress.indexed_outcomes[completed_index] = Some(outcome);
+            progress.commit_completed_selection_prefix(context.options.runtime)?;
         }
 
         for (index, handle) in active {
@@ -1784,6 +1919,7 @@ fn run_concurrent_assignment_schedule(
             record_completed_assignment_checkpoint(context, index, &outcome)?;
             release_concurrent_assignment(&mut outcome, context.sync_store, context.semantic_store);
             progress.indexed_outcomes[index] = Some(outcome);
+            progress.commit_completed_selection_prefix(context.options.runtime)?;
         }
         Ok(())
     })
@@ -3308,7 +3444,8 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 plan.assignments.len(),
                 max_concurrent_children,
                 automatic_selection_state,
-            );
+                options.runtime,
+            )?;
             let scheduler_context = AssignmentSchedulerContext {
                 plan: &plan,
                 requested_plan: &requested_plan,
@@ -3471,7 +3608,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     if nested_workers_present {
         collected.findings.push(Finding {
             severity: FindingSeverity::Warning,
-            message: "worker usage is not process-observable because nested workers execute inside child Codex sessions; child-orchestrator and auditor process usage remains reportable, while runtime-side role-tagged usage reporting is required before worker usage or cost can be reported"
+            message: "worker usage is not process-observable because nested-worker delegation is requested through the child-orchestrator contract without a separately MACO-observed worker process or runtime identity; child-orchestrator and auditor process usage remains reportable, while runtime-side role-tagged usage reporting is required before worker usage or cost can be reported"
                 .to_string(),
             paths: Vec::new(),
         });
@@ -3578,6 +3715,9 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         total_cost_usd: observed_total_cost_usd,
         lens_total_usage: review_lens_total_usage,
         lens_total_cost_usd: observed_review_lens_total_cost_usd,
+        // The validated plan remains the immutable authority for lens/backend identity and
+        // pricing. Each usage sample carries its actual active-attempt model; aggregation must
+        // retain that model rather than re-impose the original configured selection.
     } = role_usage_report(&plan, std::mem::take(&mut collected.usage_samples))?;
     let total_cost_usd =
         finalize_supervisor_cost(usage_complete, &mut role_usage, observed_total_cost_usd);
@@ -3744,7 +3884,12 @@ mod selection_policy_tests {
         })
     }
 
-    fn automatic_provenance() -> Result<crate::selection::SelectionProvenance> {
+    fn automatic_selection_fixture() -> Result<(
+        RuntimeModelCatalog,
+        SupervisorAutomaticSelectionState,
+        Vec<SupervisorSelectionEvent>,
+        SupervisorPlan,
+    )> {
         let priors = crate::selection::built_in_prior_dataset()?;
         let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(
             priors
@@ -3783,19 +3928,31 @@ mod selection_policy_tests {
         };
         let mut plan = test_plan();
         let resolved_objective_profile = default_resolved_objective_profile()?;
-        initialize_supervisor_selection(
+        let resolution = initialize_supervisor_selection(
             &mut plan,
             SupervisorRuntime::Codex,
             &catalog,
             &admission,
             &AdvertisedCatalogSet::empty(),
             Some(&resolved_objective_profile),
-        )?
-        .decisions
-        .into_iter()
-        .next()
-        .map(|event| event.provenance)
-        .context("initial selector provenance")
+        )?;
+        Ok((
+            catalog,
+            resolution
+                .automatic_state
+                .context("automatic selector same-run state")?,
+            resolution.decisions,
+            plan,
+        ))
+    }
+
+    fn automatic_provenance() -> Result<crate::selection::SelectionProvenance> {
+        automatic_selection_fixture()?
+            .2
+            .into_iter()
+            .next()
+            .map(|event| event.provenance)
+            .context("initial selector provenance")
     }
 
     fn initialized_repository() -> (tempfile::TempDir, PathBuf) {
@@ -3911,6 +4068,380 @@ mod selection_policy_tests {
                 panic!("selector-bound lens changed backend")
             }
         }
+    }
+
+    #[test]
+    fn admission_effort_bindings_use_the_active_budget_selection() {
+        let mut plan = test_plan();
+        let assignment = OrchestratorAssignment {
+            id: "active-effort-assignment".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: vec![WorkerAssignment {
+                id: "active-effort-worker".to_string(),
+                role: AgentRole::Worker,
+                assigned_paths: vec![PathBuf::from("README.md")],
+                semantic_symbols: Vec::new(),
+                semantic_modules: Vec::new(),
+                task: None,
+                environment_requirements: Vec::new(),
+                report_path: None,
+            }],
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        plan.assignments = vec![assignment.clone()];
+        plan.role_models
+            .insert(AgentRole::Worker, role_selection("initial-worker", "low"));
+        let (initial_auditor_model, initial_auditor_effort) = match &plan.review_lenses[0].backend {
+            ReviewLensBackendConfig::Model {
+                model,
+                reasoning_effort,
+                ..
+            } => (
+                model.clone(),
+                reasoning_effort.clone().expect("default auditor effort"),
+            ),
+            ReviewLensBackendConfig::Precomputed { .. } => {
+                panic!("default lens must be model-backed")
+            }
+        };
+        plan.role_models.insert(
+            AgentRole::Auditor,
+            role_selection(&initial_auditor_model, &initial_auditor_effort),
+        );
+        plan.review_lenses.push(ReviewLensConfig {
+            id: "active-effort-custom-lens".to_string(),
+            backend: ReviewLensBackendConfig::Model {
+                backend_id: "custom-provider".to_string(),
+                model: "custom-auditor".to_string(),
+                reasoning_effort: Some("ultra".to_string()),
+            },
+            information_scope: ReviewInformationScope::OutputReportOnly,
+        });
+        let mut policy = AssignmentBudgetPolicy::default();
+        policy.set_assignment_reasoning_effort_for_test(Some(ReasoningEffort::Low));
+        policy.set_selector_binding_for_test(
+            AgentRole::Worker,
+            SupervisorRuntime::Codex,
+            role_selection("active-worker", "high"),
+        );
+        policy.set_selector_binding_for_test(
+            AgentRole::Auditor,
+            SupervisorRuntime::Codex,
+            role_selection("active-auditor", "ultra"),
+        );
+        let active_plan = policy.apply(&plan);
+        assert_eq!(
+            active_plan.role_models[&AgentRole::Worker]
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            active_plan.role_models[&AgentRole::Auditor]
+                .reasoning_effort
+                .as_deref(),
+            Some("ultra")
+        );
+        assert_eq!(active_plan.review_lenses.len(), 2);
+        assert!(active_plan
+            .review_lenses
+            .iter()
+            .all(|lens| { lens.backend.reasoning_effort() == Some("xhigh") }));
+
+        let mut controller = BudgetDegradationController::new(1);
+        controller.record_assignment_effort_bindings(
+            &assignment,
+            Some(ReasoningEffort::Low),
+            &plan,
+            &policy,
+        );
+        let worker = controller
+            .assignment_effort_bindings
+            .iter()
+            .find(|binding| binding.role == AgentRole::Worker)
+            .expect("nested-worker admission binding");
+        assert_eq!(worker.resolved_reasoning_effort, "high");
+        assert_eq!(
+            worker.resolution_observation,
+            EffortResolutionObservation::BudgetDegraded
+        );
+        assert!(worker
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("admission-only")));
+        let auditors = controller
+            .assignment_effort_bindings
+            .iter()
+            .filter(|binding| binding.role == AgentRole::Auditor)
+            .collect::<Vec<_>>();
+        assert_eq!(auditors.len(), 2);
+        for (lens_index, auditor) in auditors.into_iter().enumerate() {
+            assert_eq!(
+                auditor.duty_id,
+                review_lens_auditor_id(&assignment, lens_index)
+            );
+            assert_eq!(
+                auditor.requested_reasoning_effort,
+                Some(ReasoningEffort::Low)
+            );
+            assert_eq!(auditor.fallback_reasoning_effort, "xhigh");
+            assert_eq!(auditor.resolved_reasoning_effort, "xhigh");
+            assert_eq!(
+                auditor.resolution_observation,
+                EffortResolutionObservation::HardFloorClamped
+            );
+            assert!(auditor
+                .unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("retry-time active effort")));
+        }
+    }
+
+    #[test]
+    fn completed_retry_promotes_matching_execution_override_and_reroute_state() -> Result<()> {
+        let (catalog, state, _, plan) = automatic_selection_fixture()?;
+        let mut controller = BudgetDegradationController::new_with_selection_state(
+            2,
+            Some(state),
+            SupervisorRuntime::Codex,
+        )?;
+        let mut retry_policy = controller.policy.clone();
+
+        let retry_events = retry_policy.reselect(
+            SupervisorRuntime::Codex,
+            &catalog,
+            SelectorReselectionRequest {
+                roles: &[AgentRole::Worker],
+                assignment_id: Some("retry-assignment"),
+                attempt: 2,
+                primary_cause: SupervisorSelectionEventCause::Retry,
+                retry_count: 1,
+                budget_signal: crate::selection::BudgetSignal::Continue,
+                environment_rejections: &[],
+            },
+        )?;
+        let retry_choice = retry_events[0]
+            .provenance
+            .choice
+            .as_ref()
+            .context("retry selected worker choice")?
+            .candidate
+            .clone();
+        let retry_selection = retry_policy
+            .selector_overrides
+            .get(&AgentRole::Worker)
+            .context("retry selected executable worker override")?
+            .clone();
+        assert_eq!(
+            retry_policy
+                .selected_runtime_for(AgentRole::Worker)
+                .map(SupervisorRuntime::as_str),
+            Some(retry_choice.runtime.as_str())
+        );
+
+        let indexed_outcomes = vec![Some(AssignmentExecutionOutcome {
+            selection_decisions: retry_events.clone(),
+            ..AssignmentExecutionOutcome::default()
+        })];
+        controller
+            .commit_completed_selection_prefix(&indexed_outcomes, SupervisorRuntime::Codex)?;
+
+        let continue_plan = controller.policy.apply(&plan);
+        assert_eq!(
+            continue_plan.role_models.get(&AgentRole::Worker),
+            Some(&retry_selection)
+        );
+        assert_eq!(
+            controller
+                .policy
+                .selected_runtime_for(AgentRole::Worker)
+                .map(SupervisorRuntime::as_str),
+            Some(retry_choice.runtime.as_str())
+        );
+
+        let mut later_policy = controller.policy.clone();
+        let later_events = later_policy.reselect(
+            SupervisorRuntime::Codex,
+            &catalog,
+            SelectorReselectionRequest {
+                roles: &[AgentRole::Worker],
+                assignment_id: Some("later-budget-assignment"),
+                attempt: 0,
+                primary_cause: SupervisorSelectionEventCause::BudgetDegrade,
+                retry_count: 0,
+                budget_signal: crate::selection::BudgetSignal::Degrade,
+                environment_rejections: &[],
+            },
+        )?;
+
+        assert_eq!(
+            retry_events[0].assignment_id.as_deref(),
+            Some("retry-assignment")
+        );
+        assert_eq!(retry_events[0].attempt, 2);
+        assert_eq!(
+            later_events[0]
+                .provenance
+                .normalized_input
+                .signals
+                .previous_choice
+                .as_ref(),
+            Some(&retry_choice)
+        );
+        assert_eq!(
+            later_events[0].primary_cause,
+            SupervisorSelectionEventCause::BudgetDegrade
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_retries_share_predispatch_state_and_commit_in_schedule_order() -> Result<()> {
+        let (catalog, state, initial_events, plan) = automatic_selection_fixture()?;
+        let initial_worker = initial_events
+            .iter()
+            .find(|event| event.role == AgentRole::Worker)
+            .and_then(|event| event.provenance.choice.as_ref())
+            .context("initial worker selection")?
+            .candidate
+            .clone();
+        let mut controller = BudgetDegradationController::new_with_selection_state(
+            2,
+            Some(state),
+            SupervisorRuntime::Codex,
+        )?;
+        let policies = [controller.policy.clone(), controller.policy.clone()];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut completed = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (index, mut policy) in policies.into_iter().enumerate() {
+                let barrier = barrier.clone();
+                let catalog = &catalog;
+                handles.push(scope.spawn(
+                    move || -> Result<(usize, SupervisorSelectionEvent, RoleModelSelection)> {
+                        barrier.wait();
+                        let events = policy.reselect(
+                            SupervisorRuntime::Codex,
+                            catalog,
+                            SelectorReselectionRequest {
+                                roles: &[AgentRole::Worker],
+                                assignment_id: Some(if index == 0 {
+                                    "schedule-0"
+                                } else {
+                                    "schedule-1"
+                                }),
+                                attempt: index + 1,
+                                primary_cause: SupervisorSelectionEventCause::Retry,
+                                retry_count: u32::try_from(index + 1)
+                                    .context("test retry count fits u32")?,
+                                budget_signal: crate::selection::BudgetSignal::Continue,
+                                environment_rejections: &[],
+                            },
+                        )?;
+                        let selection = policy
+                            .selector_overrides
+                            .get(&AgentRole::Worker)
+                            .context("retry worker override")?
+                            .clone();
+                        Ok((
+                            index,
+                            events.into_iter().next().context("retry event")?,
+                            selection,
+                        ))
+                    },
+                ));
+            }
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .expect("concurrent retry thread did not panic")
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        completed.sort_by_key(|(index, _, _)| *index);
+        assert!(completed.iter().all(|(_, event, _)| {
+            event
+                .provenance
+                .normalized_input
+                .signals
+                .previous_choice
+                .as_ref()
+                == Some(&initial_worker)
+        }));
+
+        let schedule_one_choice = completed[1]
+            .1
+            .provenance
+            .choice
+            .as_ref()
+            .context("schedule-one retry choice")?
+            .clone();
+        let mut indexed_outcomes = vec![None, None];
+        indexed_outcomes[1] = Some(AssignmentExecutionOutcome {
+            selection_decisions: vec![completed[1].1.clone()],
+            ..AssignmentExecutionOutcome::default()
+        });
+        controller
+            .commit_completed_selection_prefix(&indexed_outcomes, SupervisorRuntime::Codex)?;
+        assert_eq!(controller.next_selection_commit_index, 0);
+
+        indexed_outcomes[0] = Some(AssignmentExecutionOutcome {
+            selection_decisions: vec![completed[0].1.clone()],
+            ..AssignmentExecutionOutcome::default()
+        });
+        controller
+            .commit_completed_selection_prefix(&indexed_outcomes, SupervisorRuntime::Codex)?;
+        assert_eq!(controller.next_selection_commit_index, 2);
+        assert_eq!(
+            controller
+                .policy
+                .selected_runtime_for(AgentRole::Worker)
+                .map(SupervisorRuntime::as_str),
+            Some(schedule_one_choice.candidate.runtime.as_str())
+        );
+        assert_eq!(
+            controller
+                .policy
+                .apply(&plan)
+                .role_models
+                .get(&AgentRole::Worker),
+            Some(&completed[1].2)
+        );
+
+        let mut later_policy = controller.policy.clone();
+        let later_events = later_policy.reselect(
+            SupervisorRuntime::Codex,
+            &catalog,
+            SelectorReselectionRequest {
+                roles: &[AgentRole::Worker],
+                assignment_id: Some("schedule-2"),
+                attempt: 1,
+                primary_cause: SupervisorSelectionEventCause::Retry,
+                retry_count: 1,
+                budget_signal: crate::selection::BudgetSignal::Continue,
+                environment_rejections: &[],
+            },
+        )?;
+        assert_eq!(
+            later_events[0]
+                .provenance
+                .normalized_input
+                .signals
+                .previous_choice
+                .as_ref(),
+            Some(&schedule_one_choice.candidate)
+        );
+        Ok(())
     }
 
     #[test]

@@ -174,7 +174,7 @@ fn base_input() -> SelectionInput {
         priors: built_in_prior_dataset().expect("built-in priors"),
         objective_profile: ObjectiveProfileRef {
             name: "accepted-task-total-cost".to_string(),
-            version: 1,
+            version: 2,
             expected_digest: None,
         },
         resolved_objective_profile: crate::objective_profile::ResolvedObjectiveProfile {
@@ -193,6 +193,29 @@ fn base_input() -> SelectionInput {
         },
         debug_override: None,
     }
+}
+
+fn codex_model_switch_input(model_switch_cost_microunits: u64) -> SelectionInput {
+    let mut input = base_input();
+    input.catalogs.retain(|catalog| catalog.runtime == "codex");
+    input.catalogs[0]
+        .models
+        .retain(|model| matches!(model.model.as_str(), "gpt-5.6-sol" | "gpt-5.6-luna"));
+    for model in &mut input.catalogs[0].models {
+        model
+            .supported_efforts
+            .retain(|effort| *effort == ReasoningEffort::High);
+    }
+    input.pools.retain(|pool| pool.runtime == "codex");
+    input.signals.previous_choice = Some(CandidateKey {
+        runtime: "codex".to_string(),
+        model: "gpt-5.6-sol".to_string(),
+        effort: ReasoningEffort::High,
+    });
+    input.priors.objective_profiles[0]
+        .switch_costs
+        .model_change_same_runtime_microunits = model_switch_cost_microunits;
+    input
 }
 
 fn resolved_routing_profile(
@@ -432,12 +455,266 @@ fn resolved_routing_objective_round_trips_and_invalid_binding_fails_closed() {
 #[test]
 fn built_in_data_is_dated_and_keeps_policy_in_data() {
     let priors = built_in_prior_dataset().expect("built-in priors");
-    assert_eq!(priors.published_on, "2026-08-21");
+    assert_eq!(priors.revision, "2026-08-25.1");
+    assert_eq!(priors.published_on, "2026-08-25");
+    assert_eq!(priors.objective_profiles[0].version, 2);
+    assert_eq!(priors.objective_profiles[0].effective_date, "2026-08-25");
     assert!(priors.models.iter().any(|prior| prior.prohibited));
     assert!(priors
         .models
         .iter()
         .any(|prior| !prior.strong_gate_fallback_efforts.is_empty()));
+    assert_eq!(
+        priors.objective_profiles[0].switch_costs,
+        ContextSwitchCosts {
+            model_change_same_runtime_microunits: 10_000,
+            runtime_change_microunits: 25_000,
+        }
+    );
+}
+
+#[test]
+fn configured_model_switch_cost_flips_stay_versus_switch() {
+    let stay = CandidateKey {
+        runtime: "codex".to_string(),
+        model: "gpt-5.6-sol".to_string(),
+        effort: ReasoningEffort::High,
+    };
+    let switch = CandidateKey {
+        runtime: "codex".to_string(),
+        model: "gpt-5.6-luna".to_string(),
+        effort: ReasoningEffort::High,
+    };
+
+    let dominated = select(&codex_model_switch_input(40_000)).expect("dominating switch cost");
+    assert_eq!(
+        dominated.choice.as_ref().expect("stay choice").candidate,
+        stay
+    );
+    let switch_runner_up = dominated
+        .runner_up_scores
+        .iter()
+        .find(|score| score.candidate == switch)
+        .expect("switch runner-up");
+    assert_eq!(
+        switch_runner_up.switch_transition,
+        ContextSwitchTransition::ModelChangeSameRuntime
+    );
+    assert_eq!(switch_runner_up.configured_switch_cost_microunits, 40_000);
+    assert!(switch_runner_up.switch_cost_microunits >= 40_000);
+
+    for cost in [0, 20_000] {
+        let decision = select(&codex_model_switch_input(cost)).expect("affordable switch");
+        assert_eq!(
+            decision.choice.as_ref().expect("switch choice").candidate,
+            switch,
+            "configured cost {cost} should stay below the candidate advantage"
+        );
+    }
+}
+
+#[test]
+fn initial_stay_effort_model_and_runtime_transitions_are_typed_and_charged() {
+    let initial = select(&base_input()).expect("initial selection");
+    assert!(initial
+        .candidate_set
+        .iter()
+        .filter_map(|candidate| candidate.score.as_ref())
+        .all(
+            |score| score.switch_transition == ContextSwitchTransition::Initial
+                && score.configured_switch_cost_microunits == 0
+                && score.switch_cost_microunits == 0
+        ));
+
+    let previous = CandidateKey {
+        runtime: "codex".to_string(),
+        model: "gpt-5.6-sol".to_string(),
+        effort: ReasoningEffort::High,
+    };
+    let mut input = base_input();
+    input.signals.previous_choice = Some(previous.clone());
+    let decision = select(&input).expect("transition classification");
+    let score_for = |candidate: &CandidateKey| {
+        decision
+            .candidate_set
+            .iter()
+            .find(|evaluation| &evaluation.candidate == candidate)
+            .and_then(|evaluation| evaluation.score.as_ref())
+            .expect("eligible candidate score")
+    };
+
+    let stay = score_for(&previous);
+    assert_eq!(stay.switch_transition, ContextSwitchTransition::Stay);
+    assert_eq!(stay.switch_cost_microunits, 0);
+
+    let effort = score_for(&CandidateKey {
+        effort: ReasoningEffort::Xhigh,
+        ..previous.clone()
+    });
+    assert_eq!(
+        effort.switch_transition,
+        ContextSwitchTransition::EffortChangeSameRuntimeModel
+    );
+    assert_eq!(effort.configured_switch_cost_microunits, 0);
+    assert_eq!(effort.switch_cost_microunits, 0);
+
+    let model = score_for(&CandidateKey {
+        model: "gpt-5.6-luna".to_string(),
+        ..previous.clone()
+    });
+    assert_eq!(
+        model.switch_transition,
+        ContextSwitchTransition::ModelChangeSameRuntime
+    );
+    assert_eq!(model.configured_switch_cost_microunits, 10_000);
+    let model_quality = u128::from(model.posterior_quality_basis_points);
+    let expected_model_switch_cost = u128::from(model.configured_switch_cost_microunits)
+        .checked_mul(10_000)
+        .and_then(|scaled| scaled.checked_add(model_quality.checked_sub(1)?))
+        .expect("model switch normalization arithmetic")
+        / model_quality;
+    assert_eq!(
+        u128::from(model.switch_cost_microunits),
+        expected_model_switch_cost
+    );
+
+    let runtime = score_for(&CandidateKey {
+        runtime: "grok".to_string(),
+        model: "grok-code-fast-1".to_string(),
+        effort: ReasoningEffort::High,
+    });
+    assert_eq!(
+        runtime.switch_transition,
+        ContextSwitchTransition::RuntimeChange
+    );
+    assert_eq!(runtime.configured_switch_cost_microunits, 25_000);
+    let runtime_quality = u128::from(runtime.posterior_quality_basis_points);
+    let expected_runtime_switch_cost = u128::from(runtime.configured_switch_cost_microunits)
+        .checked_mul(10_000)
+        .and_then(|scaled| scaled.checked_add(runtime_quality.checked_sub(1)?))
+        .expect("runtime switch normalization arithmetic")
+        / runtime_quality;
+    assert_eq!(
+        u128::from(runtime.switch_cost_microunits),
+        expected_runtime_switch_cost
+    );
+}
+
+#[test]
+fn zero_switch_cost_preserves_candidate_keyed_initial_total_scores_exactly() {
+    let previous_choice = codex_model_switch_input(0);
+    let mut initial = previous_choice.clone();
+    initial.signals.previous_choice = None;
+
+    let initial = select(&initial).expect("equivalent initial selection");
+    let previous_choice = select(&previous_choice).expect("zero-cost previous-choice selection");
+    assert_eq!(
+        initial.candidate_set.len(),
+        previous_choice.candidate_set.len()
+    );
+
+    for evaluation in &previous_choice.candidate_set {
+        let previous_score = evaluation.score.as_ref().expect("previous-choice score");
+        let initial_score = initial
+            .candidate_set
+            .iter()
+            .find(|candidate| candidate.candidate == evaluation.candidate)
+            .and_then(|candidate| candidate.score.as_ref())
+            .expect("candidate-keyed initial score");
+        assert_eq!(previous_score.configured_switch_cost_microunits, 0);
+        assert_eq!(previous_score.switch_cost_microunits, 0);
+        assert_eq!(initial_score.configured_switch_cost_microunits, 0);
+        assert_eq!(initial_score.switch_cost_microunits, 0);
+        assert_eq!(
+            previous_score.total_score_microunits, initial_score.total_score_microunits,
+            "candidate total changed despite a zero switch term: {:?}",
+            evaluation.candidate
+        );
+    }
+}
+
+#[test]
+fn switch_evidence_round_trips_and_matches_selected_and_runner_up_scores() {
+    let decision = select(&codex_model_switch_input(20_000)).expect("switch decision");
+    let selected = decision.choice.as_ref().expect("selected choice");
+    let selected_score = decision
+        .candidate_set
+        .iter()
+        .find(|evaluation| evaluation.candidate == selected.candidate)
+        .and_then(|evaluation| evaluation.score.as_ref())
+        .expect("selected candidate score");
+    assert_eq!(selected.switch_transition, selected_score.switch_transition);
+    assert_eq!(
+        selected.configured_switch_cost_microunits,
+        selected_score.configured_switch_cost_microunits
+    );
+    assert_eq!(
+        selected.switch_cost_microunits,
+        selected_score.switch_cost_microunits
+    );
+    assert_eq!(
+        selected.total_score_microunits,
+        selected_score.total_score_microunits
+    );
+
+    for runner_up in &decision.runner_up_scores {
+        let score = decision
+            .candidate_set
+            .iter()
+            .find(|evaluation| evaluation.candidate == runner_up.candidate)
+            .and_then(|evaluation| evaluation.score.as_ref())
+            .expect("runner-up score");
+        assert_eq!(runner_up.switch_transition, score.switch_transition);
+        assert_eq!(
+            runner_up.configured_switch_cost_microunits,
+            score.configured_switch_cost_microunits
+        );
+        assert_eq!(
+            runner_up.switch_cost_microunits,
+            score.switch_cost_microunits
+        );
+        assert_eq!(
+            runner_up.total_score_microunits,
+            score.total_score_microunits
+        );
+    }
+
+    let json = serde_json::to_vec(&decision).expect("serialize selection evidence");
+    let round_trip: SelectionProvenance =
+        serde_json::from_slice(&json).expect("deserialize selection evidence");
+    assert_eq!(round_trip, decision);
+    assert_eq!(round_trip.schema_version, 2);
+}
+
+#[test]
+fn historical_profile_omission_is_zero_and_switch_score_overflow_fails_closed() {
+    let mut value =
+        serde_json::to_value(built_in_prior_dataset().expect("priors")).expect("serialize priors");
+    value["objective_profiles"][0]
+        .as_object_mut()
+        .expect("profile object")
+        .remove("switch_costs");
+    let historical: PriorDataset = serde_json::from_value(value).expect("historical priors");
+    assert_eq!(
+        historical.objective_profiles[0].switch_costs,
+        ContextSwitchCosts::zero()
+    );
+
+    let malformed = include_str!("data/priors-2026-08-07.json").replacen(
+        "\"model_change_same_runtime_microunits\": 10000",
+        "\"model_change_same_runtime_microunits\": -1",
+        1,
+    );
+    assert!(serde_json::from_str::<PriorDataset>(&malformed).is_err());
+
+    let mut overflow = codex_model_switch_input(u64::MAX);
+    overflow.priors.objective_profiles[0]
+        .switch_costs
+        .runtime_change_microunits = u64::MAX;
+    assert!(matches!(
+        select(&overflow),
+        Err(SelectionError::InvalidInput(message)) if message.contains("context-switch cost per accepted task overflowed")
+    ));
 }
 
 #[test]
@@ -858,6 +1135,20 @@ fn retry_degrade_and_catalog_change_are_provenance_triggers() {
     assert!(decision.triggers.contains(&SelectionTrigger::Retry));
     assert!(decision.triggers.contains(&SelectionTrigger::BudgetDegrade));
     assert!(decision.triggers.contains(&SelectionTrigger::CatalogChange));
+    let previous = decision
+        .normalized_input
+        .signals
+        .previous_choice
+        .as_ref()
+        .expect("same-run previous choice");
+    let stay = decision
+        .candidate_set
+        .iter()
+        .find(|evaluation| &evaluation.candidate == previous)
+        .and_then(|evaluation| evaluation.score.as_ref())
+        .expect("previous choice evaluation");
+    assert_eq!(stay.switch_transition, ContextSwitchTransition::Stay);
+    assert_eq!(stay.switch_cost_microunits, 0);
 }
 
 #[test]
@@ -916,6 +1207,13 @@ fn native_environment_rejection_allows_exactly_one_data_declared_fallback() {
     let transition = decision.environment_fallback.expect("fallback provenance");
     assert_eq!(transition.transition_ordinal, 1);
     assert_eq!(transition.maximum_transitions, 1);
+    let choice = decision.choice.as_ref().expect("fallback choice evidence");
+    assert_eq!(
+        choice.switch_transition,
+        ContextSwitchTransition::ModelChangeSameRuntime
+    );
+    assert_eq!(choice.configured_switch_cost_microunits, 10_000);
+    assert!(choice.switch_cost_microunits >= 10_000);
 
     input.signals.environment_rejections[0].fallback_transition_used = true;
     let second = select(&input).expect("post-fallback selection");
@@ -1409,6 +1707,12 @@ fn catalog_withdrawal_reselects_deterministically() {
         first.choice.as_ref().expect("replacement choice").candidate,
         previous
     );
+    let replacement = first.choice.as_ref().expect("replacement evidence");
+    assert!(matches!(
+        replacement.switch_transition,
+        ContextSwitchTransition::ModelChangeSameRuntime | ContextSwitchTransition::RuntimeChange
+    ));
+    assert!(replacement.switch_cost_microunits > 0);
 }
 
 #[test]

@@ -437,6 +437,12 @@ pub(super) struct SupervisorReselection {
     pub(super) decisions: Vec<(AgentRole, SelectionProvenance)>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct SupervisorExecutableSelectionBindings {
+    pub(super) model_overrides: BTreeMap<AgentRole, RoleModelSelection>,
+    pub(super) runtime_overrides: BTreeMap<AgentRole, SupervisorRuntime>,
+}
+
 #[cfg(test)]
 pub(super) fn initialize_supervisor_selection(
     plan: &mut SupervisorPlan,
@@ -684,6 +690,146 @@ impl SupervisorAutomaticSelectionState {
             quota_ledger,
         })
     }
+
+    pub(super) fn executable_bindings(
+        &self,
+        runtime: SupervisorRuntime,
+    ) -> Result<SupervisorExecutableSelectionBindings> {
+        let mut bindings = SupervisorExecutableSelectionBindings::default();
+        for (role, provenance) in &self.decisions {
+            let choice = match executable_choice(provenance, runtime, *role)? {
+                ExecutableChoiceResolution::Executable(choice) => choice,
+                ExecutableChoiceResolution::PreflightFailure(failure) => {
+                    bail!(
+                        "automatic selector replay state failed executable preflight: {}",
+                        failure.message
+                    )
+                }
+            };
+            bindings
+                .model_overrides
+                .insert(*role, role_selection_from_choice(choice));
+            bindings.runtime_overrides.insert(
+                *role,
+                runtime_from_name(&choice.candidate.runtime).with_context(|| {
+                    format!(
+                        "automatic selector replay state chose an invalid runtime for role '{}'",
+                        role.as_str()
+                    )
+                })?,
+            );
+        }
+        Ok(bindings)
+    }
+
+    /// Commit one completed assignment's automatic-selection events atomically.
+    ///
+    /// Concurrent assignments intentionally start from independent clones of the
+    /// last manager-committed state. Their completion events are replayed by the
+    /// scheduler in stable schedule-index order, so the first event for a role can
+    /// branch from a choice other than the manager's state at commit time. Events
+    /// within one assignment must still form an exact previous-choice chain.
+    pub(super) fn commit_completed_selection_events(
+        &mut self,
+        runtime: SupervisorRuntime,
+        events: &[SupervisorSelectionEvent],
+    ) -> Result<SupervisorExecutableSelectionBindings> {
+        if events.is_empty() {
+            return Ok(SupervisorExecutableSelectionBindings::default());
+        }
+
+        let assignment_id = events[0]
+            .assignment_id
+            .as_deref()
+            .filter(|assignment_id| !assignment_id.is_empty())
+            .context("completed automatic-selection event has no assignment identity")?;
+        let mut ordered = events.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|event| (event.attempt, event.role));
+
+        let mut next_decisions = self.decisions.clone();
+        let mut assignment_previous = BTreeMap::<AgentRole, CandidateKey>::new();
+        let mut bindings = SupervisorExecutableSelectionBindings::default();
+        let mut previous_key = None;
+        for event in ordered {
+            if event.assignment_id.as_deref() != Some(assignment_id) {
+                bail!(
+                    "completed automatic-selection events mix assignment identities '{}' and '{}'",
+                    assignment_id,
+                    event.assignment_id.as_deref().unwrap_or("<missing>")
+                );
+            }
+            let key = (event.attempt, event.role);
+            if previous_key == Some(key) {
+                bail!(
+                    "completed automatic-selection events duplicate attempt {} for role '{}'",
+                    event.attempt,
+                    event.role.as_str()
+                );
+            }
+            previous_key = Some(key);
+
+            let normalized_role = role_for_task_profile(&event.provenance.normalized_task)?;
+            if normalized_role != event.role {
+                bail!(
+                    "completed automatic-selection event role '{}' disagrees with normalized task role '{}'",
+                    event.role.as_str(),
+                    normalized_role.as_str()
+                );
+            }
+            let supplied_previous = event
+                .provenance
+                .normalized_input
+                .signals
+                .previous_choice
+                .as_ref()
+                .with_context(|| {
+                    format!(
+                        "completed automatic-selection event for role '{}' has no same-run previous choice",
+                        event.role.as_str()
+                    )
+                })?;
+            if let Some(expected_previous) = assignment_previous.get(&event.role) {
+                if supplied_previous != expected_previous {
+                    bail!(
+                        "completed automatic-selection event chain for role '{}' expected previous choice '{}:{}:{:?}' but recorded '{}:{}:{:?}'",
+                        event.role.as_str(),
+                        expected_previous.runtime,
+                        expected_previous.model,
+                        expected_previous.effort,
+                        supplied_previous.runtime,
+                        supplied_previous.model,
+                        supplied_previous.effort,
+                    );
+                }
+            }
+            let choice = match executable_choice(&event.provenance, runtime, event.role)? {
+                ExecutableChoiceResolution::Executable(choice) => choice,
+                ExecutableChoiceResolution::PreflightFailure(failure) => {
+                    bail!(
+                        "completed automatic-selection event failed executable preflight: {}",
+                        failure.message
+                    )
+                }
+            };
+            assignment_previous.insert(event.role, choice.candidate.clone());
+            bindings
+                .model_overrides
+                .insert(event.role, role_selection_from_choice(choice));
+            bindings.runtime_overrides.insert(
+                event.role,
+                runtime_from_name(&choice.candidate.runtime).with_context(|| {
+                    format!(
+                        "completed automatic-selection event chose an invalid runtime for role '{}'",
+                        event.role.as_str()
+                    )
+                })?,
+            );
+            next_decisions.insert(event.role, event.provenance.clone());
+        }
+
+        self.decisions = next_decisions;
+        Ok(bindings)
+    }
 }
 
 pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
@@ -696,6 +842,7 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
     environment_rejections: &[TypedSelectorEnvironmentRejection],
 ) -> Result<SupervisorReselection> {
     let advertised = state.advertised.clone();
+    let mut next_decisions = state.decisions.clone();
     let mut ordered_roles = roles.to_vec();
     ordered_roles.sort();
     ordered_roles.dedup();
@@ -703,7 +850,7 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
     let mut runtime_overrides = BTreeMap::new();
     let mut decisions = Vec::with_capacity(ordered_roles.len());
     for role in ordered_roles {
-        let previous = state.decisions.get(&role).with_context(|| {
+        let previous = next_decisions.get(&role).with_context(|| {
             format!(
                 "automatic selector has no replay state for role '{}'",
                 role.as_str()
@@ -777,9 +924,10 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
                 )
             })?,
         );
-        state.decisions.insert(role, decision.clone());
+        next_decisions.insert(role, decision.clone());
         decisions.push((role, decision));
     }
+    state.decisions = next_decisions;
     Ok(SupervisorReselection {
         overrides,
         runtime_overrides,
@@ -2005,6 +2153,64 @@ mod tests {
     }
 
     #[test]
+    fn completed_event_commit_is_atomic_when_assignment_chain_is_malformed() -> Result<()> {
+        let (catalog, mut manager_state) = automatic_state()?;
+        let before = manager_state.clone();
+        let mut assignment_state = manager_state.clone();
+        let first = reselect_roles_from_supplied_catalog_snapshot(
+            &mut assignment_state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        let second = reselect_roles_from_supplied_catalog_snapshot(
+            &mut assignment_state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            2,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        let mut events = vec![
+            SupervisorSelectionEvent {
+                assignment_id: Some("assignment-a".to_string()),
+                attempt: 1,
+                role: AgentRole::Worker,
+                primary_cause: SupervisorSelectionEventCause::Retry,
+                provenance: first.decisions[0].1.clone(),
+            },
+            SupervisorSelectionEvent {
+                assignment_id: Some("assignment-a".to_string()),
+                attempt: 2,
+                role: AgentRole::Worker,
+                primary_cause: SupervisorSelectionEventCause::Retry,
+                provenance: second.decisions[0].1.clone(),
+            },
+        ];
+        events[1]
+            .provenance
+            .normalized_input
+            .signals
+            .previous_choice = Some(CandidateKey {
+            runtime: "codex".to_string(),
+            model: "tampered-chain".to_string(),
+            effort: SelectorEffort::Low,
+        });
+
+        let error = manager_state
+            .commit_completed_selection_events(SupervisorRuntime::Codex, &events)
+            .expect_err("malformed assignment event chain must fail closed");
+
+        assert!(error.to_string().contains("expected previous choice"));
+        assert_eq!(manager_state, before);
+        Ok(())
+    }
+
+    #[test]
     fn automatic_empty_role_models_resolve_all_roles_from_eligible_catalog() -> Result<()> {
         let catalog = codex_catalog()?;
         let mut plan = test_plan();
@@ -2029,7 +2235,17 @@ mod tests {
                 && decision.attempt == 0
                 && decision.primary_cause == SupervisorSelectionEventCause::Initial
                 && decision.provenance.status == DecisionStatus::Selected
-                && decision.provenance.choice.is_some()
+                && decision.provenance.choice.as_ref().is_some_and(|choice| {
+                    decision
+                        .provenance
+                        .normalized_input
+                        .signals
+                        .previous_choice
+                        .is_none()
+                        && choice.switch_transition == selection::ContextSwitchTransition::Initial
+                        && choice.configured_switch_cost_microunits == 0
+                        && choice.switch_cost_microunits == 0
+                })
         }));
         Ok(())
     }
@@ -3119,7 +3335,111 @@ mod tests {
                 override_selection.reasoning_effort.as_deref(),
                 Some(selector_effort_as_str(choice.candidate.effort))
             );
+            assert_eq!(
+                first.runtime_overrides.get(role),
+                Some(&runtime_from_name(&choice.candidate.runtime)?)
+            );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn degrade_transition_retains_previous_choice_and_switch_score_evidence() -> Result<()> {
+        let (_, mut state) = automatic_state()?;
+        let previous = state
+            .decisions
+            .get(&AgentRole::Worker)
+            .and_then(|decision| decision.choice.as_ref())
+            .context("immediately prior worker choice")?
+            .candidate
+            .clone();
+        let priors = selection::built_in_prior_dataset()?;
+        let withdrawn_catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(
+            priors
+                .models
+                .iter()
+                .filter(|prior| {
+                    prior.runtime == runtime_name(SupervisorRuntime::Codex)
+                        && prior.model != previous.model
+                })
+                .map(|prior| prior.model.clone()),
+        )?);
+
+        let reselection = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &withdrawn_catalog,
+            &[AgentRole::Worker],
+            0,
+            BudgetSignal::Degrade,
+            &[],
+        )?;
+        let decision = &reselection.decisions[0].1;
+        assert!(decision
+            .triggers
+            .contains(&selection::SelectionTrigger::BudgetDegrade));
+        assert!(decision
+            .triggers
+            .contains(&selection::SelectionTrigger::CatalogChange));
+        assert_eq!(
+            decision.normalized_input.signals.previous_choice.as_ref(),
+            Some(&previous)
+        );
+
+        let choice = decision
+            .choice
+            .as_ref()
+            .context("degrade transition selected choice")?;
+        assert_eq!(choice.candidate.runtime, previous.runtime);
+        assert_ne!(choice.candidate.model, previous.model);
+        assert_eq!(
+            choice.switch_transition,
+            selection::ContextSwitchTransition::ModelChangeSameRuntime
+        );
+        assert_eq!(
+            choice.configured_switch_cost_microunits,
+            crate::objective_profile::DEFAULT_MODEL_CHANGE_SWITCH_COST_MICROUNITS
+        );
+        assert!(choice.configured_switch_cost_microunits > 0);
+        assert!(choice.switch_cost_microunits > 0);
+        assert_eq!(
+            reselection.runtime_overrides.get(&AgentRole::Worker),
+            Some(&runtime_from_name(&choice.candidate.runtime)?)
+        );
+
+        let selected_score = decision
+            .candidate_set
+            .iter()
+            .find(|candidate| candidate.candidate == choice.candidate)
+            .and_then(|candidate| candidate.score.as_ref())
+            .context("degrade transition candidate score")?;
+        assert_eq!(selected_score.switch_transition, choice.switch_transition);
+        assert_eq!(
+            selected_score.configured_switch_cost_microunits,
+            choice.configured_switch_cost_microunits
+        );
+        assert_eq!(
+            selected_score.switch_cost_microunits,
+            choice.switch_cost_microunits
+        );
+        assert_eq!(
+            selected_score.total_score_microunits,
+            choice.total_score_microunits
+        );
+        let expected_total = [
+            selected_score.expected_total_cost_per_accepted_task_microunits,
+            selected_score.pool_pressure_cost_microunits,
+            selected_score.entitlement_scarcity_cost_microunits,
+            selected_score.observed_consumption_cost_microunits,
+            selected_score.marginal_cost_microunits,
+            selected_score.retry_cost_microunits,
+            selected_score.degrade_cost_microunits,
+            selected_score.switch_cost_microunits,
+        ]
+        .into_iter()
+        .try_fold(0u64, |total, term| total.checked_add(term))
+        .context("degrade transition expected score overflow")?;
+        assert_eq!(selected_score.total_score_microunits, expected_total);
         Ok(())
     }
 
@@ -3149,6 +3469,10 @@ mod tests {
         assert!(decision
             .triggers
             .contains(&selection::SelectionTrigger::Retry));
+        assert_eq!(
+            decision.normalized_input.signals.previous_choice.as_ref(),
+            Some(&previous)
+        );
         assert_ne!(choice.candidate, previous);
         let previous_score = decision
             .candidate_set
@@ -3164,6 +3488,95 @@ mod tests {
             .context("selected candidate retry score")?;
         assert!(previous_score.retry_cost_microunits > 0);
         assert_eq!(selected_score.retry_cost_microunits, 0);
+        let expected_transition = if choice.candidate.runtime != previous.runtime {
+            selection::ContextSwitchTransition::RuntimeChange
+        } else if choice.candidate.model != previous.model {
+            selection::ContextSwitchTransition::ModelChangeSameRuntime
+        } else {
+            selection::ContextSwitchTransition::EffortChangeSameRuntimeModel
+        };
+        assert_eq!(choice.switch_transition, expected_transition);
+        assert_eq!(selected_score.switch_transition, expected_transition);
+        assert_eq!(
+            selected_score.switch_cost_microunits,
+            choice.switch_cost_microunits
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sequential_reselection_uses_immediately_prior_selected_choice() -> Result<()> {
+        let (catalog, mut state) = automatic_state()?;
+        let first = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        let first_choice = first.decisions[0]
+            .1
+            .choice
+            .as_ref()
+            .context("first retry worker choice")?
+            .candidate
+            .clone();
+
+        let second = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            0,
+            BudgetSignal::Degrade,
+            &[],
+        )?;
+        let second_provenance = &second.decisions[0].1;
+
+        assert_eq!(
+            second_provenance
+                .normalized_input
+                .signals
+                .previous_choice
+                .as_ref(),
+            Some(&first_choice)
+        );
+        assert!(second_provenance
+            .triggers
+            .contains(&selection::SelectionTrigger::BudgetDegrade));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_multi_role_reselection_does_not_commit_partial_state() -> Result<()> {
+        let (catalog, mut state) = automatic_state()?;
+        let worker_before = state
+            .decisions
+            .get(&AgentRole::Worker)
+            .context("initial worker provenance")?
+            .clone();
+        state.decisions.remove(&AgentRole::Auditor);
+
+        let error = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker, AgentRole::Auditor],
+            1,
+            BudgetSignal::Continue,
+            &[],
+        )
+        .expect_err("missing later role state must fail the whole reselection");
+
+        assert!(error
+            .to_string()
+            .contains("automatic selector has no replay state for role 'auditor'"));
+        assert_eq!(
+            state.decisions.get(&AgentRole::Worker),
+            Some(&worker_before)
+        );
         Ok(())
     }
 
@@ -3203,13 +3616,39 @@ mod tests {
         assert!(decision
             .triggers
             .contains(&selection::SelectionTrigger::CatalogChange));
-        assert_ne!(
-            decision
-                .choice
-                .as_ref()
-                .context("replacement choice")?
-                .candidate,
-            previous
+        assert_eq!(
+            decision.normalized_input.signals.previous_choice.as_ref(),
+            Some(&previous)
+        );
+        let replacement = decision.choice.as_ref().context("replacement choice")?;
+        assert_ne!(replacement.candidate, previous);
+        assert_eq!(
+            replacement.switch_transition,
+            selection::ContextSwitchTransition::ModelChangeSameRuntime
+        );
+        assert_eq!(
+            replacement.configured_switch_cost_microunits,
+            crate::objective_profile::DEFAULT_MODEL_CHANGE_SWITCH_COST_MICROUNITS
+        );
+        assert!(replacement.switch_cost_microunits > 0);
+        let replacement_choice = replacement.candidate.clone();
+        let after_catalog_change = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &withdrawn_catalog,
+            &[AgentRole::Worker],
+            0,
+            BudgetSignal::Degrade,
+            &[],
+        )?;
+        assert_eq!(
+            after_catalog_change.decisions[0]
+                .1
+                .normalized_input
+                .signals
+                .previous_choice
+                .as_ref(),
+            Some(&replacement_choice)
         );
         Ok(())
     }
@@ -3257,12 +3696,63 @@ mod tests {
         assert!(decision
             .triggers
             .contains(&selection::SelectionTrigger::EnvironmentFallback));
+        assert_eq!(
+            decision.normalized_input.signals.previous_choice.as_ref(),
+            Some(&previous)
+        );
         assert_eq!(transition.source, previous);
         assert_eq!(transition.target.runtime, fallback.target_runtime);
         assert_eq!(transition.target.model, fallback.target_model);
         assert_eq!(transition.target.effort, fallback.target_effort);
         assert_eq!(transition.transition_ordinal, 1);
         assert_eq!(transition.maximum_transitions, 1);
+        let choice = decision
+            .choice
+            .as_ref()
+            .context("environment fallback selected choice")?;
+        assert_eq!(
+            choice.switch_transition,
+            selection::ContextSwitchTransition::ModelChangeSameRuntime
+        );
+        assert_eq!(
+            choice.configured_switch_cost_microunits,
+            crate::objective_profile::DEFAULT_MODEL_CHANGE_SWITCH_COST_MICROUNITS
+        );
+        assert!(choice.switch_cost_microunits > 0);
+        let target_score = decision
+            .candidate_set
+            .iter()
+            .find(|candidate| candidate.candidate == transition.target)
+            .and_then(|candidate| candidate.score.as_ref())
+            .context("environment fallback target score")?;
+        assert_eq!(target_score.switch_transition, choice.switch_transition);
+        assert_eq!(
+            target_score.configured_switch_cost_microunits,
+            choice.configured_switch_cost_microunits
+        );
+        assert_eq!(
+            target_score.switch_cost_microunits,
+            choice.switch_cost_microunits
+        );
+        let fallback_choice = choice.candidate.clone();
+        let after_fallback = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        assert_eq!(
+            after_fallback.decisions[0]
+                .1
+                .normalized_input
+                .signals
+                .previous_choice
+                .as_ref(),
+            Some(&fallback_choice)
+        );
         Ok(())
     }
 
@@ -3484,6 +3974,82 @@ mod tests {
         assert!(
             choice.candidate.model == "composer-2.5"
                 || choice.candidate.model == "composer-2.5-fast"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_reselection_returns_matching_executable_runtime_binding() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised_with_cursor(captured_cursor_observation()?),
+        )?;
+        let mut state = resolution
+            .automatic_state
+            .context("automatic runtime-switch replay state")?;
+        let previous = state
+            .decisions
+            .get(&AgentRole::Worker)
+            .and_then(|decision| decision.choice.as_ref())
+            .context("initial worker choice")?
+            .candidate
+            .clone();
+        assert_eq!(previous.runtime, "codex");
+        state
+            .decisions
+            .get_mut(&AgentRole::Worker)
+            .context("worker replay state")?
+            .normalized_input
+            .pools
+            .iter_mut()
+            .find(|pool| pool.runtime == "codex")
+            .context("Codex replay pool")?
+            .pool_pressure_basis_points = 10_000;
+
+        let reselection = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        let choice = reselection.decisions[0]
+            .1
+            .choice
+            .as_ref()
+            .context("runtime-switch worker choice")?;
+
+        assert_eq!(
+            reselection.decisions[0]
+                .1
+                .normalized_input
+                .signals
+                .previous_choice
+                .as_ref(),
+            Some(&previous)
+        );
+        assert_eq!(
+            choice.switch_transition,
+            selection::ContextSwitchTransition::RuntimeChange
+        );
+        assert_eq!(choice.candidate.runtime, "cursor");
+        assert_eq!(
+            reselection.runtime_overrides.get(&AgentRole::Worker),
+            Some(&SupervisorRuntime::Cursor)
+        );
+        assert_eq!(
+            reselection
+                .overrides
+                .get(&AgentRole::Worker)
+                .and_then(|selection| selection.model.as_deref()),
+            Some(choice.candidate.model.as_str())
         );
         Ok(())
     }

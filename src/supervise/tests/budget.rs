@@ -652,6 +652,27 @@ fn budget_integration_scheduler_preserves_judgment_bindings_before_halt() {
             ("degrade-child-2", "xhigh"),
         ]
     );
+    let degraded_child_binding = execution
+        .assignment_effort_bindings
+        .iter()
+        .find(|binding| {
+            binding.role == AgentRole::ChildOrchestrator
+                && binding.assignment_id == "degrade-child-1"
+        })
+        .expect("first budget-degraded child admission binding");
+    // Judgment-role (child orchestrator) effort bindings are preserved under
+    // budget pressure: the merged degradation ladder degrades worker model
+    // tier/effort only, so the child stays on its role fallback.
+    assert_eq!(
+        degraded_child_binding.resolution_observation,
+        EffortResolutionObservation::RoleFallback
+    );
+    assert!(degraded_child_binding
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| {
+            reason.contains("admission-only") && reason.contains("selection_decisions")
+        }));
 
     let persisted: serde_json::Value = serde_json::from_slice(
         &fs::read(

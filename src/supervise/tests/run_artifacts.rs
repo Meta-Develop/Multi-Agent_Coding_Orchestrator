@@ -1,6 +1,184 @@
 use super::*;
 
 #[test]
+fn finalized_artifacts_round_trip_typed_context_switch_selection_evidence() {
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("artifact-context-switch-evidence").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "supervise-test",
+    )
+    .expect("reserve supervise artifact run");
+
+    let mut plan = injected_plan(injected_assignment(true), 0);
+    let catalog = injected_codex_runtime_catalog(&["gpt-5.6-sol"]);
+    let admission = SupervisorAdmissionPolicyInput::resolve(
+        &repo_path,
+        1,
+        SupervisorAdmissionConfig::default(),
+        SupervisorAdmissionConfig::default(),
+    )
+    .expect("resolve selector admission fixture");
+    let resolved_objective_profile = ResolvedObjectiveProfile {
+        profile: crate::objective_profile::default_objective_profile()
+            .binding()
+            .expect("default objective binding"),
+        source: crate::objective_profile::ObjectiveProfileSource::BuiltIn,
+    };
+    let resolution = initialize_supervisor_selection(
+        &mut plan,
+        SupervisorRuntime::Codex,
+        &catalog,
+        &admission,
+        &AdvertisedCatalogSet::empty(),
+        Some(&resolved_objective_profile),
+    )
+    .expect("initialize selector evidence fixture");
+    let initial = resolution
+        .decisions
+        .iter()
+        .find(|event| event.role == AgentRole::Worker)
+        .expect("worker selection event");
+    let mut input = initial.provenance.normalized_input.clone();
+    let previous_choice = crate::selection::CandidateKey {
+        runtime: "codex".to_string(),
+        model: "retired-same-run-model".to_string(),
+        effort: crate::selection::ReasoningEffort::High,
+    };
+    input.signals.previous_choice = Some(previous_choice.clone());
+    let provenance = crate::selection::select(&input).expect("select with previous assignment");
+    let choice = provenance.choice.as_ref().expect("selected switch choice");
+    assert_eq!(
+        choice.switch_transition,
+        crate::selection::ContextSwitchTransition::ModelChangeSameRuntime
+    );
+    assert_eq!(choice.configured_switch_cost_microunits, 10_000);
+    assert!(choice.switch_cost_microunits > 0);
+    let charged_switch_cost_microunits = choice.switch_cost_microunits;
+    assert!(!provenance.runner_up_scores.is_empty());
+    assert!(provenance.runner_up_scores.iter().all(|runner_up| {
+        runner_up.switch_transition
+            == crate::selection::ContextSwitchTransition::ModelChangeSameRuntime
+            && runner_up.configured_switch_cost_microunits == 10_000
+            && runner_up.switch_cost_microunits > 0
+    }));
+
+    let event = SupervisorSelectionEvent {
+        assignment_id: Some("child-a".to_string()),
+        attempt: 1,
+        role: AgentRole::Worker,
+        primary_cause: SupervisorSelectionEventCause::Retry,
+        provenance,
+    };
+    let assignment_selection_ledger = build_assignment_selection_ledger(
+        &plan,
+        std::slice::from_ref(&event),
+        SupervisorRuntime::Codex,
+    );
+    let mut profile = plan.effective_role_economics_profile();
+    profile.execution = Some(SupervisorExecutionMetadata {
+        assignment_count: 1,
+        started_assignment_count: 1,
+        completed_assignment_count: 1,
+        concurrency: SupervisorConcurrencyReport {
+            configured_max_concurrent_children: 1,
+            policy_input_observation: ProcessObservation::SchedulerObserved,
+            policy_input: None,
+            policy_input_details: None,
+            policy_input_unavailable_reason: None,
+            achieved_max_concurrent_children: 1,
+            achieved_mean_concurrent_children: Some(1.0),
+            achieved_mean_observation: ProcessObservation::SchedulerObserved,
+            achieved_mean_unavailable_reason: None,
+        },
+        role_bindings: BTreeMap::new(),
+        assignment_effort_bindings: Vec::new(),
+        budget_degradations: Vec::new(),
+        selection_decisions: vec![event],
+        assignment_selection_ledger,
+        usage: SupervisorExecutionUsageReport {
+            total_usage: None,
+            total_cost_usd: None,
+            usage_complete: false,
+            observation: RoleUsageObservation::NotProcessObservable,
+            unavailable_reason: Some("artifact round-trip fixture".to_string()),
+        },
+    });
+
+    let mut final_report = artifact_test_final_report(&run_id);
+    final_report.role_economics_profile = Some(profile);
+    write_supervisor_final_schema(
+        &mut writer,
+        Path::new("schemas/supervisor-final-report.schema.json"),
+    )
+    .expect("write generated supervisor schema");
+    write_selection_ledger_from_report(&mut writer, &final_report)
+        .expect("write assignment selection ledger");
+    write_final_report(&mut writer, &final_report).expect("write final report");
+    writer
+        .finalize(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            false,
+        )
+        .expect("finalize selector evidence artifact");
+
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+        .expect("open finalized selector evidence artifact");
+    let restored = read_supervisor_final_report(&reader).expect("read selector evidence report");
+    let restored_execution = restored
+        .role_economics_profile
+        .as_ref()
+        .and_then(|profile| profile.execution.as_ref())
+        .expect("restored execution evidence");
+    let restored_event = restored_execution
+        .selection_decisions
+        .first()
+        .expect("restored selection event");
+    assert_eq!(restored_event.provenance.schema_version, 2);
+    assert_eq!(
+        restored_event
+            .provenance
+            .normalized_input
+            .signals
+            .previous_choice
+            .as_ref(),
+        Some(&previous_choice)
+    );
+    assert_eq!(
+        restored_event
+            .provenance
+            .choice
+            .as_ref()
+            .expect("restored choice")
+            .switch_cost_microunits,
+        charged_switch_cost_microunits
+    );
+
+    let ledger: AssignmentSelectionLedger = serde_json::from_slice(
+        &reader
+            .read(Path::new(SELECTION_LEDGER_RELATIVE))
+            .expect("read immutable assignment selection ledger"),
+    )
+    .expect("decode assignment selection ledger");
+    assert_eq!(
+        ledger.schema_version,
+        ASSIGNMENT_SELECTION_LEDGER_SCHEMA_VERSION
+    );
+    assert!(ledger.entries.iter().any(|entry| {
+        entry.assignment_id == "child-a"
+            && entry.role == AgentRole::Worker
+            && entry.selected_model.as_deref()
+                == restored_event
+                    .provenance
+                    .choice
+                    .as_ref()
+                    .map(|choice| choice.candidate.model.as_str())
+    }));
+}
+
+#[test]
 #[cfg(unix)]
 fn worker_journals_are_precreated_as_private_exact_files() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};

@@ -9,11 +9,13 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
 
 pub const OBJECTIVE_PROFILE_OVERRIDE_FILE: &str = "maco-objective-profiles.json";
-pub const DEFAULT_OBJECTIVE_PROFILE_ID: &str = "maco-default-objective-v1";
-pub const DEFAULT_OBJECTIVE_PROFILE_VERSION: u32 = 1;
+pub const DEFAULT_OBJECTIVE_PROFILE_ID: &str = "maco-default-objective-v2";
+pub const DEFAULT_OBJECTIVE_PROFILE_VERSION: u32 = 2;
 pub const HELD_OUT_WEIGHT_PERCENT: u32 = 50;
 pub const BREADTH_WEIGHT_PERCENT: u32 = 25;
 pub const ANTI_SHORTCUT_WEIGHT_PERCENT: u32 = 25;
+pub const DEFAULT_MODEL_CHANGE_SWITCH_COST_MICROUNITS: u64 = 10_000;
+pub const DEFAULT_RUNTIME_CHANGE_SWITCH_COST_MICROUNITS: u64 = 25_000;
 
 const OBJECTIVE_PROFILE_DOCUMENT_SCHEMA_VERSION: u32 = 1;
 const MAX_OBJECTIVE_PROFILE_FILE_BYTES: u64 = 256 * 1024;
@@ -54,6 +56,42 @@ pub struct ObjectiveProfile {
     pub quality: QualityWeights,
     #[serde(default)]
     pub tradeoffs: TradeoffWeights,
+    #[serde(default = "historical_zero_switch_costs")]
+    pub switch_costs: ContextSwitchCosts,
+}
+
+/// Conservative, operator-tunable re-priming costs for automatic routing.
+///
+/// An omitted historical field decodes to zero through the explicit serde
+/// default on its containing profile. New default profiles use [`Self::default`]
+/// and therefore opt into the conservative nonzero values.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextSwitchCosts {
+    pub model_change_same_runtime_microunits: u64,
+    pub runtime_change_microunits: u64,
+}
+
+impl ContextSwitchCosts {
+    pub const fn zero() -> Self {
+        Self {
+            model_change_same_runtime_microunits: 0,
+            runtime_change_microunits: 0,
+        }
+    }
+}
+
+impl Default for ContextSwitchCosts {
+    fn default() -> Self {
+        Self {
+            model_change_same_runtime_microunits: DEFAULT_MODEL_CHANGE_SWITCH_COST_MICROUNITS,
+            runtime_change_microunits: DEFAULT_RUNTIME_CHANGE_SWITCH_COST_MICROUNITS,
+        }
+    }
+}
+
+pub(crate) const fn historical_zero_switch_costs() -> ContextSwitchCosts {
+    ContextSwitchCosts::zero()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -105,6 +143,8 @@ pub struct ObjectiveProfileBinding {
     pub content_hash: String,
     pub quality: QualityWeights,
     pub tradeoffs: TradeoffWeights,
+    #[serde(default = "historical_zero_switch_costs")]
+    pub switch_costs: ContextSwitchCosts,
 }
 
 impl Default for ObjectiveProfile {
@@ -123,6 +163,7 @@ pub fn default_objective_profile() -> ObjectiveProfile {
             anti_shortcut_percent: ANTI_SHORTCUT_WEIGHT_PERCENT,
         },
         tradeoffs: TradeoffWeights::default(),
+        switch_costs: ContextSwitchCosts::default(),
     }
 }
 
@@ -191,6 +232,7 @@ impl ObjectiveProfile {
             content_hash: self.content_hash()?,
             quality: self.quality.clone(),
             tradeoffs: self.tradeoffs.clone(),
+            switch_costs: self.switch_costs.clone(),
         })
     }
 
@@ -222,6 +264,7 @@ impl ObjectiveProfileBinding {
             version: self.version,
             quality: self.quality.clone(),
             tradeoffs: self.tradeoffs.clone(),
+            switch_costs: self.switch_costs.clone(),
         };
         profile.validate()?;
         if self.content_hash.len() != 64
@@ -451,6 +494,7 @@ mod tests {
                 retry_rework_percent: 10,
                 human_review_percent: 5,
             },
+            switch_costs: ContextSwitchCosts::default(),
         }
     }
 
@@ -481,6 +525,19 @@ mod tests {
         let second = profile.content_hash().expect("hash");
         assert_eq!(first, second);
         assert_eq!(first.len(), 64);
+        assert_eq!(profile.id, "maco-default-objective-v2");
+        assert_eq!(profile.version, 2);
+        assert_eq!(
+            profile.switch_costs,
+            ContextSwitchCosts {
+                model_change_same_runtime_microunits: 10_000,
+                runtime_change_microunits: 25_000,
+            }
+        );
+        assert_eq!(
+            profile.binding().expect("binding").switch_costs,
+            profile.switch_costs
+        );
 
         let binding = profile.binding().expect("binding");
         binding.validate().expect("valid binding");
@@ -627,5 +684,40 @@ mod tests {
         let mut profile = default_objective_profile();
         profile.quality.held_out_percent = 40;
         assert!(profile.validate().unwrap_err().to_string().contains("100"));
+    }
+
+    #[test]
+    fn historical_profile_and_binding_omissions_decode_to_zero_switch_costs() {
+        let profile = ObjectiveProfile::from_json(
+            br#"{"id":"legacy","version":1,"quality":{"held_out_percent":50,"breadth_percent":25,"anti_shortcut_percent":25}}"#,
+        )
+        .expect("historical profile");
+        assert_eq!(profile.id, "legacy");
+        assert_eq!(profile.version, 1);
+        assert_eq!(profile.switch_costs, ContextSwitchCosts::zero());
+
+        let binding: ObjectiveProfileBinding = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "version": 1,
+            "content_hash": "0".repeat(64),
+            "quality": {
+                "held_out_percent": 50,
+                "breadth_percent": 25,
+                "anti_shortcut_percent": 25
+            },
+            "tradeoffs": TradeoffWeights::default()
+        }))
+        .expect("historical binding");
+        assert_eq!(binding.switch_costs, ContextSwitchCosts::zero());
+    }
+
+    #[test]
+    fn malformed_switch_cost_json_fails_closed() {
+        for value in ["-1", "18446744073709551616"] {
+            let json = format!(
+                "{{\"id\":\"invalid\",\"version\":1,\"quality\":{{\"held_out_percent\":50,\"breadth_percent\":25,\"anti_shortcut_percent\":25}},\"switch_costs\":{{\"model_change_same_runtime_microunits\":{value},\"runtime_change_microunits\":25000}}}}"
+            );
+            assert!(ObjectiveProfile::from_json(json.as_bytes()).is_err());
+        }
     }
 }

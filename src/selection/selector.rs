@@ -1355,6 +1355,21 @@ fn score_candidate(input: CandidateScoringInput<'_>) -> Result<ScoreBreakdown, S
     } else {
         0
     };
+    let switch_transition = context_switch_transition(signals.previous_choice.as_ref(), candidate);
+    let configured_switch_cost_microunits = match switch_transition {
+        ContextSwitchTransition::Initial
+        | ContextSwitchTransition::Stay
+        | ContextSwitchTransition::EffortChangeSameRuntimeModel => 0,
+        ContextSwitchTransition::ModelChangeSameRuntime => {
+            profile.switch_costs.model_change_same_runtime_microunits
+        }
+        ContextSwitchTransition::RuntimeChange => profile.switch_costs.runtime_change_microunits,
+    };
+    let switch_cost_microunits = normalize_cost_per_accepted(
+        configured_switch_cost_microunits,
+        posterior_quality_basis_points,
+        "context-switch cost per accepted task",
+    )?;
     let legacy_baseline_score_microunits = checked_sum_costs(
         [
             expected_total_cost_per_accepted_task_microunits,
@@ -1364,6 +1379,7 @@ fn score_candidate(input: CandidateScoringInput<'_>) -> Result<ScoreBreakdown, S
             marginal_cost_microunits,
             retry_cost_microunits,
             degrade_cost_microunits,
+            switch_cost_microunits,
         ],
         "total candidate score",
     )?;
@@ -1412,6 +1428,9 @@ fn score_candidate(input: CandidateScoringInput<'_>) -> Result<ScoreBreakdown, S
         marginal_cost_microunits,
         retry_cost_microunits,
         degrade_cost_microunits,
+        switch_transition,
+        configured_switch_cost_microunits,
+        switch_cost_microunits,
         routing_score_semantics: RoutingScoreSemantics::LegacyBaselinePlusCostProxyAdjustmentsV1,
         routing_tradeoff_weights: routing_weights.clone(),
         legacy_baseline_score_microunits,
@@ -1422,6 +1441,24 @@ fn score_candidate(input: CandidateScoringInput<'_>) -> Result<ScoreBreakdown, S
         total_adjustment_microunits,
         total_score_microunits,
     })
+}
+
+fn context_switch_transition(
+    previous: Option<&CandidateKey>,
+    candidate: &CandidateKey,
+) -> ContextSwitchTransition {
+    let Some(previous) = previous else {
+        return ContextSwitchTransition::Initial;
+    };
+    if previous.runtime != candidate.runtime {
+        ContextSwitchTransition::RuntimeChange
+    } else if previous.model != candidate.model {
+        ContextSwitchTransition::ModelChangeSameRuntime
+    } else if previous.effort != candidate.effort {
+        ContextSwitchTransition::EffortChangeSameRuntimeModel
+    } else {
+        ContextSwitchTransition::Stay
+    }
 }
 
 fn automatic_choice(
@@ -1534,6 +1571,9 @@ fn selected_choice(
     })?;
     Ok(SelectedChoice {
         candidate: evaluation.candidate.clone(),
+        switch_transition: score.switch_transition,
+        configured_switch_cost_microunits: score.configured_switch_cost_microunits,
+        switch_cost_microunits: score.switch_cost_microunits,
         total_score_microunits: score.total_score_microunits,
         reason,
     })
@@ -1551,19 +1591,27 @@ fn runner_ups(
             candidate
                 .score
                 .as_ref()
-                .map(|score| (candidate.candidate.clone(), score.total_score_microunits))
+                .map(|score| (candidate.candidate.clone(), score))
         })
         .collect::<Vec<_>>();
-    scored.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    scored.sort_by(|left, right| {
+        left.1
+            .total_score_microunits
+            .cmp(&right.1.total_score_microunits)
+            .then_with(|| left.0.cmp(&right.0))
+    });
     let mut ranked = Vec::with_capacity(scored.len());
-    for (index, (candidate, total_score_microunits)) in scored.into_iter().enumerate() {
+    for (index, (candidate, score)) in scored.into_iter().enumerate() {
         let ordinal = index.checked_add(2).ok_or_else(|| {
             SelectionError::InvalidInput("runner-up rank overflowed usize".to_string())
         })?;
         ranked.push(RankedScore {
             rank: usize_to_u32(ordinal, "runner-up rank")?,
             candidate,
-            total_score_microunits,
+            switch_transition: score.switch_transition,
+            configured_switch_cost_microunits: score.configured_switch_cost_microunits,
+            switch_cost_microunits: score.switch_cost_microunits,
+            total_score_microunits: score.total_score_microunits,
         });
     }
     Ok(ranked)
@@ -1849,6 +1897,7 @@ fn validate_resolved_objective_profile(
         version: binding.version,
         quality: binding.quality.clone(),
         tradeoffs: binding.tradeoffs.clone(),
+        switch_costs: binding.switch_costs.clone(),
     };
     let expected = reconstructed.binding().map_err(|error| {
         SelectionError::InvalidInput(format!(

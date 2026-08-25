@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use crate::objective_profile::{ResolvedObjectiveProfile, TradeoffWeights};
 use serde::{Deserialize, Serialize};
 
+pub use crate::objective_profile::ContextSwitchCosts;
 use crate::optimizer::quota_pools::{
     ConsumptionSource, ExhaustionBehavior, PoolKind, PoolReference,
 };
@@ -225,6 +226,8 @@ pub struct ObjectiveProfile {
     pub entitlement_scarcity_full_cost_microunits: u64,
     pub retry_penalty_microunits: u64,
     pub degrade_effort_rank_penalty_microunits: u64,
+    #[serde(default = "crate::objective_profile::historical_zero_switch_costs")]
+    pub switch_costs: ContextSwitchCosts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -563,6 +566,12 @@ pub struct ScoreBreakdown {
     pub marginal_cost_microunits: u64,
     pub retry_cost_microunits: u64,
     pub degrade_cost_microunits: u64,
+    #[serde(default)]
+    pub switch_transition: ContextSwitchTransition,
+    #[serde(default)]
+    pub configured_switch_cost_microunits: u64,
+    #[serde(default)]
+    pub switch_cost_microunits: u64,
     pub routing_score_semantics: RoutingScoreSemantics,
     pub routing_tradeoff_weights: TradeoffWeights,
     pub legacy_baseline_score_microunits: u64,
@@ -608,7 +617,24 @@ pub struct CandidateEvaluation {
 pub struct RankedScore {
     pub rank: u32,
     pub candidate: CandidateKey,
+    #[serde(default)]
+    pub switch_transition: ContextSwitchTransition,
+    #[serde(default)]
+    pub configured_switch_cost_microunits: u64,
+    #[serde(default)]
+    pub switch_cost_microunits: u64,
     pub total_score_microunits: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSwitchTransition {
+    #[default]
+    Initial,
+    Stay,
+    EffortChangeSameRuntimeModel,
+    ModelChangeSameRuntime,
+    RuntimeChange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -717,6 +743,12 @@ pub struct QuotaDecisionProvenance {
 #[serde(deny_unknown_fields)]
 pub struct SelectedChoice {
     pub candidate: CandidateKey,
+    #[serde(default)]
+    pub switch_transition: ContextSwitchTransition,
+    #[serde(default)]
+    pub configured_switch_cost_microunits: u64,
+    #[serde(default)]
+    pub switch_cost_microunits: u64,
     pub total_score_microunits: u64,
     pub reason: ChoiceReason,
 }
