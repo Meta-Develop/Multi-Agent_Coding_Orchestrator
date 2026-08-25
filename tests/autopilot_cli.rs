@@ -185,7 +185,6 @@ fn autopilot_plan_json_normalizes_defaults_and_aliases() -> Result<()> {
 
 #[test]
 fn autopilot_plan_proposes_paths_from_plain_and_empty_tasks() -> Result<()> {
-    support::require_containment!("autopilot_plan_proposes_paths_from_plain_and_empty_tasks");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     write_file(&repo_path.join("src/inbox.rs"), "pub struct InboxRepair;\n")?;
@@ -239,9 +238,6 @@ fn autopilot_plan_proposes_paths_from_plain_and_empty_tasks() -> Result<()> {
 
 #[test]
 fn fake_autopilot_depth_two_e2e_is_gated_durable_and_primary_untouched() -> Result<()> {
-    support::require_containment!(
-        "fake_autopilot_depth_two_e2e_is_gated_durable_and_primary_untouched"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let task_path = temp.path().join("autopilot-plan.json");
@@ -331,9 +327,6 @@ fn fake_autopilot_depth_two_e2e_is_gated_durable_and_primary_untouched() -> Resu
 
 #[test]
 fn fake_autopilot_goal_run_dispatches_exact_derived_tree_and_preserves_primary() -> Result<()> {
-    support::require_containment!(
-        "fake_autopilot_goal_run_dispatches_exact_derived_tree_and_preserves_primary"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let goal_path = temp.path().join("autopilot-goal.md");
@@ -402,9 +395,6 @@ fn fake_autopilot_goal_run_dispatches_exact_derived_tree_and_preserves_primary()
 
 #[test]
 fn autopilot_goal_run_refuses_profile_that_would_mutate_the_derived_plan() -> Result<()> {
-    support::require_containment!(
-        "autopilot_goal_run_refuses_profile_that_would_mutate_the_derived_plan"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let goal_path = temp.path().join("profile-refusal-goal.md");
@@ -452,9 +442,6 @@ fn autopilot_goal_run_refuses_profile_that_would_mutate_the_derived_plan() -> Re
 
 #[test]
 fn fake_autopilot_run_reports_configured_but_execution_incomparable_profile() -> Result<()> {
-    support::require_containment!(
-        "fake_autopilot_run_reports_configured_but_execution_incomparable_profile"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("profiled-plan.json");
@@ -634,9 +621,6 @@ fn fake_autopilot_run_reports_configured_but_execution_incomparable_profile() ->
 
 #[test]
 fn autopilot_run_refuses_max_depth_three_with_typed_permission_expansion() -> Result<()> {
-    support::require_containment!(
-        "autopilot_run_refuses_max_depth_three_with_typed_permission_expansion"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("depth-three.json");
@@ -668,9 +652,6 @@ fn autopilot_run_refuses_max_depth_three_with_typed_permission_expansion() -> Re
 
 #[test]
 fn autopilot_run_refuses_recursive_assignments_with_typed_permission_expansion() -> Result<()> {
-    support::require_containment!(
-        "autopilot_run_refuses_recursive_assignments_with_typed_permission_expansion"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("recursive-assignments.json");
@@ -774,7 +755,6 @@ fn primary_git_snapshot_detects_complete_state_drift() -> Result<()> {
 
 #[test]
 fn autopilot_run_without_run_id_generates_finalized_artifacts() -> Result<()> {
-    support::require_containment!("autopilot_run_without_run_id_generates_finalized_artifacts");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let task_path = temp.path().join("task.md");
@@ -867,9 +847,6 @@ fn autopilot_prune_deletes_only_finalized_runs() -> Result<()> {
 #[test]
 fn fake_autopilot_nonpublishable_run_ignores_local_runtime_state_without_gitignore_entry(
 ) -> Result<()> {
-    support::require_containment!(
-        "fake_autopilot_nonpublishable_run_ignores_local_runtime_state_without_gitignore_entry"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo_without_maco_ignore(temp.path())?;
     let readme_before = fs::read_to_string(repo_path.join("README.md")).context("read readme")?;
@@ -907,9 +884,6 @@ fn fake_autopilot_nonpublishable_run_ignores_local_runtime_state_without_gitigno
 
 #[test]
 fn fake_supervise_flow_completes_and_legacy_pr_review_stays_unreachable() -> Result<()> {
-    support::require_containment!(
-        "fake_supervise_flow_completes_and_legacy_pr_review_stays_unreachable"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("plan.json");
@@ -949,9 +923,6 @@ fn fake_supervise_flow_completes_and_legacy_pr_review_stays_unreachable() -> Res
 
 #[test]
 fn legacy_blocking_review_configuration_cannot_start_an_outer_repair_loop() -> Result<()> {
-    support::require_containment!(
-        "legacy_blocking_review_configuration_cannot_start_an_outer_repair_loop"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("blocking-review.json");
@@ -995,7 +966,6 @@ fn legacy_blocking_review_configuration_cannot_start_an_outer_repair_loop() -> R
 
 #[test]
 fn legacy_outer_validation_command_cannot_start_a_repair_loop() -> Result<()> {
-    support::require_containment!("legacy_outer_validation_command_cannot_start_a_repair_loop");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("validation-fails.json");
@@ -1033,7 +1003,6 @@ fn legacy_outer_validation_command_cannot_start_a_repair_loop() -> Result<()> {
 
 #[test]
 fn dirty_primary_refusal_emits_public_json() -> Result<()> {
-    support::require_containment!("dirty_primary_refusal_emits_public_json");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo_without_maco_ignore(temp.path())?;
     let task_path = temp.path().join("task.md");
@@ -1196,7 +1165,6 @@ fn status_and_collect_require_verified_finalization_and_distinguish_active_runs(
 
 #[test]
 fn active_sync_claim_is_a_typed_preflight_refusal() -> Result<()> {
-    support::require_containment!("active_sync_claim_is_a_typed_preflight_refusal");
     let temp = TempDir::new().context("tempdir")?;
     let sync_repo = create_committed_repo(temp.path())?;
     run_success_json(&[
@@ -1216,7 +1184,6 @@ fn active_sync_claim_is_a_typed_preflight_refusal() -> Result<()> {
 
 #[test]
 fn active_semantic_intent_is_a_typed_preflight_refusal() -> Result<()> {
-    support::require_containment!("active_semantic_intent_is_a_typed_preflight_refusal");
     let temp = TempDir::new().context("tempdir")?;
     let semantic_repo = create_committed_repo(temp.path())?;
     run_success_json(&[
@@ -1237,7 +1204,6 @@ fn active_semantic_intent_is_a_typed_preflight_refusal() -> Result<()> {
 
 #[test]
 fn active_live_lock_is_a_typed_preflight_refusal() -> Result<()> {
-    support::require_containment!("active_live_lock_is_a_typed_preflight_refusal");
     let temp = TempDir::new().context("tempdir")?;
     let live_repo = create_committed_repo(temp.path())?;
     write_live_claim(&live_repo, "active-live", "active", "README.md")?;
@@ -1249,9 +1215,6 @@ fn active_live_lock_is_a_typed_preflight_refusal() -> Result<()> {
 
 #[test]
 fn non_overlapping_locks_do_not_refuse_nonpublishable_fake_autopilot() -> Result<()> {
-    support::require_containment!(
-        "non_overlapping_locks_do_not_refuse_nonpublishable_fake_autopilot"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     run_success_json(&[
@@ -1300,7 +1263,6 @@ fn non_overlapping_locks_do_not_refuse_nonpublishable_fake_autopilot() -> Result
 
 #[test]
 fn auto_merge_request_is_recorded_but_never_performed() -> Result<()> {
-    support::require_containment!("auto_merge_request_is_recorded_but_never_performed");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("auto-merge.json");
@@ -1343,7 +1305,6 @@ fn auto_merge_request_is_recorded_but_never_performed() -> Result<()> {
 
 #[test]
 fn public_json_shape_is_stable_and_sanitized() -> Result<()> {
-    support::require_containment!("public_json_shape_is_stable_and_sanitized");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let task_path = temp.path().join("task.md");

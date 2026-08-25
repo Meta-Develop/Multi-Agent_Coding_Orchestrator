@@ -2912,6 +2912,13 @@ fn prepare_supervisor_run(
         {
             bail!("primary-worktree execution requires the verified supervisor runtime")
         }
+        SupervisorWorktreeCreation::NonpublishableSimulation
+            if execution_runtime != SupervisorExecutionRuntime::NonpublishableSimulation =>
+        {
+            bail!(
+                "nonpublishable-simulation worktree creation requires the simulation supervisor runtime"
+            )
+        }
         #[cfg(test)]
         SupervisorWorktreeCreation::TestOnly
             if execution_runtime != SupervisorExecutionRuntime::NonpublishableSimulation =>
@@ -2925,6 +2932,11 @@ fn prepare_supervisor_run(
             bail!("verified test-only worktree creation requires the verified supervisor runtime")
         }
         _ => {}
+    }
+    if execution_runtime == SupervisorExecutionRuntime::NonpublishableSimulation
+        && !worktree_creation.is_nonpublishable_simulation()
+    {
+        bail!("simulation supervisor runtime requires nonpublishable-simulation worktree creation");
     }
     match (worktree_creation, plan_metadata.execution_target.as_ref()) {
         (
@@ -2940,6 +2952,13 @@ fn prepare_supervisor_run(
         (_, None) => {}
     }
     let runtime = options.runtime;
+    if matches!(
+        worktree_creation,
+        SupervisorWorktreeCreation::NonpublishableSimulation
+    ) && runtime != SupervisorRuntime::Fake
+    {
+        bail!("nonpublishable-simulation worktree creation requires the Fake supervisor runtime");
+    }
     let repo = discover_repo_root(&options.repo)?;
     let quota_context = live_quota_context_for_run(&repo)?;
     if quota_context.is_some() && runtime == SupervisorRuntime::Fake {

@@ -649,6 +649,9 @@ fn prepare_assignment_execution<'a>(
             SupervisorWorktreeCreation::PrimaryWorktree => {
                 bail!("primary-worktree execution does not create a managed child worktree")
             }
+            SupervisorWorktreeCreation::NonpublishableSimulation => {
+                manager.create_for_nonpublishable_simulation(create_options)
+            }
             #[cfg(test)]
             SupervisorWorktreeCreation::TestOnly | SupervisorWorktreeCreation::VerifiedTestOnly => {
                 manager.create_for_test(create_options)

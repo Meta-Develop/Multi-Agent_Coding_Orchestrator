@@ -3377,6 +3377,7 @@ impl CreationCleanliness<'_> {
     fn require_clean_for_repository(&self, repository: &ManagedRepositoryBinding) -> Result<()> {
         match self {
             Self::Bound(cleanliness) => cleanliness.require_clean_for_repository(repository),
+            Self::NonpublishableSimulation => Ok(()),
             #[cfg(test)]
             Self::TestOnly => Ok(()),
         }
@@ -3385,6 +3386,7 @@ impl CreationCleanliness<'_> {
     fn require_clean_related_worktree(&self, path: &Path) -> Result<()> {
         match self {
             Self::Bound(cleanliness) => cleanliness.require_clean_related_worktree(path),
+            Self::NonpublishableSimulation => Ok(()),
             #[cfg(test)]
             Self::TestOnly => Ok(()),
         }
