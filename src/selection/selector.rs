@@ -3,6 +3,8 @@ use std::{cmp::Ordering, collections::BTreeSet};
 use crate::objective_profile::ObjectiveProfile as RoutingObjectiveProfile;
 use serde::Serialize;
 
+use crate::optimizer::quota_pools::{ConsumptionSource, ExhaustionBehavior};
+
 use super::types::*;
 
 const BUILT_IN_PRIORS: &str = include_str!("data/priors-2026-08-07.json");
@@ -93,12 +95,33 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
 
     let catalogs_digest = &input_digests.catalogs.value;
     let mut triggers = selection_triggers(&normalized, catalogs_digest);
+    let quota_source = quota_source_pool(&normalized)?;
+    let quota_exhausted = quota_source.is_some_and(|pool| pool.exhausted);
+    if quota_exhausted {
+        triggers.push(SelectionTrigger::QuotaExhaustion);
+        triggers.sort();
+        triggers.dedup();
+    }
     let mut debug_override = None;
     let mut environment_fallback = None;
     let mut choice = None;
     let decision_reason;
 
-    if let Some(request) = &normalized.debug_override {
+    if quota_source.is_some_and(|pool| {
+        pool.exhausted && pool.exhaustion_behavior == Some(ExhaustionBehavior::FailClosed)
+    }) {
+        if let Some(request) = &normalized.debug_override {
+            debug_override = Some(DebugOverrideProvenance {
+                request: request.clone(),
+                disposition: DebugOverrideDisposition::Rejected,
+                reason: "debug override cannot bypass configured quota fail-closed behavior"
+                    .to_string(),
+            });
+        }
+        decision_reason =
+            "configured source quota pool is exhausted and requires fail-closed refusal"
+                .to_string();
+    } else if let Some(request) = &normalized.debug_override {
         let evaluation = candidate_set
             .iter()
             .find(|evaluation| evaluation.candidate == request.candidate);
@@ -145,10 +168,18 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
         decision_reason =
             "one-shot data-declared environment fallback selected after an evidenced native rejection"
                 .to_string();
-    } else if let Some(selected) = automatic_choice(&normalized, &candidate_set)? {
+    } else if let Some(mut selected) = automatic_choice(&normalized, &candidate_set)? {
+        if quota_source.is_some_and(|pool| {
+            pool.exhausted && pool.exhaustion_behavior == Some(ExhaustionBehavior::Degrade)
+        }) {
+            selected.reason = ChoiceReason::AuthorizedQuotaDegrade;
+        }
         decision_reason = match selected.reason {
             ChoiceReason::StrongestNoEvidenceJudgmentFallback =>
                 "no comparable exact judgment evidence was eligible; selected the strongest data-declared xhigh gate fallback"
+                    .to_string(),
+            ChoiceReason::AuthorizedQuotaDegrade =>
+                "source quota pool is exhausted; selected the lowest-cost independently eligible operator-authorized alternative"
                     .to_string(),
             ChoiceReason::LowestLegacyBaselinePlusCostProxyAdjustments =>
                 "selected the eligible runtime/model/effort candidate with the lowest legacy baseline plus explicit retry/rework and human-review cost-proxy adjustments"
@@ -187,6 +218,7 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
             advertised_at: catalog.advertised_at.clone(),
         })
         .collect();
+    let quota = quota_decision_provenance(&normalized, &candidate_set, choice.as_ref())?;
 
     Ok(SelectionProvenance {
         schema_version: SELECTION_SCHEMA_VERSION,
@@ -213,6 +245,7 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
         decision_reason,
         debug_override,
         environment_fallback,
+        quota,
     })
 }
 
@@ -234,6 +267,10 @@ fn normalize_input(input: &mut SelectionInput) {
     input
         .pools
         .sort_by(|left, right| left.runtime.cmp(&right.runtime));
+    for pool in &mut input.pools {
+        pool.authorized_alternatives.sort();
+        pool.authorized_alternatives.dedup();
+    }
     input
         .priors
         .objective_profiles
@@ -380,12 +417,143 @@ fn validate_input(input: &SelectionInput) -> Result<(), SelectionError> {
                 pool.runtime
             ));
         }
-        if pool.entitlement_remaining_units > pool.entitlement_capacity_units {
+        if pool.entitlement_bounded
+            && pool.entitlement_remaining_units > pool.entitlement_capacity_units
+        {
             return invalid(format!(
                 "pool '{}' remaining entitlement exceeds capacity",
                 pool.runtime
             ));
         }
+        if !pool.entitlement_bounded
+            && (pool.entitlement_capacity_units != 0
+                || pool.entitlement_remaining_units != 0
+                || pool.exhausted)
+        {
+            return invalid(format!(
+                "unbounded pool '{}' must use zero capacity/remaining units and cannot be exhausted",
+                pool.runtime
+            ));
+        }
+        let has_configured_field = pool.pool_reference.is_some()
+            || pool.pool_kind.is_some()
+            || pool.exhaustion_behavior.is_some()
+            || pool.observation_source.is_some()
+            || !pool.authorized_alternatives.is_empty();
+        let has_complete_configured_fields = pool.pool_reference.is_some()
+            && pool.pool_kind.is_some()
+            && pool.exhaustion_behavior.is_some()
+            && pool.observation_source.is_some();
+        if has_configured_field && !has_complete_configured_fields {
+            return invalid(format!(
+                "configured quota pool '{}' is missing typed identity, kind, behavior, or observation source",
+                pool.runtime
+            ));
+        }
+        if let Some(reference) = &pool.pool_reference {
+            if reference.runtime.as_str() != pool.runtime {
+                return invalid(format!(
+                    "quota pool '{}' runtime does not match its exact pool reference",
+                    pool.runtime
+                ));
+            }
+            if pool.observation_source != Some(ConsumptionSource::LocalObserved) {
+                return invalid(format!(
+                    "configured quota pool '{}' must use local observed consumption",
+                    pool.runtime
+                ));
+            }
+            if pool.entitlement_bounded {
+                if pool.entitlement_capacity_units == 0 {
+                    return invalid(format!(
+                        "configured bounded quota pool '{}' must have positive capacity",
+                        pool.runtime
+                    ));
+                }
+                if pool.exhausted != (pool.entitlement_remaining_units == 0) {
+                    return invalid(format!(
+                        "configured quota pool '{}' exhaustion disagrees with remaining entitlement",
+                        pool.runtime
+                    ));
+                }
+            }
+            match pool.exhaustion_behavior {
+                Some(ExhaustionBehavior::FailClosed)
+                    if !pool.authorized_alternatives.is_empty() =>
+                {
+                    return invalid(format!(
+                        "fail-closed quota pool '{}' cannot authorize alternatives",
+                        pool.runtime
+                    ));
+                }
+                Some(ExhaustionBehavior::Degrade) if pool.authorized_alternatives.is_empty() => {
+                    return invalid(format!(
+                        "degrading quota pool '{}' requires an authorized alternative",
+                        pool.runtime
+                    ));
+                }
+                Some(ExhaustionBehavior::FailClosed | ExhaustionBehavior::Degrade) => {}
+                None => {
+                    return invalid(format!(
+                        "configured quota pool '{}' is missing exhaustion behavior",
+                        pool.runtime
+                    ));
+                }
+            }
+            if duplicate_semantic_key(&pool.authorized_alternatives, Clone::clone) {
+                return invalid(format!(
+                    "quota pool '{}' contains duplicate authorized alternatives",
+                    pool.runtime
+                ));
+            }
+            if pool
+                .authorized_alternatives
+                .iter()
+                .any(|alternative| alternative == reference)
+            {
+                return invalid(format!(
+                    "quota pool '{}' cannot authorize itself as an alternative",
+                    pool.runtime
+                ));
+            }
+        }
+    }
+    let configured_pools = input
+        .pools
+        .iter()
+        .filter(|pool| pool.pool_reference.is_some())
+        .collect::<Vec<_>>();
+    match &input.quota_source {
+        None if !configured_pools.is_empty() => {
+            return invalid(
+                "configured quota pools require an exact quota_source; catalog order is not authority",
+            );
+        }
+        Some(source) => {
+            let matches = configured_pools
+                .iter()
+                .filter(|pool| pool.pool_reference.as_ref() == Some(source))
+                .count();
+            if matches != 1 {
+                return invalid(
+                    "quota_source must exactly match one configured runtime pool reference",
+                );
+            }
+            for pool in &configured_pools {
+                for alternative in &pool.authorized_alternatives {
+                    if !configured_pools
+                        .iter()
+                        .any(|candidate| candidate.pool_reference.as_ref() == Some(alternative))
+                    {
+                        return invalid(format!(
+                            "quota pool '{}' authorizes an undeclared alternative",
+                            pool.runtime
+                        ));
+                    }
+                }
+            }
+        }
+        None => {}
     }
     if duplicate_pair(&input.priors.models, |prior| {
         (prior.runtime.as_str(), prior.model.as_str())
@@ -561,6 +729,7 @@ fn evaluate_candidate(
         .pools
         .iter()
         .find(|pool| pool.runtime == candidate.runtime);
+    let quota = quota_candidate_provenance(input, &candidate)?;
     let ledger = ledger_summary(input, &candidate)?;
     let mut reasons = Vec::new();
 
@@ -607,12 +776,35 @@ fn evaluate_candidate(
             IneligibilityCode::RuntimeAdmissionClosed,
             "runtime pool admission is closed",
         ),
-        Some(pool) if pool.entitlement_remaining_units == 0 => reject(
-            &mut reasons,
-            IneligibilityCode::EntitlementExhausted,
-            "runtime pool entitlement is exhausted",
-        ),
+        Some(pool)
+            if pool.exhausted
+                || (pool.pool_reference.is_none()
+                    && pool.entitlement_bounded
+                    && pool.entitlement_remaining_units == 0) =>
+        {
+            reject(
+                &mut reasons,
+                IneligibilityCode::EntitlementExhausted,
+                "runtime pool entitlement is exhausted",
+            )
+        }
         Some(_) => {}
+    }
+    match quota.disposition {
+        QuotaCandidateDisposition::FailClosed => reject(
+            &mut reasons,
+            IneligibilityCode::QuotaFailClosed,
+            "configured exhausted source pool requires fail-closed refusal",
+        ),
+        QuotaCandidateDisposition::RejectedUnauthorizedAlternative => reject(
+            &mut reasons,
+            IneligibilityCode::QuotaAlternativeNotAuthorized,
+            "candidate is not an exact operator-authorized alternative for the exhausted source pool",
+        ),
+        QuotaCandidateDisposition::LegacyUnconfigured
+        | QuotaCandidateDisposition::SourceAvailable
+        | QuotaCandidateDisposition::SourceExhausted
+        | QuotaCandidateDisposition::AuthorizedAlternative => {}
     }
     if !model
         .capabilities
@@ -848,9 +1040,220 @@ fn evaluate_candidate(
         strong_gate_fallback,
         eligible: reasons.is_empty() && score.is_some(),
         ineligibility_reasons: reasons,
+        quota,
         ledger,
         score,
     })
+}
+
+fn quota_source_pool(input: &SelectionInput) -> Result<Option<&RuntimePoolState>, SelectionError> {
+    let Some(source) = input.quota_source.as_ref() else {
+        return Ok(None);
+    };
+    input
+        .pools
+        .iter()
+        .find(|pool| pool.pool_reference.as_ref() == Some(source))
+        .map(Some)
+        .ok_or_else(|| {
+            SelectionError::InvalidInput(
+                "quota_source disappeared after validated input normalization".to_string(),
+            )
+        })
+}
+
+fn quota_candidate_provenance(
+    input: &SelectionInput,
+    candidate: &CandidateKey,
+) -> Result<QuotaCandidateProvenance, SelectionError> {
+    let target = input
+        .pools
+        .iter()
+        .find(|pool| pool.runtime == candidate.runtime);
+    let target_pool = target.and_then(|pool| pool.pool_reference.clone());
+    let target_marginal_cost_microunits = target.map(|pool| pool.marginal_cost_microunits);
+    let Some(source) = quota_source_pool(input)? else {
+        return Ok(QuotaCandidateProvenance {
+            source_pool: None,
+            target_pool,
+            source_exhausted: false,
+            configured_behavior: None,
+            authorized_alternative: false,
+            disposition: QuotaCandidateDisposition::LegacyUnconfigured,
+            source_observation_revision: None,
+            source_observation: None,
+            target_marginal_cost_microunits,
+            reason: "no operator quota source was declared; legacy selector behavior applies"
+                .to_string(),
+        });
+    };
+    let source_pool = source.pool_reference.clone().ok_or_else(|| {
+        SelectionError::InvalidInput("configured quota source has no pool reference".to_string())
+    })?;
+    let behavior = source.exhaustion_behavior.ok_or_else(|| {
+        SelectionError::InvalidInput(
+            "configured quota source has no exhaustion behavior".to_string(),
+        )
+    })?;
+    let (authorized_alternative, disposition, reason) = if !source.exhausted {
+        (
+            false,
+            QuotaCandidateDisposition::SourceAvailable,
+            "configured source pool is available; exhaustion routing is inactive".to_string(),
+        )
+    } else {
+        match behavior {
+            ExhaustionBehavior::FailClosed => (
+                false,
+                QuotaCandidateDisposition::FailClosed,
+                "configured source pool is exhausted and fail-closed behavior forbids every target"
+                    .to_string(),
+            ),
+            ExhaustionBehavior::Degrade if target_pool.as_ref() == Some(&source_pool) => (
+                false,
+                QuotaCandidateDisposition::SourceExhausted,
+                "source candidate belongs to the exhausted pool".to_string(),
+            ),
+            ExhaustionBehavior::Degrade
+                if target_pool
+                    .as_ref()
+                    .is_some_and(|target| source.authorized_alternatives.contains(target)) =>
+            {
+                (
+                    true,
+                    QuotaCandidateDisposition::AuthorizedAlternative,
+                    "target pool exactly matches an operator-authorized alternative; independent hard gates still apply"
+                        .to_string(),
+                )
+            }
+            ExhaustionBehavior::Degrade => (
+                false,
+                QuotaCandidateDisposition::RejectedUnauthorizedAlternative,
+                "target pool does not exactly match an operator-authorized alternative"
+                    .to_string(),
+            ),
+        }
+    };
+    Ok(QuotaCandidateProvenance {
+        source_pool: Some(source_pool),
+        target_pool,
+        source_exhausted: source.exhausted,
+        configured_behavior: Some(behavior),
+        authorized_alternative,
+        disposition,
+        source_observation_revision: Some(source.observation_revision.clone()),
+        source_observation: source.observation_source,
+        target_marginal_cost_microunits,
+        reason,
+    })
+}
+
+fn quota_decision_provenance(
+    input: &SelectionInput,
+    candidates: &[CandidateEvaluation],
+    choice: Option<&SelectedChoice>,
+) -> Result<Option<QuotaDecisionProvenance>, SelectionError> {
+    let Some(source) = quota_source_pool(input)? else {
+        return Ok(None);
+    };
+    let source_pool = source.pool_reference.clone().ok_or_else(|| {
+        SelectionError::InvalidInput("configured quota source has no pool reference".to_string())
+    })?;
+    let configured_behavior = source.exhaustion_behavior.ok_or_else(|| {
+        SelectionError::InvalidInput(
+            "configured quota source has no exhaustion behavior".to_string(),
+        )
+    })?;
+    let observation_source = source.observation_source.ok_or_else(|| {
+        SelectionError::InvalidInput(
+            "configured quota source has no observation source".to_string(),
+        )
+    })?;
+
+    let mut eligible_alternatives = Vec::new();
+    let mut rejected_alternatives = Vec::new();
+    if source.exhausted {
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| candidate.candidate.runtime != source.runtime)
+        {
+            if candidate.quota.authorized_alternative && candidate.eligible {
+                eligible_alternatives.push(candidate.candidate.clone());
+            } else {
+                rejected_alternatives.push(RejectedQuotaAlternative {
+                    candidate: candidate.candidate.clone(),
+                    reasons: candidate.ineligibility_reasons.clone(),
+                });
+            }
+        }
+    }
+    eligible_alternatives.sort();
+    rejected_alternatives.sort_by(|left, right| left.candidate.cmp(&right.candidate));
+
+    let selected_alternative = choice
+        .filter(|choice| choice.candidate.runtime != source.runtime)
+        .map(|choice| choice.candidate.clone());
+    if source.exhausted
+        && configured_behavior == ExhaustionBehavior::Degrade
+        && selected_alternative.as_ref().is_some_and(|selected| {
+            !candidates.iter().any(|candidate| {
+                candidate.candidate == *selected
+                    && candidate.eligible
+                    && candidate.quota.authorized_alternative
+            })
+        })
+    {
+        return invalid("quota degradation selected a target without exact authorization");
+    }
+    let (disposition, reason) = if !source.exhausted {
+        (
+            QuotaDecisionDisposition::SourceAvailable,
+            "configured source pool remains available; ordinary selection applies".to_string(),
+        )
+    } else {
+        match (
+            configured_behavior,
+            selected_alternative.is_some(),
+            !eligible_alternatives.is_empty(),
+            input.debug_override.is_some(),
+        ) {
+            (ExhaustionBehavior::FailClosed, _, _, _) => (
+                QuotaDecisionDisposition::FailClosed,
+                "configured fail-closed behavior refused the decision without considering unrelated alternatives"
+                    .to_string(),
+            ),
+            (ExhaustionBehavior::Degrade, true, _, _) => (
+                QuotaDecisionDisposition::Degraded,
+                "selected an exact operator-authorized alternative that independently passed every hard gate"
+                    .to_string(),
+            ),
+            (ExhaustionBehavior::Degrade, false, true, true) => (
+                QuotaDecisionDisposition::RefusedByExplicitOverride,
+                "an explicit debug override targeted an unauthorized or otherwise ineligible candidate; automatic fallback remained forbidden"
+                    .to_string(),
+            ),
+            (ExhaustionBehavior::Degrade, false, _, _) => (
+                QuotaDecisionDisposition::RefusedNoEligibleAlternative,
+                "no exact operator-authorized alternative independently passed every hard gate"
+                    .to_string(),
+            ),
+        }
+    };
+
+    Ok(Some(QuotaDecisionProvenance {
+        source_pool,
+        configured_behavior,
+        source_exhausted: source.exhausted,
+        local_observation_revision: source.observation_revision.clone(),
+        observation_source,
+        marginal_cost_assumption_microunits: source.marginal_cost_microunits,
+        authorized_alternatives: source.authorized_alternatives.clone(),
+        eligible_alternatives,
+        rejected_alternatives,
+        selected_alternative,
+        disposition,
+        reason,
+    }))
 }
 
 struct CandidateScoringInput<'a> {
@@ -888,7 +1291,9 @@ fn score_candidate(input: CandidateScoringInput<'_>) -> Result<ScoreBreakdown, S
         posterior_quality_basis_points,
         "pool-pressure cost per accepted task",
     )?;
-    let entitlement_scarcity_bp = if pool.entitlement_capacity_units == 0 {
+    let entitlement_scarcity_bp = if !pool.entitlement_bounded {
+        0
+    } else if pool.entitlement_capacity_units == 0 {
         10_000
     } else {
         let used = pool

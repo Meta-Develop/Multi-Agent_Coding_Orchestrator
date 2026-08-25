@@ -93,7 +93,7 @@ enum DispatchBudgetAdmission<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DispatchBudgetReservationState {
     Reserved,
-    Invoked,
+    Invoked(SupervisorRuntime),
     Settled,
 }
 
@@ -144,7 +144,7 @@ fn set_dispatch_pre_runner_fault(role: AgentRole) {
 }
 
 impl DispatchBudgetReservation<'_> {
-    fn mark_invoked(&mut self) -> Result<()> {
+    fn mark_invoked_for_runtime(&mut self, launch_runtime: SupervisorRuntime) -> Result<()> {
         if self.state != DispatchBudgetReservationState::Reserved {
             bail!("budget reservation was invoked outside its reserved state");
         }
@@ -158,37 +158,40 @@ impl DispatchBudgetReservation<'_> {
                 self.reservation.role.as_str()
             );
         }
-        self.state = DispatchBudgetReservationState::Invoked;
+        self.state = DispatchBudgetReservationState::Invoked(launch_runtime);
         Ok(())
     }
 
+    #[cfg(test)]
+    fn mark_invoked(&mut self) -> Result<()> {
+        self.mark_invoked_for_runtime(SupervisorRuntime::Codex)
+    }
+
     fn settle_not_started(&mut self) -> Result<()> {
-        let prior = std::mem::replace(&mut self.state, DispatchBudgetReservationState::Settled);
-        if prior == DispatchBudgetReservationState::Settled {
+        if self.state == DispatchBudgetReservationState::Settled {
             bail!("budget reservation was already settled");
         }
         self.ledger
             .release(self.reservation.id)
             .context("failed to release budget for a dispatch that never started")?;
+        self.state = DispatchBudgetReservationState::Settled;
         Ok(())
     }
 
-    fn settle(
+    fn settle_bound_runtime(
         &mut self,
         run: &ExternalAgentRun,
-        runtime: SupervisorRuntime,
         command: &ExternalAgentCommand,
     ) -> Result<DispatchUsageSettlement> {
-        let prior = std::mem::replace(&mut self.state, DispatchBudgetReservationState::Settled);
-        if prior != DispatchBudgetReservationState::Invoked {
-            bail!("budget reservation was settled before its dispatch was invoked");
-        }
+        let DispatchBudgetReservationState::Invoked(launch_runtime) = self.state else {
+            bail!("budget reservation was settled before its dispatch was invoked")
+        };
         let usage = complete_external_codex_usage(run, command);
-        if external_dispatch_may_have_started(run, runtime) {
+        let settlement = if external_dispatch_may_have_started(run, launch_runtime) {
             let (measurement, reliability) = match usage {
                 Some(usage)
                     if external_process_completed(run)
-                        && external_safety_verified(run, runtime)
+                        && external_safety_verified(run, launch_runtime)
                         && !run.stdout.truncated =>
                 {
                     (
@@ -215,37 +218,62 @@ impl DispatchBudgetReservation<'_> {
                 None => (UsageMeasurement::Missing, DispatchUsageReliability::Missing),
             };
             self.ledger
-                .reconcile(self.reservation.id, measurement)
+                .reconcile_for_runtime_if_configured(
+                    self.reservation.id,
+                    measurement,
+                    Some(runtime_name(launch_runtime)),
+                )
                 .context("failed to reconcile started dispatch budget reservation")?;
-            Ok(DispatchUsageSettlement {
+            DispatchUsageSettlement {
                 observed_usage: usage,
                 reliability,
-            })
+            }
         } else {
             self.ledger
                 .release(self.reservation.id)
                 .context("failed to release budget for a dispatch that never started")?;
-            Ok(DispatchUsageSettlement {
+            DispatchUsageSettlement {
                 observed_usage: usage,
                 reliability: DispatchUsageReliability::NotStarted,
-            })
+            }
+        };
+        self.state = DispatchBudgetReservationState::Settled;
+        Ok(settlement)
+    }
+
+    #[cfg(test)]
+    fn settle(
+        &mut self,
+        run: &ExternalAgentRun,
+        runtime: SupervisorRuntime,
+        command: &ExternalAgentCommand,
+    ) -> Result<DispatchUsageSettlement> {
+        if !matches!(self.state, DispatchBudgetReservationState::Invoked(bound) if bound == runtime)
+        {
+            bail!("test settlement runtime does not match the retained launch runtime");
         }
+        self.settle_bound_runtime(run, command)
     }
 }
 
 impl Drop for DispatchBudgetReservation<'_> {
     fn drop(&mut self) {
-        let prior = std::mem::replace(&mut self.state, DispatchBudgetReservationState::Settled);
-        match prior {
+        let result = match self.state {
             DispatchBudgetReservationState::Reserved => {
-                let _ = self.ledger.release(self.reservation.id);
+                self.ledger.release(self.reservation.id).map(|_| ())
             }
-            DispatchBudgetReservationState::Invoked => {
-                let _ = self
-                    .ledger
-                    .reconcile(self.reservation.id, UsageMeasurement::Missing);
-            }
-            DispatchBudgetReservationState::Settled => {}
+            DispatchBudgetReservationState::Invoked(launch_runtime) => self
+                .ledger
+                .reconcile_for_runtime_if_configured(
+                    self.reservation.id,
+                    UsageMeasurement::Missing,
+                    Some(runtime_name(launch_runtime)),
+                )
+                .map(|_| ()),
+            DispatchBudgetReservationState::Settled => Ok(()),
+        };
+        if result.is_ok() {
+            self.state = DispatchBudgetReservationState::Settled;
         }
     }
 }
@@ -432,6 +460,12 @@ fn run_supervisor_plan_with_budget_catalog_and_runner(
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
 ) -> Result<SupervisorFinalReport> {
     let serialized_runner = Mutex::new(external_runner);
+    let worktree_creation = match execution_runtime {
+        SupervisorExecutionRuntime::Verified => SupervisorWorktreeCreation::VerifiedTestOnly,
+        SupervisorExecutionRuntime::NonpublishableSimulation => {
+            SupervisorWorktreeCreation::TestOnly
+        }
+    };
     run_supervisor_plan_with_runner_and_creation(
         LoadedSupervisorPlan {
             plan,
@@ -445,7 +479,7 @@ fn run_supervisor_plan_with_budget_catalog_and_runner(
         options,
         1,
         execution_runtime,
-        SupervisorWorktreeCreation::TestOnly,
+        worktree_creation,
         runtime_model_catalog,
         &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),

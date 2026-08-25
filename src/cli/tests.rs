@@ -1403,6 +1403,85 @@ fn supervise_admission_flags_parse_and_reject_zero() {
 }
 
 #[test]
+fn supervise_and_autopilot_parse_repository_local_quota_config() {
+    let retention = [
+        "--machine-global-config",
+        "/tmp/maco-machine-global.json",
+        "--machine-global-runtime-root-id",
+        "runtime",
+    ];
+    for command in ["supervise", "autopilot"] {
+        let mut argv = vec![
+            "maco",
+            command,
+            "run",
+            "plan.json",
+            "--quota-config",
+            "config/operator-quota.json",
+        ];
+        argv.extend(retention);
+        let parsed = Cli::try_parse_from(argv)
+            .unwrap_or_else(|error| panic!("{command} quota config must parse: {error}"));
+        let quota_config = match parsed.command {
+            Command::Supervise(SuperviseCommand {
+                command: SuperviseSubcommand::Run(args),
+            }) => args.quota_config,
+            Command::Autopilot(AutopilotCommand {
+                command: AutopilotSubcommand::Run(args),
+            }) => args.quota_config,
+            _ => panic!("expected a live run command"),
+        };
+        assert_eq!(
+            quota_config,
+            Some(PathBuf::from("config/operator-quota.json"))
+        );
+    }
+}
+
+#[test]
+fn autopilot_parses_real_runtime_quota_and_rolling_budget_as_one_run_contract() {
+    let parsed = Cli::try_parse_from([
+        "maco",
+        "autopilot",
+        "run",
+        "plan.json",
+        "--run-id",
+        "autopilot-live-quota",
+        "--codex-bin",
+        "codex",
+        "--quota-config",
+        "config/operator-quota.json",
+        "--max-rolling-tokens",
+        "50000",
+        "--rolling-window-seconds",
+        "3600",
+        "--machine-global-config",
+        "/tmp/maco-machine-global.json",
+        "--machine-global-runtime-root-id",
+        "runtime",
+    ])
+    .expect("combined Autopilot quota and rolling budget flags must parse");
+    let Command::Autopilot(AutopilotCommand {
+        command: AutopilotSubcommand::Run(args),
+    }) = parsed.command
+    else {
+        panic!("expected Autopilot run command");
+    };
+    assert_eq!(args.run_id.as_deref(), Some("autopilot-live-quota"));
+    assert_eq!(args.codex_bin, Some(PathBuf::from("codex")));
+    assert_eq!(
+        args.quota_config,
+        Some(PathBuf::from("config/operator-quota.json"))
+    );
+    let rolling = args
+        .budget
+        .rolling_quota()
+        .expect("combined Autopilot rolling budget");
+    assert_eq!(rolling.max_tokens, Some(50_000));
+    assert_eq!(rolling.window_seconds, 3_600);
+}
+
+#[test]
 fn supervise_and_autopilot_budget_flags_parse_validate_and_bind_hard_limits() {
     let retention = [
         "--machine-global-config",

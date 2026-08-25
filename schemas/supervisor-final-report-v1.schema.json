@@ -900,10 +900,395 @@
           }
         },
         "assignment_selection_ledger": {
-          "type": "array",
           "items": {
-            "type": "object",
             "additionalProperties": false,
+            "properties": {
+              "assignment_id": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "attempt": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "catalog_revisions": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "advertised_at": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "revision": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "runtime": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "runtime",
+                    "revision",
+                    "advertised_at"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "catalog_snapshot_digest": {
+                "minLength": 1,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "catalog_source": {
+                "enum": [
+                  "runtime_advertised",
+                  "operator_declared",
+                  "none"
+                ],
+                "type": "string"
+              },
+              "evidence_gap": {
+                "minLength": 1,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "quota_evidence": {
+                "additionalProperties": false,
+                "properties": {
+                  "admission_open": {
+                    "type": "boolean"
+                  },
+                  "admission_provenance": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "authorized_alternatives": {
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "account": {
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "runtime": {
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "window": {
+                          "oneOf": [
+                            {
+                              "enum": [
+                                "none",
+                                "calendar_month"
+                              ]
+                            },
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "rolling_hours": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "hours": {
+                                      "minimum": 1,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "hours"
+                                  ],
+                                  "type": "object"
+                                }
+                              },
+                              "required": [
+                                "rolling_hours"
+                              ],
+                              "type": "object"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "runtime",
+                        "account",
+                        "window"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "entitlement_bounded": {
+                    "type": "boolean"
+                  },
+                  "entitlement_capacity_units": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "entitlement_remaining_units": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "exhausted": {
+                    "type": "boolean"
+                  },
+                  "exhaustion_behavior": {
+                    "enum": [
+                      "fail_closed",
+                      "degrade"
+                    ]
+                  },
+                  "failover_provenance": {
+                    "minLength": 1,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "marginal_cost_microunits": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "observation_revision": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "observation_source": {
+                    "const": "local_observed"
+                  },
+                  "observed_consumption_units": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "pool_kind": {
+                    "enum": [
+                      "subscription_included",
+                      "metered",
+                      "prepaid_credits"
+                    ]
+                  },
+                  "pool_pressure_basis_points": {
+                    "maximum": 10000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "pool_reference": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "account": {
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "runtime": {
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "window": {
+                        "oneOf": [
+                          {
+                            "enum": [
+                              "none",
+                              "calendar_month"
+                            ]
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "rolling_hours": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "hours": {
+                                    "minimum": 1,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "hours"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "required": [
+                              "rolling_hours"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "runtime",
+                      "account",
+                      "window"
+                    ],
+                    "type": "object"
+                  },
+                  "runtime": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "runtime",
+                  "admission_open",
+                  "pool_reference",
+                  "pool_kind",
+                  "entitlement_bounded",
+                  "entitlement_capacity_units",
+                  "entitlement_remaining_units",
+                  "pool_pressure_basis_points",
+                  "observed_consumption_units",
+                  "marginal_cost_microunits",
+                  "exhausted",
+                  "exhaustion_behavior",
+                  "authorized_alternatives",
+                  "observation_revision",
+                  "observation_source",
+                  "admission_provenance",
+                  "failover_provenance"
+                ],
+                "type": "object"
+              },
+              "rejected_candidates": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "effort": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "model": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "reasons": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "code": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "detail": {
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "code",
+                          "detail"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "runtime": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "runtime",
+                    "model",
+                    "effort",
+                    "reasons"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "role": {
+                "enum": [
+                  "supervisor",
+                  "child_orchestrator",
+                  "worker",
+                  "gate_classifier",
+                  "auditor"
+                ],
+                "type": "string"
+              },
+              "role_assignment": {
+                "additionalProperties": false,
+                "properties": {
+                  "agent_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "category": {
+                    "enum": [
+                      "delegating_coordinator",
+                      "non_delegating_terminal_worker",
+                      "read_only_researcher",
+                      "read_only_review_auditor"
+                    ],
+                    "type": "string"
+                  },
+                  "legacy_role": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "reason": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "source": {
+                    "enum": [
+                      "derived_from_plan_role",
+                      "operator_override"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "agent_id",
+                  "category",
+                  "legacy_role",
+                  "source",
+                  "reason"
+                ],
+                "type": "object"
+              },
+              "selected_model": {
+                "minLength": 1,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "selected_reasoning_effort": {
+                "minLength": 1,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "selected_runtime": {
+                "minLength": 1,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "selection_source": {
+                "enum": [
+                  "automatic",
+                  "plan_role_models",
+                  "operator_override",
+                  "budget_degrade",
+                  "low_difficulty_mechanical",
+                  "retry",
+                  "legacy_fake",
+                  "legacy_nonpublishable_simulation"
+                ],
+                "type": "string"
+              }
+            },
             "required": [
               "assignment_id",
               "attempt",
@@ -918,125 +1303,11 @@
               "rejected_candidates",
               "evidence_gap"
             ],
-            "properties": {
-              "assignment_id": {
-                "type": "string",
-                "minLength": 1
-              },
-              "attempt": {
-                "type": "integer",
-                "minimum": 0
-              },
-              "role": {
-                "$ref": "#/$defs/agentRole"
-              },
-              "role_assignment": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["agent_id", "category", "legacy_role", "source", "reason"],
-                "properties": {
-                  "agent_id": {"type": "string", "minLength": 1},
-                  "category": {
-                    "type": "string",
-                    "enum": [
-                      "delegating_coordinator",
-                      "non_delegating_terminal_worker",
-                      "read_only_researcher",
-                      "read_only_review_auditor"
-                    ]
-                  },
-                  "legacy_role": {"type": "string", "minLength": 1},
-                  "source": {
-                    "type": "string",
-                    "enum": ["derived_from_plan_role", "operator_override"]
-                  },
-                  "reason": {"type": "string", "minLength": 1}
-                }
-              },
-              "selection_source": {
-                "type": "string",
-                "enum": [
-                  "automatic",
-                  "plan_role_models",
-                  "operator_override",
-                  "budget_degrade",
-                  "low_difficulty_mechanical",
-                  "retry",
-                  "legacy_fake",
-                  "legacy_nonpublishable_simulation"
-                ]
-              },
-              "selected_runtime": {
-                "type": ["string", "null"],
-                "minLength": 1
-              },
-              "selected_model": {
-                "type": ["string", "null"],
-                "minLength": 1
-              },
-              "selected_reasoning_effort": {
-                "type": ["string", "null"],
-                "minLength": 1
-              },
-              "catalog_source": {
-                "type": "string",
-                "enum": [
-                  "runtime_advertised",
-                  "operator_declared",
-                  "none"
-                ]
-              },
-              "catalog_snapshot_digest": {
-                "type": ["string", "null"],
-                "minLength": 1
-              },
-              "catalog_revisions": {
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["runtime", "revision", "advertised_at"],
-                  "properties": {
-                    "runtime": {"type": "string", "minLength": 1},
-                    "revision": {"type": "string", "minLength": 1},
-                    "advertised_at": {"type": "string", "minLength": 1}
-                  }
-                }
-              },
-              "rejected_candidates": {
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["runtime", "model", "effort", "reasons"],
-                  "properties": {
-                    "runtime": {"type": "string", "minLength": 1},
-                    "model": {"type": "string", "minLength": 1},
-                    "effort": {"type": "string", "minLength": 1},
-                    "reasons": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["code", "detail"],
-                        "properties": {
-                          "code": {"type": "string", "minLength": 1},
-                          "detail": {"type": "string", "minLength": 1}
-                        }
-                      }
-                    }
-                  }
-                }
-              },
-              "evidence_gap": {
-                "type": ["string", "null"],
-                "minLength": 1
-              }
-            }
-          }
+            "type": "object"
+          },
+          "type": "array"
         },
         "selection_decisions": {
-          "type": "array",
           "items": {
             "additionalProperties": false,
             "properties": {
@@ -1114,6 +1385,8 @@
                                   "operator_constraint",
                                   "runtime_admission_closed",
                                   "entitlement_exhausted",
+                                  "quota_fail_closed",
+                                  "quota_alternative_not_authorized",
                                   "task_class_not_advertised",
                                   "task_shape_not_advertised",
                                   "authority_not_advertised",
@@ -1250,6 +1523,213 @@
                               "type": "null"
                             }
                           ]
+                        },
+                        "quota": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "authorized_alternative": {
+                              "type": "boolean"
+                            },
+                            "configured_behavior": {
+                              "oneOf": [
+                                {
+                                  "enum": [
+                                    "fail_closed",
+                                    "degrade"
+                                  ],
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "disposition": {
+                              "enum": [
+                                "legacy_unconfigured",
+                                "source_available",
+                                "source_exhausted",
+                                "authorized_alternative",
+                                "rejected_unauthorized_alternative",
+                                "fail_closed"
+                              ],
+                              "type": "string"
+                            },
+                            "reason": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "source_exhausted": {
+                              "type": "boolean"
+                            },
+                            "source_observation": {
+                              "oneOf": [
+                                {
+                                  "enum": [
+                                    "local_observed",
+                                    "provider_reported"
+                                  ],
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "source_observation_revision": {
+                              "oneOf": [
+                                {
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "source_pool": {
+                              "oneOf": [
+                                {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "account": {
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "runtime": {
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "window": {
+                                      "oneOf": [
+                                        {
+                                          "enum": [
+                                            "none",
+                                            "calendar_month"
+                                          ],
+                                          "type": "string"
+                                        },
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "rolling_hours": {
+                                              "additionalProperties": false,
+                                              "properties": {
+                                                "hours": {
+                                                  "minimum": 1,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "hours"
+                                              ],
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "rolling_hours"
+                                          ],
+                                          "type": "object"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "runtime",
+                                    "account",
+                                    "window"
+                                  ],
+                                  "type": "object"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "target_marginal_cost_microunits": {
+                              "oneOf": [
+                                {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "target_pool": {
+                              "oneOf": [
+                                {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "account": {
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "runtime": {
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "window": {
+                                      "oneOf": [
+                                        {
+                                          "enum": [
+                                            "none",
+                                            "calendar_month"
+                                          ],
+                                          "type": "string"
+                                        },
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "rolling_hours": {
+                                              "additionalProperties": false,
+                                              "properties": {
+                                                "hours": {
+                                                  "minimum": 1,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "hours"
+                                              ],
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "rolling_hours"
+                                          ],
+                                          "type": "object"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "runtime",
+                                    "account",
+                                    "window"
+                                  ],
+                                  "type": "object"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "source_pool",
+                            "target_pool",
+                            "source_exhausted",
+                            "configured_behavior",
+                            "authorized_alternative",
+                            "disposition",
+                            "source_observation_revision",
+                            "source_observation",
+                            "target_marginal_cost_microunits",
+                            "reason"
+                          ],
+                          "type": "object"
                         },
                         "score": {
                           "oneOf": [
@@ -1414,6 +1894,7 @@
                         "strong_gate_fallback",
                         "eligible",
                         "ineligibility_reasons",
+                        "quota",
                         "ledger",
                         "score"
                       ],
@@ -1488,7 +1969,8 @@
                               "lowest_legacy_baseline_plus_cost_proxy_adjustments",
                               "strongest_no_evidence_judgment_fallback",
                               "debug_override",
-                              "one_shot_environment_fallback"
+                              "one_shot_environment_fallback",
+                              "authorized_quota_degrade"
                             ],
                             "type": "string"
                           },
@@ -2415,6 +2897,64 @@
                               "minLength": 1,
                               "type": "string"
                             },
+                            "authorized_alternatives": {
+                              "items": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "account": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "runtime": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "window": {
+                                    "oneOf": [
+                                      {
+                                        "enum": [
+                                          "none",
+                                          "calendar_month"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "rolling_hours": {
+                                            "additionalProperties": false,
+                                            "properties": {
+                                              "hours": {
+                                                "minimum": 1,
+                                                "type": "integer"
+                                              }
+                                            },
+                                            "required": [
+                                              "hours"
+                                            ],
+                                            "type": "object"
+                                          }
+                                        },
+                                        "required": [
+                                          "rolling_hours"
+                                        ],
+                                        "type": "object"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "runtime",
+                                  "account",
+                                  "window"
+                                ],
+                                "type": "object"
+                              },
+                              "type": "array"
+                            },
+                            "entitlement_bounded": {
+                              "type": "boolean"
+                            },
                             "entitlement_capacity_units": {
                               "minimum": 0,
                               "type": "integer"
@@ -2422,6 +2962,23 @@
                             "entitlement_remaining_units": {
                               "minimum": 0,
                               "type": "integer"
+                            },
+                            "exhausted": {
+                              "type": "boolean"
+                            },
+                            "exhaustion_behavior": {
+                              "oneOf": [
+                                {
+                                  "enum": [
+                                    "fail_closed",
+                                    "degrade"
+                                  ],
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
                             },
                             "failover_provenance": {
                               "oneOf": [
@@ -2442,14 +2999,102 @@
                               "minLength": 1,
                               "type": "string"
                             },
+                            "observation_source": {
+                              "oneOf": [
+                                {
+                                  "enum": [
+                                    "local_observed",
+                                    "provider_reported"
+                                  ],
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
                             "observed_consumption_units": {
                               "minimum": 0,
                               "type": "integer"
+                            },
+                            "pool_kind": {
+                              "oneOf": [
+                                {
+                                  "enum": [
+                                    "subscription_included",
+                                    "metered",
+                                    "prepaid_credits"
+                                  ],
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
                             },
                             "pool_pressure_basis_points": {
                               "maximum": 10000,
                               "minimum": 0,
                               "type": "integer"
+                            },
+                            "pool_reference": {
+                              "oneOf": [
+                                {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "account": {
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "runtime": {
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "window": {
+                                      "oneOf": [
+                                        {
+                                          "enum": [
+                                            "none",
+                                            "calendar_month"
+                                          ],
+                                          "type": "string"
+                                        },
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "rolling_hours": {
+                                              "additionalProperties": false,
+                                              "properties": {
+                                                "hours": {
+                                                  "minimum": 1,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "hours"
+                                              ],
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "rolling_hours"
+                                          ],
+                                          "type": "object"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "runtime",
+                                    "account",
+                                    "window"
+                                  ],
+                                  "type": "object"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
                             },
                             "runtime": {
                               "minLength": 1,
@@ -2459,12 +3104,19 @@
                           "required": [
                             "runtime",
                             "admission_open",
+                            "pool_reference",
+                            "pool_kind",
+                            "entitlement_bounded",
                             "entitlement_capacity_units",
                             "entitlement_remaining_units",
                             "pool_pressure_basis_points",
                             "observed_consumption_units",
                             "marginal_cost_microunits",
+                            "exhausted",
+                            "exhaustion_behavior",
+                            "authorized_alternatives",
                             "observation_revision",
+                            "observation_source",
                             "admission_provenance",
                             "failover_provenance"
                           ],
@@ -2826,6 +3478,65 @@
                         ],
                         "type": "object"
                       },
+                      "quota_source": {
+                        "oneOf": [
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "account": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "runtime": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "window": {
+                                "oneOf": [
+                                  {
+                                    "enum": [
+                                      "none",
+                                      "calendar_month"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "rolling_hours": {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "hours": {
+                                            "minimum": 1,
+                                            "type": "integer"
+                                          }
+                                        },
+                                        "required": [
+                                          "hours"
+                                        ],
+                                        "type": "object"
+                                      }
+                                    },
+                                    "required": [
+                                      "rolling_hours"
+                                    ],
+                                    "type": "object"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "runtime",
+                              "account",
+                              "window"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
                       "resolved_objective_profile": {
                         "additionalProperties": false,
                         "properties": {
@@ -3132,6 +3843,7 @@
                       "task",
                       "catalogs",
                       "pools",
+                      "quota_source",
                       "constraints",
                       "priors",
                       "objective_profile",
@@ -3263,6 +3975,334 @@
                       "profile_digest"
                     ],
                     "type": "object"
+                  },
+                  "quota": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "authorized_alternatives": {
+                            "items": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "account": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "runtime": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "window": {
+                                  "oneOf": [
+                                    {
+                                      "enum": [
+                                        "none",
+                                        "calendar_month"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "rolling_hours": {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "hours": {
+                                              "minimum": 1,
+                                              "type": "integer"
+                                            }
+                                          },
+                                          "required": [
+                                            "hours"
+                                          ],
+                                          "type": "object"
+                                        }
+                                      },
+                                      "required": [
+                                        "rolling_hours"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "runtime",
+                                "account",
+                                "window"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "configured_behavior": {
+                            "enum": [
+                              "fail_closed",
+                              "degrade"
+                            ],
+                            "type": "string"
+                          },
+                          "disposition": {
+                            "enum": [
+                              "source_available",
+                              "fail_closed",
+                              "degraded",
+                              "refused_by_explicit_override",
+                              "refused_no_eligible_alternative"
+                            ],
+                            "type": "string"
+                          },
+                          "eligible_alternatives": {
+                            "items": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "effort": {
+                                  "enum": [
+                                    "low",
+                                    "medium",
+                                    "high",
+                                    "xhigh",
+                                    "max",
+                                    "ultra"
+                                  ],
+                                  "type": "string"
+                                },
+                                "model": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "runtime": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "runtime",
+                                "model",
+                                "effort"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "local_observation_revision": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "marginal_cost_assumption_microunits": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "observation_source": {
+                            "enum": [
+                              "local_observed",
+                              "provider_reported"
+                            ],
+                            "type": "string"
+                          },
+                          "reason": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "rejected_alternatives": {
+                            "items": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "candidate": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "effort": {
+                                      "enum": [
+                                        "low",
+                                        "medium",
+                                        "high",
+                                        "xhigh",
+                                        "max",
+                                        "ultra"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "model": {
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "runtime": {
+                                      "minLength": 1,
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "runtime",
+                                    "model",
+                                    "effort"
+                                  ],
+                                  "type": "object"
+                                },
+                                "reasons": {
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "code": {
+                                        "enum": [
+                                          "catalog_unavailable",
+                                          "operator_constraint",
+                                          "runtime_admission_closed",
+                                          "entitlement_exhausted",
+                                          "quota_fail_closed",
+                                          "quota_alternative_not_authorized",
+                                          "task_class_not_advertised",
+                                          "task_shape_not_advertised",
+                                          "authority_not_advertised",
+                                          "policy_prohibited",
+                                          "long_context_prohibited",
+                                          "missing_dated_prior",
+                                          "missing_class_fit_evidence",
+                                          "class_fit_evidence_insufficient",
+                                          "quality_bar_not_met",
+                                          "missing_authority_evidence",
+                                          "authority_evidence_insufficient",
+                                          "authority_quality_bar_not_met",
+                                          "unknown_judgment_authority",
+                                          "environment_rejected"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "detail": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "code",
+                                      "detail"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "type": "array"
+                                }
+                              },
+                              "required": [
+                                "candidate",
+                                "reasons"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "selected_alternative": {
+                            "oneOf": [
+                              {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "effort": {
+                                    "enum": [
+                                      "low",
+                                      "medium",
+                                      "high",
+                                      "xhigh",
+                                      "max",
+                                      "ultra"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  "model": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "runtime": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "runtime",
+                                  "model",
+                                  "effort"
+                                ],
+                                "type": "object"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "source_exhausted": {
+                            "type": "boolean"
+                          },
+                          "source_pool": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "account": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "runtime": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "window": {
+                                "oneOf": [
+                                  {
+                                    "enum": [
+                                      "none",
+                                      "calendar_month"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "rolling_hours": {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "hours": {
+                                            "minimum": 1,
+                                            "type": "integer"
+                                          }
+                                        },
+                                        "required": [
+                                          "hours"
+                                        ],
+                                        "type": "object"
+                                      }
+                                    },
+                                    "required": [
+                                      "rolling_hours"
+                                    ],
+                                    "type": "object"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "runtime",
+                              "account",
+                              "window"
+                            ],
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "source_pool",
+                          "configured_behavior",
+                          "source_exhausted",
+                          "local_observation_revision",
+                          "observation_source",
+                          "marginal_cost_assumption_microunits",
+                          "authorized_alternatives",
+                          "eligible_alternatives",
+                          "rejected_alternatives",
+                          "selected_alternative",
+                          "disposition",
+                          "reason"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
                   },
                   "resolved_objective_profile": {
                     "additionalProperties": false,
@@ -3433,6 +4473,64 @@
                           "minLength": 1,
                           "type": "string"
                         },
+                        "authorized_alternatives": {
+                          "items": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "account": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "runtime": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "window": {
+                                "oneOf": [
+                                  {
+                                    "enum": [
+                                      "none",
+                                      "calendar_month"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "rolling_hours": {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "hours": {
+                                            "minimum": 1,
+                                            "type": "integer"
+                                          }
+                                        },
+                                        "required": [
+                                          "hours"
+                                        ],
+                                        "type": "object"
+                                      }
+                                    },
+                                    "required": [
+                                      "rolling_hours"
+                                    ],
+                                    "type": "object"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "runtime",
+                              "account",
+                              "window"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "entitlement_bounded": {
+                          "type": "boolean"
+                        },
                         "entitlement_capacity_units": {
                           "minimum": 0,
                           "type": "integer"
@@ -3440,6 +4538,23 @@
                         "entitlement_remaining_units": {
                           "minimum": 0,
                           "type": "integer"
+                        },
+                        "exhausted": {
+                          "type": "boolean"
+                        },
+                        "exhaustion_behavior": {
+                          "oneOf": [
+                            {
+                              "enum": [
+                                "fail_closed",
+                                "degrade"
+                              ],
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
                         },
                         "failover_provenance": {
                           "oneOf": [
@@ -3460,14 +4575,102 @@
                           "minLength": 1,
                           "type": "string"
                         },
+                        "observation_source": {
+                          "oneOf": [
+                            {
+                              "enum": [
+                                "local_observed",
+                                "provider_reported"
+                              ],
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "observed_consumption_units": {
                           "minimum": 0,
                           "type": "integer"
+                        },
+                        "pool_kind": {
+                          "oneOf": [
+                            {
+                              "enum": [
+                                "subscription_included",
+                                "metered",
+                                "prepaid_credits"
+                              ],
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
                         },
                         "pool_pressure_basis_points": {
                           "maximum": 10000,
                           "minimum": 0,
                           "type": "integer"
+                        },
+                        "pool_reference": {
+                          "oneOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "account": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "runtime": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "window": {
+                                  "oneOf": [
+                                    {
+                                      "enum": [
+                                        "none",
+                                        "calendar_month"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "rolling_hours": {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "hours": {
+                                              "minimum": 1,
+                                              "type": "integer"
+                                            }
+                                          },
+                                          "required": [
+                                            "hours"
+                                          ],
+                                          "type": "object"
+                                        }
+                                      },
+                                      "required": [
+                                        "rolling_hours"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "runtime",
+                                "account",
+                                "window"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
                         },
                         "runtime": {
                           "minLength": 1,
@@ -3477,12 +4680,19 @@
                       "required": [
                         "runtime",
                         "admission_open",
+                        "pool_reference",
+                        "pool_kind",
+                        "entitlement_bounded",
                         "entitlement_capacity_units",
                         "entitlement_remaining_units",
                         "pool_pressure_basis_points",
                         "observed_consumption_units",
                         "marginal_cost_microunits",
+                        "exhausted",
+                        "exhaustion_behavior",
+                        "authorized_alternatives",
                         "observation_revision",
+                        "observation_source",
                         "admission_provenance",
                         "failover_provenance"
                       ],
@@ -3509,7 +4719,8 @@
                         "budget_degrade",
                         "catalog_change",
                         "environment_fallback",
-                        "debug_override"
+                        "debug_override",
+                        "quota_exhaustion"
                       ],
                       "type": "string"
                     },
@@ -3533,7 +4744,8 @@
                   "runner_up_scores",
                   "decision_reason",
                   "debug_override",
-                  "environment_fallback"
+                  "environment_fallback",
+                  "quota"
                 ],
                 "type": "object"
               },
@@ -3556,7 +4768,8 @@
               "provenance"
             ],
             "type": "object"
-          }
+          },
+          "type": "array"
         },
         "usage": {
           "$ref": "#/$defs/executionUsage"
@@ -4005,6 +5218,7 @@
       "type": "string",
       "enum": [
         "configured",
+        "operator_quota_config",
         "conservative_default",
         "measured"
       ]
@@ -4023,29 +5237,91 @@
         "resolved_bound"
       ],
       "properties": {
-        "entrypoint_bound": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "plan": {
-          "$ref": "#/$defs/admissionConfig"
-        },
         "cli": {
           "$ref": "#/$defs/admissionConfig"
         },
         "effective": {
           "$ref": "#/$defs/admissionConfig"
         },
-        "provider_inflight_bound": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "provider_inflight_source": {
-          "$ref": "#/$defs/admissionInputSource"
+        "entrypoint_bound": {
+          "minimum": 1,
+          "type": "integer"
         },
         "host": {
-          "type": "object",
           "additionalProperties": false,
+          "properties": {
+            "disk_available_mib": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "disk_available_source": {
+              "$ref": "#/$defs/admissionInputSource"
+            },
+            "disk_bound": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "disk_per_child_mib": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "fallback_children": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "fd_available": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "fd_available_source": {
+              "$ref": "#/$defs/admissionInputSource"
+            },
+            "fd_bound": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "fds_per_child": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "memory_available_mib": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "memory_available_source": {
+              "$ref": "#/$defs/admissionInputSource"
+            },
+            "memory_bound": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "memory_per_child_mib": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "resolved_bound": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
           "required": [
             "memory_available_mib",
             "memory_available_source",
@@ -4062,65 +5338,44 @@
             "fallback_children",
             "resolved_bound"
           ],
-          "properties": {
-            "memory_available_mib": {
-              "type": ["integer", "null"],
-              "minimum": 1
-            },
-            "memory_available_source": {
-              "$ref": "#/$defs/admissionInputSource"
-            },
-            "memory_per_child_mib": {
-              "type": "integer",
-              "minimum": 1
-            },
-            "memory_bound": {
-              "type": ["integer", "null"],
-              "minimum": 1
-            },
-            "fd_available": {
-              "type": ["integer", "null"],
-              "minimum": 1
-            },
-            "fd_available_source": {
-              "$ref": "#/$defs/admissionInputSource"
-            },
-            "fds_per_child": {
-              "type": "integer",
-              "minimum": 1
-            },
-            "fd_bound": {
-              "type": ["integer", "null"],
-              "minimum": 1
-            },
-            "disk_available_mib": {
-              "type": ["integer", "null"],
-              "minimum": 1
-            },
-            "disk_available_source": {
-              "$ref": "#/$defs/admissionInputSource"
-            },
-            "disk_per_child_mib": {
-              "type": "integer",
-              "minimum": 1
-            },
-            "disk_bound": {
-              "type": ["integer", "null"],
-              "minimum": 1
-            },
-            "fallback_children": {
-              "type": "integer",
-              "minimum": 1
-            },
-            "resolved_bound": {
-              "type": "integer",
-              "minimum": 1
-            }
-          }
+          "type": "object"
+        },
+        "plan": {
+          "$ref": "#/$defs/admissionConfig"
+        },
+        "provider_inflight_bound": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "provider_inflight_source": {
+          "$ref": "#/$defs/admissionInputSource"
+        },
+        "quota_config_path": {
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "quota_inflight_bound": {
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "quota_inflight_source": {
+          "enum": [
+            "configured",
+            "operator_quota_config",
+            "conservative_default",
+            "measured"
+          ],
+          "type": "string"
         },
         "resolved_bound": {
-          "type": "integer",
-          "minimum": 1
+          "minimum": 1,
+          "type": "integer"
         }
       }
     },

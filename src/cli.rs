@@ -843,6 +843,7 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             print_query_report(&plan, json)
         }
         SuperviseSubcommand::Run(args) => {
+            let quota_config = args.quota_config.clone();
             let rolling_quota = args.budget.rolling_quota();
             let budget_overrides = args.budget.limits();
             let budget_max_duration_seconds = args.budget.max_duration_seconds();
@@ -919,6 +920,10 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                         resolved_run_id.as_str(),
                     )
                 })
+                .transpose()?;
+            let _quota_config_guard = quota_config
+                .as_deref()
+                .map(|path| supervise::bind_operator_quota_config(&resolved_repo, path))
                 .transpose()?;
             let options = SupervisorRunOptions {
                 repo: resolved_repo,
@@ -1229,6 +1234,9 @@ struct RunSuperviseArgs {
     /// Configured provider quota for simultaneous in-flight child requests (no live probing).
     #[arg(long, value_parser = parse_positive_usize)]
     provider_inflight_limit: Option<usize>,
+    /// Repository-relative strict versioned quota entitlement config. No provider is probed.
+    #[arg(long, value_name = "REPO_RELATIVE_FILE")]
+    quota_config: Option<PathBuf>,
     /// Explicit host memory available to supervised children, in MiB.
     #[arg(long, value_parser = parse_positive_usize)]
     host_memory_available_mib: Option<usize>,
@@ -1942,6 +1950,7 @@ impl AutopilotCommand {
             }
             AutopilotSubcommand::Run(args) => {
                 let json = args.json;
+                let quota_config = args.quota_config.clone();
                 let rolling_quota = args.budget.rolling_quota();
                 let budget_overrides = args.budget.limits();
                 let budget_max_duration_seconds = args.budget.max_duration_seconds();
@@ -1976,6 +1985,10 @@ impl AutopilotCommand {
                             resolved.run_id.as_str(),
                         )
                     })
+                    .transpose()?;
+                let _quota_config_guard = quota_config
+                    .as_deref()
+                    .map(|path| supervise::bind_operator_quota_config(&resolved.repo, path))
                     .transpose()?;
                 let options = AutopilotRunOptions {
                     repo: resolved.repo,
@@ -2113,6 +2126,9 @@ struct RunAutopilotArgs {
     /// Maximum source plus generated follow-up supervisor-plan dispatches admitted by this run.
     #[arg(long, value_name = "COUNT")]
     max_child_dispatches: Option<usize>,
+    /// Repository-relative strict versioned quota entitlement config propagated to supervise.
+    #[arg(long, value_name = "REPO_RELATIVE_FILE")]
+    quota_config: Option<PathBuf>,
     #[command(flatten)]
     budget: RunBudgetArgs,
     /// Exact reviewed config used to gate private runtime output-staging cleanup.

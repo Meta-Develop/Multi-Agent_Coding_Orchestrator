@@ -152,16 +152,56 @@ fn runtime_catalog() -> Value {
     )
 }
 
+fn quota_pool_kind() -> Value {
+    enum_schema(&["subscription_included", "metered", "prepaid_credits"])
+}
+
+fn quota_reset_window() -> Value {
+    json!({
+        "oneOf": [
+            {"type": "string", "enum": ["none", "calendar_month"]},
+            strict_object!(
+                "rolling_hours" => strict_object!(
+                    "hours" => positive_integer(),
+                ),
+            )
+        ]
+    })
+}
+
+fn pool_reference() -> Value {
+    strict_object!(
+        "runtime" => nonempty_string(),
+        "account" => nonempty_string(),
+        "window" => quota_reset_window(),
+    )
+}
+
+fn exhaustion_behavior() -> Value {
+    enum_schema(&["fail_closed", "degrade"])
+}
+
+fn consumption_source() -> Value {
+    enum_schema(&["local_observed", "provider_reported"])
+}
+
 fn runtime_pool_state() -> Value {
     strict_object!(
         "runtime" => nonempty_string(),
         "admission_open" => json!({"type": "boolean"}),
+        "pool_reference" => nullable(pool_reference()),
+        "pool_kind" => nullable(quota_pool_kind()),
+        "entitlement_bounded" => json!({"type": "boolean"}),
         "entitlement_capacity_units" => nonnegative_integer(),
         "entitlement_remaining_units" => nonnegative_integer(),
         "pool_pressure_basis_points" => basis_points(),
         "observed_consumption_units" => nonnegative_integer(),
         "marginal_cost_microunits" => nonnegative_integer(),
+        "exhausted" => json!({"type": "boolean"}),
+        "exhaustion_behavior" => nullable(exhaustion_behavior()),
+        "authorized_alternatives" => array(pool_reference()),
         "observation_revision" => nonempty_string(),
+        "observation_source" => nullable(consumption_source()),
         "admission_provenance" => nonempty_string(),
         "failover_provenance" => nullable(nonempty_string()),
     )
@@ -365,6 +405,7 @@ fn selection_input() -> Value {
         "task" => task_profile(false),
         "catalogs" => array(runtime_catalog()),
         "pools" => array(runtime_pool_state()),
+        "quota_source" => nullable(pool_reference()),
         "constraints" => operator_constraints(),
         "priors" => prior_dataset(),
         "objective_profile" => objective_profile_ref(),
@@ -429,7 +470,8 @@ fn ineligibility_reason() -> Value {
     strict_object!(
         "code" => enum_schema(&[
             "catalog_unavailable", "operator_constraint", "runtime_admission_closed",
-            "entitlement_exhausted", "task_class_not_advertised", "task_shape_not_advertised",
+            "entitlement_exhausted", "quota_fail_closed", "quota_alternative_not_authorized",
+            "task_class_not_advertised", "task_shape_not_advertised",
             "authority_not_advertised", "policy_prohibited", "long_context_prohibited",
             "missing_dated_prior", "missing_class_fit_evidence", "class_fit_evidence_insufficient",
             "quality_bar_not_met", "missing_authority_evidence", "authority_evidence_insufficient",
@@ -472,6 +514,7 @@ fn candidate_evaluation() -> Value {
         "strong_gate_fallback" => json!({"type": "boolean"}),
         "eligible" => json!({"type": "boolean"}),
         "ineligibility_reasons" => array(ineligibility_reason()),
+        "quota" => quota_candidate_provenance(),
         "ledger" => ledger_summary(),
         "score" => nullable(score_breakdown()),
     )
@@ -486,8 +529,54 @@ fn selected_choice() -> Value {
             "lowest_legacy_baseline_plus_cost_proxy_adjustments",
             "strongest_no_evidence_judgment_fallback",
             "debug_override",
-            "one_shot_environment_fallback"
+            "one_shot_environment_fallback",
+            "authorized_quota_degrade"
         ]),
+    )
+}
+
+fn quota_candidate_provenance() -> Value {
+    strict_object!(
+        "source_pool" => nullable(pool_reference()),
+        "target_pool" => nullable(pool_reference()),
+        "source_exhausted" => json!({"type": "boolean"}),
+        "configured_behavior" => nullable(exhaustion_behavior()),
+        "authorized_alternative" => json!({"type": "boolean"}),
+        "disposition" => enum_schema(&[
+            "legacy_unconfigured", "source_available", "source_exhausted",
+            "authorized_alternative", "rejected_unauthorized_alternative", "fail_closed"
+        ]),
+        "source_observation_revision" => nullable(nonempty_string()),
+        "source_observation" => nullable(consumption_source()),
+        "target_marginal_cost_microunits" => nullable(nonnegative_integer()),
+        "reason" => nonempty_string(),
+    )
+}
+
+fn rejected_quota_alternative() -> Value {
+    strict_object!(
+        "candidate" => candidate_key(),
+        "reasons" => array(ineligibility_reason()),
+    )
+}
+
+fn quota_decision_provenance() -> Value {
+    strict_object!(
+        "source_pool" => pool_reference(),
+        "configured_behavior" => exhaustion_behavior(),
+        "source_exhausted" => json!({"type": "boolean"}),
+        "local_observation_revision" => nonempty_string(),
+        "observation_source" => consumption_source(),
+        "marginal_cost_assumption_microunits" => nonnegative_integer(),
+        "authorized_alternatives" => array(pool_reference()),
+        "eligible_alternatives" => array(candidate_key()),
+        "rejected_alternatives" => array(rejected_quota_alternative()),
+        "selected_alternative" => nullable(candidate_key()),
+        "disposition" => enum_schema(&[
+            "source_available", "fail_closed", "degraded", "refused_by_explicit_override",
+            "refused_no_eligible_alternative"
+        ]),
+        "reason" => nonempty_string(),
     )
 }
 
@@ -539,7 +628,7 @@ pub(crate) fn selection_provenance_schema_value() -> Value {
         "runtime_operations" => array(runtime_pool_state()),
         "triggers" => set(enum_schema(&[
             "initial", "retry", "budget_degrade", "catalog_change", "environment_fallback",
-            "debug_override"
+            "debug_override", "quota_exhaustion"
         ])),
         "candidate_set" => array(candidate_evaluation()),
         "choice" => nullable(selected_choice()),
@@ -547,6 +636,7 @@ pub(crate) fn selection_provenance_schema_value() -> Value {
         "decision_reason" => nonempty_string(),
         "debug_override" => nullable(debug_override_provenance()),
         "environment_fallback" => nullable(environment_fallback_transition()),
+        "quota" => nullable(quota_decision_provenance()),
     )
 }
 
