@@ -1,11 +1,13 @@
 use super::*;
 
-// Cost decision: 6 KiB gives the fixed worker fixture bounded maintenance headroom without
-// hiding another large contract paragraph; raising it is a deliberate prompt-cost decision.
-const WORKER_PROMPT_FIXTURE_CEILING_BYTES: usize = 6 * 1024;
+// Cost decision: the ceiling gives the fixed worker fixture bounded maintenance headroom
+// without hiding another large contract paragraph; raising it is a deliberate prompt-cost
+// decision. Raised from 6 KiB when the merged switch-cost routing evidence and hardened
+// worker prompt boundaries (#312 + #320) pushed the legitimate rendered prompt to ~6.2 KiB.
+const WORKER_PROMPT_FIXTURE_CEILING_BYTES: usize = 13 * 512;
 // Cost decision: 20 KiB covers the fixed child fixture plus its embedded worker/auditor templates;
 // raising it is a deliberate prompt-cost decision about the multiplied worker-template cost.
-const CHILD_ORCHESTRATOR_PROMPT_FIXTURE_CEILING_BYTES: usize = 20 * 1024;
+const CHILD_ORCHESTRATOR_PROMPT_FIXTURE_CEILING_BYTES: usize = 21 * 1024;
 // Cost decision: 4 KiB permits the advisory child-side audit contract and a small fixed margin;
 // raising it is a deliberate prompt-cost decision, never an automatic fixture update.
 const REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES: usize = 4 * 1024;
