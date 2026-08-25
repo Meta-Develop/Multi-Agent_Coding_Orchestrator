@@ -50,12 +50,72 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
+#[cfg(unix)]
+use std::{fs::OpenOptions, io::Write, os::unix::fs::PermissionsExt};
+
 #[cfg(target_os = "linux")]
 use std::io::Read;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
 const DEFAULT_BRANCH_PREFIX: &str = "maco";
+const WORKTREE_GUARD_ASSET: &[u8] = include_bytes!("../assets/maco-worktree-guard.sh");
+const WORKTREE_GUARD_STATE_DIRECTORY: &str = ".maco-worktree-guard";
+const WORKTREE_GUARD_MARKER: &str = "maco-worktree-guard-v3";
+const WORKTREE_GUARD_PREVIOUS_SUFFIX: &str = ".maco-worktree-guard-previous";
+const WORKTREE_GUARD_STAGED_SUFFIX: &str = ".maco-worktree-guard-installing";
+const WORKTREE_GUARD_PRE_PUSH_TARGET: &str = "pre-push.human-authorship-previous";
+const HUMAN_AUTHORSHIP_PRE_PUSH_DISPATCHER_V5: &[u8] = br#"#!/usr/bin/env bash
+# human-authorship-guard dispatcher v5
+set -euo pipefail
+self="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+previous="$self.human-authorship-previous"
+input="$(mktemp)"
+trap 'rm -f "$input"' EXIT
+cat > "$input"
+if [[ -x "$previous" ]]; then
+  "$previous" "$@" < "$input"
+fi
+
+resolve_guard() {
+  local name="$1"
+  local repo_root
+  local primary
+  local common_dir
+  local fallback
+
+  repo_root="$(git rev-parse --show-toplevel)"
+  primary="$repo_root/.agents/scripts/$name"
+  if [[ -x "$primary" ]]; then
+    printf '%s\n' "$primary"
+    return 0
+  fi
+
+  if ! common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    printf 'human-authorship-guard dispatcher: cannot resolve Git common directory for %s\n' \
+      "$name" >&2
+    return 1
+  fi
+  fallback="$(dirname "$common_dir")/.agents/scripts/$name"
+  if [[ -x "$fallback" ]]; then
+    printf '%s\n' "$fallback"
+    return 0
+  fi
+
+  printf 'human-authorship-guard dispatcher: missing executable guard %s; checked %s and %s\n' \
+    "$name" "$primary" "$fallback" >&2
+  return 1
+}
+
+authorship_guard="$(resolve_guard check-human-authorship)"
+"$authorship_guard" approved-current
+"$authorship_guard" pre-push-approved "${1:-}" < "$input"
+private_guard="$(resolve_guard check-private-agent-paths)"
+"$private_guard" pre-push "${1:-}" < "$input"
+github_actor_guard="$(resolve_guard check-approved-github-actor)"
+"$github_actor_guard"
+"#;
+const MAX_WORKTREE_GUARD_FILE_BYTES: u64 = 256 * 1024;
 const MANAGED_WORKTREE_REGISTRY_VERSION: u32 = 2;
 const MAX_WORKTREE_METADATA_BYTES: u64 = 64 * 1024;
 const MAX_AGENT_ID_BYTES: usize = 64;
@@ -172,6 +232,26 @@ pub struct WorktreeRecord {
     pub name: String,
     pub path: PathBuf,
     pub branch: String,
+}
+
+/// Observable state for the explicit primary-worktree branch guard.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorktreeGuardReport {
+    pub status: WorktreeGuardStatus,
+    pub worktree_path: PathBuf,
+    pub hooks_path: PathBuf,
+    pub pre_push_target: PathBuf,
+    pub mode: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeGuardStatus {
+    Installed,
+    AlreadyInstalled,
+    Verified,
+    Removed,
+    AlreadyAbsent,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1443,6 +1523,631 @@ struct ManagedWorktreeRegistryLock {
     lock: KernelStateLock,
     root_identity: FileIdentity,
     lock_identity: FileIdentity,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct PrimaryWorktreeGuardLayout {
+    worktree_path: PathBuf,
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+    hooks_dir: PathBuf,
+    state_dir: PathBuf,
+    pre_commit: PathBuf,
+    pre_merge_commit: PathBuf,
+    pre_push: PathBuf,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct InstalledPrePushGuard {
+    target: PathBuf,
+    previous: PathBuf,
+}
+
+/// Installs the advisory branch guard in the primary repository's default
+/// shared hooks directory. The operation never sets `core.hooksPath`.
+#[cfg(unix)]
+pub fn install_primary_worktree_guard(repo_path: impl AsRef<Path>) -> Result<WorktreeGuardReport> {
+    let layout = primary_worktree_guard_layout(repo_path.as_ref())?;
+    match fs::symlink_metadata(&layout.state_dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!(
+                    "MACO worktree guard state path is not an owned directory: {}",
+                    layout.state_dir.display()
+                );
+            }
+            let mut report = verify_primary_worktree_guard_layout(&layout)?;
+            report.status = WorktreeGuardStatus::AlreadyInstalled;
+            return Ok(report);
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("failed to inspect worktree guard state"),
+    }
+
+    let pre_push_target = select_pre_push_guard_target(&layout)?;
+    preflight_guard_target(&layout.pre_commit)?;
+    preflight_guard_target(&layout.pre_merge_commit)?;
+    preflight_guard_target(&pre_push_target)?;
+
+    fs::create_dir(&layout.state_dir).with_context(|| {
+        format!(
+            "failed to create worktree guard state directory {}",
+            layout.state_dir.display()
+        )
+    })?;
+    fs::set_permissions(&layout.state_dir, fs::Permissions::from_mode(0o700))
+        .context("failed to protect worktree guard state directory")?;
+
+    let installation = (|| -> Result<WorktreeGuardReport> {
+        write_guard_state(&layout, &pre_push_target)?;
+        install_guard_target(&layout.pre_commit)?;
+        if let Err(error) = install_guard_target(&layout.pre_merge_commit) {
+            rollback_installed_guard_target(&layout.pre_commit)?;
+            return Err(error);
+        }
+        if let Err(error) = install_guard_target(&pre_push_target) {
+            rollback_installed_guard_target(&layout.pre_merge_commit)?;
+            rollback_installed_guard_target(&layout.pre_commit)?;
+            return Err(error);
+        }
+        let mut report = verify_primary_worktree_guard_layout(&layout)?;
+        report.status = WorktreeGuardStatus::Installed;
+        Ok(report)
+    })();
+
+    if installation.is_err() {
+        let _ = rollback_installed_guard_target(&pre_push_target);
+        let _ = rollback_installed_guard_target(&layout.pre_merge_commit);
+        let _ = rollback_installed_guard_target(&layout.pre_commit);
+        let _ = remove_guard_state(&layout);
+    }
+    installation
+}
+
+#[cfg(not(unix))]
+pub fn install_primary_worktree_guard(_repo_path: impl AsRef<Path>) -> Result<WorktreeGuardReport> {
+    bail!("the POSIX MACO worktree guard is unsupported on this platform")
+}
+
+/// Verifies the exact installed hook payload and its primary-repository
+/// binding without changing repository state.
+#[cfg(unix)]
+pub fn verify_primary_worktree_guard(repo_path: impl AsRef<Path>) -> Result<WorktreeGuardReport> {
+    let layout = primary_worktree_guard_layout(repo_path.as_ref())?;
+    verify_primary_worktree_guard_layout(&layout)
+}
+
+#[cfg(not(unix))]
+pub fn verify_primary_worktree_guard(_repo_path: impl AsRef<Path>) -> Result<WorktreeGuardReport> {
+    bail!("the POSIX MACO worktree guard is unsupported on this platform")
+}
+
+/// Removes only an exactly verified guard and restores hooks that were
+/// preserved by its installation.
+#[cfg(unix)]
+pub fn uninstall_primary_worktree_guard(
+    repo_path: impl AsRef<Path>,
+) -> Result<WorktreeGuardReport> {
+    let layout = primary_worktree_guard_layout(repo_path.as_ref())?;
+    match fs::symlink_metadata(&layout.state_dir) {
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            require_no_orphaned_guard_payload(&layout)?;
+            return Ok(worktree_guard_report(
+                &layout,
+                layout.pre_push.clone(),
+                WorktreeGuardStatus::AlreadyAbsent,
+            ));
+        }
+        Err(error) => return Err(error).context("failed to inspect worktree guard state"),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!(
+                "MACO worktree guard state path is not an owned directory: {}",
+                layout.state_dir.display()
+            )
+        }
+        Ok(_) => {}
+    }
+
+    let verified = verify_primary_worktree_guard_layout(&layout)?;
+    let pre_push = resolve_installed_pre_push_guard(&layout)?;
+    uninstall_guard_target_with_previous(&pre_push.target, &pre_push.previous)?;
+    uninstall_guard_target(&layout.pre_merge_commit)?;
+    uninstall_guard_target(&layout.pre_commit)?;
+    remove_guard_state(&layout)?;
+    Ok(worktree_guard_report(
+        &layout,
+        verified.pre_push_target,
+        WorktreeGuardStatus::Removed,
+    ))
+}
+
+#[cfg(not(unix))]
+pub fn uninstall_primary_worktree_guard(
+    _repo_path: impl AsRef<Path>,
+) -> Result<WorktreeGuardReport> {
+    bail!("the POSIX MACO worktree guard is unsupported on this platform")
+}
+
+#[cfg(unix)]
+fn primary_worktree_guard_layout(repo_path: &Path) -> Result<PrimaryWorktreeGuardLayout> {
+    let repository = crate::git_repository::open(repo_path).with_context(|| {
+        format!(
+            "failed to open primary repository for worktree guard: {}",
+            repo_path.display()
+        )
+    })?;
+    let worktree_path = fs::canonicalize(
+        repository
+            .workdir()
+            .context("worktree guard requires a non-bare repository")?,
+    )
+    .context("failed to resolve primary worktree path")?;
+    let git_dir =
+        fs::canonicalize(repository.path()).context("failed to resolve primary Git directory")?;
+    let common_dir = fs::canonicalize(repository.commondir())
+        .context("failed to resolve Git common directory")?;
+    if git_dir != common_dir {
+        bail!(
+            "worktree guard installation must be managed from the primary worktree; {} is linked",
+            worktree_path.display()
+        );
+    }
+    match repository.config()?.get_entry("core.hooksPath") {
+        Ok(_) => {
+            bail!(
+                "worktree guard requires the default shared Git hooks directory; remove core.hooksPath before installing"
+            )
+        }
+        Err(error) if error.code() == ErrorCode::NotFound => {}
+        Err(error) => return Err(error).context("failed to inspect the effective core.hooksPath"),
+    }
+    let hooks_dir = common_dir.join("hooks");
+    require_plain_directory(&hooks_dir, "default Git hooks directory")?;
+    Ok(PrimaryWorktreeGuardLayout {
+        worktree_path,
+        git_dir,
+        common_dir,
+        state_dir: hooks_dir.join(WORKTREE_GUARD_STATE_DIRECTORY),
+        pre_commit: hooks_dir.join("pre-commit"),
+        pre_merge_commit: hooks_dir.join("pre-merge-commit"),
+        pre_push: hooks_dir.join("pre-push"),
+        hooks_dir,
+    })
+}
+
+#[cfg(unix)]
+fn select_pre_push_guard_target(layout: &PrimaryWorktreeGuardLayout) -> Result<PathBuf> {
+    let bytes = read_guard_regular_file(&layout.pre_push)?.with_context(|| {
+        format!(
+            "human-authorship dispatcher v5 must be installed before the MACO worktree guard: {}",
+            layout.pre_push.display()
+        )
+    })?;
+    require_exact_human_authorship_dispatcher_v5(&layout.pre_push, &bytes)?;
+    Ok(layout.hooks_dir.join(WORKTREE_GUARD_PRE_PUSH_TARGET))
+}
+
+#[cfg(unix)]
+fn require_exact_human_authorship_dispatcher_v5(path: &Path, bytes: &[u8]) -> Result<()> {
+    if bytes != HUMAN_AUTHORSHIP_PRE_PUSH_DISPATCHER_V5 {
+        bail!(
+            "human-authorship dispatcher v5 is missing or modified: {}",
+            path.display()
+        );
+    }
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to inspect human-authorship dispatcher {}",
+            path.display()
+        )
+    })?;
+    if metadata.permissions().mode() & 0o111 == 0 {
+        bail!(
+            "human-authorship dispatcher v5 is not executable: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn preflight_guard_target(target: &Path) -> Result<()> {
+    let backup = guard_previous_path(target)?;
+    if fs::symlink_metadata(&backup).is_ok() {
+        bail!(
+            "worktree guard backup collision; refusing to replace {}",
+            backup.display()
+        );
+    }
+    let staged = guard_staged_path(target)?;
+    if fs::symlink_metadata(&staged).is_ok() {
+        bail!(
+            "worktree guard staged-file collision; refusing to replace {}",
+            staged.display()
+        );
+    }
+    if let Some(bytes) = read_guard_regular_file(target)? {
+        if bytes == WORKTREE_GUARD_ASSET {
+            bail!(
+                "worktree guard hook exists without owned state; refusing to adopt {}",
+                target.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn install_guard_target(target: &Path) -> Result<()> {
+    let backup = guard_previous_path(target)?;
+    let staged = guard_staged_path(target)?;
+    let had_previous = read_guard_regular_file(target)?.is_some();
+    publish_guard_file(&staged, WORKTREE_GUARD_ASSET, 0o755)?;
+
+    if had_previous {
+        if let Err(error) = fs::hard_link(target, &backup) {
+            let _ = fs::remove_file(&staged);
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to preserve existing hook {} as {}",
+                    target.display(),
+                    backup.display()
+                )
+            });
+        }
+    }
+    if let Err(error) = fs::rename(&staged, target) {
+        if had_previous {
+            let _ = fs::remove_file(&backup);
+        }
+        let _ = fs::remove_file(&staged);
+        return Err(error).with_context(|| {
+            format!(
+                "failed to atomically install guard hook {}",
+                target.display()
+            )
+        });
+    }
+    sync_guard_parent_directory(target)
+}
+
+#[cfg(unix)]
+fn uninstall_guard_target(target: &Path) -> Result<()> {
+    let backup = guard_previous_path(target)?;
+    uninstall_guard_target_with_previous(target, &backup)
+}
+
+#[cfg(unix)]
+fn uninstall_guard_target_with_previous(target: &Path, previous: &Path) -> Result<()> {
+    require_exact_guard_hook(target)?;
+    if fs::symlink_metadata(previous).is_ok() {
+        fs::rename(previous, target).with_context(|| {
+            format!(
+                "failed to atomically restore preserved hook {} to {}",
+                previous.display(),
+                target.display()
+            )
+        })?;
+    } else {
+        fs::remove_file(target)
+            .with_context(|| format!("failed to remove guard hook {}", target.display()))?;
+    }
+    sync_guard_parent_directory(target)
+}
+
+#[cfg(unix)]
+fn rollback_installed_guard_target(target: &Path) -> Result<()> {
+    match read_guard_regular_file(target)? {
+        Some(bytes) if bytes == WORKTREE_GUARD_ASSET => uninstall_guard_target(target),
+        Some(_) => bail!(
+            "worktree guard rollback refused a changed hook: {}",
+            target.display()
+        ),
+        None => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+fn write_guard_state(layout: &PrimaryWorktreeGuardLayout, pre_push_target: &Path) -> Result<()> {
+    let target_name = pre_push_target
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("worktree guard pre-push target is not UTF-8")?;
+    if target_name != WORKTREE_GUARD_PRE_PUSH_TARGET {
+        bail!("worktree guard requires the canonical v5 pre-push chain");
+    }
+    for (name, value) in [
+        ("marker", WORKTREE_GUARD_MARKER.to_string()),
+        ("git-dir", guard_path_text(&layout.git_dir)?),
+        ("common-dir", guard_path_text(&layout.common_dir)?),
+        ("pre-push-target", target_name.to_string()),
+        (
+            "pre-commit-previous",
+            guard_hook_state_value(&layout.pre_commit)?,
+        ),
+        (
+            "pre-merge-commit-previous",
+            guard_hook_state_value(&layout.pre_merge_commit)?,
+        ),
+        (
+            "pre-push-previous",
+            guard_hook_state_value(pre_push_target)?,
+        ),
+    ] {
+        let mut bytes = value.into_bytes();
+        bytes.push(b'\n');
+        publish_guard_file(&layout.state_dir.join(name), &bytes, 0o600)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_primary_worktree_guard_layout(
+    layout: &PrimaryWorktreeGuardLayout,
+) -> Result<WorktreeGuardReport> {
+    let marker = read_guard_state_line(layout, "marker")?;
+    if marker != WORKTREE_GUARD_MARKER {
+        bail!("MACO worktree guard ownership marker is missing or changed");
+    }
+    if read_guard_state_line(layout, "git-dir")? != guard_path_text(&layout.git_dir)?
+        || read_guard_state_line(layout, "common-dir")? != guard_path_text(&layout.common_dir)?
+    {
+        bail!("MACO worktree guard repository binding changed");
+    }
+    let pre_push = resolve_installed_pre_push_guard(layout)?;
+    require_exact_guard_hook(&layout.pre_commit)?;
+    require_exact_guard_hook(&layout.pre_merge_commit)?;
+    require_exact_guard_hook(&pre_push.target)?;
+    require_guard_previous_binding(layout, "pre-commit-previous", &layout.pre_commit)?;
+    require_guard_previous_binding(
+        layout,
+        "pre-merge-commit-previous",
+        &layout.pre_merge_commit,
+    )?;
+    require_guard_previous_binding(layout, "pre-push-previous", &pre_push.target)?;
+    Ok(worktree_guard_report(
+        layout,
+        pre_push.target,
+        WorktreeGuardStatus::Verified,
+    ))
+}
+
+#[cfg(unix)]
+fn resolve_installed_pre_push_guard(
+    layout: &PrimaryWorktreeGuardLayout,
+) -> Result<InstalledPrePushGuard> {
+    let target_name = read_guard_state_line(layout, "pre-push-target")?;
+    if target_name != WORKTREE_GUARD_PRE_PUSH_TARGET {
+        bail!("worktree guard pre-push composition state is invalid");
+    }
+    let active = read_guard_regular_file(&layout.pre_push)?
+        .context("human-authorship dispatcher v5 is missing")?;
+    require_exact_human_authorship_dispatcher_v5(&layout.pre_push, &active)?;
+    let target = layout.hooks_dir.join(WORKTREE_GUARD_PRE_PUSH_TARGET);
+    Ok(InstalledPrePushGuard {
+        previous: guard_previous_path(&target)?,
+        target,
+    })
+}
+
+#[cfg(unix)]
+fn require_exact_guard_hook(path: &Path) -> Result<()> {
+    let bytes = read_guard_regular_file(path)?
+        .with_context(|| format!("worktree guard hook is missing: {}", path.display()))?;
+    if bytes != WORKTREE_GUARD_ASSET {
+        bail!("worktree guard hook changed: {}", path.display());
+    }
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect worktree guard hook {}", path.display()))?;
+    if metadata.permissions().mode() & 0o111 == 0 {
+        bail!("worktree guard hook is not executable: {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn require_guard_previous_binding(
+    layout: &PrimaryWorktreeGuardLayout,
+    state_name: &str,
+    target: &Path,
+) -> Result<()> {
+    let expected = read_guard_state_line(layout, state_name)?;
+    let backup = guard_previous_path(target)?;
+    let actual = guard_hook_state_value(&backup)?;
+    if actual != expected {
+        bail!(
+            "worktree guard preserved-hook binding changed: {}",
+            backup.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn require_no_orphaned_guard_payload(layout: &PrimaryWorktreeGuardLayout) -> Result<()> {
+    for target in [
+        layout.pre_commit.clone(),
+        layout.pre_merge_commit.clone(),
+        layout.pre_push.clone(),
+        layout.hooks_dir.join(WORKTREE_GUARD_PRE_PUSH_TARGET),
+    ] {
+        if read_guard_regular_file(&target)?.as_deref() == Some(WORKTREE_GUARD_ASSET) {
+            bail!(
+                "worktree guard payload exists without owned state; refusing uninstall: {}",
+                target.display()
+            );
+        }
+        for residue in [guard_previous_path(&target)?, guard_staged_path(&target)?] {
+            if fs::symlink_metadata(&residue).is_ok() {
+                bail!(
+                    "worktree guard preserved or staged hook exists without owned state; refusing uninstall: {}",
+                    residue.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn guard_previous_path(target: &Path) -> Result<PathBuf> {
+    let name = target
+        .file_name()
+        .context("worktree guard target has no filename")?;
+    let mut previous = name.to_os_string();
+    previous.push(WORKTREE_GUARD_PREVIOUS_SUFFIX);
+    Ok(target.with_file_name(previous))
+}
+
+#[cfg(unix)]
+fn guard_staged_path(target: &Path) -> Result<PathBuf> {
+    let name = target
+        .file_name()
+        .context("worktree guard target has no filename")?;
+    let mut staged = name.to_os_string();
+    staged.push(WORKTREE_GUARD_STAGED_SUFFIX);
+    Ok(target.with_file_name(staged))
+}
+
+#[cfg(unix)]
+fn guard_hook_state_value(path: &Path) -> Result<String> {
+    let Some(bytes) = read_guard_regular_file(path)? else {
+        return Ok("absent".to_string());
+    };
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect preserved hook {}", path.display()))?;
+    let object_id = Oid::hash_object(ObjectType::Blob, &bytes)
+        .context("failed to bind preserved hook bytes")?;
+    Ok(format!(
+        "present:{}:{:o}",
+        object_id,
+        metadata.permissions().mode() & 0o7777
+    ))
+}
+
+#[cfg(unix)]
+fn sync_guard_parent_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("worktree guard target has no parent directory")?;
+    fs::File::open(parent)
+        .with_context(|| format!("failed to open hooks directory {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to sync hooks directory {}", parent.display()))
+}
+
+#[cfg(unix)]
+fn read_guard_regular_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect guard file {}", path.display()))
+        }
+    };
+    if before.file_type().is_symlink()
+        || !before.is_file()
+        || before.nlink() != 1
+        || before.len() > MAX_WORKTREE_GUARD_FILE_BYTES
+    {
+        bail!(
+            "guard file is not a bounded single-link regular file: {}",
+            path.display()
+        );
+    }
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read guard file {}", path.display()))?;
+    let after = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to re-inspect guard file {}", path.display()))?;
+    if before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.permissions().mode() != after.permissions().mode()
+        || u64::try_from(bytes.len()).map_or(true, |len| len > MAX_WORKTREE_GUARD_FILE_BYTES)
+    {
+        bail!("guard file changed while being read: {}", path.display());
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(unix)]
+fn publish_guard_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("failed to create guard file {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write guard file {}", path.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(mode))
+        .with_context(|| format!("failed to set guard file mode {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync guard file {}", path.display()))
+}
+
+#[cfg(unix)]
+fn read_guard_state_line(layout: &PrimaryWorktreeGuardLayout, name: &str) -> Result<String> {
+    let bytes = read_guard_regular_file(&layout.state_dir.join(name))?
+        .with_context(|| format!("worktree guard state is missing: {name}"))?;
+    let value = bytes
+        .strip_suffix(b"\n")
+        .context("worktree guard state is not newline terminated")?;
+    if value.is_empty() || value.contains(&b'\n') || value.contains(&b'\r') {
+        bail!("worktree guard state is not one non-empty line: {name}");
+    }
+    String::from_utf8(value.to_vec()).context("worktree guard state is not UTF-8")
+}
+
+#[cfg(unix)]
+fn guard_path_text(path: &Path) -> Result<String> {
+    let text = path
+        .to_str()
+        .context("worktree guard requires UTF-8 repository paths")?;
+    if text.is_empty() || text.contains(['\n', '\r']) {
+        bail!("worktree guard repository path contains an invalid line break");
+    }
+    Ok(text.to_string())
+}
+
+#[cfg(unix)]
+fn remove_guard_state(layout: &PrimaryWorktreeGuardLayout) -> Result<()> {
+    for name in [
+        "marker",
+        "git-dir",
+        "common-dir",
+        "pre-push-target",
+        "pre-commit-previous",
+        "pre-merge-commit-previous",
+        "pre-push-previous",
+    ] {
+        match fs::remove_file(layout.state_dir.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to remove worktree guard state {name}"))
+            }
+        }
+    }
+    fs::remove_dir(&layout.state_dir).context("failed to remove worktree guard state directory")
+}
+
+#[cfg(unix)]
+fn worktree_guard_report(
+    layout: &PrimaryWorktreeGuardLayout,
+    pre_push_target: PathBuf,
+    status: WorktreeGuardStatus,
+) -> WorktreeGuardReport {
+    WorktreeGuardReport {
+        status,
+        worktree_path: layout.worktree_path.clone(),
+        hooks_path: layout.hooks_dir.clone(),
+        pre_push_target,
+        mode: "primary",
+    }
 }
 
 impl WorktreeManager {
