@@ -236,12 +236,16 @@ pub(super) fn worker_cacheable_prefix() -> String {
         r#"You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
 Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
 You are not the supervisor. Do not launch further workers, delegate to another worker, or spawn/impersonate O1 or O2 roles.
+Your authority is execution-only. Do not plan, make judgments, review, act as an acceptance gate, merge, or publish on behalf of another role.
 
 {tool_call_batching_guidance}
 
 Rules:
 - Edit only inside your assigned worktree and only inside claimed paths.
 - Do not mutate the primary worktree.
+- Do not broaden the assignment, add claimed paths, or change files outside the assigned path set.
+- Do not request, access, read, write, disclose, or transmit credentials, secrets, tokens, or keys.
+- Do not stage, commit, push, merge, or otherwise publish changes.
 - Before returning your WorkerReport, write a structured execution journal to the exact execution journal path in the assignment-specific context below; this is the only allowed non-source artifact write for this worker. Create its parent directory if needed. Use JSONL: one JSON object per command, with fields "command" (array of strings), "cwd" (string), "start_timestamp" (string), "end_timestamp" (string), and "changed_paths" (array of repo-relative paths changed by that command, or [] when none). Do not write prose or Markdown to the journal.
 - Run validation or record why validation was not run.
 - Return WorkerReport JSON in your final response with assignment_kind, target_path, changed files, commands run, validation results, findings, bloated_file_flags, decomposition_completion, remaining risk, and next safe action.
@@ -1393,6 +1397,31 @@ mod regression_tests {
 
     fn fixed_prompt_fixture() -> Result<(String, String, String, String)> {
         fixed_prompt_fixture_with_ids("child-a", "worker-a", "src/supervise/prompts.rs")
+    }
+
+    #[test]
+    fn terminal_worker_prefix_preserves_execution_only_authority() {
+        let prefix = worker_cacheable_prefix();
+        let primary_target = SupervisorExecutionTarget::PrimaryWorktree {
+            claim_paths: vec![PathBuf::from("local/deploy.txt")],
+        };
+        let primary_prefix = worker_cacheable_prefix_for_target(Some(&primary_target));
+
+        assert!(prefix.contains(
+            "Do not plan, make judgments, review, act as an acceptance gate, merge, or publish"
+        ));
+        assert!(prefix.contains(
+            "Do not request, access, read, write, disclose, or transmit credentials, secrets, tokens, or keys."
+        ));
+        assert!(prefix.contains(
+            "Do not broaden the assignment, add claimed paths, or change files outside the assigned path set."
+        ));
+        assert!(prefix.contains("Do not stage, commit, push, merge, or otherwise publish changes."));
+        assert!(prefix.contains(
+            "Do not launch further workers, delegate to another worker, or spawn/impersonate O1 or O2 roles."
+        ));
+        assert!(primary_prefix.contains("The assigned worktree is the existing primary checkout"));
+        assert!(!primary_prefix.contains("Do not mutate the primary worktree."));
     }
 
     fn fixed_prompt_fixture_with_ids(
