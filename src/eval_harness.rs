@@ -131,17 +131,12 @@ impl MixRole {
 }
 
 /// Provider kinds the harness understands. Only [`Self::LocalFake`] may run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum EvalHarnessProviderKind {
+    #[default]
     LocalFake,
     RealProvider,
-}
-
-impl Default for EvalHarnessProviderKind {
-    fn default() -> Self {
-        Self::LocalFake
-    }
 }
 
 /// Provider request boundary for v2 experiments. Its default is deterministic
