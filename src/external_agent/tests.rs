@@ -1506,16 +1506,14 @@ fn planning_and_execution_profiles_reach_actual_inner_argv_and_outer_systemd_pro
     let canonical_incoming = fs::canonicalize(&incoming)?;
     let program = child.join("fixture-codex");
 
-    for (phase, access, expected_git_access) in [
+    for (phase, access) in [
         (
             crate::supervise::AssignmentPhase::Planning,
             WorkspaceAccess::ReadOnly,
-            "read",
         ),
         (
             crate::supervise::AssignmentPhase::Execution,
             WorkspaceAccess::ReadWrite,
-            "write",
         ),
     ] {
         let command = crate::supervise::configure_assignment_phase_command_for_test(
@@ -1525,6 +1523,13 @@ fn planning_and_execution_profiles_reach_actual_inner_argv_and_outer_systemd_pro
         )?;
         assert_eq!(command.workspace_access, access);
         let controls = protected_worktree_controls(&command)?;
+        let git = controls
+            .managed_git
+            .as_ref()
+            .context("managed Git controls")?;
+        assert_eq!(git.worktree_git_dir, child_git_dir);
+        let private_git_dir = git.private_git_dir.clone();
+        let fixed_private_read_only_files = git.fixed_private_read_only_files.clone();
         let profile = external_side_effect_profile(
             &command,
             &program,
@@ -1558,10 +1563,43 @@ fn planning_and_execution_profiles_reach_actual_inner_argv_and_outer_systemd_pro
             filesystem.contains("\":workspace_roots\"={\".\"=\"write\"}"),
             access == WorkspaceAccess::ReadWrite
         );
-        assert!(filesystem.contains(&format!(
-            "{}=\"{expected_git_access}\"",
+        let child_git_read = format!(
+            "{}=\"read\"",
             toml_basic_string(child_git_dir.to_str().context("UTF-8 child gitdir")?)
-        )));
+        );
+        let child_git_write = format!(
+            "{}=\"write\"",
+            toml_basic_string(child_git_dir.to_str().context("UTF-8 child gitdir")?)
+        );
+        assert!(filesystem.contains(&child_git_read));
+        assert!(!filesystem.contains(&child_git_write));
+        let private_git_write = format!(
+            "{}=\"write\"",
+            toml_basic_string(
+                private_git_dir
+                    .to_str()
+                    .context("UTF-8 private child gitdir")?
+            )
+        );
+        assert_eq!(
+            filesystem.contains(&private_git_write),
+            access == WorkspaceAccess::ReadWrite
+        );
+        for file in &fixed_private_read_only_files {
+            let read = format!(
+                "{}=\"read\"",
+                toml_basic_string(file.to_str().context("UTF-8 fixed private Git file")?)
+            );
+            let write = format!(
+                "{}=\"write\"",
+                toml_basic_string(file.to_str().context("UTF-8 fixed private Git file")?)
+            );
+            assert_eq!(
+                filesystem.contains(&read),
+                access == WorkspaceAccess::ReadWrite
+            );
+            assert!(!filesystem.contains(&write));
+        }
         assert!(filesystem.contains(&format!(
             "{}=\"write\"",
             toml_basic_string(canonical_incoming.to_str().context("UTF-8 staging root")?)
@@ -1577,20 +1615,24 @@ fn planning_and_execution_profiles_reach_actual_inner_argv_and_outer_systemd_pro
         assert_eq!(bind_read_only, read_only);
         assert_eq!(bind_writable, writable);
         assert!(bind_read_only.contains(&fs::canonicalize(common.join("objects"))?));
+        assert!(bind_read_only.contains(&child_git_dir));
         if access == WorkspaceAccess::ReadOnly {
             assert!(bind_read_only.contains(&child));
-            assert!(bind_read_only.contains(&child_git_dir));
+            assert!(!bind_writable.contains(&private_git_dir));
+            for file in &fixed_private_read_only_files {
+                assert!(!bind_read_only.contains(file));
+            }
             assert_eq!(bind_writable, vec![canonical_incoming.clone()]);
         } else {
             assert!(!bind_read_only.contains(&child));
-            assert!(!bind_read_only.contains(&child_git_dir));
-            let mut expected_writable = vec![
-                child.clone(),
-                child_git_dir.clone(),
-                canonical_incoming.clone(),
-            ];
+            let mut expected_writable =
+                vec![child.clone(), private_git_dir, canonical_incoming.clone()];
             expected_writable.sort();
             assert_eq!(bind_writable, expected_writable);
+            for file in &fixed_private_read_only_files {
+                assert!(bind_read_only.contains(file));
+                assert!(!bind_writable.contains(file));
+            }
         }
     }
     Ok(())
