@@ -353,7 +353,8 @@ fn assignment_selection_ledger_schema_value() -> serde_json::Value {
                     "type": "string",
                     "enum": [
                         "automatic", "plan_role_models", "operator_override", "budget_degrade",
-                        "retry", "legacy_fake", "legacy_nonpublishable_simulation"
+                        "low_difficulty_mechanical", "retry", "legacy_fake",
+                        "legacy_nonpublishable_simulation"
                     ]
                 },
                 "selected_runtime": {"type": ["string", "null"], "minLength": 1},
@@ -447,6 +448,15 @@ fn reasoning_effort_schema_value() -> serde_json::Value {
 }
 
 fn budget_degradation_records_schema_value() -> serde_json::Value {
+    let role_binding = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["model", "reasoning_effort"],
+        "properties": {
+            "model": {"type": ["string", "null"]},
+            "reasoning_effort": {"type": ["string", "null"]}
+        }
+    });
     let change = json!({
         "oneOf": [
             {
@@ -487,6 +497,14 @@ fn budget_degradation_records_schema_value() -> serde_json::Value {
                     "before_new_dispatch_allowed": {"type": "boolean"},
                     "after_new_dispatch_allowed": {"type": "boolean"}
                 }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "role"],
+                "properties": {
+                    "kind": {"const": "role_binding_applied"},
+                    "role": {"const": "worker"}
+                }
             }
         ]
     });
@@ -496,13 +514,17 @@ fn budget_degradation_records_schema_value() -> serde_json::Value {
             "type": "object",
             "additionalProperties": false,
             "required": [
-                "sequence", "assignment_id", "budget_action", "budget_reasons", "change",
+                "sequence", "assignment_id", "trigger", "budget_action", "budget_reasons", "change",
                 "effective_child_model", "effective_child_reasoning_effort", "effective_fan_out",
                 "observation"
             ],
             "properties": {
                 "sequence": {"type": "integer", "minimum": 1},
                 "assignment_id": {"type": "string", "minLength": 1},
+                "trigger": {
+                    "type": "string",
+                    "enum": ["budget_pressure", "low_difficulty_mechanical"]
+                },
                 "budget_action": {"type": "string", "enum": ["continue", "degrade", "owner_escalation"]},
                 "budget_reasons": {
                     "type": "array",
@@ -515,11 +537,21 @@ fn budget_degradation_records_schema_value() -> serde_json::Value {
                     ]},
                     "uniqueItems": true
                 },
-                "change": change
-                ,"effective_child_model": {"type": ["string", "null"]}
-                ,"effective_child_reasoning_effort": {"type": ["string", "null"]}
-                ,"effective_fan_out": {"type": "integer", "minimum": 1}
-                ,"observation": {"const": "admission_policy_resolved"}
+                "change": change,
+                "role_binding_transition": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["role", "before", "after"],
+                    "properties": {
+                        "role": {"const": "worker"},
+                        "before": role_binding.clone(),
+                        "after": role_binding
+                    }
+                },
+                "effective_child_model": {"type": ["string", "null"]},
+                "effective_child_reasoning_effort": {"type": ["string", "null"]},
+                "effective_fan_out": {"type": "integer", "minimum": 1},
+                "observation": {"const": "admission_policy_resolved"}
             }
         }
     })
@@ -2056,6 +2088,38 @@ mod selection_schema_tests {
                 ["properties"]["execution"],
             "assignment_selection_ledger"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn degradation_and_ledger_source_schemas_match_tracked_artifact_exactly() -> Result<()> {
+        let dynamic = supervisor_final_report_schema_value();
+        let dynamic_execution =
+            &dynamic["properties"]["role_economics_profile"]["properties"]["execution"];
+        let tracked: serde_json::Value = serde_json::from_str(include_str!(
+            "../../schemas/supervisor-final-report-v1.schema.json"
+        ))?;
+        let tracked_execution = &tracked["$defs"]["execution"];
+
+        assert_eq!(
+            tracked_execution["properties"]["assignment_selection_ledger"]["items"]["properties"]
+                ["selection_source"],
+            dynamic_execution["properties"]["assignment_selection_ledger"]["items"]["properties"]
+                ["selection_source"]
+        );
+        let tracked_degradations = &tracked_execution["properties"]["budget_degradations"];
+        let dynamic_degradations = &dynamic_execution["properties"]["budget_degradations"];
+        assert_eq!(tracked_degradations["type"], dynamic_degradations["type"]);
+        let mut tracked_record = tracked["$defs"]["budgetDegradationRecord"].clone();
+        tracked_record["properties"]["budget_reasons"]["items"] =
+            tracked["$defs"]["budgetReason"].clone();
+        tracked_record["properties"]["change"] =
+            tracked["$defs"]["budgetDegradationChange"].clone();
+        for index in [0, 1] {
+            tracked_record["properties"]["change"]["oneOf"][index]["properties"]["role"] =
+                tracked["$defs"]["agentRole"].clone();
+        }
+        assert_eq!(tracked_record, dynamic_degradations["items"]);
         Ok(())
     }
 }

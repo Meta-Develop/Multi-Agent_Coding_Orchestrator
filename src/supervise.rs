@@ -1083,6 +1083,7 @@ pub enum AssignmentSelectionSource {
     PlanRoleModels,
     OperatorOverride,
     BudgetDegrade,
+    LowDifficultyMechanical,
     Retry,
     LegacyFake,
     LegacyNonpublishableSimulation,
@@ -1192,14 +1193,41 @@ pub enum EffortResolutionObservation {
 pub struct BudgetDegradationRecord {
     pub sequence: usize,
     pub assignment_id: String,
+    #[serde(default)]
+    pub trigger: BudgetDegradationTrigger,
     pub budget_action: BudgetAction,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub budget_reasons: Vec<BudgetReason>,
     pub change: BudgetDegradationChange,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_binding_transition: Option<BudgetDegradationRoleBindingTransition>,
     pub effective_child_model: Option<String>,
     pub effective_child_reasoning_effort: Option<String>,
     pub effective_fan_out: usize,
     pub observation: BudgetDegradationObservation,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetDegradationTrigger {
+    #[default]
+    BudgetPressure,
+    LowDifficultyMechanical,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetDegradationRoleBindingTransition {
+    pub role: AgentRole,
+    pub before: BudgetDegradationRoleBinding,
+    pub after: BudgetDegradationRoleBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetDegradationRoleBinding {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1229,6 +1257,9 @@ pub enum BudgetDegradationChange {
     Halt {
         before_new_dispatch_allowed: bool,
         after_new_dispatch_allowed: bool,
+    },
+    RoleBindingApplied {
+        role: AgentRole,
     },
 }
 
@@ -1483,6 +1514,8 @@ struct EvidenceOnlyReauditSource {
 struct WorkerAssignmentMetadata {
     #[serde(default)]
     kind: AssignmentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mechanical_duty: Option<MechanicalTerminalDuty>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
