@@ -7,11 +7,12 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
 };
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
+const COMMAND_DIAGNOSTIC_LIMIT_CHARS: usize = 4096;
 
 #[test]
 fn containment_gate_only_skips_without_a_delegated_user_manager() {
@@ -1459,12 +1460,94 @@ fn run_success_json(args: &[&str]) -> Result<Value> {
         .context("run maco")?;
     if !output.status.success() {
         anyhow::bail!(
-            "maco command failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "maco command failed: {}",
+            command_failure_diagnostics(args, &output)
         );
     }
     serde_json::from_slice(&output.stdout).context("parse json")
+}
+
+fn command_failure_diagnostics(args: &[&str], output: &Output) -> String {
+    let repo = option_value(args, "--repo").map(Path::new);
+    let mut detail = format!(
+        "status={}; stdout={}; stderr={}",
+        output.status,
+        bounded_diagnostic(&output.stdout, repo),
+        bounded_diagnostic(&output.stderr, repo)
+    );
+    let public_run_id = serde_json::from_slice::<Value>(&output.stdout)
+        .ok()
+        .and_then(|report| report["run_id"].as_str().map(str::to_string));
+    let run_id = option_value(args, "--run-id")
+        .map(str::to_string)
+        .or(public_run_id);
+    let Some((repo, run_id)) = repo.zip(run_id) else {
+        return detail;
+    };
+    if Path::new(&run_id)
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some(run_id.as_str())
+    {
+        detail.push_str("; artifacts=<unsafe or unavailable run id>");
+        return detail;
+    }
+    let nested_id = format!("{run_id}-supervise");
+    let paths = [
+        PathBuf::from(format!(
+            ".maco/autopilot/runs/{run_id}/supervisor-report.json"
+        )),
+        PathBuf::from(format!(".maco/autopilot/runs/{run_id}/final-report.json")),
+        PathBuf::from(format!(
+            ".maco/o2/runs/{nested_id}/reports/supervisor-final.json"
+        )),
+        PathBuf::from(format!(
+            ".git/maco/state/orchestration-checkpoints-v3/{nested_id}/.head.json"
+        )),
+    ];
+    for path in paths {
+        detail.push_str("; ");
+        detail.push_str(&artifact_diagnostic(repo, &path));
+    }
+    detail
+}
+
+fn option_value<'a>(args: &'a [&str], option: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find_map(|pair| (pair[0] == option).then_some(pair[1]))
+}
+
+fn artifact_diagnostic(repo: &Path, relative: &Path) -> String {
+    match fs::read(repo.join(relative)) {
+        Ok(bytes) => format!(
+            "{} exists=true readable=true content={}",
+            relative.display(),
+            bounded_diagnostic(&bytes, Some(repo))
+        ),
+        Err(error) => format!(
+            "{} exists={} readable=false reason={}",
+            relative.display(),
+            error.kind() != std::io::ErrorKind::NotFound,
+            error.kind()
+        ),
+    }
+}
+
+fn bounded_diagnostic(bytes: &[u8], repo: Option<&Path>) -> String {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if let Some(repo) = repo {
+        for root in [Some(repo), repo.parent()].into_iter().flatten() {
+            text = text.replace(root.to_string_lossy().as_ref(), "<private-root>");
+        }
+    }
+    let mut bounded = text
+        .chars()
+        .take(COMMAND_DIAGNOSTIC_LIMIT_CHARS)
+        .collect::<String>();
+    if text.chars().count() > COMMAND_DIAGNOSTIC_LIMIT_CHARS {
+        bounded.push_str("...<truncated>");
+    }
+    bounded
 }
 
 fn run_failure_json(args: &[&str]) -> Result<Value> {
