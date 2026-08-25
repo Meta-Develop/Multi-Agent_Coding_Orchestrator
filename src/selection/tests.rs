@@ -1,6 +1,10 @@
 use std::collections::BTreeSet;
 
 use super::*;
+use crate::optimizer::ids::RuntimeSlug;
+use crate::optimizer::quota_pools::{
+    AccountId, ConsumptionSource, ExhaustionBehavior, PoolKind, PoolReference, ResetWindow,
+};
 
 fn leaf_task() -> TaskProfile {
     TaskProfile {
@@ -62,15 +66,66 @@ fn pool(runtime: &str, pressure: u16) -> RuntimePoolState {
     RuntimePoolState {
         runtime: runtime.to_string(),
         admission_open: true,
+        pool_reference: None,
+        pool_kind: None,
+        entitlement_bounded: true,
         entitlement_capacity_units: 100,
         entitlement_remaining_units: 100,
         pool_pressure_basis_points: pressure,
         observed_consumption_units: 0,
         marginal_cost_microunits: 0,
+        exhausted: false,
+        exhaustion_behavior: None,
+        authorized_alternatives: Vec::new(),
         observation_revision: format!("{runtime}-pool-r1"),
+        observation_source: None,
         admission_provenance: "deterministic fixture".to_string(),
         failover_provenance: None,
     }
+}
+
+fn pool_reference(runtime: &str) -> PoolReference {
+    PoolReference {
+        runtime: RuntimeSlug::new(runtime).expect("runtime"),
+        account: AccountId::new("operator").expect("account"),
+        window: ResetWindow::CalendarMonth,
+    }
+}
+
+fn configure_exhausted_quota(
+    input: &mut SelectionInput,
+    behavior: ExhaustionBehavior,
+    authorized_runtimes: &[&str],
+) {
+    let source = pool_reference("codex");
+    let authorized_alternatives = authorized_runtimes
+        .iter()
+        .map(|runtime| pool_reference(runtime))
+        .collect::<Vec<_>>();
+    for pool in &mut input.pools {
+        let reference = pool_reference(&pool.runtime);
+        let is_source = reference == source;
+        pool.pool_reference = Some(reference);
+        pool.pool_kind = Some(PoolKind::SubscriptionIncluded);
+        pool.entitlement_bounded = true;
+        pool.entitlement_capacity_units = 100;
+        pool.entitlement_remaining_units = if is_source { 0 } else { 100 };
+        pool.exhausted = is_source;
+        pool.admission_open = !is_source || behavior == ExhaustionBehavior::Degrade;
+        pool.exhaustion_behavior = Some(if is_source {
+            behavior
+        } else {
+            ExhaustionBehavior::FailClosed
+        });
+        pool.authorized_alternatives = if is_source {
+            authorized_alternatives.clone()
+        } else {
+            Vec::new()
+        };
+        pool.observation_revision = format!("{}-workspace-ledger-r7", pool.runtime);
+        pool.observation_source = Some(ConsumptionSource::LocalObserved);
+    }
+    input.quota_source = Some(source);
 }
 
 fn base_input() -> SelectionInput {
@@ -107,6 +162,7 @@ fn base_input() -> SelectionInput {
             ),
         ],
         pools: vec![pool("codex", 0), pool("grok", 0), pool("cursor", 0)],
+        quota_source: None,
         constraints: OperatorConstraints {
             allowed_runtimes: BTreeSet::new(),
             allowed_models: BTreeSet::new(),
@@ -427,6 +483,7 @@ fn owner_same_class_fixture_uses_codex_fresh_and_alternate_under_pressure() {
             .runtime,
         "codex"
     );
+    assert!(fresh.quota.is_none());
 
     let mut pressured = base_input();
     pressured
@@ -443,6 +500,151 @@ fn owner_same_class_fixture_uses_codex_fresh_and_alternate_under_pressure() {
             .map(|choice| choice.candidate.runtime.as_str()),
         Some("grok" | "cursor")
     ));
+}
+
+#[test]
+fn exhausted_source_degrades_only_to_an_exact_authorized_pool() {
+    let mut input = base_input();
+    configure_exhausted_quota(&mut input, ExhaustionBehavior::Degrade, &["grok"]);
+
+    let decision = select(&input).expect("authorized quota degrade");
+    let choice = decision.choice.as_ref().expect("authorized alternative");
+    assert_eq!(choice.candidate.runtime, "grok");
+    assert_eq!(choice.reason, ChoiceReason::AuthorizedQuotaDegrade);
+    assert!(decision
+        .triggers
+        .contains(&SelectionTrigger::QuotaExhaustion));
+    let quota = decision.quota.as_ref().expect("quota provenance");
+    assert_eq!(quota.source_pool, pool_reference("codex"));
+    assert_eq!(quota.configured_behavior, ExhaustionBehavior::Degrade);
+    assert_eq!(quota.disposition, QuotaDecisionDisposition::Degraded);
+    assert_eq!(quota.selected_alternative.as_ref(), Some(&choice.candidate));
+    assert!(quota
+        .eligible_alternatives
+        .iter()
+        .all(|candidate| candidate.runtime == "grok"));
+    assert!(decision
+        .candidate_set
+        .iter()
+        .filter(|candidate| candidate.candidate.runtime == "cursor")
+        .all(|candidate| candidate
+            .ineligibility_reasons
+            .iter()
+            .any(|reason| { reason.code == IneligibilityCode::QuotaAlternativeNotAuthorized })));
+}
+
+#[test]
+fn fail_closed_exhaustion_refuses_even_with_unrelated_eligible_catalogs() {
+    let mut input = base_input();
+    configure_exhausted_quota(&mut input, ExhaustionBehavior::FailClosed, &[]);
+
+    let decision = select(&input).expect("quota fail closed");
+    assert_eq!(decision.status, DecisionStatus::FailClosed);
+    assert!(decision.choice.is_none());
+    assert_eq!(
+        decision
+            .quota
+            .as_ref()
+            .expect("quota provenance")
+            .disposition,
+        QuotaDecisionDisposition::FailClosed
+    );
+    assert!(decision.candidate_set.iter().all(|candidate| candidate
+        .ineligibility_reasons
+        .iter()
+        .any(|reason| reason.code == IneligibilityCode::QuotaFailClosed)));
+}
+
+#[test]
+fn authorized_degrade_refuses_when_the_authorized_pool_fails_catalog_gate() {
+    let mut input = base_input();
+    configure_exhausted_quota(&mut input, ExhaustionBehavior::Degrade, &["grok"]);
+    input
+        .catalogs
+        .iter_mut()
+        .find(|catalog| catalog.runtime == "grok")
+        .expect("Grok catalog")
+        .models
+        .iter_mut()
+        .for_each(|model| model.available = false);
+
+    let decision = select(&input).expect("no eligible authorized alternative");
+    assert_eq!(decision.status, DecisionStatus::FailClosed);
+    assert!(decision.choice.is_none());
+    let quota = decision.quota.expect("quota provenance");
+    assert_eq!(
+        quota.disposition,
+        QuotaDecisionDisposition::RefusedNoEligibleAlternative
+    );
+    assert!(quota.eligible_alternatives.is_empty());
+    assert!(quota.rejected_alternatives.iter().any(|alternative| {
+        alternative.candidate.runtime == "grok"
+            && alternative
+                .reasons
+                .iter()
+                .any(|reason| reason.code == IneligibilityCode::CatalogUnavailable)
+    }));
+}
+
+#[test]
+fn unauthorized_debug_override_cannot_bypass_exhausted_pool_policy() {
+    let mut input = base_input();
+    configure_exhausted_quota(&mut input, ExhaustionBehavior::Degrade, &["grok"]);
+    input.constraints.allow_debug_override = true;
+    input.debug_override = Some(DebugOverride {
+        candidate: CandidateKey {
+            runtime: "cursor".to_string(),
+            model: "cursor-composer-1".to_string(),
+            effort: ReasoningEffort::High,
+        },
+        requested_by: "test operator".to_string(),
+        reason: "verify quota authorization remains a hard gate".to_string(),
+    });
+
+    let decision = select(&input).expect("debug override refusal");
+    assert_eq!(decision.status, DecisionStatus::FailClosed);
+    assert!(decision.choice.is_none());
+    assert_eq!(
+        decision
+            .debug_override
+            .as_ref()
+            .expect("debug provenance")
+            .disposition,
+        DebugOverrideDisposition::Rejected
+    );
+    assert_eq!(
+        decision
+            .quota
+            .as_ref()
+            .expect("quota provenance")
+            .disposition,
+        QuotaDecisionDisposition::RefusedByExplicitOverride
+    );
+}
+
+#[test]
+fn marginal_cost_reorders_only_the_authorized_alternative_set() {
+    let mut input = base_input();
+    configure_exhausted_quota(&mut input, ExhaustionBehavior::Degrade, &["grok", "cursor"]);
+    let first = select(&input)
+        .expect("first quota choice")
+        .choice
+        .expect("first alternative")
+        .candidate;
+    input
+        .pools
+        .iter_mut()
+        .find(|pool| pool.runtime == first.runtime)
+        .expect("selected pool")
+        .marginal_cost_microunits = 10_000_000_000;
+
+    let second = select(&input)
+        .expect("repriced quota choice")
+        .choice
+        .expect("repriced alternative")
+        .candidate;
+    assert_ne!(second.runtime, first.runtime);
+    assert!(matches!(second.runtime.as_str(), "grok" | "cursor"));
 }
 
 #[test]
@@ -1214,6 +1416,119 @@ fn normalized_input_is_a_self_contained_replay_fixture() {
     let decision = select(&base_input()).expect("initial decision");
     let replay = select(&decision.normalized_input).expect("provenance replay");
     assert_eq!(replay, decision);
+}
+
+#[test]
+fn quota_provenance_round_trips_and_is_required_by_the_strict_artifact_schema() {
+    let mut input = base_input();
+    configure_exhausted_quota(&mut input, ExhaustionBehavior::Degrade, &["grok"]);
+    let decision = select(&input).expect("quota decision");
+    let bytes = serde_json::to_vec(&decision).expect("serialize quota decision");
+    let decoded = serde_json::from_slice::<SelectionProvenance>(&bytes)
+        .expect("strict quota provenance round trip");
+    assert_eq!(decoded, decision);
+    assert_eq!(decoded.schema_version, 2);
+
+    let schema = selection_event_schema_value();
+    let provenance = &schema["properties"]["provenance"];
+    let required = provenance["required"].as_array().expect("required fields");
+    assert!(required.iter().any(|field| field == "quota"));
+    let runtime_pool = &provenance["properties"]["runtime_operations"]["items"];
+    let pool_required = runtime_pool["required"]
+        .as_array()
+        .expect("runtime pool required fields");
+    for field in [
+        "pool_reference",
+        "pool_kind",
+        "exhausted",
+        "exhaustion_behavior",
+        "authorized_alternatives",
+        "observation_source",
+        "marginal_cost_microunits",
+    ] {
+        assert!(pool_required.iter().any(|required| required == field));
+    }
+}
+
+#[test]
+fn historical_schema_v1_without_quota_fields_remains_readable() {
+    let decision = select(&base_input()).expect("legacy-compatible decision");
+    let mut value = serde_json::to_value(decision).expect("selector JSON");
+    let object = value.as_object_mut().expect("selector object");
+    object.insert("schema_version".to_string(), serde_json::json!(1));
+    object.remove("quota");
+    object
+        .get_mut("normalized_input")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("normalized input")
+        .remove("quota_source");
+    for collection in ["normalized_input", "runtime_operations"] {
+        let pools = if collection == "normalized_input" {
+            object[collection]["pools"]
+                .as_array_mut()
+                .expect("normalized pools")
+        } else {
+            object[collection]
+                .as_array_mut()
+                .expect("runtime operations")
+        };
+        for pool in pools {
+            let pool = pool.as_object_mut().expect("pool object");
+            for field in [
+                "pool_reference",
+                "pool_kind",
+                "entitlement_bounded",
+                "exhausted",
+                "exhaustion_behavior",
+                "authorized_alternatives",
+                "observation_source",
+            ] {
+                pool.remove(field);
+            }
+        }
+    }
+    for candidate in object["candidate_set"]
+        .as_array_mut()
+        .expect("candidate set")
+    {
+        candidate
+            .as_object_mut()
+            .expect("candidate object")
+            .remove("quota");
+    }
+
+    let decoded = serde_json::from_value::<SelectionProvenance>(value)
+        .expect("historical schema-v1 selector event");
+    assert_eq!(decoded.schema_version, 1);
+    assert!(decoded.quota.is_none());
+    assert!(decoded.candidate_set.iter().all(|candidate| {
+        candidate.quota.disposition == QuotaCandidateDisposition::LegacyUnconfigured
+    }));
+}
+
+#[test]
+fn legacy_unconfigured_zero_remaining_pool_still_fails_exhausted() {
+    let mut input = base_input();
+    input.constraints.allowed_runtimes = ["codex".to_string()].into_iter().collect();
+    let codex = input
+        .pools
+        .iter_mut()
+        .find(|pool| pool.runtime == "codex")
+        .expect("Codex pool");
+    codex.entitlement_remaining_units = 0;
+    codex.exhausted = false;
+
+    let decision = select(&input).expect("legacy exhaustion decision");
+    assert_eq!(decision.status, DecisionStatus::FailClosed);
+    assert!(decision.quota.is_none());
+    assert!(decision
+        .candidate_set
+        .iter()
+        .filter(|candidate| candidate.candidate.runtime == "codex")
+        .all(|candidate| candidate
+            .ineligibility_reasons
+            .iter()
+            .any(|reason| { reason.code == IneligibilityCode::EntitlementExhausted })));
 }
 
 #[test]

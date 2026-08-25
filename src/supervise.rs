@@ -95,6 +95,7 @@ use std::os::{
     unix::fs::{MetadataExt, OpenOptionsExt},
 };
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fmt, fs,
@@ -109,6 +110,135 @@ use std::{
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+const MAX_OPERATOR_QUOTA_CONFIG_BYTES: u64 = 256 * 1024;
+
+#[derive(Debug, Clone)]
+pub(crate) struct OperatorQuotaConfigBinding {
+    pub(crate) repo: PathBuf,
+    pub(crate) relative_path: PathBuf,
+    pub(crate) config: crate::optimizer::quota_pools::QuotaConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveQuotaSelectionContext {
+    pub(crate) repo: PathBuf,
+    pub(crate) relative_path: PathBuf,
+    pub(crate) config: crate::optimizer::quota_pools::QuotaConfig,
+}
+
+thread_local! {
+    static OPERATOR_QUOTA_CONFIG_BINDING: RefCell<Option<OperatorQuotaConfigBinding>> = const {
+        RefCell::new(None)
+    };
+}
+
+/// Restores the prior operator quota-config binding when a nested CLI dispatch returns.
+#[derive(Debug)]
+pub struct OperatorQuotaConfigBindGuard {
+    previous: Option<OperatorQuotaConfigBinding>,
+}
+
+impl Drop for OperatorQuotaConfigBindGuard {
+    fn drop(&mut self) {
+        OPERATOR_QUOTA_CONFIG_BINDING.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+/// Bind one explicit repository-local quota config for the current supervise/autopilot call.
+///
+/// The input is opened once through the repository-relative bounded regular-file reader. Absolute
+/// paths, traversal, symbolic links in any component, multiply-linked leaves, special files, and
+/// oversized input are refused before supervisor dispatch.
+pub fn bind_operator_quota_config(
+    repo: impl AsRef<Path>,
+    relative_path: impl AsRef<Path>,
+) -> Result<OperatorQuotaConfigBindGuard> {
+    let repo = discover_repo_root(repo.as_ref())?;
+    let relative_path = normalize_repo_relative_path(relative_path.as_ref())
+        .context("operator quota config path must be repository-relative")?;
+    let bytes =
+        BoundedRegularReader::read_relative(&repo, &relative_path, MAX_OPERATOR_QUOTA_CONFIG_BYTES)
+            .with_context(|| {
+                format!(
+                    "failed to read bounded repository-local operator quota config {}",
+                    relative_path.display()
+                )
+            })?;
+    let config =
+        crate::optimizer::quota_pools::QuotaConfig::from_json(&bytes).with_context(|| {
+            format!(
+                "operator quota config {} failed strict schema or semantic validation",
+                relative_path.display()
+            )
+        })?;
+    let binding = OperatorQuotaConfigBinding {
+        repo,
+        relative_path,
+        config,
+    };
+    Ok(
+        OPERATOR_QUOTA_CONFIG_BINDING.with(|slot| OperatorQuotaConfigBindGuard {
+            previous: slot.borrow_mut().replace(binding),
+        }),
+    )
+}
+
+pub(crate) fn current_operator_quota_config_binding() -> Option<OperatorQuotaConfigBinding> {
+    OPERATOR_QUOTA_CONFIG_BINDING.with(|slot| slot.borrow().clone())
+}
+
+pub(crate) fn live_quota_context_for_run(repo: &Path) -> Result<Option<LiveQuotaSelectionContext>> {
+    let Some(binding) = current_operator_quota_config_binding() else {
+        return Ok(None);
+    };
+    let repo = discover_repo_root(repo)?;
+    if binding.repo != repo {
+        bail!("operator quota config is bound to a different repository than this supervise run");
+    }
+    let context = LiveQuotaSelectionContext {
+        repo,
+        relative_path: binding.relative_path,
+        config: binding.config,
+    };
+    Ok(Some(context))
+}
+
+pub(crate) fn live_quota_pool_for_runtime<'context>(
+    context: &'context LiveQuotaSelectionContext,
+    runtime: &str,
+) -> Result<&'context crate::optimizer::quota_pools::EntitlementDescriptor> {
+    context
+        .config
+        .pools
+        .iter()
+        .find(|pool| pool.runtime.as_str() == runtime)
+        .with_context(|| {
+            format!(
+                "operator quota config {} has no pool for selected runtime '{}'",
+                context.relative_path.display(),
+                runtime
+            )
+        })
+}
+
+pub(crate) fn live_quota_concurrency_bound(
+    context: &LiveQuotaSelectionContext,
+) -> Result<Option<usize>> {
+    context
+        .config
+        .pools
+        .iter()
+        .filter_map(|pool| pool.rate_limits.max_concurrent_sessions)
+        .map(|value| {
+            usize::try_from(value)
+                .context("quota max_concurrent_sessions does not fit the host admission type")
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|bounds| bounds.into_iter().min())
+}
 mod plan_api;
 pub use plan_api::*;
 mod model_policy;
@@ -538,6 +668,7 @@ const DEFAULT_HOST_FALLBACK_CHILDREN: usize = 1;
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionInputSource {
     Configured,
+    OperatorQuotaConfig,
     ConservativeDefault,
     Measured,
 }
@@ -570,6 +701,12 @@ pub struct SupervisorAdmissionPolicyInput {
     pub effective: SupervisorAdmissionConfig,
     pub provider_inflight_bound: usize,
     pub provider_inflight_source: AdmissionInputSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_inflight_bound: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_inflight_source: Option<AdmissionInputSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_config_path: Option<PathBuf>,
     pub host: SupervisorHostResourcePolicyInput,
     pub resolved_bound: usize,
 }
@@ -647,11 +784,22 @@ impl SupervisorAdmissionConfig {
 }
 
 impl SupervisorAdmissionPolicyInput {
+    #[cfg(test)]
     fn resolve(
         repo: &Path,
         entrypoint_bound: usize,
         plan: SupervisorAdmissionConfig,
         cli: SupervisorAdmissionConfig,
+    ) -> Result<Self> {
+        Self::resolve_with_quota(repo, entrypoint_bound, plan, cli, None)
+    }
+
+    fn resolve_with_quota(
+        repo: &Path,
+        entrypoint_bound: usize,
+        plan: SupervisorAdmissionConfig,
+        cli: SupervisorAdmissionConfig,
+        quota_context: Option<&LiveQuotaSelectionContext>,
     ) -> Result<Self> {
         validate_max_concurrent_children(entrypoint_bound)?;
         let plan = plan.validate()?;
@@ -683,9 +831,14 @@ impl SupervisorAdmissionPolicyInput {
         let configured_bound = effective
             .max_concurrent_children
             .unwrap_or(entrypoint_bound);
+        let quota_inflight_bound = quota_context
+            .map(live_quota_concurrency_bound)
+            .transpose()?
+            .flatten();
         let resolved_bound = entrypoint_bound
             .min(configured_bound)
             .min(provider_inflight_bound)
+            .min(quota_inflight_bound.unwrap_or(usize::MAX))
             .min(host.resolved_children)
             .max(1);
         Ok(Self {
@@ -699,6 +852,11 @@ impl SupervisorAdmissionPolicyInput {
             } else {
                 AdmissionInputSource::ConservativeDefault
             },
+            quota_inflight_bound,
+            quota_inflight_source: quota_context
+                .is_some()
+                .then_some(AdmissionInputSource::OperatorQuotaConfig),
+            quota_config_path: quota_context.map(|context| context.relative_path.clone()),
             host: SupervisorHostResourcePolicyInput::from_capacity(host, effective),
             resolved_bound,
         })
@@ -1080,7 +1238,7 @@ pub struct SupervisorExecutionMetadata {
     pub usage: SupervisorExecutionUsageReport,
 }
 
-pub const ASSIGNMENT_SELECTION_LEDGER_SCHEMA_VERSION: u32 = 1;
+pub const ASSIGNMENT_SELECTION_LEDGER_SCHEMA_VERSION: u32 = 2;
 pub const SELECTION_LEDGER_RELATIVE: &str = "selection/assignment-selection-ledger.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1140,6 +1298,9 @@ pub struct AssignmentSelectionLedgerEntry {
     pub catalog_revisions: Vec<crate::selection::CatalogRevisionProvenance>,
     #[serde(default)]
     pub rejected_candidates: Vec<AssignmentRejectedCandidate>,
+    /// Exact local quota row used for the selected runtime. `None` is the legacy/no-config path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_evidence: Option<crate::selection::RuntimePoolState>,
     pub evidence_gap: Option<String>,
 }
 
@@ -3550,6 +3711,21 @@ enum SupervisorWorktreeCreation<'a> {
     PrimaryWorktree,
     #[cfg(test)]
     TestOnly,
+    #[cfg(test)]
+    VerifiedTestOnly,
+}
+
+impl SupervisorWorktreeCreation<'_> {
+    fn bypass_verified_admission_for_test(self) -> bool {
+        #[cfg(test)]
+        {
+            matches!(self, Self::VerifiedTestOnly)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
 }
 
 struct SharedSupervisorArtifacts<'a> {

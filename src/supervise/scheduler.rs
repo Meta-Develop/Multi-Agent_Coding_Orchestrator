@@ -352,6 +352,7 @@ pub(super) struct AssignmentBudgetPolicy {
     assignment_reasoning_effort: Option<ReasoningEffort>,
     selector_state: Option<SupervisorAutomaticSelectionState>,
     selector_overrides: BTreeMap<AgentRole, RoleModelSelection>,
+    selector_runtime_overrides: BTreeMap<AgentRole, SupervisorRuntime>,
     pub(super) selector_decisions: Vec<SupervisorSelectionEvent>,
 }
 
@@ -383,9 +384,14 @@ impl AssignmentBudgetPolicy {
             selection.reasoning_effort = Some(resolved.resolved);
             effective.role_models.insert(role, selection);
         }
+        let mechanical_worker_binding_active =
+            self.model_overrides.contains_key(&AgentRole::Worker)
+                || self.worker_effort_degradation_steps > 0;
         let initial_auditor = effective_role_model_selection(plan, AgentRole::Auditor);
         for (role, selection) in &self.selector_overrides {
-            effective.role_models.insert(*role, selection.clone());
+            if *role != AgentRole::Worker || !mechanical_worker_binding_active {
+                effective.role_models.insert(*role, selection.clone());
+            }
         }
         if let Some(auditor) = self.selector_overrides.get(&AgentRole::Auditor) {
             for lens in &mut effective.review_lenses {
@@ -440,6 +446,8 @@ impl AssignmentBudgetPolicy {
             environment_rejections,
         )?;
         self.selector_overrides.extend(reselection.overrides);
+        self.selector_runtime_overrides
+            .extend(reselection.runtime_overrides);
         Ok(reselection
             .decisions
             .into_iter()
@@ -451,6 +459,19 @@ impl AssignmentBudgetPolicy {
                 provenance,
             })
             .collect())
+    }
+
+    pub(super) fn selected_runtime_for(&self, role: AgentRole) -> Option<SupervisorRuntime> {
+        self.selector_runtime_overrides.get(&role).copied()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_selected_runtime_for_test(
+        &mut self,
+        role: AgentRole,
+        runtime: SupervisorRuntime,
+    ) {
+        self.selector_runtime_overrides.insert(role, runtime);
     }
 }
 
@@ -555,6 +576,36 @@ impl BudgetDegradationController {
                 },
             )?;
         }
+        let (selection_roles, selection_cause, budget_signal) = if budget_trigger {
+            (
+                vec![
+                    AgentRole::ChildOrchestrator,
+                    AgentRole::Worker,
+                    AgentRole::Auditor,
+                ],
+                SupervisorSelectionEventCause::BudgetDegrade,
+                crate::selection::BudgetSignal::Degrade,
+            )
+        } else {
+            (
+                vec![assignment.role],
+                SupervisorSelectionEventCause::Initial,
+                crate::selection::BudgetSignal::Continue,
+            )
+        };
+        let selector_decisions = self.policy.reselect(
+            request.runtime,
+            request.catalog,
+            SelectorReselectionRequest {
+                roles: &selection_roles,
+                assignment_id: Some(&assignment.id),
+                attempt: 0,
+                primary_cause: selection_cause,
+                retry_count: 0,
+                budget_signal,
+                environment_rejections: &[],
+            },
+        )?;
         self.last_new_dispatch_allowed = report.new_dispatch_allowed;
         let mut policy = self.policy.clone();
         if mechanical_duties.is_none() {
@@ -562,7 +613,7 @@ impl BudgetDegradationController {
             policy.worker_effort_degradation_steps = 0;
         }
         policy.assignment_reasoning_effort = requested_reasoning_effort;
-        policy.selector_decisions.clear();
+        policy.selector_decisions = selector_decisions;
         if mechanical_duties.is_some()
             && self.records.len() == records_before
             && (policy.model_overrides.contains_key(&AgentRole::Worker)
@@ -961,6 +1012,30 @@ impl BudgetDegradationController {
             );
         }
     }
+}
+
+#[cfg(test)]
+pub(super) fn assignment_policy_after_completed_settlement_for_test(
+    automatic_selection_state: SupervisorAutomaticSelectionState,
+    assignment: &OrchestratorAssignment,
+    report: &RunBudgetReport,
+    plan: &SupervisorPlan,
+    catalog: &RuntimeModelCatalog,
+    runtime: SupervisorRuntime,
+) -> Result<AssignmentBudgetPolicy> {
+    let assignment_metadata = AssignmentMetadata::new();
+    BudgetDegradationController::new_with_selection_state(1, Some(automatic_selection_state))
+        .assignment_policy(AssignmentBudgetPolicyRequest {
+            assignment,
+            requested_reasoning_effort: None,
+            report,
+            plan,
+            requested_plan: plan,
+            assignment_metadata: &assignment_metadata,
+            catalog,
+            runtime,
+        })?
+        .context("completed settlement unexpectedly stopped the next assignment admission")
 }
 
 fn assignment_mechanical_duties(
@@ -2669,7 +2744,7 @@ fn prepare_supervisor_run(
         mut plan_metadata,
     } = loaded;
     validate_max_concurrent_children(max_concurrent_children)?;
-    let budget_ledger = RunBudgetLedger::new_composed(
+    let mut budget_ledger = RunBudgetLedger::new_composed(
         plan_metadata.run_budget.limits,
         options.budget_overrides,
         plan_metadata.run_budget_max_duration_seconds,
@@ -2699,6 +2774,12 @@ fn prepare_supervisor_run(
         {
             bail!("test-only worktree creation requires the simulation supervisor runtime")
         }
+        #[cfg(test)]
+        SupervisorWorktreeCreation::VerifiedTestOnly
+            if execution_runtime != SupervisorExecutionRuntime::Verified =>
+        {
+            bail!("verified test-only worktree creation requires the verified supervisor runtime")
+        }
         _ => {}
     }
     match (worktree_creation, plan_metadata.execution_target.as_ref()) {
@@ -2716,22 +2797,38 @@ fn prepare_supervisor_run(
     }
     let runtime = options.runtime;
     let repo = discover_repo_root(&options.repo)?;
-    let admission_policy_input = SupervisorAdmissionPolicyInput::resolve(
+    let quota_context = live_quota_context_for_run(&repo)?;
+    if quota_context.is_some() && runtime == SupervisorRuntime::Fake {
+        bail!("operator quota config is not valid for the nonpublishable Fake supervisor runtime");
+    }
+    if let Some(quota_context) = &quota_context {
+        budget_ledger
+            .attach_quota_config(&repo, options.run_id.as_str(), &quota_context.config)
+            .context("failed to attach operator quota config to the run budget ledger")?;
+    }
+    let admission_policy_input = SupervisorAdmissionPolicyInput::resolve_with_quota(
         &repo,
         max_concurrent_children,
         plan_metadata.admission,
         options.admission_overrides,
+        quota_context.as_ref(),
     )?;
     let max_concurrent_children = admission_policy_input.resolved_bound;
     let requested_plan = plan.clone();
     let selection = initialize_supervisor_selection_from_prepared_metadata(
-        &repo,
-        runtime,
-        execution_runtime,
         &mut plan,
         &mut plan_metadata,
-        &runtime_model_catalog,
-        &admission_policy_input,
+        PreparedSupervisorSelectionRequest {
+            repo: &repo,
+            runtime,
+            execution_runtime,
+            runtime_model_catalog: &runtime_model_catalog,
+            admission_policy_input: &admission_policy_input,
+            quota: SupervisorQuotaSelectionInput {
+                context: quota_context.as_ref(),
+                ledger: quota_context.as_ref().map(|_| &budget_ledger),
+            },
+        },
     )?;
     let evidence_only_reaudit = plan_metadata
         .evidence_only_reaudit
@@ -2833,15 +2930,28 @@ fn prepare_supervisor_run(
     })
 }
 
+pub(super) struct PreparedSupervisorSelectionRequest<'a> {
+    pub(super) repo: &'a Path,
+    pub(super) runtime: SupervisorRuntime,
+    pub(super) execution_runtime: SupervisorExecutionRuntime,
+    pub(super) runtime_model_catalog: &'a RuntimeModelCatalogAcquisition,
+    pub(super) admission_policy_input: &'a SupervisorAdmissionPolicyInput,
+    pub(super) quota: SupervisorQuotaSelectionInput<'a>,
+}
+
 pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
-    repo: &Path,
-    runtime: SupervisorRuntime,
-    execution_runtime: SupervisorExecutionRuntime,
     plan: &mut SupervisorPlan,
     plan_metadata: &mut SupervisorPlanMetadata,
-    runtime_model_catalog: &RuntimeModelCatalogAcquisition,
-    admission_policy_input: &SupervisorAdmissionPolicyInput,
+    request: PreparedSupervisorSelectionRequest<'_>,
 ) -> Result<SupervisorSelectionResolution> {
+    let PreparedSupervisorSelectionRequest {
+        repo,
+        runtime,
+        execution_runtime,
+        runtime_model_catalog,
+        admission_policy_input,
+        quota,
+    } = request;
     if plan_metadata.resolved_objective_profile.is_none() {
         let requested_objective_profile = plan_metadata.objective_profile.clone();
         plan_metadata.resolved_objective_profile = Some(
@@ -2860,13 +2970,14 @@ pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
         }),
         Ok(catalog) => {
             let advertised = advertised_catalogs_for_launch(repo)?;
-            let resolution = initialize_supervisor_selection(
+            let resolution = initialize_supervisor_selection_with_quota(
                 plan,
                 runtime,
                 catalog,
                 admission_policy_input,
                 &advertised,
                 plan_metadata.resolved_objective_profile.as_ref(),
+                quota,
             )?;
             if resolution.selection_preflight_failure.is_none() {
                 bind_selected_assignment_runtimes(plan, &resolution.decisions)?;
@@ -3641,6 +3752,9 @@ mod selection_policy_tests {
             effective: SupervisorAdmissionConfig::default(),
             provider_inflight_bound: 1,
             provider_inflight_source: AdmissionInputSource::ConservativeDefault,
+            quota_inflight_bound: None,
+            quota_inflight_source: None,
+            quota_config_path: None,
             host: SupervisorHostResourcePolicyInput {
                 memory_available_mib: None,
                 memory_available_source: AdmissionInputSource::ConservativeDefault,
@@ -3746,6 +3860,10 @@ mod selection_policy_tests {
             AgentRole::ChildOrchestrator,
             role_selection("legacy-degraded-child", "low"),
         );
+        policy.model_overrides.insert(
+            AgentRole::Worker,
+            role_selection("mechanical-degraded-worker", "low"),
+        );
         policy.selector_overrides.insert(
             AgentRole::ChildOrchestrator,
             role_selection("selector-child", "high"),
@@ -3754,6 +3872,9 @@ mod selection_policy_tests {
             AgentRole::Auditor,
             role_selection("selector-auditor", "xhigh"),
         );
+        policy
+            .selector_overrides
+            .insert(AgentRole::Worker, role_selection("selector-worker", "high"));
 
         let effective = policy.apply(&plan);
 
@@ -3764,6 +3885,10 @@ mod selection_policy_tests {
         assert_eq!(
             effective.role_models[&AgentRole::Auditor],
             role_selection("selector-auditor", "xhigh")
+        );
+        assert_eq!(
+            effective.role_models[&AgentRole::Worker].model.as_deref(),
+            Some("mechanical-degraded-worker")
         );
         match &effective.review_lenses[0].backend {
             ReviewLensBackendConfig::Model {
