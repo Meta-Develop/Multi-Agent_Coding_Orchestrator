@@ -205,6 +205,12 @@ fn o1_worker_and_auditor_production_prompts_place_the_nonce_frame_after_role_met
         "{}{child_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n",
         child_orchestrator_cacheable_prefix()
     )));
+    assert!(child_prompt.contains("exactly one OrchestratorReviewReport JSON object"));
+    assert!(child_prompt.contains("without losing or changing any reported evidence"));
+    assert!(child_prompt.contains("represent absent optional evidence as null"));
+    assert!(child_prompt.contains("read-only AuditorReport"));
+    assert!(child_prompt.contains("parent directory is nonwritable"));
+    assert!(child_prompt.contains("no prose wrapper or Markdown fence"));
     assert_eq!(child_prompt.matches(FIELD_GUIDE_SECTION_NOTICE).count(), 3);
     assert_eq!(child_prompt.matches(guide_finding).count(), 3);
     assert_eq!(child_prompt.matches(guide_context).count(), 3);
@@ -228,7 +234,7 @@ fn o1_worker_and_auditor_production_prompts_place_the_nonce_frame_after_role_met
         supervise_role_prefix(SupervisePromptRole::TerminalWorker, &worker.id, None);
     assert!(worker_prompt.starts_with(&format!(
         "{}{worker_role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n",
-        worker_cacheable_prefix()
+        worker_cacheable_prefix().expect("render worker cacheable prefix")
     )));
     assert_eq!(worker_prompt.matches(guide_finding).count(), 1);
     assert_eq!(worker_prompt.matches(guide_context).count(), 1);
@@ -332,9 +338,27 @@ fn worker_prompt_includes_execution_journal_contract() {
 
     assert!(prompt
         .contains("Execution journal path: /tmp/maco-run/incoming/worker-journals/worker-a.jsonl"));
-    assert!(prompt.contains("write a structured execution journal"));
+    assert!(prompt.contains("Append one JSON line directly"));
+    assert!(prompt.contains("exact precreated journal"));
+    assert!(prompt.contains("parent is nonwritable"));
+    assert!(prompt.contains("Never create, replace, rename, link, truncate, or swap"));
+    assert!(prompt.contains("Never reconstruct at the end"));
+    assert!(prompt.contains("WorkerExecutionJournalRecordError"));
+    assert!(prompt.contains("WorkerReport.commands_run may be a subset of real journal records"));
+    assert!(prompt.contains(
+        "each command array element and cwd must be copied byte-for-byte, failed commands included"
+    ));
+    assert!(prompt.contains(
+        "Never paraphrase, summarize, normalize environment assignments, drop shell wrappers, or invent command identities"
+    ));
+    assert!(prompt.contains("\"command\":[\"apply_patch\","));
+    assert!(prompt.contains("\"cwd\":\"/worktree\""));
+    assert!(prompt.contains("\"start_timestamp\":\"2026-08-25T00:00:00Z\""));
+    assert!(prompt.contains("\"end_timestamp\":\"2026-08-25T00:00:01Z\""));
     assert!(prompt.contains("\"start_timestamp\""));
     assert!(prompt.contains("\"changed_paths\""));
+    assert!(prompt.contains("exactly one WorkerReport JSON object"));
+    assert!(prompt.contains("Do not wrap it in Markdown, a code fence, or prose"));
     assert!(prompt.contains("Worker model: worker-model"));
     assert!(prompt.contains("Worker reasoning effort: low"));
     assert!(prompt.contains("runtime-side role-tagged usage reporting"));

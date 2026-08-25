@@ -26,6 +26,17 @@ pub(super) fn write_orchestrator_schema(
     write_schema(writer, relative, orchestrator_report_schema_value())
 }
 
+pub(super) fn write_codex_orchestrator_schema(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+) -> Result<()> {
+    write_schema(
+        writer,
+        relative,
+        codex_response_format_schema(orchestrator_report_schema_value())?,
+    )
+}
+
 pub(super) fn write_supervisor_final_schema(
     writer: &mut ArtifactRunWriter,
     relative: &Path,
@@ -1465,6 +1476,489 @@ pub(super) fn write_auditor_schema(writer: &mut ArtifactRunWriter, relative: &Pa
     write_schema(writer, relative, auditor_report_schema_value())
 }
 
+pub(super) fn write_codex_auditor_schema(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+) -> Result<()> {
+    write_schema(
+        writer,
+        relative,
+        codex_response_format_schema(auditor_report_schema_value())?,
+    )
+}
+
+pub(super) fn codex_response_format_schema(
+    mut authoritative: serde_json::Value,
+) -> Result<serde_json::Value> {
+    if authoritative
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        == Some("OrchestratorReviewReport")
+    {
+        let properties = authoritative
+            .get_mut("properties")
+            .and_then(serde_json::Value::as_object_mut)
+            .context("authoritative orchestrator schema omitted properties")?;
+        for supervisor_owned in [
+            "licensed_breakage_review",
+            "generated_follow_up_tasks",
+            "gate_denials",
+            "gate_correction_outcomes",
+        ] {
+            properties.remove(supervisor_owned);
+        }
+    }
+    apply_codex_serde_option_projection(&mut authoritative)?;
+    make_codex_response_format_compatible(&mut authoritative)?;
+    validate_codex_response_format_schema(&authoritative)?;
+    Ok(authoritative)
+}
+
+const CODEX_SERDE_OPTION_PROJECTION: &str = "x-maco-serde-option";
+
+fn apply_codex_serde_option_projection(schema: &mut serde_json::Value) -> Result<()> {
+    let expected = match schema
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .context("Codex report schema omitted its title")?
+    {
+        "WorkerReport" | "AuditorReport" => 13,
+        "OrchestratorReviewReport" => 39,
+        title => bail!("unsupported Codex report schema title '{title}'"),
+    };
+    let projected = project_serde_option_properties(schema)?;
+    if projected != expected {
+        bail!(
+            "Codex serde Option projection expected {expected} typed properties but found {projected}"
+        );
+    }
+    Ok(())
+}
+
+fn project_serde_option_properties(schema: &mut serde_json::Value) -> Result<usize> {
+    let serde_json::Value::Object(object) = schema else {
+        return Ok(0);
+    };
+    let projected_names = if schema_object_matches(
+        object,
+        &["boundary", "policy_id", "operation", "retryability"],
+        &["boundary", "policy_id", "operation", "path", "retryability"],
+    ) {
+        &["path"][..]
+    } else if schema_object_matches(
+        object,
+        &["requirement", "status"],
+        &["requirement", "status", "observation"],
+    ) {
+        &["observation"][..]
+    } else if schema_object_matches(
+        object,
+        &["category", "summary", "remediation"],
+        &["category", "requirement", "summary", "remediation"],
+    ) {
+        &["requirement"][..]
+    } else if schema_object_matches(
+        object,
+        &["kind", "executable"],
+        &["kind", "executable", "version"],
+    ) {
+        &["version"][..]
+    } else if schema_object_matches(object, &[], &["minimum_inclusive", "maximum_exclusive"]) {
+        &["minimum_inclusive", "maximum_exclusive"][..]
+    } else {
+        &[][..]
+    };
+
+    let mut projected = projected_names.len();
+    if !projected_names.is_empty() {
+        let properties = object
+            .get_mut("properties")
+            .and_then(serde_json::Value::as_object_mut)
+            .context("typed serde Option projection omitted properties")?;
+        for name in projected_names {
+            let property = properties
+                .get_mut(*name)
+                .and_then(serde_json::Value::as_object_mut)
+                .with_context(|| format!("typed serde Option projection omitted '{name}'"))?;
+            if property
+                .insert(
+                    CODEX_SERDE_OPTION_PROJECTION.to_string(),
+                    serde_json::Value::Bool(true),
+                )
+                .is_some()
+            {
+                bail!("typed serde Option projection duplicated '{name}'");
+            }
+        }
+    }
+    for value in object.values_mut() {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    projected += project_serde_option_properties(value)?;
+                }
+            }
+            serde_json::Value::Object(_) => {
+                projected += project_serde_option_properties(value)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(projected)
+}
+
+fn schema_object_matches(
+    object: &serde_json::Map<String, serde_json::Value>,
+    required: &[&str],
+    properties: &[&str],
+) -> bool {
+    if object.get("type") != Some(&json!("object")) {
+        return false;
+    }
+    let Some(actual_properties) = object
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    if actual_properties.len() != properties.len()
+        || properties
+            .iter()
+            .any(|name| !actual_properties.contains_key(*name))
+    {
+        return false;
+    }
+    match object.get("required").and_then(serde_json::Value::as_array) {
+        Some(actual_required) => {
+            actual_required.len() == required.len()
+                && required.iter().all(|name| {
+                    actual_required
+                        .iter()
+                        .any(|actual| actual.as_str() == Some(name))
+                })
+        }
+        None => required.is_empty(),
+    }
+}
+
+fn codex_const_json_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn make_codex_response_format_compatible(schema: &mut serde_json::Value) -> Result<()> {
+    if schema
+        .as_object()
+        .is_some_and(|object| object.len() == 1 && object.get("type") == Some(&json!("object")))
+    {
+        *schema = codex_environment_preflight_observation_schema_value();
+    }
+    let serde_json::Value::Object(object) = schema else {
+        return Ok(());
+    };
+    if !object.contains_key("type") {
+        if let Some(schema_type) = object.get("const").map(codex_const_json_type) {
+            object.insert("type".to_string(), json!(schema_type));
+        }
+    }
+    for unsupported in [
+        "$schema",
+        "allOf",
+        "if",
+        "then",
+        "else",
+        "not",
+        "contains",
+        "minContains",
+        "maxContains",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "format",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "minProperties",
+        "maxProperties",
+        "default",
+        CODEX_SERDE_OPTION_PROJECTION,
+        "examples",
+        "readOnly",
+        "writeOnly",
+    ] {
+        object.remove(unsupported);
+    }
+
+    if object.contains_key("properties") {
+        let required = object
+            .get("required")
+            .map(|required| {
+                required
+                    .as_array()
+                    .context("Codex response required entry must be an array")?
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_string)
+                            .context("Codex response required entry must be a string")
+                    })
+                    .collect::<Result<BTreeSet<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let properties = object
+            .get_mut("properties")
+            .and_then(serde_json::Value::as_object_mut)
+            .context("Codex response properties must be an object")?;
+        for (name, property_schema) in properties.iter_mut() {
+            if !required.contains(name) && serde_option_accepts_explicit_null(property_schema)? {
+                make_codex_property_nullable(property_schema)?;
+            }
+        }
+        let retained_required = properties
+            .keys()
+            .cloned()
+            .map(serde_json::Value::String)
+            .collect::<Vec<_>>();
+        object.insert(
+            "required".to_string(),
+            serde_json::Value::Array(retained_required),
+        );
+        object.insert(
+            "additionalProperties".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        // These keywords express authoritative cross-field conditions. The local schema and
+        // acceptance gates retain and enforce them after provider-constrained decoding.
+        object.remove("oneOf");
+        object.remove("anyOf");
+    } else if let Some(one_of) = object.remove("oneOf") {
+        if object.insert("anyOf".to_string(), one_of).is_some() {
+            bail!("Codex response schema cannot combine oneOf and anyOf at one node");
+        }
+    }
+
+    for value in object.values_mut() {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    make_codex_response_format_compatible(value)?;
+                }
+            }
+            serde_json::Value::Object(_) => make_codex_response_format_compatible(value)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn serde_option_accepts_explicit_null(schema: &serde_json::Value) -> Result<bool> {
+    let object = schema
+        .as_object()
+        .context("Codex property schema must be an object")?;
+    match object.get(CODEX_SERDE_OPTION_PROJECTION) {
+        None => Ok(false),
+        Some(serde_json::Value::Bool(true)) => Ok(true),
+        Some(_) => bail!("Codex serde Option projection marker must be true"),
+    }
+}
+
+fn make_codex_property_nullable(schema: &mut serde_json::Value) -> Result<()> {
+    let object = schema
+        .as_object_mut()
+        .context("Codex optional property schema must be an object")?;
+    if object.remove(CODEX_SERDE_OPTION_PROJECTION) != Some(serde_json::Value::Bool(true)) {
+        bail!("Codex nullable property omitted its typed serde Option projection");
+    }
+    if schema
+        .as_object()
+        .is_some_and(|object| object.len() == 1 && object.get("type") == Some(&json!("object")))
+    {
+        *schema = codex_environment_preflight_observation_schema_value();
+    }
+    let object = schema
+        .as_object_mut()
+        .context("Codex optional property schema must be an object")?;
+    if let Some(schema_type) = object.get_mut("type") {
+        match schema_type {
+            serde_json::Value::String(existing) if existing != "null" => {
+                *schema_type = json!([existing.clone(), "null"]);
+            }
+            serde_json::Value::Array(types) => {
+                if !types.iter().any(|value| value == "null") {
+                    types.push(json!("null"));
+                }
+            }
+            serde_json::Value::String(_) => {}
+            _ => bail!("Codex optional property type must be a string or string array"),
+        }
+        if let Some(enum_values) = object
+            .get_mut("enum")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            if !enum_values.iter().any(serde_json::Value::is_null) {
+                enum_values.push(serde_json::Value::Null);
+            }
+        }
+        return Ok(());
+    }
+    for union in ["oneOf", "anyOf"] {
+        if let Some(variants) = object
+            .get_mut(union)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            if !variants
+                .iter()
+                .any(|variant| variant == &json!({"type": "null"}))
+            {
+                variants.push(json!({"type": "null"}));
+            }
+            return Ok(());
+        }
+    }
+    bail!("Codex optional property schema has no nullable type or union representation")
+}
+
+fn codex_environment_preflight_observation_schema_value() -> serde_json::Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "executable", "version"],
+                "properties": {
+                    "kind": {"const": "executable_version"},
+                    "executable": {
+                        "type": "string",
+                        "enum": ["bash", "cargo", "cmake", "codex", "git", "nix", "node", "npm", "python3", "rustc"]
+                    },
+                    "version": environment_version_schema_value()
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "credential"],
+                "properties": {
+                    "kind": {"const": "credential_present"},
+                    "credential": {
+                        "type": "string",
+                        "enum": ["codex_access_token", "codex_api_key", "open_ai_api_key"]
+                    }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "configuration"],
+                "properties": {
+                    "kind": {"const": "configuration_present"},
+                    "configuration": {"const": "codex_auth_file"}
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "enabled"],
+                "properties": {
+                    "kind": {"const": "network"},
+                    "enabled": {"type": "boolean"}
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "profile"],
+                "properties": {
+                    "kind": {"const": "sandbox"},
+                    "profile": {
+                        "type": "string",
+                        "enum": ["strict_offline_workspace", "trusted_fixed_network", "external_codex", "trusted_compatibility"]
+                    }
+                }
+            }
+        ]
+    })
+}
+
+fn validate_codex_response_format_schema(schema: &serde_json::Value) -> Result<()> {
+    let serde_json::Value::Object(object) = schema else {
+        return Ok(());
+    };
+    if object.contains_key("const") && !object.contains_key("type") {
+        bail!("Codex response const schema omitted its JSON type");
+    }
+    for unsupported in [
+        "$schema",
+        "allOf",
+        "oneOf",
+        "if",
+        "then",
+        "else",
+        "not",
+        "contains",
+        "minContains",
+        "maxContains",
+        "default",
+        CODEX_SERDE_OPTION_PROJECTION,
+    ] {
+        if object.contains_key(unsupported) {
+            bail!("Codex response schema retained unsupported keyword '{unsupported}'");
+        }
+    }
+    if let Some(properties) = object
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    {
+        let required = object
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .context("Codex response object schema omitted required")?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .context("Codex required entry is not a string")
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        if required.len() != properties.len()
+            || properties
+                .keys()
+                .any(|name| !required.contains(name.as_str()))
+            || object.get("additionalProperties") != Some(&serde_json::Value::Bool(false))
+        {
+            bail!(
+                "Codex response object schema must require every property and deny additional properties"
+            );
+        }
+    }
+    for value in object.values() {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    validate_codex_response_format_schema(value)?;
+                }
+            }
+            serde_json::Value::Object(_) => validate_codex_response_format_schema(value)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn auditor_report_schema_value() -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2324,6 +2818,331 @@ mod selection_schema_tests {
         schema["required"]
             .as_array()
             .is_some_and(|required| required.iter().any(|value| value == field))
+    }
+
+    fn schema_accepts_null(schema: &serde_json::Value) -> bool {
+        schema["type"] == "null"
+            || schema["type"]
+                .as_array()
+                .is_some_and(|types| types.iter().any(|value| value == "null"))
+            || schema["anyOf"]
+                .as_array()
+                .is_some_and(|variants| variants.iter().any(schema_accepts_null))
+    }
+
+    fn schema_accepts_instance(schema: &serde_json::Value, instance: &serde_json::Value) -> bool {
+        let Some(schema) = schema.as_object() else {
+            return true;
+        };
+        if let Some(any_of) = schema.get("anyOf").and_then(serde_json::Value::as_array) {
+            if !any_of
+                .iter()
+                .any(|variant| schema_accepts_instance(variant, instance))
+            {
+                return false;
+            }
+        }
+        if schema
+            .get("const")
+            .is_some_and(|expected| expected != instance)
+        {
+            return false;
+        }
+        if schema
+            .get("enum")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|values| !values.contains(instance))
+        {
+            return false;
+        }
+        if let Some(schema_type) = schema.get("type") {
+            let matches_type = |schema_type: &serde_json::Value| match schema_type.as_str() {
+                Some("null") => instance.is_null(),
+                Some("boolean") => instance.is_boolean(),
+                Some("integer") => instance.as_i64().is_some() || instance.as_u64().is_some(),
+                Some("number") => instance.is_number(),
+                Some("string") => instance.is_string(),
+                Some("array") => instance.is_array(),
+                Some("object") => instance.is_object(),
+                _ => false,
+            };
+            let accepted_type = schema_type.as_array().map_or_else(
+                || matches_type(schema_type),
+                |types| types.iter().any(matches_type),
+            );
+            if !accepted_type {
+                return false;
+            }
+        }
+        if let Some(instance) = instance.as_object() {
+            let properties = schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object);
+            if let Some(required) = schema.get("required").and_then(serde_json::Value::as_array) {
+                if required.iter().any(|name| {
+                    name.as_str()
+                        .is_none_or(|name| !instance.contains_key(name))
+                }) {
+                    return false;
+                }
+            }
+            for (name, value) in instance {
+                match properties.and_then(|properties| properties.get(name)) {
+                    Some(property_schema) => {
+                        if !schema_accepts_instance(property_schema, value) {
+                            return false;
+                        }
+                    }
+                    None if schema.get("additionalProperties") == Some(&json!(false)) => {
+                        return false;
+                    }
+                    None => {}
+                }
+            }
+        }
+        if let Some(instance) = instance.as_array() {
+            if let Some(items) = schema.get("items") {
+                if instance
+                    .iter()
+                    .any(|value| !schema_accepts_instance(items, value))
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn assert_serialized_keys_are_required(value: &serde_json::Value, schema: &serde_json::Value) {
+        let object = value.as_object().expect("representative report object");
+        let properties = schema["properties"]
+            .as_object()
+            .expect("compatible object properties");
+        for key in object.keys() {
+            assert!(
+                properties.contains_key(key),
+                "schema omitted serialized key {key}"
+            );
+            assert!(
+                required_contains(schema, key),
+                "schema did not require key {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_report_schemas_are_strict_shape_only_derivatives() -> Result<()> {
+        let authoritative = orchestrator_report_schema_value();
+        assert!(authoritative.get("allOf").is_some());
+        assert!(authoritative["properties"]
+            .get("licensed_breakage_review")
+            .is_some());
+
+        let codex = codex_response_format_schema(authoritative.clone())?;
+        assert_eq!(codex["title"], "OrchestratorReviewReport");
+        assert!(codex.get("$schema").is_none());
+        assert!(codex.get("allOf").is_none());
+        assert!(required_contains(&codex, "worker_reports"));
+        assert!(required_contains(&codex, "audit_reports"));
+        assert!(codex["properties"]
+            .get("licensed_breakage_review")
+            .is_none());
+        assert!(codex["properties"]
+            .get("generated_follow_up_tasks")
+            .is_none());
+        assert!(codex["properties"].get("gate_denials").is_none());
+        assert!(codex["properties"]
+            .get("gate_correction_outcomes")
+            .is_none());
+        let worker = &codex["properties"]["worker_reports"]["items"];
+        let command = &worker["properties"]["commands_run"]["items"];
+        for field in [
+            "sandbox_denials",
+            "environment_preflight_results",
+            "environment_failures",
+        ] {
+            assert!(required_contains(command, field));
+            assert!(command["properties"].get(field).is_some());
+            assert!(!schema_accepts_null(&command["properties"][field]));
+        }
+        for field in ["stdout", "stderr"] {
+            assert!(required_contains(command, field));
+            assert!(!schema_accepts_null(&command["properties"][field]));
+        }
+        let denial = &command["properties"]["sandbox_denials"]["items"];
+        assert!(required_contains(denial, "path"));
+        assert!(schema_accepts_null(&denial["properties"]["path"]));
+        let preflight = &command["properties"]["environment_preflight_results"]["items"];
+        assert!(required_contains(preflight, "observation"));
+        assert!(schema_accepts_null(&preflight["properties"]["observation"]));
+        let failure = &command["properties"]["environment_failures"]["items"];
+        assert!(required_contains(failure, "requirement"));
+        assert!(schema_accepts_null(&failure["properties"]["requirement"]));
+        let requirement_kind =
+            &failure["properties"]["requirement"]["anyOf"][0]["properties"]["kind"];
+        assert_eq!(requirement_kind["const"], "executable");
+        assert_eq!(requirement_kind["type"], "string");
+        let validation = &worker["properties"]["validation_results"]["items"];
+        assert!(required_contains(validation, "command"));
+        assert!(!schema_accepts_null(&validation["properties"]["command"]));
+        assert!(required_contains(validation, "message"));
+        assert!(schema_accepts_null(&validation["properties"]["message"]));
+        validate_codex_response_format_schema(&codex)?;
+        assert!(validate_codex_response_format_schema(&json!({
+            "const": "missing-type"
+        }))
+        .is_err());
+
+        let auditor = codex_response_format_schema(auditor_report_schema_value())?;
+        assert_eq!(auditor["title"], "AuditorReport");
+        assert!(required_contains(&auditor, "reviewed_worker_ids"));
+        assert!(required_contains(&auditor, "read_only"));
+        validate_codex_response_format_schema(&auditor)?;
+
+        let requirement = crate::external_agent::EnvironmentRequirement::executable(
+            crate::external_agent::EnvironmentExecutable::Cargo,
+            Some(
+                crate::external_agent::EnvironmentVersionConstraint::bounded(
+                    crate::external_agent::EnvironmentVersion::new(1, 90, 0),
+                    crate::external_agent::EnvironmentVersion::new(2, 0, 0),
+                ),
+            ),
+        );
+        let failure = EnvironmentFailure {
+            category: EnvironmentFailureCategory::VersionMismatch,
+            requirement: Some(requirement.clone()),
+            summary: "representative version mismatch".to_string(),
+            remediation: vec![EnvironmentRemediation {
+                scope: EnvironmentRemediationScope::ProjectLocal,
+                guidance: "use the pinned toolchain".to_string(),
+            }],
+        };
+        let command_record = CommandRunRecord {
+            command: vec!["cargo".to_string(), "check".to_string()],
+            cwd: PathBuf::from("."),
+            exit_code: Some(1),
+            status: ReviewStatus::Failed,
+            timeout_seconds: 30,
+            duration_ms: 4,
+            timed_out: false,
+            stdout: String::new(),
+            stderr: "version mismatch".to_string(),
+            sandbox_denials: vec![SandboxDenialEvidence {
+                boundary: crate::external_agent::SandboxDenialBoundary::InnerCodex,
+                policy_id: "maco_external_codex_inner_v1".to_string(),
+                operation: crate::external_agent::SandboxDeniedOperation::Write,
+                path: Some(PathBuf::from(".maco/schema-test")),
+                retryability: crate::external_agent::SandboxDenialRetryability::NotRetryable,
+            }],
+            environment_preflight_results: vec![EnvironmentPreflightResult {
+                requirement,
+                status: crate::external_agent::EnvironmentPreflightStatus::Blocked,
+                observation: Some(
+                    crate::external_agent::EnvironmentPreflightObservation::ExecutableVersion {
+                        executable: crate::external_agent::EnvironmentExecutable::Cargo,
+                        version: crate::external_agent::EnvironmentVersion::new(1, 89, 0),
+                    },
+                ),
+            }],
+            environment_failures: vec![failure.clone()],
+            error: Some("representative failure".to_string()),
+        };
+        let validation_result = ValidationResult {
+            name: "cargo check".to_string(),
+            status: ReviewStatus::Failed,
+            command: vec!["cargo".to_string(), "check".to_string()],
+            message: Some("representative failure".to_string()),
+        };
+        let worker_report = WorkerReport {
+            id: "worker-schema".to_string(),
+            role: AgentRole::Worker,
+            assignment_kind: AssignmentKind::Ordinary,
+            target_path: None,
+            assigned_paths: vec![PathBuf::from("src/lib.rs")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            claim_token: Some(1),
+            semantic_intent_token: Some(2),
+            commands_run: vec![command_record.clone()],
+            environment_failures: vec![failure.clone()],
+            files_changed: Vec::new(),
+            validation_results: vec![validation_result.clone()],
+            findings: Vec::new(),
+            field_guide_entries: Vec::new(),
+            bloated_file_flags: Vec::new(),
+            decomposition_completion: None,
+            no_further_delegation: Some(true),
+            accepted: false,
+            rejected: true,
+            status: ReviewStatus::Failed,
+            remaining_risk: "representative risk".to_string(),
+            next_safe_action: "correct the environment".to_string(),
+        };
+        let auditor_report = AuditorReport {
+            id: "auditor-schema".to_string(),
+            role: AgentRole::Auditor,
+            reviewed_worker_ids: vec![worker_report.id.clone()],
+            reviewed_paths: worker_report.assigned_paths.clone(),
+            commands_run: vec![command_record],
+            environment_failures: vec![failure],
+            validation_results: vec![validation_result],
+            findings: Vec::new(),
+            rejection_kind: Some(AuditorRejectionKind::EvidenceQuality),
+            no_further_delegation: Some(true),
+            read_only: true,
+            accepted: false,
+            rejected: true,
+            status: ReviewStatus::Failed,
+            remaining_risk: "representative risk".to_string(),
+            next_safe_action: "correct the evidence".to_string(),
+        };
+        let serialized_worker = serde_json::to_value(&worker_report)?;
+        let serialized_auditor = serde_json::to_value(&auditor_report)?;
+        let worker_response = codex_response_format_schema(worker_report_schema_value())?;
+        assert_serialized_keys_are_required(&serialized_worker, worker);
+        assert_serialized_keys_are_required(&serialized_auditor, &auditor);
+        assert_serialized_keys_are_required(&serialized_worker["commands_run"][0], command);
+        assert!(schema_accepts_instance(
+            &worker_response,
+            &serialized_worker
+        ));
+        assert!(schema_accepts_instance(&auditor, &serialized_auditor));
+        let _: WorkerReport = serde_json::from_value(serialized_worker.clone())?;
+        let _: AuditorReport = serde_json::from_value(serialized_auditor)?;
+
+        let mut explicit_null_worker = serialized_worker.clone();
+        explicit_null_worker["commands_run"][0]["sandbox_denials"][0]["boundary"] =
+            json!("outer_systemd");
+        explicit_null_worker["commands_run"][0]["sandbox_denials"][0]["policy_id"] =
+            json!("maco_external_codex_outer_systemd_v1");
+        explicit_null_worker["commands_run"][0]["sandbox_denials"][0]["operation"] =
+            json!("establish_boundary");
+        explicit_null_worker["commands_run"][0]["sandbox_denials"][0]["path"] = json!(null);
+        explicit_null_worker["commands_run"][0]["environment_preflight_results"][0]
+            ["observation"] = json!(null);
+        explicit_null_worker["commands_run"][0]["environment_failures"][0]["requirement"] =
+            json!(null);
+        explicit_null_worker["validation_results"][0]["message"] = json!(null);
+        assert!(schema_accepts_instance(
+            &worker_response,
+            &explicit_null_worker
+        ));
+        let _: WorkerReport = serde_json::from_value(explicit_null_worker)?;
+
+        for (field, replacement) in [("sandbox_denials", json!(null)), ("stdout", json!(null))] {
+            let mut invalid = serialized_worker.clone();
+            invalid["commands_run"][0][field] = replacement;
+            assert!(!schema_accepts_instance(&worker_response, &invalid));
+            assert!(serde_json::from_value::<WorkerReport>(invalid).is_err());
+        }
+        let mut invalid_validation_command = serialized_worker;
+        invalid_validation_command["validation_results"][0]["command"] = json!(null);
+        assert!(!schema_accepts_instance(
+            &worker_response,
+            &invalid_validation_command
+        ));
+        assert!(serde_json::from_value::<WorkerReport>(invalid_validation_command).is_err());
+        Ok(())
     }
 
     #[test]

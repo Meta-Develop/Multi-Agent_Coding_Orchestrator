@@ -79,6 +79,7 @@ pub(super) fn collect_child_report(
             report
         }
         Err(error) => {
+            let error = format!("{error:#}");
             let message = format!("required child report is missing or invalid: {error}");
             report_shape_problems.push(message);
             missing_child_report(
@@ -86,7 +87,7 @@ pub(super) fn collect_child_report(
                 report_path,
                 external_run,
                 external_command,
-                error.to_string(),
+                error,
             )
         }
     };

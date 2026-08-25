@@ -179,6 +179,142 @@ fn finalized_artifacts_round_trip_typed_context_switch_selection_evidence() {
 }
 
 #[test]
+#[cfg(unix)]
+fn worker_journals_are_precreated_as_private_exact_files() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("artifact-precreated-worker-journal").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id,
+        "supervise-test",
+    )
+    .expect("reserve supervise artifact run");
+    let (incoming, capture) =
+        create_invocation_scratches(&mut writer).expect("reserve invocation scratches");
+    let assignment = injected_assignment(true);
+    let journals = precreate_worker_execution_journals(&assignment, &incoming)
+        .expect("precreate exact worker journals");
+    assert_eq!(journals.len(), assignment.worker_assignments.len());
+    let journal_parent = incoming.path().join("worker-journals");
+    let parent_metadata = fs::symlink_metadata(&journal_parent).expect("journal parent metadata");
+    assert!(parent_metadata.is_dir());
+    assert_eq!(parent_metadata.permissions().mode() & 0o777, 0o700);
+    #[cfg(target_os = "linux")]
+    for name in CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS {
+        let path = journal_parent.join(name);
+        let metadata = fs::symlink_metadata(&path).expect("protected mount target metadata");
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert!(fs::read_dir(path)
+            .expect("protected mount target entries")
+            .next()
+            .is_none());
+    }
+    for journal in &journals {
+        assert_eq!(journal.parent(), Some(journal_parent.as_path()));
+        let metadata = fs::symlink_metadata(journal).expect("journal metadata");
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.len(), 0);
+    }
+    discard_invocation_scratches(&mut writer, &incoming, &capture)
+        .expect("discard journal scratch fixture");
+}
+
+#[test]
+fn worker_journal_append_writes_a_complete_apply_patch_record() {
+    let record = WorkerExecutionJournalEntry {
+        command: vec![
+            "apply_patch".to_string(),
+            "*** Begin Patch\n*** Update File: src/supervise.rs\n@@\n-old\n+new\n*** End Patch"
+                .to_string(),
+        ],
+        cwd: PathBuf::from("/native/local/worktree"),
+        start_timestamp: "2026-08-25T00:00:00Z".to_string(),
+        end_timestamp: "2026-08-25T00:00:01Z".to_string(),
+        changed_paths: vec![PathBuf::from("src/supervise.rs")],
+    };
+    let mut journal = Vec::new();
+
+    append_worker_execution_journal_record(&mut journal, &record)
+        .expect("append semantically complete apply_patch record");
+
+    let parsed = parse_worker_execution_journal(&journal, Path::new("worker.jsonl"))
+        .expect("parse appended apply_patch record");
+    assert_eq!(parsed, vec![record]);
+    assert!(!parsed[0].cwd.as_os_str().is_empty());
+    assert!(!parsed[0].start_timestamp.is_empty());
+    assert!(!parsed[0].end_timestamp.is_empty());
+    assert!(!parsed[0].command[1].is_empty());
+}
+
+#[test]
+fn worker_journal_append_rejects_blank_mandatory_fields_before_writing() {
+    let valid = WorkerExecutionJournalEntry {
+        command: vec!["apply_patch".to_string(), "nonempty patch".to_string()],
+        cwd: PathBuf::from("/native/local/worktree"),
+        start_timestamp: "2026-08-25T00:00:00Z".to_string(),
+        end_timestamp: "2026-08-25T00:00:01Z".to_string(),
+        changed_paths: vec![PathBuf::from("src/supervise.rs")],
+    };
+    let existing = b"existing immutable record\n".to_vec();
+
+    let mut blank_payload = valid.clone();
+    blank_payload.command[1].clear();
+    let mut journal = existing.clone();
+    let error = append_worker_execution_journal_record(&mut journal, &blank_payload)
+        .expect_err("blank apply_patch payload must be refused");
+    assert!(error
+        .to_string()
+        .contains("preserve the complete nonempty patch as command[1] before retrying the append"));
+    assert!(matches!(
+        error,
+        WorkerExecutionJournalRecordError::MissingApplyPatchPayload
+    ));
+    assert_eq!(journal, existing);
+
+    let mut blank_cwd = valid.clone();
+    blank_cwd.cwd = PathBuf::from("   ");
+    let mut journal = existing.clone();
+    let error = append_worker_execution_journal_record(&mut journal, &blank_cwd)
+        .expect_err("blank cwd must be refused");
+    assert!(error
+        .to_string()
+        .contains("provide the absolute assigned-worktree cwd before retrying the append"));
+    assert!(matches!(
+        error,
+        WorkerExecutionJournalRecordError::MissingCwd
+    ));
+    assert_eq!(journal, existing);
+
+    let mut blank_start = valid.clone();
+    blank_start.start_timestamp = " \t".to_string();
+    let mut journal = existing.clone();
+    let error = append_worker_execution_journal_record(&mut journal, &blank_start)
+        .expect_err("blank start_timestamp must be refused");
+    assert!(matches!(
+        error,
+        WorkerExecutionJournalRecordError::MissingStartTimestamp
+    ));
+    assert_eq!(journal, existing);
+
+    let mut blank_end = valid;
+    blank_end.end_timestamp = "\n".to_string();
+    let mut journal = existing.clone();
+    let error = append_worker_execution_journal_record(&mut journal, &blank_end)
+        .expect_err("blank end_timestamp must be refused");
+    assert!(matches!(
+        error,
+        WorkerExecutionJournalRecordError::MissingEndTimestamp
+    ));
+    assert_eq!(journal, existing);
+}
+
+#[test]
 fn supervise_writer_discards_reusable_invocation_scratches_and_finalizes_private_evidence() {
     let (_temp, repo_path) = injected_repository();
     let run_id = RunId::new("artifact-scratch-finalized").expect("valid run id");
@@ -1426,10 +1562,15 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
     let mut launched = false;
     let mut runner = |command: &ExternalAgentCommand| {
         launched = true;
-        assert!(
-            command.output_schema.is_none(),
-            "external Codex child and auditor launches must rely on authoritative local report validation"
-        );
+        let output_schema = command
+            .output_schema
+            .as_ref()
+            .expect("external Codex launch must bind a compatible output schema");
+        assert!(output_schema
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.ends_with(".codex-output.schema.json")));
+        assert!(output_schema.is_file());
         if command.workspace_access == WorkspaceAccess::ReadWrite {
             assert!(
                 !command.hidden_roots.iter().any(|root| root == &repo_path),
@@ -1874,7 +2015,9 @@ fn fake_supervise_run_finalizes_manifested_report_tree_events() {
     assert_eq!(child_measurements.prompts[1].agent_label, "worker-a");
     assert_eq!(
         child_measurements.prompts[1].invariant_bytes,
-        worker_cacheable_prefix().len()
+        worker_cacheable_prefix()
+            .expect("render worker cacheable prefix")
+            .len()
     );
     assert_eq!(
         child_measurements.prompts[2].role,
@@ -2172,7 +2315,7 @@ fn accepted_audited_suggestions_append_with_trusted_provenance_and_redacted_jour
     let role_prefix = supervise_role_prefix(SupervisePromptRole::TerminalWorker, &worker.id, None);
     assert!(worker_prompt.starts_with(&format!(
         "{}{role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n",
-        worker_cacheable_prefix()
+        worker_cacheable_prefix().expect("render worker cacheable prefix")
     )));
     let (opening_token, closing_token) = single_field_guide_frame_tokens(&worker_prompt);
     let final_nonce = opening_token
