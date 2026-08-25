@@ -211,6 +211,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         let planning_index = assignments.len();
         assignments.push(OrchestratorAssignment {
             id: planning_id.clone(),
+            phase: AssignmentPhase::Planning,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: assignment.assigned_paths.clone(),
@@ -254,6 +255,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         let execution_index = assignments.len();
         assignments.push(OrchestratorAssignment {
             id: assignment.id.clone(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: assignment.assigned_paths,
@@ -439,6 +441,11 @@ fn lower_provider_assignment_tree(
     let flattened_index = assignments.len();
     assignments.push(OrchestratorAssignment {
         id: node.id.clone(),
+        phase: if is_leaf {
+            AssignmentPhase::Execution
+        } else {
+            AssignmentPhase::Planning
+        },
         runtime: None,
         role: AgentRole::ChildOrchestrator,
         assigned_paths: node.assigned_paths.clone(),

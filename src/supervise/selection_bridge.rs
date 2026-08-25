@@ -2023,6 +2023,7 @@ mod tests {
     fn child_assignment(id: &str) -> OrchestratorAssignment {
         OrchestratorAssignment {
             id: id.to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("README.md")],
@@ -2883,6 +2884,7 @@ mod tests {
     fn worker_assignment() -> OrchestratorAssignment {
         OrchestratorAssignment {
             id: "worker-a".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::Worker,
             assigned_paths: vec![PathBuf::from("README.md")],

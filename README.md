@@ -73,9 +73,13 @@ The current implementation covers a local-first command-line slice:
   `maco supervise run --from-goal <file>` accept the same mutually exclusive
   positional-plan or high-level-goal inputs as `supervise plan`, then execute
   the resulting validated plan through the live supervisor gates. The command
-  selects the Codex runtime by default. Verified managed-worktree Codex
-  children launch through native workspace-write execution; the optional
-  app-server duplex reviewer is not their release path. Writable access to the
+  selects the Codex runtime by default. Normalized planning-phase Codex
+  children receive a read-only workspace and read-only access to their own Git
+  worktree metadata in both the outer systemd containment and inner Codex
+  permission profile. Only their exact private final-message staging root is
+  writable. Execution-phase children retain native workspace-write and their
+  existing bounded writable Git metadata; the optional app-server duplex
+  reviewer is not their release path. Writable access to the
   primary checkout remains fail-closed because Codex cannot force a blocking
   client callback for every in-sandbox action. The command requires
   `--machine-global-config` and
@@ -1017,8 +1021,9 @@ cargo run -- consult ask \
   --json
 ```
 
-For writable Codex launches in a managed linked worktree, MACO grants read-write
-access only to that worktree's own per-worktree Git directory. The common Git
+For execution-phase Codex launches in a managed linked worktree, MACO grants
+read-write access only to that worktree's own per-worktree Git directory.
+Planning-phase launches bind that same directory read-only. The common Git
 allowlist is read-only: `objects/`, `refs/`, `config`, `packed-refs`,
 `info/exclude`, and optional `shallow`. The primary `HEAD`, `index`, and
 `config.worktree`, MACO common state, and peer worktree entries are not exposed.
@@ -2615,6 +2620,7 @@ Run an opt-in supervisor-of-orchestrators plan:
   "assignments": [
     {
       "id": "docs-child",
+      "phase": "execution",
       "assigned_paths": ["README.md"],
       "worker_assignments": [
         {
@@ -2625,6 +2631,7 @@ Run an opt-in supervisor-of-orchestrators plan:
     },
     {
       "id": "rust-child",
+      "phase": "execution",
       "assigned_paths": ["src/lib.rs"],
       "semantic_symbols": ["WorktreeManager"],
       "worker_assignments": [
@@ -2700,6 +2707,7 @@ scope and the operator separately passing `--allow-primary-worktree`:
   },
   "assignments": [{
     "id": "local-deploy",
+    "phase": "execution",
     "assigned_paths": ["local/deploy.txt"],
     "worker_assignments": []
   }]
@@ -2743,7 +2751,12 @@ not execute a primary-worktree target.
 
 Goal/spec planning fragments the source and emits one nested subtree per
 disjoint workstream: a depth-2 read-only planning root followed by a depth-3
-execution child with a real `parent_assignment_id`. The execution child keeps
+execution child with a real `parent_assignment_id`. Every normalized assignment
+carries a required typed `phase`; schedule identity and flattened index are
+validated before that authority is consumed at launch. Every recursive
+assignment must declare `planning` or `execution`. Omitted, mixed
+present/absent, null, and unknown phases are rejected rather than inheriting
+writable execution authority. The execution child keeps
 the proposed `assigned_paths`, worker assignment, and any parser-backed Rust
 `semantic_symbols` and `semantic_modules`. These are proposed path claims and
 semantic intents; `supervise run` still acquires and enforces the authoritative

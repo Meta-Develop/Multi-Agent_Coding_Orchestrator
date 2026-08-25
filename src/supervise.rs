@@ -143,6 +143,8 @@ mod selection_bridge;
 use selection_bridge::*;
 
 mod assignment_execution;
+#[cfg(test)]
+pub(crate) use assignment_execution::configure_assignment_phase_command_for_test;
 use assignment_execution::*;
 
 mod plan_validation;
@@ -1531,9 +1533,26 @@ struct WorkerAssignmentMetadata {
     target_path: Option<PathBuf>,
 }
 
+/// Typed launch authority for one normalized supervisor assignment.
+///
+/// Every executable plan must declare this field for every recursive
+/// assignment. Omission never grants execution authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentPhase {
+    Planning,
+    Execution,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OrchestratorAssignment {
     pub id: String,
+    /// The sole planning-versus-execution capability selector for launch.
+    ///
+    /// Schedule lineage determines admission order only. The launcher binds
+    /// this typed phase to the validated schedule entry at the same flattened
+    /// index before constructing either confinement layer.
+    pub phase: AssignmentPhase,
     /// Optional per-assignment runtime. A CLI override remains authoritative; absent both,
     /// supervisor execution defaults to Codex.
     #[serde(default, skip_serializing_if = "Option::is_none")]

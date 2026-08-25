@@ -16,6 +16,7 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
         "max_child_assignments": 1,
         "assignments": [{
             "id": "child-a",
+            "phase": "execution",
             "assigned_paths": ["README.md"]
         }]
     });

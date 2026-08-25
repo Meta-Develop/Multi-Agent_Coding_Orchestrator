@@ -63,6 +63,43 @@ fn requires_hosted_pre_action_review(command: &ExternalAgentCommand) -> bool {
             == crate::runtime_adapter::WritableLaunchTarget::PrimaryWorktree
 }
 
+fn configure_assignment_phase_command(
+    command: ExternalAgentCommand,
+    phase: AssignmentPhase,
+    assigned_paths: &[PathBuf],
+) -> Result<ExternalAgentCommand> {
+    match phase {
+        AssignmentPhase::Planning => {
+            if !command.worktree_control_exceptions.is_empty() {
+                bail!("planning child command may not contain writable control exceptions");
+            }
+            Ok(command.with_workspace_access(WorkspaceAccess::ReadOnly))
+        }
+        AssignmentPhase::Execution => configure_writable_child_command(command, assigned_paths),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn configure_assignment_phase_command_for_test(
+    command: ExternalAgentCommand,
+    phase: AssignmentPhase,
+    assigned_paths: &[PathBuf],
+) -> Result<ExternalAgentCommand> {
+    configure_assignment_phase_command(command, phase, assigned_paths)
+}
+
+fn validated_assignment_phase_for_launch(
+    assignment: &OrchestratorAssignment,
+    index: usize,
+    assignment_schedule: &[AssignmentScheduleEntry],
+) -> Result<AssignmentPhase> {
+    assignment_schedule
+        .get(index)
+        .filter(|entry| entry.assignment_id == assignment.id && entry.flattened_index == index)
+        .context("assignment launch is not bound to its validated schedule entry")?;
+    Ok(assignment.phase)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn worktree_writable_admission_record(
     assignment_id: &str,
@@ -73,7 +110,17 @@ fn worktree_writable_admission_record(
     authenticated_claims: &[PathClaim],
     command: &ExternalAgentCommand,
     runtime: SupervisorRuntime,
+    phase: AssignmentPhase,
 ) -> Result<Option<crate::external_agent::WorktreeWritableAdmission>> {
+    if phase == AssignmentPhase::Planning {
+        if command.workspace_access != WorkspaceAccess::ReadOnly {
+            bail!(
+                "planning assignment '{}' attempted to request writable workspace admission",
+                assignment_id
+            );
+        }
+        return Ok(None);
+    }
     if command.workspace_access == WorkspaceAccess::ReadOnly
         || command.writable_launch_target
             == crate::runtime_adapter::WritableLaunchTarget::PrimaryWorktree
@@ -822,6 +869,7 @@ fn prepare_child_attempt<'a>(
         budget_config,
         consultant,
         assignment_metadata,
+        assignment_schedule,
         evidence_only_reaudit,
         options,
         repo,
@@ -836,6 +884,8 @@ fn prepare_child_attempt<'a>(
         ..
     } = context;
     let assignment = &preflight.assignment;
+    let assignment_phase =
+        validated_assignment_phase_for_launch(assignment, *index, assignment_schedule)?;
     let worktree = &preflight.worktree;
     if let Err(error) = preflight.mandatory_worktree_controls.revalidate() {
         record_isolated_assignment_failure(
@@ -1007,7 +1057,7 @@ fn prepare_child_attempt<'a>(
     command = if evidence_only_reaudit.is_some() {
         configure_read_only_auditor_command(command)?
     } else {
-        configure_writable_child_command(command, &assignment.assigned_paths)?
+        configure_assignment_phase_command(command, assignment_phase, &assignment.assigned_paths)?
     };
     command = command.with_writable_launch_target(match execution_target {
         Some(SupervisorExecutionTarget::PrimaryWorktree { .. }) => {
@@ -1125,6 +1175,7 @@ fn prepare_child_attempt<'a>(
             &authenticated_claims,
             &command,
             launch_runtime,
+            assignment_phase,
         )? {
             let relative = PathBuf::from("assignments").join(format!(
                 "{}.attempt-{attempt}.worktree-writable-admission.json",
@@ -3596,6 +3647,7 @@ mod decomposition_tests {
 
         let assignment = OrchestratorAssignment {
             id: "phase-child".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("README.md")],
@@ -4272,6 +4324,99 @@ done
         }
     }
 
+    fn phase_fixture_assignment(id: &str, phase: AssignmentPhase) -> OrchestratorAssignment {
+        OrchestratorAssignment {
+            id: id.to_string(),
+            phase,
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn typed_assignment_phase_selects_workspace_access_independent_of_id() {
+        let planning = phase_fixture_assignment("execution-looking-id", AssignmentPhase::Planning);
+        let planning_schedule = [AssignmentScheduleEntry {
+            assignment_id: planning.id.clone(),
+            parent_assignment_id: None,
+            depth: MIN_SUPERVISOR_DEPTH,
+            flattened_index: 0,
+        }];
+        let planning_phase =
+            validated_assignment_phase_for_launch(&planning, 0, &planning_schedule)
+                .expect("planning assignment is bound to its validated schedule entry");
+        let planning_command = configure_assignment_phase_command(
+            launch_fixture_command(),
+            planning_phase,
+            &planning.assigned_paths,
+        )
+        .expect("planning command is read-only");
+        assert_eq!(planning_command.workspace_access, WorkspaceAccess::ReadOnly);
+        assert!(planning_command.worktree_control_exceptions.is_empty());
+
+        let execution = phase_fixture_assignment("planning-looking-id", AssignmentPhase::Execution);
+        let execution_schedule = [AssignmentScheduleEntry {
+            assignment_id: execution.id.clone(),
+            parent_assignment_id: None,
+            depth: MIN_SUPERVISOR_DEPTH,
+            flattened_index: 0,
+        }];
+        let execution_phase =
+            validated_assignment_phase_for_launch(&execution, 0, &execution_schedule)
+                .expect("execution assignment is bound to its validated schedule entry");
+        let execution_command = configure_assignment_phase_command(
+            launch_fixture_command(),
+            execution_phase,
+            &execution.assigned_paths,
+        )
+        .expect("execution command retains bounded writes");
+        assert_eq!(
+            execution_command.workspace_access,
+            WorkspaceAccess::ReadWrite
+        );
+        assert!(execution_command.worktree_control_exceptions.is_empty());
+    }
+
+    #[test]
+    fn assignment_phase_launch_rejects_schedule_id_mismatch() {
+        let assignment = phase_fixture_assignment("child-a", AssignmentPhase::Planning);
+        let schedule = [AssignmentScheduleEntry {
+            assignment_id: "child-b".to_string(),
+            parent_assignment_id: None,
+            depth: MIN_SUPERVISOR_DEPTH,
+            flattened_index: 0,
+        }];
+        let error = validated_assignment_phase_for_launch(&assignment, 0, &schedule)
+            .expect_err("mismatched schedule identity must fail closed");
+        assert!(error
+            .to_string()
+            .contains("not bound to its validated schedule entry"));
+    }
+
+    #[test]
+    fn assignment_phase_launch_rejects_schedule_index_mismatch() {
+        let assignment = phase_fixture_assignment("child-a", AssignmentPhase::Planning);
+        let schedule = [AssignmentScheduleEntry {
+            assignment_id: assignment.id.clone(),
+            parent_assignment_id: None,
+            depth: MIN_SUPERVISOR_DEPTH,
+            flattened_index: 1,
+        }];
+        let error = validated_assignment_phase_for_launch(&assignment, 0, &schedule)
+            .expect_err("mismatched flattened index must fail closed");
+        assert!(error
+            .to_string()
+            .contains("not bound to its validated schedule entry"));
+    }
+
     fn worker_plan(model: &str) -> SupervisorPlan {
         let mut plan = SupervisorPlan {
             version: SUPERVISOR_SCHEMA_VERSION,
@@ -4382,6 +4527,7 @@ done
             std::slice::from_ref(&claim),
             &command,
             SupervisorRuntime::Codex,
+            AssignmentPhase::Execution,
         )
         .expect("all three factors admit the managed worktree")
         .expect("writable managed worktree produces admission evidence");
@@ -4433,6 +4579,7 @@ done
             std::slice::from_ref(&claim),
             &primary,
             SupervisorRuntime::Codex,
+            AssignmentPhase::Execution,
         )
         .expect("primary targets use the separate universal callback gate")
         .is_none());
@@ -4446,6 +4593,7 @@ done
             &[],
             &command,
             SupervisorRuntime::Codex,
+            AssignmentPhase::Execution,
         )
         .expect_err("an unauthenticated claim must fail closed");
         assert!(format!("{missing_claim:#}").contains("not held in authenticated state"));
@@ -4463,6 +4611,7 @@ done
             std::slice::from_ref(&claim),
             &command,
             SupervisorRuntime::Codex,
+            AssignmentPhase::Execution,
         )
         .expect_err("a mismatched worktree binding must fail closed");
         assert!(format!("{worktree_error:#}").contains("managed worktree"));
@@ -4476,9 +4625,55 @@ done
             std::slice::from_ref(&claim),
             &command,
             SupervisorRuntime::Cursor,
+            AssignmentPhase::Execution,
         )
         .expect_err("unverified native confinement must fail closed");
         assert!(format!("{confinement_error:#}").contains("verified native sandbox admission"));
+    }
+
+    #[test]
+    fn planning_phase_never_produces_writable_admission() {
+        let assigned_paths = vec![PathBuf::from("README.md")];
+        let worktree = WorktreeRecord {
+            name: "planning-child".to_string(),
+            path: PathBuf::from("/tmp/work"),
+            branch: "maco/planning-child".to_string(),
+        };
+        let claim = PathClaim {
+            token: crate::sync::ClaimToken::from_u64(7),
+            agent_id: "planning-child".to_string(),
+            paths: assigned_paths.clone(),
+        };
+        let read_only = launch_fixture_command().with_workspace_access(WorkspaceAccess::ReadOnly);
+        assert!(worktree_writable_admission_record(
+            "planning-child",
+            &assigned_paths,
+            1,
+            &worktree,
+            &claim,
+            std::slice::from_ref(&claim),
+            &read_only,
+            SupervisorRuntime::Codex,
+            AssignmentPhase::Planning,
+        )
+        .expect("read-only planning launch requires no writable admission")
+        .is_none());
+
+        let error = worktree_writable_admission_record(
+            "planning-child",
+            &assigned_paths,
+            1,
+            &worktree,
+            &claim,
+            std::slice::from_ref(&claim),
+            &launch_fixture_command(),
+            SupervisorRuntime::Codex,
+            AssignmentPhase::Planning,
+        )
+        .expect_err("planning phase must reject writable workspace admission");
+        assert!(error
+            .to_string()
+            .contains("attempted to request writable workspace admission"));
     }
 
     #[test]
@@ -4539,6 +4734,7 @@ done
         let assignment: OrchestratorAssignment = serde_json::from_str(
             r#"{
                 "id": "worker-claude",
+                "phase": "execution",
                 "runtime": "claude-code",
                 "role": "worker",
                 "assigned_paths": ["README.md"]
@@ -4570,6 +4766,7 @@ done
         let assignment: OrchestratorAssignment = serde_json::from_str(
             r#"{
                 "id": "worker-gemini",
+                "phase": "execution",
                 "runtime": "gemini-cli",
                 "role": "worker",
                 "assigned_paths": ["README.md"]
@@ -4600,6 +4797,7 @@ done
     fn assignment_launch_uses_selected_runtime_pair_not_run_global() -> Result<()> {
         let mut assignment = OrchestratorAssignment {
             id: "worker-a".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: Some(SupervisorRuntime::Cursor),
             role: AgentRole::Worker,
             assigned_paths: vec![PathBuf::from("README.md")],

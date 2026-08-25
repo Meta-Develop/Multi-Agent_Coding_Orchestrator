@@ -1441,6 +1441,7 @@ mod regression_tests {
         };
         let assignment = OrchestratorAssignment {
             id: child_id.to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from(assigned_path)],
@@ -1590,6 +1591,7 @@ mod regression_tests {
     fn worker_embedding_multiplier_uses_all_worker_roles_in_the_run() {
         let assignment = |id: &str, worker_count: usize| OrchestratorAssignment {
             id: id.to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
@@ -1677,6 +1679,7 @@ mod regression_tests {
         };
         let assignment = OrchestratorAssignment {
             id: "child-lite".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
@@ -1757,6 +1760,7 @@ mod regression_tests {
     fn judgment_and_auditor_prompts_never_receive_the_lite_profile() {
         let assignment = OrchestratorAssignment {
             id: "child-judgment".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
@@ -2134,6 +2138,7 @@ mod regression_tests {
         .expect("review-lens fixture capability policy");
         let assignment = OrchestratorAssignment {
             id: "child-decorrelated".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("src/review.rs")],
@@ -2294,6 +2299,7 @@ mod regression_tests {
     fn review_lens_prompt_rejects_parent_auditor_ceiling_overrun() -> Result<()> {
         let assignment = OrchestratorAssignment {
             id: "child-bounded-lens".to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("src/review.rs")],

@@ -9,6 +9,7 @@ fn environment_requirements_default_compatibly_and_aggregate_canonically() {
         "max_child_assignments": 1,
         "assignments": [{
             "id": "child-a",
+            "phase": "execution",
             "assigned_paths": ["README.md"],
             "worker_assignments": [{
                 "id": "worker-a",

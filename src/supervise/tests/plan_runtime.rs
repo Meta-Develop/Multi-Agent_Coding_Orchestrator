@@ -344,6 +344,78 @@ fn old_and_new_supervisor_model_economics_schema_round_trip() {
 }
 
 #[test]
+fn assignment_phase_is_required_and_fail_closed() {
+    let explicit = serde_json::from_slice::<Value>(&bounded_loader_plan_json())
+        .expect("parse explicit plan fixture");
+    let loaded = parse_supervisor_plan_with_consultant(&explicit.to_string())
+        .expect("explicit execution phase");
+    assert_eq!(loaded.plan.assignments[0].phase, AssignmentPhase::Execution);
+    let normalized = supervisor_plan_value(
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )
+    .expect("normalize explicit plan");
+    assert_eq!(normalized["assignments"][0]["phase"], "execution");
+
+    let mut omitted = explicit.clone();
+    omitted["assignments"][0]
+        .as_object_mut()
+        .expect("assignment object")
+        .remove("phase");
+    let omitted_error = parse_supervisor_plan_with_consultant(&omitted.to_string())
+        .expect_err("omitted phase must not grant execution authority");
+    assert!(format!("{omitted_error:#}").contains("missing field `phase`"));
+
+    let mut mixed = explicit.clone();
+    mixed["max_depth"] = json!(3);
+    mixed["max_child_assignments"] = json!(2);
+    mixed["assignments"][0]["child_assignments"] = json!([{
+        "id": "nested-without-phase",
+        "assigned_paths": ["src/nested.rs"],
+        "worker_assignments": []
+    }]);
+    let mixed_error = parse_supervisor_plan_with_consultant(&mixed.to_string())
+        .expect_err("mixed explicit and omitted phase authority must fail closed");
+    assert!(format!("{mixed_error:#}").contains("missing field `phase`"));
+
+    let mut unknown = explicit.clone();
+    unknown["assignments"][0]["phase"] = json!("untrusted");
+    let unknown_error = parse_supervisor_plan_with_consultant(&unknown.to_string())
+        .expect_err("unknown phase must be rejected by typed deserialization");
+    assert!(format!("{unknown_error:#}").contains("unknown variant `untrusted`"));
+
+    let mut null_phase = explicit.clone();
+    null_phase["assignments"][0]["phase"] = Value::Null;
+    let null_error = parse_supervisor_plan_with_consultant(&null_phase.to_string())
+        .expect_err("null phase must not grant execution authority");
+    assert!(format!("{null_error:#}").contains("supervisor plan fields are invalid"));
+
+    let direct_assignment = json!({
+        "id": "direct-without-phase",
+        "assigned_paths": ["README.md"]
+    });
+    assert!(serde_json::from_value::<OrchestratorAssignment>(direct_assignment).is_err());
+}
+
+#[test]
+fn planning_phase_rejects_execution_authority() {
+    let mut document =
+        serde_json::from_slice::<Value>(&bounded_loader_plan_json()).expect("parse plan fixture");
+    document["assignments"][0]["phase"] = json!("planning");
+    document["assignments"][0]["worker_assignments"] = json!([{
+        "id": "forbidden-worker",
+        "assigned_paths": ["README.md"]
+    }]);
+    let error = parse_supervisor_plan_with_consultant(&document.to_string())
+        .expect_err("planning assignment must not delegate execution");
+    assert!(error
+        .to_string()
+        .contains("may not declare terminal worker assignments"));
+}
+
+#[test]
 fn assignment_reasoning_effort_round_trips_and_rejects_unknown_values() {
     let mut document = serde_json::from_slice::<Value>(&bounded_loader_plan_json())
         .expect("parse supervisor plan fixture");
@@ -444,11 +516,13 @@ fn recursive_supervisor_plan_flattens_and_preserves_schedule_on_round_trip() {
         "spec_fragment_ids": ["SPEC-root", "SPEC-child", "SPEC-gap"],
         "assignments": [{
             "id": "root-child",
+            "phase": "execution",
             "assigned_paths": ["src/root.rs"],
             "spec_fragment_ids": ["SPEC-root"],
             "worker_assignments": [],
             "child_assignments": [{
                 "id": "nested-child",
+                "phase": "execution",
                 "assigned_paths": ["src/nested.rs"],
                 "spec_fragment_ids": ["SPEC-child"],
                 "worker_assignments": []
@@ -468,6 +542,11 @@ fn recursive_supervisor_plan_flattens_and_preserves_schedule_on_round_trip() {
             .collect::<Vec<_>>(),
         vec!["root-child", "nested-child"]
     );
+    assert!(loaded
+        .plan
+        .assignments
+        .iter()
+        .all(|assignment| assignment.phase == AssignmentPhase::Execution));
     assert_eq!(
         loaded.plan_metadata.assignment_schedule,
         vec![
@@ -542,6 +621,7 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
     assert_eq!(document["max_child_assignments"], 4);
     assert_eq!(assignments.len(), 4);
     assert_eq!(assignments[0]["id"], "assignment-001-planning");
+    assert_eq!(assignments[0]["phase"], "planning");
     assert_eq!(assignments[0]["assigned_paths"], json!(["src/alpha.rs"]));
     assert_eq!(
         assignments[0]["semantic_symbols"],
@@ -557,6 +637,7 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
         .expect("planning task")
         .contains("Read-only planning gate"));
     assert_eq!(assignments[1]["id"], "assignment-001");
+    assert_eq!(assignments[1]["phase"], "execution");
     assert_eq!(assignments[1]["assigned_paths"], json!(["src/alpha.rs"]));
     assert_eq!(assignments[1]["spec_fragment_ids"], json!(["fragment-002"]));
     assert_eq!(
@@ -568,12 +649,14 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
         "Update AlphaHandler."
     );
     assert_eq!(assignments[2]["id"], "assignment-002-planning");
+    assert_eq!(assignments[2]["phase"], "planning");
     assert_eq!(assignments[2]["assigned_paths"], json!(["src/beta.rs"]));
     assert!(assignments[2]["worker_assignments"]
         .as_array()
         .expect("planning workers")
         .is_empty());
     assert_eq!(assignments[3]["id"], "assignment-002");
+    assert_eq!(assignments[3]["phase"], "execution");
     assert_eq!(assignments[3]["assigned_paths"], json!(["src/beta.rs"]));
     assert_eq!(assignments[3]["spec_fragment_ids"], json!(["fragment-003"]));
     assert_eq!(
@@ -633,6 +716,20 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
     )
     .expect("renormalize generated plan");
     assert_eq!(renormalized, document);
+
+    let mut stripped = document;
+    for assignment in stripped["assignments"]
+        .as_array_mut()
+        .expect("generated assignments")
+    {
+        assignment
+            .as_object_mut()
+            .expect("generated assignment object")
+            .remove("phase");
+    }
+    let error = parse_supervisor_plan_with_consultant(&stripped.to_string())
+        .expect_err("stripping every generated phase must fail closed");
+    assert!(format!("{error:#}").contains("missing field `phase`"));
 }
 
 #[test]
@@ -825,9 +922,11 @@ fn supervisor_depth_bounds_are_configurable_and_enforced() {
             "max_child_assignments": 2,
             "assignments": [{
                 "id": "root-child",
+                "phase": "execution",
                 "assigned_paths": ["src/root.rs"],
                 "child_assignments": [{
                     "id": "nested-child",
+                    "phase": "execution",
                     "assigned_paths": ["src/nested.rs"]
                 }]
             }]
@@ -852,6 +951,7 @@ fn supervisor_depth_bounds_are_configurable_and_enforced() {
             "max_child_assignments": 1,
             "assignments": [{
                 "id": "child-a",
+                "phase": "execution",
                 "assigned_paths": ["README.md"]
             }]
         });
@@ -871,15 +971,19 @@ fn supervisor_represents_and_validates_assignment_trees_to_arbitrary_configured_
         "max_child_assignments": 4,
         "assignments": [{
             "id": "depth-2",
+            "phase": "execution",
             "assigned_paths": ["src/depth_2.rs"],
             "child_assignments": [{
                 "id": "depth-3",
+                "phase": "execution",
                 "assigned_paths": ["src/depth_3.rs"],
                 "child_assignments": [{
                     "id": "depth-4",
+                    "phase": "execution",
                     "assigned_paths": ["src/depth_4.rs"],
                     "child_assignments": [{
                         "id": "depth-5",
+                        "phase": "execution",
                         "assigned_paths": ["src/depth_5.rs"]
                     }]
                 }]
@@ -931,10 +1035,12 @@ fn supervisor_allows_overlapping_scopes_only_across_strict_lineage() {
         "max_child_assignments": 2,
         "assignments": [{
             "id": "planning-root",
+            "phase": "planning",
             "assigned_paths": ["src/shared.rs"],
             "semantic_symbols": ["crate::shared::Shared"],
             "child_assignments": [{
                 "id": "execution-child",
+                "phase": "execution",
                 "assigned_paths": ["src/shared.rs"],
                 "semantic_symbols": ["crate::shared::Shared"]
             }]
@@ -957,14 +1063,17 @@ fn supervisor_allows_overlapping_scopes_only_across_strict_lineage() {
         "max_child_assignments": 3,
         "assignments": [{
             "id": "planning-root",
+            "phase": "planning",
             "assigned_paths": ["src"],
             "child_assignments": [
                 {
                     "id": "execution-a",
+                    "phase": "execution",
                     "assigned_paths": ["src/shared.rs"]
                 },
                 {
                     "id": "execution-b",
+                    "phase": "execution",
                     "assigned_paths": ["src/shared.rs"]
                 }
             ]
@@ -1135,7 +1244,9 @@ fn same_lineage_semantic_preview_excludes_ancestor_but_retains_independent_root(
 
 #[test]
 fn supervisor_rejects_normalized_path_symbol_and_module_collisions() {
-    let collision_error = |left: Value, right: Value| {
+    let collision_error = |mut left: Value, mut right: Value| {
+        left["phase"] = json!("execution");
+        right["phase"] = json!("execution");
         let source = json!({
             "version": 1,
             "task": "collision",
@@ -1235,6 +1346,7 @@ fn supervisor_rejects_normalized_worker_semantic_collisions() {
             "max_child_assignments": 1,
             "assignments": [{
                 "id": "child-a",
+                "phase": "execution",
                 "assigned_paths": ["src"],
                 "worker_assignments": [first, second]
             }]
@@ -1286,7 +1398,9 @@ fn supervisor_rejects_normalized_worker_semantic_collisions() {
 
 #[test]
 fn supervisor_rejects_cross_assignment_worker_semantic_collisions() {
-    let collision_error = |left: Value, right: Value| {
+    let collision_error = |mut left: Value, mut right: Value| {
+        left["phase"] = json!("execution");
+        right["phase"] = json!("execution");
         let source = json!({
             "version": 1,
             "task": "cross assignment worker collision",
@@ -3264,10 +3378,13 @@ fn provider_planning_session_lowers_recursive_tree_and_binds_run_identity() {
     .expect("lower provider session");
     assert_eq!(plan.assignments.len(), 3);
     assert_eq!(plan.assignments[0].id, "parent");
+    assert_eq!(plan.assignments[0].phase, AssignmentPhase::Planning);
     assert!(plan.assignments[0].worker_assignments.is_empty());
     assert_eq!(plan.assignments[1].id, "alpha");
+    assert_eq!(plan.assignments[1].phase, AssignmentPhase::Execution);
     assert_eq!(plan.assignments[1].worker_assignments.len(), 1);
     assert_eq!(plan.assignments[2].id, "beta");
+    assert_eq!(plan.assignments[2].phase, AssignmentPhase::Execution);
 
     let run_id = crate::orchestrator::RunId::new("provider-bind-run").expect("valid run id");
     let bound = bind_provider_task_planning_session_to_supervisor_run(
@@ -3310,7 +3427,9 @@ fn heuristic_feedback_replan_lowers_remaining_work_only() {
     assert_eq!(session.replans_used(), 1);
     assert_eq!(plan.assignments.len(), 2);
     assert_eq!(plan.assignments[0].id, "assignment-replan-01-001-planning");
+    assert_eq!(plan.assignments[0].phase, AssignmentPhase::Planning);
     assert_eq!(plan.assignments[1].id, "assignment-replan-01-001");
+    assert_eq!(plan.assignments[1].phase, AssignmentPhase::Execution);
     assert!(
         plan.assignments[1]
             .assigned_paths
