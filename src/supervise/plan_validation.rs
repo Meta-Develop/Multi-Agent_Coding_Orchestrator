@@ -1,5 +1,26 @@
 use super::*;
 
+pub(super) fn validate_assignment_phase_contract(plan: &SupervisorPlan) -> Result<()> {
+    for assignment in &plan.assignments {
+        if assignment.phase != AssignmentPhase::Planning {
+            continue;
+        }
+        if !assignment.worker_assignments.is_empty() {
+            bail!(
+                "planning assignment '{}' may not declare terminal worker assignments",
+                assignment.id
+            );
+        }
+        if assignment.licensed_breakage.is_some() {
+            bail!(
+                "planning assignment '{}' may not carry licensed breakage execution authority",
+                assignment.id
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn supervisor_assignment_traceability(
     plan: &SupervisorPlan,
     metadata: &SupervisorPlanMetadata,
@@ -190,6 +211,7 @@ pub(super) fn validate_supervisor_plan(
     if plan.assignments.is_empty() {
         bail!("supervisor plan must include at least one orchestrator assignment");
     }
+    validate_assignment_phase_contract(&plan)?;
     validate_primary_worktree_execution_target(&plan, &mut metadata)?;
     validate_review_lens_set(&plan.review_lenses)
         .context("supervisor review_lenses are invalid")?;

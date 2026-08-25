@@ -29,6 +29,7 @@ pub mod llm;
 pub mod machine_global;
 pub mod megafile;
 pub mod merge;
+pub mod mutation_taxonomy;
 pub mod objective_profile;
 pub mod optimizer;
 pub mod orchestration_event;

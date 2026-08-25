@@ -8,6 +8,7 @@ static TEST_RUNTIME_MODEL_CATALOG: RuntimeModelCatalog =
 fn test_assignment(id: &str, path: &str) -> OrchestratorAssignment {
     OrchestratorAssignment {
         id: id.to_string(),
+        phase: AssignmentPhase::Execution,
         runtime: None,
         role: AgentRole::ChildOrchestrator,
         assigned_paths: vec![PathBuf::from(path)],
@@ -37,6 +38,91 @@ fn test_plan(assignments: Vec<OrchestratorAssignment>) -> SupervisorPlan {
         review_lenses: default_supervisor_review_lenses(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments,
+    }
+}
+
+fn mechanical_assignment(id: &str) -> OrchestratorAssignment {
+    let mut assignment = test_assignment(id, "mechanical.txt");
+    assignment.worker_assignments.push(WorkerAssignment {
+        id: "mechanical-worker".to_string(),
+        role: AgentRole::Worker,
+        assigned_paths: vec![PathBuf::from("mechanical.txt")],
+        semantic_symbols: Vec::new(),
+        semantic_modules: Vec::new(),
+        task: None,
+        environment_requirements: Vec::new(),
+        report_path: None,
+    });
+    assignment
+}
+
+fn insert_mechanical_metadata(metadata: &mut AssignmentMetadata, assignment_id: &str) {
+    metadata.insert(
+        (assignment_id.to_string(), "mechanical-worker".to_string()),
+        WorkerAssignmentMetadata {
+            kind: AssignmentKind::Ordinary,
+            mechanical_duty: Some(MechanicalTerminalDuty::RunPreselectedCommand),
+            target_path: None,
+        },
+    );
+}
+
+fn worker_degrade_plan(assignments: Vec<OrchestratorAssignment>) -> SupervisorPlan {
+    let mut plan = test_plan(assignments);
+    plan.role_models.insert(
+        AgentRole::Worker,
+        RoleModelSelection {
+            model: Some(FRONTIER_PROFILE_MODEL.to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::OrderedCatalogChain(
+                OrderedCatalogFallback {
+                    models: Vec::new(),
+                    budget_degrade_models: vec![ECONOMY_PROFILE_MODEL.to_string()],
+                    on_exhausted: TerminalUnavailableModelFallback::FailClosed,
+                },
+            ),
+        },
+    );
+    plan
+}
+
+fn degrade_report() -> RunBudgetReport {
+    let ledger = RunBudgetLedger::new(RunBudgetLimits {
+        soft_tokens: Some(1),
+        hard_tokens: Some(4),
+        soft_cost_usd: None,
+        hard_cost_usd: None,
+    })
+    .expect("degradation ledger");
+    ledger
+        .reserve(BudgetReservationRequest {
+            role: AgentRole::ChildOrchestrator,
+            tokens: 1,
+            cost_usd: None,
+        })
+        .expect("soft reservation")
+        .report()
+        .clone()
+}
+
+fn budget_policy_request<'a>(
+    assignment: &'a OrchestratorAssignment,
+    requested_reasoning_effort: Option<ReasoningEffort>,
+    report: &'a RunBudgetReport,
+    plan: &'a SupervisorPlan,
+    requested_plan: &'a SupervisorPlan,
+    assignment_metadata: &'a AssignmentMetadata,
+    catalog: &'a RuntimeModelCatalog,
+) -> AssignmentBudgetPolicyRequest<'a> {
+    AssignmentBudgetPolicyRequest {
+        assignment,
+        requested_reasoning_effort,
+        report,
+        plan,
+        requested_plan,
+        assignment_metadata,
+        catalog,
+        runtime: SupervisorRuntime::Codex,
     }
 }
 
@@ -94,12 +180,58 @@ fn role_binding_telemetry_retains_catalog_fallback_resolution() {
 }
 
 #[test]
-fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
-    let plan = test_plan(Vec::new());
-    let effort_assignment = test_assignment("effort-assignment", "effort.txt");
-    let model_assignment = test_assignment("model-assignment", "model.txt");
-    let fanout_assignment = test_assignment("fanout-assignment", "fanout.txt");
+fn budget_degrade_ladder_applies_worker_model_effort_fanout_then_halts() {
+    let mut model_assignment = test_assignment("model-assignment", "model.txt");
+    model_assignment.worker_assignments.push(WorkerAssignment {
+        id: "mechanical-worker".to_string(),
+        role: AgentRole::Worker,
+        assigned_paths: vec![PathBuf::from("model.txt")],
+        semantic_symbols: Vec::new(),
+        semantic_modules: Vec::new(),
+        task: None,
+        environment_requirements: Vec::new(),
+        report_path: None,
+    });
+    let mut effort_assignment = model_assignment.clone();
+    effort_assignment.id = "effort-assignment".to_string();
+    let mut fanout_assignment = model_assignment.clone();
+    fanout_assignment.id = "fanout-assignment".to_string();
     let halted_assignment = test_assignment("halted-assignment", "halted.txt");
+    let mut plan = test_plan(Vec::new());
+    plan.role_models.insert(
+        AgentRole::Worker,
+        RoleModelSelection {
+            model: Some(FRONTIER_PROFILE_MODEL.to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::OrderedCatalogChain(
+                OrderedCatalogFallback {
+                    models: Vec::new(),
+                    budget_degrade_models: vec![ECONOMY_PROFILE_MODEL.to_string()],
+                    on_exhausted: TerminalUnavailableModelFallback::FailClosed,
+                },
+            ),
+        },
+    );
+    let requested_plan = plan.clone();
+    let mut assignment_metadata = AssignmentMetadata::new();
+    assignment_metadata.insert(
+        (model_assignment.id.clone(), "mechanical-worker".to_string()),
+        WorkerAssignmentMetadata {
+            kind: AssignmentKind::Ordinary,
+            mechanical_duty: Some(MechanicalTerminalDuty::RunPreselectedCommand),
+            target_path: None,
+        },
+    );
+    for assignment_id in [&effort_assignment.id, &fanout_assignment.id] {
+        assignment_metadata.insert(
+            (assignment_id.clone(), "mechanical-worker".to_string()),
+            WorkerAssignmentMetadata {
+                kind: AssignmentKind::Ordinary,
+                mechanical_duty: Some(MechanicalTerminalDuty::RunPreselectedCommand),
+                target_path: None,
+            },
+        );
+    }
     let catalog = RuntimeModelCatalog::Codex(
         CodexRuntimeModelCatalog::from_slugs([
             FRONTIER_PROFILE_MODEL,
@@ -127,56 +259,54 @@ fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
     assert_eq!(soft.action, BudgetAction::Degrade);
 
     let mut controller = BudgetDegradationController::new(8);
-    let effort_policy = controller
-        .assignment_policy(
-            &effort_assignment,
-            None,
-            &soft,
-            &plan,
-            &catalog,
-            SupervisorRuntime::Codex,
-        )
-        .expect("effort degradation")
-        .expect("effort admission");
-    assert_eq!(
-        effort_policy.apply(&plan).role_models[&AgentRole::ChildOrchestrator]
-            .reasoning_effort
-            .as_deref(),
-        Some("high")
-    );
     let model_policy = controller
-        .assignment_policy(
+        .assignment_policy(budget_policy_request(
             &model_assignment,
             None,
             &soft,
             &plan,
+            &requested_plan,
+            &assignment_metadata,
             &catalog,
-            SupervisorRuntime::Codex,
-        )
+        ))
         .expect("model degradation")
         .expect("model admission");
     assert_eq!(
-        model_policy.apply(&plan).role_models[&AgentRole::ChildOrchestrator]
+        model_policy.apply(&plan).role_models[&AgentRole::Worker]
             .model
             .as_deref(),
-        Some(FRONTIER_PROFILE_MODEL),
-        "measured-ineligible luna must not become a child degrade target"
+        Some(ECONOMY_PROFILE_MODEL)
     );
+    let effort_policy = controller
+        .assignment_policy(budget_policy_request(
+            &effort_assignment,
+            None,
+            &soft,
+            &plan,
+            &requested_plan,
+            &assignment_metadata,
+            &catalog,
+        ))
+        .expect("effort degradation")
+        .expect("effort admission");
     assert_eq!(
-        controller.effective_fan_out, 4,
-        "ineligible static tier must skip to fan-out rather than override measured evidence"
+        effort_policy.apply(&plan).role_models[&AgentRole::Worker]
+            .reasoning_effort
+            .as_deref(),
+        Some("high")
     );
     controller
-        .assignment_policy(
+        .assignment_policy(budget_policy_request(
             &fanout_assignment,
             None,
             &soft,
             &plan,
+            &requested_plan,
+            &assignment_metadata,
             &catalog,
-            SupervisorRuntime::Codex,
-        )
-        .expect("exhausted degradation")
-        .expect("exhausted admission");
+        ))
+        .expect("fan-out degradation")
+        .expect("fan-out admission");
     assert_eq!(controller.effective_fan_out, 4);
 
     let hard = ledger
@@ -190,75 +320,69 @@ fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
         .clone();
     assert_eq!(hard.action, BudgetAction::OwnerEscalation);
     assert!(controller
-        .assignment_policy(
+        .assignment_policy(budget_policy_request(
             &halted_assignment,
             None,
             &hard,
             &plan,
+            &requested_plan,
+            &assignment_metadata,
             &catalog,
-            SupervisorRuntime::Codex,
-        )
+        ))
         .expect("halt decision")
         .is_none());
 
-    assert_eq!(controller.records.len(), 3);
+    assert_eq!(controller.records.len(), 4);
+    assert_eq!(
+        controller.records[0].change,
+        BudgetDegradationChange::ModelTier {
+            role: AgentRole::Worker,
+            before: FRONTIER_PROFILE_MODEL.to_string(),
+            after: ECONOMY_PROFILE_MODEL.to_string(),
+            resolved_candidate_index: 0,
+        }
+    );
     assert!(matches!(
-        &controller.records[0].change,
-        BudgetDegradationChange::ReasoningEffort { before, after, .. }
+        &controller.records[1].change,
+        BudgetDegradationChange::ReasoningEffort { role: AgentRole::Worker, before, after }
             if before == "xhigh" && after == "high"
     ));
     assert_eq!(
-        controller.records[1].change,
+        controller.records[2].change,
         BudgetDegradationChange::FanOut {
             before: 8,
             after: 4
         }
     );
     assert_eq!(
-        controller.records[2].change,
+        controller.records[3].change,
         BudgetDegradationChange::Halt {
             before_new_dispatch_allowed: true,
             after_new_dispatch_allowed: false
         }
     );
     assert_eq!(
-        serde_json::to_value(&controller.records).expect("degradation artifact sample"),
-        json!([
-            {
-                "sequence": 1,
-                "assignment_id": "effort-assignment",
-                "budget_action": "degrade",
-                "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
-                "change": {"kind": "reasoning_effort", "role": "child_orchestrator", "before": "xhigh", "after": "high"},
-                "effective_child_model": FRONTIER_PROFILE_MODEL,
-                "effective_child_reasoning_effort": "high",
-                "effective_fan_out": 8,
-                "observation": "admission_policy_resolved"
-            },
-            {
-                "sequence": 2,
-                "assignment_id": "model-assignment",
-                "budget_action": "degrade",
-                "budget_reasons": ["soft_token_ceiling_reached", "missing_pricing"],
-                "change": {"kind": "fan_out", "before": 8, "after": 4},
-                "effective_child_model": FRONTIER_PROFILE_MODEL,
-                "effective_child_reasoning_effort": "high",
-                "effective_fan_out": 4,
-                "observation": "admission_policy_resolved"
-            },
-            {
-                "sequence": 3,
-                "assignment_id": "halted-assignment",
-                "budget_action": "owner_escalation",
-                "budget_reasons": ["soft_token_ceiling_reached", "hard_token_ceiling_reached", "missing_pricing"],
-                "change": {"kind": "halt", "before_new_dispatch_allowed": true, "after_new_dispatch_allowed": false},
-                "effective_child_model": null,
-                "effective_child_reasoning_effort": "high",
-                "effective_fan_out": 4,
-                "observation": "admission_policy_resolved"
-            }
-        ])
+        controller.records[0].trigger,
+        BudgetDegradationTrigger::BudgetPressure
     );
+    let transition = controller.records[0]
+        .role_binding_transition
+        .as_ref()
+        .expect("Worker model transition evidence");
+    assert_eq!(transition.role, AgentRole::Worker);
+    assert_eq!(
+        transition.before.model.as_deref(),
+        Some(FRONTIER_PROFILE_MODEL)
+    );
+    assert_eq!(
+        transition.after.model.as_deref(),
+        Some(ECONOMY_PROFILE_MODEL)
+    );
+    assert!(controller
+        .records
+        .iter()
+        .take(3)
+        .all(|record| { record.effective_child_model.as_deref() == Some(FRONTIER_PROFILE_MODEL) }));
     let mut construction = test_report_construction(
         &plan,
         RunId::new("budget-degradation-artifact").expect("run id"),
@@ -287,6 +411,230 @@ fn budget_degrade_ladder_applies_effort_model_fanout_then_halts() {
 }
 
 #[test]
+fn low_difficulty_mechanical_trigger_consumes_only_worker_requested_ladder() {
+    let assignment = mechanical_assignment("low-difficulty-mechanical");
+    let inherited_assignment = mechanical_assignment("inherited-mechanical");
+    let plan = worker_degrade_plan(vec![assignment.clone(), inherited_assignment.clone()]);
+    let requested_plan = plan.clone();
+    let mut metadata = AssignmentMetadata::new();
+    insert_mechanical_metadata(&mut metadata, &assignment.id);
+    insert_mechanical_metadata(&mut metadata, &inherited_assignment.id);
+    let catalog = RuntimeModelCatalog::Codex(
+        CodexRuntimeModelCatalog::from_slugs([FRONTIER_PROFILE_MODEL, ECONOMY_PROFILE_MODEL])
+            .expect("mechanical catalog"),
+    );
+    let report = RunBudgetLedger::new(RunBudgetLimits::default())
+        .expect("unbounded budget")
+        .report()
+        .expect("unbounded report");
+    let mut controller = BudgetDegradationController::new(4);
+
+    let policy = controller
+        .assignment_policy(budget_policy_request(
+            &assignment,
+            None,
+            &report,
+            &plan,
+            &requested_plan,
+            &metadata,
+            &catalog,
+        ))
+        .expect("low-difficulty model degradation")
+        .expect("assignment admitted");
+
+    assert_eq!(report.action, BudgetAction::Continue);
+    assert_eq!(
+        policy.apply(&plan).role_models[&AgentRole::Worker]
+            .model
+            .as_deref(),
+        Some(ECONOMY_PROFILE_MODEL)
+    );
+    assert_eq!(controller.records.len(), 1);
+    assert_eq!(
+        controller.records[0].trigger,
+        BudgetDegradationTrigger::LowDifficultyMechanical
+    );
+    assert!(controller.records[0].budget_reasons.is_empty());
+    assert_eq!(controller.effective_fan_out, 4);
+
+    let inherited_policy = controller
+        .assignment_policy(budget_policy_request(
+            &inherited_assignment,
+            None,
+            &report,
+            &plan,
+            &requested_plan,
+            &metadata,
+            &catalog,
+        ))
+        .expect("inherited mechanical binding evidence")
+        .expect("inherited assignment admitted");
+    assert_eq!(controller.rung, BudgetDegradationRung::Effort);
+    assert_eq!(controller.effective_fan_out, 4);
+    assert_eq!(controller.records.len(), 2);
+    assert_eq!(
+        controller.records[1].change,
+        BudgetDegradationChange::RoleBindingApplied {
+            role: AgentRole::Worker
+        }
+    );
+    assert_eq!(
+        inherited_policy.apply(&plan).role_models[&AgentRole::Worker]
+            .model
+            .as_deref(),
+        Some(ECONOMY_PROFILE_MODEL)
+    );
+    let mut ledger = build_assignment_selection_ledger(&plan, &[], SupervisorRuntime::Codex);
+    apply_budget_degradations_to_selection_ledger(&mut ledger, &controller.records);
+    let inherited = ledger
+        .iter()
+        .find(|entry| {
+            entry.assignment_id == inherited_assignment.id && entry.role == AgentRole::Worker
+        })
+        .expect("inherited Worker ledger row");
+    assert_eq!(
+        inherited.selection_source,
+        AssignmentSelectionSource::LowDifficultyMechanical
+    );
+    assert_eq!(
+        inherited.selected_model.as_deref(),
+        Some(ECONOMY_PROFILE_MODEL)
+    );
+}
+
+#[test]
+fn judgment_assignment_is_not_degraded_by_shared_worker_binding() {
+    let seed_assignment = mechanical_assignment("mechanical-seed");
+    let mut assignment = mechanical_assignment("judgment-assignment");
+    assignment.worker_assignments.push(WorkerAssignment {
+        id: "unmarked-worker".to_string(),
+        role: AgentRole::Worker,
+        assigned_paths: vec![PathBuf::from("mechanical.txt")],
+        semantic_symbols: Vec::new(),
+        semantic_modules: Vec::new(),
+        task: None,
+        environment_requirements: Vec::new(),
+        report_path: None,
+    });
+    let plan = worker_degrade_plan(vec![seed_assignment.clone(), assignment.clone()]);
+    let requested_plan = plan.clone();
+    let mut metadata = AssignmentMetadata::new();
+    insert_mechanical_metadata(&mut metadata, &seed_assignment.id);
+    insert_mechanical_metadata(&mut metadata, &assignment.id);
+    let catalog = RuntimeModelCatalog::Codex(
+        CodexRuntimeModelCatalog::from_slugs([FRONTIER_PROFILE_MODEL, ECONOMY_PROFILE_MODEL])
+            .expect("judgment exclusion catalog"),
+    );
+    let report = degrade_report();
+    let mut controller = BudgetDegradationController::new(4);
+    controller
+        .assignment_policy(budget_policy_request(
+            &seed_assignment,
+            None,
+            &report,
+            &plan,
+            &requested_plan,
+            &metadata,
+            &catalog,
+        ))
+        .expect("seed mechanical degradation")
+        .expect("seed assignment admitted");
+
+    let policy = controller
+        .assignment_policy(budget_policy_request(
+            &assignment,
+            None,
+            &report,
+            &plan,
+            &requested_plan,
+            &metadata,
+            &catalog,
+        ))
+        .expect("judgment assignment policy")
+        .expect("judgment assignment admitted");
+
+    let effective = policy.apply(&plan);
+    assert_eq!(
+        effective.role_models[&AgentRole::Worker].model.as_deref(),
+        Some(FRONTIER_PROFILE_MODEL)
+    );
+    assert_eq!(
+        effective.role_models[&AgentRole::ChildOrchestrator]
+            .model
+            .as_deref(),
+        Some(FRONTIER_PROFILE_MODEL)
+    );
+    assert_eq!(controller.records.len(), 1);
+    assert_eq!(controller.rung, BudgetDegradationRung::Effort);
+    assert_eq!(controller.effective_fan_out, 4);
+}
+
+#[test]
+fn worker_model_rung_refuses_no_distinct_eligible_target_without_advancing() {
+    let assignment = mechanical_assignment("no-target");
+    let mut plan = worker_degrade_plan(vec![assignment.clone()]);
+    plan.role_models.insert(
+        AgentRole::ChildOrchestrator,
+        RoleModelSelection {
+            model: Some(FRONTIER_PROFILE_MODEL.to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::OrderedCatalogChain(
+                OrderedCatalogFallback {
+                    models: Vec::new(),
+                    budget_degrade_models: vec![ECONOMY_PROFILE_MODEL.to_string()],
+                    on_exhausted: TerminalUnavailableModelFallback::FailClosed,
+                },
+            ),
+        },
+    );
+    let mut requested_plan = plan.clone();
+    requested_plan
+        .role_models
+        .get_mut(&AgentRole::Worker)
+        .expect("Worker selection")
+        .unavailable_model_fallback =
+        UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
+            models: Vec::new(),
+            budget_degrade_models: vec![
+                FRONTIER_PROFILE_MODEL.to_string(),
+                BALANCED_PROFILE_MODEL.to_string(),
+            ],
+            on_exhausted: TerminalUnavailableModelFallback::FailClosed,
+        });
+    let mut metadata = AssignmentMetadata::new();
+    insert_mechanical_metadata(&mut metadata, &assignment.id);
+    let catalog = RuntimeModelCatalog::Codex(
+        CodexRuntimeModelCatalog::from_slugs([
+            FRONTIER_PROFILE_MODEL,
+            BALANCED_PROFILE_MODEL,
+            ECONOMY_PROFILE_MODEL,
+        ])
+        .expect("no-target catalog"),
+    );
+    let report = degrade_report();
+    let mut controller = BudgetDegradationController::new(8);
+
+    let error = controller
+        .assignment_policy(budget_policy_request(
+            &assignment,
+            None,
+            &report,
+            &plan,
+            &requested_plan,
+            &metadata,
+            &catalog,
+        ))
+        .expect_err("no eligible Worker target must refuse degradation");
+
+    assert!(error.to_string().contains(
+        "requested-plan budget_degrade_models ladder has no distinct runtime-advertised authority-eligible target"
+    ));
+    assert_eq!(controller.rung, BudgetDegradationRung::ModelTier);
+    assert_eq!(controller.effective_fan_out, 8);
+    assert!(controller.records.is_empty());
+}
+
+#[test]
 fn assignment_effort_resolves_per_duty_and_records_hard_floor_clamps() {
     let assignment = test_assignment("bounded-task", "bounded.txt");
     let mut plan = test_plan(vec![assignment.clone()]);
@@ -306,15 +654,17 @@ fn assignment_effort_resolves_per_duty_and_records_hard_floor_clamps() {
         .report()
         .expect("unbounded report");
     let mut controller = BudgetDegradationController::new(1);
+    let assignment_metadata = AssignmentMetadata::new();
     let policy = controller
-        .assignment_policy(
+        .assignment_policy(budget_policy_request(
             &assignment,
             Some(ReasoningEffort::Low),
             &report,
             &plan,
+            &plan,
+            &assignment_metadata,
             &catalog,
-            SupervisorRuntime::Codex,
-        )
+        ))
         .expect("assignment effort resolution")
         .expect("assignment admission");
     let effective = policy.apply(&plan);

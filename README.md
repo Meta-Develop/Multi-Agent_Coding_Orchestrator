@@ -73,9 +73,13 @@ The current implementation covers a local-first command-line slice:
   `maco supervise run --from-goal <file>` accept the same mutually exclusive
   positional-plan or high-level-goal inputs as `supervise plan`, then execute
   the resulting validated plan through the live supervisor gates. The command
-  selects the Codex runtime by default. Verified managed-worktree Codex
-  children launch through native workspace-write execution; the optional
-  app-server duplex reviewer is not their release path. Writable access to the
+  selects the Codex runtime by default. Normalized planning-phase Codex
+  children receive a read-only workspace and read-only access to their own Git
+  worktree metadata in both the outer systemd containment and inner Codex
+  permission profile. Only their exact private final-message staging root is
+  writable. Execution-phase children retain native workspace-write and their
+  existing bounded writable Git metadata; the optional app-server duplex
+  reviewer is not their release path. Writable access to the
   primary checkout remains fail-closed because Codex cannot force a blocking
   client callback for every in-sandbox action. The command requires
   `--machine-global-config` and
@@ -1017,8 +1021,9 @@ cargo run -- consult ask \
   --json
 ```
 
-For writable Codex launches in a managed linked worktree, MACO grants read-write
-access only to that worktree's own per-worktree Git directory. The common Git
+For execution-phase Codex launches in a managed linked worktree, MACO grants
+read-write access only to that worktree's own per-worktree Git directory.
+Planning-phase launches bind that same directory read-only. The common Git
 allowlist is read-only: `objects/`, `refs/`, `config`, `packed-refs`,
 `info/exclude`, and optional `shallow`. The primary `HEAD`, `index`, and
 `config.worktree`, MACO common state, and peer worktree entries are not exposed.
@@ -1101,12 +1106,11 @@ and wait for both the `macos-latest` and `windows-latest` `portable-build` jobs;
 a draft pull request is the cheapest honest way to close that residual gap.
 
 GitHub-hosted Linux runners do not provide the delegated systemd user manager
-required by strict containment. On such a runner, CI prints one `SKIP <test>:
-<reason>` line and job notice for every exact containment-dependent test listed
-in the workflow. Containment-dependent CLI integration tests use the same
-cgroup gate and print their own `SKIP <test>: <reason>` lines. CI exposes those
-successful-test reports and runs every other test normally. A Linux runner
-inside a delegated user manager receives no filters and runs the complete suite.
+required by strict containment. Containment-dependent lib tests and CLI
+integration tests share the same cgroup probe and print one `SKIP <test>:
+<reason>` line when that manager is absent. CI runs plain
+`cargo test --locked --all-targets`; tests decide at runtime whether to execute.
+A Linux runner inside a delegated user manager runs the complete suite.
 
 The Nix development shell also pins the supply-chain tools through
 `flake.lock`. Audit the exact Cargo lockfile and enforce the repository policy
@@ -1301,6 +1305,52 @@ fixtures do not claim that command exists.
 Gate-policy/classifier corpus experiments remain separate and depend on the
 Issue #28 production broker path.
 
+### Operator objective profiles
+
+Supervisor routing accepts a named, versioned objective profile. The built-in
+`maco-default-objective-v1` profile preserves the existing quality weighting
+exactly: held-out validation 50%, breadth 25%, and anti-shortcut quality 25%.
+Its tradeoff weights preserve the current cost-first selector behavior. The
+profile contains no switch-cost term.
+
+Repository-specific profiles may be declared only in the fixed repository-root
+file `maco-objective-profiles.json`. MACO opens that file through its bounded,
+no-follow repository-local reader and rejects symlinks, path aliases, unsupported
+schema versions, unknown fields, duplicate profile IDs, invalid names, and
+weights that are out of range or do not sum to 100. The CLI never accepts an
+alternate profile-file path.
+
+Selection precedence is `--objective-profile NAME` over the authored
+`objective_profile` plan field over the built-in default. Both `maco supervise
+plan` and `maco supervise run` expose the flag; the plan command records the
+request in its normalized output, while the run command resolves the effective
+profile once against the discovered repository before selector initialization.
+Unknown profile names and invalid override files fail before child dispatch.
+Retries and budget degradation reuse that frozen resolution instead of reading
+mutable configuration again.
+
+New `supervisor-final.json` reports retain the resolved profile under
+`role_economics_profile.resolved_objective_profile`, including its immutable
+ID, version, built-in or repository-override source, content hash, quality
+weights, and every effective tradeoff weight. Older reports remain readable;
+the generated schema requires this evidence for newly finalized reports.
+
+Supervisor routing interprets the default 100%-monetary profile as the exact
+legacy selector baseline. Nonzero retry/rework and human-review weights are
+supported as explicit monetary cost-proxy adjustments, proportional to their
+weights relative to the nonzero monetary baseline. They are not retry rates,
+review load, or independent observations. A nonzero quota weight fails closed
+because this branch has no typed, contract-backed per-runtime quota evidence;
+a nonzero latency weight likewise fails closed because it has no typed
+per-candidate observed or predicted latency evidence. Missing evidence is never
+scored as numeric zero.
+
+The 50/25/25 quality decomposition is frozen for evaluation-side consumers;
+supervisor selector hard quality and authority gates remain unchanged and
+non-weightable. This milestone adds operator profile selection and immutable
+review evidence only; it does not implement the GUI tracked by #152 or
+historical run rescoring.
+
 ### Provisional named effort default
 
 When a supervisor plan supplies no `role_models` override, MACO selects the
@@ -1315,9 +1365,9 @@ gate and review-auditor hard floors remain enforced.
 Each default role selection retains the ordered-catalog data shape and typed
 resolution observations. Its ordinary availability `models` list is empty, so
 the default path never silently substitutes a cheaper slug. The separately
-named `budget_degrade_models` list remains available only to the Issue #78
-budget-pressure ladder. MACO consults the authenticated runtime catalog once;
-when `gpt-5.6-sol` is present, every default role resolves to it.
+named `budget_degrade_models` list remains available only to the typed
+mechanical-Worker degradation ladder. MACO consults the authenticated runtime
+catalog once; when `gpt-5.6-sol` is present, every default role resolves to it.
 
 The chain is ordinary plan/profile data and round-trips without a code-shape
 change:
@@ -1351,30 +1401,45 @@ authored request.
 
 The availability fallback order and the economics downgrade order are distinct
 data. `models` answers which advertised model may substitute when the primary
-is absent. `budget_degrade_models` is a monotone cheaper-tier list consulted
-only after a run crosses a soft budget ceiling; an arbitrary plan fallback is
-never assumed to be cheaper.
+is absent. `budget_degrade_models` is a monotone cheaper-tier list consulted for
+an explicitly mechanical Worker assignment after a run crosses a soft budget
+ceiling or when the scheduler observes the low-difficulty mechanical trigger;
+an arbitrary plan fallback is never assumed to be cheaper.
 
 ### Budget-pressure degradation
 
-The scheduler consumes `BudgetAction::Degrade` before admitting new work. On
-successive admissions while a soft token or cost ceiling remains reached it
-lowers the assignment-resolved child-orchestrator reasoning effort, selects the first
-runtime-advertised entry from that role's `budget_degrade_models`, and halves
-the remaining fan-out bound (never below one). A hard ceiling still halts new
-dispatch and drains already-started assignments. Concurrent admission waits
-until each newly spawned assignment has either committed its child budget
-reservation or completed without one, so the next policy decision cannot race
-past an invisible reservation.
+The scheduler consumes `BudgetAction::Degrade` before admitting new work, but
+never lowers a child-orchestrator, gate, or auditor judgment binding. Worker
+degradation is available only when every Worker in that assignment declares a
+typed `mechanical_duty`. The scheduler first selects a distinct,
+runtime-advertised, authority-eligible model from the requested plan's Worker
+`budget_degrade_models`, then lowers Worker effort on the next applicable rung,
+and only then halves the remaining fan-out bound (never below one). If the
+Worker ladder has no eligible target, the model rung refuses explicitly and
+does not advance to fan-out. A hard ceiling still halts new dispatch and drains
+already-started assignments. Concurrent admission waits until each newly
+spawned assignment has either committed its child budget reservation or
+completed without one, so the next policy decision cannot race past an
+invisible reservation.
+
+`mechanical_duty` accepts `apply_explicit_text_replacement`,
+`run_preselected_command`, `format_preselected_files`,
+`enumerate_declared_artifacts`, or `validate_against_fixed_schema`. Omission is
+fail-closed for Worker model and effort degradation; mixed marked/unmarked
+Worker assignments retain their ordinary role bindings.
 
 Every applied rung is retained in
 `role_economics_profile.execution.budget_degradations` with the assignment ID,
-budget reasons, typed before/after change, and the full effective child model,
-effort, and fan-out. `observation=admission_policy_resolved` deliberately says
-that this is scheduler admission evidence; `commands_run` remains the process
-evidence for a dispatch that actually started. When assignments use different
-bindings, the aggregate child role binding is marked `assignment_specific`
-instead of claiming one model or effort for the whole run.
+typed trigger (`budget_pressure` or `low_difficulty_mechanical`), budget reasons,
+the Worker binding before and after the change, and the full effective child
+model, effort, and fan-out. The assignment selection ledger projects the
+resulting Worker model and effort without rewriting judgment-role rows.
+`observation=admission_policy_resolved` deliberately says that this is
+scheduler admission evidence; `commands_run` remains the process evidence for
+a dispatch that actually started. When assignments use different mechanical
+Worker bindings, the aggregate Worker role binding is marked
+`assignment_specific` instead of claiming one model or effort for the whole
+run.
 
 ### CLI run ceilings
 
@@ -2555,6 +2620,7 @@ Run an opt-in supervisor-of-orchestrators plan:
   "assignments": [
     {
       "id": "docs-child",
+      "phase": "execution",
       "assigned_paths": ["README.md"],
       "worker_assignments": [
         {
@@ -2565,6 +2631,7 @@ Run an opt-in supervisor-of-orchestrators plan:
     },
     {
       "id": "rust-child",
+      "phase": "execution",
       "assigned_paths": ["src/lib.rs"],
       "semantic_symbols": ["WorktreeManager"],
       "worker_assignments": [
@@ -2640,6 +2707,7 @@ scope and the operator separately passing `--allow-primary-worktree`:
   },
   "assignments": [{
     "id": "local-deploy",
+    "phase": "execution",
     "assigned_paths": ["local/deploy.txt"],
     "worker_assignments": []
   }]
@@ -2683,7 +2751,12 @@ not execute a primary-worktree target.
 
 Goal/spec planning fragments the source and emits one nested subtree per
 disjoint workstream: a depth-2 read-only planning root followed by a depth-3
-execution child with a real `parent_assignment_id`. The execution child keeps
+execution child with a real `parent_assignment_id`. Every normalized assignment
+carries a required typed `phase`; schedule identity and flattened index are
+validated before that authority is consumed at launch. Every recursive
+assignment must declare `planning` or `execution`. Omitted, mixed
+present/absent, null, and unknown phases are rejected rather than inheriting
+writable execution authority. The execution child keeps
 the proposed `assigned_paths`, worker assignment, and any parser-backed Rust
 `semantic_symbols` and `semantic_modules`. These are proposed path claims and
 semantic intents; `supervise run` still acquires and enforces the authoritative
@@ -2924,7 +2997,7 @@ limit.
 ```
 
 Every newly finalized `supervisor-final.json` carries
-`role_economics_profile.schema_version=5` plus execution telemetry: planned,
+`role_economics_profile.schema_version=6` plus execution telemetry: planned,
 started, and completed assignment counts; the resolved configured child bound;
 scheduler-observed peak and active-interval mean concurrency; configured and
 resolved model/reasoning bindings for every role; resolved effort for every
@@ -2937,8 +3010,8 @@ catalog, runtime-default model, nested-worker usage, and unpriced cost values
 remain explicit unavailable observations. A width-one run with multiple
 independent assignment or spec scopes emits a final-report warning. Readers
 continue accepting historical reports that omit this block or carry economics
-profile schema versions 1 through 3; the generated schema describes the required
-version 5 contract for newly finalized reports. Version 4 profiles and the
+profile schema versions 1 through 5; the generated schema describes the required
+version 6 contract for newly finalized reports. Version 4 profiles and the
 withdrawn model-tier profile name remain deserializable compatibility input.
 
 A worker assignment may opt into `"kind":"megafile_decomposition"` only with an

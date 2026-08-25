@@ -136,6 +136,32 @@ fn bounded_reader_rejects_symlink_hardlink_fifo_and_large_file() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn bounded_reader_rejects_windows_hard_links_and_accepts_single_link_files() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("root");
+    fs::create_dir(&root).expect("root");
+    let regular = root.join("regular");
+    fs::write(&regular, b"single link").expect("write regular");
+
+    assert_eq!(
+        BoundedRegularReader::read(&regular, 32).expect("read single-link file"),
+        b"single link"
+    );
+    assert_eq!(
+        BoundedRegularReader::read_relative(&root, "regular", 32)
+            .expect("read repository-relative single-link file"),
+        b"single link"
+    );
+
+    fs::hard_link(&regular, root.join("hardlink")).expect("create hard link");
+
+    assert!(BoundedRegularReader::read(&regular, 32).is_err());
+    assert!(BoundedRegularReader::read_relative(&root, "regular", 32).is_err());
+    assert!(BoundedRegularReader::read_relative_optional(&root, "hardlink", 32).is_err());
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn repository_relative_reader_refuses_mount_boundary() {

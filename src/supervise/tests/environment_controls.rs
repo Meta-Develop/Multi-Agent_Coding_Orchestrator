@@ -9,6 +9,7 @@ fn environment_requirements_default_compatibly_and_aggregate_canonically() {
         "max_child_assignments": 1,
         "assignments": [{
             "id": "child-a",
+            "phase": "execution",
             "assigned_paths": ["README.md"],
             "worker_assignments": [{
                 "id": "worker-a",
@@ -573,13 +574,13 @@ fn issue32_denials_propagate_deduplicate_round_trip_and_default() {
     let command = control_test_command(&workspace, &artifact_root);
     let outer = denial_fixture(
         SandboxDenialBoundary::OuterSystemd,
-        "outer-policy",
+        "maco_external_codex_outer_systemd_v1",
         None,
         SandboxDenialRetryability::NotRetryable,
     );
     let inner = denial_fixture(
         SandboxDenialBoundary::InnerCodex,
-        "inner-policy",
+        "maco_external_codex_inner_v1",
         Some("AGENTS.md"),
         SandboxDenialRetryability::RequiresDeclaredException,
     );
@@ -590,7 +591,7 @@ fn issue32_denials_propagate_deduplicate_round_trip_and_default() {
         .expect("external run object")
         .insert(
             "sandbox_denials".to_string(),
-            serde_json::to_value(vec![inner.clone(), outer.clone(), inner.clone()])
+            serde_json::to_value(vec![inner.clone(), outer.clone()])
                 .expect("serialize denial fixtures"),
         );
     let run: ExternalAgentRun =
@@ -648,14 +649,15 @@ fn issue32_unsafe_denial_paths_do_not_serialize_absolute_host_paths() {
     let unsafe_path = "/home/operator/private/control";
     let denials = sandbox_denials_for_report(&[denial_fixture(
         SandboxDenialBoundary::InnerCodex,
-        "inner-policy",
+        "maco_external_codex_inner_v1",
         Some(unsafe_path),
         SandboxDenialRetryability::RequiresDeclaredException,
     )]);
     assert_eq!(denials.len(), 1);
     assert_eq!(denials[0].path, None);
-    let serialized = serde_json::to_string(&denials).expect("serialize sanitized denials");
-    assert!(!serialized.contains(unsafe_path));
+    let error =
+        serde_json::to_string(&denials).expect_err("sanitized invalid evidence must not serialize");
+    assert!(!error.to_string().contains(unsafe_path));
 }
 
 #[test]

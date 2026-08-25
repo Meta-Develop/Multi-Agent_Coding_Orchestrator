@@ -81,6 +81,8 @@ const POLICY_CONTROL_FILES: &[&str] = &[
     "CLAUDE.md",
 ];
 const MAX_WORKTREE_CONTROL_EXCEPTIONS: usize = 128;
+const MAX_SANDBOX_DENIAL_EVIDENCE: usize = 128;
+const MAX_SANDBOX_DENIAL_PATH_BYTES: usize = 4 * 1024;
 const MAX_CODEX_JSONL_EVENT_BYTES: usize = 256 * 1024;
 const MAX_CODEX_EVENT_TEXT_BYTES: usize = 64 * 1024;
 const MAX_ENVIRONMENT_REQUIREMENTS: usize = 32;
@@ -662,16 +664,172 @@ pub enum SandboxDeniedOperation {
     Write,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SandboxDenialEvidence {
     pub boundary: SandboxDenialBoundary,
     pub policy_id: String,
     pub operation: SandboxDeniedOperation,
     /// A safe workspace-relative path. Absolute host paths and untrusted free-form paths are never
     /// copied into this field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
     pub retryability: SandboxDenialRetryability,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct SandboxDenialEvidenceWireRef<'a> {
+    boundary: SandboxDenialBoundary,
+    policy_id: &'a str,
+    operation: SandboxDeniedOperation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: &'a Option<PathBuf>,
+    retryability: SandboxDenialRetryability,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SandboxDenialEvidenceWireOwned {
+    boundary: SandboxDenialBoundary,
+    policy_id: String,
+    operation: SandboxDeniedOperation,
+    #[serde(default)]
+    path: Option<PathBuf>,
+    retryability: SandboxDenialRetryability,
+}
+
+impl Serialize for SandboxDenialEvidence {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        validate_sandbox_denial_evidence(self).map_err(serde::ser::Error::custom)?;
+        SandboxDenialEvidenceWireRef {
+            boundary: self.boundary,
+            policy_id: &self.policy_id,
+            operation: self.operation,
+            path: &self.path,
+            retryability: self.retryability,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SandboxDenialEvidence {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = SandboxDenialEvidenceWireOwned::deserialize(deserializer)?;
+        let evidence = Self {
+            boundary: wire.boundary,
+            policy_id: wire.policy_id,
+            operation: wire.operation,
+            path: wire.path,
+            retryability: wire.retryability,
+        };
+        validate_sandbox_denial_evidence(&evidence).map_err(serde::de::Error::custom)?;
+        Ok(evidence)
+    }
+}
+
+fn validate_sandbox_denial_evidence(
+    evidence: &SandboxDenialEvidence,
+) -> std::result::Result<(), &'static str> {
+    match evidence.boundary {
+        SandboxDenialBoundary::OuterSystemd => {
+            if evidence.policy_id != OUTER_SYSTEMD_POLICY_ID
+                || evidence.operation != SandboxDeniedOperation::EstablishBoundary
+                || evidence.path.is_some()
+                || evidence.retryability != SandboxDenialRetryability::NotRetryable
+            {
+                return Err("invalid outer sandbox-denial policy evidence");
+            }
+        }
+        SandboxDenialBoundary::InnerCodex => {
+            if evidence.policy_id != INNER_CODEX_POLICY_ID
+                || evidence.operation != SandboxDeniedOperation::Write
+            {
+                return Err("invalid inner sandbox-denial policy evidence");
+            }
+            let path = evidence
+                .path
+                .as_deref()
+                .ok_or("inner sandbox-denial evidence requires a protected path")?;
+            let expected_retryability = validate_sandbox_denial_path(path)?;
+            if evidence.retryability != expected_retryability {
+                return Err("sandbox-denial retryability does not match protected path policy");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_sandbox_denial_path(
+    path: &Path,
+) -> std::result::Result<SandboxDenialRetryability, &'static str> {
+    let text = path
+        .as_os_str()
+        .to_str()
+        .ok_or("sandbox-denial path must be valid UTF-8")?;
+    if text.is_empty()
+        || text.len() > MAX_SANDBOX_DENIAL_PATH_BYTES
+        || path.is_absolute()
+        || text
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '\\' | ':'))
+    {
+        return Err("sandbox-denial path is not a safe workspace-relative path");
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(component) => normalized.push(component),
+            std::path::Component::CurDir
+            | std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err("sandbox-denial path must already be normalized");
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() || normalized.as_os_str() != path.as_os_str() {
+        return Err("sandbox-denial path must already be normalized");
+    }
+
+    if path == Path::new(".git")
+        || PERMANENT_CONTROL_ROOTS
+            .iter()
+            .any(|root| path.starts_with(root))
+    {
+        return Ok(SandboxDenialRetryability::NotRetryable);
+    }
+    if POLICY_CONTROL_ROOTS
+        .iter()
+        .any(|root| path.starts_with(root))
+        || POLICY_CONTROL_FILES
+            .iter()
+            .any(|file| path == Path::new(file))
+    {
+        return Ok(SandboxDenialRetryability::RequiresDeclaredException);
+    }
+    Err("sandbox-denial path is outside the protected control set")
+}
+
+fn canonicalize_sandbox_denials(
+    mut evidence: Vec<SandboxDenialEvidence>,
+) -> std::result::Result<Vec<SandboxDenialEvidence>, &'static str> {
+    if evidence.len() > MAX_SANDBOX_DENIAL_EVIDENCE {
+        return Err("sandbox-denial evidence exceeds the bounded entry count");
+    }
+    for item in &evidence {
+        validate_sandbox_denial_evidence(item)?;
+    }
+    evidence.sort();
+    if evidence.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("sandbox-denial evidence contains duplicate entries");
+    }
+    Ok(evidence)
 }
 
 impl ExternalAgentCommand {
@@ -1106,7 +1264,7 @@ struct ExternalAgentRunWireRef<'a> {
     environment_failures: &'a Vec<EnvironmentFailure>,
     environment_preflight_process_started: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    sandbox_denials: &'a Vec<SandboxDenialEvidence>,
+    sandbox_denials: Vec<SandboxDenialEvidence>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     gate_denials: &'a Vec<GateDenial>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1162,6 +1320,8 @@ impl Serialize for ExternalAgentRun {
     where
         S: serde::Serializer,
     {
+        let sandbox_denials = canonicalize_sandbox_denials(self.sandbox_denials().to_vec())
+            .map_err(serde::ser::Error::custom)?;
         ExternalAgentRunWireRef {
             command: &self.command,
             cwd: &self.cwd,
@@ -1180,7 +1340,7 @@ impl Serialize for ExternalAgentRun {
                 .stdout
                 .run_metadata
                 .environment_preflight_process_started,
-            sandbox_denials: &self.stdout.run_metadata.sandbox_denials,
+            sandbox_denials,
             gate_denials: &self.stdout.run_metadata.gate_denials,
             machine_global_bypasses: &self.stdout.run_metadata.machine_global_bypasses,
             machine_global_retention_operation_id: &self
@@ -1202,12 +1362,14 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
         D: serde::Deserializer<'de>,
     {
         let wire = ExternalAgentRunWireOwned::deserialize(deserializer)?;
+        let sandbox_denials =
+            canonicalize_sandbox_denials(wire.sandbox_denials).map_err(serde::de::Error::custom)?;
         let mut stdout = wire.stdout;
         stdout.run_metadata.environment_preflight_results = wire.environment_preflight_results;
         stdout.run_metadata.environment_failures = wire.environment_failures;
         stdout.run_metadata.environment_preflight_process_started =
             wire.environment_preflight_process_started;
-        stdout.run_metadata.sandbox_denials = wire.sandbox_denials;
+        stdout.run_metadata.sandbox_denials = sandbox_denials;
         stdout.run_metadata.gate_denials = wire.gate_denials;
         stdout.run_metadata.machine_global_bypasses = wire.machine_global_bypasses;
         stdout.run_metadata.machine_global_retention_operation_id =
