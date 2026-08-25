@@ -1084,6 +1084,107 @@ fn inventory_limits(max_entries: usize) -> BoundedTreeWalkLimits {
 }
 
 #[cfg(unix)]
+fn nested_repository_options() -> BoundedTreeWalkOptions {
+    BoundedTreeWalkOptions {
+        stop_at_nested_repositories: true,
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_tree_walk_stops_at_nested_repository_markers_and_keeps_root_traversal() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("repo");
+    fs::create_dir_all(root.join(".git")).expect("root marker directory");
+    fs::write(root.join(".git/root-metadata"), "root metadata\n").expect("root metadata");
+    fs::write(root.join("outer.txt"), "outer\n").expect("outer file");
+    fs::create_dir_all(root.join("vendor/sdk/.git")).expect("nested marker directory");
+    fs::write(root.join("vendor/sdk/.git/config"), "nested config\n").expect("nested config");
+    fs::write(root.join("vendor/sdk/payload.bin"), "nested payload\n").expect("nested payload");
+    fs::create_dir_all(root.join("vendor/peer/.git")).expect("sibling marker directory");
+    fs::write(root.join("vendor/peer/peer.bin"), "sibling payload\n").expect("sibling payload");
+    fs::create_dir_all(root.join("a/b/c")).expect("deep nested repository");
+    fs::write(root.join("a/b/c/.git"), "gitdir: elsewhere\n").expect("nested marker file");
+    fs::write(root.join("a/b/c/deep.bin"), "deep payload\n").expect("deep payload");
+    fs::write(root.join("a/b/sibling.txt"), "visible sibling\n").expect("visible sibling");
+
+    let binding = DirectoryBindingGuard::bind(&root).expect("bind repository root");
+    let result = BoundedTreeWalker::walk_bound_with_options_detailed(
+        &binding,
+        inventory_limits(64),
+        nested_repository_options(),
+        |entry| {
+            Ok(if entry.kind == BoundedTreeEntryKind::Directory {
+                BoundedTreeWalkAction::RecordAndDescend
+            } else {
+                BoundedTreeWalkAction::Record
+            })
+        },
+    )
+    .expect("bounded nested-repository inventory");
+    assert_eq!(
+        result.nested_repository_boundaries,
+        vec![
+            PathBuf::from("a/b/c"),
+            PathBuf::from("vendor/peer"),
+            PathBuf::from("vendor/sdk"),
+        ]
+    );
+    let paths = result
+        .entries
+        .iter()
+        .map(|entry| entry.relative_path.as_path())
+        .collect::<Vec<_>>();
+
+    for expected in [
+        Path::new("outer.txt"),
+        Path::new(".git"),
+        Path::new(".git/root-metadata"),
+        Path::new("vendor/sdk"),
+        Path::new("vendor/peer"),
+        Path::new("a/b/c"),
+        Path::new("a/b/sibling.txt"),
+    ] {
+        assert!(paths.contains(&expected), "missing {}", expected.display());
+    }
+    for excluded in [
+        Path::new("vendor/sdk/.git"),
+        Path::new("vendor/sdk/.git/config"),
+        Path::new("vendor/sdk/payload.bin"),
+        Path::new("vendor/peer/.git"),
+        Path::new("vendor/peer/peer.bin"),
+        Path::new("a/b/c/.git"),
+        Path::new("a/b/c/deep.bin"),
+    ] {
+        assert!(
+            !paths.contains(&excluded),
+            "unexpected nested path {}",
+            excluded.display()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_tree_walk_default_still_descends_into_nested_repositories() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("repo");
+    fs::create_dir_all(root.join("vendor/sdk/.git")).expect("nested marker directory");
+    fs::write(root.join("vendor/sdk/.git/config"), "nested config\n").expect("nested config");
+    fs::write(root.join("vendor/sdk/payload.bin"), "nested payload\n").expect("nested payload");
+
+    let entries =
+        BoundedTreeWalker::walk(&root, inventory_limits(16)).expect("default bounded inventory");
+
+    assert!(entries
+        .iter()
+        .any(|entry| entry.relative_path == Path::new("vendor/sdk/.git/config")));
+    assert!(entries
+        .iter()
+        .any(|entry| entry.relative_path == Path::new("vendor/sdk/payload.bin")));
+}
+
+#[cfg(unix)]
 #[test]
 fn bounded_tree_walk_records_but_never_follows_unsafe_entries() {
     use std::os::unix::{fs::symlink, net::UnixListener};

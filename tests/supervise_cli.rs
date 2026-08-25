@@ -969,6 +969,46 @@ fn supervise_plan_plain_text_gitignored_policy_path_emits_workstream() -> Result
 }
 
 #[test]
+fn supervise_plan_emits_degraded_inventory_diagnostic_in_plan_json() -> Result<()> {
+    support::require_containment!(
+        "supervise_plan_emits_degraded_inventory_diagnostic_in_plan_json"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = Repository::open(&repo_path)?;
+    let alternates = repo.path().join("objects/info/alternates");
+    fs::create_dir_all(alternates.parent().context("alternates parent")?)?;
+    fs::write(&alternates, "/untrusted/object-store\n")?;
+    let task_path = temp.path().join("degraded-inventory-task.md");
+    fs::write(&task_path, "Update README.md.\n")?;
+
+    let plan = run_success_json(&[
+        "supervise",
+        "plan",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    let assignments = plan["assignments"].as_array().context("assignments")?;
+    assert!(assignments.iter().any(|assignment| {
+        assignment["task"].as_str().is_some_and(|task| {
+            task.contains("Planning inventory diagnostics:")
+                && task.contains("repository inventory failed")
+                && task.contains("bounded-status rejects Git object alternates")
+                && task.contains("using 1 explicitly named repository path(s)")
+        })
+    }));
+    assert!(assignments.iter().all(|assignment| {
+        assignment["assigned_paths"]
+            .as_array()
+            .is_some_and(|paths| paths == &[Value::String("README.md".to_string())])
+    }));
+    assert!(!repo_path.join(".maco/o2").exists());
+    Ok(())
+}
+
+#[test]
 fn supervise_plan_normalizes_typed_decomposition_and_defaults_legacy_workers() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;

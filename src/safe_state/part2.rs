@@ -1414,9 +1414,11 @@ struct InventoryWalkState<'a, F> {
     #[cfg(target_os = "linux")]
     root_mount_id: Option<u64>,
     limits: BoundedTreeWalkLimits,
+    options: BoundedTreeWalkOptions,
     budget: &'a mut InventoryBudget,
     action: &'a mut F,
     entries: &'a mut Vec<BoundedTreeEntry>,
+    nested_repository_boundaries: &'a mut Vec<PathBuf>,
 }
 
 pub(crate) fn unsigned_to_u64<T>(value: T) -> u64
@@ -1502,7 +1504,13 @@ where
     fn walk(&mut self, directory_fd: RawFd, relative_directory: &Path, depth: usize) -> Result<()> {
         self.budget
             .ensure_before_deadline("before directory enumeration")?;
-        for name in inventory_directory_entries(directory_fd, self.budget)? {
+        let names = inventory_directory_entries(directory_fd, self.budget)?;
+        if is_nested_repository_boundary(&names, depth, self.options) {
+            self.nested_repository_boundaries
+                .push(relative_directory.to_path_buf());
+            return Ok(());
+        }
+        for name in names {
             self.budget
                 .ensure_before_deadline("during entry inspection")?;
             let relative = relative_directory.join(&name);

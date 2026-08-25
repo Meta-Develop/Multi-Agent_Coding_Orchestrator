@@ -3,7 +3,7 @@ use crate::{
     repo_semantic,
     safe_state::{
         BoundedTreeEntry, BoundedTreeEntryKind, BoundedTreeWalkAction, BoundedTreeWalkLimits,
-        BoundedTreeWalker, DirectoryBindingGuard,
+        BoundedTreeWalkOptions, BoundedTreeWalker, DirectoryBindingGuard,
     },
     sync::normalize_repo_relative_path,
 };
@@ -20,6 +20,9 @@ const REPOSITORY_INVENTORY_MAX_DEPTH: usize = 128;
 const REPOSITORY_INVENTORY_MAX_ENTRIES: usize = 100_000;
 const REPOSITORY_INVENTORY_MAX_PATH_BYTES: usize = 4096;
 const REPOSITORY_INVENTORY_MAX_TOTAL_PATH_BYTES: usize = 64 * 1024 * 1024;
+const REPOSITORY_INVENTORY_MAX_REPORTED_NESTED_BOUNDARIES: usize = 3;
+const EMITTED_REPOSITORY_INVENTORY_DIAGNOSTIC_MAX_BYTES: usize = 16 * 1024;
+const REPOSITORY_INVENTORY_DIAGNOSTIC_PREFIX: &str = "repository inventory ";
 const TASK_SPEC_MAX_FRAGMENTS: usize = 128;
 const TASK_SPEC_MAX_FRAGMENT_BYTES: usize = 16 * 1024;
 const TASK_SPEC_MAX_TOTAL_BYTES: usize = 256 * 1024;
@@ -614,9 +617,11 @@ fn propose_task_decomposition_from_fragments(
             "an explicit single-file-only directive bounded the task before semantic inference"
                 .to_string(),
         );
+        let mut assignments = vec![assignment];
+        surface_inventory_diagnostics_in_assignment_tasks(&mut assignments, &diagnostics);
         return Ok(TaskDecompositionProposal {
             fragments,
-            assignments: vec![assignment],
+            assignments,
             coverage_gaps: Vec::new(),
             diagnostics,
             disjointness: TaskDisjointnessReport {
@@ -715,6 +720,7 @@ fn propose_task_decomposition_from_fragments(
             );
         }
     }
+    surface_inventory_diagnostics_in_assignment_tasks(&mut assignments, &diagnostics);
 
     Ok(TaskDecompositionProposal {
         fragments,
@@ -2306,8 +2312,13 @@ fn collect_planning_files(
     diagnostics: &mut TaskPathProposalDiagnostics,
 ) -> Result<Vec<PathBuf>> {
     let named_on_disk = named_paths_present_on_disk(repo, &format!("{title}\n{body}"));
-    match collect_repo_files(repo) {
-        Ok(mut files) => {
+    match collect_repo_file_inventory(repo) {
+        Ok(inventory) => {
+            record_nested_repository_boundaries(
+                diagnostics,
+                &inventory.nested_repository_boundaries,
+            );
+            let mut files = inventory.files;
             let mut file_set = files.iter().cloned().collect::<BTreeSet<_>>();
             for path in named_on_disk {
                 if file_set.insert(path.clone()) {
@@ -2340,6 +2351,71 @@ fn collect_planning_files(
             Ok(named_on_disk)
         }
     }
+}
+
+fn record_nested_repository_boundaries(
+    diagnostics: &mut TaskPathProposalDiagnostics,
+    boundaries: &[PathBuf],
+) {
+    if boundaries.is_empty() {
+        return;
+    }
+    diagnostics.degraded = true;
+    let total = boundaries.len();
+    let listed = boundaries
+        .iter()
+        .take(REPOSITORY_INVENTORY_MAX_REPORTED_NESTED_BOUNDARIES)
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if total > REPOSITORY_INVENTORY_MAX_REPORTED_NESTED_BOUNDARIES {
+        diagnostics.notes.push(format!(
+            "repository inventory treated nested repositories as opaque boundaries and excluded their contents (total {total}; showing first {REPOSITORY_INVENTORY_MAX_REPORTED_NESTED_BOUNDARIES} sorted paths): {listed}"
+        ));
+    } else {
+        diagnostics.notes.push(format!(
+            "repository inventory treated nested repositories as opaque boundaries and excluded their contents (total {total}): {listed}"
+        ));
+    }
+}
+
+fn surface_inventory_diagnostics_in_assignment_tasks(
+    assignments: &mut [TaskAssignmentProposal],
+    diagnostics: &TaskPathProposalDiagnostics,
+) {
+    let notes = diagnostics
+        .notes
+        .iter()
+        .filter(|note| note.starts_with(REPOSITORY_INVENTORY_DIAGNOSTIC_PREFIX))
+        .map(|note| bounded_inventory_diagnostic(note))
+        .collect::<Vec<_>>();
+    let Some(first_assignment) = assignments.first_mut() else {
+        return;
+    };
+    if notes.is_empty() {
+        return;
+    }
+    first_assignment
+        .task
+        .push_str("\n\nPlanning inventory diagnostics:\n");
+    for note in notes {
+        first_assignment.task.push_str("- ");
+        first_assignment.task.push_str(&note);
+        first_assignment.task.push('\n');
+    }
+}
+
+fn bounded_inventory_diagnostic(note: &str) -> String {
+    if note.len() <= EMITTED_REPOSITORY_INVENTORY_DIAGNOSTIC_MAX_BYTES {
+        return note.to_string();
+    }
+    const TRUNCATED_SUFFIX: &str = " [truncated]";
+    let mut end = EMITTED_REPOSITORY_INVENTORY_DIAGNOSTIC_MAX_BYTES
+        .saturating_sub(TRUNCATED_SUFFIX.len());
+    while !note.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}{TRUNCATED_SUFFIX}", &note[..end])
 }
 
 fn named_paths_present_on_disk(repo: &Path, text: &str) -> Vec<PathBuf> {
@@ -2671,7 +2747,24 @@ fn normalize_text(text: &str) -> String {
         .collect::<String>()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct RepositoryFileInventory {
+    files: Vec<PathBuf>,
+    nested_repository_boundaries: Vec<PathBuf>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GitInventorySnapshot {
+    visible_paths: BTreeSet<PathBuf>,
+    descriptor_entries: Vec<BoundedTreeEntry>,
+    nested_repository_boundaries: Vec<PathBuf>,
+}
+
 fn collect_repo_files(repo: &Path) -> Result<Vec<PathBuf>> {
+    Ok(collect_repo_file_inventory(repo)?.files)
+}
+
+fn collect_repo_file_inventory(repo: &Path) -> Result<RepositoryFileInventory> {
     let mut deadline = Instant::now()
         .checked_add(repository_inventory_max_duration())
         .context("repository inventory deadline overflowed")?;
@@ -2689,9 +2782,9 @@ fn collect_repo_files(repo: &Path) -> Result<Vec<PathBuf>> {
     };
     binding.verify()?;
     remaining_inventory_time(deadline, "after repository inventory")?;
-    let visible = stable.0;
+    let visible = stable.visible_paths;
     let mut files = stable
-        .1
+        .descriptor_entries
         .into_iter()
         .filter(|entry| {
             entry.kind == BoundedTreeEntryKind::RegularFile
@@ -2701,7 +2794,10 @@ fn collect_repo_files(repo: &Path) -> Result<Vec<PathBuf>> {
         .collect::<Vec<_>>();
     files.sort();
     files.dedup();
-    Ok(files)
+    Ok(RepositoryFileInventory {
+        files,
+        nested_repository_boundaries: stable.nested_repository_boundaries,
+    })
 }
 
 #[cfg(not(test))]
@@ -2725,7 +2821,7 @@ thread_local! {
 fn collect_git_inventory_snapshot(
     binding: &crate::worktree::RepositoryBindingGuard,
     deadline: &mut Instant,
-) -> Result<(BTreeSet<PathBuf>, Vec<BoundedTreeEntry>)> {
+) -> Result<GitInventorySnapshot> {
     let (visible, process_queue_wait) =
         crate::worktree::bounded_repository_visible_paths_bound_with_process_wait(
             binding,
@@ -2742,10 +2838,14 @@ fn collect_git_inventory_snapshot(
         process_queue_wait,
         "bounded Git inventory queue wait",
     )?;
-    let visible = visible.into_iter().collect::<BTreeSet<_>>();
+    let visible_paths = visible.into_iter().collect::<BTreeSet<_>>();
     let inventory = collect_descriptor_inventory(binding.worktree_binding(), *deadline)?;
     binding.verify()?;
-    Ok((visible, inventory))
+    Ok(GitInventorySnapshot {
+        visible_paths,
+        descriptor_entries: inventory.entries,
+        nested_repository_boundaries: inventory.nested_repository_boundaries,
+    })
 }
 
 fn extend_inventory_deadline(
@@ -2765,8 +2865,8 @@ fn extend_inventory_deadline(
 fn collect_descriptor_inventory(
     binding: &DirectoryBindingGuard,
     deadline: Instant,
-) -> Result<Vec<BoundedTreeEntry>> {
-    BoundedTreeWalker::walk_bound_with(
+) -> Result<crate::safe_state::BoundedTreeWalkResult> {
+    BoundedTreeWalker::walk_bound_with_options_detailed(
         binding,
         BoundedTreeWalkLimits {
             max_depth: REPOSITORY_INVENTORY_MAX_DEPTH,
@@ -2775,6 +2875,9 @@ fn collect_descriptor_inventory(
             max_total_path_bytes: REPOSITORY_INVENTORY_MAX_TOTAL_PATH_BYTES,
             max_duration: remaining_inventory_time(deadline, "before descriptor inventory")?,
             same_device: true,
+        },
+        BoundedTreeWalkOptions {
+            stop_at_nested_repositories: true,
         },
         |entry| {
             let path = &entry.relative_path;
@@ -4050,6 +4153,157 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
             proposal.assignments[0].assigned_paths,
             vec![PathBuf::from(".agents/skills/demo/SKILL.md")]
         );
+        assert!(proposal.assignments[0]
+            .task
+            .contains("Planning inventory diagnostics:"));
+        assert!(proposal.assignments[0]
+            .task
+            .contains("repository inventory failed"));
+    }
+
+    #[test]
+    fn planning_inventory_prunes_and_reports_nested_repository_boundaries() {
+        skip_without_containment!();
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path().join("repo");
+            git2::Repository::init(&repo).expect("init outer repo");
+            write_file(&repo, "README.md", "# Outer\n");
+            write_file(&repo, "src/lib.rs", "pub fn outer() {}\n");
+
+            for boundary in ["a/b/c", "vendor/alpha", "vendor/beta", "vendor/gamma"] {
+                let nested = repo.join(boundary);
+                git2::Repository::init(&nested).expect("init nested repo");
+                write_file(
+                    &repo,
+                    &format!("{boundary}/excluded.rs"),
+                    "pub fn nested() {}\n",
+                );
+            }
+
+            let linked_admin = temp.path().join("linked-admin");
+            git2::Repository::init(&linked_admin).expect("init linked admin repo");
+            write_file(&repo, "linked/worktree/excluded.rs", "pub fn linked() {}\n");
+            fs::write(
+                repo.join("linked/worktree/.git"),
+                format!("gitdir: {}\n", linked_admin.join(".git").display()),
+            )
+            .expect("write nested gitfile");
+
+            let inventory =
+                collect_repo_file_inventory(&repo).expect("collect nested-aware inventory");
+            assert!(inventory.files.contains(&PathBuf::from("README.md")));
+            assert!(inventory.files.contains(&PathBuf::from("src/lib.rs")));
+            assert!(!inventory
+                .files
+                .iter()
+                .any(|path| path.ends_with("excluded.rs")));
+            assert_eq!(
+                inventory.nested_repository_boundaries,
+                vec![
+                    PathBuf::from("a/b/c"),
+                    PathBuf::from("linked/worktree"),
+                    PathBuf::from("vendor/alpha"),
+                    PathBuf::from("vendor/beta"),
+                    PathBuf::from("vendor/gamma"),
+                ]
+            );
+
+            let mut diagnostics = TaskPathProposalDiagnostics::default();
+            let files = collect_planning_files(
+                &repo,
+                "Update README.md",
+                "Keep src/lib.rs working.",
+                &mut diagnostics,
+            )
+            .expect("collect planning files");
+            assert!(files.contains(&PathBuf::from("README.md")));
+            assert!(files.contains(&PathBuf::from("src/lib.rs")));
+            assert!(diagnostics.degraded);
+            assert_eq!(
+                diagnostics.notes,
+                vec![
+                    "repository inventory treated nested repositories as opaque boundaries and excluded their contents (total 5; showing first 3 sorted paths): a/b/c, linked/worktree, vendor/alpha"
+                        .to_string()
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn planning_inventory_accepts_gitlink_and_root_gitmodules_without_descent() {
+        skip_without_containment!();
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path().join("repo");
+            let outer = git2::Repository::init(&repo).expect("init outer repo");
+            write_file(&repo, "README.md", "# Outer\n");
+            write_file(&repo, "src/lib.rs", "pub fn outer() {}\n");
+            write_file(
+                &repo,
+                ".gitmodules",
+                "[submodule \"vendor/sdk\"]\n\tpath = vendor/sdk\n\turl = ../sdk\n",
+            );
+
+            let nested_path = repo.join("vendor/sdk");
+            let nested = git2::Repository::init(&nested_path).expect("init submodule repo");
+            fs::write(nested_path.join("excluded.rs"), "pub fn nested() {}\n")
+                .expect("write nested source");
+            let nested_oid = commit_all_test_files(&nested, "nested initial");
+
+            let mut index = outer.index().expect("outer index");
+            index
+                .add_all(
+                    ["README.md", "src/lib.rs", ".gitmodules"],
+                    git2::IndexAddOption::DEFAULT,
+                    None,
+                )
+                .expect("add outer files");
+            index
+                .add(&git2::IndexEntry {
+                    ctime: git2::IndexTime::new(0, 0),
+                    mtime: git2::IndexTime::new(0, 0),
+                    dev: 0,
+                    ino: 0,
+                    mode: 0o160000,
+                    uid: 0,
+                    gid: 0,
+                    file_size: 0,
+                    id: nested_oid,
+                    flags: 0,
+                    flags_extended: 0,
+                    path: b"vendor/sdk".to_vec(),
+                })
+                .expect("add gitlink");
+            index.write().expect("write outer index");
+
+            let inventory = collect_repo_file_inventory(&repo).expect("collect gitlink inventory");
+            assert!(inventory.files.contains(&PathBuf::from(".gitmodules")));
+            assert!(inventory.files.contains(&PathBuf::from("README.md")));
+            assert!(inventory.files.contains(&PathBuf::from("src/lib.rs")));
+            assert!(!inventory
+                .files
+                .iter()
+                .any(|path| path.starts_with("vendor/sdk")));
+            assert_eq!(
+                inventory.nested_repository_boundaries,
+                vec![PathBuf::from("vendor/sdk")]
+            );
+
+            let proposal = propose_task_path_proposal(
+                &repo,
+                "Update README.md",
+                "Keep the outer src/lib.rs implementation intact.",
+            )
+            .expect("plan with gitlink and gitmodules");
+            assert!(proposal.paths.contains(&PathBuf::from("README.md")));
+            assert!(proposal.paths.contains(&PathBuf::from("src/lib.rs")));
+            assert!(proposal
+                .diagnostics
+                .notes
+                .iter()
+                .any(|note| { note.contains("(total 1): vendor/sdk") }));
+        });
     }
 
     #[test]
@@ -4295,5 +4549,19 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
             fs::create_dir_all(parent).expect("create parent directory");
         }
         fs::write(path, contents).expect("write file");
+    }
+
+    fn commit_all_test_files(repo: &git2::Repository, message: &str) -> git2::Oid {
+        let mut index = repo.index().expect("open index");
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .expect("add test files");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature =
+            git2::Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+        repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &[])
+            .expect("commit test files")
     }
 }
