@@ -2052,8 +2052,11 @@ fn run_external_agent_runtime(
         match ValidatedCodexAuth::load() {
             Ok(auth) => auth,
             Err(error) => {
+                let auth_failure = sanitized_codex_auth_validation_summary(&error);
                 report.duration_ms = duration_millis(started.elapsed());
-                report.error = Some(format!("failed to validate Codex auth source: {error}"));
+                report.error = Some(format!(
+                    "failed to validate Codex auth source: {auth_failure}"
+                ));
                 let requirement =
                     EnvironmentRequirement::configuration(EnvironmentConfiguration::CodexAuthFile);
                 report
@@ -2072,7 +2075,7 @@ fn run_external_agent_runtime(
                     .push(environment_failure(
                         EnvironmentFailureCategory::ProbeFailed,
                         Some(requirement),
-                        format!("Codex credential/config presence probe failed: {error}"),
+                        format!("Codex credential/config presence probe failed: {auth_failure}"),
                     ));
                 return report;
             }

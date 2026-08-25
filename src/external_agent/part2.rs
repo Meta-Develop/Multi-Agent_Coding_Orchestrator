@@ -492,42 +492,35 @@ pub(crate) fn load_codex_runtime_model_catalog(
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (program, cwd, timeout);
-            bail!("Codex runtime model catalog preflight is unsupported on this platform");
+            return Err(CodexRuntimeModelCatalogFailureCause::UnsupportedPlatform.into());
         }
 
         #[cfg(target_os = "linux")]
         {
             if program != Path::new("codex") {
-                bail!(
-                    "Codex runtime model catalog preflight requires the trusted system Codex executable and verified process-tree ownership; explicit custom executables receive no auth or provider network access"
+                return Err(
+                    CodexRuntimeModelCatalogFailureCause::UntrustedCustomExecutable.into(),
                 );
             }
             if timeout.is_zero() {
-                bail!("Codex runtime model catalog preflight requires a positive timeout");
+                return Err(CodexRuntimeModelCatalogFailureCause::InvalidTimeout.into());
             }
             let resolved_program = resolve_external_program(program, cwd)
-                .context("failed to resolve trusted Codex for model catalog preflight")?;
-            let program_parent = resolved_program.parent().with_context(|| {
-                format!(
-                    "trusted Codex executable has no parent: {}",
-                    resolved_program.display()
-                )
-            })?;
+                .context(CodexRuntimeModelCatalogFailureCause::ExecutableResolutionFailed)?;
+            let program_parent = codex_runtime_model_catalog_process_root(&resolved_program)?;
             let program_identity = external_program_identity(&resolved_program)
-                .context("failed to bind trusted Codex identity for model catalog preflight")?;
+                .context(CodexRuntimeModelCatalogFailureCause::ExecutableIdentityFailed)?;
             let auth = ValidatedCodexAuth::load()
-                .context("failed to validate Codex auth for model catalog preflight")?
-                .context(
-                    "Codex runtime model catalog preflight requires a validated auth.json source",
-                )?;
+                .context(CodexRuntimeModelCatalogFailureCause::AuthValidationFailed)?
+                .context(CodexAuthValidationFailureCause::AuthFileMissing)?;
             auth.verify_source_unchanged()
-                .context("Codex auth changed before model catalog preflight")?;
+                .context(CodexRuntimeModelCatalogFailureCause::AuthRevalidationFailed)?;
 
             let process_spec = ProcessSpec::direct(
                 "Codex runtime model catalog preflight",
                 &resolved_program,
                 ["debug", "models"],
-                cwd,
+                program_parent,
                 CODEX_MODEL_CATALOG_MAX_BYTES,
             )
             .with_environment(EnvironmentMode::ClearAndSet(allowed_env(
@@ -540,47 +533,142 @@ pub(crate) fn load_codex_runtime_model_catalog(
             .with_private_runtime_codex_home(true)
             .with_private_runtime_file("auth.json", auth.bytes.clone())
             .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(
-                ExternalCodexProfile::read_only(cwd).with_visible_read_only_root(program_parent),
+                ExternalCodexProfile::read_only(program_parent),
             ));
 
             let process_result = run_process_cancellable(process_spec, &ProcessCancellation::new());
             let current_identity = external_program_identity(&resolved_program)
-                .context("failed to revalidate trusted Codex after model catalog preflight")?;
+                .context(CodexRuntimeModelCatalogFailureCause::ExecutableRevalidationFailed)?;
             let auth_result = auth
                 .verify_source_unchanged()
-                .context("Codex auth changed during model catalog preflight");
+                .context(CodexRuntimeModelCatalogFailureCause::AuthRevalidationFailed);
             if current_identity != program_identity {
-                bail!("trusted Codex executable changed during model catalog preflight");
+                return Err(CodexRuntimeModelCatalogFailureCause::ExecutableChanged.into());
             }
             auth_result?;
-            let output = process_result.context(
-                "Codex runtime model catalog preflight failed before a verified result was available",
-            )?;
+            let output = process_result
+                .map_err(|error| codex_runtime_model_catalog_process_failure_cause(&error))?;
             if !output.safety_sensitive_succeeded() {
-                bail!(
-                    "Codex runtime model catalog preflight failed closed: exit={:?}; timed_out={}; process_tree={:?}; side_effects={:?}; process_error_present={}",
-                    output.status.and_then(|status| status.code()),
-                    output.timed_out,
-                    output.process_tree,
-                    output.side_effects,
-                    output.process_error.is_some()
-                );
+                return Err(CodexRuntimeModelCatalogFailureCause::UnsafeProcessResult.into());
             }
             if output.stdout.is_truncated() || output.stderr.is_truncated() {
-                bail!(
-                    "Codex runtime model catalog preflight output exceeded the {} byte limit",
-                    CODEX_MODEL_CATALOG_MAX_BYTES
-                );
+                return Err(CodexRuntimeModelCatalogFailureCause::OutputLimitExceeded.into());
             }
             parse_codex_runtime_model_catalog(output.stdout.as_bytes())
+                .context(CodexRuntimeModelCatalogFailureCause::InvalidOutput)
         }
     })();
 
-    catalog.map_err(|error| {
-        Box::new(EnvironmentFailure::runtime_model_catalog(format!(
-            "Codex runtime model catalog acquisition failed: {error:#}"
-        )))
-    })
+    catalog.map_err(|error| codex_runtime_model_catalog_failure(&error))
+}
+
+fn codex_runtime_model_catalog_process_root(resolved_program: &Path) -> Result<&Path> {
+    resolved_program
+        .parent()
+        .context(CodexRuntimeModelCatalogFailureCause::ExecutableHasNoParent)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum CodexRuntimeModelCatalogFailureCause {
+    #[cfg(not(target_os = "linux"))]
+    #[error("unsupported_platform")]
+    UnsupportedPlatform,
+    #[error("untrusted_custom_executable")]
+    UntrustedCustomExecutable,
+    #[error("invalid_timeout")]
+    InvalidTimeout,
+    #[error("trusted_executable_resolution_failed")]
+    ExecutableResolutionFailed,
+    #[error("trusted_executable_has_no_parent")]
+    ExecutableHasNoParent,
+    #[error("trusted_executable_identity_failed")]
+    ExecutableIdentityFailed,
+    #[error("codex_auth_validation_failed")]
+    AuthValidationFailed,
+    #[error("codex_auth_revalidation_failed")]
+    AuthRevalidationFailed,
+    #[error("trusted_executable_revalidation_failed")]
+    ExecutableRevalidationFailed,
+    #[error("trusted_executable_changed")]
+    ExecutableChanged,
+    #[error("catalog_process_cancelled")]
+    ProcessCancelled,
+    #[error("catalog_process_tee_failed")]
+    ProcessTeeFailed,
+    #[error("catalog_process_spawn_failed")]
+    ProcessSpawnFailed,
+    #[error("catalog_process_containment_unavailable")]
+    ProcessContainmentUnavailable,
+    #[error("catalog_process_setup_timed_out")]
+    ProcessSetupTimedOut,
+    #[error("catalog_process_wait_failed")]
+    ProcessWaitFailed,
+    #[error("catalog_process_ownership_failed")]
+    ProcessOwnershipFailed,
+    #[error("catalog_process_environment_failed")]
+    ProcessEnvironmentFailed,
+    #[error("catalog_process_io_setup_failed")]
+    ProcessIoSetupFailed,
+    #[error("catalog_process_stdin_too_large")]
+    ProcessStdinTooLarge,
+    #[error("catalog_process_result_unverified")]
+    UnsafeProcessResult,
+    #[error("catalog_output_limit_exceeded")]
+    OutputLimitExceeded,
+    #[error("catalog_output_invalid")]
+    InvalidOutput,
+}
+
+fn codex_runtime_model_catalog_process_failure_cause(
+    error: &ProcessRunError,
+) -> CodexRuntimeModelCatalogFailureCause {
+    match error {
+        ProcessRunError::Cancelled { .. } => {
+            CodexRuntimeModelCatalogFailureCause::ProcessCancelled
+        }
+        ProcessRunError::OpenTee { .. } | ProcessRunError::TeeConflict { .. } => {
+            CodexRuntimeModelCatalogFailureCause::ProcessTeeFailed
+        }
+        ProcessRunError::Spawn { .. } => {
+            CodexRuntimeModelCatalogFailureCause::ProcessSpawnFailed
+        }
+        ProcessRunError::ContainmentUnavailable { .. } => {
+            CodexRuntimeModelCatalogFailureCause::ProcessContainmentUnavailable
+        }
+        ProcessRunError::SetupTimeout { .. } => {
+            CodexRuntimeModelCatalogFailureCause::ProcessSetupTimedOut
+        }
+        ProcessRunError::Wait { .. } => {
+            CodexRuntimeModelCatalogFailureCause::ProcessWaitFailed
+        }
+        ProcessRunError::ProcessOwnership { .. } => {
+            CodexRuntimeModelCatalogFailureCause::ProcessOwnershipFailed
+        }
+        ProcessRunError::EnvironmentFailure { .. } => {
+            CodexRuntimeModelCatalogFailureCause::ProcessEnvironmentFailed
+        }
+        ProcessRunError::IoSetup { .. } => {
+            CodexRuntimeModelCatalogFailureCause::ProcessIoSetupFailed
+        }
+        ProcessRunError::StdinTooLarge { .. } => {
+            CodexRuntimeModelCatalogFailureCause::ProcessStdinTooLarge
+        }
+    }
+}
+
+fn codex_runtime_model_catalog_failure(error: &anyhow::Error) -> Box<EnvironmentFailure> {
+    let cause = error
+        .downcast_ref::<CodexAuthValidationFailureCause>()
+        .map(ToString::to_string)
+        .or_else(|| {
+            error
+                .downcast_ref::<CodexRuntimeModelCatalogFailureCause>()
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "unexpected_failure".to_string());
+    Box::new(EnvironmentFailure::runtime_model_catalog(format!(
+        "Codex runtime model catalog acquisition failed: cause={cause}"
+    )))
 }
 
 fn parse_codex_runtime_model_catalog(bytes: &[u8]) -> Result<CodexRuntimeModelCatalog> {
@@ -4006,6 +4094,195 @@ fn required_parent(path: &Path) -> Result<&Path> {
         .with_context(|| format!("path must have a parent directory: {}", path.display()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum CodexAuthValidationFailureCause {
+    #[error("auth_home_not_absolute")]
+    HomeNotAbsolute,
+    #[error("auth_home_canonicalization_failed")]
+    HomeCanonicalizationFailed,
+    #[error("auth_home_not_directory")]
+    HomeNotDirectory,
+    #[error("auth_home_ancestor_inspection_failed")]
+    HomeAncestorInspectionFailed,
+    #[error("auth_home_ancestor_not_directory")]
+    HomeAncestorNotDirectory,
+    #[error("auth_home_ancestor_writable")]
+    HomeAncestorWritable,
+    #[error("auth_home_ancestor_owner_mismatch")]
+    HomeAncestorOwnerMismatch,
+    #[error("auth_file_missing")]
+    AuthFileMissing,
+    #[error("auth_file_inspection_failed")]
+    AuthFileInspectionFailed,
+    #[error("auth_file_symlink")]
+    AuthFileSymlink,
+    #[error("auth_file_open_failed")]
+    AuthFileOpenFailed,
+    #[error("auth_file_metadata_failed")]
+    AuthFileMetadataFailed,
+    #[error("auth_file_not_bounded_regular")]
+    AuthFileNotBoundedRegular,
+    #[error("auth_file_owner_mismatch")]
+    AuthFileOwnerMismatch,
+    #[error("auth_file_mode_too_broad")]
+    AuthFileModeTooBroad,
+    #[error("auth_file_link_count_invalid")]
+    AuthFileLinkCountInvalid,
+    #[error("auth_file_read_failed")]
+    AuthFileReadFailed,
+    #[error("auth_file_grew_during_read")]
+    AuthFileGrewDuringRead,
+    #[error("auth_file_changed_during_read")]
+    AuthFileChangedDuringRead,
+    #[error("auth_file_identity_changed_during_read")]
+    AuthFileIdentityChangedDuringRead,
+    #[error("auth_file_revalidation_inspection_failed")]
+    AuthFileRevalidationInspectionFailed,
+    #[error("auth_file_revalidation_metadata_changed")]
+    AuthFileRevalidationMetadataChanged,
+    #[error("auth_file_revalidation_identity_changed")]
+    AuthFileRevalidationIdentityChanged,
+    #[cfg(not(unix))]
+    #[error("auth_file_unsupported_platform")]
+    AuthFileUnsupportedPlatform,
+}
+
+fn sanitized_codex_auth_validation_summary(error: &anyhow::Error) -> String {
+    let cause = error
+        .downcast_ref::<CodexAuthValidationFailureCause>()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "unexpected_failure".to_string());
+    format!("codex_auth_preflight_cause={cause}")
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexAuthDirectoryTrustDecision {
+    Accept,
+    RejectNotDirectory,
+    RejectWritable,
+    RejectOwnership,
+}
+
+#[cfg(unix)]
+fn codex_auth_directory_trust_decision(
+    mode: u32,
+    uid: u32,
+    is_directory: bool,
+    effective_uid: u32,
+) -> CodexAuthDirectoryTrustDecision {
+    if !is_directory {
+        return CodexAuthDirectoryTrustDecision::RejectNotDirectory;
+    }
+    if mode & 0o022 != 0 {
+        CodexAuthDirectoryTrustDecision::RejectWritable
+    } else if uid != 0 && uid != effective_uid {
+        CodexAuthDirectoryTrustDecision::RejectOwnership
+    } else {
+        CodexAuthDirectoryTrustDecision::Accept
+    }
+}
+
+#[cfg(unix)]
+fn ensure_trusted_codex_auth_home(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    for ancestor in path.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)
+            .context(CodexAuthValidationFailureCause::HomeAncestorInspectionFailed)?;
+        if metadata.file_type().is_symlink() {
+            return Err(CodexAuthValidationFailureCause::HomeAncestorNotDirectory.into());
+        }
+        match codex_auth_directory_trust_decision(
+            metadata.permissions().mode(),
+            metadata.uid(),
+            metadata.is_dir(),
+            effective_uid,
+        ) {
+            CodexAuthDirectoryTrustDecision::Accept => {}
+            CodexAuthDirectoryTrustDecision::RejectNotDirectory => {
+                return Err(CodexAuthValidationFailureCause::HomeAncestorNotDirectory.into());
+            }
+            CodexAuthDirectoryTrustDecision::RejectWritable => {
+                return Err(CodexAuthValidationFailureCause::HomeAncestorWritable.into());
+            }
+            CodexAuthDirectoryTrustDecision::RejectOwnership => {
+                return Err(CodexAuthValidationFailureCause::HomeAncestorOwnerMismatch.into());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_trusted_codex_auth_home(path: &Path) -> Result<()> {
+    ensure_existing_directory_without_symlinks(path)
+        .context(CodexAuthValidationFailureCause::HomeAncestorInspectionFailed)
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexAuthFileTrustDecision {
+    Accept,
+    RejectNotRegular,
+    RejectOwnership,
+    RejectMode,
+    RejectLinkCount,
+}
+
+#[cfg(unix)]
+fn codex_auth_file_trust_decision(
+    is_regular_file: bool,
+    uid: u32,
+    effective_uid: u32,
+    mode: u32,
+    link_count: u64,
+) -> CodexAuthFileTrustDecision {
+    if !is_regular_file {
+        CodexAuthFileTrustDecision::RejectNotRegular
+    } else if uid != effective_uid {
+        CodexAuthFileTrustDecision::RejectOwnership
+    } else if mode & 0o077 != 0 {
+        CodexAuthFileTrustDecision::RejectMode
+    } else if link_count != 1 {
+        CodexAuthFileTrustDecision::RejectLinkCount
+    } else {
+        CodexAuthFileTrustDecision::Accept
+    }
+}
+
+#[cfg(unix)]
+fn ensure_trusted_codex_auth_file_metadata(
+    metadata: &fs::Metadata,
+    effective_uid: u32,
+) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    match codex_auth_file_trust_decision(
+        metadata.is_file(),
+        metadata.uid(),
+        effective_uid,
+        metadata.permissions().mode(),
+        metadata.nlink(),
+    ) {
+        CodexAuthFileTrustDecision::Accept => Ok(()),
+        CodexAuthFileTrustDecision::RejectNotRegular => {
+            Err(CodexAuthValidationFailureCause::AuthFileNotBoundedRegular.into())
+        }
+        CodexAuthFileTrustDecision::RejectOwnership => {
+            Err(CodexAuthValidationFailureCause::AuthFileOwnerMismatch.into())
+        }
+        CodexAuthFileTrustDecision::RejectMode => {
+            Err(CodexAuthValidationFailureCause::AuthFileModeTooBroad.into())
+        }
+        CodexAuthFileTrustDecision::RejectLinkCount => {
+            Err(CodexAuthValidationFailureCause::AuthFileLinkCountInvalid.into())
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ValidatedCodexAuth {
     path: PathBuf,
@@ -4032,37 +4309,39 @@ impl ValidatedCodexAuth {
 
     fn load_from_home(home: &Path) -> Result<Option<Self>> {
         if !home.is_absolute() {
-            bail!("Codex auth home must be absolute: {}", home.display());
+            return Err(CodexAuthValidationFailureCause::HomeNotAbsolute.into());
         }
         let home = match fs::canonicalize(home) {
             Ok(home) => home,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to canonicalize Codex auth home {}", home.display())
-                });
+                return Err(error)
+                    .context(CodexAuthValidationFailureCause::HomeCanonicalizationFailed);
             }
         };
         match fs::symlink_metadata(&home) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                bail!(
-                    "Codex auth home must be a non-symlink directory: {}",
-                    home.display()
-                );
+                return Err(CodexAuthValidationFailureCause::HomeNotDirectory.into());
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error).context("failed to inspect Codex auth home"),
+            Err(error) => {
+                return Err(error)
+                    .context(CodexAuthValidationFailureCause::HomeAncestorInspectionFailed);
+            }
         }
-        ensure_existing_directory_without_symlinks(&home)?;
+        ensure_trusted_codex_auth_home(&home)?;
         let path = home.join("auth.json");
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                bail!("Codex auth file may not be a symlink: {}", path.display());
+                return Err(CodexAuthValidationFailureCause::AuthFileSymlink.into());
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error).context("failed to inspect Codex auth file"),
+            Err(error) => {
+                return Err(error)
+                    .context(CodexAuthValidationFailureCause::AuthFileInspectionFailed);
+            }
         }
         let mut options = OpenOptions::new();
         options.read(true);
@@ -4073,45 +4352,40 @@ impl ValidatedCodexAuth {
         }
         let mut file = options
             .open(&path)
-            .with_context(|| format!("failed to open Codex auth file {}", path.display()))?;
-        let metadata = file.metadata()?;
+            .context(CodexAuthValidationFailureCause::AuthFileOpenFailed)?;
+        let metadata = file
+            .metadata()
+            .context(CodexAuthValidationFailureCause::AuthFileMetadataFailed)?;
         if !metadata.is_file() || metadata.len() > MAX_PROMPT_BYTES as u64 {
-            bail!(
-                "Codex auth file must be a bounded regular file: {}",
-                path.display()
-            );
+            return Err(CodexAuthValidationFailureCause::AuthFileNotBoundedRegular.into());
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
             // SAFETY: geteuid has no preconditions and does not access Rust memory.
             let effective_uid = unsafe { libc::geteuid() };
-            if metadata.uid() != effective_uid
-                || metadata.permissions().mode() & 0o077 != 0
-                || metadata.nlink() != 1
-            {
-                bail!(
-                    "Codex auth file must be current-user-owned, single-link, and mode 0600 or stricter: {}",
-                    path.display()
-                );
-            }
+            ensure_trusted_codex_auth_file_metadata(&metadata, effective_uid)?;
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
         file.by_ref()
             .take((MAX_PROMPT_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)?;
+            .read_to_end(&mut bytes)
+            .context(CodexAuthValidationFailureCause::AuthFileReadFailed)?;
         if bytes.len() > MAX_PROMPT_BYTES {
-            bail!("Codex auth file grew beyond the bounded read limit");
+            return Err(CodexAuthValidationFailureCause::AuthFileGrewDuringRead.into());
         }
-        let after = file.metadata()?;
+        let after = file
+            .metadata()
+            .context(CodexAuthValidationFailureCause::AuthFileMetadataFailed)?;
         if after.len() != metadata.len() || after.modified().ok() != metadata.modified().ok() {
-            bail!("Codex auth file changed while it was read");
+            return Err(CodexAuthValidationFailureCause::AuthFileChangedDuringRead.into());
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
             if after.dev() != metadata.dev() || after.ino() != metadata.ino() {
-                bail!("Codex auth file identity changed while it was read");
+                return Err(
+                    CodexAuthValidationFailureCause::AuthFileIdentityChangedDuringRead.into(),
+                );
             }
             Ok(Some(Self {
                 path,
@@ -4124,31 +4398,32 @@ impl ValidatedCodexAuth {
         }
         #[cfg(not(unix))]
         {
-            bail!("verified Codex auth injection is not implemented on this platform")
+            Err(CodexAuthValidationFailureCause::AuthFileUnsupportedPlatform.into())
         }
     }
 
     fn verify_source_unchanged(&self) -> Result<()> {
-        let metadata = fs::symlink_metadata(&self.path)?;
+        let metadata = fs::symlink_metadata(&self.path)
+            .context(CodexAuthValidationFailureCause::AuthFileRevalidationInspectionFailed)?;
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
             || metadata.len() != self.length
             || metadata.modified().ok() != self.modified
         {
-            bail!("Codex auth file metadata changed");
+            return Err(
+                CodexAuthValidationFailureCause::AuthFileRevalidationMetadataChanged.into(),
+            );
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            use std::os::unix::fs::MetadataExt;
             // SAFETY: geteuid has no preconditions and does not access Rust memory.
             let effective_uid = unsafe { libc::geteuid() };
-            if metadata.uid() != effective_uid
-                || metadata.permissions().mode() & 0o077 != 0
-                || metadata.nlink() != 1
-                || metadata.dev() != self.device
-                || metadata.ino() != self.inode
-            {
-                bail!("Codex auth file ownership, links, mode, or inode changed");
+            ensure_trusted_codex_auth_file_metadata(&metadata, effective_uid)?;
+            if metadata.dev() != self.device || metadata.ino() != self.inode {
+                return Err(
+                    CodexAuthValidationFailureCause::AuthFileRevalidationIdentityChanged.into(),
+                );
             }
         }
         Ok(())
@@ -4952,28 +5227,42 @@ mod nixos_identity_regression_tests {
 
     #[cfg(unix)]
     #[test]
-    fn codex_auth_home_symlink_is_canonicalized_before_auth_validation() -> Result<()> {
-        use std::os::unix::{fs::symlink, fs::PermissionsExt};
+    fn codex_auth_symlinked_home_canonical_target_metadata_is_trusted() -> Result<()> {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
         let temp = tempfile::tempdir()?;
         let target = temp.path().join("codex-home-target");
         fs::create_dir(&target)?;
-        let auth_path = target.join("auth.json");
-        fs::write(&auth_path, br#"{"token":"redacted"}"#)?;
-        fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))?;
         let selected = temp.path().join("selected-codex-home");
         symlink(&target, &selected)?;
 
-        let validated = ValidatedCodexAuth::load_from_home(&selected)?
-            .context("canonical Codex auth source")?;
-        assert_eq!(validated.path, fs::canonicalize(&target)?.join("auth.json"));
-        assert_eq!(validated.bytes, br#"{"token":"redacted"}"#);
+        let canonical_target = fs::canonicalize(&selected)?;
+        assert_eq!(canonical_target, fs::canonicalize(&target)?);
+        let metadata = fs::symlink_metadata(&canonical_target)?;
+        assert!(!metadata.file_type().is_symlink());
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        let effective_uid = unsafe { libc::geteuid() };
+        assert_eq!(
+            codex_auth_directory_trust_decision(
+                metadata.permissions().mode(),
+                metadata.uid(),
+                metadata.is_dir(),
+                effective_uid,
+            ),
+            CodexAuthDirectoryTrustDecision::Accept
+        );
+        assert_eq!(
+            codex_auth_directory_trust_decision(0o755, 0, true, effective_uid),
+            CodexAuthDirectoryTrustDecision::Accept
+        );
 
         let replacement = temp.path().join("replacement-codex-home");
         fs::create_dir(&replacement)?;
         fs::remove_file(&selected)?;
         symlink(&replacement, &selected)?;
-        validated.verify_source_unchanged()?;
+        assert_ne!(fs::canonicalize(&selected)?, canonical_target);
+        assert_eq!(canonical_target, fs::canonicalize(&target)?);
         Ok(())
     }
 
