@@ -345,6 +345,8 @@ struct OptimizerReplayShowArgs {
 enum WorktreeSubcommand {
     /// Create a linked worktree for an agent.
     Create(CreateWorktreeArgs),
+    /// Manage the advisory agent-branch guard in the primary worktree.
+    Guard(WorktreeGuardCommand),
     /// Collect an agent worktree diff and claim-boundary report.
     Diff(DiffWorktreeArgs),
     /// Remove clean, inactive managed worktrees and unregistered leftover directories.
@@ -359,6 +361,32 @@ enum WorktreeSubcommand {
     List(ListWorktreesArgs),
     /// Inspect authenticated pending worktree operations without recovering them.
     Pending(ListWorktreesArgs),
+}
+
+#[derive(Debug, Args)]
+struct WorktreeGuardCommand {
+    #[command(subcommand)]
+    command: WorktreeGuardSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorktreeGuardSubcommand {
+    /// Install the primary-worktree guard while preserving existing hooks.
+    Install(WorktreeGuardArgs),
+    /// Verify the exact guard payload and repository binding without changes.
+    Verify(WorktreeGuardArgs),
+    /// Remove an exactly verified guard and restore preserved hooks.
+    Uninstall(WorktreeGuardArgs),
+}
+
+#[derive(Debug, Args)]
+struct WorktreeGuardArgs {
+    /// Primary repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]

@@ -62,10 +62,11 @@ use crate::{
         MegafileClaimWarning, OwnerReport, SyncStore,
     },
     worktree::{
-        sweep_workspace_worktrees, worktree_report_path_text, RepositoryInfo,
-        WorktreeCreateOptions, WorktreeGcOptions, WorktreeGcReason, WorktreeGcReport,
-        WorktreeGcStatus, WorktreeLifecycleOptions, WorktreeLifecycleReport, WorktreeManager,
-        WorktreeRecord, WorktreeRetentionPolicy, WorktreeSweepDiscoveryStatus,
+        install_primary_worktree_guard, sweep_workspace_worktrees,
+        uninstall_primary_worktree_guard, verify_primary_worktree_guard, worktree_report_path_text,
+        RepositoryInfo, WorktreeCreateOptions, WorktreeGcOptions, WorktreeGcReason,
+        WorktreeGcReport, WorktreeGcStatus, WorktreeLifecycleOptions, WorktreeLifecycleReport,
+        WorktreeManager, WorktreeRecord, WorktreeRetentionPolicy, WorktreeSweepDiscoveryStatus,
         WorktreeSweepFailureKind, WorktreeSweepOptions, WorktreeSweepReport,
         WorktreeSweepRepositoryStatus, WorktreeSweepRootKind, WorktreeTargetLivenessCause,
         WorktreeTargetLivenessEvidence, WorktreeTargetLivenessSource,
@@ -2684,6 +2685,17 @@ impl WorktreeCommand {
                     print_worktree_record(&record, args.json)
                 }
             }
+            WorktreeSubcommand::Guard(command) => match command.command {
+                WorktreeGuardSubcommand::Install(args) => {
+                    print_query_report(&install_primary_worktree_guard(args.repo)?, args.json)
+                }
+                WorktreeGuardSubcommand::Verify(args) => {
+                    print_query_report(&verify_primary_worktree_guard(args.repo)?, args.json)
+                }
+                WorktreeGuardSubcommand::Uninstall(args) => {
+                    print_query_report(&uninstall_primary_worktree_guard(args.repo)?, args.json)
+                }
+            },
             WorktreeSubcommand::Gc(args) => {
                 let manager = WorktreeManager::new(args.repo);
                 let machine_global_retention = match (
