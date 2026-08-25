@@ -147,6 +147,7 @@ fn licensed_auditor_report(
 fn licensed_follow_up_assignment() -> OrchestratorAssignment {
     OrchestratorAssignment {
         id: "child-a-licensed-update-01".to_string(),
+        phase: AssignmentPhase::Execution,
         runtime: None,
         role: AgentRole::ChildOrchestrator,
         assigned_paths: vec![PathBuf::from("src/client.rs")],

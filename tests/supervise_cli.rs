@@ -95,6 +95,7 @@ fn fake_runtime_never_executes_codex_bin_or_task_text_and_is_never_publishable()
         "task": format!("$(touch '{}'); touch '{}'", task_marker.display(), task_marker.display()),
         "assignments": [{
             "id": "deterministic-child",
+            "phase": "execution",
             "assigned_paths": ["README.md"],
             "worker_assignments": []
         }]
@@ -143,15 +144,57 @@ fn deterministic_fake_cli_emits_stable_shape_artifacts_and_cleans_claims() -> Re
     );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
+    fs::write(
+        repo_path.join("maco-objective-profiles.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "profiles": [
+                {
+                    "id": "authored-v1",
+                    "version": 1,
+                    "quality": {
+                        "held_out_percent": 50,
+                        "breadth_percent": 25,
+                        "anti_shortcut_percent": 25
+                    },
+                    "tradeoffs": {
+                        "monetary_cost_percent": 80,
+                        "quota_consumption_percent": 5,
+                        "latency_percent": 5,
+                        "retry_rework_percent": 5,
+                        "human_review_percent": 5
+                    }
+                },
+                {
+                    "id": "cli-v1",
+                    "version": 3,
+                    "quality": {
+                        "held_out_percent": 50,
+                        "breadth_percent": 25,
+                        "anti_shortcut_percent": 25
+                    },
+                    "tradeoffs": {
+                        "monetary_cost_percent": 40,
+                        "quota_consumption_percent": 10,
+                        "latency_percent": 10,
+                        "retry_rework_percent": 20,
+                        "human_review_percent": 20
+                    }
+                }
+            ]
+        }))?,
+    )?;
+    commit_all(&Repository::open(&repo_path)?, "objective profile fixtures")?;
     let plan_path = temp.path().join("two-children.json");
     fs::write(
         &plan_path,
         serde_json::to_vec_pretty(&serde_json::json!({
             "version": 1,
             "task": "deterministic shape",
+            "objective_profile": "authored-v1",
             "assignments": [
-                {"id": "child-a", "assigned_paths": ["README.md"], "worker_assignments": []},
-                {"id": "child-b", "assigned_paths": ["src/lib.rs"], "worker_assignments": []}
+                {"id": "child-a", "phase": "execution", "assigned_paths": ["README.md"], "worker_assignments": []},
+                {"id": "child-b", "phase": "execution", "assigned_paths": ["src/lib.rs"], "worker_assignments": []}
             ]
         }))?,
     )?;
@@ -168,11 +211,30 @@ fn deterministic_fake_cli_emits_stable_shape_artifacts_and_cleans_claims() -> Re
         "fake",
         "--max-concurrent-children",
         "1",
+        "--objective-profile",
+        "cli-v1",
         "--json",
     ])?;
     assert_eq!(report["runtime"], "fake");
     assert_eq!(report["success"], true);
     assert_eq!(report["publishable"], false);
+    assert_eq!(
+        report["role_economics_profile"]["resolved_objective_profile"]["profile"]["id"],
+        "cli-v1"
+    );
+    assert_eq!(
+        report["role_economics_profile"]["resolved_objective_profile"]["profile"]["version"],
+        3
+    );
+    assert_eq!(
+        report["role_economics_profile"]["resolved_objective_profile"]["source"],
+        "repository_override"
+    );
+    assert_eq!(
+        report["role_economics_profile"]["resolved_objective_profile"]["profile"]["tradeoffs"]
+            ["human_review_percent"],
+        20
+    );
     assert_eq!(
         report["orchestrator_reports"].as_array().map(Vec::len),
         Some(2)
@@ -268,7 +330,7 @@ fn supervise_plan_normalizes_aliases_and_rejects_top_level_scope_conflicts() -> 
           "task": "aliases",
           "max_child_processes": 2,
           "assignments": [
-            {"id": "child-a", "role": "child_orchestrator", "assigned_paths": ["./README.md"]}
+            {"id": "child-a", "phase": "execution", "role": "child_orchestrator", "assigned_paths": ["./README.md"]}
           ]
         }"#,
     )?;
@@ -285,6 +347,18 @@ fn supervise_plan_normalizes_aliases_and_rejects_top_level_scope_conflicts() -> 
         plan["assignments"][0]["assigned_paths"],
         serde_json::json!(["README.md"])
     );
+    assert!(plan.get("objective_profile").is_none());
+    let profile_override = run_success_json(&[
+        "supervise",
+        "plan",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--objective-profile",
+        "review-balanced-v2",
+        "--json",
+    ])?;
+    assert_eq!(profile_override["objective_profile"], "review-balanced-v2");
 
     let overlap = temp.path().join("overlap.json");
     fs::write(
@@ -293,8 +367,8 @@ fn supervise_plan_normalizes_aliases_and_rejects_top_level_scope_conflicts() -> 
           "version": 1,
           "task": "overlap",
           "assignments": [
-            {"id": "child-a", "assigned_paths": ["src"]},
-            {"id": "child-b", "assigned_paths": ["src/lib.rs"]}
+            {"id": "child-a", "phase": "execution", "assigned_paths": ["src"]},
+            {"id": "child-b", "phase": "execution", "assigned_paths": ["src/lib.rs"]}
           ]
         }"#,
     )?;
@@ -333,6 +407,7 @@ fn primary_worktree_cli_requires_plan_and_flag_and_rejects_invalid_scope() -> Re
             },
             "assignments": [{
                 "id": "primary-child",
+                "phase": "execution",
                 "assigned_paths": ["local/deploy.txt"],
                 "worker_assignments": []
             }]
@@ -427,6 +502,7 @@ fn primary_worktree_cli_requires_plan_and_flag_and_rejects_invalid_scope() -> Re
                 "execution_target": execution_target,
                 "assignments": [{
                     "id": "primary-child",
+                    "phase": "execution",
                     "assigned_paths": ["local/deploy.txt"],
                     "worker_assignments": []
                 }]
@@ -904,6 +980,7 @@ fn supervise_plan_normalizes_typed_decomposition_and_defaults_legacy_workers() -
           "task": "typed decomposition",
           "assignments": [{
             "id": "child-a",
+            "phase": "execution",
             "assigned_paths": ["src"],
             "worker_assignments": [
               {"id": "ordinary-worker", "assigned_paths": ["src/lib.rs"]},
@@ -996,6 +1073,7 @@ fn supervise_plan_fails_closed_on_invalid_typed_decomposition_values() -> Result
                 "task": "invalid typed decomposition",
                 "assignments": [{
                     "id": "child-a",
+                    "phase": "execution",
                     "assigned_paths": ["README.md", "src"],
                     "worker_assignments": [worker]
                 }]
@@ -1029,6 +1107,7 @@ fn supervise_plan_still_rejects_overlapping_worker_siblings() -> Result<()> {
           "task": "worker overlap",
           "assignments": [{
             "id": "child-a",
+            "phase": "execution",
             "assigned_paths": ["src"],
             "worker_assignments": [
               {"id": "worker-a", "assigned_paths": ["src/lib.rs"]},
@@ -1251,6 +1330,7 @@ fn fake_prompt_keeps_role_assignment_and_consultant_contract_as_data() -> Result
             "consultant": {"enabled": true, "runtime": "fake", "max_consultations": 1},
             "assignments": [{
                 "id": "prompt-child",
+                "phase": "execution",
                 "assigned_paths": ["README.md"],
                 "task": "child override $(touch must-not-run)",
                 "worker_assignments": [{
@@ -1368,12 +1448,14 @@ fn supervise_plan_rejects_cross_assignment_semantic_conflicts_even_in_warn_mode(
             "assignments": [
                 {
                     "id": "child-a",
+                    "phase": "execution",
                     "assigned_paths": ["README.md"],
                     "semantic_symbols": ["Shared"],
                     "worker_assignments": []
                 },
                 {
                     "id": "child-b",
+                    "phase": "execution",
                     "assigned_paths": ["src/lib.rs"],
                     "semantic_symbols": ["Shared"],
                     "worker_assignments": []
@@ -1510,7 +1592,7 @@ fn supervise_plan_enforces_depth_assignment_and_retry_bounds() -> Result<()> {
                 "task": "bad depth",
                 "max_depth": 33,
                 "max_child_assignments": 1,
-                "assignments": [{"id": "child-a", "assigned_paths": ["README.md"]}]
+                "assignments": [{"id": "child-a", "phase": "execution", "assigned_paths": ["README.md"]}]
             }),
             "max_depth",
         ),
@@ -1522,8 +1604,8 @@ fn supervise_plan_enforces_depth_assignment_and_retry_bounds() -> Result<()> {
                 "max_depth": 2,
                 "max_child_assignments": 1,
                 "assignments": [
-                    {"id": "child-a", "assigned_paths": ["README.md"]},
-                    {"id": "child-b", "assigned_paths": ["src/lib.rs"]}
+                    {"id": "child-a", "phase": "execution", "assigned_paths": ["README.md"]},
+                    {"id": "child-b", "phase": "execution", "assigned_paths": ["src/lib.rs"]}
                 ]
             }),
             "max_child_assignments",
@@ -1536,7 +1618,7 @@ fn supervise_plan_enforces_depth_assignment_and_retry_bounds() -> Result<()> {
                 "max_depth": 2,
                 "max_child_assignments": 1,
                 "max_child_retries": 3,
-                "assignments": [{"id": "child-a", "assigned_paths": ["README.md"]}]
+                "assignments": [{"id": "child-a", "phase": "execution", "assigned_paths": ["README.md"]}]
             }),
             "max_child_retries",
         ),
@@ -1641,6 +1723,7 @@ fn write_simple_plan(path: &Path, id: &str) -> Result<()> {
             "task": "simple deterministic plan",
             "assignments": [{
                 "id": id,
+                "phase": "execution",
                 "assigned_paths": ["README.md"],
                 "worker_assignments": []
             }]

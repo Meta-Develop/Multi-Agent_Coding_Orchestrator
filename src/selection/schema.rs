@@ -152,16 +152,56 @@ fn runtime_catalog() -> Value {
     )
 }
 
+fn quota_pool_kind() -> Value {
+    enum_schema(&["subscription_included", "metered", "prepaid_credits"])
+}
+
+fn quota_reset_window() -> Value {
+    json!({
+        "oneOf": [
+            {"type": "string", "enum": ["none", "calendar_month"]},
+            strict_object!(
+                "rolling_hours" => strict_object!(
+                    "hours" => positive_integer(),
+                ),
+            )
+        ]
+    })
+}
+
+fn pool_reference() -> Value {
+    strict_object!(
+        "runtime" => nonempty_string(),
+        "account" => nonempty_string(),
+        "window" => quota_reset_window(),
+    )
+}
+
+fn exhaustion_behavior() -> Value {
+    enum_schema(&["fail_closed", "degrade"])
+}
+
+fn consumption_source() -> Value {
+    enum_schema(&["local_observed", "provider_reported"])
+}
+
 fn runtime_pool_state() -> Value {
     strict_object!(
         "runtime" => nonempty_string(),
         "admission_open" => json!({"type": "boolean"}),
+        "pool_reference" => nullable(pool_reference()),
+        "pool_kind" => nullable(quota_pool_kind()),
+        "entitlement_bounded" => json!({"type": "boolean"}),
         "entitlement_capacity_units" => nonnegative_integer(),
         "entitlement_remaining_units" => nonnegative_integer(),
         "pool_pressure_basis_points" => basis_points(),
         "observed_consumption_units" => nonnegative_integer(),
         "marginal_cost_microunits" => nonnegative_integer(),
+        "exhausted" => json!({"type": "boolean"}),
+        "exhaustion_behavior" => nullable(exhaustion_behavior()),
+        "authorized_alternatives" => array(pool_reference()),
         "observation_revision" => nonempty_string(),
+        "observation_source" => nullable(consumption_source()),
         "admission_provenance" => nonempty_string(),
         "failover_provenance" => nullable(nonempty_string()),
     )
@@ -190,6 +230,41 @@ fn context_switch_costs() -> Value {
     strict_object!(
         "model_change_same_runtime_microunits" => nonnegative_integer(),
         "runtime_change_microunits" => nonnegative_integer(),
+    )
+}
+
+fn routing_quality_weights() -> Value {
+    strict_object!(
+        "held_out_percent" => json!({"type": "integer", "minimum": 0, "maximum": 100}),
+        "breadth_percent" => json!({"type": "integer", "minimum": 0, "maximum": 100}),
+        "anti_shortcut_percent" => json!({"type": "integer", "minimum": 0, "maximum": 100}),
+    )
+}
+
+fn routing_tradeoff_weights() -> Value {
+    strict_object!(
+        "monetary_cost_percent" => json!({"type": "integer", "minimum": 0, "maximum": 100}),
+        "quota_consumption_percent" => json!({"type": "integer", "minimum": 0, "maximum": 100}),
+        "latency_percent" => json!({"type": "integer", "minimum": 0, "maximum": 100}),
+        "retry_rework_percent" => json!({"type": "integer", "minimum": 0, "maximum": 100}),
+        "human_review_percent" => json!({"type": "integer", "minimum": 0, "maximum": 100}),
+    )
+}
+
+fn routing_objective_profile_binding() -> Value {
+    strict_object!(
+        "id" => nonempty_string(),
+        "version" => positive_integer(),
+        "content_hash" => json!({"type": "string", "pattern": "^[0-9a-f]{64}$"}),
+        "quality" => routing_quality_weights(),
+        "tradeoffs" => routing_tradeoff_weights(),
+    )
+}
+
+fn resolved_routing_objective_profile() -> Value {
+    strict_object!(
+        "profile" => routing_objective_profile_binding(),
+        "source" => enum_schema(&["built_in", "repository_override"]),
     )
 }
 
@@ -338,9 +413,11 @@ fn selection_input() -> Value {
         "task" => task_profile(false),
         "catalogs" => array(runtime_catalog()),
         "pools" => array(runtime_pool_state()),
+        "quota_source" => nullable(pool_reference()),
         "constraints" => operator_constraints(),
         "priors" => prior_dataset(),
         "objective_profile" => objective_profile_ref(),
+        "resolved_objective_profile" => resolved_routing_objective_profile(),
         "outcomes" => array(outcome_record()),
         "signals" => dynamic_signals(),
         "debug_override" => nullable(debug_override()),
@@ -362,6 +439,7 @@ fn input_digests() -> Value {
         "pools" => digest_record(),
         "constraints" => digest_record(),
         "priors" => digest_record(),
+        "resolved_objective_profile" => digest_record(),
         "outcomes" => digest_record(),
         "signals" => digest_record(),
     )
@@ -400,7 +478,8 @@ fn ineligibility_reason() -> Value {
     strict_object!(
         "code" => enum_schema(&[
             "catalog_unavailable", "operator_constraint", "runtime_admission_closed",
-            "entitlement_exhausted", "task_class_not_advertised", "task_shape_not_advertised",
+            "entitlement_exhausted", "quota_fail_closed", "quota_alternative_not_authorized",
+            "task_class_not_advertised", "task_shape_not_advertised",
             "authority_not_advertised", "policy_prohibited", "long_context_prohibited",
             "missing_dated_prior", "missing_class_fit_evidence", "class_fit_evidence_insufficient",
             "quality_bar_not_met", "missing_authority_evidence", "authority_evidence_insufficient",
@@ -434,6 +513,14 @@ fn score_breakdown() -> Value {
         "switch_transition" => context_switch_transition(),
         "configured_switch_cost_microunits" => nonnegative_integer(),
         "switch_cost_microunits" => nonnegative_integer(),
+        "routing_score_semantics" => enum_schema(&["legacy_baseline_plus_cost_proxy_adjustments_v1"]),
+        "routing_tradeoff_weights" => routing_tradeoff_weights(),
+        "legacy_baseline_score_microunits" => nonnegative_integer(),
+        "retry_rework_cost_proxy_microunits" => nonnegative_integer(),
+        "human_review_cost_proxy_microunits" => nonnegative_integer(),
+        "retry_rework_adjustment_microunits" => nonnegative_integer(),
+        "human_review_adjustment_microunits" => nonnegative_integer(),
+        "total_adjustment_microunits" => nonnegative_integer(),
         "total_score_microunits" => nonnegative_integer(),
     )
 }
@@ -448,6 +535,7 @@ fn candidate_evaluation() -> Value {
         "strong_gate_fallback" => json!({"type": "boolean"}),
         "eligible" => json!({"type": "boolean"}),
         "ineligibility_reasons" => array(ineligibility_reason()),
+        "quota" => quota_candidate_provenance(),
         "ledger" => ledger_summary(),
         "score" => nullable(score_breakdown()),
     )
@@ -462,10 +550,57 @@ fn selected_choice() -> Value {
         "total_score_microunits" => nonnegative_integer(),
         "reason" => enum_schema(&[
             "lowest_expected_total_cost_per_accepted_task",
+            "lowest_legacy_baseline_plus_cost_proxy_adjustments",
             "strongest_no_evidence_judgment_fallback",
             "debug_override",
-            "one_shot_environment_fallback"
+            "one_shot_environment_fallback",
+            "authorized_quota_degrade"
         ]),
+    )
+}
+
+fn quota_candidate_provenance() -> Value {
+    strict_object!(
+        "source_pool" => nullable(pool_reference()),
+        "target_pool" => nullable(pool_reference()),
+        "source_exhausted" => json!({"type": "boolean"}),
+        "configured_behavior" => nullable(exhaustion_behavior()),
+        "authorized_alternative" => json!({"type": "boolean"}),
+        "disposition" => enum_schema(&[
+            "legacy_unconfigured", "source_available", "source_exhausted",
+            "authorized_alternative", "rejected_unauthorized_alternative", "fail_closed"
+        ]),
+        "source_observation_revision" => nullable(nonempty_string()),
+        "source_observation" => nullable(consumption_source()),
+        "target_marginal_cost_microunits" => nullable(nonnegative_integer()),
+        "reason" => nonempty_string(),
+    )
+}
+
+fn rejected_quota_alternative() -> Value {
+    strict_object!(
+        "candidate" => candidate_key(),
+        "reasons" => array(ineligibility_reason()),
+    )
+}
+
+fn quota_decision_provenance() -> Value {
+    strict_object!(
+        "source_pool" => pool_reference(),
+        "configured_behavior" => exhaustion_behavior(),
+        "source_exhausted" => json!({"type": "boolean"}),
+        "local_observation_revision" => nonempty_string(),
+        "observation_source" => consumption_source(),
+        "marginal_cost_assumption_microunits" => nonnegative_integer(),
+        "authorized_alternatives" => array(pool_reference()),
+        "eligible_alternatives" => array(candidate_key()),
+        "rejected_alternatives" => array(rejected_quota_alternative()),
+        "selected_alternative" => nullable(candidate_key()),
+        "disposition" => enum_schema(&[
+            "source_available", "fail_closed", "degraded", "refused_by_explicit_override",
+            "refused_no_eligible_alternative"
+        ]),
+        "reason" => nonempty_string(),
     )
 }
 
@@ -515,11 +650,12 @@ pub(crate) fn selection_provenance_schema_value() -> Value {
         "normalized_task" => task_profile(false),
         "input_digests" => input_digests(),
         "objective_profile" => objective_profile_provenance(),
+        "resolved_objective_profile" => resolved_routing_objective_profile(),
         "catalog_revisions" => array(catalog_revision_provenance()),
         "runtime_operations" => array(runtime_pool_state()),
         "triggers" => set(enum_schema(&[
             "initial", "retry", "budget_degrade", "catalog_change", "environment_fallback",
-            "debug_override"
+            "debug_override", "quota_exhaustion"
         ])),
         "candidate_set" => array(candidate_evaluation()),
         "choice" => nullable(selected_choice()),
@@ -527,6 +663,7 @@ pub(crate) fn selection_provenance_schema_value() -> Value {
         "decision_reason" => nonempty_string(),
         "debug_override" => nullable(debug_override_provenance()),
         "environment_fallback" => nullable(environment_fallback_transition()),
+        "quota" => nullable(quota_decision_provenance()),
     )
 }
 

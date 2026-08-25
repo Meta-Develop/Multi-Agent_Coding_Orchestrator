@@ -4,6 +4,8 @@ Copyright (C) 2026 Meta-Develop
 
 This repository is licensed under the GNU Affero General Public License, version 3 or later (AGPL-3.0-or-later), unless otherwise noted.
 
+Releases up to and including the `v0.1.0` tag were distributed under `MIT OR Apache-2.0`. That grant is not revoked for those releases. All later revisions, including this one, are AGPL-3.0-or-later.
+
 Original upstream repository: https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator
 
 Redistributions, modified versions, and network service deployments must preserve this notice and provide the corresponding source code as required by the AGPL.

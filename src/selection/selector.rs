@@ -1,6 +1,9 @@
 use std::{cmp::Ordering, collections::BTreeSet};
 
+use crate::objective_profile::ObjectiveProfile as RoutingObjectiveProfile;
 use serde::Serialize;
+
+use crate::optimizer::quota_pools::{ConsumptionSource, ExhaustionBehavior};
 
 use super::types::*;
 
@@ -92,12 +95,33 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
 
     let catalogs_digest = &input_digests.catalogs.value;
     let mut triggers = selection_triggers(&normalized, catalogs_digest);
+    let quota_source = quota_source_pool(&normalized)?;
+    let quota_exhausted = quota_source.is_some_and(|pool| pool.exhausted);
+    if quota_exhausted {
+        triggers.push(SelectionTrigger::QuotaExhaustion);
+        triggers.sort();
+        triggers.dedup();
+    }
     let mut debug_override = None;
     let mut environment_fallback = None;
     let mut choice = None;
     let decision_reason;
 
-    if let Some(request) = &normalized.debug_override {
+    if quota_source.is_some_and(|pool| {
+        pool.exhausted && pool.exhaustion_behavior == Some(ExhaustionBehavior::FailClosed)
+    }) {
+        if let Some(request) = &normalized.debug_override {
+            debug_override = Some(DebugOverrideProvenance {
+                request: request.clone(),
+                disposition: DebugOverrideDisposition::Rejected,
+                reason: "debug override cannot bypass configured quota fail-closed behavior"
+                    .to_string(),
+            });
+        }
+        decision_reason =
+            "configured source quota pool is exhausted and requires fail-closed refusal"
+                .to_string();
+    } else if let Some(request) = &normalized.debug_override {
         let evaluation = candidate_set
             .iter()
             .find(|evaluation| evaluation.candidate == request.candidate);
@@ -144,10 +168,21 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
         decision_reason =
             "one-shot data-declared environment fallback selected after an evidenced native rejection"
                 .to_string();
-    } else if let Some(selected) = automatic_choice(&normalized, &candidate_set)? {
+    } else if let Some(mut selected) = automatic_choice(&normalized, &candidate_set)? {
+        if quota_source.is_some_and(|pool| {
+            pool.exhausted && pool.exhaustion_behavior == Some(ExhaustionBehavior::Degrade)
+        }) {
+            selected.reason = ChoiceReason::AuthorizedQuotaDegrade;
+        }
         decision_reason = match selected.reason {
             ChoiceReason::StrongestNoEvidenceJudgmentFallback =>
                 "no comparable exact judgment evidence was eligible; selected the strongest data-declared xhigh gate fallback"
+                    .to_string(),
+            ChoiceReason::AuthorizedQuotaDegrade =>
+                "source quota pool is exhausted; selected the lowest-cost independently eligible operator-authorized alternative"
+                    .to_string(),
+            ChoiceReason::LowestLegacyBaselinePlusCostProxyAdjustments =>
+                "selected the eligible runtime/model/effort candidate with the lowest legacy baseline plus explicit retry/rework and human-review cost-proxy adjustments"
                     .to_string(),
             _ =>
                 "selected the eligible runtime/model/effort candidate with the lowest expected total cost per accepted task"
@@ -183,6 +218,7 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
             advertised_at: catalog.advertised_at.clone(),
         })
         .collect();
+    let quota = quota_decision_provenance(&normalized, &candidate_set, choice.as_ref())?;
 
     Ok(SelectionProvenance {
         schema_version: SELECTION_SCHEMA_VERSION,
@@ -199,6 +235,7 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
             profile_effective_date: profile.effective_date.clone(),
             profile_digest,
         },
+        resolved_objective_profile: normalized.resolved_objective_profile.clone(),
         catalog_revisions,
         runtime_operations: normalized.pools,
         triggers,
@@ -208,6 +245,7 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
         decision_reason,
         debug_override,
         environment_fallback,
+        quota,
     })
 }
 
@@ -229,6 +267,10 @@ fn normalize_input(input: &mut SelectionInput) {
     input
         .pools
         .sort_by(|left, right| left.runtime.cmp(&right.runtime));
+    for pool in &mut input.pools {
+        pool.authorized_alternatives.sort();
+        pool.authorized_alternatives.dedup();
+    }
     input
         .priors
         .objective_profiles
@@ -301,6 +343,7 @@ fn validate_input(input: &SelectionInput) -> Result<(), SelectionError> {
     if let Some(expected_digest) = &input.objective_profile.expected_digest {
         validate_sha256_digest("objective_profile.expected_digest", expected_digest)?;
     }
+    validate_resolved_objective_profile(&input.resolved_objective_profile)?;
     if input.catalogs.is_empty() {
         return invalid("at least one runtime catalog is required");
     }
@@ -374,12 +417,143 @@ fn validate_input(input: &SelectionInput) -> Result<(), SelectionError> {
                 pool.runtime
             ));
         }
-        if pool.entitlement_remaining_units > pool.entitlement_capacity_units {
+        if pool.entitlement_bounded
+            && pool.entitlement_remaining_units > pool.entitlement_capacity_units
+        {
             return invalid(format!(
                 "pool '{}' remaining entitlement exceeds capacity",
                 pool.runtime
             ));
         }
+        if !pool.entitlement_bounded
+            && (pool.entitlement_capacity_units != 0
+                || pool.entitlement_remaining_units != 0
+                || pool.exhausted)
+        {
+            return invalid(format!(
+                "unbounded pool '{}' must use zero capacity/remaining units and cannot be exhausted",
+                pool.runtime
+            ));
+        }
+        let has_configured_field = pool.pool_reference.is_some()
+            || pool.pool_kind.is_some()
+            || pool.exhaustion_behavior.is_some()
+            || pool.observation_source.is_some()
+            || !pool.authorized_alternatives.is_empty();
+        let has_complete_configured_fields = pool.pool_reference.is_some()
+            && pool.pool_kind.is_some()
+            && pool.exhaustion_behavior.is_some()
+            && pool.observation_source.is_some();
+        if has_configured_field && !has_complete_configured_fields {
+            return invalid(format!(
+                "configured quota pool '{}' is missing typed identity, kind, behavior, or observation source",
+                pool.runtime
+            ));
+        }
+        if let Some(reference) = &pool.pool_reference {
+            if reference.runtime.as_str() != pool.runtime {
+                return invalid(format!(
+                    "quota pool '{}' runtime does not match its exact pool reference",
+                    pool.runtime
+                ));
+            }
+            if pool.observation_source != Some(ConsumptionSource::LocalObserved) {
+                return invalid(format!(
+                    "configured quota pool '{}' must use local observed consumption",
+                    pool.runtime
+                ));
+            }
+            if pool.entitlement_bounded {
+                if pool.entitlement_capacity_units == 0 {
+                    return invalid(format!(
+                        "configured bounded quota pool '{}' must have positive capacity",
+                        pool.runtime
+                    ));
+                }
+                if pool.exhausted != (pool.entitlement_remaining_units == 0) {
+                    return invalid(format!(
+                        "configured quota pool '{}' exhaustion disagrees with remaining entitlement",
+                        pool.runtime
+                    ));
+                }
+            }
+            match pool.exhaustion_behavior {
+                Some(ExhaustionBehavior::FailClosed)
+                    if !pool.authorized_alternatives.is_empty() =>
+                {
+                    return invalid(format!(
+                        "fail-closed quota pool '{}' cannot authorize alternatives",
+                        pool.runtime
+                    ));
+                }
+                Some(ExhaustionBehavior::Degrade) if pool.authorized_alternatives.is_empty() => {
+                    return invalid(format!(
+                        "degrading quota pool '{}' requires an authorized alternative",
+                        pool.runtime
+                    ));
+                }
+                Some(ExhaustionBehavior::FailClosed | ExhaustionBehavior::Degrade) => {}
+                None => {
+                    return invalid(format!(
+                        "configured quota pool '{}' is missing exhaustion behavior",
+                        pool.runtime
+                    ));
+                }
+            }
+            if duplicate_semantic_key(&pool.authorized_alternatives, Clone::clone) {
+                return invalid(format!(
+                    "quota pool '{}' contains duplicate authorized alternatives",
+                    pool.runtime
+                ));
+            }
+            if pool
+                .authorized_alternatives
+                .iter()
+                .any(|alternative| alternative == reference)
+            {
+                return invalid(format!(
+                    "quota pool '{}' cannot authorize itself as an alternative",
+                    pool.runtime
+                ));
+            }
+        }
+    }
+    let configured_pools = input
+        .pools
+        .iter()
+        .filter(|pool| pool.pool_reference.is_some())
+        .collect::<Vec<_>>();
+    match &input.quota_source {
+        None if !configured_pools.is_empty() => {
+            return invalid(
+                "configured quota pools require an exact quota_source; catalog order is not authority",
+            );
+        }
+        Some(source) => {
+            let matches = configured_pools
+                .iter()
+                .filter(|pool| pool.pool_reference.as_ref() == Some(source))
+                .count();
+            if matches != 1 {
+                return invalid(
+                    "quota_source must exactly match one configured runtime pool reference",
+                );
+            }
+            for pool in &configured_pools {
+                for alternative in &pool.authorized_alternatives {
+                    if !configured_pools
+                        .iter()
+                        .any(|candidate| candidate.pool_reference.as_ref() == Some(alternative))
+                    {
+                        return invalid(format!(
+                            "quota pool '{}' authorizes an undeclared alternative",
+                            pool.runtime
+                        ));
+                    }
+                }
+            }
+        }
+        None => {}
     }
     if duplicate_pair(&input.priors.models, |prior| {
         (prior.runtime.as_str(), prior.model.as_str())
@@ -555,6 +729,7 @@ fn evaluate_candidate(
         .pools
         .iter()
         .find(|pool| pool.runtime == candidate.runtime);
+    let quota = quota_candidate_provenance(input, &candidate)?;
     let ledger = ledger_summary(input, &candidate)?;
     let mut reasons = Vec::new();
 
@@ -601,12 +776,35 @@ fn evaluate_candidate(
             IneligibilityCode::RuntimeAdmissionClosed,
             "runtime pool admission is closed",
         ),
-        Some(pool) if pool.entitlement_remaining_units == 0 => reject(
-            &mut reasons,
-            IneligibilityCode::EntitlementExhausted,
-            "runtime pool entitlement is exhausted",
-        ),
+        Some(pool)
+            if pool.exhausted
+                || (pool.pool_reference.is_none()
+                    && pool.entitlement_bounded
+                    && pool.entitlement_remaining_units == 0) =>
+        {
+            reject(
+                &mut reasons,
+                IneligibilityCode::EntitlementExhausted,
+                "runtime pool entitlement is exhausted",
+            )
+        }
         Some(_) => {}
+    }
+    match quota.disposition {
+        QuotaCandidateDisposition::FailClosed => reject(
+            &mut reasons,
+            IneligibilityCode::QuotaFailClosed,
+            "configured exhausted source pool requires fail-closed refusal",
+        ),
+        QuotaCandidateDisposition::RejectedUnauthorizedAlternative => reject(
+            &mut reasons,
+            IneligibilityCode::QuotaAlternativeNotAuthorized,
+            "candidate is not an exact operator-authorized alternative for the exhausted source pool",
+        ),
+        QuotaCandidateDisposition::LegacyUnconfigured
+        | QuotaCandidateDisposition::SourceAvailable
+        | QuotaCandidateDisposition::SourceExhausted
+        | QuotaCandidateDisposition::AuthorizedAlternative => {}
     }
     if !model
         .capabilities
@@ -675,6 +873,8 @@ fn evaluate_candidate(
     let mut posterior_quality = 0u16;
     let mut authority_quality = None;
     let mut expected_cost = 0u64;
+    let mut expected_retry_rework_cost = 0u64;
+    let mut expected_human_review_cost = 0u64;
     let mut strength_rank = 0u16;
     match prior {
         None => reject(
@@ -731,6 +931,34 @@ fn evaluate_candidate(
                         );
                     }
                     expected_cost = expected_cost_per_accepted(class_fit, &ledger)?;
+                    expected_retry_rework_cost = expected_cost_component_per_accepted(
+                        class_fit.rework_cost_microunits,
+                        ledger.rework_cost_microunits,
+                        class_fit,
+                        &ledger,
+                        "expected retry/rework cost per accepted task",
+                    )?;
+                    let prior_human_review_cost = checked_sum_costs(
+                        [
+                            class_fit.review_cost_microunits,
+                            class_fit.rereview_cost_microunits,
+                        ],
+                        "prior human-review cost",
+                    )?;
+                    let observed_human_review_cost = checked_sum_costs(
+                        [
+                            ledger.review_cost_microunits,
+                            ledger.rereview_cost_microunits,
+                        ],
+                        "observed human-review cost",
+                    )?;
+                    expected_human_review_cost = expected_cost_component_per_accepted(
+                        prior_human_review_cost,
+                        observed_human_review_cost,
+                        class_fit,
+                        &ledger,
+                        "expected human-review cost per accepted task",
+                    )?;
                 }
             }
             if input.task.authority_role.requires_exact_judgment_evidence()
@@ -783,15 +1011,18 @@ fn evaluate_candidate(
 
     let score = if reasons.is_empty() {
         pool.map(|pool| {
-            score_candidate(
+            score_candidate(CandidateScoringInput {
                 profile,
+                routing_weights: &input.resolved_objective_profile.profile.tradeoffs,
                 pool,
-                &candidate,
-                &input.signals,
-                posterior_quality,
-                authority_quality,
-                expected_cost,
-            )
+                candidate: &candidate,
+                signals: &input.signals,
+                posterior_quality_basis_points: posterior_quality,
+                authority_quality_basis_points: authority_quality,
+                expected_total_cost_per_accepted_task_microunits: expected_cost,
+                expected_retry_rework_cost_per_accepted_task_microunits: expected_retry_rework_cost,
+                expected_human_review_cost_per_accepted_task_microunits: expected_human_review_cost,
+            })
         })
         .transpose()?
     } else {
@@ -809,20 +1040,248 @@ fn evaluate_candidate(
         strong_gate_fallback,
         eligible: reasons.is_empty() && score.is_some(),
         ineligibility_reasons: reasons,
+        quota,
         ledger,
         score,
     })
 }
 
-fn score_candidate(
-    profile: &ObjectiveProfile,
-    pool: &RuntimePoolState,
+fn quota_source_pool(input: &SelectionInput) -> Result<Option<&RuntimePoolState>, SelectionError> {
+    let Some(source) = input.quota_source.as_ref() else {
+        return Ok(None);
+    };
+    input
+        .pools
+        .iter()
+        .find(|pool| pool.pool_reference.as_ref() == Some(source))
+        .map(Some)
+        .ok_or_else(|| {
+            SelectionError::InvalidInput(
+                "quota_source disappeared after validated input normalization".to_string(),
+            )
+        })
+}
+
+fn quota_candidate_provenance(
+    input: &SelectionInput,
     candidate: &CandidateKey,
-    signals: &DynamicSignals,
+) -> Result<QuotaCandidateProvenance, SelectionError> {
+    let target = input
+        .pools
+        .iter()
+        .find(|pool| pool.runtime == candidate.runtime);
+    let target_pool = target.and_then(|pool| pool.pool_reference.clone());
+    let target_marginal_cost_microunits = target.map(|pool| pool.marginal_cost_microunits);
+    let Some(source) = quota_source_pool(input)? else {
+        return Ok(QuotaCandidateProvenance {
+            source_pool: None,
+            target_pool,
+            source_exhausted: false,
+            configured_behavior: None,
+            authorized_alternative: false,
+            disposition: QuotaCandidateDisposition::LegacyUnconfigured,
+            source_observation_revision: None,
+            source_observation: None,
+            target_marginal_cost_microunits,
+            reason: "no operator quota source was declared; legacy selector behavior applies"
+                .to_string(),
+        });
+    };
+    let source_pool = source.pool_reference.clone().ok_or_else(|| {
+        SelectionError::InvalidInput("configured quota source has no pool reference".to_string())
+    })?;
+    let behavior = source.exhaustion_behavior.ok_or_else(|| {
+        SelectionError::InvalidInput(
+            "configured quota source has no exhaustion behavior".to_string(),
+        )
+    })?;
+    let (authorized_alternative, disposition, reason) = if !source.exhausted {
+        (
+            false,
+            QuotaCandidateDisposition::SourceAvailable,
+            "configured source pool is available; exhaustion routing is inactive".to_string(),
+        )
+    } else {
+        match behavior {
+            ExhaustionBehavior::FailClosed => (
+                false,
+                QuotaCandidateDisposition::FailClosed,
+                "configured source pool is exhausted and fail-closed behavior forbids every target"
+                    .to_string(),
+            ),
+            ExhaustionBehavior::Degrade if target_pool.as_ref() == Some(&source_pool) => (
+                false,
+                QuotaCandidateDisposition::SourceExhausted,
+                "source candidate belongs to the exhausted pool".to_string(),
+            ),
+            ExhaustionBehavior::Degrade
+                if target_pool
+                    .as_ref()
+                    .is_some_and(|target| source.authorized_alternatives.contains(target)) =>
+            {
+                (
+                    true,
+                    QuotaCandidateDisposition::AuthorizedAlternative,
+                    "target pool exactly matches an operator-authorized alternative; independent hard gates still apply"
+                        .to_string(),
+                )
+            }
+            ExhaustionBehavior::Degrade => (
+                false,
+                QuotaCandidateDisposition::RejectedUnauthorizedAlternative,
+                "target pool does not exactly match an operator-authorized alternative"
+                    .to_string(),
+            ),
+        }
+    };
+    Ok(QuotaCandidateProvenance {
+        source_pool: Some(source_pool),
+        target_pool,
+        source_exhausted: source.exhausted,
+        configured_behavior: Some(behavior),
+        authorized_alternative,
+        disposition,
+        source_observation_revision: Some(source.observation_revision.clone()),
+        source_observation: source.observation_source,
+        target_marginal_cost_microunits,
+        reason,
+    })
+}
+
+fn quota_decision_provenance(
+    input: &SelectionInput,
+    candidates: &[CandidateEvaluation],
+    choice: Option<&SelectedChoice>,
+) -> Result<Option<QuotaDecisionProvenance>, SelectionError> {
+    let Some(source) = quota_source_pool(input)? else {
+        return Ok(None);
+    };
+    let source_pool = source.pool_reference.clone().ok_or_else(|| {
+        SelectionError::InvalidInput("configured quota source has no pool reference".to_string())
+    })?;
+    let configured_behavior = source.exhaustion_behavior.ok_or_else(|| {
+        SelectionError::InvalidInput(
+            "configured quota source has no exhaustion behavior".to_string(),
+        )
+    })?;
+    let observation_source = source.observation_source.ok_or_else(|| {
+        SelectionError::InvalidInput(
+            "configured quota source has no observation source".to_string(),
+        )
+    })?;
+
+    let mut eligible_alternatives = Vec::new();
+    let mut rejected_alternatives = Vec::new();
+    if source.exhausted {
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| candidate.candidate.runtime != source.runtime)
+        {
+            if candidate.quota.authorized_alternative && candidate.eligible {
+                eligible_alternatives.push(candidate.candidate.clone());
+            } else {
+                rejected_alternatives.push(RejectedQuotaAlternative {
+                    candidate: candidate.candidate.clone(),
+                    reasons: candidate.ineligibility_reasons.clone(),
+                });
+            }
+        }
+    }
+    eligible_alternatives.sort();
+    rejected_alternatives.sort_by(|left, right| left.candidate.cmp(&right.candidate));
+
+    let selected_alternative = choice
+        .filter(|choice| choice.candidate.runtime != source.runtime)
+        .map(|choice| choice.candidate.clone());
+    if source.exhausted
+        && configured_behavior == ExhaustionBehavior::Degrade
+        && selected_alternative.as_ref().is_some_and(|selected| {
+            !candidates.iter().any(|candidate| {
+                candidate.candidate == *selected
+                    && candidate.eligible
+                    && candidate.quota.authorized_alternative
+            })
+        })
+    {
+        return invalid("quota degradation selected a target without exact authorization");
+    }
+    let (disposition, reason) = if !source.exhausted {
+        (
+            QuotaDecisionDisposition::SourceAvailable,
+            "configured source pool remains available; ordinary selection applies".to_string(),
+        )
+    } else {
+        match (
+            configured_behavior,
+            selected_alternative.is_some(),
+            !eligible_alternatives.is_empty(),
+            input.debug_override.is_some(),
+        ) {
+            (ExhaustionBehavior::FailClosed, _, _, _) => (
+                QuotaDecisionDisposition::FailClosed,
+                "configured fail-closed behavior refused the decision without considering unrelated alternatives"
+                    .to_string(),
+            ),
+            (ExhaustionBehavior::Degrade, true, _, _) => (
+                QuotaDecisionDisposition::Degraded,
+                "selected an exact operator-authorized alternative that independently passed every hard gate"
+                    .to_string(),
+            ),
+            (ExhaustionBehavior::Degrade, false, true, true) => (
+                QuotaDecisionDisposition::RefusedByExplicitOverride,
+                "an explicit debug override targeted an unauthorized or otherwise ineligible candidate; automatic fallback remained forbidden"
+                    .to_string(),
+            ),
+            (ExhaustionBehavior::Degrade, false, _, _) => (
+                QuotaDecisionDisposition::RefusedNoEligibleAlternative,
+                "no exact operator-authorized alternative independently passed every hard gate"
+                    .to_string(),
+            ),
+        }
+    };
+
+    Ok(Some(QuotaDecisionProvenance {
+        source_pool,
+        configured_behavior,
+        source_exhausted: source.exhausted,
+        local_observation_revision: source.observation_revision.clone(),
+        observation_source,
+        marginal_cost_assumption_microunits: source.marginal_cost_microunits,
+        authorized_alternatives: source.authorized_alternatives.clone(),
+        eligible_alternatives,
+        rejected_alternatives,
+        selected_alternative,
+        disposition,
+        reason,
+    }))
+}
+
+struct CandidateScoringInput<'a> {
+    profile: &'a ObjectiveProfile,
+    routing_weights: &'a crate::objective_profile::TradeoffWeights,
+    pool: &'a RuntimePoolState,
+    candidate: &'a CandidateKey,
+    signals: &'a DynamicSignals,
     posterior_quality_basis_points: u16,
     authority_quality_basis_points: Option<u16>,
     expected_total_cost_per_accepted_task_microunits: u64,
-) -> Result<ScoreBreakdown, SelectionError> {
+    expected_retry_rework_cost_per_accepted_task_microunits: u64,
+    expected_human_review_cost_per_accepted_task_microunits: u64,
+}
+
+fn score_candidate(input: CandidateScoringInput<'_>) -> Result<ScoreBreakdown, SelectionError> {
+    let CandidateScoringInput {
+        profile,
+        routing_weights,
+        pool,
+        candidate,
+        signals,
+        posterior_quality_basis_points,
+        authority_quality_basis_points,
+        expected_total_cost_per_accepted_task_microunits,
+        expected_retry_rework_cost_per_accepted_task_microunits,
+        expected_human_review_cost_per_accepted_task_microunits,
+    } = input;
     let pool_pressure_cost_microunits = normalize_cost_per_accepted(
         scale_basis_points(
             profile.pool_pressure_full_cost_microunits,
@@ -832,7 +1291,9 @@ fn score_candidate(
         posterior_quality_basis_points,
         "pool-pressure cost per accepted task",
     )?;
-    let entitlement_scarcity_bp = if pool.entitlement_capacity_units == 0 {
+    let entitlement_scarcity_bp = if !pool.entitlement_bounded {
+        0
+    } else if pool.entitlement_capacity_units == 0 {
         10_000
     } else {
         let used = pool
@@ -909,7 +1370,7 @@ fn score_candidate(
         posterior_quality_basis_points,
         "context-switch cost per accepted task",
     )?;
-    let total_score_microunits = checked_sum_costs(
+    let legacy_baseline_score_microunits = checked_sum_costs(
         [
             expected_total_cost_per_accepted_task_microunits,
             pool_pressure_cost_microunits,
@@ -921,6 +1382,41 @@ fn score_candidate(
             switch_cost_microunits,
         ],
         "total candidate score",
+    )?;
+    let retry_rework_cost_proxy_microunits = checked_sum_costs(
+        [
+            expected_retry_rework_cost_per_accepted_task_microunits,
+            retry_cost_microunits,
+        ],
+        "retry/rework cost proxy",
+    )?;
+    let human_review_cost_proxy_microunits =
+        expected_human_review_cost_per_accepted_task_microunits;
+    let retry_rework_adjustment_microunits = proportional_cost_proxy_adjustment(
+        retry_rework_cost_proxy_microunits,
+        routing_weights.retry_rework_percent,
+        routing_weights.monetary_cost_percent,
+        "retry/rework cost-proxy adjustment",
+    )?;
+    let human_review_adjustment_microunits = proportional_cost_proxy_adjustment(
+        human_review_cost_proxy_microunits,
+        routing_weights.human_review_percent,
+        routing_weights.monetary_cost_percent,
+        "human-review cost-proxy adjustment",
+    )?;
+    let total_adjustment_microunits = checked_sum_costs(
+        [
+            retry_rework_adjustment_microunits,
+            human_review_adjustment_microunits,
+        ],
+        "total cost-proxy adjustment",
+    )?;
+    let total_score_microunits = checked_sum_costs(
+        [
+            legacy_baseline_score_microunits,
+            total_adjustment_microunits,
+        ],
+        "legacy baseline plus cost-proxy adjustments",
     )?;
     Ok(ScoreBreakdown {
         posterior_quality_basis_points,
@@ -935,6 +1431,14 @@ fn score_candidate(
         switch_transition,
         configured_switch_cost_microunits,
         switch_cost_microunits,
+        routing_score_semantics: RoutingScoreSemantics::LegacyBaselinePlusCostProxyAdjustmentsV1,
+        routing_tradeoff_weights: routing_weights.clone(),
+        legacy_baseline_score_microunits,
+        retry_rework_cost_proxy_microunits,
+        human_review_cost_proxy_microunits,
+        retry_rework_adjustment_microunits,
+        human_review_adjustment_microunits,
+        total_adjustment_microunits,
         total_score_microunits,
     })
 }
@@ -968,11 +1472,7 @@ fn automatic_choice(
             .filter(|candidate| !candidate.strong_gate_fallback)
             .min_by(candidate_score_order)
         {
-            return selected_choice(
-                candidate,
-                ChoiceReason::LowestExpectedTotalCostPerAcceptedTask,
-            )
-            .map(Some);
+            return selected_choice(candidate, automatic_score_choice_reason(input)).map(Some);
         }
         if let Some(candidate) = eligible
             .filter(|candidate| candidate.strong_gate_fallback)
@@ -989,13 +1489,22 @@ fn automatic_choice(
     }
     eligible
         .min_by(candidate_score_order)
-        .map(|candidate| {
-            selected_choice(
-                candidate,
-                ChoiceReason::LowestExpectedTotalCostPerAcceptedTask,
-            )
-        })
+        .map(|candidate| selected_choice(candidate, automatic_score_choice_reason(input)))
         .transpose()
+}
+
+fn automatic_score_choice_reason(input: &SelectionInput) -> ChoiceReason {
+    let weights = &input.resolved_objective_profile.profile.tradeoffs;
+    if weights.monetary_cost_percent == 100
+        && weights.quota_consumption_percent == 0
+        && weights.latency_percent == 0
+        && weights.retry_rework_percent == 0
+        && weights.human_review_percent == 0
+    {
+        ChoiceReason::LowestExpectedTotalCostPerAcceptedTask
+    } else {
+        ChoiceReason::LowestLegacyBaselinePlusCostProxyAdjustments
+    }
 }
 
 fn environment_fallback_choice(
@@ -1267,6 +1776,58 @@ fn expected_cost_per_accepted(
     )
 }
 
+fn expected_cost_component_per_accepted(
+    prior_component_cost_microunits: u64,
+    observed_component_cost_microunits: u64,
+    class_fit: &ClassFitPrior,
+    ledger: &LedgerSummary,
+    context: &str,
+) -> Result<u64, SelectionError> {
+    let prior_samples = u128::from(class_fit.sample_size);
+    let total_cost = u128::from(prior_component_cost_microunits)
+        .checked_mul(prior_samples)
+        .and_then(|prior| prior.checked_add(u128::from(observed_component_cost_microunits)))
+        .ok_or_else(|| SelectionError::InvalidInput(format!("{context} numerator overflowed")))?;
+    let accepted_basis_units = u128::from(class_fit.quality_basis_points)
+        .checked_mul(prior_samples)
+        .and_then(|prior| {
+            u128::from(ledger.accepted)
+                .checked_mul(10_000)
+                .and_then(|local| prior.checked_add(local))
+        })
+        .ok_or_else(|| SelectionError::InvalidInput(format!("{context} denominator overflowed")))?;
+    if accepted_basis_units == 0 {
+        return Ok(u64::MAX);
+    }
+    let scaled = total_cost
+        .checked_mul(10_000)
+        .ok_or_else(|| SelectionError::InvalidInput(format!("{context} scaling overflowed")))?;
+    u128_to_u64(scaled / accepted_basis_units, context)
+}
+
+fn proportional_cost_proxy_adjustment(
+    cost_proxy_microunits: u64,
+    adjustment_weight_percent: u32,
+    monetary_baseline_weight_percent: u32,
+    context: &str,
+) -> Result<u64, SelectionError> {
+    if adjustment_weight_percent == 0 {
+        return Ok(0);
+    }
+    if monetary_baseline_weight_percent == 0 {
+        return invalid(format!(
+            "{context} requires a nonzero monetary baseline weight"
+        ));
+    }
+    let weighted = u128::from(cost_proxy_microunits)
+        .checked_mul(u128::from(adjustment_weight_percent))
+        .ok_or_else(|| SelectionError::InvalidInput(format!("{context} overflowed")))?;
+    u128_to_u64(
+        weighted / u128::from(monetary_baseline_weight_percent),
+        context,
+    )
+}
+
 fn sum_cost<F>(records: &[&OutcomeRecord], value: F) -> Result<u64, SelectionError>
 where
     F: Fn(&OutcomeRecord) -> u64,
@@ -1312,9 +1873,61 @@ fn input_digests(input: &SelectionInput) -> Result<InputDigests, SelectionError>
         pools: digest(&input.pools)?,
         constraints: digest(&input.constraints)?,
         priors: digest(&input.priors)?,
+        resolved_objective_profile: digest(&input.resolved_objective_profile)?,
         outcomes: digest(&input.outcomes)?,
         signals: digest(&input.signals)?,
     })
+}
+
+fn validate_resolved_objective_profile(
+    resolved: &crate::objective_profile::ResolvedObjectiveProfile,
+) -> Result<(), SelectionError> {
+    let binding = &resolved.profile;
+    validate_identifier("resolved_objective_profile.profile.id", &binding.id)?;
+    validate_positive(
+        "resolved_objective_profile.profile.version",
+        binding.version,
+    )?;
+    validate_sha256_digest(
+        "resolved_objective_profile.profile.content_hash",
+        &binding.content_hash,
+    )?;
+    let reconstructed = RoutingObjectiveProfile {
+        id: binding.id.clone(),
+        version: binding.version,
+        quality: binding.quality.clone(),
+        tradeoffs: binding.tradeoffs.clone(),
+        switch_costs: binding.switch_costs.clone(),
+    };
+    let expected = reconstructed.binding().map_err(|error| {
+        SelectionError::InvalidInput(format!(
+            "resolved objective profile binding is invalid: {error:#}"
+        ))
+    })?;
+    if expected != *binding {
+        return invalid(
+            "resolved_objective_profile.profile content_hash does not match its effective weights",
+        );
+    }
+    let weights = &binding.tradeoffs;
+    if weights.quota_consumption_percent != 0 {
+        return invalid(format!(
+            "resolved objective profile requests quota_consumption_percent={} but typed contract-backed per-runtime quota evidence is unavailable",
+            weights.quota_consumption_percent
+        ));
+    }
+    if weights.latency_percent != 0 {
+        return invalid(format!(
+            "resolved objective profile requests latency_percent={} but typed per-candidate observed or predicted latency evidence is unavailable",
+            weights.latency_percent
+        ));
+    }
+    if weights.monetary_cost_percent == 0 {
+        return invalid(
+            "resolved objective profile baseline-plus-adjustment scoring requires monetary_cost_percent greater than zero",
+        );
+    }
+    Ok(())
 }
 
 fn digest<T: Serialize>(value: &T) -> Result<DigestRecord, SelectionError> {

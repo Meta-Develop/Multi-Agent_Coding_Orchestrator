@@ -21,12 +21,19 @@ fn finalized_artifacts_round_trip_typed_context_switch_selection_evidence() {
         SupervisorAdmissionConfig::default(),
     )
     .expect("resolve selector admission fixture");
+    let resolved_objective_profile = ResolvedObjectiveProfile {
+        profile: crate::objective_profile::default_objective_profile()
+            .binding()
+            .expect("default objective binding"),
+        source: crate::objective_profile::ObjectiveProfileSource::BuiltIn,
+    };
     let resolution = initialize_supervisor_selection(
         &mut plan,
         SupervisorRuntime::Codex,
         &catalog,
         &admission,
         &AdvertisedCatalogSet::empty(),
+        Some(&resolved_objective_profile),
     )
     .expect("initialize selector evidence fixture");
     let initial = resolution
@@ -1428,6 +1435,8 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
                 !command.hidden_roots.iter().any(|root| root == &repo_path),
                 "the linked worktree's owning primary/common checkout must remain visible read-only"
             );
+            crate::external_agent::prepare_managed_child_git_boundary_for_test(&command.cwd)
+                .expect("prepare injected managed-child private Git boundary");
         }
         assert_ne!(command.cwd, repo_path);
         assert_eq!(
@@ -2413,6 +2422,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
             id: assignment_id.to_string(),
+            phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
             assigned_paths: vec![PathBuf::from("README.md")],

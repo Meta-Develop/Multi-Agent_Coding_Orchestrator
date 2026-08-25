@@ -6,16 +6,19 @@
 //! owner of both usage accounting and enforcement.
 
 use crate::{
+    artifacts::state_auth::random_identifier,
     budget_ledger::{
-        current_rolling_binding, provider_error_is_rate_limited, unix_now, RollingBudgetQuota,
-        WorkspaceBudgetLedger,
+        current_rolling_binding, provider_error_is_rate_limited, unix_now,
+        CompletedPoolConsumption, RollingBudgetQuota, WorkspaceBudgetLedger,
     },
     llm::ProviderError,
+    optimizer::quota_pools::{ConsumptionLedger, PoolKey, QuotaConfig},
     supervise::AgentRole,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
@@ -342,6 +345,12 @@ pub(super) enum BudgetError {
     Poisoned,
     #[error("workspace rolling budget ledger is unavailable or corrupt: {0}")]
     RollingLedgerUnavailable(String),
+    #[error("operator quota config is invalid: {0}")]
+    QuotaConfigInvalid(String),
+    #[error("operator quota pool is unavailable for runtime '{0}'")]
+    QuotaPoolUnavailable(String),
+    #[error("failed to create a unique run-budget ledger session: {0}")]
+    SessionIdentityUnavailable(String),
 }
 
 pub(super) type Result<T> = std::result::Result<T, BudgetError>;
@@ -352,6 +361,7 @@ pub(super) struct RunBudgetLedger {
     max_duration_seconds: Option<u64>,
     sources: Option<RunBudgetSources>,
     started_at: Instant,
+    session_id: String,
     inner: Arc<Mutex<LedgerState>>,
     rolling: Option<Arc<Mutex<AttachedRollingBudget>>>,
 }
@@ -359,8 +369,10 @@ pub(super) struct RunBudgetLedger {
 #[derive(Debug)]
 struct AttachedRollingBudget {
     ledger: WorkspaceBudgetLedger,
-    quota: RollingBudgetQuota,
+    quota: Option<RollingBudgetQuota>,
+    repo: PathBuf,
     run_id: String,
+    quota_pools: BTreeMap<String, PoolKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -435,6 +447,13 @@ struct ReconciliationCharge {
     stop_for_uncertainty: bool,
 }
 
+fn rolling_binding_matches_supervisor_run(binding_run_id: &str, supervisor_run_id: &str) -> bool {
+    binding_run_id == supervisor_run_id
+        || supervisor_run_id
+            .strip_suffix("-supervise")
+            .is_some_and(|parent| parent == binding_run_id)
+}
+
 impl RunBudgetLedger {
     #[cfg(test)]
     pub(super) fn new(limits: RunBudgetLimits) -> Result<Self> {
@@ -485,6 +504,8 @@ impl RunBudgetLedger {
             max_duration_seconds,
             sources,
             started_at: Instant::now(),
+            session_id: random_identifier()
+                .map_err(|error| BudgetError::SessionIdentityUnavailable(format!("{error:#}")))?,
             inner: Arc::new(Mutex::new(LedgerState::default())),
             rolling: None,
         };
@@ -500,8 +521,10 @@ impl RunBudgetLedger {
             WorkspaceBudgetLedger::open_or_create(&binding.repo).map_err(rolling_ledger_error)?;
         let attached = AttachedRollingBudget {
             ledger,
-            quota: binding.quota,
+            quota: Some(binding.quota),
+            repo: binding.repo,
             run_id: binding.run_id,
+            quota_pools: BTreeMap::new(),
         };
         let now = unix_now().map_err(rolling_ledger_error)?;
         if let Some(reasons) = attached.admission_block_reasons(now)? {
@@ -510,6 +533,58 @@ impl RunBudgetLedger {
             state.persistent_reasons.extend(reasons);
         }
         self.rolling = Some(Arc::new(Mutex::new(attached)));
+        Ok(())
+    }
+
+    /// Attach the validated operator quota config to this run ledger before
+    /// scheduler threads begin. The runtime map is immutable after attachment.
+    pub(super) fn attach_quota_config(
+        &mut self,
+        repo: &Path,
+        run_id: &str,
+        config: &QuotaConfig,
+    ) -> Result<()> {
+        config
+            .validate()
+            .map_err(|error| BudgetError::QuotaConfigInvalid(error.to_string()))?;
+        if run_id.is_empty() {
+            return Err(BudgetError::QuotaConfigInvalid(
+                "workspace quota run id cannot be empty".to_string(),
+            ));
+        }
+        let quota_pools = config
+            .pools
+            .iter()
+            .map(|pool| (pool.runtime.as_str().to_string(), pool.key()))
+            .collect::<BTreeMap<_, _>>();
+        if let Some(rolling) = &self.rolling {
+            if Arc::strong_count(rolling) != 1 {
+                return Err(BudgetError::QuotaConfigInvalid(
+                    "operator quota config must be attached before the run ledger is shared"
+                        .to_string(),
+                ));
+            }
+            let mut attached = rolling.lock().map_err(|_| BudgetError::Poisoned)?;
+            if attached.repo != repo
+                || !rolling_binding_matches_supervisor_run(&attached.run_id, run_id)
+            {
+                return Err(BudgetError::QuotaConfigInvalid(
+                    "operator quota config repository/run binding does not match the rolling budget ledger"
+                        .to_string(),
+                ));
+            }
+            attached.quota_pools = quota_pools;
+            return Ok(());
+        }
+
+        let ledger = WorkspaceBudgetLedger::open_or_create(repo).map_err(rolling_ledger_error)?;
+        self.rolling = Some(Arc::new(Mutex::new(AttachedRollingBudget {
+            ledger,
+            quota: None,
+            repo: repo.to_path_buf(),
+            run_id: run_id.to_string(),
+            quota_pools,
+        })));
         Ok(())
     }
 
@@ -653,6 +728,80 @@ impl RunBudgetLedger {
         id: BudgetReservationId,
         measurement: UsageMeasurement,
     ) -> Result<BudgetReconciliation> {
+        self.reconcile_with_pool(id, measurement, None)
+    }
+
+    /// Reconcile a completed dispatch into both the run budget and the unique
+    /// configured quota pool for `runtime`.
+    pub(super) fn reconcile_quota_runtime(
+        &self,
+        id: BudgetReservationId,
+        measurement: UsageMeasurement,
+        runtime: &str,
+    ) -> Result<BudgetReconciliation> {
+        let pool = {
+            let rolling = self
+                .lock_rolling()?
+                .ok_or_else(|| BudgetError::QuotaPoolUnavailable(runtime.to_string()))?;
+            rolling
+                .quota_pools
+                .get(runtime)
+                .cloned()
+                .ok_or_else(|| BudgetError::QuotaPoolUnavailable(runtime.to_string()))?
+        };
+        self.reconcile_with_pool(id, measurement, Some(pool))
+    }
+
+    /// Reconcile through the configured per-runtime pool when a quota config
+    /// was attached, otherwise preserve the legacy aggregate-only behavior.
+    pub(super) fn reconcile_for_runtime_if_configured(
+        &self,
+        id: BudgetReservationId,
+        measurement: UsageMeasurement,
+        runtime: Option<&str>,
+    ) -> Result<BudgetReconciliation> {
+        let quota_configured = self
+            .lock_rolling()?
+            .is_some_and(|rolling| !rolling.quota_pools.is_empty());
+        if quota_configured {
+            let runtime = runtime.ok_or_else(|| {
+                BudgetError::QuotaPoolUnavailable("<missing-runtime>".to_string())
+            })?;
+            self.reconcile_quota_runtime(id, measurement, runtime)
+        } else {
+            self.reconcile(id, measurement)
+        }
+    }
+
+    /// Read a fresh selector projection through the same held authenticated
+    /// ledger instance used for completed reconciliation writes.
+    pub(super) fn quota_consumption_ledger(
+        &self,
+        config: &QuotaConfig,
+        now_unix_seconds: u64,
+    ) -> Result<ConsumptionLedger> {
+        let attached = self.lock_rolling()?.ok_or_else(|| {
+            BudgetError::QuotaConfigInvalid(
+                "operator quota config is not attached to the run ledger".to_string(),
+            )
+        })?;
+        if attached.quota_pools.is_empty() {
+            return Err(BudgetError::QuotaConfigInvalid(
+                "operator quota config is not attached to the run ledger".to_string(),
+            ));
+        }
+        attached
+            .ledger
+            .quota_consumption_ledger(config, now_unix_seconds)
+            .map_err(rolling_ledger_error)
+    }
+
+    fn reconcile_with_pool(
+        &self,
+        id: BudgetReservationId,
+        measurement: UsageMeasurement,
+        pool: Option<PoolKey>,
+    ) -> Result<BudgetReconciliation> {
         validate_measurement(&measurement)?;
         let mut state = self.lock_state()?;
         let reservation = state
@@ -664,7 +813,7 @@ impl RunBudgetLedger {
         let mut next = state.clone();
         remove_reservation(&mut next, id)?;
         apply_charge(&mut next, reservation.role, &charge, self.limits)?;
-        let rolling_reasons = self.persist_rolling_consumption(&charge)?;
+        let rolling_reasons = self.persist_rolling_consumption(id, &charge, pool.as_ref())?;
         if !rolling_reasons.is_empty() {
             next.persistent_reasons.extend(rolling_reasons);
             next.force_stop = true;
@@ -728,27 +877,26 @@ impl RunBudgetLedger {
         let Some(rolling) = self.lock_rolling()? else {
             return Ok(None);
         };
+        let Some(quota) = rolling.quota else {
+            return Ok(None);
+        };
         let now = unix_now().map_err(rolling_ledger_error)?;
         if rolling.admission_block_reasons(now)?.is_some() {
             return Ok(Some(BudgetAdmissionRefusal::NewDispatchStopped));
         }
-        if request.cost_usd.is_none() && rolling.quota.max_cost_usd.is_some() {
+        if request.cost_usd.is_none() && quota.max_cost_usd.is_some() {
             return Ok(Some(BudgetAdmissionRefusal::MissingCostEstimate));
         }
         let usage = rolling
             .ledger
-            .usage_in_window(rolling.quota.window_seconds, now)
+            .usage_in_window(quota.window_seconds, now)
             .map_err(rolling_ledger_error)?;
         let projected_tokens = usage
             .tokens
             .checked_add(state.reserved_tokens)
             .and_then(|tokens| tokens.checked_add(request.tokens))
             .ok_or(BudgetError::TokenOverflow)?;
-        if let Some(limit) = rolling
-            .quota
-            .max_tokens
-            .filter(|limit| projected_tokens > *limit)
-        {
+        if let Some(limit) = quota.max_tokens.filter(|limit| projected_tokens > *limit) {
             return Ok(Some(BudgetAdmissionRefusal::HardTokenCeiling {
                 limit,
                 committed: usage
@@ -758,9 +906,7 @@ impl RunBudgetLedger {
                 requested: request.tokens,
             }));
         }
-        if let (Some(requested_usd), Some(limit_usd)) =
-            (request.cost_usd, rolling.quota.max_cost_usd)
-        {
+        if let (Some(requested_usd), Some(limit_usd)) = (request.cost_usd, quota.max_cost_usd) {
             let Some(window_cost) = usage.cost_usd else {
                 return Ok(Some(BudgetAdmissionRefusal::MissingCostEstimate));
             };
@@ -779,22 +925,43 @@ impl RunBudgetLedger {
 
     fn persist_rolling_consumption(
         &self,
+        reservation_id: BudgetReservationId,
         charge: &ReconciliationCharge,
+        pool: Option<&PoolKey>,
     ) -> Result<Vec<BudgetReason>> {
         let Some(mut rolling) = self.lock_rolling()? else {
             return Ok(Vec::new());
         };
         let now = unix_now().map_err(rolling_ledger_error)?;
         let run_id = rolling.run_id.clone();
-        rolling
-            .ledger
-            .record_consumption(
-                run_id,
-                charge.tokens,
-                charge.cost_complete.then_some(charge.cost_usd),
-                now,
-            )
-            .map_err(rolling_ledger_error)?;
+        if let Some(pool) = pool {
+            let tokens = u64::try_from(charge.tokens).map_err(|_| BudgetError::TokenOverflow)?;
+            rolling
+                .ledger
+                .record_completed_pool_consumption(CompletedPoolConsumption {
+                    completion_id: format!(
+                        "{run_id}/session/{}/reservation/{}",
+                        self.session_id,
+                        reservation_id.get()
+                    ),
+                    pool: pool.clone(),
+                    tokens,
+                    requests: 1,
+                    cost_usd: charge.cost_complete.then_some(charge.cost_usd),
+                    unix_seconds: now,
+                })
+                .map_err(rolling_ledger_error)?;
+        } else {
+            rolling
+                .ledger
+                .record_consumption(
+                    run_id,
+                    charge.tokens,
+                    charge.cost_complete.then_some(charge.cost_usd),
+                    now,
+                )
+                .map_err(rolling_ledger_error)?;
+        }
         Ok(rolling.admission_block_reasons(now)?.unwrap_or_default())
     }
 
@@ -819,7 +986,14 @@ impl RunBudgetLedger {
             ));
         };
         let now = unix_now().map_err(rolling_ledger_error)?;
-        let window_seconds = rolling.quota.window_seconds;
+        let window_seconds = rolling
+            .quota
+            .ok_or_else(|| {
+                BudgetError::RollingLedgerUnavailable(
+                    "provider rate-limit latching requires an aggregate rolling quota".to_string(),
+                )
+            })?
+            .window_seconds;
         rolling
             .ledger
             .record_rate_limited(
@@ -839,22 +1013,21 @@ impl RunBudgetLedger {
 
 impl AttachedRollingBudget {
     fn admission_block_reasons(&self, now: u64) -> Result<Option<Vec<BudgetReason>>> {
+        let Some(quota) = self.quota else {
+            return Ok(None);
+        };
         if self.ledger.any_active_rate_limit(now).is_some() {
             return Ok(Some(vec![BudgetReason::MissingProviderUsage]));
         }
         let usage = self
             .ledger
-            .usage_in_window(self.quota.window_seconds, now)
+            .usage_in_window(quota.window_seconds, now)
             .map_err(rolling_ledger_error)?;
         let mut reasons = Vec::new();
-        if self
-            .quota
-            .max_tokens
-            .is_some_and(|limit| usage.tokens >= limit)
-        {
+        if quota.max_tokens.is_some_and(|limit| usage.tokens >= limit) {
             reasons.push(BudgetReason::HardTokenCeilingReached);
         }
-        if let Some(limit) = self.quota.max_cost_usd {
+        if let Some(limit) = quota.max_cost_usd {
             match usage.cost_usd {
                 Some(cost)
                     if crate::budget_ledger::rolling_cost_exceeds(cost, limit) || cost >= limit =>
@@ -1963,6 +2136,191 @@ mod tests {
             max_cost_usd: None,
             window_seconds: crate::budget_ledger::DEFAULT_ROLLING_WINDOW_SECONDS,
         }
+    }
+
+    fn quota_config(runtime: &str) -> QuotaConfig {
+        QuotaConfig {
+            version: crate::optimizer::quota_pools::QUOTA_CONFIG_VERSION,
+            pools: vec![crate::optimizer::quota_pools::EntitlementDescriptor {
+                runtime: crate::optimizer::ids::RuntimeSlug::new(runtime).expect("runtime"),
+                account: crate::optimizer::quota_pools::AccountId::new("operator")
+                    .expect("account"),
+                pool_kind: crate::optimizer::quota_pools::PoolKind::Metered,
+                window: crate::optimizer::quota_pools::ResetWindow::None,
+                nominal_capacity: crate::optimizer::quota_pools::NominalCapacity::Unknown,
+                rate_limits: crate::optimizer::quota_pools::RateLimits::default(),
+                priority_tier: None,
+                exhaustion_behavior: crate::optimizer::quota_pools::ExhaustionBehavior::FailClosed,
+                authorized_alternatives: Vec::new(),
+                declared_list_price_microunits: Some(1),
+            }],
+        }
+    }
+
+    #[test]
+    fn quota_config_attachment_routes_completed_reconciliation_to_pool() {
+        let (_temp, repo) = rolling_repo();
+        let config = quota_config("gpt-5.6-sol");
+        let mut ledger = RunBudgetLedger::new(RunBudgetLimits::default()).expect("run ledger");
+        ledger
+            .attach_quota_config(&repo, "quota-run", &config)
+            .expect("attach config");
+        let reservation =
+            admitted_reservation(ledger.reserve(request(20, Some(0.2))).expect("reserve"));
+        ledger
+            .reconcile_for_runtime_if_configured(
+                reservation.id,
+                UsageMeasurement::Reliable {
+                    tokens: 12,
+                    cost_usd: Some(0.12),
+                },
+                Some("gpt-5.6-sol"),
+            )
+            .expect("reconcile pool");
+
+        drop(ledger);
+        let workspace = WorkspaceBudgetLedger::open_or_create(&repo).expect("workspace ledger");
+        let usage = workspace
+            .pool_usage(
+                &config.pools[0].key(),
+                crate::budget_ledger::unix_now().expect("now"),
+            )
+            .expect("pool usage");
+        assert_eq!(usage.tokens, 12);
+        assert_eq!(usage.requests, 1);
+        assert_eq!(usage.cost_usd, Some(0.12));
+    }
+
+    #[test]
+    fn autopilot_outer_rolling_binding_composes_only_with_exact_nested_supervise_identity() {
+        let (_temp, repo) = rolling_repo();
+        let _guard =
+            crate::budget_ledger::bind_rolling_budget(&repo, rolling_quota(100), "autopilot-run")
+                .expect("bind outer Autopilot rolling budget");
+        let config = quota_config("codex");
+        let mut nested =
+            RunBudgetLedger::new(RunBudgetLimits::default()).expect("nested supervisor run ledger");
+        nested
+            .attach_quota_config(&repo, "autopilot-run-supervise", &config)
+            .expect("exact nested supervise identity composes with outer binding");
+        let reservation = admitted_reservation(
+            nested
+                .reserve(request(9, None))
+                .expect("combined rolling and quota reservation"),
+        );
+        nested
+            .reconcile_for_runtime_if_configured(
+                reservation.id,
+                UsageMeasurement::Reliable {
+                    tokens: 9,
+                    cost_usd: None,
+                },
+                Some("codex"),
+            )
+            .expect("combined rolling and exact quota reconciliation");
+        drop(nested);
+
+        let mut unrelated =
+            RunBudgetLedger::new(RunBudgetLimits::default()).expect("unrelated supervisor ledger");
+        assert!(matches!(
+            unrelated.attach_quota_config(&repo, "autopilot-run-worker", &config),
+            Err(BudgetError::QuotaConfigInvalid(message))
+                if message.contains("repository/run binding")
+        ));
+        drop(unrelated);
+        drop(_guard);
+
+        let workspace = WorkspaceBudgetLedger::open_or_create(&repo).expect("reopen workspace");
+        let usage = workspace
+            .pool_usage(
+                &config.pools[0].key(),
+                crate::budget_ledger::unix_now().expect("now"),
+            )
+            .expect("nested quota usage");
+        assert_eq!(usage.tokens, 9);
+        assert_eq!(usage.requests, 1);
+    }
+
+    #[test]
+    fn runtime_aware_reconcile_preserves_no_config_behavior_and_refuses_unknown_configured_pool() {
+        let legacy = RunBudgetLedger::new(RunBudgetLimits::default()).expect("legacy ledger");
+        let reservation =
+            admitted_reservation(legacy.reserve(request(10, None)).expect("legacy reserve"));
+        legacy
+            .reconcile_for_runtime_if_configured(
+                reservation.id,
+                UsageMeasurement::Reliable {
+                    tokens: 8,
+                    cost_usd: None,
+                },
+                Some("unconfigured-runtime"),
+            )
+            .expect("legacy reconcile ignores quota runtime without config");
+        assert_eq!(legacy.report().expect("legacy report").consumed.tokens, 8);
+
+        let (_temp, repo) = rolling_repo();
+        let mut configured =
+            RunBudgetLedger::new(RunBudgetLimits::default()).expect("configured ledger");
+        configured
+            .attach_quota_config(&repo, "configured-run", &quota_config("configured"))
+            .expect("attach config");
+        let reservation = admitted_reservation(
+            configured
+                .reserve(request(10, None))
+                .expect("configured reserve"),
+        );
+        assert!(matches!(
+            configured.reconcile_for_runtime_if_configured(
+                reservation.id,
+                UsageMeasurement::Reliable {
+                    tokens: 8,
+                    cost_usd: None,
+                },
+                Some("unknown"),
+            ),
+            Err(BudgetError::QuotaPoolUnavailable(runtime)) if runtime == "unknown"
+        ));
+        configured
+            .release(reservation.id)
+            .expect("unknown runtime did not consume reservation");
+    }
+
+    #[test]
+    fn resumed_run_session_does_not_alias_a_new_reservation_one_completion() {
+        let (_temp, repo) = rolling_repo();
+        let config = quota_config("gpt-5.6-sol");
+        for tokens in [11, 13] {
+            let mut ledger =
+                RunBudgetLedger::new(RunBudgetLimits::default()).expect("run ledger session");
+            ledger
+                .attach_quota_config(&repo, "same-run-id", &config)
+                .expect("attach same run id");
+            let reservation = admitted_reservation(
+                ledger
+                    .reserve(request(tokens, None))
+                    .expect("reservation one"),
+            );
+            assert_eq!(reservation.id.get(), 1);
+            ledger
+                .reconcile_for_runtime_if_configured(
+                    reservation.id,
+                    UsageMeasurement::Reliable {
+                        tokens,
+                        cost_usd: None,
+                    },
+                    Some("gpt-5.6-sol"),
+                )
+                .expect("record distinct session completion");
+        }
+        let workspace = WorkspaceBudgetLedger::open_or_create(&repo).expect("workspace ledger");
+        let usage = workspace
+            .pool_usage(
+                &config.pools[0].key(),
+                crate::budget_ledger::unix_now().expect("now"),
+            )
+            .expect("combined pool usage");
+        assert_eq!(usage.tokens, 24);
+        assert_eq!(usage.requests, 2);
     }
 
     #[test]

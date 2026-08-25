@@ -94,7 +94,8 @@ pub use policy::{PolicyEdge, PolicyGraph, PolicyNode, TransitionCondition, Trans
 pub use predictor::{PolicyOutcomeDistribution, PolicyPredictor};
 pub use quality::QualityContract;
 pub use quota_pools::{
-    build_quota_selector_input, ConsumptionLedger, EntitlementDescriptor, QuotaSelectorInput,
+    build_quota_selector_input, ConsumptionLedger, EntitlementDescriptor, ExhaustionBehavior,
+    PoolReference, QuotaConfig, QuotaSelectorInput,
 };
 pub use resources::{
     DispatchClass, DispatchDecision, DispatchRequest, ResourceObserver, ResourceSnapshot,

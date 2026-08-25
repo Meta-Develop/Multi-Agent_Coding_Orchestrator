@@ -249,7 +249,7 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
         "required": [
             "schema_version", "name", "evidence", "evidence_notice", "production_eligible",
             "model_availability", "overridden_roles", "role_models",
-            "model_catalog_observation", "execution"
+            "model_catalog_observation", "execution", "resolved_objective_profile"
         ],
         "properties": {
             "schema_version": {
@@ -274,6 +274,7 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                 "type": "string",
                 "enum": ["consulted", "consultation_failed", "not_consulted"]
             },
+            "resolved_objective_profile": resolved_objective_profile_schema_value(),
             "execution": {
                 "type": "object",
                 "additionalProperties": false,
@@ -293,6 +294,55 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                     "assignment_selection_ledger": assignment_selection_ledger_schema_value(),
                     "selection_decisions": selection_decisions_schema_value(),
                     "usage": execution_usage_schema_value()
+                }
+            }
+        }
+    })
+}
+
+fn resolved_objective_profile_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["profile", "source"],
+        "properties": {
+            "source": {
+                "type": "string",
+                "enum": ["built_in", "repository_override"]
+            },
+            "profile": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id", "version", "content_hash", "quality", "tradeoffs"],
+                "properties": {
+                    "id": {"type": "string", "minLength": 1},
+                    "version": {"type": "integer", "minimum": 1},
+                    "content_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "quality": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["held_out_percent", "breadth_percent", "anti_shortcut_percent"],
+                        "properties": {
+                            "held_out_percent": {"type": "integer", "minimum": 0, "maximum": 100},
+                            "breadth_percent": {"type": "integer", "minimum": 0, "maximum": 100},
+                            "anti_shortcut_percent": {"type": "integer", "minimum": 0, "maximum": 100}
+                        }
+                    },
+                    "tradeoffs": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                            "monetary_cost_percent", "quota_consumption_percent", "latency_percent",
+                            "retry_rework_percent", "human_review_percent"
+                        ],
+                        "properties": {
+                            "monetary_cost_percent": {"type": "integer", "minimum": 0, "maximum": 100},
+                            "quota_consumption_percent": {"type": "integer", "minimum": 0, "maximum": 100},
+                            "latency_percent": {"type": "integer", "minimum": 0, "maximum": 100},
+                            "retry_rework_percent": {"type": "integer", "minimum": 0, "maximum": 100},
+                            "human_review_percent": {"type": "integer", "minimum": 0, "maximum": 100}
+                        }
+                    }
                 }
             }
         }
@@ -353,7 +403,8 @@ fn assignment_selection_ledger_schema_value() -> serde_json::Value {
                     "type": "string",
                     "enum": [
                         "automatic", "plan_role_models", "operator_override", "budget_degrade",
-                        "retry", "legacy_fake", "legacy_nonpublishable_simulation"
+                        "low_difficulty_mechanical", "retry", "legacy_fake",
+                        "legacy_nonpublishable_simulation"
                     ]
                 },
                 "selected_runtime": {"type": ["string", "null"], "minLength": 1},
@@ -402,8 +453,74 @@ fn assignment_selection_ledger_schema_value() -> serde_json::Value {
                         }
                     }
                 },
+                "quota_evidence": runtime_pool_state_schema_value(),
                 "evidence_gap": {"type": ["string", "null"], "minLength": 1}
             }
+        }
+    })
+}
+
+fn runtime_pool_state_schema_value() -> serde_json::Value {
+    let pool_reference = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["runtime", "account", "window"],
+        "properties": {
+            "runtime": {"type": "string", "minLength": 1},
+            "account": {"type": "string", "minLength": 1},
+            "window": {
+                "oneOf": [
+                    {"enum": ["none", "calendar_month"]},
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["rolling_hours"],
+                        "properties": {
+                            "rolling_hours": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["hours"],
+                                "properties": {"hours": {"type": "integer", "minimum": 1}}
+                            }
+                        }
+                    }
+                ]
+            }
+        }
+    });
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "runtime", "admission_open", "pool_reference", "pool_kind",
+            "entitlement_bounded", "entitlement_capacity_units",
+            "entitlement_remaining_units", "pool_pressure_basis_points",
+            "observed_consumption_units", "marginal_cost_microunits", "exhausted",
+            "exhaustion_behavior", "authorized_alternatives", "observation_revision",
+            "observation_source", "admission_provenance", "failover_provenance"
+        ],
+        "properties": {
+            "runtime": {"type": "string", "minLength": 1},
+            "admission_open": {"type": "boolean"},
+            "pool_reference": pool_reference.clone(),
+            "pool_kind": {"enum": ["subscription_included", "metered", "prepaid_credits"]},
+            "entitlement_bounded": {"type": "boolean"},
+            "entitlement_capacity_units": {"type": "integer", "minimum": 0},
+            "entitlement_remaining_units": {"type": "integer", "minimum": 0},
+            "pool_pressure_basis_points": {"type": "integer", "minimum": 0, "maximum": 10000},
+            "observed_consumption_units": {"type": "integer", "minimum": 0},
+            "marginal_cost_microunits": {"type": "integer", "minimum": 0},
+            "exhausted": {"type": "boolean"},
+            "exhaustion_behavior": {"enum": ["fail_closed", "degrade"]},
+            "authorized_alternatives": {
+                "type": "array",
+                "items": pool_reference,
+                "uniqueItems": true
+            },
+            "observation_revision": {"type": "string", "minLength": 1},
+            "observation_source": {"const": "local_observed"},
+            "admission_provenance": {"type": "string", "minLength": 1},
+            "failover_provenance": {"type": ["string", "null"], "minLength": 1}
         }
     })
 }
@@ -447,6 +564,15 @@ fn reasoning_effort_schema_value() -> serde_json::Value {
 }
 
 fn budget_degradation_records_schema_value() -> serde_json::Value {
+    let role_binding = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["model", "reasoning_effort"],
+        "properties": {
+            "model": {"type": ["string", "null"]},
+            "reasoning_effort": {"type": ["string", "null"]}
+        }
+    });
     let change = json!({
         "oneOf": [
             {
@@ -487,6 +613,14 @@ fn budget_degradation_records_schema_value() -> serde_json::Value {
                     "before_new_dispatch_allowed": {"type": "boolean"},
                     "after_new_dispatch_allowed": {"type": "boolean"}
                 }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "role"],
+                "properties": {
+                    "kind": {"const": "role_binding_applied"},
+                    "role": {"const": "worker"}
+                }
             }
         ]
     });
@@ -496,13 +630,17 @@ fn budget_degradation_records_schema_value() -> serde_json::Value {
             "type": "object",
             "additionalProperties": false,
             "required": [
-                "sequence", "assignment_id", "budget_action", "budget_reasons", "change",
+                "sequence", "assignment_id", "trigger", "budget_action", "budget_reasons", "change",
                 "effective_child_model", "effective_child_reasoning_effort", "effective_fan_out",
                 "observation"
             ],
             "properties": {
                 "sequence": {"type": "integer", "minimum": 1},
                 "assignment_id": {"type": "string", "minLength": 1},
+                "trigger": {
+                    "type": "string",
+                    "enum": ["budget_pressure", "low_difficulty_mechanical"]
+                },
                 "budget_action": {"type": "string", "enum": ["continue", "degrade", "owner_escalation"]},
                 "budget_reasons": {
                     "type": "array",
@@ -515,11 +653,21 @@ fn budget_degradation_records_schema_value() -> serde_json::Value {
                     ]},
                     "uniqueItems": true
                 },
-                "change": change
-                ,"effective_child_model": {"type": ["string", "null"]}
-                ,"effective_child_reasoning_effort": {"type": ["string", "null"]}
-                ,"effective_fan_out": {"type": "integer", "minimum": 1}
-                ,"observation": {"const": "admission_policy_resolved"}
+                "change": change,
+                "role_binding_transition": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["role", "before", "after"],
+                    "properties": {
+                        "role": {"const": "worker"},
+                        "before": role_binding.clone(),
+                        "after": role_binding
+                    }
+                },
+                "effective_child_model": {"type": ["string", "null"]},
+                "effective_child_reasoning_effort": {"type": ["string", "null"]},
+                "effective_fan_out": {"type": "integer", "minimum": 1},
+                "observation": {"const": "admission_policy_resolved"}
             }
         }
     })
@@ -593,7 +741,7 @@ fn admission_policy_input_schema_value() -> serde_json::Value {
     });
     let source = json!({
         "type": "string",
-        "enum": ["configured", "conservative_default", "measured"]
+        "enum": ["configured", "operator_quota_config", "conservative_default", "measured"]
     });
     json!({
         "type": "object",
@@ -609,6 +757,9 @@ fn admission_policy_input_schema_value() -> serde_json::Value {
             "effective": admission_config,
             "provider_inflight_bound": {"type": "integer", "minimum": 1},
             "provider_inflight_source": source.clone(),
+            "quota_inflight_bound": optional_positive.clone(),
+            "quota_inflight_source": source.clone(),
+            "quota_config_path": {"type": ["string", "null"], "minLength": 1},
             "host": {
                 "type": "object",
                 "additionalProperties": false,
@@ -2002,6 +2153,173 @@ pub(super) fn write_private_prompt(
 mod selection_schema_tests {
     use super::*;
 
+    const TRACKED_SUPERVISOR_SCHEMA: &str = "schemas/supervisor-final-report-v1.schema.json";
+
+    fn skip_json_whitespace(bytes: &[u8], cursor: &mut usize) {
+        while bytes
+            .get(*cursor)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            *cursor += 1;
+        }
+    }
+
+    fn json_value_end(bytes: &[u8], start: usize) -> Result<usize> {
+        let first = *bytes
+            .get(start)
+            .with_context(|| format!("JSON value starts beyond byte {start}"))?;
+        if first == b'"' {
+            let mut escaped = false;
+            for (offset, byte) in bytes[start + 1..].iter().enumerate() {
+                if escaped {
+                    escaped = false;
+                } else if *byte == b'\\' {
+                    escaped = true;
+                } else if *byte == b'"' {
+                    return Ok(start + offset + 2);
+                }
+            }
+            bail!("unterminated JSON string at byte {start}");
+        }
+        if matches!(first, b'{' | b'[') {
+            let mut stack = vec![if first == b'{' { b'}' } else { b']' }];
+            let mut escaped = false;
+            let mut in_string = false;
+            for (offset, byte) in bytes[start + 1..].iter().enumerate() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if *byte == b'\\' {
+                        escaped = true;
+                    } else if *byte == b'"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match *byte {
+                    b'"' => in_string = true,
+                    b'{' => stack.push(b'}'),
+                    b'[' => stack.push(b']'),
+                    b'}' | b']' if stack.last() == Some(byte) => {
+                        stack.pop();
+                        if stack.is_empty() {
+                            return Ok(start + offset + 2);
+                        }
+                    }
+                    b'}' | b']' => bail!("mismatched JSON delimiter at byte {start}"),
+                    _ => {}
+                }
+            }
+            bail!("unterminated JSON container at byte {start}");
+        }
+        let end = bytes[start..]
+            .iter()
+            .position(|byte| byte.is_ascii_whitespace() || matches!(*byte, b',' | b'}' | b']'))
+            .map(|offset| start + offset)
+            .unwrap_or(bytes.len());
+        if end == start {
+            bail!("empty JSON primitive at byte {start}");
+        }
+        Ok(end)
+    }
+
+    fn json_object_property_range(
+        bytes: &[u8],
+        object: std::ops::Range<usize>,
+        wanted: &str,
+    ) -> Result<std::ops::Range<usize>> {
+        if bytes.get(object.start) != Some(&b'{') {
+            bail!("JSON pointer parent for '{wanted}' is not an object");
+        }
+        let mut cursor = object.start + 1;
+        loop {
+            skip_json_whitespace(bytes, &mut cursor);
+            if bytes.get(cursor) == Some(&b'}') {
+                bail!("JSON object is missing property '{wanted}'");
+            }
+            let key_start = cursor;
+            let key_end = json_value_end(bytes, key_start)?;
+            let key: String = serde_json::from_slice(&bytes[key_start..key_end])
+                .with_context(|| format!("parse JSON object key for '{wanted}'"))?;
+            cursor = key_end;
+            skip_json_whitespace(bytes, &mut cursor);
+            if bytes.get(cursor) != Some(&b':') {
+                bail!("JSON object property '{key}' is missing its colon");
+            }
+            cursor += 1;
+            skip_json_whitespace(bytes, &mut cursor);
+            let value_start = cursor;
+            let value_end = json_value_end(bytes, value_start)?;
+            if key == wanted {
+                return Ok(value_start..value_end);
+            }
+            cursor = value_end;
+            skip_json_whitespace(bytes, &mut cursor);
+            match bytes.get(cursor) {
+                Some(b',') => cursor += 1,
+                Some(b'}') => bail!("JSON object is missing property '{wanted}'"),
+                _ => bail!("JSON object property '{key}' has an invalid terminator"),
+            }
+        }
+    }
+
+    fn json_pointer_range(bytes: &[u8], segments: &[&str]) -> Result<std::ops::Range<usize>> {
+        let mut cursor = 0;
+        skip_json_whitespace(bytes, &mut cursor);
+        let mut range = cursor..json_value_end(bytes, cursor)?;
+        for segment in segments {
+            range = json_object_property_range(bytes, range, segment)?;
+        }
+        Ok(range)
+    }
+
+    fn indented_json_replacement(
+        document: &[u8],
+        range: &std::ops::Range<usize>,
+        value: &serde_json::Value,
+    ) -> Result<Vec<u8>> {
+        let line_start = document[..range.start]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let indent = document[line_start..range.start]
+            .iter()
+            .take_while(|byte| **byte == b' ')
+            .count();
+        let pretty = serde_json::to_string_pretty(value).context("serialize JSON replacement")?;
+        let mut rendered = Vec::with_capacity(pretty.len() + indent * 4);
+        for (index, line) in pretty.lines().enumerate() {
+            if index > 0 {
+                rendered.push(b'\n');
+                rendered.extend(std::iter::repeat_n(b' ', indent));
+            }
+            rendered.extend_from_slice(line.as_bytes());
+        }
+        Ok(rendered)
+    }
+
+    fn replace_json_values_preserving_document(
+        original: &[u8],
+        replacements: &[(&[&str], serde_json::Value)],
+    ) -> Result<Vec<u8>> {
+        let mut ranged = replacements
+            .iter()
+            .map(|(segments, value)| {
+                let range = json_pointer_range(original, segments)?;
+                let rendered = indented_json_replacement(original, &range, value)?;
+                Ok((range, rendered))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ranged.sort_by(|left, right| right.0.start.cmp(&left.0.start));
+        let mut output = original.to_vec();
+        for (range, replacement) in ranged {
+            output.splice(range, replacement);
+        }
+        serde_json::from_slice::<serde_json::Value>(&output)
+            .context("synchronized tracked supervisor schema is invalid JSON")?;
+        Ok(output)
+    }
+
     fn required_contains(schema: &serde_json::Value, field: &str) -> bool {
         schema["required"]
             .as_array()
@@ -2056,6 +2374,126 @@ mod selection_schema_tests {
                 ["properties"]["execution"],
             "assignment_selection_ledger"
         ));
+        Ok(())
+    }
+
+    /// Explicit maintainer action for synchronizing generated execution
+    /// subcontracts into the broader published supervisor-report envelope.
+    ///
+    /// Run with:
+    /// `cargo test --lib supervise::schema_artifacts::selection_schema_tests::regenerate_tracked_supervisor_execution_schemas -- --ignored --exact`
+    #[test]
+    #[ignore = "explicitly rewrites the tracked supervisor schema"]
+    fn regenerate_tracked_supervisor_execution_schemas() -> Result<()> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(TRACKED_SUPERVISOR_SCHEMA);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("inspect tracked schema {}", path.display()))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            bail!(
+                "tracked supervisor schema must be a regular nofollow file: {}",
+                path.display()
+            );
+        }
+        let original =
+            fs::read(&path).with_context(|| format!("read tracked schema {}", path.display()))?;
+        let tracked: serde_json::Value = serde_json::from_slice(&original)
+            .with_context(|| format!("parse tracked schema {}", path.display()))?;
+        let published_id = tracked["$id"].clone();
+        let published_title = tracked["title"].clone();
+        let published_required = tracked["required"].clone();
+
+        let generated = supervisor_final_report_schema_value();
+        let generated_execution =
+            &generated["properties"]["role_economics_profile"]["properties"]["execution"];
+        let generated_concurrency = &generated_execution["properties"]["concurrency"];
+        let generated_admission =
+            &generated_concurrency["properties"]["policy_input_details"]["anyOf"][0];
+        let mut admission_properties =
+            tracked["$defs"]["admissionPolicyInput"]["properties"].clone();
+        let admission_properties_object = admission_properties
+            .as_object_mut()
+            .context("tracked admissionPolicyInput properties are not an object")?;
+        for field in [
+            "quota_inflight_bound",
+            "quota_inflight_source",
+            "quota_config_path",
+        ] {
+            admission_properties_object.insert(
+                field.to_string(),
+                generated_admission["properties"][field].clone(),
+            );
+        }
+        let replacements: &[(&[&str], serde_json::Value)] = &[
+            (
+                &["$defs", "execution", "properties", "selection_decisions"],
+                generated_execution["properties"]["selection_decisions"].clone(),
+            ),
+            (
+                &[
+                    "$defs",
+                    "execution",
+                    "properties",
+                    "assignment_selection_ledger",
+                ],
+                generated_execution["properties"]["assignment_selection_ledger"].clone(),
+            ),
+            (
+                &["$defs", "admissionPolicyInput", "properties"],
+                admission_properties,
+            ),
+            (
+                &["$defs", "admissionInputSource", "enum"],
+                json!([
+                    "configured",
+                    "operator_quota_config",
+                    "conservative_default",
+                    "measured"
+                ]),
+            ),
+        ];
+        let rendered = replace_json_values_preserving_document(&original, replacements)?;
+        let rendered_value: serde_json::Value = serde_json::from_slice(&rendered)
+            .context("parse synchronized tracked supervisor schema")?;
+        if rendered_value["$id"] != published_id
+            || rendered_value["title"] != published_title
+            || rendered_value["required"] != published_required
+        {
+            bail!("schema regeneration changed the published report envelope");
+        }
+        fs::write(&path, rendered)
+            .with_context(|| format!("write tracked schema {}", path.display()))?;
+        Ok(())
+    }
+
+    #[test]
+    fn degradation_and_ledger_source_schemas_match_tracked_artifact_exactly() -> Result<()> {
+        let dynamic = supervisor_final_report_schema_value();
+        let dynamic_execution =
+            &dynamic["properties"]["role_economics_profile"]["properties"]["execution"];
+        let tracked: serde_json::Value = serde_json::from_str(include_str!(
+            "../../schemas/supervisor-final-report-v1.schema.json"
+        ))?;
+        let tracked_execution = &tracked["$defs"]["execution"];
+
+        assert_eq!(
+            tracked_execution["properties"]["assignment_selection_ledger"]["items"]["properties"]
+                ["selection_source"],
+            dynamic_execution["properties"]["assignment_selection_ledger"]["items"]["properties"]
+                ["selection_source"]
+        );
+        let tracked_degradations = &tracked_execution["properties"]["budget_degradations"];
+        let dynamic_degradations = &dynamic_execution["properties"]["budget_degradations"];
+        assert_eq!(tracked_degradations["type"], dynamic_degradations["type"]);
+        let mut tracked_record = tracked["$defs"]["budgetDegradationRecord"].clone();
+        tracked_record["properties"]["budget_reasons"]["items"] =
+            tracked["$defs"]["budgetReason"].clone();
+        tracked_record["properties"]["change"] =
+            tracked["$defs"]["budgetDegradationChange"].clone();
+        for index in [0, 1] {
+            tracked_record["properties"]["change"]["oneOf"][index]["properties"]["role"] =
+                tracked["$defs"]["agentRole"].clone();
+        }
+        assert_eq!(tracked_record, dynamic_degradations["items"]);
         Ok(())
     }
 }

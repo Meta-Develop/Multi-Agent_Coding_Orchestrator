@@ -16,6 +16,7 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
         "max_child_assignments": 1,
         "assignments": [{
             "id": "child-a",
+            "phase": "execution",
             "assigned_paths": ["README.md"]
         }]
     });
@@ -32,6 +33,36 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
     )
     .expect("normalize legacy plan");
     assert!(legacy_normalized.get("run_budget").is_none());
+
+    let mut mechanical_source = legacy_source.clone();
+    mechanical_source["assignments"][0]["worker_assignments"] = json!([{
+        "id": "worker-a",
+        "role": "worker",
+        "assigned_paths": ["README.md"],
+        "mechanical_duty": "run_preselected_command"
+    }]);
+    let mechanical = parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&mechanical_source).expect("serialize mechanical plan"),
+    )
+    .expect("parse typed mechanical Worker metadata");
+    assert_eq!(
+        mechanical
+            .assignment_metadata
+            .get(&("child-a".to_string(), "worker-a".to_string()))
+            .and_then(|metadata| metadata.mechanical_duty),
+        Some(MechanicalTerminalDuty::RunPreselectedCommand)
+    );
+    let mechanical_normalized = supervisor_plan_value(
+        &mechanical.plan,
+        &mechanical.consultant,
+        &mechanical.assignment_metadata,
+        &mechanical.plan_metadata,
+    )
+    .expect("normalize typed mechanical Worker metadata");
+    assert_eq!(
+        mechanical_normalized["assignments"][0]["worker_assignments"][0]["mechanical_duty"],
+        "run_preselected_command"
+    );
 
     let mut budget_source = legacy_source;
     budget_source["run_budget"] = json!({
@@ -166,6 +197,20 @@ fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
                     .any(|observation| observation == "not_process_observable"))
         );
     }
+    let degradations = &schema["properties"]["role_economics_profile"]["properties"]["execution"]
+        ["properties"]["budget_degradations"]["items"];
+    assert!(degradations["required"]
+        .as_array()
+        .is_some_and(|required| required.iter().any(|field| field == "trigger")));
+    assert!(degradations["properties"]["trigger"]["enum"]
+        .as_array()
+        .is_some_and(|triggers| triggers
+            .iter()
+            .any(|trigger| trigger == "low_difficulty_mechanical")));
+    assert_eq!(
+        degradations["properties"]["role_binding_transition"]["properties"]["before"]["required"],
+        json!(["model", "reasoning_effort"])
+    );
 }
 
 #[test]
@@ -476,7 +521,7 @@ fn budget_integration_concurrent_scheduler_cannot_oversubscribe_and_drains_admit
 }
 
 #[test]
-fn budget_integration_scheduler_applies_and_persists_degrade_ladder_before_halt() {
+fn budget_integration_scheduler_preserves_judgment_bindings_before_halt() {
     let (temp, repo_path) = injected_repository();
     let assignments = (0..7)
         .map(|index| {
@@ -565,11 +610,11 @@ fn budget_integration_scheduler_applies_and_persists_degrade_ladder_before_halt(
     );
     assert_eq!(
         child_bindings["degrade-child-1"],
-        (FRONTIER_PROFILE_MODEL.to_string(), "high".to_string())
+        (FRONTIER_PROFILE_MODEL.to_string(), "xhigh".to_string())
     );
     assert_eq!(
         child_bindings["degrade-child-2"],
-        (FRONTIER_PROFILE_MODEL.to_string(), "high".to_string())
+        (FRONTIER_PROFILE_MODEL.to_string(), "xhigh".to_string())
     );
     assert!(!child_bindings.contains_key("degrade-child-6"));
 
@@ -578,25 +623,15 @@ fn budget_integration_scheduler_applies_and_persists_degrade_ladder_before_halt(
         .as_ref()
         .and_then(|profile| profile.execution.as_ref())
         .expect("execution telemetry");
-    assert_eq!(execution.budget_degradations.len(), 3);
+    assert_eq!(execution.budget_degradations.len(), 1);
     assert!(matches!(
         execution.budget_degradations[0].change,
-        BudgetDegradationChange::ReasoningEffort { .. }
-    ));
-    assert_eq!(
-        execution.budget_degradations[1].change,
-        BudgetDegradationChange::FanOut {
-            before: 8,
-            after: 4
-        }
-    );
-    assert!(matches!(
-        execution.budget_degradations[2].change,
         BudgetDegradationChange::Halt { .. }
     ));
-    assert_eq!(
+    assert_ne!(
         execution.role_bindings[&AgentRole::ChildOrchestrator].observation,
-        RoleBindingObservation::AssignmentSpecific
+        RoleBindingObservation::AssignmentSpecific,
+        "budget pressure must not degrade a judgment binding"
     );
     assert_eq!(
         execution
@@ -613,8 +648,8 @@ fn budget_integration_scheduler_applies_and_persists_degrade_ladder_before_halt(
             .collect::<Vec<_>>(),
         vec![
             ("degrade-child-0", "xhigh"),
-            ("degrade-child-1", "high"),
-            ("degrade-child-2", "high"),
+            ("degrade-child-1", "xhigh"),
+            ("degrade-child-2", "xhigh"),
         ]
     );
     let degraded_child_binding = execution
@@ -650,7 +685,7 @@ fn budget_integration_scheduler_applies_and_persists_degrade_ladder_before_halt(
         persisted["role_economics_profile"]["execution"]["budget_degradations"]
             .as_array()
             .map(Vec::len),
-        Some(3)
+        Some(1)
     );
 }
 
