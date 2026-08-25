@@ -19,6 +19,7 @@ Tool-call batching:
 - Batch independent, side-effect-free inspections in one tool call when the runtime supports it.
 - Keep dependent steps, approval-sensitive actions, and mutations ordered. Batching never relaxes ownership, journaling, validation, or audit requirements.";
 
+#[cfg(test)]
 fn enforce_rendered_prompt_ceiling(role: &str, rendered: &str, ceiling: usize) -> Result<()> {
     if rendered.len() > ceiling {
         bail!(
@@ -1149,11 +1150,12 @@ REVIEW_LENS_REQUEST_JSON:
         model = lens.backend.model(),
         reasoning_effort = reasoning_effort,
     );
-    enforce_rendered_prompt_ceiling(
-        "parent acceptance auditor review lens",
-        &prompt,
-        PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES,
-    )?;
+    if prompt.len() > MAX_SUPERVISOR_PROMPT_BYTES {
+        bail!(
+            "review lens prompt exceeds its {} byte launch limit",
+            MAX_SUPERVISOR_PROMPT_BYTES
+        );
+    }
     let measurement = PromptByteMeasurement::new(
         PromptMeasurementRole::ParentAcceptanceAuditor,
         auditor_id,
@@ -2266,7 +2268,7 @@ mod regression_tests {
     }
 
     #[test]
-    fn review_lens_prompt_rejects_parent_auditor_ceiling_overrun() -> Result<()> {
+    fn review_lens_prompt_accepts_bounded_full_transcript_above_fixture_ceiling() -> Result<()> {
         let assignment = OrchestratorAssignment {
             id: "child-bounded-lens".to_string(),
             runtime: None,
@@ -2287,18 +2289,19 @@ mod regression_tests {
                 model: "gpt-5".to_string(),
                 reasoning_effort: Some("high".to_string()),
             },
-            information_scope: ReviewInformationScope::OutputReportOnly,
+            information_scope: ReviewInformationScope::FullChildTranscript,
         };
-        let oversized_report = "x".repeat(PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES);
+        let child_transcript = "t".repeat(96 * 1024);
+        let output_report = "r".repeat(32 * 1024);
         let request = build_review_lens_request(
             &lens,
             ReviewLensRequestSources {
-                child_transcript: "",
-                diff: "",
-                output_report: &oversized_report,
+                child_transcript: &child_transcript,
+                diff: "+bounded live diff",
+                output_report: &output_report,
             },
         )?;
-        let error = match render_review_lens_auditor_prompt(
+        let rendered = render_review_lens_auditor_prompt(
             ReviewLensAuditorPromptContext {
                 assignment: &assignment,
                 lens: &lens,
@@ -2307,20 +2310,27 @@ mod regression_tests {
                 required_coverage: &ReviewCoverageRequirement::default(),
             },
             0,
-        ) {
-            Ok(_) => panic!("an oversized real lens prompt must fail before launch"),
-            Err(error) => error,
-        };
+        )?;
 
         assert!(
-            error
-                .to_string()
-                .contains("parent acceptance auditor review lens"),
-            "unexpected rejection: {error}"
+            rendered.prompt.len() > PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES,
+            "bounded live evidence should exceed only the fixed-fixture budget"
         );
-        assert!(error
-            .to_string()
-            .contains(&PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES.to_string()));
+        assert!(
+            rendered.prompt.len() <= MAX_SUPERVISOR_PROMPT_BYTES,
+            "bounded live evidence must stay within the trusted launch limit"
+        );
+        assert!(rendered.prompt.contains(&child_transcript));
+        assert!(rendered.prompt.contains(&output_report));
+        assert_eq!(rendered.measurements.prompts.len(), 1);
+        assert_eq!(
+            rendered.measurements.prompts[0].full_bytes,
+            rendered.prompt.len()
+        );
+        assert_eq!(
+            rendered.measurements.prompts[0].fixture_ceiling_bytes,
+            PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES
+        );
         Ok(())
     }
 }
