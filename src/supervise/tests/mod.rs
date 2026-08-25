@@ -843,6 +843,12 @@ fn commit_injected_managed_child_result(command: &ExternalAgentCommand) {
     {
         return;
     }
+    if !command.cwd.join(".git").is_file() {
+        // Fixtures without a linked-worktree gitdir pointer (no .git, or a
+        // plain repository .git directory) exercise paths before or beside
+        // the child Git boundary; there is nothing to commit on their behalf.
+        return;
+    }
 
     crate::external_agent::prepare_managed_child_git_boundary_for_test(&command.cwd)
         .expect("prepare injected managed-child private Git boundary");
