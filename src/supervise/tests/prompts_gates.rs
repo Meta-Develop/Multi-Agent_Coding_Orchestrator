@@ -344,6 +344,13 @@ fn worker_prompt_includes_execution_journal_contract() {
     assert!(prompt.contains("Never create, replace, rename, link, truncate, or swap"));
     assert!(prompt.contains("Never reconstruct at the end"));
     assert!(prompt.contains("WorkerExecutionJournalRecordError"));
+    assert!(prompt.contains("WorkerReport.commands_run may be a subset of real journal records"));
+    assert!(prompt.contains(
+        "each command array element and cwd must be copied byte-for-byte, failed commands included"
+    ));
+    assert!(prompt.contains(
+        "Never paraphrase, summarize, normalize environment assignments, drop shell wrappers, or invent command identities"
+    ));
     assert!(prompt.contains("\"command\":[\"apply_patch\","));
     assert!(prompt.contains("\"cwd\":\"/worktree\""));
     assert!(prompt.contains("\"start_timestamp\":\"2026-08-25T00:00:00Z\""));

@@ -1102,6 +1102,81 @@ fn injected_worker_execution_journals_reject_material_mismatches() {
 }
 
 #[test]
+fn worker_journal_reconciliation_accepts_exact_multiline_and_failed_command_identities() {
+    let assignment = injected_assignment(true);
+    let report_path = Path::new("worker-journal-exact-command-identities.json");
+    let cwd = PathBuf::from("/native/local/tmp/c6/a1/.maco/worktrees/r/assignment-001");
+    let multiline_command = vec![
+        "bash".to_string(),
+        "-lc".to_string(),
+        "set -euo pipefail\nprivate_git=/native/local/tmp/c6/a1/r/.git/worktrees/assignment-001/maco-private-git-v1\ncommon_objects=/native/local/tmp/c6/a1/r/.git/objects\nGIT_ALTERNATE_OBJECT_DIRECTORIES=\"$common_objects\" git --git-dir=\"$private_git\" --work-tree=/native/local/tmp/c6/a1/.maco/worktrees/r/assignment-001 status --short".to_string(),
+    ];
+    let failed_command = vec![
+        "bash".to_string(),
+        "-lc".to_string(),
+        "git add -- RELEASE_NOTES.md".to_string(),
+    ];
+
+    let mut multiline_record = injected_command_record();
+    multiline_record.command = multiline_command.clone();
+    multiline_record.cwd = cwd.clone();
+    let mut failed_record = injected_command_record();
+    failed_record.command = failed_command.clone();
+    failed_record.cwd = cwd.clone();
+    failed_record.exit_code = Some(128);
+    failed_record.status = ReviewStatus::Failed;
+    failed_record.error = Some("managed worktree index is read-only".to_string());
+
+    let journals = injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(vec![
+        WorkerExecutionJournalEntry {
+            command: multiline_command,
+            cwd: cwd.clone(),
+            start_timestamp: "2026-08-25T02:16:22Z".to_string(),
+            end_timestamp: "2026-08-25T02:16:22Z".to_string(),
+            changed_paths: Vec::new(),
+        },
+        WorkerExecutionJournalEntry {
+            command: failed_command,
+            cwd,
+            start_timestamp: "2026-08-25T02:15:49Z".to_string(),
+            end_timestamp: "2026-08-25T02:15:49Z".to_string(),
+            changed_paths: Vec::new(),
+        },
+    ]));
+
+    let mut exact = injected_child_report(&assignment);
+    exact.worker_reports[0].commands_run = vec![multiline_record, failed_record];
+    validate_worker_execution_journal_evidence(&assignment, report_path, &journals, &mut exact);
+
+    assert_eq!(exact.status, ReviewStatus::Succeeded);
+    assert!(exact.accepted);
+    assert!(!exact.rejected);
+    assert_eq!(
+        exact.worker_reports[0].commands_run[1].status,
+        ReviewStatus::Failed,
+        "a failed command remains reportable when its command and cwd identity are exact"
+    );
+    assert!(!finding_messages(&exact).contains("not supported by execution journal"));
+
+    let mut paraphrased = injected_child_report(&assignment);
+    paraphrased.worker_reports[0].commands_run = exact.worker_reports[0].commands_run.clone();
+    paraphrased.worker_reports[0].commands_run[0].command[2] =
+        "validate private Git status".to_string();
+    validate_worker_execution_journal_evidence(
+        &assignment,
+        report_path,
+        &journals,
+        &mut paraphrased,
+    );
+
+    assert_eq!(paraphrased.status, ReviewStatus::Failed);
+    assert!(!paraphrased.accepted);
+    assert!(paraphrased.rejected);
+    assert!(finding_messages(&paraphrased)
+        .contains("commands_run entries are not supported by execution journal"));
+}
+
+#[test]
 fn primary_integrity_matrix_covers_index_flags_split_sparse_submodule_non_utf8_and_runtime_roots() {
     let base = injected_primary_snapshot();
     let replacement = injected_oid("replacement");
