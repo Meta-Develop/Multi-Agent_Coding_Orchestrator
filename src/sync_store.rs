@@ -4024,6 +4024,32 @@ mod tests {
 
     #[test]
     fn concurrent_claims_are_serialized_without_lost_updates() {
+        #[cfg(unix)]
+        if env::var_os(WATCHDOG_RECEIPT_PATH_ENV).is_none() {
+            const CHILD_TEST: &str =
+                "sync_store::tests::concurrent_claims_are_serialized_without_lost_updates";
+            const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
+            let temp = TempDir::new().expect("concurrent claims watchdog tempdir");
+            let receipt_path = temp.path().join("completion-receipt");
+            let outcome =
+                run_exact_current_test_with_watchdog(CHILD_TEST, CHILD_TIMEOUT, &[], &receipt_path)
+                    .expect("run concurrent claims child under watchdog");
+            match outcome {
+                ExactTestOutcome::Completed { status, receipt } => {
+                    assert!(
+                        status.success() && receipt == CompletionReceipt::Confirmed,
+                        "{CHILD_TEST} completed without exact success evidence: status={status}, receipt={receipt:?}"
+                    );
+                }
+                ExactTestOutcome::TimedOut { pid, status } => {
+                    panic!(
+                        "{CHILD_TEST} exceeded its {CHILD_TIMEOUT:?} bound; killed and reaped PID {pid} with status {status}"
+                    );
+                }
+            }
+            return;
+        }
+
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -4038,12 +4064,29 @@ mod tests {
                 )
             }));
         }
-        for worker in workers {
-            worker.join().expect("worker thread").expect("claim");
-        }
+        let outcomes = workers
+            .into_iter()
+            .enumerate()
+            .map(|(index, worker)| (index, worker.join()))
+            .collect::<Vec<_>>();
+        let failures = outcomes
+            .into_iter()
+            .filter_map(|(index, outcome)| match outcome {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) => Some(format!("worker {index} claim failed: {error:#}")),
+                Err(_) => Some(format!("worker {index} panicked")),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            failures.is_empty(),
+            "concurrent claim workers failed after all joins:\n{}",
+            failures.join("\n")
+        );
 
         let claims = store.snapshot().expect("snapshot");
         assert_eq!(claims.len(), 16);
+        #[cfg(unix)]
+        write_completion_receipt_if_requested();
     }
 
     #[test]
