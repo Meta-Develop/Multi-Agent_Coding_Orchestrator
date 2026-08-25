@@ -696,6 +696,7 @@
         "overridden_roles",
         "role_models",
         "model_catalog_observation",
+        "resolved_objective_profile",
         "execution"
       ],
       "properties": {
@@ -741,6 +742,112 @@
             "consultation_failed",
             "not_consulted"
           ]
+        },
+        "resolved_objective_profile": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "profile",
+            "source"
+          ],
+          "properties": {
+            "profile": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "version",
+                "content_hash",
+                "quality",
+                "tradeoffs"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "version": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "content_hash": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "quality": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "held_out_percent",
+                    "breadth_percent",
+                    "anti_shortcut_percent"
+                  ],
+                  "properties": {
+                    "held_out_percent": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 100
+                    },
+                    "breadth_percent": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 100
+                    },
+                    "anti_shortcut_percent": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 100
+                    }
+                  }
+                },
+                "tradeoffs": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "monetary_cost_percent",
+                    "quota_consumption_percent",
+                    "latency_percent",
+                    "retry_rework_percent",
+                    "human_review_percent"
+                  ],
+                  "properties": {
+                    "monetary_cost_percent": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 100
+                    },
+                    "quota_consumption_percent": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 100
+                    },
+                    "latency_percent": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 100
+                    },
+                    "retry_rework_percent": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 100
+                    },
+                    "human_review_percent": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 100
+                    }
+                  }
+                }
+              }
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "built_in",
+                "repository_override"
+              ]
+            }
+          }
         },
         "execution": {
           "$ref": "#/$defs/execution"
@@ -930,7 +1037,7 @@
         },
         "selection_decisions": {
           "type": "array",
-"items": {
+          "items": {
             "additionalProperties": false,
             "properties": {
               "assignment_id": {
@@ -1173,6 +1280,18 @@
                                   "minimum": 0,
                                   "type": "integer"
                                 },
+                                "human_review_adjustment_microunits": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "human_review_cost_proxy_microunits": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "legacy_baseline_score_microunits": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
                                 "marginal_cost_microunits": {
                                   "minimum": 0,
                                   "type": "integer"
@@ -1194,6 +1313,62 @@
                                   "minimum": 0,
                                   "type": "integer"
                                 },
+                                "retry_rework_adjustment_microunits": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "retry_rework_cost_proxy_microunits": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "routing_score_semantics": {
+                                  "enum": [
+                                    "legacy_baseline_plus_cost_proxy_adjustments_v1"
+                                  ],
+                                  "type": "string"
+                                },
+                                "routing_tradeoff_weights": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "human_review_percent": {
+                                      "maximum": 100,
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "latency_percent": {
+                                      "maximum": 100,
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "monetary_cost_percent": {
+                                      "maximum": 100,
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "quota_consumption_percent": {
+                                      "maximum": 100,
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "retry_rework_percent": {
+                                      "maximum": 100,
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "monetary_cost_percent",
+                                    "quota_consumption_percent",
+                                    "latency_percent",
+                                    "retry_rework_percent",
+                                    "human_review_percent"
+                                  ],
+                                  "type": "object"
+                                },
+                                "total_adjustment_microunits": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
                                 "total_score_microunits": {
                                   "minimum": 0,
                                   "type": "integer"
@@ -1209,6 +1384,14 @@
                                 "marginal_cost_microunits",
                                 "retry_cost_microunits",
                                 "degrade_cost_microunits",
+                                "routing_score_semantics",
+                                "routing_tradeoff_weights",
+                                "legacy_baseline_score_microunits",
+                                "retry_rework_cost_proxy_microunits",
+                                "human_review_cost_proxy_microunits",
+                                "retry_rework_adjustment_microunits",
+                                "human_review_adjustment_microunits",
+                                "total_adjustment_microunits",
                                 "total_score_microunits"
                               ],
                               "type": "object"
@@ -1302,6 +1485,7 @@
                           "reason": {
                             "enum": [
                               "lowest_expected_total_cost_per_accepted_task",
+                              "lowest_legacy_baseline_plus_cost_proxy_adjustments",
                               "strongest_no_evidence_judgment_fallback",
                               "debug_override",
                               "one_shot_environment_fallback"
@@ -1611,6 +1795,23 @@
                         ],
                         "type": "object"
                       },
+                      "resolved_objective_profile": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "algorithm": {
+                            "const": "sha256"
+                          },
+                          "value": {
+                            "pattern": "^[0-9a-f]{64}$",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "algorithm",
+                          "value"
+                        ],
+                        "type": "object"
+                      },
                       "signals": {
                         "additionalProperties": false,
                         "properties": {
@@ -1653,6 +1854,7 @@
                       "pools",
                       "constraints",
                       "priors",
+                      "resolved_objective_profile",
                       "outcomes",
                       "signals"
                     ],
@@ -2624,6 +2826,112 @@
                         ],
                         "type": "object"
                       },
+                      "resolved_objective_profile": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "profile": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "content_hash": {
+                                "pattern": "^[0-9a-f]{64}$",
+                                "type": "string"
+                              },
+                              "id": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "quality": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "anti_shortcut_percent": {
+                                    "maximum": 100,
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "breadth_percent": {
+                                    "maximum": 100,
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "held_out_percent": {
+                                    "maximum": 100,
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "held_out_percent",
+                                  "breadth_percent",
+                                  "anti_shortcut_percent"
+                                ],
+                                "type": "object"
+                              },
+                              "tradeoffs": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "human_review_percent": {
+                                    "maximum": 100,
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "latency_percent": {
+                                    "maximum": 100,
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "monetary_cost_percent": {
+                                    "maximum": 100,
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "quota_consumption_percent": {
+                                    "maximum": 100,
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "retry_rework_percent": {
+                                    "maximum": 100,
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "monetary_cost_percent",
+                                  "quota_consumption_percent",
+                                  "latency_percent",
+                                  "retry_rework_percent",
+                                  "human_review_percent"
+                                ],
+                                "type": "object"
+                              },
+                              "version": {
+                                "minimum": 1,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "id",
+                              "version",
+                              "content_hash",
+                              "quality",
+                              "tradeoffs"
+                            ],
+                            "type": "object"
+                          },
+                          "source": {
+                            "enum": [
+                              "built_in",
+                              "repository_override"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "profile",
+                          "source"
+                        ],
+                        "type": "object"
+                      },
                       "signals": {
                         "additionalProperties": false,
                         "properties": {
@@ -2827,6 +3135,7 @@
                       "constraints",
                       "priors",
                       "objective_profile",
+                      "resolved_objective_profile",
                       "outcomes",
                       "signals",
                       "debug_override"
@@ -2955,6 +3264,112 @@
                     ],
                     "type": "object"
                   },
+                  "resolved_objective_profile": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "profile": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "content_hash": {
+                            "pattern": "^[0-9a-f]{64}$",
+                            "type": "string"
+                          },
+                          "id": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "quality": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "anti_shortcut_percent": {
+                                "maximum": 100,
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "breadth_percent": {
+                                "maximum": 100,
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "held_out_percent": {
+                                "maximum": 100,
+                                "minimum": 0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "held_out_percent",
+                              "breadth_percent",
+                              "anti_shortcut_percent"
+                            ],
+                            "type": "object"
+                          },
+                          "tradeoffs": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "human_review_percent": {
+                                "maximum": 100,
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "latency_percent": {
+                                "maximum": 100,
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "monetary_cost_percent": {
+                                "maximum": 100,
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "quota_consumption_percent": {
+                                "maximum": 100,
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "retry_rework_percent": {
+                                "maximum": 100,
+                                "minimum": 0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "monetary_cost_percent",
+                              "quota_consumption_percent",
+                              "latency_percent",
+                              "retry_rework_percent",
+                              "human_review_percent"
+                            ],
+                            "type": "object"
+                          },
+                          "version": {
+                            "minimum": 1,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "version",
+                          "content_hash",
+                          "quality",
+                          "tradeoffs"
+                        ],
+                        "type": "object"
+                      },
+                      "source": {
+                        "enum": [
+                          "built_in",
+                          "repository_override"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "profile",
+                      "source"
+                    ],
+                    "type": "object"
+                  },
                   "runner_up_scores": {
                     "items": {
                       "additionalProperties": false,
@@ -3076,7 +3491,7 @@
                     "type": "array"
                   },
                   "schema_version": {
-                    "const": 1,
+                    "const": 2,
                     "type": "integer"
                   },
                   "status": {
@@ -3109,6 +3524,7 @@
                   "normalized_task",
                   "input_digests",
                   "objective_profile",
+                  "resolved_objective_profile",
                   "catalog_revisions",
                   "runtime_operations",
                   "triggers",

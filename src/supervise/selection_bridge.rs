@@ -5,6 +5,7 @@
 //! cannot inspect the host, clock, catalog, or supervisor plan directly.
 
 use super::*;
+use crate::objective_profile::ResolvedObjectiveProfile;
 use crate::selection::{
     self, AuthorityRole, Boundedness, BudgetSignal, CandidateCapabilities, CandidateKey,
     CatalogModel, ContextSize, DebugOverride, DecisionStatus, DynamicSignals, ObjectiveProfileRef,
@@ -393,6 +394,7 @@ pub(super) fn initialize_supervisor_selection(
     catalog: &RuntimeModelCatalog,
     admission: &SupervisorAdmissionPolicyInput,
     advertised: &AdvertisedCatalogSet,
+    resolved_objective_profile: Option<&ResolvedObjectiveProfile>,
 ) -> Result<SupervisorSelectionResolution> {
     if runtime == SupervisorRuntime::Fake {
         return Ok(SupervisorSelectionResolution {
@@ -402,6 +404,11 @@ pub(super) fn initialize_supervisor_selection(
             selection_preflight_failure: None,
         });
     }
+    let resolved_objective_profile = resolved_objective_profile
+        .cloned()
+        .context(
+            "verified supervisor routing requires an objective profile resolved and frozen in the run context",
+        )?;
 
     let automatic = plan.role_models.is_empty();
     let roles = if automatic {
@@ -443,13 +450,14 @@ pub(super) fn initialize_supervisor_selection(
         let debug_override = configured
             .map(|selection| debug_override_for_role(role, runtime, selection))
             .transpose()?;
-        let input = selection_input_for_role(
+        let input = selection_input_for_role(SelectionInputForRoleArgs {
             role,
             runtime,
             catalog,
             advertised,
             admission,
-            DynamicSignals {
+            resolved_objective_profile: &resolved_objective_profile,
+            signals: DynamicSignals {
                 retry_count: 0,
                 budget_signal: BudgetSignal::Continue,
                 previous_choice: None,
@@ -457,7 +465,7 @@ pub(super) fn initialize_supervisor_selection(
                 environment_rejections: Vec::new(),
             },
             debug_override,
-        )?;
+        })?;
         let decision = selection::select(&input).map_err(|error| {
             anyhow!(
                 "automatic selector rejected role '{}': {error}",
@@ -790,15 +798,28 @@ fn debug_override_for_role(
     })
 }
 
-fn selection_input_for_role(
+struct SelectionInputForRoleArgs<'a> {
     role: AgentRole,
     runtime: SupervisorRuntime,
-    catalog: &RuntimeModelCatalog,
-    advertised: &AdvertisedCatalogSet,
-    admission: &SupervisorAdmissionPolicyInput,
+    catalog: &'a RuntimeModelCatalog,
+    advertised: &'a AdvertisedCatalogSet,
+    admission: &'a SupervisorAdmissionPolicyInput,
+    resolved_objective_profile: &'a ResolvedObjectiveProfile,
     signals: DynamicSignals,
     debug_override: Option<DebugOverride>,
-) -> Result<SelectionInput> {
+}
+
+fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<SelectionInput> {
+    let SelectionInputForRoleArgs {
+        role,
+        runtime,
+        catalog,
+        advertised,
+        admission,
+        resolved_objective_profile,
+        signals,
+        debug_override,
+    } = args;
     let priors = selection::built_in_prior_dataset()?;
     let task = task_profile_for_role(role);
     let runtime_name = runtime_name(runtime);
@@ -855,6 +876,7 @@ fn selection_input_for_role(
             version: profile_version,
             expected_digest: None,
         },
+        resolved_objective_profile: resolved_objective_profile.clone(),
         outcomes: Vec::new(),
         signals,
         debug_override,
@@ -1671,6 +1693,33 @@ fn selector_effort_as_str(effort: SelectorEffort) -> &'static str {
 mod tests {
     use super::*;
 
+    fn default_resolved_profile() -> ResolvedObjectiveProfile {
+        ResolvedObjectiveProfile {
+            profile: crate::objective_profile::default_objective_profile()
+                .binding()
+                .expect("default objective profile binding"),
+            source: crate::objective_profile::ObjectiveProfileSource::BuiltIn,
+        }
+    }
+
+    fn initialize_supervisor_selection(
+        plan: &mut SupervisorPlan,
+        runtime: SupervisorRuntime,
+        catalog: &RuntimeModelCatalog,
+        admission: &SupervisorAdmissionPolicyInput,
+        advertised: &AdvertisedCatalogSet,
+    ) -> Result<SupervisorSelectionResolution> {
+        let resolved = default_resolved_profile();
+        super::initialize_supervisor_selection(
+            plan,
+            runtime,
+            catalog,
+            admission,
+            advertised,
+            Some(&resolved),
+        )
+    }
+
     fn codex_catalog() -> Result<RuntimeModelCatalog> {
         let priors = selection::built_in_prior_dataset()?;
         Ok(RuntimeModelCatalog::Codex(
@@ -1796,6 +1845,178 @@ mod tests {
                 && decision.provenance.status == DecisionStatus::Selected
                 && decision.provenance.choice.is_some()
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn verified_routing_requires_frozen_profile_while_fake_compatibility_remains_explicit(
+    ) -> Result<()> {
+        let catalog = codex_catalog()?;
+        let mut missing = test_plan();
+        let error = super::initialize_supervisor_selection(
+            &mut missing,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+            None,
+        )
+        .expect_err("verified routing without a frozen profile must fail closed");
+        assert!(error
+            .to_string()
+            .contains("objective profile resolved and frozen"));
+
+        let fake = super::initialize_supervisor_selection(
+            &mut missing,
+            SupervisorRuntime::Fake,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+            None,
+        )?;
+        assert_eq!(fake.mode, SupervisorSelectionMode::LegacyFake);
+        Ok(())
+    }
+
+    #[test]
+    fn initial_retry_and_budget_degrade_reuse_exact_frozen_profile_evidence() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        let mut profile = crate::objective_profile::default_objective_profile();
+        profile.id = "frozen-routing-profile-v1".to_string();
+        profile.tradeoffs.monetary_cost_percent = 75;
+        profile.tradeoffs.human_review_percent = 25;
+        let frozen = ResolvedObjectiveProfile {
+            profile: profile.binding()?,
+            source: crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+        };
+        let resolution = super::initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+            Some(&frozen),
+        )?;
+        assert!(resolution.decisions.iter().all(|event| {
+            event.provenance.resolved_objective_profile == frozen
+                && event.provenance.normalized_input.resolved_objective_profile == frozen
+        }));
+        let mut state = resolution
+            .automatic_state
+            .context("automatic selection state")?;
+        let retry = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        assert_eq!(retry.decisions[0].1.resolved_objective_profile, frozen);
+        let degrade = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::ChildOrchestrator, AgentRole::Auditor],
+            0,
+            BudgetSignal::Degrade,
+            &[],
+        )?;
+        assert!(degrade
+            .decisions
+            .iter()
+            .all(|(_, decision)| decision.resolved_objective_profile == frozen));
+        Ok(())
+    }
+
+    #[test]
+    fn verified_bridge_applies_supported_profile_to_score_arithmetic_and_choice() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let admission = test_admission();
+        let advertised = AdvertisedCatalogSet::empty();
+
+        let mut default_plan = test_plan();
+        let default = initialize_supervisor_selection(
+            &mut default_plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &admission,
+            &advertised,
+        )?;
+        let default_worker = default
+            .decisions
+            .iter()
+            .find(|event| event.role == AgentRole::Worker)
+            .context("default worker decision")?;
+        let default_choice = default_worker
+            .provenance
+            .choice
+            .as_ref()
+            .context("default worker choice")?;
+
+        let mut profile = crate::objective_profile::default_objective_profile();
+        profile.id = "review-sensitive-routing-v1".to_string();
+        profile.tradeoffs.monetary_cost_percent = 25;
+        profile.tradeoffs.human_review_percent = 75;
+        let frozen = ResolvedObjectiveProfile {
+            profile: profile.binding()?,
+            source: crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+        };
+        let mut adjusted_plan = test_plan();
+        let adjusted = super::initialize_supervisor_selection(
+            &mut adjusted_plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &admission,
+            &advertised,
+            Some(&frozen),
+        )?;
+        let adjusted_worker = adjusted
+            .decisions
+            .iter()
+            .find(|event| event.role == AgentRole::Worker)
+            .context("adjusted worker decision")?;
+        assert_eq!(
+            adjusted_worker.provenance.resolved_objective_profile,
+            frozen
+        );
+        let adjusted_choice = adjusted_worker
+            .provenance
+            .choice
+            .as_ref()
+            .context("adjusted worker choice")?;
+        assert_ne!(adjusted_choice.candidate, default_choice.candidate);
+        assert_eq!(
+            adjusted_choice.reason,
+            selection::ChoiceReason::LowestLegacyBaselinePlusCostProxyAdjustments
+        );
+        let score = adjusted_worker
+            .provenance
+            .candidate_set
+            .iter()
+            .find(|candidate| candidate.candidate == adjusted_choice.candidate)
+            .and_then(|candidate| candidate.score.as_ref())
+            .context("adjusted worker selected score")?;
+        assert_eq!(
+            score.routing_score_semantics,
+            selection::RoutingScoreSemantics::LegacyBaselinePlusCostProxyAdjustmentsV1
+        );
+        assert_eq!(score.routing_tradeoff_weights, frozen.profile.tradeoffs);
+        assert_eq!(score.retry_rework_adjustment_microunits, 0);
+        assert_eq!(
+            score.human_review_adjustment_microunits,
+            score.human_review_cost_proxy_microunits * 75 / 25
+        );
+        assert_eq!(
+            score.total_adjustment_microunits,
+            score.human_review_adjustment_microunits
+        );
+        assert_eq!(
+            score.total_score_microunits,
+            score.legacy_baseline_score_microunits + score.total_adjustment_microunits
+        );
         Ok(())
     }
 

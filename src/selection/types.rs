@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use crate::objective_profile::{ResolvedObjectiveProfile, TradeoffWeights};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -427,6 +428,7 @@ pub struct SelectionInput {
     pub constraints: OperatorConstraints,
     pub priors: PriorDataset,
     pub objective_profile: ObjectiveProfileRef,
+    pub resolved_objective_profile: ResolvedObjectiveProfile,
     pub outcomes: Vec<OutcomeRecord>,
     pub signals: DynamicSignals,
     pub debug_override: Option<DebugOverride>,
@@ -448,6 +450,7 @@ pub struct InputDigests {
     pub pools: DigestRecord,
     pub constraints: DigestRecord,
     pub priors: DigestRecord,
+    pub resolved_objective_profile: DigestRecord,
     pub outcomes: DigestRecord,
     pub signals: DigestRecord,
 }
@@ -523,7 +526,27 @@ pub struct ScoreBreakdown {
     pub marginal_cost_microunits: u64,
     pub retry_cost_microunits: u64,
     pub degrade_cost_microunits: u64,
+    pub routing_score_semantics: RoutingScoreSemantics,
+    pub routing_tradeoff_weights: TradeoffWeights,
+    pub legacy_baseline_score_microunits: u64,
+    pub retry_rework_cost_proxy_microunits: u64,
+    pub human_review_cost_proxy_microunits: u64,
+    pub retry_rework_adjustment_microunits: u64,
+    pub human_review_adjustment_microunits: u64,
+    pub total_adjustment_microunits: u64,
     pub total_score_microunits: u64,
+}
+
+/// Versioned interpretation of selector objective weights.
+///
+/// The legacy baseline already contains complete cycle and operational score
+/// components. Supported non-monetary weights intentionally add cost-proxy
+/// penalties relative to that baseline; they are not a non-overlapping cost
+/// decomposition, rate, load, or independent observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingScoreSemantics {
+    LegacyBaselinePlusCostProxyAdjustmentsV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -564,6 +587,7 @@ pub enum SelectionTrigger {
 #[serde(rename_all = "snake_case")]
 pub enum ChoiceReason {
     LowestExpectedTotalCostPerAcceptedTask,
+    LowestLegacyBaselinePlusCostProxyAdjustments,
     StrongestNoEvidenceJudgmentFallback,
     DebugOverride,
     OneShotEnvironmentFallback,
@@ -627,6 +651,7 @@ pub struct SelectionProvenance {
     pub normalized_task: TaskProfile,
     pub input_digests: InputDigests,
     pub objective_profile: ObjectiveProfileProvenance,
+    pub resolved_objective_profile: ResolvedObjectiveProfile,
     pub catalog_revisions: Vec<CatalogRevisionProvenance>,
     pub runtime_operations: Vec<RuntimePoolState>,
     pub triggers: Vec<SelectionTrigger>,

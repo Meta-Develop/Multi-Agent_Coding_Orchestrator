@@ -143,12 +143,54 @@ fn deterministic_fake_cli_emits_stable_shape_artifacts_and_cleans_claims() -> Re
     );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
+    fs::write(
+        repo_path.join("maco-objective-profiles.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "profiles": [
+                {
+                    "id": "authored-v1",
+                    "version": 1,
+                    "quality": {
+                        "held_out_percent": 50,
+                        "breadth_percent": 25,
+                        "anti_shortcut_percent": 25
+                    },
+                    "tradeoffs": {
+                        "monetary_cost_percent": 80,
+                        "quota_consumption_percent": 5,
+                        "latency_percent": 5,
+                        "retry_rework_percent": 5,
+                        "human_review_percent": 5
+                    }
+                },
+                {
+                    "id": "cli-v1",
+                    "version": 3,
+                    "quality": {
+                        "held_out_percent": 50,
+                        "breadth_percent": 25,
+                        "anti_shortcut_percent": 25
+                    },
+                    "tradeoffs": {
+                        "monetary_cost_percent": 40,
+                        "quota_consumption_percent": 10,
+                        "latency_percent": 10,
+                        "retry_rework_percent": 20,
+                        "human_review_percent": 20
+                    }
+                }
+            ]
+        }))?,
+    )?;
+    commit_all(&Repository::open(&repo_path)?, "objective profile fixtures")?;
     let plan_path = temp.path().join("two-children.json");
     fs::write(
         &plan_path,
         serde_json::to_vec_pretty(&serde_json::json!({
             "version": 1,
             "task": "deterministic shape",
+            "objective_profile": "authored-v1",
             "assignments": [
                 {"id": "child-a", "assigned_paths": ["README.md"], "worker_assignments": []},
                 {"id": "child-b", "assigned_paths": ["src/lib.rs"], "worker_assignments": []}
@@ -168,11 +210,30 @@ fn deterministic_fake_cli_emits_stable_shape_artifacts_and_cleans_claims() -> Re
         "fake",
         "--max-concurrent-children",
         "1",
+        "--objective-profile",
+        "cli-v1",
         "--json",
     ])?;
     assert_eq!(report["runtime"], "fake");
     assert_eq!(report["success"], true);
     assert_eq!(report["publishable"], false);
+    assert_eq!(
+        report["role_economics_profile"]["resolved_objective_profile"]["profile"]["id"],
+        "cli-v1"
+    );
+    assert_eq!(
+        report["role_economics_profile"]["resolved_objective_profile"]["profile"]["version"],
+        3
+    );
+    assert_eq!(
+        report["role_economics_profile"]["resolved_objective_profile"]["source"],
+        "repository_override"
+    );
+    assert_eq!(
+        report["role_economics_profile"]["resolved_objective_profile"]["profile"]["tradeoffs"]
+            ["human_review_percent"],
+        20
+    );
     assert_eq!(
         report["orchestrator_reports"].as_array().map(Vec::len),
         Some(2)
@@ -285,6 +346,18 @@ fn supervise_plan_normalizes_aliases_and_rejects_top_level_scope_conflicts() -> 
         plan["assignments"][0]["assigned_paths"],
         serde_json::json!(["README.md"])
     );
+    assert!(plan.get("objective_profile").is_none());
+    let profile_override = run_success_json(&[
+        "supervise",
+        "plan",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--objective-profile",
+        "review-balanced-v2",
+        "--json",
+    ])?;
+    assert_eq!(profile_override["objective_profile"], "review-balanced-v2");
 
     let overlap = temp.path().join("overlap.json");
     fs::write(

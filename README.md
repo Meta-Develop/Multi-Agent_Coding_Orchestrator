@@ -1300,6 +1300,52 @@ fixtures do not claim that command exists.
 Gate-policy/classifier corpus experiments remain separate and depend on the
 Issue #28 production broker path.
 
+### Operator objective profiles
+
+Supervisor routing accepts a named, versioned objective profile. The built-in
+`maco-default-objective-v1` profile preserves the existing quality weighting
+exactly: held-out validation 50%, breadth 25%, and anti-shortcut quality 25%.
+Its tradeoff weights preserve the current cost-first selector behavior. The
+profile contains no switch-cost term.
+
+Repository-specific profiles may be declared only in the fixed repository-root
+file `maco-objective-profiles.json`. MACO opens that file through its bounded,
+no-follow repository-local reader and rejects symlinks, path aliases, unsupported
+schema versions, unknown fields, duplicate profile IDs, invalid names, and
+weights that are out of range or do not sum to 100. The CLI never accepts an
+alternate profile-file path.
+
+Selection precedence is `--objective-profile NAME` over the authored
+`objective_profile` plan field over the built-in default. Both `maco supervise
+plan` and `maco supervise run` expose the flag; the plan command records the
+request in its normalized output, while the run command resolves the effective
+profile once against the discovered repository before selector initialization.
+Unknown profile names and invalid override files fail before child dispatch.
+Retries and budget degradation reuse that frozen resolution instead of reading
+mutable configuration again.
+
+New `supervisor-final.json` reports retain the resolved profile under
+`role_economics_profile.resolved_objective_profile`, including its immutable
+ID, version, built-in or repository-override source, content hash, quality
+weights, and every effective tradeoff weight. Older reports remain readable;
+the generated schema requires this evidence for newly finalized reports.
+
+Supervisor routing interprets the default 100%-monetary profile as the exact
+legacy selector baseline. Nonzero retry/rework and human-review weights are
+supported as explicit monetary cost-proxy adjustments, proportional to their
+weights relative to the nonzero monetary baseline. They are not retry rates,
+review load, or independent observations. A nonzero quota weight fails closed
+because this branch has no typed, contract-backed per-runtime quota evidence;
+a nonzero latency weight likewise fails closed because it has no typed
+per-candidate observed or predicted latency evidence. Missing evidence is never
+scored as numeric zero.
+
+The 50/25/25 quality decomposition is frozen for evaluation-side consumers;
+supervisor selector hard quality and authority gates remain unchanged and
+non-weightable. This milestone adds operator profile selection and immutable
+review evidence only; it does not implement the GUI tracked by #152 or
+historical run rescoring.
+
 ### Provisional named effort default
 
 When a supervisor plan supplies no `role_models` override, MACO selects the
@@ -2938,7 +2984,7 @@ limit.
 ```
 
 Every newly finalized `supervisor-final.json` carries
-`role_economics_profile.schema_version=5` plus execution telemetry: planned,
+`role_economics_profile.schema_version=6` plus execution telemetry: planned,
 started, and completed assignment counts; the resolved configured child bound;
 scheduler-observed peak and active-interval mean concurrency; configured and
 resolved model/reasoning bindings for every role; resolved effort for every
@@ -2951,8 +2997,8 @@ catalog, runtime-default model, nested-worker usage, and unpriced cost values
 remain explicit unavailable observations. A width-one run with multiple
 independent assignment or spec scopes emits a final-report warning. Readers
 continue accepting historical reports that omit this block or carry economics
-profile schema versions 1 through 3; the generated schema describes the required
-version 5 contract for newly finalized reports. Version 4 profiles and the
+profile schema versions 1 through 5; the generated schema describes the required
+version 6 contract for newly finalized reports. Version 4 profiles and the
 withdrawn model-tier profile name remain deserializable compatibility input.
 
 A worker assignment may opt into `"kind":"megafile_decomposition"` only with an

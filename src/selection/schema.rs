@@ -186,6 +186,41 @@ fn objective_profile_ref() -> Value {
     )
 }
 
+fn routing_quality_weights() -> Value {
+    strict_object!(
+        "held_out_percent" => json!({"type": "integer", "minimum": 0, "maximum": 100}),
+        "breadth_percent" => json!({"type": "integer", "minimum": 0, "maximum": 100}),
+        "anti_shortcut_percent" => json!({"type": "integer", "minimum": 0, "maximum": 100}),
+    )
+}
+
+fn routing_tradeoff_weights() -> Value {
+    strict_object!(
+        "monetary_cost_percent" => json!({"type": "integer", "minimum": 0, "maximum": 100}),
+        "quota_consumption_percent" => json!({"type": "integer", "minimum": 0, "maximum": 100}),
+        "latency_percent" => json!({"type": "integer", "minimum": 0, "maximum": 100}),
+        "retry_rework_percent" => json!({"type": "integer", "minimum": 0, "maximum": 100}),
+        "human_review_percent" => json!({"type": "integer", "minimum": 0, "maximum": 100}),
+    )
+}
+
+fn routing_objective_profile_binding() -> Value {
+    strict_object!(
+        "id" => nonempty_string(),
+        "version" => positive_integer(),
+        "content_hash" => json!({"type": "string", "pattern": "^[0-9a-f]{64}$"}),
+        "quality" => routing_quality_weights(),
+        "tradeoffs" => routing_tradeoff_weights(),
+    )
+}
+
+fn resolved_routing_objective_profile() -> Value {
+    strict_object!(
+        "profile" => routing_objective_profile_binding(),
+        "source" => enum_schema(&["built_in", "repository_override"]),
+    )
+}
+
 fn objective_profile() -> Value {
     strict_object!(
         "name" => nonempty_string(),
@@ -333,6 +368,7 @@ fn selection_input() -> Value {
         "constraints" => operator_constraints(),
         "priors" => prior_dataset(),
         "objective_profile" => objective_profile_ref(),
+        "resolved_objective_profile" => resolved_routing_objective_profile(),
         "outcomes" => array(outcome_record()),
         "signals" => dynamic_signals(),
         "debug_override" => nullable(debug_override()),
@@ -354,6 +390,7 @@ fn input_digests() -> Value {
         "pools" => digest_record(),
         "constraints" => digest_record(),
         "priors" => digest_record(),
+        "resolved_objective_profile" => digest_record(),
         "outcomes" => digest_record(),
         "signals" => digest_record(),
     )
@@ -413,6 +450,14 @@ fn score_breakdown() -> Value {
         "marginal_cost_microunits" => nonnegative_integer(),
         "retry_cost_microunits" => nonnegative_integer(),
         "degrade_cost_microunits" => nonnegative_integer(),
+        "routing_score_semantics" => enum_schema(&["legacy_baseline_plus_cost_proxy_adjustments_v1"]),
+        "routing_tradeoff_weights" => routing_tradeoff_weights(),
+        "legacy_baseline_score_microunits" => nonnegative_integer(),
+        "retry_rework_cost_proxy_microunits" => nonnegative_integer(),
+        "human_review_cost_proxy_microunits" => nonnegative_integer(),
+        "retry_rework_adjustment_microunits" => nonnegative_integer(),
+        "human_review_adjustment_microunits" => nonnegative_integer(),
+        "total_adjustment_microunits" => nonnegative_integer(),
         "total_score_microunits" => nonnegative_integer(),
     )
 }
@@ -438,6 +483,7 @@ fn selected_choice() -> Value {
         "total_score_microunits" => nonnegative_integer(),
         "reason" => enum_schema(&[
             "lowest_expected_total_cost_per_accepted_task",
+            "lowest_legacy_baseline_plus_cost_proxy_adjustments",
             "strongest_no_evidence_judgment_fallback",
             "debug_override",
             "one_shot_environment_fallback"
@@ -482,12 +528,13 @@ fn ranked_score() -> Value {
 
 pub(crate) fn selection_provenance_schema_value() -> Value {
     strict_object!(
-        "schema_version" => json!({"type": "integer", "const": 1}),
+        "schema_version" => json!({"type": "integer", "const": 2}),
         "status" => enum_schema(&["selected", "fail_closed"]),
         "normalized_input" => selection_input(),
         "normalized_task" => task_profile(false),
         "input_digests" => input_digests(),
         "objective_profile" => objective_profile_provenance(),
+        "resolved_objective_profile" => resolved_routing_objective_profile(),
         "catalog_revisions" => array(catalog_revision_provenance()),
         "runtime_operations" => array(runtime_pool_state()),
         "triggers" => set(enum_schema(&[
